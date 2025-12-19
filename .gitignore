@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# Runtime files
+.run/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bittensor
+wallets/*/coldkey
+wallets/*/hotkeys/*_hotkey
+
+# Docker
+*.pid
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test outputs
+test_results/
+coverage/
+.pytest_cache/
+
+# Local-only (kept locally, not versioned)
+wallets/
+scripts/docker_local_subtensor_validator.sh
+
+# Environment variables (contains secrets)
+.env
