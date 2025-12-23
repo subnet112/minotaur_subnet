@@ -54,6 +54,40 @@ python -m neurons.validator \
   --simulator.rpc_url "$SIMULATOR_RPC_URL"
 ```
 
+### With Auto-Update (Recommended for Production)
+
+We highly recommend running the validator with auto-updates. This will help ensure your validator is always running the latest release.
+
+Prerequisites:
+1. Install [PM2](https://pm2.keymetrics.io/): `npm install -g pm2`
+2. Make sure your virtual environment is activated (the auto-updater will automatically update package dependencies with pip)
+3. Make sure you're on the main branch: `git checkout main`
+
+From the minotaur directory:
+```bash
+pm2 start --name minotaur-vali-updater --interpreter python scripts/start_validator.py -- \
+  --pm2_name minotaur-vali \
+  --wallet.name "$WALLET_NAME" \
+  --wallet.hotkey "$WALLET_HOTKEY" \
+  --netuid "$NETUID" \
+  --subtensor.network finney \
+  --validator.api_key "$VALIDATOR_API_KEY" \
+  --simulator.rpc_url "$SIMULATOR_RPC_URL"
+```
+
+This starts a process called `minotaur-vali-updater` which periodically checks for new git commits. When one is found, it runs `pip install` for the latest packages and restarts the validator process (whose name is given by the `--pm2_name` flag).
+
+Options:
+- `--pm2_name` - Validator PM2 process name (default: `minotaur_vali`)
+- `--no_autoupdate` - Disable automatic updates
+- `--update_interval` - Update check interval in minutes (default: 15)
+
+To view logs:
+```bash
+pm2 logs minotaur-vali-updater  # Auto-updater logs
+pm2 logs minotaur-vali          # Validator logs
+```
+
 ## Run tests
 ```bash
 pytest tests/ -v
