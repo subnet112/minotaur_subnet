@@ -134,7 +134,8 @@ The `POST /quotes` endpoint receives a JSON body describing the swap intent:
     {
       "receiver": "0x01...InteropAddress", // ERC-7930 InteropAddress (hex-encoded)
       "asset": "0x01...InteropAddress",    // ERC-7930 InteropAddress (hex-encoded)
-      "amount": "1000000"                  // Output amount (decimal string; must be > 0 in aggregator API)
+       "minAmount": "0",                    // Optional minimum output (wei, decimal string; ignored by sample solvers today)
+       "amount": "0"                        // Optional; sample solvers ignore this field on requests
     }
   ],
   "minValidUntil": 600,              // Optional: minimum validity duration (seconds)
@@ -142,8 +143,8 @@ The `POST /quotes` endpoint receives a JSON body describing the swap intent:
 }
 ```
 Notes:
-- The aggregator’s OIF adapter sends exactly the fields above to solvers (it does **not** forward `/v1/quotes` `solverOptions` or `metadata` to the solver `/quotes` endpoint).
-- Addresses are serialized as **ERC-7930 hex** strings (see `oif-aggregator/crates/types/src/models/interop_address.rs` for encoding/parsing).
+- The Python sample solvers in this repo require `availableInputs[0].asset`, `availableInputs[0].amount`, and `requestedOutputs[0].asset`. Other fields may be present and are often ignored by the sample solvers.
+- Addresses are serialized as **ERC-7930 hex** strings. The Python reference parser is `Solver._interop_to_components()` in `neurons/solver.py` / `neurons/solver_base.py`.
 
 #### Response Body (The Quote)
 The solver must return a JSON object with a `quotes` array. Each quote object MUST match this structure:
@@ -240,6 +241,14 @@ The `executionPlan` is the most critical part. It tells the smart contract how t
 ## Testing with Simulation
 
 The `minotaur_contracts` repository provides a Docker-based Simulator that validators use to check if an ExecutionPlan actually delivers the promised tokens. You should use this continuously during development to verify your solver's logic.
+
+### Quick local testing (no Aggregator required)
+
+This repo includes a small harness that simulates the key Aggregator/Miner calls against your solver and validates the response schema and invariants (including `interactionsHash` and `callValue`):
+
+```bash
+python -m tests.solver_harness --solver-url http://localhost:8000
+```
 
 ### 1. Build the Simulator Image
 Clone the `minotaur_contracts` repo and build the image:

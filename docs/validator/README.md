@@ -27,5 +27,5 @@ The validator:
 5. Normalizes scores and applies burn allocation (if configured)
 6. Emits weights on-chain when tempo spacing allows
 
-For more details, see the [main README](../../README.md).
+For more details, see the main README in the repo root: `README.md`.
 

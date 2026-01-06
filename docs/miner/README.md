@@ -32,5 +32,5 @@ The miner:
 5. Solvers provide quotes using Uniswap V2/V3 integration
 6. When an order is selected, the solver executes the swap
 
-For more details, see the [main README](../../README.md).
+For more details, see the main README in the repo root: `README.md`.
 

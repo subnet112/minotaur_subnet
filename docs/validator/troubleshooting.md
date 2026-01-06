@@ -13,7 +13,8 @@
 - Verify `VALIDATOR_API_KEY` is valid and has proper permissions
 
 ## No orders being validated
-- Check that the aggregator has pending orders: `curl $AGGREGATOR_URL/v1/validators/orders?validator_id=YOUR_ID`
+- Check that the aggregator has pending orders (validator endpoints require `VALIDATOR_API_KEY`):
+  - `curl -H "X-API-Key: $VALIDATOR_API_KEY" "$AGGREGATOR_URL/v1/validators/orders?validator_id=YOUR_ID"`
 - Verify Docker is running and the simulator image is available
 - Check `SIMULATOR_RPC_URL` is accessible and has sufficient rate limits
 - Review logs for simulation errors or timeouts

@@ -32,16 +32,18 @@ Get swap quotes for available inputs and requested outputs.
 **Request:**
 ```json
 {
+  "user": "0x01...UserInteropAddress",
   "availableInputs": [
     {
-      "token": "0x4200000000000000000000000000000000000006",
+      "asset": "0x01...TokenInteropAddress",
       "amount": "1000000000000000000"
     }
   ],
   "requestedOutputs": [
     {
-      "token": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-      "amount": null
+      "asset": "0x01...TokenInteropAddress",
+      "minAmount": "0",
+      "receiver": "0x01...UserInteropAddress"
     }
   ]
 }
@@ -52,17 +54,39 @@ Get swap quotes for available inputs and requested outputs.
 {
   "quotes": [
     {
-      "input": {
-        "token": "0x4200000000000000000000000000000000000006",
-        "amount": "1000000000000000000"
+      "quoteId": "unique-quote-id",
+      "provider": "solver-id",
+      "orders": [],
+      "validUntil": 1715000000,
+      "eta": 10,
+      "details": {
+        "availableInputs": [
+          { "asset": "0x01...TokenInteropAddress", "amount": "1000000000000000000", "user": "0x01...UserInteropAddress" }
+        ],
+        "requestedOutputs": [
+          { "asset": "0x01...TokenInteropAddress", "amount": "1800000000", "receiver": "0x01...UserInteropAddress" }
+        ]
       },
-      "output": {
-        "token": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-        "amount": "1800000000"
-      },
-      "plan": {
-        "interactions": [...],
-        "interactionsHash": "0x..."
+      "settlement": {
+        "contractAddress": "0xSettlementAddr...",
+        "deadline": 1715000000,
+        "nonce": "0x...",
+        "callValue": "0",
+        "gasEstimate": 150000,
+        "interactionsHash": "0x...",
+        "permit": {
+          "permitType": "standard_approval",
+          "permitCall": "0x",
+          "amount": "1000000000000000000",
+          "deadline": 1715000000
+        },
+        "executionPlan": {
+          "preInteractions": [],
+          "interactions": [
+            { "target": "0xRouter...", "value": "0", "callData": "0x..." }
+          ],
+          "postInteractions": []
+        }
       }
     }
   ]
@@ -76,27 +100,17 @@ Submit an order for execution.
 **Request:**
 ```json
 {
-  "orderId": "order-123",
-  "input": {
-    "token": "0x4200000000000000000000000000000000000006",
-    "amount": "1000000000000000000"
-  },
-  "output": {
-    "token": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-    "amount": "1800000000"
-  },
-  "plan": {
-    "interactions": [...],
-    "interactionsHash": "0x..."
-  }
+  "quoteId": "unique-quote-id"
 }
 ```
 
 **Response:**
 ```json
 {
-  "orderId": "order-123",
-  "status": "pending"
+  "status": "success",
+  "orderId": "solver-order-id",
+  "order": { "...": "..." },
+  "message": "Order accepted"
 }
 ```
 
@@ -107,9 +121,17 @@ Get order status.
 **Response:**
 ```json
 {
-  "orderId": "order-123",
-  "status": "completed",
-  "txHash": "0x..."
+  "order": {
+    "id": "solver-order-id",
+    "status": "pending",
+    "createdAt": 1715000000,
+    "updatedAt": 1715000001,
+    "quoteId": "unique-quote-id",
+    "inputAmount": { "asset": "0x01...TokenInteropAddress", "amount": "1000000000000000000" },
+    "outputAmount": { "asset": "0x01...TokenInteropAddress", "amount": "1800000000" },
+    "settlement": { "type": "escrow", "data": { "estimatedGasUnits": 150000 } },
+    "fillTransaction": null
+  }
 }
 ```
 
@@ -120,18 +142,18 @@ List supported tokens.
 **Response:**
 ```json
 {
-  "tokens": [
-    {
-      "address": "0x4200000000000000000000000000000000000006",
-      "symbol": "WETH",
-      "decimals": 18
-    },
-    {
-      "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-      "symbol": "USDC",
-      "decimals": 6
+  "networks": {
+    "8453": {
+      "chain_id": 8453,
+      "name": "Base",
+      "input_settler": "0xSettlementAddr...",
+      "output_settler": "0xSettlementAddr...",
+      "tokens": [
+        { "address": "0x4200000000000000000000000000000000000006", "symbol": "WETH", "decimals": 18 },
+        { "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "symbol": "USDC", "decimals": 6 }
+      ]
     }
-  ]
+  }
 }
 ```
 
