@@ -47,7 +47,8 @@ python -m neurons.miner \
   --aggregator.url http://localhost:4000 \
   --miner.api_key your-miner-api-key \
   --miner.base_port 8000 \
-  --miner.solver_host host.docker.internal \  # Required if aggregator is in Docker
+  # Required if aggregator is in Docker:
+  --miner.solver_host host.docker.internal \
   --miner.num_solvers 2  # Run 2 solvers (default: 1)
 ```
 

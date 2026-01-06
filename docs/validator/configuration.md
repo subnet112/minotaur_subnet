@@ -21,8 +21,10 @@ This page summarizes all environment variables and recommended defaults for the 
 - `VALIDATION_DEFAULT_TTL_MS` (default: `1000`)
 - `VALIDATION_MAX_RESPONSE_LATENCY_MS` (default: `1500`)
 - `VALIDATION_MAX_CLOCK_SKEW_SECONDS` (default: `1`)
-- `VALIDATION_MIN_PRICE`, `VALIDATION_MAX_PRICE` (default: `0.0` = disabled)
-- `VALIDATION_MIN_SIZE`, `VALIDATION_MAX_SIZE` (default: `0.0` = disabled)
+
+Notes:
+- The validator currently uses these bounds to validate **aggregator event submissions** and to enforce latency/TTL constraints.
+- Price/size bound env vars are not wired in the current Python validator implementation.
 
 ## Burn allocation (optional)
 - `BURN_PERCENTAGE` (default: `0.0`) – Fraction of emissions to allocate to creator hotkey for burning (0.0-1.0)
@@ -43,10 +45,15 @@ This page summarizes all environment variables and recommended defaults for the 
   - `mock`: Simulation mode with real aggregator but no Bittensor operations
 
 ## Order simulation
-- `SIMULATOR_RPC_URL` (required) – Ethereum RPC URL for order simulation
+- `SIMULATOR_RPC_URL` (recommended) – Ethereum RPC URL for order simulation (chain ID 1)
+- `ETHEREUM_RPC_URL` / `INFURA_RPC_URL` – Also accepted by the simulator as fallbacks for chain ID 1
+- `BASE_RPC_URL` – Base RPC URL for simulating Base orders (chain ID 8453)
 - `SIMULATOR_DOCKER_IMAGE` (default: `mino-simulation`) – Docker image for simulator
 - `SIMULATOR_MAX_CONCURRENT` (default: `5`) – Maximum number of concurrent simulations
 - `SIMULATOR_TIMEOUT_SECONDS` (default: `300`) – Simulation timeout in seconds (5 minutes)
+
+## State persistence (optional)
+- `VALIDATOR_STATE_DIR` (optional) – Directory where the validator stores persistent state (defaults to the validator run directory)
 
 ## Validator identity
 - `VALIDATOR_ID` (optional) – Unique validator ID for order filtering (defaults to hotkey)
@@ -57,6 +64,12 @@ This page summarizes all environment variables and recommended defaults for the 
 
 ## Logging (optional)
 - `LOGURU_LEVEL` = `DEBUG` | `INFO` | `WARNING` | `ERROR`
+
+## Advanced Bittensor wallet settings (optional)
+These are used by the on-chain weights emitter (`neurons/onchain_emitter.py`) in some deployment setups:
+- `VALIDATOR_WALLET_PATH` (or `BT_WALLET_PATH` / `WALLET_PATH`) – Override bittensor wallet directory
+- `VALIDATOR_HOTKEY_PASSWORD` (or `WALLET_HOTKEY_PASSWORD` / `HOTKEY_PASSWORD`) – Hotkey password
+- `EXCLUDE_QUANTILE` (default: `0`) – Weight filtering quantile used when processing weights for on-chain constraints
 
 ## Example (.env)
 ```bash

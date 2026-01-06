@@ -9,7 +9,8 @@
 ## No quotes being provided
 - Verify Ethereum RPC URL is configured: `ETHEREUM_RPC_URL` or `ALCHEMY_API_KEY`
 - Check RPC URL is accessible and has sufficient rate limits
-- Verify solver is registered and active: `curl $AGGREGATOR_URL/v1/solvers/$SOLVER_ID`
+- Verify solver is registered and active (miner endpoints require `MINER_API_KEY`):
+  - `curl -H "X-API-Key: $MINER_API_KEY" "$AGGREGATOR_URL/v1/solvers/$SOLVER_ID"`
 - Review solver logs for quote request errors
 
 ## Rate limiting errors
@@ -27,7 +28,8 @@
 ## Multiple solvers not working
 - Verify ports don't conflict: `MINER_BASE_PORT + solver_index`
 - Check each solver is on a different port
-- Ensure all solvers are registered: `curl $AGGREGATOR_URL/v1/solvers`
+- Ensure all solvers are registered (requires `MINER_API_KEY`):
+  - `curl -H "X-API-Key: $MINER_API_KEY" "$AGGREGATOR_URL/v1/solvers"`
 - Review logs for each solver instance
 
 ## Token discovery issues
@@ -51,7 +53,7 @@
 - Verify `AGGREGATOR_URL` is correct
 - Check network connectivity
 - Ensure aggregator is running: `curl $AGGREGATOR_URL/health`
-- Review timeout settings: `AGGREGATOR_TIMEOUT`
+- Note: `neurons/miner.py` currently uses fixed per-request timeouts (there is no `AGGREGATOR_TIMEOUT` setting for the miner).
 
 ## Bittensor mode issues
 - Verify wallet is registered on the subnet

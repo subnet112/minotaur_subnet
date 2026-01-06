@@ -21,8 +21,8 @@ All documentation for running the miner:
 
 ## Quick Links
 
-- [Main README](../README.md) – Project overview and repository layout
-- [Environment Variables Example](../env.example) – Ready-to-use configuration template
+- Main README (repo root): `README.md` – Project overview and repository layout
+- Environment variables example (repo root): `env.example` – Ready-to-use configuration template
 
 ## About this Documentation
 

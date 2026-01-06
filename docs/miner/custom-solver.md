@@ -67,16 +67,18 @@ Get swap quotes for available inputs and requested outputs.
 **Request:**
 ```json
 {
+  "user": "0x01...InteropAddress",
   "availableInputs": [
     {
-      "token": "0x...",
+      "asset": "0x01...InteropAddress",
       "amount": "1000000000000000000"
     }
   ],
   "requestedOutputs": [
     {
-      "token": "0x...",
-      "amount": null
+      "asset": "0x01...InteropAddress",
+      "minAmount": "0",
+      "receiver": "0x01...InteropAddress"
     }
   ]
 }
@@ -87,17 +89,39 @@ Get swap quotes for available inputs and requested outputs.
 {
   "quotes": [
     {
-      "input": {
-        "token": "0x...",
-        "amount": "1000000000000000000"
+      "quoteId": "unique-quote-id",
+      "provider": "your-solver-id",
+      "orders": [],
+      "validUntil": 1715000000,
+      "eta": 10,
+      "details": {
+        "availableInputs": [
+          { "asset": "0x01...InteropAddress", "amount": "1000000000000000000", "user": "0x01...InteropAddress" }
+        ],
+        "requestedOutputs": [
+          { "asset": "0x01...InteropAddress", "amount": "1800000000", "receiver": "0x01...InteropAddress" }
+        ]
       },
-      "output": {
-        "token": "0x...",
-        "amount": "1800000000"
-      },
-      "plan": {
-        "interactions": [...],
-        "interactionsHash": "0x..."
+      "settlement": {
+        "contractAddress": "0xSettlementAddr...",
+        "deadline": 1715000000,
+        "nonce": "0x...",
+        "callValue": "0",
+        "gasEstimate": 150000,
+        "interactionsHash": "0x...",
+        "permit": {
+          "permitType": "standard_approval",
+          "permitCall": "0x",
+          "amount": "1000000000000000000",
+          "deadline": 1715000000
+        },
+        "executionPlan": {
+          "preInteractions": [],
+          "interactions": [
+            { "target": "0xRouter...", "value": "0", "callData": "0x..." }
+          ],
+          "postInteractions": []
+        }
       }
     }
   ]
@@ -110,27 +134,17 @@ Submit an order for execution.
 **Request:**
 ```json
 {
-  "orderId": "order-123",
-  "input": {
-    "token": "0x...",
-    "amount": "1000000000000000000"
-  },
-  "output": {
-    "token": "0x...",
-    "amount": "1800000000"
-  },
-  "plan": {
-    "interactions": [...],
-    "interactionsHash": "0x..."
-  }
+  "quoteId": "unique-quote-id"
 }
 ```
 
 **Response:**
 ```json
 {
-  "orderId": "order-123",
-  "status": "pending"
+  "status": "success",
+  "orderId": "solver-order-id",
+  "order": { "...": "..." },
+  "message": "Order accepted"
 }
 ```
 
@@ -152,13 +166,16 @@ List supported tokens.
 **Response:**
 ```json
 {
-  "tokens": [
-    {
-      "address": "0x...",
-      "symbol": "WETH",
-      "decimals": 18
+  "networks": {
+    "1": {
+      "chain_id": 1,
+      "input_settler": "0xSettlementAddr...",
+      "output_settler": "0xSettlementAddr...",
+      "tokens": [
+        { "address": "0x...", "symbol": "WETH", "decimals": 18 }
+      ]
     }
-  ]
+  }
 }
 ```
 
@@ -236,23 +253,31 @@ class CustomSolver:
                 if not available_inputs or not requested_outputs:
                     return jsonify({"error": "Missing required fields"}), 400
                 
-                # Generate quotes (simplified example)
+                # Generate quotes (simplified example matching this repo's solver schema)
                 quotes = []
-                for input_token in available_inputs:
-                    for output_token in requested_outputs:
-                        # Your quote calculation logic here
-                        quote = {
-                            "input": input_token,
-                            "output": {
-                                "token": output_token["token"],
-                                "amount": str(int(input_token["amount"]) * self.quality)  # Simplified
+                for input_entry in available_inputs:
+                    for output_entry in requested_outputs:
+                        quote_id = f"{self.solver_id}-quote-123"
+                        amount_out = str(int(input_entry["amount"]) * self.quality)  # Simplified
+                        quotes.append({
+                            "quoteId": quote_id,
+                            "provider": self.solver_id,
+                            "orders": [],
+                            "details": {
+                                "availableInputs": [{
+                                    "asset": input_entry["asset"],
+                                    "amount": str(input_entry["amount"]),
+                                    "user": input_entry.get("user") or req.get("user"),
+                                }],
+                                "requestedOutputs": [{
+                                    "asset": output_entry["asset"],
+                                    "amount": amount_out,
+                                    "receiver": output_entry.get("receiver") or input_entry.get("user") or req.get("user"),
+                                }]
                             },
-                            "plan": {
-                                "interactions": [],
-                                "interactionsHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
-                            }
-                        }
-                        quotes.append(quote)
+                            # NOTE: sample solvers in this repo generally include `settlement`
+                            # with `executionPlan`. This minimal example omits it for brevity.
+                        })
                 
                 return jsonify({"quotes": quotes}), 200
                 
@@ -268,9 +293,10 @@ class CustomSolver:
                 if not req:
                     return jsonify({"error": "Invalid request"}), 400
                 
-                order_id = req.get('orderId')
-                if not order_id:
-                    return jsonify({"error": "Missing orderId"}), 400
+                quote_id = req.get('quoteId')
+                if not quote_id:
+                    return jsonify({"error": "Missing quoteId"}), 400
+                order_id = f"{self.solver_id}-order-123"
                 
                 # Store order
                 self.orders[order_id] = {
@@ -303,7 +329,16 @@ class CustomSolver:
         @self.app.route('/tokens', methods=['GET'])
         def get_tokens():
             """List supported tokens."""
-            return jsonify({"tokens": self.supported_tokens}), 200
+            return jsonify({
+                "networks": {
+                    "1": {
+                        "chain_id": 1,
+                        "input_settler": "0x0000000000000000000000000000000000000000",
+                        "output_settler": "0x0000000000000000000000000000000000000000",
+                        "tokens": self.supported_tokens
+                    }
+                }
+            }), 200
     
     def run(self, debug=False):
         """Start the Flask server."""
@@ -437,8 +472,8 @@ class DEXSolver:
                     for output_token in requested_outputs:
                         amount_in = int(input_token["amount"])
                         amount_out = self._get_quote(
-                            input_token["token"],
-                            output_token["token"],
+                            input_token["asset"],
+                            output_token["asset"],
                             amount_in
                         )
                         
@@ -449,13 +484,13 @@ class DEXSolver:
                             quote = {
                                 "input": input_token,
                                 "output": {
-                                    "token": output_token["token"],
+                                    "asset": output_token["asset"],
                                     "amount": str(amount_out)
                                 },
                                 "plan": {
                                     "interactions": self._build_interactions(
-                                        input_token["token"],
-                                        output_token["token"],
+                                        input_token["asset"],
+                                        output_token["asset"],
                                         amount_in
                                     ),
                                     "interactionsHash": self._compute_interactions_hash(...)

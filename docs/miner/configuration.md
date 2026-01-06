@@ -14,12 +14,11 @@ This page summarizes all environment variables and command-line arguments for th
 
 ## Aggregator API
 - `AGGREGATOR_URL` (default: `http://localhost:4000`) – Base URL for the aggregator API
-- `AGGREGATOR_API_KEY` (optional) – General aggregator API key
+- `AGGREGATOR_API_KEY` (optional) – General aggregator API key (currently not used by `neurons/miner.py`; miner uses `MINER_API_KEY` for miner endpoints)
 - `MINER_API_KEY` (required) – Miner-specific API key for `/v1/solvers/*` endpoints
-- `AGGREGATOR_TIMEOUT` (default: `10`) – HTTP timeout (seconds)
-- `AGGREGATOR_VERIFY_SSL` (default: `1`) – Validate TLS certs (1=yes, 0=no)
-- `AGGREGATOR_MAX_RETRIES` (default: `3`) – Retry budget
-- `AGGREGATOR_BACKOFF_SECONDS` (default: `0.5`) – Retry backoff multiplier
+
+Notes:
+- `neurons/miner.py` currently uses fixed per-request timeouts for aggregator calls (it does not read `AGGREGATOR_TIMEOUT/*` environment variables).
 
 ## Solver Configuration
 - `MINER_BASE_PORT` (default: `8000`) – Base port for solver servers (each solver uses `base_port + index`)
