@@ -168,7 +168,12 @@ class Miner:
             "port": port,
             "latency_ms": latency_ms,
             "quality": quality,
-            "endpoint": f"http://{self.solver_host}:{port}"
+            # Endpoint advertised to the aggregator (may need to be reachable from Docker/remote).
+            "endpoint": f"http://{self.solver_host}:{port}",
+            # Local endpoint used by the miner for readiness checks and token polling.
+            # The solver runs in-process, so localhost is the most reliable target even when
+            # solver_host is an external/bridge IP.
+            "local_endpoint": f"http://127.0.0.1:{port}",
         }
 
         self.solvers.append(solver_config)
@@ -341,7 +346,7 @@ class Miner:
 
     def _poll_solver_tokens(self, solver_config: dict, max_attempts: int = 30, delay: float = 1.0) -> list:
         """Wait for the solver to expose supported tokens."""
-        endpoint = solver_config["endpoint"]
+        endpoint = solver_config.get("local_endpoint") or solver_config["endpoint"]
         tokens_url = f"{endpoint}/tokens"
         last_error = None
 
@@ -598,7 +603,7 @@ class Miner:
     
     def _wait_for_solver_ready(self, solver_config: dict, max_attempts: int = 10, delay: float = 1.0) -> bool:
         """Wait for solver to be ready by checking /health endpoint."""
-        endpoint = solver_config["endpoint"]
+        endpoint = solver_config.get("local_endpoint") or solver_config["endpoint"]
         health_url = f"{endpoint}/health"
         
         for attempt in range(1, max_attempts + 1):
@@ -646,7 +651,9 @@ class Miner:
             # Wait for solver to be ready
             if self.logger:
                 self.logger.info(f"Waiting for solver {solver_index + 1} to initialize...")
-            if not self._wait_for_solver_ready(solver_config, max_attempts=15, delay=0.5):
+            # Solvers may perform token discovery and RPC init before binding the HTTP server.
+            # Use a longer wait window to avoid false negatives during startup.
+            if not self._wait_for_solver_ready(solver_config, max_attempts=60, delay=0.5):
                 if self.logger:
                     self.logger.error(f"Solver {solver_index + 1} failed to start. Registration will likely fail.")
                 continue
