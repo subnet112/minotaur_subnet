@@ -93,7 +93,7 @@ class Miner:
         base_port: int = 8000,
         solver_host: Optional[str] = None,
         mode: str = "simulation",
-        wallet: Optional[bt.wallet] = None,
+        wallet: Optional[bt.Wallet] = None,
         num_solvers: int = 1,
         solver_type: str = "v3",
         logger=None,
@@ -779,10 +779,19 @@ def main():
     """Main entry point for miner."""
     parser = argparse.ArgumentParser(description="Subnet Miner")
     
-    # Bittensor arguments
-    bt.subtensor.add_args(parser)
-    bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
+    # Wallet arguments (bittensor v10+ no longer provides add_args)
+    parser.add_argument("--wallet.name", type=str, default="default", help="Wallet name")
+    parser.add_argument("--wallet.hotkey", type=str, default="default", help="Hotkey name")
+    parser.add_argument("--wallet.path", type=str, default="~/.bittensor/wallets", help="Wallet path")
+    
+    # Subtensor arguments
+    parser.add_argument("--subtensor.network", type=str, default="finney", help="Bittensor network (finney, test, local)")
+    parser.add_argument("--subtensor.chain_endpoint", type=str, default=None, help="Chain endpoint URL (optional)")
+    
+    # Logging arguments
+    parser.add_argument("--logging.debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--logging.trace", action="store_true", help="Enable trace logging")
+    parser.add_argument("--logging.logging_dir", type=str, default="~/.bittensor/miners", help="Logging directory")
     
     # Miner-specific arguments
     parser.add_argument("--miner.mode", choices=["simulation", "bittensor"], default="simulation",
@@ -804,7 +813,7 @@ def main():
     parser.add_argument("--miner.solver_type", type=str, default="v3",
                        choices=["v2", "v3", "uniswap-v2", "uniswap-v3", "base", "base-v3", "uniswap-v3-base"],
                        help="Solver type: v2/uniswap-v2 (Uniswap V2 mainnet), v3/uniswap-v3 (Uniswap V3 mainnet, default), base/base-v3/uniswap-v3-base (Uniswap V3 on Base)")
-    config = bt.config(parser)
+    config = bt.Config(parser)
     
     # Override from environment (command-line args take precedence over env vars)
     # Get command-line args first
@@ -852,7 +861,11 @@ def main():
     # Initialize wallet if in bittensor mode
     wallet = None
     if miner_mode == "bittensor":
-        wallet = bt.wallet(config=config)
+        wallet = bt.Wallet(
+            name=getattr(config.wallet, "name", "default"),
+            hotkey=getattr(config.wallet, "hotkey", "default"),
+            path=getattr(config.wallet, "path", "~/.bittensor/wallets"),
+        )
         if miner_id is None:
             miner_id = wallet.name
     

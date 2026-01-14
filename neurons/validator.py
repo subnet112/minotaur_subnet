@@ -66,8 +66,15 @@ class Validator:
         else:
             # Bittensor mode - initialize full components
             self._log("Initializing Bittensor components", LogLevel.INFO, prefix="INIT")
-            self.wallet = bt.wallet(config=self.config)
-            self.subtensor = bt.subtensor(config=self.config)
+            self.wallet = bt.Wallet(
+                name=getattr(self.config.wallet, "name", "default"),
+                hotkey=getattr(self.config.wallet, "hotkey", "default"),
+                path=getattr(self.config.wallet, "path", "~/.bittensor/wallets"),
+            )
+            self.subtensor = bt.Subtensor(
+                network=getattr(self.config.subtensor, "network", "finney"),
+                config=self.config,
+            )
             
             self._log(f"Wallet: {self.wallet.hotkey.ss58_address}", LogLevel.INFO, prefix="WALLET")
             self._log(f"Network: {self.subtensor.network}", LogLevel.INFO, prefix="CONFIG", suffix=f"netuid={self.config.netuid}")
@@ -144,10 +151,19 @@ class Validator:
         """Get validator configuration from args and environment."""
         parser = argparse.ArgumentParser()
 
-        # First add Bittensor arguments (avoids local duplicates)
-        bt.subtensor.add_args(parser)
-        bt.logging.add_args(parser)
-        bt.wallet.add_args(parser)
+        # Wallet arguments (bittensor v10+ no longer provides add_args)
+        parser.add_argument("--wallet.name", type=str, default="default", help="Wallet name")
+        parser.add_argument("--wallet.hotkey", type=str, default="default", help="Hotkey name")
+        parser.add_argument("--wallet.path", type=str, default="~/.bittensor/wallets", help="Wallet path")
+        
+        # Subtensor arguments
+        parser.add_argument("--subtensor.network", type=str, default="finney", help="Bittensor network (finney, test, local)")
+        parser.add_argument("--subtensor.chain_endpoint", type=str, default=None, help="Chain endpoint URL (optional)")
+        
+        # Logging arguments
+        parser.add_argument("--logging.debug", action="store_true", help="Enable debug logging")
+        parser.add_argument("--logging.trace", action="store_true", help="Enable trace logging")
+        parser.add_argument("--logging.logging_dir", type=str, default="~/.bittensor/miners", help="Logging directory")
 
         # Validator-specific additions (not provided by Bittensor)
         # Aggregator API
@@ -186,7 +202,7 @@ class Validator:
         parser.add_argument("--validator.backoff_max_seconds", type=int, default=120, help="Maximum poll interval after backoff")
         parser.add_argument("--netuid", type=int, default=None, help="Target subnet UID for validator operations")
         
-        config = bt.config(parser)
+        config = bt.Config(parser)
         
         # Override from env
         netuid_env = os.getenv("NETUID")

@@ -1,5 +1,6 @@
 # Minimal requirements for validator with commit-reveal
-bittensor>=8.5.1
+# Code has been updated to work with bittensor v10+ API (no add_args methods)
+bittensor>=10.0.0
 bittensor-cli
 requests>=2.31.0
 pytest>=8.3.2
