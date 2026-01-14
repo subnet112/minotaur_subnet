@@ -100,7 +100,7 @@ class Validator:
         # Ensure simulator_docker_image has a valid value
         simulator_docker_image = getattr(self.config, "simulator_docker_image", None)
         if not simulator_docker_image:
-            simulator_docker_image = "mino-simulation"
+            simulator_docker_image = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
             self._log(f"Using default simulator docker image: {simulator_docker_image}", LogLevel.INFO, prefix="INIT")
         
         # Use VALIDATOR_API_KEY for validator-specific endpoints (required)
@@ -292,11 +292,11 @@ class Validator:
         # Get simulator docker image - handle None/empty string cases
         env_image = os.getenv("SIMULATOR_DOCKER_IMAGE")
         config_image = getattr(config, "simulator_docker_image", None)
-        config.simulator_docker_image = env_image or config_image or "mino-simulation"
+        config.simulator_docker_image = env_image or config_image or "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
         
         # Ensure it's not None or empty
         if not config.simulator_docker_image:
-            config.simulator_docker_image = "mino-simulation"
+            config.simulator_docker_image = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
         
         # Get max concurrent simulations
         max_concurrent_default = getattr(config, "simulator_max_concurrent", None)
@@ -395,7 +395,7 @@ class Validator:
     def run(self):
         """Run the validator with asyncio loop"""
         try:
-            validator_mode = getattr(self.config, "validator", None) and getattr(self.config.validator, "mode", "bittensor") or "bittensor"
+            validator_mode = getattr(self.config, "validator_mode", "bittensor")
             if validator_mode == "mock":
                 self._run_mock_validator()
             else:

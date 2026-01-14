@@ -717,7 +717,8 @@ class Miner:
                 f"{self.aggregator_url}/health",
                 timeout=5
             )
-            return response.status_code == 200
+            # Accept 200 (healthy) or 503 (degraded but still operational)
+            return response.status_code in (200, 503)
         except Exception:
             return False
 
