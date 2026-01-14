@@ -169,7 +169,7 @@ class MockValidator:
         aggregator_url: str,
         validator_api_key: str,
         simulator_rpc_url: Optional[str] = None,
-        simulator_docker_image: str = "mino-simulation",
+        simulator_docker_image: str = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest",
         validator_id: Optional[str] = None,
         burn_percentage: float = 0.0,
         creator_miner_id: Optional[str] = None,
