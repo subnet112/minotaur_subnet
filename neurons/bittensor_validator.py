@@ -82,13 +82,20 @@ class BittensorValidator:
     def __init__(
         self,
         config,
-        subtensor: Optional[bt.subtensor] = None,
-        wallet: Optional[bt.wallet] = None,
+        subtensor: Optional[bt.Subtensor] = None,
+        wallet: Optional[bt.Wallet] = None,
         logger: Optional[logging.Logger] = None
     ):
         self.config = config
-        self.subtensor = subtensor or bt.subtensor(config=config)
-        self.wallet = wallet or bt.wallet(config=config)
+        self.subtensor = subtensor or bt.Subtensor(
+            network=getattr(config.subtensor, "network", "finney"),
+            config=config,
+        )
+        self.wallet = wallet or bt.Wallet(
+            name=getattr(config.wallet, "name", "default"),
+            hotkey=getattr(config.wallet, "hotkey", "default"),
+            path=getattr(config.wallet, "path", "~/.bittensor/wallets"),
+        )
         self.logger = logger or logging.getLogger(__name__)
 
         # Initialize Bittensor-specific components
