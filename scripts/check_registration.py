@@ -55,6 +55,14 @@ class RegistrationChecker:
             
             with urllib.request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read().decode())
+        except urllib.request.HTTPError as e:
+            # Handle 503 (degraded) - still returns valid JSON
+            if e.code == 503:
+                try:
+                    return json.loads(e.read().decode())
+                except:
+                    pass
+            return {"error": f"HTTP {e.code}: {e.reason}"}
         except Exception as e:
             return {"error": str(e)}
     
