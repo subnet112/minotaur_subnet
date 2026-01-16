@@ -66,5 +66,25 @@
 - Check generated hotkey is unique
 - Review logs for hotkey generation errors
 
+## Useful Debugging Tools
+
+Use these scripts to diagnose issues:
+
+```bash
+# Check miner and solver status
+python scripts/miner_status.py
+
+# Verify solver registration
+python scripts/check_registration.py --verify-endpoint
+
+# Test solver quote generation
+python scripts/test_solver.py --health
+python scripts/test_solver.py --quote USDC WETH 1000
+
+# Run performance benchmark
+python scripts/test_solver.py --benchmark --iterations 50
+```
+
 See also: [Configuration](./configuration.md), [Quickstart](./quickstart.md).
+
 
