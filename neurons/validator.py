@@ -4,6 +4,8 @@ import sys
 import asyncio
 import argparse
 import signal
+import threading
+import time
 from enum import Enum
 from typing import Dict, Optional
 
@@ -89,6 +91,30 @@ class Validator:
 
         self._log("Validator initialized successfully", LogLevel.SUCCESS, prefix="INIT")
 
+        # Heartbeat watchdog
+        self._last_heartbeat = time.time()
+        self._heartbeat_timeout = int(os.getenv("VALIDATOR_HEARTBEAT_TIMEOUT", "600"))
+        self._heartbeat_stop_event = threading.Event()
+
+    def _heartbeat(self) -> None:
+        self._last_heartbeat = time.time()
+
+    def _start_heartbeat_monitor(self) -> None:
+        def monitor():
+            while not self._heartbeat_stop_event.is_set():
+                time.sleep(5)
+                if time.time() - self._last_heartbeat > self._heartbeat_timeout:
+                    self._log(
+                        f"No heartbeat detected in the last {self._heartbeat_timeout} seconds. Restarting process.",
+                        LogLevel.ERROR,
+                        prefix="HEARTBEAT",
+                    )
+                    self._heartbeat_stop_event.set()
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
+
     def _init_mock_mode(self) -> None:
         """Initialize mock mode components (no Bittensor dependencies)."""
         from neurons.mock_validator import MockValidator
@@ -119,6 +145,7 @@ class Validator:
             validation_interval_seconds=getattr(self.config, "poll_seconds", 5),
             max_concurrent_simulations=getattr(self.config, "simulator_max_concurrent", 5),
             logger=bt.logging,  # Use bittensor logging for consistent SUCCESS level support
+            heartbeat_callback=self._heartbeat,
         )
 
         # Initialize state store for mock mode
@@ -395,6 +422,7 @@ class Validator:
     def run(self):
         """Run the validator with asyncio loop"""
         try:
+            self._start_heartbeat_monitor()
             validator_mode = getattr(self.config, "validator_mode", "bittensor")
             if validator_mode == "mock":
                 self._run_mock_validator()
@@ -432,7 +460,8 @@ class Validator:
             config=self.config,
             subtensor=self.subtensor,
             wallet=self.wallet,
-            logger=bt.logging
+            logger=bt.logging,
+            heartbeat_callback=self._heartbeat,
         )
 
         async def main_async():
