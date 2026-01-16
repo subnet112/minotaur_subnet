@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -89,6 +90,7 @@ class ValidationEngine:
         max_concurrent_simulations: int = 5,
         signing_keypair: Optional[Any] = None,
         submit_weights_to_aggregator: bool = True,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ):
         self.events_client = events_client
         self.validator_id = validator_id
@@ -108,6 +110,7 @@ class ValidationEngine:
         self.creator_miner_id = creator_miner_id
         self.signing_keypair = signing_keypair  # Bittensor keypair for signing weights
         self.submit_weights_to_aggregator = submit_weights_to_aggregator
+        self._heartbeat_callback = heartbeat_callback
 
         self._simulation_semaphore: Optional[asyncio.Semaphore] = None  # Created lazily in the event loop
         if self.logger:
@@ -120,6 +123,16 @@ class ValidationEngine:
         self._submitted_epochs: set[str] = set()  # Track epochs that have had weights submitted
         self._validation_running = False
         self._validation_thread: Optional[threading.Thread] = None
+
+        # Validation history for chain-aligned windowing
+        self._validation_history: List[ValidationResult] = []
+        self._validation_history_lock = threading.Lock()
+        try:
+            self._history_retention_seconds = int(
+                os.getenv("VALIDATION_HISTORY_RETENTION_SECONDS", "7200")
+            )
+        except Exception:
+            self._history_retention_seconds = 7200
         
         # Logging state for no-orders tracking
         self._last_no_orders_log: Optional[float] = None
@@ -136,6 +149,37 @@ class ValidationEngine:
     def add_weight_callback(self, callback: WeightCallback):
         """Add a callback to be called when weights are computed."""
         self._weight_callbacks.append(callback)
+
+    def _append_validation_results(self, results: List[ValidationResult]) -> None:
+        if not results:
+            return
+        now = datetime.now(timezone.utc)
+        with self._validation_history_lock:
+            self._validation_history.extend(results)
+            self._prune_validation_history(now)
+
+    def _prune_validation_history(self, now: datetime) -> None:
+        if self._history_retention_seconds <= 0:
+            self._validation_history.clear()
+            return
+        cutoff = now.timestamp() - self._history_retention_seconds
+        self._validation_history = [
+            r for r in self._validation_history if r.timestamp.timestamp() >= cutoff
+        ]
+
+    def get_results_for_window(self, from_ts: str, to_ts: str) -> List[ValidationResult]:
+        """Return validation results within [from_ts, to_ts)."""
+        def _parse(ts: str) -> datetime:
+            normalized = ts.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized)
+
+        start = _parse(from_ts)
+        end = _parse(to_ts)
+        with self._validation_history_lock:
+            return [
+                r for r in self._validation_history
+                if start <= r.timestamp < end
+            ]
 
     def _get_simulation_semaphore(self) -> asyncio.Semaphore:
         """Get or create the simulation semaphore in the current event loop.
@@ -243,6 +287,7 @@ class ValidationEngine:
             failed_validations = len(valid_results) - successful_validations
 
             if valid_results:
+                self._append_validation_results(valid_results)
                 success_rate = successful_validations / len(valid_results) * 100
                 self.logger.info(
                     f"📊 Validation batch complete: {len(valid_results)} orders processed "
@@ -303,16 +348,24 @@ class ValidationEngine:
         return scores, stats
 
     def _normalize_scores_to_weights(self, scores: Dict[str, dict]) -> Dict[str, float]:
-        """Normalize scores to weights summing to 1.0."""
+        """Normalize scores to weights summing to 1.0.
+        
+        When no miners have scores, falls back to 100% burn to creator if set.
+        """
         total_score = sum(data["score"] for data in scores.values())
         
         if total_score == 0:
-            # No miner activity - return empty weights (will result in 100% burn)
+            # No miner activity
             if not scores:
-                self.logger.debug("No miner scores - all weights will be 0 (100% burn)")
-                weights = {}
+                # No miners at all - fallback to 100% burn to creator
+                if self.creator_miner_id:
+                    self.logger.info(f"🔥 No miner scores - falling back to 100% burn to creator {self.creator_miner_id[:8]}...")
+                    return {self.creator_miner_id: 1.0}
+                else:
+                    self.logger.debug("No miner scores and no creator_miner_id - weights will be empty")
+                    return {}
             else:
-                # Equal distribution if no activity but miners exist
+                # Miners exist but no activity - equal distribution
                 weights = {miner_id: 1.0 / len(scores) for miner_id in scores.keys()}
                 self.logger.debug(f"Equal distribution (no activity): {weights}")
         else:
@@ -334,14 +387,14 @@ class ValidationEngine:
                 else:
                     weights[self.creator_miner_id] = self.burn_percentage
             else:
-                # No miner weights - 100% burn (no weights allocated to anyone)
-                self.logger.info(f"No miner weights - 100% burn (0 weights for everyone, empty result)")
-                # Don't add creator to weights - empty weights means 100% burn
+                # No miner weights - 100% burn to creator
+                self.logger.info(f"🔥 No miner weights - 100% burn to creator {self.creator_miner_id[:8]}...")
+                weights = {self.creator_miner_id: 1.0}
 
         if weights:
             self.logger.debug(f"Final weights: {weights} (sum: {sum(weights.values()):.6f})")
         else:
-            self.logger.info(f"Final weights: {{}} (empty - 100% burn, 0% to all miners)")
+            self.logger.info(f"Final weights: {{}} (empty - no creator_miner_id set)")
         return weights
 
     async def compute_weights_for_epoch(
@@ -353,15 +406,20 @@ class ValidationEngine:
         start_time = datetime.now(timezone.utc)
         epoch_start = min((r.timestamp for r in validation_results), default=start_time)
 
-        # Check aggregator health - if unhealthy, return empty weights (100% burn)
+        # Check aggregator health - if unhealthy, fallback to 100% burn to creator
         if self._aggregator_healthy is False:
-            self.logger.error(f"❌ Aggregator is unhealthy - setting all weights to 0 (100% burn)")
-            weights = {}
+            if self.creator_miner_id:
+                self.logger.warning(f"🔥 Aggregator is unhealthy - falling back to 100% burn to creator {self.creator_miner_id[:8]}...")
+                weights = {self.creator_miner_id: 1.0}
+            else:
+                self.logger.error(f"❌ Aggregator is unhealthy and no creator_miner_id set - cannot emit burn weights")
+                weights = {}
             stats = {
                 "total_simulations": len(validation_results),
                 "valid_miners": 0,
                 "total_miners": 0,
-                "burn_percentage": self.burn_percentage,
+                "burn_percentage": 1.0,
+                "burn_fallback": True,
                 "error": "aggregator_unhealthy"
             }
             end_time = datetime.now(timezone.utc)
@@ -378,7 +436,10 @@ class ValidationEngine:
 
         if not validation_results:
             self.logger.warning(f"⚠️  No validation results to compute weights for epoch {epoch_key}")
-            self.logger.info("Computing weights with no validation results (will result in 100% burn if burn_percentage > 0)")
+            if self.creator_miner_id:
+                self.logger.info(f"🔥 No validation results - falling back to 100% burn to creator {self.creator_miner_id[:8]}...")
+            else:
+                self.logger.info("No validation results and no creator_miner_id set - weights will be empty")
 
         # Compute scores and stats (miner_id is now included directly in validation results)
         scores, stats = self._compute_scores_from_results(validation_results)
@@ -688,6 +749,8 @@ class ValidationEngine:
         elapsed = 0
         
         while elapsed < total_seconds:
+            if self._heartbeat_callback:
+                self._heartbeat_callback()
             sleep_time = min(check_interval, total_seconds - elapsed)
             await asyncio.sleep(sleep_time)
             elapsed += sleep_time
@@ -745,6 +808,8 @@ class ValidationEngine:
             while self._validation_running:
                 try:
                     current_time = time.time()
+                    if self._heartbeat_callback:
+                        self._heartbeat_callback()
                     
                     # Check aggregator health periodically
                     should_check_health = (
