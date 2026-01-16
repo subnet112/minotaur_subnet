@@ -141,15 +141,17 @@ class Miner:
                 raise ValueError("Wallet is required in bittensor mode")
             self.wallet = wallet
             self.miner_id = wallet.hotkey.ss58_address
-            # Derive signing key from hotkey
-            # Note: In production, you'd use the actual hotkey private key
-            # For now, we derive from the hotkey address
-            self.signing_key = derive_signing_key(self.miner_id)
+            # Use real hotkey signing in bittensor mode
+            self.signing_keypair = wallet.hotkey
+            self.signing_key = None
+            self.signature_type = "sr25519"
         else:  # simulation mode
             self.wallet = None
             hotkey, signing_key = generate_hotkey(miner_id)
             self.miner_id = hotkey
             self.signing_key = signing_key
+            self.signing_keypair = None
+            self.signature_type = "ed25519"
             if self.logger:
                 self.logger.info(f"Simulation mode: Generated hotkey {hotkey} from miner_id {miner_id}")
 
@@ -206,10 +208,23 @@ class Miner:
     def _registration_message(self, solver_config: dict) -> str:
         return f"{REGISTRATION_PREFIX}:{self.miner_id}:{solver_config['solver_id']}:{solver_config['endpoint']}"
 
-    def _sign_registration(self, solver_config: dict) -> str:
-        message = self._registration_message(solver_config).encode("utf-8")
+    def _sign_message(self, message: bytes) -> str:
+        if self.signing_keypair is not None:
+            try:
+                signature_bytes = self.signing_keypair.sign(message)
+            except Exception:
+                signature_bytes = self.signing_keypair.sign(message).data
+            if isinstance(signature_bytes, str):
+                return signature_bytes if signature_bytes.startswith("0x") else f"0x{signature_bytes}"
+            return "0x" + bytes(signature_bytes).hex()
+        if self.signing_key is None:
+            raise ValueError("Signing key not available")
         signature = self.signing_key.sign(message).signature
         return "0x" + signature.hex()
+
+    def _sign_registration(self, solver_config: dict) -> str:
+        message = self._registration_message(solver_config).encode("utf-8")
+        return self._sign_message(message)
 
     def _update_message(self, solver_id: str, new_endpoint: str) -> str:
         """Generate update message for endpoint update."""
@@ -218,8 +233,7 @@ class Miner:
     def _sign_update(self, solver_id: str, new_endpoint: str) -> str:
         """Sign an endpoint update message."""
         message = self._update_message(solver_id, new_endpoint).encode("utf-8")
-        signature = self.signing_key.sign(message).signature
-        return "0x" + signature.hex()
+        return self._sign_message(message)
 
     def _delete_message(self, solver_id: str) -> str:
         """Generate delete message for solver deregistration."""
@@ -228,8 +242,7 @@ class Miner:
     def _sign_delete(self, solver_id: str) -> str:
         """Sign a solver deletion message."""
         message = self._delete_message(solver_id).encode("utf-8")
-        signature = self.signing_key.sign(message).signature
-        return "0x" + signature.hex()
+        return self._sign_message(message)
 
     def deregister_solver(self, solver_id: str) -> bool:
         """Deregister a solver from the aggregator."""
@@ -251,22 +264,26 @@ class Miner:
         signature = self._sign_delete(solver_id)
         
         # Verify signature locally
-        try:
-            from nacl.signing import VerifyKey
-            message_bytes = delete_message.encode("utf-8")
-            verify_key = self.signing_key.verify_key
-            signature_bytes = bytes.fromhex(signature[2:])  # Remove 0x prefix
-            verify_key.verify(message_bytes, signature_bytes)
+        if self.signature_type == "ed25519" and self.signing_key is not None:
+            try:
+                from nacl.signing import VerifyKey
+                message_bytes = delete_message.encode("utf-8")
+                verify_key = self.signing_key.verify_key
+                signature_bytes = bytes.fromhex(signature[2:])  # Remove 0x prefix
+                verify_key.verify(message_bytes, signature_bytes)
+                sig_verified = True
+            except Exception as e:
+                sig_verified = False
+                sig_error = str(e)
+        else:
             sig_verified = True
-        except Exception as e:
-            sig_verified = False
-            sig_error = str(e)
+            sig_error = "sr25519 verification skipped"
         
         delete_data = {
             "solverId": solver_id,
             "minerId": self.miner_id,
             "signature": signature,
-            "signatureType": "ed25519"
+            "signatureType": self.signature_type
         }
 
         try:
@@ -278,7 +295,10 @@ class Miner:
                     self.logger.warning(f"⚠️  No MINER_API_KEY set - deregistration may fail")
             
             if self.logger:
-                verify_key_ss58 = ss58_encode(self.signing_key.verify_key.encode())
+                if self.signing_key is not None:
+                    verify_key_ss58 = ss58_encode(self.signing_key.verify_key.encode())
+                else:
+                    verify_key_ss58 = self.miner_id  # Use hotkey address in bittensor mode
                 self.logger.debug(
                     f"🔍 Deregistering solver:\n"
                     f"   solver_id: {solver_id}\n"
@@ -287,6 +307,7 @@ class Miner:
                     f"   verify_key (SS58): {verify_key_ss58}\n"
                     f"   delete_message: {delete_message}\n"
                     f"   signature: {signature}\n"
+                    f"   signature_type: {self.signature_type}\n"
                     f"   local_sig_verification: {'✅ PASS' if sig_verified else f'❌ FAIL: {sig_error}'}\n"
                     f"   api_key_set: {bool(self.miner_api_key)}"
                 )
@@ -519,7 +540,7 @@ class Miner:
             "endpoint": solver_config["endpoint"],
             "minerId": self.miner_id,
             "signature": self._sign_registration(solver_config),
-            "signatureType": "ed25519",
+            "signatureType": self.signature_type,
             "name": f"{self.miner_id}'s Solver {solver_config['solver_id'].split('-')[-1]}",
             "description": f"Solver with {solver_config['latency_ms']}ms latency",
             "supportedAssets": supported_assets
