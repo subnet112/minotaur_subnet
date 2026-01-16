@@ -671,6 +671,10 @@ class SetupWizard:
             miner_id = prompt("Miner ID (unique identifier)", default="miner-001")
             self.config["miner_id"] = miner_id
             
+            print()
+            print_warning("Note: The aggregator limits miners to 3 registrations per week.")
+            print_info("Exceeding this limit will result in registration failure (Status 429).")
+            
             # Solver host
             print()
             print_info("Solver host is the IP/hostname that the aggregator will use to reach your solver")

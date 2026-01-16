@@ -13,11 +13,18 @@
   - `curl -H "X-API-Key: $MINER_API_KEY" "$AGGREGATOR_URL/v1/solvers/$SOLVER_ID"`
 - Review solver logs for quote request errors
 
-## Rate limiting errors
+## Rate limiting errors (RPC)
 - Configure a reliable RPC provider (Infura, Alchemy, or local node)
 - Consider upgrading your RPC plan for higher rate limits
 - Check `ETHEREUM_RPC_URL` is set correctly
 - Monitor RPC usage and adjust if needed
+
+## Registration Failed (Status 429)
+The aggregator limits miners to **3 registrations per week**. If you exceed this:
+- Wait 7 days for the limit to reset
+- Or contact the aggregator administrator to request a limit reset
+- Ensure you are using unique `MINER_ID` if running multiple instances
+- Use `--miner.solver_id_prefix` (v3/v2/base) to distinguish solvers under the same miner ID
 
 ## Solver not responding
 - Check solver is running: `curl http://localhost:$PORT/health`
