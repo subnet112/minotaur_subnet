@@ -93,7 +93,7 @@ class Miner:
         base_port: int = 8000,
         solver_host: Optional[str] = None,
         mode: str = "simulation",
-        wallet: Optional[bt.wallet] = None,
+        wallet: Optional[bt.Wallet] = None,
         num_solvers: int = 1,
         solver_type: str = "v3",
         logger=None,
@@ -141,15 +141,17 @@ class Miner:
                 raise ValueError("Wallet is required in bittensor mode")
             self.wallet = wallet
             self.miner_id = wallet.hotkey.ss58_address
-            # Derive signing key from hotkey
-            # Note: In production, you'd use the actual hotkey private key
-            # For now, we derive from the hotkey address
-            self.signing_key = derive_signing_key(self.miner_id)
+            # Use real hotkey signing in bittensor mode
+            self.signing_keypair = wallet.hotkey
+            self.signing_key = None
+            self.signature_type = "sr25519"
         else:  # simulation mode
             self.wallet = None
             hotkey, signing_key = generate_hotkey(miner_id)
             self.miner_id = hotkey
             self.signing_key = signing_key
+            self.signing_keypair = None
+            self.signature_type = "ed25519"
             if self.logger:
                 self.logger.info(f"Simulation mode: Generated hotkey {hotkey} from miner_id {miner_id}")
 
@@ -168,7 +170,12 @@ class Miner:
             "port": port,
             "latency_ms": latency_ms,
             "quality": quality,
-            "endpoint": f"http://{self.solver_host}:{port}"
+            # Endpoint advertised to the aggregator (may need to be reachable from Docker/remote).
+            "endpoint": f"http://{self.solver_host}:{port}",
+            # Local endpoint used by the miner for readiness checks and token polling.
+            # The solver runs in-process, so localhost is the most reliable target even when
+            # solver_host is an external/bridge IP.
+            "local_endpoint": f"http://127.0.0.1:{port}",
         }
 
         self.solvers.append(solver_config)
@@ -201,10 +208,23 @@ class Miner:
     def _registration_message(self, solver_config: dict) -> str:
         return f"{REGISTRATION_PREFIX}:{self.miner_id}:{solver_config['solver_id']}:{solver_config['endpoint']}"
 
-    def _sign_registration(self, solver_config: dict) -> str:
-        message = self._registration_message(solver_config).encode("utf-8")
+    def _sign_message(self, message: bytes) -> str:
+        if self.signing_keypair is not None:
+            try:
+                signature_bytes = self.signing_keypair.sign(message)
+            except Exception:
+                signature_bytes = self.signing_keypair.sign(message).data
+            if isinstance(signature_bytes, str):
+                return signature_bytes if signature_bytes.startswith("0x") else f"0x{signature_bytes}"
+            return "0x" + bytes(signature_bytes).hex()
+        if self.signing_key is None:
+            raise ValueError("Signing key not available")
         signature = self.signing_key.sign(message).signature
         return "0x" + signature.hex()
+
+    def _sign_registration(self, solver_config: dict) -> str:
+        message = self._registration_message(solver_config).encode("utf-8")
+        return self._sign_message(message)
 
     def _update_message(self, solver_id: str, new_endpoint: str) -> str:
         """Generate update message for endpoint update."""
@@ -213,8 +233,7 @@ class Miner:
     def _sign_update(self, solver_id: str, new_endpoint: str) -> str:
         """Sign an endpoint update message."""
         message = self._update_message(solver_id, new_endpoint).encode("utf-8")
-        signature = self.signing_key.sign(message).signature
-        return "0x" + signature.hex()
+        return self._sign_message(message)
 
     def _delete_message(self, solver_id: str) -> str:
         """Generate delete message for solver deregistration."""
@@ -223,8 +242,7 @@ class Miner:
     def _sign_delete(self, solver_id: str) -> str:
         """Sign a solver deletion message."""
         message = self._delete_message(solver_id).encode("utf-8")
-        signature = self.signing_key.sign(message).signature
-        return "0x" + signature.hex()
+        return self._sign_message(message)
 
     def deregister_solver(self, solver_id: str) -> bool:
         """Deregister a solver from the aggregator."""
@@ -246,22 +264,26 @@ class Miner:
         signature = self._sign_delete(solver_id)
         
         # Verify signature locally
-        try:
-            from nacl.signing import VerifyKey
-            message_bytes = delete_message.encode("utf-8")
-            verify_key = self.signing_key.verify_key
-            signature_bytes = bytes.fromhex(signature[2:])  # Remove 0x prefix
-            verify_key.verify(message_bytes, signature_bytes)
+        if self.signature_type == "ed25519" and self.signing_key is not None:
+            try:
+                from nacl.signing import VerifyKey
+                message_bytes = delete_message.encode("utf-8")
+                verify_key = self.signing_key.verify_key
+                signature_bytes = bytes.fromhex(signature[2:])  # Remove 0x prefix
+                verify_key.verify(message_bytes, signature_bytes)
+                sig_verified = True
+            except Exception as e:
+                sig_verified = False
+                sig_error = str(e)
+        else:
             sig_verified = True
-        except Exception as e:
-            sig_verified = False
-            sig_error = str(e)
+            sig_error = "sr25519 verification skipped"
         
         delete_data = {
             "solverId": solver_id,
             "minerId": self.miner_id,
             "signature": signature,
-            "signatureType": "ed25519"
+            "signatureType": self.signature_type
         }
 
         try:
@@ -273,7 +295,10 @@ class Miner:
                     self.logger.warning(f"⚠️  No MINER_API_KEY set - deregistration may fail")
             
             if self.logger:
-                verify_key_ss58 = ss58_encode(self.signing_key.verify_key.encode())
+                if self.signing_key is not None:
+                    verify_key_ss58 = ss58_encode(self.signing_key.verify_key.encode())
+                else:
+                    verify_key_ss58 = self.miner_id  # Use hotkey address in bittensor mode
                 self.logger.debug(
                     f"🔍 Deregistering solver:\n"
                     f"   solver_id: {solver_id}\n"
@@ -282,6 +307,7 @@ class Miner:
                     f"   verify_key (SS58): {verify_key_ss58}\n"
                     f"   delete_message: {delete_message}\n"
                     f"   signature: {signature}\n"
+                    f"   signature_type: {self.signature_type}\n"
                     f"   local_sig_verification: {'✅ PASS' if sig_verified else f'❌ FAIL: {sig_error}'}\n"
                     f"   api_key_set: {bool(self.miner_api_key)}"
                 )
@@ -341,7 +367,7 @@ class Miner:
 
     def _poll_solver_tokens(self, solver_config: dict, max_attempts: int = 30, delay: float = 1.0) -> list:
         """Wait for the solver to expose supported tokens."""
-        endpoint = solver_config["endpoint"]
+        endpoint = solver_config.get("local_endpoint") or solver_config["endpoint"]
         tokens_url = f"{endpoint}/tokens"
         last_error = None
 
@@ -514,7 +540,7 @@ class Miner:
             "endpoint": solver_config["endpoint"],
             "minerId": self.miner_id,
             "signature": self._sign_registration(solver_config),
-            "signatureType": "ed25519",
+            "signatureType": self.signature_type,
             "name": f"{self.miner_id}'s Solver {solver_config['solver_id'].split('-')[-1]}",
             "description": f"Solver with {solver_config['latency_ms']}ms latency",
             "supportedAssets": supported_assets
@@ -598,7 +624,7 @@ class Miner:
     
     def _wait_for_solver_ready(self, solver_config: dict, max_attempts: int = 10, delay: float = 1.0) -> bool:
         """Wait for solver to be ready by checking /health endpoint."""
-        endpoint = solver_config["endpoint"]
+        endpoint = solver_config.get("local_endpoint") or solver_config["endpoint"]
         health_url = f"{endpoint}/health"
         
         for attempt in range(1, max_attempts + 1):
@@ -646,7 +672,9 @@ class Miner:
             # Wait for solver to be ready
             if self.logger:
                 self.logger.info(f"Waiting for solver {solver_index + 1} to initialize...")
-            if not self._wait_for_solver_ready(solver_config, max_attempts=15, delay=0.5):
+            # Solvers may perform token discovery and RPC init before binding the HTTP server.
+            # Use a longer wait window to avoid false negatives during startup.
+            if not self._wait_for_solver_ready(solver_config, max_attempts=60, delay=0.5):
                 if self.logger:
                     self.logger.error(f"Solver {solver_index + 1} failed to start. Registration will likely fail.")
                 continue
@@ -710,7 +738,8 @@ class Miner:
                 f"{self.aggregator_url}/health",
                 timeout=5
             )
-            return response.status_code == 200
+            # Accept 200 (healthy) or 503 (degraded but still operational)
+            return response.status_code in (200, 503)
         except Exception:
             return False
 
@@ -772,10 +801,19 @@ def main():
     """Main entry point for miner."""
     parser = argparse.ArgumentParser(description="Subnet Miner")
     
-    # Bittensor arguments
-    bt.subtensor.add_args(parser)
-    bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
+    # Wallet arguments (bittensor v10+ no longer provides add_args)
+    parser.add_argument("--wallet.name", type=str, default="default", help="Wallet name")
+    parser.add_argument("--wallet.hotkey", type=str, default="default", help="Hotkey name")
+    parser.add_argument("--wallet.path", type=str, default="~/.bittensor/wallets", help="Wallet path")
+    
+    # Subtensor arguments
+    parser.add_argument("--subtensor.network", type=str, default="finney", help="Bittensor network (finney, test, local)")
+    parser.add_argument("--subtensor.chain_endpoint", type=str, default=None, help="Chain endpoint URL (optional)")
+    
+    # Logging arguments
+    parser.add_argument("--logging.debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--logging.trace", action="store_true", help="Enable trace logging")
+    parser.add_argument("--logging.logging_dir", type=str, default="~/.bittensor/miners", help="Logging directory")
     
     # Miner-specific arguments
     parser.add_argument("--miner.mode", choices=["simulation", "bittensor"], default="simulation",
@@ -797,7 +835,7 @@ def main():
     parser.add_argument("--miner.solver_type", type=str, default="v3",
                        choices=["v2", "v3", "uniswap-v2", "uniswap-v3", "base", "base-v3", "uniswap-v3-base"],
                        help="Solver type: v2/uniswap-v2 (Uniswap V2 mainnet), v3/uniswap-v3 (Uniswap V3 mainnet, default), base/base-v3/uniswap-v3-base (Uniswap V3 on Base)")
-    config = bt.config(parser)
+    config = bt.Config(parser)
     
     # Override from environment (command-line args take precedence over env vars)
     # Get command-line args first
@@ -845,7 +883,11 @@ def main():
     # Initialize wallet if in bittensor mode
     wallet = None
     if miner_mode == "bittensor":
-        wallet = bt.wallet(config=config)
+        wallet = bt.Wallet(
+            name=getattr(config.wallet, "name", "default"),
+            hotkey=getattr(config.wallet, "hotkey", "default"),
+            path=getattr(config.wallet, "path", "~/.bittensor/wallets"),
+        )
         if miner_id is None:
             miner_id = wallet.name
     

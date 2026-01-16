@@ -20,12 +20,12 @@ class MetagraphSnapshot:
 
 
 class MetagraphManager:
-    def __init__(self, subtensor: bt.subtensor, wallet: bt.wallet, netuid: int, logger):
+    def __init__(self, subtensor: bt.Subtensor, wallet: bt.Wallet, netuid: int, logger):
         self.subtensor = subtensor
         self.wallet = wallet
         self.netuid = int(netuid)
         self.logger = logger
-        self._metagraph: Optional[bt.metagraph] = None
+        self._metagraph: Optional[bt.Metagraph] = None
         self._last_block: Optional[int] = None
 
     def refresh(self, force: bool = False) -> Optional[MetagraphSnapshot]:
@@ -41,13 +41,21 @@ class MetagraphManager:
 
         try:
             if self._metagraph is None:
-                self._metagraph = bt.metagraph(netuid=self.netuid, subtensor=self.subtensor)
+                self._metagraph = bt.Metagraph(netuid=self.netuid, network=self.subtensor.network, sync=False)
             self._metagraph.sync(subtensor=self.subtensor, lite=True)
             self._last_block = block
             return self._build_snapshot(self._metagraph)
         except Exception as e:
             self.logger.error(f"Failed to sync metagraph: {e}")
             return None
+
+    async def sync_metagraph(self) -> Optional[MetagraphSnapshot]:
+        """Async-friendly metagraph refresh."""
+        return self.refresh(force=True)
+
+    async def get_current_metagraph(self) -> Optional[MetagraphSnapshot]:
+        """Async-friendly accessor for the latest metagraph snapshot."""
+        return self.refresh(force=False)
 
     def _build_snapshot(self, m: bt.metagraph) -> Optional[MetagraphSnapshot]:
         if not hasattr(m, "hotkeys") or not hasattr(m, "uids"):
