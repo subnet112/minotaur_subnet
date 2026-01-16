@@ -162,7 +162,7 @@ class Miner:
         if quality is None:
             quality = random.uniform(0.8, 1.2)
 
-        solver_id = f"{self.miner_id}-solver-{solver_index:02d}"
+        solver_id = f"{self.miner_id}-{self.solver_type}-solver-{solver_index:02d}"
         port = self.base_port + solver_index
 
         solver_config = {
