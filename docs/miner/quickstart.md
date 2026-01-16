@@ -104,5 +104,20 @@ Choose the solver type based on your needs:
 
 Available options: `v2`, `v3`, `uniswap-v2`, `uniswap-v3`, `base`, `base-v3`, `uniswap-v3-base`
 
+## Monitoring
+
+Monitor your solvers with built-in tools:
+
+```bash
+# Real-time status dashboard
+python scripts/miner_status.py --watch
+
+# Check solver registration
+python scripts/check_registration.py
+
+# Test quote generation
+python scripts/test_solver.py --quote USDC WETH 1000
+```
+
 See also: [Configuration](./configuration.md), [Solver API](./solver-api.md), [Troubleshooting](./troubleshooting.md).
 
