@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 
 import bittensor as bt
 
@@ -16,6 +16,9 @@ from .aggregator_client import AggregatorClient
 from .simulator import OrderSimulator
 from .metagraph_manager import MetagraphManager
 from .onchain_emitter import OnchainWeightsEmitter
+from .state_store import StateStore
+from .window_planner import WindowPlanner
+from .exceptions import WindowPlannerError
 
 
 class BittensorWeightCallback:
@@ -34,26 +37,28 @@ class BittensorWeightCallback:
     async def __call__(self, weights: Dict[str, float], epoch_result: EpochResult) -> bool:
         """Convert miner weights to UID weights and set on chain."""
         try:
-            # Get current metagraph
-            metagraph = await self.metagraph_manager.get_current_metagraph()
+            # Get current metagraph snapshot
+            snapshot = await self.metagraph_manager.get_current_metagraph()
+            if snapshot is None:
+                self.logger.error("Failed to fetch metagraph snapshot; skipping weight emission")
+                return False
 
-            # Convert miner IDs to UIDs
-            uid_weights = {}
-            for miner_id, weight in weights.items():
-                # For now, use a simple mapping - in production you'd need proper miner_id -> UID mapping
-                try:
-                    # This is a placeholder - you'll need to implement proper mapping
-                    # based on your miner registration system
-                    uid = hash(miner_id) % metagraph.n
-                    if 0 <= uid < metagraph.n:
-                        uid_weights[uid] = weight
-                except (ValueError, IndexError):
+            if not snapshot.validator_permit:
+                self.logger.error("Validator lacks permit; skipping weight emission")
+                return False
+
+            # Filter to hotkeys present in metagraph
+            hotkey_weights: Dict[str, float] = {}
+            for miner_hotkey, weight in weights.items():
+                if str(miner_hotkey) not in snapshot.uid_for_hotkey:
+                    self.logger.warning(f"Hotkey not found in metagraph: {str(miner_hotkey)[:8]}...")
                     continue
+                hotkey_weights[str(miner_hotkey)] = float(weight)
 
-            if uid_weights:
-                success = await self.onchain_emitter.set_weights(uid_weights)
+            if hotkey_weights:
+                success = await self.onchain_emitter.emit_async(hotkey_weights)
                 if success:
-                    self.logger.info(f"✅ Set weights for {len(uid_weights)} UIDs on Bittensor chain")
+                    self.logger.info(f"✅ Set weights for {len(hotkey_weights)} hotkeys on Bittensor chain")
                     return True
                 else:
                     self.logger.error("❌ Failed to set weights on Bittensor chain")
@@ -84,7 +89,8 @@ class BittensorValidator:
         config,
         subtensor: Optional[bt.Subtensor] = None,
         wallet: Optional[bt.Wallet] = None,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ):
         self.config = config
         self.subtensor = subtensor or bt.Subtensor(
@@ -97,6 +103,7 @@ class BittensorValidator:
             path=getattr(config.wallet, "path", "~/.bittensor/wallets"),
         )
         self.logger = logger or logging.getLogger(__name__)
+        self._heartbeat_callback = heartbeat_callback
 
         # Initialize Bittensor-specific components
         self._metagraph_manager = MetagraphManager(
@@ -122,6 +129,11 @@ class BittensorValidator:
             logger=self.logger
         )
         self._validation_engine.add_weight_callback(weight_callback)
+
+        # State store for chain-aligned epochs
+        state_dir = getattr(self.config, "full_path", None)
+        self._state_store = StateStore(base_dir=state_dir)
+        self._last_epoch_index = self._state_store.get_last_epoch()
 
     def _create_onchain_emitter(self):
         """Create the on-chain weights emitter."""
@@ -202,6 +214,7 @@ class BittensorValidator:
             max_concurrent_simulations=max_concurrent,
             signing_keypair=self.wallet.hotkey,  # Bittensor keypair for signing
             submit_weights_to_aggregator=True,
+            heartbeat_callback=self._heartbeat_callback,
         )
 
     @property
@@ -210,9 +223,56 @@ class BittensorValidator:
         return self._validation_engine
 
     async def run_continuous_epochs(self, epoch_minutes: int = 5):
-        """Run continuous epochs with Bittensor weight emission."""
-        self.logger.info("Starting Bittensor validator with continuous epochs", prefix="BITTENSOR")
-        await self._validation_engine.run_continuous_epochs(epoch_minutes)
+        """Run chain-aligned epochs with Bittensor weight emission."""
+        self.logger.info("Starting Bittensor validator with chain-aligned epochs", prefix="BITTENSOR")
+        if epoch_minutes:
+            self.logger.info(
+                f"Ignoring epoch_minutes={epoch_minutes} in chain-aligned mode (tempo-driven)",
+                prefix="BITTENSOR",
+            )
+
+        await self._validation_engine.start_continuous_validation()
+
+        try:
+            planner = WindowPlanner(self.subtensor.substrate, int(self.config.netuid))
+            poll_seconds = int(getattr(self.config, "poll_seconds", 12))
+            buffer_blocks = int(getattr(self.config, "finalization_buffer_blocks", 6))
+
+            while True:
+                try:
+                    window = planner.previous_epoch_window(
+                        last_processed_epoch=self._last_epoch_index,
+                        finalization_buffer_blocks=buffer_blocks,
+                    )
+                except WindowPlannerError as e:
+                    self.logger.warning(f"Window planner error: {e}", prefix="WINDOW")
+                    window = None
+
+                if not window:
+                    await asyncio.sleep(poll_seconds)
+                    continue
+
+                epoch_index, from_ts, to_ts = window
+                epoch_key = f"epoch-{epoch_index}-{to_ts}"
+                self.logger.info(
+                    f"Processing epoch {epoch_index} window {from_ts} -> {to_ts}",
+                    prefix="EPOCH",
+                )
+
+                validation_results = self._validation_engine.get_results_for_window(from_ts, to_ts)
+                epoch_result = await self._validation_engine.compute_weights_for_epoch(
+                    epoch_key,
+                    validation_results,
+                )
+                await self._validation_engine.process_epoch_results(epoch_result)
+
+                self._state_store.commit_epoch(epoch_index, to_ts, epoch_result.weights)
+                self._last_epoch_index = epoch_index
+
+        except KeyboardInterrupt:
+            self.logger.info("Continuous epochs interrupted", prefix="BITTENSOR")
+        finally:
+            await self._validation_engine.stop_continuous_validation()
 
     async def run_single_epoch(self, epoch_minutes: int = 5) -> EpochResult:
         """Run a single epoch."""
@@ -233,22 +293,31 @@ class BittensorValidator:
     async def _check_wallet_registration(self) -> bool:
         """Check if wallet is registered and has stake."""
         try:
-            metagraph = await self._metagraph_manager.get_current_metagraph()
+            snapshot = await self._metagraph_manager.get_current_metagraph()
+            if snapshot is None:
+                self.logger.error("Failed to get metagraph snapshot")
+                return False
 
-            # Check if hotkey is registered
+            # Check if hotkey is registered using snapshot's uid_for_hotkey map
             hotkey = self.wallet.hotkey.ss58_address
-            if hotkey not in metagraph.hotkeys:
+            if hotkey not in snapshot.uid_for_hotkey:
                 self.logger.error(f"Hotkey {hotkey[:8]}... not registered on subnet {self.config.netuid}")
                 return False
 
-            # Get UID
-            uid = metagraph.hotkeys.index(hotkey)
-            stake = metagraph.stake[uid]
+            # Get UID from snapshot
+            uid = snapshot.uid_for_hotkey[hotkey]
 
             self.logger.info(
-                f"Validator registered: UID={uid}, stake={stake:.4f}TAO",
+                f"Validator registered: UID={uid}, permit={snapshot.validator_permit}",
                 prefix="BITTENSOR"
             )
+
+            if not snapshot.validator_permit:
+                self.logger.error(
+                    "Validator does not have permit; refusing to start weight emission",
+                    prefix="BITTENSOR",
+                )
+                return False
 
             return True
 

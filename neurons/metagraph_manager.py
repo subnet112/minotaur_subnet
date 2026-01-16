@@ -49,6 +49,14 @@ class MetagraphManager:
             self.logger.error(f"Failed to sync metagraph: {e}")
             return None
 
+    async def sync_metagraph(self) -> Optional[MetagraphSnapshot]:
+        """Async-friendly metagraph refresh."""
+        return self.refresh(force=True)
+
+    async def get_current_metagraph(self) -> Optional[MetagraphSnapshot]:
+        """Async-friendly accessor for the latest metagraph snapshot."""
+        return self.refresh(force=False)
+
     def _build_snapshot(self, m: bt.metagraph) -> Optional[MetagraphSnapshot]:
         if not hasattr(m, "hotkeys") or not hasattr(m, "uids"):
             self.logger.error("Metagraph missing hotkeys/uids attributes")
