@@ -9,7 +9,8 @@ def check_solver(solver_id: str, aggregator_url: str, api_key: str = None):
     """Check if a solver is registered and its status."""
     headers = {}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        # Aggregator miner endpoints use X-API-Key (see neurons/miner.py)
+        headers["X-API-Key"] = api_key
     
     try:
         response = requests.get(
@@ -51,7 +52,7 @@ def list_all_solvers(aggregator_url: str, api_key: str = None):
     """List all solvers from health endpoint."""
     headers = {}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-API-Key"] = api_key
     
     try:
         response = requests.get(f"{aggregator_url}/health", headers=headers, timeout=5)
@@ -80,7 +81,8 @@ def list_all_solvers(aggregator_url: str, api_key: str = None):
 
 if __name__ == "__main__":
     aggregator_url = os.getenv("AGGREGATOR_URL", "http://localhost:4000")
-    api_key = os.getenv("AGGREGATOR_API_KEY")
+    # Prefer MINER_API_KEY (required for /v1/solvers/* endpoints); fall back to AGGREGATOR_API_KEY for older setups.
+    api_key = os.getenv("MINER_API_KEY") or os.getenv("AGGREGATOR_API_KEY")
     
     if len(sys.argv) > 1:
         if sys.argv[1] == "--all":
@@ -96,5 +98,5 @@ if __name__ == "__main__":
         print(f"  {sys.argv[0]} 5GxnM365xyjm9WvT2GsHQ6erhi7yEGREr8gJJ74bkazAQqfV-solver-00")
         print(f"\nEnvironment variables:")
         print(f"  AGGREGATOR_URL={aggregator_url}")
-        print(f"  AGGREGATOR_API_KEY={'SET' if api_key else 'NOT SET'}")
+        print(f"  MINER_API_KEY={'SET' if api_key else 'NOT SET'}")
 

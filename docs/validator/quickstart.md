@@ -28,6 +28,7 @@ export WALLET_HOTKEY=my-hotkey
 export AGGREGATOR_URL=http://127.0.0.1:4100
 export VALIDATOR_API_KEY=your-validator-api-key  # Required
 export SIMULATOR_RPC_URL=https://mainnet.infura.io/v3/YOUR_INFURA_KEY  # Required
+export SIMULATOR_DOCKER_IMAGE=ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest
 ```
 
 ## Run the validator

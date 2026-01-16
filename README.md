@@ -99,7 +99,65 @@ During the initial training phase, we collect real auctions from multiple swap a
 - **Simulation Mode:** Access to the Aggregator API and Docker + RPC for simulation
 - **Both Modes:** API keys (VALIDATOR_API_KEY for validators, MINER_API_KEY for miners)
 
-### Quick Start
+### Easy Setup (Recommended for Beginners)
+
+We provide several tools to make setup and monitoring easier:
+
+#### 1. Interactive Setup Wizard
+The setup wizard guides you through configuration step-by-step:
+```bash
+python scripts/setup_wizard.py
+```
+
+This will:
+- Check system requirements (Docker, Python, etc.)
+- Guide you through choosing validator/miner mode
+- Validate your RPC endpoints
+- Generate .env configuration files
+- Optionally pull Docker images
+
+#### 2. Docker Compose (Simplest Deployment)
+After running the setup wizard, start everything with:
+```bash
+# Start all services
+docker compose up -d
+
+# Or start only validator
+docker compose --profile validator up -d
+
+# Or start only miners
+docker compose --profile miner up -d
+
+# View logs
+docker compose logs -f
+
+# Check status
+docker compose ps
+```
+
+#### 3. Status Dashboard
+Monitor your services with the status dashboard:
+```bash
+# One-time status check
+python scripts/status.py
+
+# Live updating dashboard
+python scripts/status.py --watch
+
+# JSON output (for scripting)
+python scripts/status.py --json
+```
+
+#### 4. Configuration Validator
+Validate your .env files before starting:
+```bash
+python scripts/validate_config.py
+python scripts/validate_config.py --env-file /path/to/.env
+```
+
+---
+
+### Quick Start (Manual Setup)
 
 #### Validator - Simulation Mode (Testing)
 ```bash

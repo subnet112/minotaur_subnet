@@ -4,6 +4,8 @@ import sys
 import asyncio
 import argparse
 import signal
+import threading
+import time
 from enum import Enum
 from typing import Dict, Optional
 
@@ -66,8 +68,15 @@ class Validator:
         else:
             # Bittensor mode - initialize full components
             self._log("Initializing Bittensor components", LogLevel.INFO, prefix="INIT")
-            self.wallet = bt.wallet(config=self.config)
-            self.subtensor = bt.subtensor(config=self.config)
+            self.wallet = bt.Wallet(
+                name=getattr(self.config.wallet, "name", "default"),
+                hotkey=getattr(self.config.wallet, "hotkey", "default"),
+                path=getattr(self.config.wallet, "path", "~/.bittensor/wallets"),
+            )
+            self.subtensor = bt.Subtensor(
+                network=getattr(self.config.subtensor, "network", "finney"),
+                config=self.config,
+            )
             
             self._log(f"Wallet: {self.wallet.hotkey.ss58_address}", LogLevel.INFO, prefix="WALLET")
             self._log(f"Network: {self.subtensor.network}", LogLevel.INFO, prefix="CONFIG", suffix=f"netuid={self.config.netuid}")
@@ -82,6 +91,30 @@ class Validator:
 
         self._log("Validator initialized successfully", LogLevel.SUCCESS, prefix="INIT")
 
+        # Heartbeat watchdog
+        self._last_heartbeat = time.time()
+        self._heartbeat_timeout = int(os.getenv("VALIDATOR_HEARTBEAT_TIMEOUT", "600"))
+        self._heartbeat_stop_event = threading.Event()
+
+    def _heartbeat(self) -> None:
+        self._last_heartbeat = time.time()
+
+    def _start_heartbeat_monitor(self) -> None:
+        def monitor():
+            while not self._heartbeat_stop_event.is_set():
+                time.sleep(5)
+                if time.time() - self._last_heartbeat > self._heartbeat_timeout:
+                    self._log(
+                        f"No heartbeat detected in the last {self._heartbeat_timeout} seconds. Restarting process.",
+                        LogLevel.ERROR,
+                        prefix="HEARTBEAT",
+                    )
+                    self._heartbeat_stop_event.set()
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
+
     def _init_mock_mode(self) -> None:
         """Initialize mock mode components (no Bittensor dependencies)."""
         from neurons.mock_validator import MockValidator
@@ -93,7 +126,7 @@ class Validator:
         # Ensure simulator_docker_image has a valid value
         simulator_docker_image = getattr(self.config, "simulator_docker_image", None)
         if not simulator_docker_image:
-            simulator_docker_image = "mino-simulation"
+            simulator_docker_image = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
             self._log(f"Using default simulator docker image: {simulator_docker_image}", LogLevel.INFO, prefix="INIT")
         
         # Use VALIDATOR_API_KEY for validator-specific endpoints (required)
@@ -112,6 +145,7 @@ class Validator:
             validation_interval_seconds=getattr(self.config, "poll_seconds", 5),
             max_concurrent_simulations=getattr(self.config, "simulator_max_concurrent", 5),
             logger=bt.logging,  # Use bittensor logging for consistent SUCCESS level support
+            heartbeat_callback=self._heartbeat,
         )
 
         # Initialize state store for mock mode
@@ -144,10 +178,19 @@ class Validator:
         """Get validator configuration from args and environment."""
         parser = argparse.ArgumentParser()
 
-        # First add Bittensor arguments (avoids local duplicates)
-        bt.subtensor.add_args(parser)
-        bt.logging.add_args(parser)
-        bt.wallet.add_args(parser)
+        # Wallet arguments (bittensor v10+ no longer provides add_args)
+        parser.add_argument("--wallet.name", type=str, default="default", help="Wallet name")
+        parser.add_argument("--wallet.hotkey", type=str, default="default", help="Hotkey name")
+        parser.add_argument("--wallet.path", type=str, default="~/.bittensor/wallets", help="Wallet path")
+        
+        # Subtensor arguments
+        parser.add_argument("--subtensor.network", type=str, default="finney", help="Bittensor network (finney, test, local)")
+        parser.add_argument("--subtensor.chain_endpoint", type=str, default=None, help="Chain endpoint URL (optional)")
+        
+        # Logging arguments
+        parser.add_argument("--logging.debug", action="store_true", help="Enable debug logging")
+        parser.add_argument("--logging.trace", action="store_true", help="Enable trace logging")
+        parser.add_argument("--logging.logging_dir", type=str, default="~/.bittensor/miners", help="Logging directory")
 
         # Validator-specific additions (not provided by Bittensor)
         # Aggregator API
@@ -186,7 +229,7 @@ class Validator:
         parser.add_argument("--validator.backoff_max_seconds", type=int, default=120, help="Maximum poll interval after backoff")
         parser.add_argument("--netuid", type=int, default=None, help="Target subnet UID for validator operations")
         
-        config = bt.config(parser)
+        config = bt.Config(parser)
         
         # Override from env
         netuid_env = os.getenv("NETUID")
@@ -276,11 +319,11 @@ class Validator:
         # Get simulator docker image - handle None/empty string cases
         env_image = os.getenv("SIMULATOR_DOCKER_IMAGE")
         config_image = getattr(config, "simulator_docker_image", None)
-        config.simulator_docker_image = env_image or config_image or "mino-simulation"
+        config.simulator_docker_image = env_image or config_image or "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
         
         # Ensure it's not None or empty
         if not config.simulator_docker_image:
-            config.simulator_docker_image = "mino-simulation"
+            config.simulator_docker_image = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
         
         # Get max concurrent simulations
         max_concurrent_default = getattr(config, "simulator_max_concurrent", None)
@@ -379,7 +422,8 @@ class Validator:
     def run(self):
         """Run the validator with asyncio loop"""
         try:
-            validator_mode = getattr(self.config, "validator", None) and getattr(self.config.validator, "mode", "bittensor") or "bittensor"
+            self._start_heartbeat_monitor()
+            validator_mode = getattr(self.config, "validator_mode", "bittensor")
             if validator_mode == "mock":
                 self._run_mock_validator()
             else:
@@ -416,7 +460,8 @@ class Validator:
             config=self.config,
             subtensor=self.subtensor,
             wallet=self.wallet,
-            logger=bt.logging
+            logger=bt.logging,
+            heartbeat_callback=self._heartbeat,
         )
 
         async def main_async():

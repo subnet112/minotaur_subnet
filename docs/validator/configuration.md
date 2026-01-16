@@ -48,9 +48,10 @@ Notes:
 - `SIMULATOR_RPC_URL` (recommended) – Ethereum RPC URL for order simulation (chain ID 1)
 - `ETHEREUM_RPC_URL` / `INFURA_RPC_URL` – Also accepted by the simulator as fallbacks for chain ID 1
 - `BASE_RPC_URL` – Base RPC URL for simulating Base orders (chain ID 8453)
-- `SIMULATOR_DOCKER_IMAGE` (default: `mino-simulation`) – Docker image for simulator
+- `SIMULATOR_DOCKER_IMAGE` (default: `ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest`) – Docker image for simulator
 - `SIMULATOR_MAX_CONCURRENT` (default: `5`) – Maximum number of concurrent simulations
 - `SIMULATOR_TIMEOUT_SECONDS` (default: `300`) – Simulation timeout in seconds (5 minutes)
+- `SIMULATOR_AUTO_PULL` (default: `true`) – If true, the validator will `docker pull` the simulator image on startup (set `false/0/no` to disable)
 
 ## State persistence (optional)
 - `VALIDATOR_STATE_DIR` (optional) – Directory where the validator stores persistent state (defaults to the validator run directory)

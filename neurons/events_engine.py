@@ -182,29 +182,48 @@ class EventsWeightsEngine:
         # Normalize to weights
         total_score = sum(data["score"] for data in scores.values())
         if total_score == 0:
-            # Equal distribution if no activity
-            weights = {miner_id: 1.0 / len(scores) for miner_id in scores.keys()}
+            if not scores:
+                # No miners at all - fallback to 100% burn to creator
+                if self.creator_hotkey:
+                    self.logger.info(
+                        f"🔥 No miner scores - falling back to 100% burn to creator {self.creator_hotkey[:8]}...",
+                        prefix="BURN"
+                    )
+                    weights = {self.creator_hotkey: 1.0}
+                else:
+                    weights = {}
+            else:
+                # Equal distribution if no activity but miners exist
+                weights = {miner_id: 1.0 / len(scores) for miner_id in scores.keys()}
         else:
             weights = {miner_id: data["score"] / total_score for miner_id, data in scores.items()}
 
         # Apply burn allocation if specified
         if self.burn_percentage > 0.0 and self.creator_hotkey:
-            # Scale down legitimate miner weights
-            allocate_percentage = 1.0 - self.burn_percentage
-            for miner_id in weights:
-                weights[miner_id] *= allocate_percentage
+            if weights and any(k != self.creator_hotkey for k in weights):
+                # Scale down legitimate miner weights
+                allocate_percentage = 1.0 - self.burn_percentage
+                for miner_id in weights:
+                    if miner_id != self.creator_hotkey:
+                        weights[miner_id] *= allocate_percentage
 
-            # Allocate burn percentage to creator
-            if self.creator_hotkey in weights:
-                weights[self.creator_hotkey] += self.burn_percentage
-            else:
-                # Add creator to weights if not present
-                weights[self.creator_hotkey] = self.burn_percentage
+                # Allocate burn percentage to creator
+                if self.creator_hotkey in weights:
+                    weights[self.creator_hotkey] += self.burn_percentage
+                else:
+                    weights[self.creator_hotkey] = self.burn_percentage
 
-            self.logger.info(
-                f"Burn allocation applied: {self.burn_percentage:.1%} to creator hotkey {self.creator_hotkey[:8]}...",
-                prefix="BURN"
-            )
+                self.logger.info(
+                    f"Burn allocation applied: {self.burn_percentage:.1%} to creator hotkey {self.creator_hotkey[:8]}...",
+                    prefix="BURN"
+                )
+            elif not weights and self.creator_hotkey:
+                # No miners - 100% to creator
+                weights = {self.creator_hotkey: 1.0}
+                self.logger.info(
+                    f"🔥 No miner weights - 100% burn to creator {self.creator_hotkey[:8]}...",
+                    prefix="BURN"
+                )
 
         stats = {
             "total_simulations": len(simulation_results),

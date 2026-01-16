@@ -33,10 +33,12 @@ SUPPORTED_CHAINS = {
 class OrderSimulator:
     """Handles order simulation using Docker containers with container reuse."""
 
+    DEFAULT_SIMULATOR_IMAGE = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest"
+
     def __init__(
         self,
         rpc_url: Optional[str] = None,
-        simulator_image: str = "mino-simulation",
+        simulator_image: str = DEFAULT_SIMULATOR_IMAGE,
         logger: Optional[logging.Logger] = None,
         failed_simulations_dir: Optional[Path] = None,
         timeout_seconds: int = 300,
@@ -141,6 +143,16 @@ class OrderSimulator:
         except Exception as e:
             self.logger.error(f"🔍 Failed to create failed_simulations_dir: {e}")
             raise
+
+        # Optionally auto-pull the simulator image so operators always run the latest version.
+        # This is especially useful for validators where the simulator contract logic can evolve.
+        #
+        # Opt-out by setting SIMULATOR_AUTO_PULL=0/false/no.
+        auto_pull = os.getenv("SIMULATOR_AUTO_PULL", "true").lower() in ("1", "true", "yes")
+        if auto_pull:
+            self._pull_simulator_image()
+        else:
+            self.logger.info("⏭️  SIMULATOR_AUTO_PULL disabled - skipping docker pull of simulator image")
         
         # Start container pool
         self._start_container_pool()
@@ -204,6 +216,37 @@ class OrderSimulator:
             raise RuntimeError("Failed to start any simulation containers. Check Docker is running and image exists.")
         
         self.logger.info(f"✅ Container pool ready: {len(self._container_names)} container(s) available")
+
+    def _pull_simulator_image(self) -> None:
+        """Pull the configured simulator image (best-effort).
+
+        If the pull fails, we continue and let container startup surface the error.
+        """
+        if not self.simulator_image:
+            return
+        try:
+            self.logger.info(f"⬇️  Pulling simulator image: {self.simulator_image}")
+            result = subprocess.run(
+                ["docker", "pull", self.simulator_image],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            if result.returncode == 0:
+                self.logger.info(f"✅ Pulled simulator image: {self.simulator_image}")
+            else:
+                stderr = (result.stderr or "").strip()
+                self.logger.warning(
+                    f"⚠️  Failed to pull simulator image {self.simulator_image} (exit {result.returncode}). "
+                    f"Will try to run with local image if present. Error: {stderr[:300]}"
+                )
+        except FileNotFoundError:
+            self.logger.warning("⚠️  docker CLI not found; cannot auto-pull simulator image")
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"⚠️  Timed out pulling simulator image: {self.simulator_image}")
+        except Exception as exc:
+            self.logger.warning(f"⚠️  Unexpected error pulling simulator image: {exc}")
 
     def _get_container_name(self) -> Optional[str]:
         """Get next container name using round-robin selection."""

@@ -1,0 +1,189 @@
+# Minotaur Docker Compose Configuration
+# 
+# This file provides a simple way to run validator and/or miner services.
+# 
+# Quick Start:
+#   1. Copy env.example to .env and configure your settings
+#   2. Run: docker compose up -d
+#   3. Check status: docker compose ps
+#   4. View logs: docker compose logs -f
+#
+# Profiles:
+#   - validator: Run only the validator
+#   - miner: Run only miners (all three solver types)
+#   - full: Run validator + all miners (default)
+#
+# Usage:
+#   docker compose up -d                    # Start all services
+#   docker compose --profile validator up -d # Start validator only
+#   docker compose --profile miner up -d    # Start miners only
+#   docker compose down                     # Stop all services
+#   docker compose logs -f validator        # Follow validator logs
+#   docker compose restart                  # Restart all services
+
+x-common-env: &common-env
+  # These can be overridden in .env file
+  AGGREGATOR_URL: ${AGGREGATOR_URL:-https://aggregator.ntfork.com}
+  ETHEREUM_RPC_URL: ${ETHEREUM_RPC_URL:-}
+  BASE_RPC_URL: ${BASE_RPC_URL:-}
+  LOGURU_LEVEL: ${LOGURU_LEVEL:-INFO}
+
+x-healthcheck: &default-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 30s
+
+services:
+  # ===========================================
+  # VALIDATOR SERVICE
+  # ===========================================
+  validator:
+    image: ${MINOTAUR_IMAGE:-ghcr.io/subnet112/minotaur_subnet:latest}
+    container_name: minotaur-validator
+    command: validator
+    profiles:
+      - validator
+      - full
+    environment:
+      <<: *common-env
+      VALIDATOR_MODE: ${VALIDATOR_MODE:-mock}
+      VALIDATOR_API_KEY: ${VALIDATOR_API_KEY:-}
+      SIMULATOR_MAX_CONCURRENT: ${SIMULATOR_MAX_CONCURRENT:-5}
+      SIMULATOR_TIMEOUT_SECONDS: ${SIMULATOR_TIMEOUT_SECONDS:-300}
+      SIMULATOR_AUTO_PULL: "true"
+      VALIDATOR_EPOCH_MINUTES: ${VALIDATOR_EPOCH_MINUTES:-5}
+      VALIDATOR_CONTINUOUS: "true"
+      # Bittensor settings (production mode only)
+      NETUID: ${NETUID:-112}
+      WALLET_NAME: ${WALLET_NAME:-validator}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+    volumes:
+      # Required for Docker-based simulation
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persist validator state
+      - validator-state:/app/state
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9999/health', timeout=5)"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ===========================================
+  # MINER SERVICES (Solvers)
+  # ===========================================
+  
+  # Uniswap V3 Mainnet Solver (Ethereum)
+  miner-v3:
+    image: ${MINOTAUR_IMAGE:-ghcr.io/subnet112/minotaur_subnet:latest}
+    container_name: miner-v3
+    command: miner
+    profiles:
+      - miner
+      - full
+    environment:
+      <<: *common-env
+      MINER_MODE: ${MINER_MODE:-simulation}
+      MINER_API_KEY: ${MINER_API_KEY:-}
+      MINER_ID: ${MINER_ID_V3:-miner-mainnet-v3}
+      MINER_SOLVER_TYPE: v3
+      MINER_BASE_PORT: "8000"
+      MINER_NUM_SOLVERS: "1"
+      MINER_SOLVER_HOST: ${MINER_SOLVER_HOST:-localhost}
+      # Bittensor settings (production mode only)
+      NETUID: ${NETUID:-112}
+      WALLET_NAME: ${WALLET_NAME:-miner}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - validator
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Uniswap V2 Mainnet Solver (Ethereum)
+  miner-v2:
+    image: ${MINOTAUR_IMAGE:-ghcr.io/subnet112/minotaur_subnet:latest}
+    container_name: miner-v2
+    command: miner
+    profiles:
+      - miner
+      - full
+    environment:
+      <<: *common-env
+      MINER_MODE: ${MINER_MODE:-simulation}
+      MINER_API_KEY: ${MINER_API_KEY:-}
+      MINER_ID: ${MINER_ID_V2:-miner-mainnet-v2}
+      MINER_SOLVER_TYPE: v2
+      MINER_BASE_PORT: "8001"
+      MINER_NUM_SOLVERS: "1"
+      MINER_SOLVER_HOST: ${MINER_SOLVER_HOST:-localhost}
+      # Bittensor settings (production mode only)
+      NETUID: ${NETUID:-112}
+      WALLET_NAME: ${WALLET_NAME:-miner}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - validator
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Uniswap V3 Base Solver (Base chain)
+  miner-base:
+    image: ${MINOTAUR_IMAGE:-ghcr.io/subnet112/minotaur_subnet:latest}
+    container_name: miner-base
+    command: miner
+    profiles:
+      - miner
+      - full
+    environment:
+      <<: *common-env
+      MINER_MODE: ${MINER_MODE:-simulation}
+      MINER_API_KEY: ${MINER_API_KEY:-}
+      MINER_ID: ${MINER_ID_BASE:-miner-base-v3}
+      MINER_SOLVER_TYPE: base
+      MINER_BASE_PORT: "8002"
+      MINER_NUM_SOLVERS: "1"
+      MINER_SOLVER_HOST: ${MINER_SOLVER_HOST:-localhost}
+      # Bittensor settings (production mode only)
+      NETUID: ${NETUID:-112}
+      WALLET_NAME: ${WALLET_NAME:-miner}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - validator
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  validator-state:
+    name: minotaur-validator-state

@@ -29,12 +29,12 @@ class FakeSubtensor:
             return None
         return None
 
-    def get_current_block(self):
-        return self._current_block
+    def get_block_header(self, block_hash=None):
+        return {"number": self._current_block}
 
     def get_block_hash(self, block_number: int):
-        # encode block number into fake hash so we can recover it in query
-        return f"0x{block_number}"
+        # Use hex to mirror substrate hash encoding for tests
+        return hex(block_number)
 
 
 def test_previous_epoch_window_success():

@@ -144,7 +144,12 @@ getcontext().prec = 64
 
 
 class Solver:
-    """OIF v1 compatible solver with Uniswap V3 integration."""
+    """OIF v1 compatible solver with Uniswap V3 integration.
+    
+    Supports two execution modes:
+    - simulation (default): Simulates order execution for testing
+    - live: Executes orders on-chain via the Settlement contract
+    """
     
     def __init__(
         self,
@@ -152,13 +157,32 @@ class Solver:
         port: int,
         latency_ms: int = 100,
         quality: float = 1.0,
-        logger=None
+        logger=None,
+        execution_mode: str = "simulation",
+        executor_private_key: Optional[str] = None,
+        dry_run: bool = False
     ):
+        """
+        Initialize the solver.
+        
+        Args:
+            solver_id: Unique identifier for this solver
+            port: Port to run the HTTP server on
+            latency_ms: Artificial latency to add to responses (for testing)
+            quality: Quality factor for quotes (1.0 = best)
+            logger: Logger instance
+            execution_mode: "simulation" or "live"
+            executor_private_key: Private key for executing transactions (required for live mode)
+            dry_run: In live mode, simulate but don't submit transactions
+        """
         self.solver_id = solver_id
         self.port = port
         self.latency_ms = latency_ms
         self.quality = quality
         self.logger = logger
+        self.execution_mode = execution_mode
+        self.executor_private_key = executor_private_key
+        self.dry_run = dry_run
         self.request_count = 0
         self.advertised_token_limit = DEFAULT_TOKEN_ADVERTISE_LIMIT
         self.token_metadata: Dict[str, Dict[str, Any]] = dict(BASE_TOKEN_METADATA)
@@ -190,6 +214,30 @@ class Solver:
         self.setup_routes()
         self.orders = {}
         self.quote_cache: Dict[str, dict] = {}
+        
+        # Initialize on-chain executor for live mode
+        self.onchain_executor = None
+        if self.execution_mode == "live" and self.web3:
+            try:
+                from neurons.onchain_executor import OnchainExecutor
+                self.onchain_executor = OnchainExecutor(
+                    web3=self.web3,
+                    settlement_address=SETTLEMENT_CONTRACT_ADDRESS,
+                    chain_id=CHAIN_ID,
+                    private_key=executor_private_key,
+                    logger=self.logger,
+                    dry_run=dry_run
+                )
+                if self.logger:
+                    mode_str = "DRY RUN" if dry_run else "LIVE"
+                    self.logger.info(f"🔗 On-chain executor initialized ({mode_str} mode)")
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"❌ Failed to initialize on-chain executor: {e}")
+                self.execution_mode = "simulation"
+        
+        if self.logger:
+            self.logger.info(f"Solver execution mode: {self.execution_mode}")
     
     def _init_web3(self) -> Optional["Web3"]:
         if not WEB3_AVAILABLE:
@@ -1041,61 +1089,125 @@ class Solver:
         
         @self.app.route('/orders', methods=['POST'])
         def submit_order():
-            """Handle order submissions - OIF v1 format"""
+            """Handle order submissions - OIF v1 format
+            
+            In simulation mode: Simulates order finalization
+            In live mode: Executes order on-chain via Settlement contract
+            
+            Request body:
+            {
+                "quoteId": "solver-00-q-1234567890-001",
+                "signature": "0x...",  # EIP-712 signature from user
+                "order": "optional-order-data",
+                "sponsor": "optional-sponsor-address"
+            }
+            """
             try:
                 req = request.json
                 order_id = f"{self.solver_id}-order-{int(time.time() * 1000)}"
                 quote_id = req.get('quoteId')
+                signature = req.get('signature', '')
                 cached_quote = self.quote_cache.get(quote_id)
 
                 now = int(time.time())
 
-                order_ctx = None
+                # Validate quote exists
+                if not cached_quote:
+                    if self.logger:
+                        self.logger.warning(f"Order submission with unknown quote: {quote_id}")
+                    return jsonify({
+                        "status": "error",
+                        "error": f"Unknown quoteId: {quote_id}"
+                    }), 400
 
-                if cached_quote:
-                    order_msg = cached_quote['message']
-                    order_ctx = cached_quote['context']
-                    input_amount_wei = int(order_ctx['input']['amountWei'])
-                    min_output_wei = int(order_ctx['output']['minimumAmountWei'])
-                    expected_output_wei = int(order_ctx['output']['estimatedAmountWei'])
+                order_ctx = cached_quote.get('context')
+                order_msg = cached_quote.get('message')
+                
+                # Check if quote has expired
+                quote_deadline = order_msg.get('deadline', 0) if order_msg else 0
+                if quote_deadline and now > quote_deadline:
+                    return jsonify({
+                        "status": "error",
+                        "error": "Quote has expired"
+                    }), 400
 
-                    standard_order = {
-                        "expires": order_msg['deadline'],
-                        "fillDeadline": order_msg['deadline'] + 300,
-                        "inputOracle": "0x0000000000000000000000000000000000000000",
-                        "inputs": [
-                            [
-                                self._int_to_hex(input_amount_wei),
-                                self._int_to_hex(min_output_wei),
-                            ]
-                        ],
-                        "nonce": order_msg['nonce'],
-                        "originChainId": self._int_to_hex(order_ctx['originChainId']),
-                        "outputs": [
-                            {
-                                "amount": self._int_to_hex(expected_output_wei),
-                                "call": "0x",
-                                "chainId": self._int_to_hex(order_ctx['output']['chainId']),
-                                "context": "0x",
-                                "oracle": self._address_to_bytes32(UNISWAP_ROUTER_ADDRESS),
-                                "recipient": self._address_to_bytes32(order_ctx['output']['asset']),
-                                "settler": self._address_to_bytes32(UNISWAP_ROUTER_ADDRESS),
-                                "token": self._address_to_bytes32(order_ctx['output']['asset']),
-                            }
-                        ],
-                        "user": order_ctx['user']['address'],
+                # Build quote data for execution
+                quote_data = {
+                    "quoteId": quote_id,
+                    "details": cached_quote.get('details', {}),
+                    "settlement": order_ctx.get('settlement') if order_ctx else {}
+                }
+
+                # Live execution mode
+                if self.execution_mode == "live" and self.onchain_executor:
+                    if not signature:
+                        return jsonify({
+                            "status": "error",
+                            "error": "Signature required for live execution"
+                        }), 400
+                    
+                    if self.logger:
+                        self.logger.info(f"🔗 Executing order on-chain: {order_id}")
+                    
+                    # Execute asynchronously (returns immediately with RECEIVED status)
+                    executed_order = self.onchain_executor.execute_order_async(
+                        order_id=order_id,
+                        quote_data=quote_data,
+                        signature=signature,
+                        skip_verification=False
+                    )
+                    
+                    # Store in local orders dict for backward compatibility
+                    self.orders[order_id] = {
+                        "id": order_id,
+                        "quote_id": quote_id,
+                        "status": executed_order.status.value,
+                        "created_at": executed_order.created_at,
+                        "updated_at": executed_order.updated_at,
+                        "context": order_ctx,
+                        "fill_tx_hash": executed_order.tx_hash,
+                        "execution_mode": "live"
                     }
-                else:
-                    standard_order = {
-                        "expires": now + 3600,
-                        "fillDeadline": now + 3600,
-                        "inputOracle": "0x0000000000000000000000000000000000000000",
-                        "inputs": [],
-                        "nonce": self._generate_nonce(),
-                        "originChainId": self._int_to_hex(CHAIN_ID),
-                        "outputs": [],
-                        "user": "0x0000000000000000000000000000000000000000",
+                    
+                    response = {
+                        "status": "received",
+                        "orderId": order_id,
+                        "message": "Order received for on-chain execution"
                     }
+                    
+                    return jsonify(response), 200
+
+                # Simulation mode (default)
+                input_amount_wei = int(order_ctx['input']['amountWei']) if order_ctx else 0
+                min_output_wei = int(order_ctx['output']['minimumAmountWei']) if order_ctx else 0
+                expected_output_wei = int(order_ctx['output']['estimatedAmountWei']) if order_ctx else 0
+
+                standard_order = {
+                    "expires": order_msg['deadline'] if order_msg else now + 3600,
+                    "fillDeadline": (order_msg['deadline'] + 300) if order_msg else now + 3900,
+                    "inputOracle": "0x0000000000000000000000000000000000000000",
+                    "inputs": [
+                        [
+                            self._int_to_hex(input_amount_wei),
+                            self._int_to_hex(min_output_wei),
+                        ]
+                    ] if order_ctx else [],
+                    "nonce": order_msg['nonce'] if order_msg else self._generate_nonce(),
+                    "originChainId": self._int_to_hex(order_ctx['originChainId']) if order_ctx else self._int_to_hex(CHAIN_ID),
+                    "outputs": [
+                        {
+                            "amount": self._int_to_hex(expected_output_wei),
+                            "call": "0x",
+                            "chainId": self._int_to_hex(order_ctx['output']['chainId']),
+                            "context": "0x",
+                            "oracle": self._address_to_bytes32(UNISWAP_ROUTER_ADDRESS),
+                            "recipient": self._address_to_bytes32(order_ctx['output']['asset']),
+                            "settler": self._address_to_bytes32(UNISWAP_ROUTER_ADDRESS),
+                            "token": self._address_to_bytes32(order_ctx['output']['asset']),
+                        }
+                    ] if order_ctx else [],
+                    "user": order_ctx['user']['address'] if order_ctx else "0x0000000000000000000000000000000000000000",
+                }
 
                 self.orders[order_id] = {
                     "id": order_id,
@@ -1106,6 +1218,7 @@ class Solver:
                     "standard_order": standard_order,
                     "context": order_ctx,
                     "fill_tx_hash": None,
+                    "execution_mode": "simulation"
                 }
                 
                 import threading
@@ -1115,12 +1228,14 @@ class Solver:
                         self.orders[order_id]['status'] = 'finalized'
                         self.orders[order_id]['updated_at'] = int(time.time())
                         self.orders[order_id]['fill_tx_hash'] = "0x" + secrets.token_hex(32)
+                        self.orders[order_id]['block_number'] = self.web3.eth.block_number if self.web3 else 0
+                        self.orders[order_id]['gas_used'] = random.randint(100000, 200000)
                 
                 threading.Thread(target=finalize_order, daemon=True).start()
                 
                 if self.logger:
                     self.logger.info(
-                        f"Order accepted: {order_id} | quote: {quote_id} | "
+                        f"Order accepted (simulation): {order_id} | quote: {quote_id} | "
                         f"status: pending"
                     )
                 
@@ -1128,7 +1243,7 @@ class Solver:
                     "status": "success",
                     "orderId": order_id,
                     "order": standard_order,
-                    "message": "Order accepted"
+                    "message": "Order accepted (simulation mode)"
                 }
                 
                 return jsonify(response), 200
@@ -1140,7 +1255,33 @@ class Solver:
         
         @self.app.route('/orders/<order_id>', methods=['GET'])
         def get_order(order_id):
-            """Get order status - OIF v1 GetOrderResponse format"""
+            """Get order status - OIF v1 GetOrderResponse format
+            
+            Returns the current status and execution details for an order.
+            For live executions, includes real transaction hash and block info.
+            """
+            # First check if it's a live execution in the onchain_executor
+            if self.onchain_executor:
+                executed_order = self.onchain_executor.get_order(order_id)
+                if executed_order:
+                    # Update local orders dict for sync
+                    self.orders[order_id] = {
+                        "id": order_id,
+                        "quote_id": executed_order.quote_id,
+                        "status": executed_order.status.value,
+                        "created_at": executed_order.created_at,
+                        "updated_at": executed_order.updated_at,
+                        "fill_tx_hash": executed_order.tx_hash,
+                        "block_number": executed_order.block_number,
+                        "gas_used": executed_order.gas_used,
+                        "error_message": executed_order.error_message,
+                        "execution_mode": "live"
+                    }
+                    
+                    # Return in the expected format
+                    return jsonify(self.onchain_executor.to_order_response(executed_order)), 200
+            
+            # Fall back to local orders dict
             order_data = self.orders.get(order_id)
             if not order_data:
                 return jsonify({"error": "Order not found"}), 404
@@ -1179,11 +1320,17 @@ class Solver:
                 "estimatedGasUnits": context.get("gasEstimate") if context else None,
             }
 
+            # Format timestamps as ISO strings
+            created_at = order_data["created_at"]
+            updated_at = order_data["updated_at"]
+            created_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_at))
+            updated_at_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(updated_at))
+
             order_payload = {
                 "id": order_data["id"],
                 "status": order_data["status"],
-                "createdAt": order_data["created_at"],
-                "updatedAt": order_data["updated_at"],
+                "createdAt": created_at_iso,
+                "updatedAt": updated_at_iso,
                 "quoteId": order_data.get("quote_id"),
                 "inputAmount": sanitized_input_amount,
                 "outputAmount": sanitized_output_amount,
@@ -1198,10 +1345,20 @@ class Solver:
                 order_payload["fillTransaction"] = {
                     "txHash": order_data["fill_tx_hash"],
                     "chainId": context['output']['chainId'] if context else CHAIN_ID,
+                    "blockNumber": order_data.get("block_number"),
+                    "gasUsed": order_data.get("gas_used"),
                     "executor": UNISWAP_ROUTER_ADDRESS,
                 }
+            
+            if order_data.get("error_message"):
+                order_payload["error"] = order_data["error_message"]
 
-            return jsonify({"order": order_payload}), 200
+            # Return in the format expected by aggregator
+            return jsonify({
+                "orderId": order_data["id"],
+                "status": order_data["status"],
+                "order": order_payload
+            }), 200
         
         @self.app.route('/tokens', methods=['GET'])
         def get_tokens():

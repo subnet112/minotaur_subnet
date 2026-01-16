@@ -13,7 +13,7 @@ import socket
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 
 try:
     import bittensor as bt
@@ -169,13 +169,14 @@ class MockValidator:
         aggregator_url: str,
         validator_api_key: str,
         simulator_rpc_url: Optional[str] = None,
-        simulator_docker_image: str = "mino-simulation",
+        simulator_docker_image: str = "ghcr.io/subnet112/minotaur_contracts/mino-simulation:latest",
         validator_id: Optional[str] = None,
         burn_percentage: float = 0.0,
         creator_miner_id: Optional[str] = None,
         validation_interval_seconds: int = 5,
         max_concurrent_simulations: int = 5,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ):
         self.logger = logger or logging.getLogger(__name__)
 
@@ -268,6 +269,7 @@ class MockValidator:
             max_concurrent_simulations=max_concurrent_simulations,
             signing_keypair=test_keypair,  # Test keypair for simulation mode
             submit_weights_to_aggregator=True,  # Enable weight submission in mock mode
+            heartbeat_callback=heartbeat_callback,
         )
         
         # Log burn configuration
