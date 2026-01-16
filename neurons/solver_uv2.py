@@ -201,11 +201,12 @@ class SolverV2:
         self.advertised_token_limit = DEFAULT_TOKEN_ADVERTISE_LIMIT
         self.token_metadata: Dict[str, Dict[str, Any]] = dict(BASE_TOKEN_METADATA)
         self._load_token_list()
-        if os.environ.get("ENABLE_POOL_TOKEN_DISCOVERY", "true").lower() in ("1", "true", "yes"):
-            self._discover_tokens_from_pairs()  # Discover additional tokens from Uniswap V2 pairs
+        # Initialize web3 BEFORE token discovery (needed for pair discovery)
         self.web3 = self._init_web3()
         if self.web3 and not self.web3.is_connected():
             self.web3 = None
+        if os.environ.get("ENABLE_POOL_TOKEN_DISCOVERY", "true").lower() in ("1", "true", "yes"):
+            self._discover_tokens_from_pairs()  # Discover additional tokens from Uniswap V2 pairs
         self.factory_contract = (
             self.web3.eth.contract(
                 address=self.web3.to_checksum_address(UNISWAP_V2_FACTORY_ADDRESS),

@@ -222,11 +222,12 @@ class SolverBase:
         self.advertised_token_limit = DEFAULT_TOKEN_ADVERTISE_LIMIT
         self.token_metadata: Dict[str, Dict[str, Any]] = dict(BASE_TOKEN_METADATA)
         self._load_token_list()
-        if os.environ.get("ENABLE_POOL_TOKEN_DISCOVERY", "true").lower() in ("1", "true", "yes"):
-            self._discover_tokens_from_pools()  # Discover additional tokens from Uniswap V3 pools
+        # Initialize web3 BEFORE token discovery (needed for pool discovery)
         self.web3 = self._init_web3()
         if self.web3 and not self.web3.is_connected():
             self.web3 = None
+        if os.environ.get("ENABLE_POOL_TOKEN_DISCOVERY", "true").lower() in ("1", "true", "yes"):
+            self._discover_tokens_from_pools()  # Discover additional tokens from Uniswap V3 pools
         
         if self.web3 is None:
             if self.logger:
