@@ -327,7 +327,10 @@ def main():
                 print(colored(f"No solvers found for miner: {args.miner_id}", Colors.YELLOW))
         
         for solver in solvers:
-            result = checker.verify_registration(solver["solver_id"], args.verify_endpoint)
+            solver_id = solver.get("solver_id") or solver.get("solverId")
+            if not solver_id:
+                continue
+            result = checker.verify_registration(solver_id, args.verify_endpoint)
             results.append(result)
             if not args.json:
                 print_solver_result(result)
@@ -345,7 +348,10 @@ def main():
                 print("No solvers found. Set MINER_ID or use --solver-id/--miner-id")
         
         for solver in solvers:
-            result = checker.verify_registration(solver["solver_id"], args.verify_endpoint)
+            solver_id = solver.get("solver_id") or solver.get("solverId")
+            if not solver_id:
+                continue
+            result = checker.verify_registration(solver_id, args.verify_endpoint)
             results.append(result)
             if not args.json:
                 print_solver_result(result)
