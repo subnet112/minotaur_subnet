@@ -1,54 +1,52 @@
-from typing import Any, Dict
+from typing import Any
 
-import types
-import pytest
+from neurons.metagraph_manager import MetagraphManager
 
-import neurons.validator as vmod
+
+class FakeSubtensor:
+    def __init__(self, uid_for_hotkey: dict):
+        self._uid_for_hotkey = uid_for_hotkey
+        self.network = "local"
+
+    def get_uid_for_hotkey_on_subnet(self, hotkey: str, netuid: int):
+        return self._uid_for_hotkey.get(hotkey)
+
+    def get_current_block(self):
+        return 100
+
+
+class FakeWallet:
+    def __init__(self, hotkey: str):
+        self.hotkey = type("Hotkey", (), {"ss58_address": hotkey})()
 
 
 class FakeMetagraph:
-    def __init__(self, hotkeys, uids):
+    def __init__(self, hotkeys, uids, validator_permit):
         self.hotkeys = hotkeys
         self.uids = uids
-
-    def sync(self, subtensor: Any, lite: bool = True) -> None:  # pragma: no cover - no-op
-        return
+        self.validator_permit = validator_permit
 
 
-class FakeBt:
-    def __init__(self, hotkeys, uids):
-        self._mg = FakeMetagraph(hotkeys, uids)
-        self.logging = types.SimpleNamespace(
-            info=lambda *a, **k: None,
-            debug=lambda *a, **k: None,
-            warning=lambda *a, **k: None,
-            error=lambda *a, **k: None,
-        )
+def test_metagraph_snapshot_builds_uid_map_and_permit():
+    subtensor = FakeSubtensor(uid_for_hotkey={"hk-validator": 3})
+    wallet = FakeWallet("hk-validator")
+    logger = type("Logger", (), {"error": lambda *a, **k: None})()
 
-    def metagraph(self, netuid: int, subtensor: Any) -> FakeMetagraph:  # type: ignore[override]
-        return self._mg
+    manager = MetagraphManager(subtensor=subtensor, wallet=wallet, netuid=1, logger=logger)
 
-
-def test_validator_uses_metagraph_first(monkeypatch: Any) -> None:
-    # Arrange: prepare a Validator instance without running __init__
-    Validator = vmod.Validator
-    v = Validator.__new__(Validator)
-
-    # Minimal config/subtensor stubs
-    v.config = types.SimpleNamespace(netuid=2)
-    v.subtensor = types.SimpleNamespace(network="local")
-
-    # Fake bt returns a metagraph with 2 entries
-    fake_bt = FakeBt(
-        hotkeys=["HK1", "HK2"],
-        uids=[0, 5],
+    metagraph = FakeMetagraph(
+        hotkeys=["hk-1", "hk-2", "hk-validator"],
+        uids=[0, 1, 3],
+        validator_permit=[True, True, False, True],
     )
-    monkeypatch.setattr(vmod, "bt", fake_bt)
 
-    # Act
-    mapping: Dict[str, int] = v._build_miner_id_to_uid_map()
+    snapshot = manager._build_snapshot(metagraph)
 
-    # Assert
-    assert mapping == {"HK1": 0, "HK2": 5}
+    assert snapshot is not None
+    assert snapshot.uid_for_hotkey["hk-1"] == 0
+    assert snapshot.uid_for_hotkey["hk-2"] == 1
+    assert snapshot.uid_for_hotkey["hk-validator"] == 3
+    assert snapshot.validator_uid == 3
+    assert snapshot.validator_permit is True
 
 
