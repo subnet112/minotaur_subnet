@@ -177,6 +177,7 @@ class MockValidator:
         max_concurrent_simulations: int = 5,
         logger: Optional[logging.Logger] = None,
         heartbeat_callback: Optional[Callable[[], None]] = None,
+        filter_user_address: Optional[str] = None,
     ):
         self.logger = logger or logging.getLogger(__name__)
 
@@ -270,6 +271,7 @@ class MockValidator:
             signing_keypair=test_keypair,  # Test keypair for simulation mode
             submit_weights_to_aggregator=True,  # Enable weight submission in mock mode
             heartbeat_callback=heartbeat_callback,
+            filter_user_address=filter_user_address,  # Only count orders from this user for scoring
         )
         
         # Log burn configuration
@@ -283,6 +285,13 @@ class MockValidator:
                     f"⚠️  Burn percentage is {burn_percentage:.1%} but creator_miner_id is not set - "
                     f"burn will NOT be applied to weights (only tracked in stats)"
                 )
+
+        # Log user address filter configuration
+        if filter_user_address:
+            self.logger.info(
+                f"🔍 User filter configured: only counting orders from {filter_user_address} for scoring "
+                f"(still validating all orders)"
+            )
 
         # Register mock weight callback (logs weights instead of setting on chain)
         self.validation_engine.add_weight_callback(self.mock_weight_callback)

@@ -28,7 +28,8 @@ class ValidationResult:
         miner_id: Optional[str],
         success: bool,
         error_message: Optional[str] = None,
-        execution_time: Optional[float] = None
+        execution_time: Optional[float] = None,
+        user_address: Optional[str] = None,
     ):
         self.order_id = order_id
         self.solver_id = solver_id
@@ -36,6 +37,7 @@ class ValidationResult:
         self.success = success
         self.error_message = error_message
         self.execution_time = execution_time
+        self.user_address = user_address
         self.timestamp = datetime.now(timezone.utc)
 
 
@@ -91,6 +93,7 @@ class ValidationEngine:
         signing_keypair: Optional[Any] = None,
         submit_weights_to_aggregator: bool = True,
         heartbeat_callback: Optional[Callable[[], None]] = None,
+        filter_user_address: Optional[str] = None,
     ):
         self.events_client = events_client
         self.validator_id = validator_id
@@ -111,6 +114,7 @@ class ValidationEngine:
         self.signing_keypair = signing_keypair  # Bittensor keypair for signing weights
         self.submit_weights_to_aggregator = submit_weights_to_aggregator
         self._heartbeat_callback = heartbeat_callback
+        self.filter_user_address = filter_user_address  # Only count orders from this user for scoring (mock mode)
 
         self._simulation_semaphore: Optional[asyncio.Semaphore] = None  # Created lazily in the event loop
         if self.logger:
@@ -201,13 +205,20 @@ class ValidationEngine:
         solver_id = order.get("solverId")  # Directly from order
         miner_id = order.get("minerId")  # Directly from order
 
+        # Extract user address from order for filtering
+        user_address = None
+        quote_details = order.get("quoteDetails", {})
+        available_inputs = quote_details.get("availableInputs", [])
+        if available_inputs and len(available_inputs) > 0:
+            user_address = available_inputs[0].get("user")
+
         if not solver_id:
             self.logger.warning(f"Order {order_id} missing solverId")
-            return ValidationResult(order_id, "unknown", miner_id, False, "Missing solverId")
+            return ValidationResult(order_id, "unknown", miner_id, False, "Missing solverId", user_address=user_address)
 
         if not miner_id:
             self.logger.warning(f"Order {order_id} missing minerId")
-            return ValidationResult(order_id, solver_id, None, False, "Missing minerId")
+            return ValidationResult(order_id, solver_id, None, False, "Missing minerId", user_address=user_address)
 
         # Get semaphore for current event loop (created lazily if needed)
         semaphore = self._get_simulation_semaphore()
@@ -244,7 +255,8 @@ class ValidationEngine:
             miner_id=miner_id,
             success=success,
             error_message=error_message,
-            execution_time=execution_time
+            execution_time=execution_time,
+            user_address=user_address,
         )
 
         if success:
@@ -307,6 +319,7 @@ class ValidationEngine:
         """Compute scores and stats from validation results."""
         miner_validated: Dict[str, int] = defaultdict(int)
         miner_total: Dict[str, int] = defaultdict(int)
+        filtered_count = 0
 
         for result in validation_results:
             miner_id = result.miner_id
@@ -314,9 +327,18 @@ class ValidationEngine:
                 self.logger.warning(f"Skipping result for order {result.order_id}: missing miner_id")
                 continue  # Skip results without miner_id
 
+            # Filter by user address if configured (for mock mode testing)
+            if self.filter_user_address:
+                if result.user_address != self.filter_user_address:
+                    filtered_count += 1
+                    continue  # Skip orders not from the specified user
+
             miner_total[miner_id] += 1
             if result.success:
                 miner_validated[miner_id] += 1
+
+        if filtered_count > 0:
+            self.logger.info(f"🔍 Filtered {filtered_count} orders not from user {self.filter_user_address[:10]}... (only counting filtered user for scoring)")
 
         # Compute scores
         scores = {}
@@ -342,7 +364,9 @@ class ValidationEngine:
             "total_simulations": len(validation_results),
             "valid_miners": len(scores),
             "total_miners": len(miner_total),
-            "burn_percentage": self.burn_percentage
+            "burn_percentage": self.burn_percentage,
+            "filtered_orders": filtered_count,
+            "filter_user_address": self.filter_user_address,
         }
 
         return scores, stats

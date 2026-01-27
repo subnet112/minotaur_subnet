@@ -146,6 +146,7 @@ class Validator:
             max_concurrent_simulations=getattr(self.config, "simulator_max_concurrent", 5),
             logger=bt.logging,  # Use bittensor logging for consistent SUCCESS level support
             heartbeat_callback=self._heartbeat,
+            filter_user_address=getattr(self.config, "mock_filter_user_address", None),
         )
 
         # Initialize state store for mock mode
@@ -223,6 +224,8 @@ class Validator:
         parser.add_argument("--no-validator.continuous", dest="validator_continuous", action="store_false", help="Disable continuous epoch mode")
         # Validator mode
         parser.add_argument("--validator.mode", choices=["bittensor", "mock"], default="bittensor", help="Validator mode: bittensor (production) or mock (simulation with real aggregator)")
+        # Mock mode filtering
+        parser.add_argument("--mock.filter_user_address", type=str, default=None, help="In mock mode, only count validations from this user address for scoring (still validates all orders)")
         # Polling / backoff
         parser.add_argument("--validator.poll_seconds", type=int, default=12, help="Base polling interval in seconds")
         parser.add_argument("--validator.backoff_factor", type=float, default=2.0, help="Multiplicative error backoff factor")
@@ -362,6 +365,9 @@ class Validator:
         validator_mode_cli = getattr(config, "validator", None) and getattr(config.validator, "mode", None)
         config.validator_mode = os.getenv("VALIDATOR_MODE", validator_mode_cli or "bittensor")
 
+        # Mock mode user address filter (only count validations from this user for scoring)
+        mock_filter_user_cli = getattr(config, "mock", None) and getattr(config.mock, "filter_user_address", None)
+        config.mock_filter_user_address = os.getenv("MOCK_FILTER_USER_ADDRESS", mock_filter_user_cli)
 
         # Polling/backoff overrides
         try:
