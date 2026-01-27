@@ -145,18 +145,18 @@ class BittensorValidator:
 
         return OnchainWeightsEmitter(
             netuid=netuid,
-            wallet_name=wallet_name,
-            hotkey_name=hotkey_name,
+            validator_wallet_name=wallet_name,
+            validator_hotkey_name=hotkey_name,
             subtensor_network=subtensor_network,
             subtensor_address=subtensor_address,
-            logger=self.logger
+            logger=self.logger,
         )
 
     def _get_creator_hotkey(self) -> Optional[str]:
         """Get the creator hotkey for burn allocation."""
         try:
             # Do a lightweight metagraph sync to get UID 0 hotkey
-            metagraph = bt.metagraph(netuid=self.config.netuid, subtensor=self.subtensor, lite=True)
+            metagraph = bt.Metagraph(netuid=int(self.config.netuid), network=self.subtensor.network, sync=False)
             metagraph.sync(subtensor=self.subtensor, lite=True)
 
             if len(metagraph.hotkeys) > 0:
@@ -203,18 +203,20 @@ class BittensorValidator:
         
         # Create validation engine
         # Pass wallet hotkey keypair for signing weights
+        filter_user_address = getattr(self.config, "mock_filter_user_address", None)
         return ValidationEngine(
             events_client=events_client,
             validator_id=validator_id,
             simulator=simulator,
             logger=self.logger,
-            validation_interval_seconds=int(self.config.validator_poll_seconds),
-            burn_percentage=float(self.config.burn_percentage),
+            validation_interval_seconds=int(getattr(self.config, "poll_seconds", 12)),
+            burn_percentage=float(getattr(self.config, "burn_percentage", 0.0)),
             creator_miner_id=self._creator_hotkey,
             max_concurrent_simulations=max_concurrent,
             signing_keypair=self.wallet.hotkey,  # Bittensor keypair for signing
             submit_weights_to_aggregator=True,
             heartbeat_callback=self._heartbeat_callback,
+            filter_user_address=filter_user_address,
         )
 
     @property
