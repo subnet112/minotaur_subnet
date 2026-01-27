@@ -45,8 +45,14 @@ class WindowPlanner:
     def _get_current_block(self) -> int:
         try:
             header = self.substrate.get_block_header(block_hash=None)
-            # header.number can be hex string or int depending on library version
-            num = header.get("number") if isinstance(header, dict) else getattr(header, "number", None)
+            # header can be nested dict {'header': {...}} or direct dict/object
+            if isinstance(header, dict):
+                if "header" in header:
+                    num = header["header"].get("number")
+                else:
+                    num = header.get("number")
+            else:
+                num = getattr(header, "number", None)
             if isinstance(num, str):
                 return int(num, 16)
             return int(num)
