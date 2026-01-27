@@ -167,23 +167,14 @@ class OnchainWeightsEmitter:
             return self._subtensor
 
         bt_module = self._import_bittensor()
-        config = bt_module.subtensor.config()
-        if self.subtensor_network:
-            try:
-                config.subtensor.network = self.subtensor_network
-            except AttributeError:
-                pass
-        if self.subtensor_address:
-            try:
-                config.subtensor.chain_endpoint = self.subtensor_address
-            except AttributeError:
-                pass
 
-        subtensor = bt_module.subtensor(network=self.subtensor_network or None, config=config)
+        # Always use finney for transactions - archive nodes are read-only
+        # Even if validator uses archive for historical queries, we need finney to submit weights
+        network = self.subtensor_network
+        if network == "archive":
+            network = "finney"
 
-        if self.subtensor_address and getattr(subtensor, "chain_endpoint", None) != self.subtensor_address:
-            subtensor.chain_endpoint = self.subtensor_address
-            subtensor.substrate = subtensor._get_substrate()  # type: ignore[attr-defined]
+        subtensor = bt_module.Subtensor(network=network or "finney")
 
         self._subtensor = subtensor
         return subtensor
