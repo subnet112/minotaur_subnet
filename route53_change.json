@@ -1,0 +1,18 @@
+{
+    "Comment": "Create A record for validator dashboard",
+    "Changes": [
+        {
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "valivali.minotaursubnet.com",
+                "Type": "A",
+                "TTL": 300,
+                "ResourceRecords": [
+                    {
+                        "Value": "34.239.154.249"
+                    }
+                ]
+            }
+        }
+    ]
+}
