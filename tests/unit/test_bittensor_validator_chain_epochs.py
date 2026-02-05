@@ -38,7 +38,7 @@ class DummyLogger:
 
 def test_chain_aligned_epochs_ignore_epoch_minutes(monkeypatch):
     class FakeWindowPlanner:
-        def __init__(self, substrate, netuid):
+        def __init__(self, substrate, netuid, *, finney_substrate=None):
             return None
 
         def previous_epoch_window(self, last_processed_epoch, finalization_buffer_blocks):

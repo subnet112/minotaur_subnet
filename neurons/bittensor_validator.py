@@ -236,7 +236,30 @@ class BittensorValidator:
         await self._validation_engine.start_continuous_validation()
 
         try:
-            planner = WindowPlanner(self.subtensor.substrate, int(self.config.netuid))
+            # When using archive network, create a dedicated finney substrate
+            # for chain-head queries so epoch detection isn't delayed by
+            # the archive node lagging behind.
+            finney_substrate = None
+            network = getattr(self.subtensor, "network", "finney")
+            if network == "archive":
+                try:
+                    finney_sub = bt.Subtensor(network="finney")
+                    finney_substrate = finney_sub.substrate
+                    self.logger.info(
+                        "Created dedicated finney substrate for chain-head queries",
+                        prefix="WINDOW",
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to create finney substrate, falling back to archive: {e}",
+                        prefix="WINDOW",
+                    )
+
+            planner = WindowPlanner(
+                self.subtensor.substrate,
+                int(self.config.netuid),
+                finney_substrate=finney_substrate,
+            )
             poll_seconds = int(getattr(self.config, "poll_seconds", 12))
             buffer_blocks = int(getattr(self.config, "finalization_buffer_blocks", 6))
 

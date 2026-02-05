@@ -272,6 +272,8 @@ class OnchainWeightsEmitter:
 
         except Exception as e:
             self.logger.error(f"Error emitting weights via bittensor: {e}", exc_info=True)
+            # Clear cached subtensor so the next call creates a fresh connection
+            self._subtensor = None
             return False
 
     async def emit_async(self, weights_mapping: Dict[str, float]) -> bool:

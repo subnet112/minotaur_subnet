@@ -31,7 +31,8 @@ class MetagraphManager:
     def refresh(self, force: bool = False) -> Optional[MetagraphSnapshot]:
         try:
             block = self.subtensor.get_current_block()
-        except Exception:
+        except Exception as exc:
+            self.logger.warning("Failed to get current block for metagraph refresh: %s", exc)
             block = None
 
         if not force and self._last_block is not None and block is not None and block - self._last_block < 5:
@@ -79,7 +80,8 @@ class MetagraphManager:
             try:
                 validator_uid = self.subtensor.get_uid_for_hotkey_on_subnet(validator_ss58, self.netuid)
                 validator_permit = bool(m.validator_permit[validator_uid]) if validator_uid is not None else False
-            except Exception:
+            except Exception as exc:
+                self.logger.warning("Failed to resolve validator permit for %s: %s", validator_ss58, exc)
                 validator_permit = False
 
         if not validator_permit:

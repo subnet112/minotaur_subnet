@@ -6,6 +6,7 @@ slice the same window deterministically.
 """
 from __future__ import annotations
 
+import logging
 import os
 import datetime as dt
 from typing import Tuple, Optional
@@ -13,6 +14,8 @@ from typing import Tuple, Optional
 from async_substrate_interface.sync_substrate import SubstrateInterface
 
 from .exceptions import WindowPlannerError
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> dt.datetime:
@@ -24,9 +27,10 @@ def _to_iso(ts: dt.datetime) -> str:
 
 
 class WindowPlanner:
-    def __init__(self, substrate: SubstrateInterface, netuid: int):
+    def __init__(self, substrate: SubstrateInterface, netuid: int, *, finney_substrate: SubstrateInterface | None = None):
         self.substrate = substrate
         self.netuid = int(netuid)
+        self._finney_substrate = finney_substrate
         self.max_timestamp_retries = int(os.getenv("WINDOW_PLANNER_MAX_RETRIES", "3"))
 
     def _get_tempo(self) -> int:
@@ -34,8 +38,8 @@ class WindowPlanner:
             q = self.substrate.query("SubtensorModule", "Tempo", [self.netuid])
             tempo = int(q.value) if q is not None else 360
             return max(1, tempo)
-        except Exception:
-            # Sensible default if query fails
+        except Exception as exc:
+            logger.warning("Failed to query Tempo, using default 360: %s", exc)
             return 360
 
     def get_current_tempo(self) -> int:
@@ -43,8 +47,9 @@ class WindowPlanner:
         return self._get_tempo()
 
     def _get_current_block(self) -> int:
+        substrate = self._finney_substrate or self.substrate
         try:
-            header = self.substrate.get_block_header(block_hash=None)
+            header = substrate.get_block_header(block_hash=None)
             # header can be nested dict {'header': {...}} or direct dict/object
             if isinstance(header, dict):
                 if "header" in header:
@@ -56,38 +61,62 @@ class WindowPlanner:
             if isinstance(num, str):
                 return int(num, 16)
             return int(num)
-        except Exception:
-            # Fallback to 0
+        except Exception as exc:
+            logger.warning("Failed to get current block, falling back to 0: %s", exc)
             return 0
 
-    def _block_hash(self, block_number: int) -> Optional[str]:
+    def _block_hash(self, block_number: int, substrate: SubstrateInterface | None = None) -> Optional[str]:
+        sub = substrate or self.substrate
         try:
-            return self.substrate.get_block_hash(block_number)
-        except Exception:
+            return sub.get_block_hash(block_number)
+        except Exception as exc:
+            logger.warning("Failed to get block hash for block %d: %s", block_number, exc)
             return None
 
-    def _block_timestamp_iso(self, block_hash: Optional[str]) -> Optional[str]:
+    def _block_timestamp_iso(self, block_hash: Optional[str], substrate: SubstrateInterface | None = None) -> Optional[str]:
         if not block_hash:
             return None
+        sub = substrate or self.substrate
         try:
-            tsq = self.substrate.query("Timestamp", "Now", block_hash=block_hash)
+            tsq = sub.query("Timestamp", "Now", block_hash=block_hash)
             # Timestamp pallet stores milliseconds since epoch
             millis = int(tsq.value) if tsq is not None else None
             if millis is None:
                 return None
             dt_ = dt.datetime.fromtimestamp(millis / 1000.0, tz=dt.timezone.utc)
             return _to_iso(dt_)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to get timestamp for block hash %s: %s", block_hash, exc)
             return None
 
     def _resolve_block_timestamp(self, block_number: int) -> Optional[str]:
         attempts = max(1, self.max_timestamp_retries)
+        # Try archive first (preferred for historical data)
         for _ in range(attempts):
             block_hash = self._block_hash(block_number)
             ts = self._block_timestamp_iso(block_hash)
             if ts:
                 return ts
+        # Fall back to finney for recent blocks the archive hasn't indexed yet
+        if self._finney_substrate:
+            for _ in range(attempts):
+                block_hash = self._block_hash(block_number, substrate=self._finney_substrate)
+                ts = self._block_timestamp_iso(block_hash, substrate=self._finney_substrate)
+                if ts:
+                    return ts
         return None
+
+    def _estimate_block_timestamp(self, block_number: int, cur_block: int, block_time_seconds: float = 12.0) -> str:
+        """Estimate a block's timestamp from the current time and block distance.
+
+        Bittensor produces blocks at a ~12-second cadence.  When neither archive
+        nor finney can return an on-chain timestamp (archive too far behind,
+        finney state pruned), we estimate using:
+            now - (cur_block - block_number) * block_time
+        """
+        blocks_ago = max(0, cur_block - block_number)
+        estimated = _utcnow() - dt.timedelta(seconds=blocks_ago * block_time_seconds)
+        return _to_iso(estimated)
 
     def previous_epoch_window(
         self,
@@ -99,6 +128,8 @@ class WindowPlanner:
         Epoch index is derived as floor(current_block / tempo). The previous
         epoch spans blocks [start, end] = [(epoch-1)*tempo, epoch*tempo - 1].
         Timestamps are taken from the Timestamp pallet at the start and end blocks.
+        If on-chain timestamps are unavailable (e.g. archive behind, finney pruned),
+        timestamps are estimated from block distance.
         """
         tempo = self._get_tempo()
         cur_block = self._get_current_block()
@@ -120,10 +151,15 @@ class WindowPlanner:
         from_ts = self._resolve_block_timestamp(start_block)
         to_ts = self._resolve_block_timestamp(end_block_inclusive)
 
-        # Fallbacks: if timestamps unavailable, use now-based approximations
+        # Fallback: estimate from block distance when on-chain queries fail
         if not from_ts or not to_ts:
-            raise WindowPlannerError(
-                f"Failed to resolve timestamps for epoch {prev_epoch} blocks {start_block}-{end_block_inclusive}"
+            if not from_ts:
+                from_ts = self._estimate_block_timestamp(start_block, cur_block)
+            if not to_ts:
+                to_ts = self._estimate_block_timestamp(end_block_inclusive, cur_block)
+            logger.warning(
+                "Using estimated timestamps for epoch %d (blocks %d-%d): archive/finney state unavailable",
+                prev_epoch, start_block, end_block_inclusive,
             )
 
         return int(prev_epoch), str(from_ts), str(to_ts)
