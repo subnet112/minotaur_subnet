@@ -1,0 +1,95 @@
+version: "3.8"
+
+# Full-stack emulation for Minotaur v2 integration testing.
+# Usage: docker compose -f tests/emulation/docker-compose.emulation.yml up
+
+services:
+  # Local Bittensor chain (alice/bob default keys)
+  subtensor-local:
+    image: opentensor/subtensor:latest
+    command: ["--dev", "--ws-external"]
+    ports:
+      - "9944:9944"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9944"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Anvil forking Ethereum mainnet
+  anvil-eth:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command:
+      - "--fork-url"
+      - "${ETHEREUM_RPC_URL:-https://eth.llamarpc.com}"
+      - "--port"
+      - "8545"
+      - "--block-time"
+      - "2"
+      - "--chain-id"
+      - "1"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Anvil forking Base
+  anvil-base:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command:
+      - "--fork-url"
+      - "${BASE_RPC_URL:-https://mainnet.base.org}"
+      - "--port"
+      - "8546"
+      - "--block-time"
+      - "2"
+      - "--chain-id"
+      - "8453"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+    ports:
+      - "8546:8546"
+
+  # Minotaur API + BlockLoop
+  api:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    command: ["python", "-m", "minotaur_subnet.api.server", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    environment:
+      - ETHEREUM_RPC_URL=http://anvil-eth:8545
+      - BASE_RPC_URL=http://anvil-base:8546
+      - BLOCK_LOOP_TICK_INTERVAL=5
+      - BLOCK_LOOP_SCORE_THRESHOLD=0.3
+      - DISABLE_BENCHMARK_WORKER=true
+    depends_on:
+      anvil-eth:
+        condition: service_healthy
+
+  # Relayer service
+  relayer:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    command: ["python", "-m", "minotaur_subnet.relayer.main", "--port", "8091"]
+    ports:
+      - "8091:8091"
+    environment:
+      - ETHEREUM_RPC_URL=http://anvil-eth:8545
+      - BASE_RPC_URL=http://anvil-base:8546
+    depends_on:
+      anvil-eth:
+        condition: service_healthy

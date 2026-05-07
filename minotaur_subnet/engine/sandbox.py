@@ -1,0 +1,191 @@
+"""
+JsSandbox - Sandboxed JS execution via Node.js subprocess.
+
+Executes JavaScript code in an isolated Node.js VM context with:
+- No access to require/import (no filesystem, network, child_process)
+- No access to process object (no env vars, exit, etc.)
+- Configurable timeout (enforced by both Python asyncio and Node VM)
+- JSON-based communication over stdin/stdout
+
+The actual sandboxing is done by runner.js using Node's vm.createContext().
+"""
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+from dataclasses import asdict
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Path to the Node.js runner script (co-located with this module)
+_RUNNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runner.js")
+
+
+class JsSandboxError(Exception):
+    """Base exception for sandbox errors."""
+    pass
+
+
+class JsTimeoutError(JsSandboxError):
+    """Raised when JS execution exceeds the timeout."""
+    pass
+
+
+class JsRuntimeError(JsSandboxError):
+    """Raised when JS code throws an error during execution."""
+    pass
+
+
+class JsSandbox:
+    """Sandboxed JS execution environment using Node.js subprocess.
+
+    Each call to execute() or execute_async() spawns a fresh Node.js process,
+    ensuring complete isolation between invocations. The JS code runs inside
+    a vm.createContext sandbox with no access to Node built-ins.
+    """
+
+    def __init__(self, timeout_ms: int = 5000, max_memory_mb: int = 128):
+        """Initialize the sandbox.
+
+        Args:
+            timeout_ms: Maximum execution time in milliseconds.
+            max_memory_mb: Maximum memory for the Node.js process (V8 heap limit).
+        """
+        self.timeout_ms = timeout_ms
+        self.max_memory_mb = max_memory_mb
+        self._node_path = self._find_node()
+
+    @staticmethod
+    def _find_node() -> str:
+        """Locate the Node.js binary."""
+        node = shutil.which("node")
+        if node is None:
+            raise JsSandboxError(
+                "Node.js is required but not found on PATH. "
+                "Install Node.js (v18+) to use the JS execution engine."
+            )
+        return node
+
+    def execute(self, js_code: str, function_name: str, args: list[Any]) -> Any:
+        """Execute a JS function synchronously (blocking).
+
+        Creates a new event loop if needed. Prefer execute_async() when
+        running inside an existing async context.
+        """
+        return asyncio.get_event_loop().run_until_complete(
+            self.execute_async(js_code, function_name, args)
+        )
+
+    async def execute_async(
+        self, js_code: str, function_name: str, args: list[Any]
+    ) -> Any:
+        """Execute a JS function in the sandbox asynchronously.
+
+        Args:
+            js_code: The JavaScript module source code (must set module.exports).
+            function_name: Name of the exported function to call.
+            args: Arguments to pass to the function (must be JSON-serializable).
+
+        Returns:
+            The return value from the JS function (deserialized from JSON).
+
+        Raises:
+            JsTimeoutError: If execution exceeds timeout_ms.
+            JsRuntimeError: If the JS code throws an error.
+            JsSandboxError: For other failures (Node not found, invalid input, etc.).
+        """
+        # Prepare the payload for runner.js
+        payload = {
+            "jsCode": js_code,
+            "functionName": function_name,
+            "args": _make_json_safe(args),
+        }
+        payload_bytes = json.dumps(payload).encode("utf-8")
+
+        # Build the Node.js command with memory limit
+        node_args = [
+            f"--max-old-space-size={self.max_memory_mb}",
+            _RUNNER_PATH,
+        ]
+
+        timeout_seconds = self.timeout_ms / 1000.0
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._node_path,
+                *node_args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=payload_bytes),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                # Kill the process on timeout
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                raise JsTimeoutError(
+                    f"JS execution timed out after {self.timeout_ms}ms"
+                )
+
+        except JsTimeoutError:
+            raise
+        except OSError as exc:
+            raise JsSandboxError(f"Failed to start Node.js process: {exc}") from exc
+
+        # Log any stderr output (JS console.log/warn/error)
+        if stderr:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                for line in stderr_text.split("\n"):
+                    logger.debug("JS stderr: %s", line)
+
+        # Parse the JSON response from runner.js
+        if not stdout:
+            raise JsSandboxError(
+                "Node.js process produced no output. "
+                f"Exit code: {proc.returncode}"
+            )
+
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+
+        try:
+            response = json.loads(stdout_text)
+        except json.JSONDecodeError as exc:
+            raise JsSandboxError(
+                f"Failed to parse Node.js output as JSON: {exc}. "
+                f"Raw output: {stdout_text[:500]}"
+            ) from exc
+
+        if not response.get("success"):
+            error_msg = response.get("error", "Unknown JS error")
+            error_type = response.get("errorType", "RuntimeError")
+            if error_type == "TimeoutError":
+                raise JsTimeoutError(f"JS execution timed out: {error_msg}")
+            raise JsRuntimeError(f"JS {error_type}: {error_msg}")
+
+        return response.get("result")
+
+
+def _make_json_safe(obj: Any) -> Any:
+    """Recursively convert dataclasses and other non-JSON types to dicts/primitives."""
+    if hasattr(obj, "__dataclass_fields__"):
+        return {k: _make_json_safe(v) for k, v in asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_safe(item) for item in obj]
+    if isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    # Fallback: try str()
+    return str(obj)

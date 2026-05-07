@@ -1,0 +1,13 @@
+# Dependencies for solver-base image
+# These are available to all IntentSolver submissions
+
+# Core SDK deps
+eth-abi>=4.0.0
+
+# Common ML/data libraries (miners can add more in their requirements.txt)
+numpy>=1.26.0
+scipy>=1.12.0
+pandas>=2.2.0
+
+# Utilities
+pydantic>=2.0.0

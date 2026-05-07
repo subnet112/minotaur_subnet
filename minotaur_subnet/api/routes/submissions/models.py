@@ -1,0 +1,191 @@
+"""Pydantic request/response models for solver submission endpoints."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class SubmitRequest(BaseModel):
+    repo_url: str = Field(
+        ...,
+        description=(
+            "Git repo URL (HTTPS). Public in production; private allowed in "
+            "controlled demos when the screening service has separate read-only "
+            "clone credentials."
+        ),
+        examples=["https://github.com/miner/my-solver"],
+    )
+    commit_hash: str = Field(
+        ..., description="Git commit hash to pin",
+        min_length=7, max_length=64,
+    )
+    round_id: str | None = Field(
+        default=None,
+        description=(
+            "Current solver round ID. New clients should send this; older "
+            "clients may continue signing with epoch during migration."
+        ),
+        min_length=1,
+    )
+    epoch: int = Field(..., description="Current epoch number", ge=0)
+    hotkey: str = Field(
+        ..., description="Miner's Bittensor hotkey (SS58)",
+        min_length=10,
+    )
+    signature: str = Field(
+        ..., description="Signature proving hotkey ownership (base64-encoded)",
+        min_length=1,
+    )
+
+
+class SubmitResponse(BaseModel):
+    submission_id: str
+    status: str
+    status_url: str
+    round_id: str
+    epoch: int
+
+
+class StatusResponse(BaseModel):
+    submission_id: str
+    status: str
+    round_id: str | None = None
+    screening: dict[str, Any]
+    image_tag: str | None = None
+    image_id: str | None = None
+    solver_name: str | None = None
+    solver_version: str | None = None
+    benchmark_score: float | None = None
+    benchmark_rank: int | None = None
+    rejection_reason: str | None = None
+
+
+class SourceSubmitRequest(BaseModel):
+    """Request body for source-based submission (no git/Docker)."""
+    solver_source: str = Field(
+        ...,
+        description="Complete Python source of the solver",
+        max_length=500_000,
+    )
+    hotkey: str = Field("local-miner", description="Miner identifier")
+    round_id: str | None = Field(
+        default=None,
+        description="Current solver round ID",
+        min_length=1,
+    )
+    epoch: int = Field(0, description="Epoch number", ge=0)
+    solver_name: str = Field("", description="Solver name")
+
+
+class SolverRoundResponse(BaseModel):
+    round_id: str
+    status: str
+    accepting_submissions: bool
+    opened_epoch: int
+    close_epoch: int | None = None
+    incumbent_submission_id: str | None = None
+    incumbent_image_id: str | None = None
+    benchmark_pack_hash: str | None = None
+    committee_block: int | None = None
+    committee_hash: str | None = None
+    quorum_required: int | None = None
+    decision_deadline_epoch: int | None = None
+    finalist_submission_id: str | None = None
+    finalist_image_id: str | None = None
+    finalist_score: float | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int | None = None
+    abort_reason: str | None = None
+    certificate_candidate_submission_id: str | None = None
+    certificate_candidate_image_id: str | None = None
+    certificate_quorum_required: int | None = None
+    certificate_approvals: int = 0
+
+
+class SolverChampionResponse(BaseModel):
+    submission_id: str | None = None
+    image_id: str | None = None
+    solver_name: str | None = None
+    solver_version: str | None = None
+    hotkey: str | None = None
+    activated_round_id: str | None = None
+    activated_epoch: int = 0
+    activated_at: float = 0.0
+
+
+class CloseRoundRequest(BaseModel):
+    round_id: str | None = None
+    close_epoch: int = Field(..., ge=0)
+    benchmark_pack_hash: str | None = None
+    committee_block: int | None = Field(default=None, ge=0)
+    committee_hash: str | None = None
+    quorum_required: int | None = Field(default=None, ge=0)
+    decision_deadline_epoch: int | None = Field(default=None, ge=0)
+    effective_epoch: int | None = Field(default=None, ge=0)
+
+
+class ChampionApprovalPayload(BaseModel):
+    validator_id: str
+    timestamp: float = 0.0
+    signature: str = ""
+    committee_hash: str | None = None
+    incumbent_image_id: str | None = None
+    candidate_submission_id: str | None = None
+    candidate_image_id: str | None = None
+    benchmark_pack_hash: str | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int | None = None
+    # v2 signed fields
+    commit_hash: str | None = None
+    nonce: int = 0
+    deadline: int = 0
+
+
+class CertifyRoundRequest(BaseModel):
+    round_id: str
+    candidate_submission_id: str | None = None
+    candidate_image_id: str | None = None
+    committee_hash: str | None = None
+    benchmark_pack_hash: str | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int = Field(..., ge=0)
+    quorum_required: int = Field(0, ge=0)
+    approvals: list[ChampionApprovalPayload] = Field(default_factory=list)
+
+
+class ActivateRoundRequest(BaseModel):
+    round_id: str
+    activation_epoch: int = Field(..., ge=0)
+
+
+class AbortRoundRequest(BaseModel):
+    round_id: str
+    reason: str = Field(..., min_length=1, max_length=256)
+
+
+class ChampionConsensusProposalRequest(BaseModel):
+    round_id: str
+    candidate_submission_id: str
+    candidate_image_id: str
+    committee_hash: str | None = None
+    incumbent_image_id: str | None = None
+    benchmark_pack_hash: str | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int = Field(..., ge=0)
+    close_epoch: int | None = Field(default=None, ge=0)
+    quorum_required: int | None = Field(default=None, ge=0)
+    decision_deadline_epoch: int | None = Field(default=None, ge=0)
+    committee_block: int | None = Field(default=None, ge=0)
+    # v2 signed fields — leader propagates to peers so they can rebuild and
+    # verify the identical digest.
+    commit_hash: str | None = None
+    nonce: int = 0
+    deadline: int = 0
+    # Per-proposer signature over the canonical JSON of this payload (with
+    # proposer_signature field stripped). Required when
+    # CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=1 — then shared API key
+    # alone is no longer enough.
+    proposer: str | None = None
+    proposer_signature: str | None = None

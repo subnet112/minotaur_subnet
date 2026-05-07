@@ -1,0 +1,123 @@
+# Validator Overview
+
+The Minotaur validator is the backbone of **Bittensor Subnet 112** -- a distributed intent execution platform. Validators run the Solving Engine, simulate execution plans on Ethereum forks, score results through a dual-scoring system, and reach consensus before relaying approved transactions on-chain.
+
+## Contents
+
+- [Quickstart](./quickstart.md) -- Get up and running
+- [Configuration](./configuration.md) -- Full CLI and environment variable reference
+- [Troubleshooting](./troubleshooting.md) -- Common issues and solutions
+
+## What Validators Do
+
+Validators perform six core functions:
+
+1. **Run the Solving Engine** -- Execute miner-submitted solver code to generate execution plans for user orders in the Intent OrderBook.
+2. **Simulate on Anvil forks** -- Plans are executed on Ethereum mainnet forks via Anvil, using snapshot/revert isolation so no real state is modified.
+3. **Dual scoring** -- Every plan is scored twice. The JavaScript score (from the app's JS scoring module, range 0.0--1.0) and the on-chain score (from contract simulation on the Anvil fork) must both exceed the configured threshold.
+4. **N-of-M consensus** -- The leader validator proposes plans; follower validators independently re-simulate, re-score, and sign EIP-712 approvals. Exact score match is not required -- followers sign if both scores pass their threshold.
+5. **Weight emission** -- Champion-takes-all model. The miner who submitted the currently active (best-performing) solver receives 100% of emissions via `set_weights()`.
+6. **Accept miner solver submissions** -- Validate incoming solver code, screen it through three stages, benchmark performance, and adopt the champion solver.
+
+## Architecture
+
+### Leader/Follower Model
+
+Validators operate in a leader/follower topology:
+
+- **Leader**: The validator with the highest TAO stake on subnet 112. Ties are broken by hotkey (lexicographic ascending). The leader runs the BlockLoop, processes all orders, and broadcasts proposals to followers.
+- **Followers**: All other registered validators. They receive proposals from the leader, independently re-simulate and re-score each plan, and sign EIP-712 approvals if both scores pass threshold.
+- **Leader failover**: When the leader changes (e.g., stake rebalancing), the Relayer drops all in-flight work. The new leader reprocesses everything from scratch.
+
+### BlockLoop Pipeline
+
+The BlockLoop is the core runtime for validators, executing once per tick (default: every 12 seconds, matching Ethereum block time).
+
+Each tick:
+
+1. **Expire** stale orders past their deadline.
+2. **Snapshot** all OPEN orders from the Intent OrderBook.
+3. **Process** each order through the full pipeline:
+   - Generate an execution plan (via the Solving Engine / miner solver)
+   - Simulate the plan on an Anvil fork (captures on-chain score and token transfer events)
+   - Run JS scoring (`score(plan, state, context)`)
+   - Both scores must exceed threshold (default: 0.5)
+   - Broadcast proposal to follower validators for consensus
+   - Collect N-of-M EIP-712 signatures
+   - Submit the approved plan via the Relayer
+4. **Cross-chain orders**: Two-phase lifecycle -- source leg execution, then BRIDGING status while the bridge transfer completes, then destination leg execution.
+
+### Dual Scoring
+
+Every execution plan is scored at two layers:
+
+| Layer | Where it runs | What it checks |
+|-------|---------------|----------------|
+| **JavaScript** | Validator Node.js sandbox | App-defined scoring logic via `score(plan, state, context)`. Reads simulation data including token transfers, gas usage, and state changes. Score range: 0.0--1.0. |
+| **Solidity** | Anvil fork (simulated on-chain) | Contract-enforced invariants, user signature verification, validator quorum checks. Executed via ephemeral proxy (`CREATE2`) for state isolation. |
+
+Both scores must independently exceed the threshold. This prevents any single layer from being bypassed.
+
+### Intent OrderBook
+
+The Intent OrderBook is the universal entry point for all intent execution:
+
+- **One-shot orders**: Execute once and complete.
+- **Perpetual orders**: Re-execute every tick when score exceeds threshold. No explicit trigger gate -- validators try every tick.
+- Orders are signed by users (EIP-712) and submitted to the OrderBook.
+- The leader validator's BlockLoop drains the OrderBook each tick.
+
+## HTTP API Endpoints
+
+The validator exposes an HTTP API on its configured port (default: 9100):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Service health, loaded intents, uptime |
+| `GET` | `/intents/available` | Active intents available for miners |
+| `GET` | `/intents/{app_id}/details` | Detailed info for a specific app |
+| `GET` | `/intents/{app_id}/scores` | Score history for a specific app |
+| `POST` | `/intents/{app_id}/submit` | Accept a miner plan submission |
+| `GET` | `/weights` | Current champion and weight mapping |
+| `GET` | `/weights/history` | Historical weight emissions |
+| `GET` | `/blockloop/status` | Block loop tick statistics |
+| `POST` | `/orders/submit` | Submit an order to the OrderBook |
+| `GET` | `/orders` | List orders in the OrderBook |
+| `POST` | `/apps/{app_id}/quote` | Get a dry-run quote for an intent |
+| `POST` | `/consensus/proposal` | Receive a proposal from the leader (followers) |
+| `GET` | `/consensus/info` | Consensus configuration and peer info |
+| `GET` | `/leader` | Leader status and metagraph info |
+| `POST` | `/reload` | Reload app definitions from store |
+
+Git/source solver submissions are currently served by the API server (`/v1/submissions*`), not by the standalone validator endpoint set above.
+
+## Entry Points
+
+There are three ways to run a validator:
+
+1. **Standalone validator** -- Direct Python process, connects to external Anvil and Subtensor:
+   ```bash
+   python -m minotaur_subnet.validator.main --port 9100
+   ```
+
+2. **API server** (also runs BlockLoop) -- For development and the REST API:
+   ```bash
+   python -m minotaur_subnet.api.server --port 8080
+   ```
+
+3. **Local testnet** -- Full Docker Compose stack including subtensor, Anvil forks, API, validator, miner, relayer, and frontend:
+   ```bash
+   make testnet-up
+   ```
+
+## Requirements
+
+- **Python 3.12** with project dependencies installed
+- **Node.js 20.x** for the JS scoring engine
+- **Foundry** (anvil, forge, cast) for simulation and contract interaction
+- **Bittensor wallet** with a registered hotkey on subnet 112
+- **Ethereum RPC URL** (Alchemy or Infura) for Anvil mainnet fork
+- **EVM private key** for EIP-712 consensus signing
+- Sufficient **TAO stake** to participate in leader election
+
+See [Quickstart](./quickstart.md) for step-by-step setup instructions.

@@ -1,0 +1,58 @@
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: minotaur_subnet/Dockerfile
+    command: ["python", "-m", "minotaur_subnet.validator.main", "--port", "9100", "--epoch-seconds", "60", "--store-path", "/data/store.json"]
+    ports:
+      - "9100:9100"
+    volumes:
+      - store-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: ..
+      dockerfile: minotaur_subnet/Dockerfile
+    command: ["python", "-m", "minotaur_subnet.api.server", "--port", "8080"]
+    environment:
+      APP_INTENTS_STORE_PATH: /data/store.json
+    ports:
+      - "8080:8080"
+    volumes:
+      - store-data:/data
+    depends_on:
+      validator:
+        condition: service_healthy
+
+  mcp:
+    build:
+      context: ..
+      dockerfile: minotaur_subnet/Dockerfile
+    command: ["python", "-m", "minotaur_subnet.mcp.server"]
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_PORT: "8090"
+      MINOTAUR_API_URL: http://api:8080
+    ports:
+      - "8090:8090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  miner:
+    build:
+      context: ..
+      dockerfile: minotaur_subnet/Dockerfile
+    command: ["python", "-m", "minotaur_subnet.miner.main", "--validator-url", "http://validator:9100", "--miner-id", "miner-001", "--poll-interval", "10"]
+    depends_on:
+      validator:
+        condition: service_healthy
+
+volumes:
+  store-data:

@@ -1,0 +1,54 @@
+# Pinned production dependencies.
+#
+# All versions are == (not >=) so CI/prod rebuilds are reproducible and a
+# silent transitive upgrade can't break signature verification or consensus
+# compatibility between leader and peers.
+#
+# To bump: change the pin, rebuild the venv (.venv/bin/pip install -r
+# requirements.txt), run `make test-unit && make test-cross-chain`, and
+# commit. Never drift to >= without a matching upgrade-plan test.
+
+# Bittensor subnet integration
+bittensor==10.1.0
+bittensor-cli==9.18.1
+bittensor-wallet==4.0.1
+async-substrate-interface==1.6.3
+
+# HTTP / core
+requests==2.32.5
+aiohttp==3.13.3
+httpx==0.28.1
+numpy==2.4.2
+
+# Testing
+pytest==9.0.2
+requests-mock==1.12.1
+
+# Miner and solver dependencies
+flask==3.1.3
+web3==7.14.1
+eth-utils==5.3.1
+eth-abi==5.2.0
+eth-account==0.13.7
+eth-keys==0.7.0
+pynacl==1.6.2
+base58==2.1.1
+python-dotenv==1.2.2
+
+# App Intents API
+fastapi==0.135.1
+uvicorn==0.41.0
+
+# App Intents LLM code generation
+anthropic==0.84.0
+
+# MCP (Model Context Protocol) SDK — required by the miner agent's
+# mcp_server which exposes test_strategy, score_strategy, read_contract,
+# etc. as tools to the Claude CLI. Without this package, Claude's MCP
+# session silently fails to initialize and the agent runs with only
+# built-in tools (no ability to test or score its own output).
+mcp==1.26.0
+
+# AWS Secrets Manager + CloudWatch (Phase 5). Falls back gracefully if
+# missing so dev rigs that don't have AWS creds still work.
+boto3==1.42.91

@@ -1,0 +1,14 @@
+{
+  "name": "minotaur-lit-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local testnet Lit Protocol wallet bridge (ethers.js backend)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ethers": "^6.13.0"
+  }
+}

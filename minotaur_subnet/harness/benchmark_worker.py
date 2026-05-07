@@ -1,0 +1,1175 @@
+"""Background benchmark worker.
+
+Processes submissions that have passed screening and are in BENCHMARKING
+status. Loads active intents, builds snapshots, runs the harness, scores
+plans via JsExecutionEngine, and ranks replay results for a later round
+coordinator to evaluate.
+
+Usage:
+    worker = BenchmarkWorker(submission_store, app_store)
+    await worker.run_once()          # Process one batch
+    await worker.run_loop(interval=30)  # Continuous polling
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from minotaur_subnet.shared.types import (
+    AppIntentDefinition,
+    ExecutionPlan,
+    IntentState,
+    ScoreResult,
+    SimulationResult,
+    TriggerType,
+)
+from minotaur_subnet.sdk.intent_solver import MarketSnapshot
+from minotaur_subnet.harness.submission_store import (
+    SubmissionStatus,
+    SubmissionStore,
+)
+from minotaur_subnet.harness.round_store import RoundStatus, RoundStore
+from minotaur_subnet.harness.orchestrator import (
+    BenchmarkConfig,
+    BenchmarkResult,
+    SolverOrchestrator,
+    SolverSession,
+    SolverTimeoutError,
+    SolverCrashedError,
+    run_benchmark,
+)
+from minotaur_subnet.weight_policy import GENESIS_HOTKEY
+
+logger = logging.getLogger(__name__)
+
+# Genesis submission sentinel values
+GENESIS_REPO_URL = "builtin://baseline-swap-solver"
+GENESIS_EPOCH = 0
+GENESIS_SOLVER_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
+
+
+@dataclass
+class _StageScore:
+    """Aggregated score for one benchmark stage (synthetic or historical)."""
+    avg_score: float
+    count: int
+    success_count: int
+
+
+def _result_stage(result: Any) -> str:
+    """Extract the stage tag ('synthetic' or 'historical') from a result.
+
+    The stage is embedded in the intent_id format. Historical scenarios
+    use 'hist:ord_xxx' in the scenario name; synthetic use the manifest
+    scenario name. For backward compat, unknown tags default to 'synthetic'.
+    """
+    intent_id = getattr(result, "intent_id", "") or ""
+    if ":hist:" in intent_id or intent_id.endswith(":hist") or "hist:ord_" in intent_id:
+        return "historical"
+    return "synthetic"
+
+
+@dataclass
+class BenchmarkScorecard:
+    """Per-app and per-scenario scoring breakdown.
+
+    Used by the champion adoption logic to enforce non-regression
+    guarantees and per-app quality floors.
+    """
+    global_score: float = 0.0
+    app_scores: dict[str, float] = field(default_factory=dict)
+    scenario_scores: dict[str, float] = field(default_factory=dict)
+    failures: int = 0
+    total: int = 0
+    mock_simulation_count: int = 0  # Number of results that used fabricated simulation
+
+    @property
+    def coverage(self) -> float:
+        return (self.total - self.failures) / self.total if self.total > 0 else 0.0
+
+    @property
+    def mock_simulation_ratio(self) -> float:
+        """Fraction of results that relied on mock simulation (0.0 – 1.0)."""
+        return self.mock_simulation_count / self.total if self.total > 0 else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "global_score": self.global_score,
+            "app_scores": dict(self.app_scores),
+            "scenario_scores": dict(self.scenario_scores),
+            "failures": self.failures,
+            "total": self.total,
+            "coverage": self.coverage,
+            "mock_simulation_count": self.mock_simulation_count,
+            "mock_simulation_ratio": self.mock_simulation_ratio,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BenchmarkScorecard":
+        if not data:
+            return cls()
+        return cls(
+            global_score=data.get("global_score", 0.0),
+            app_scores=data.get("app_scores", {}),
+            scenario_scores=data.get("scenario_scores", {}),
+            failures=data.get("failures", 0),
+            total=data.get("total", 0),
+            mock_simulation_count=data.get("mock_simulation_count", 0),
+        )
+
+
+def _allow_subprocess_benchmark() -> bool:
+    """Subprocess benchmarking is permanently disabled.
+
+    All miner submissions run in sandboxed Docker containers with:
+    - --network=benchmark-sandbox (iptables-restricted, only Anvil RPCs)
+    - --read-only, --cap-drop=ALL, --no-new-privileges
+    - Memory + CPU limits
+    - No access to host filesystem, secrets, or other services
+
+    The ALLOW_SUBPROCESS_BENCHMARK env var is ignored. Subprocess mode
+    was a development shortcut that runs untrusted code directly on the
+    host with no isolation — it has been removed.
+    """
+    return False
+
+class BenchmarkWorker:
+    """Processes BENCHMARKING submissions by scoring them against active intents.
+
+    Runs as a background task, polling the submission store for work.
+    """
+
+    def __init__(
+        self,
+        submission_store: SubmissionStore,
+        app_store: Any = None,  # AppIntentStore, optional for DI
+        js_engine: Any = None,  # JsExecutionEngine, optional for DI
+        use_docker: bool = True,
+        snapshot_builder: Any = None,  # SnapshotBuilder, optional for DI
+        epoch_block_number: int | None = None,
+        round_store: RoundStore | None = None,
+        on_champion_adopted: Any = None,  # deprecated compatibility hook
+        genesis_solver_image: str | None = None,  # Docker image for genesis benchmarking
+        simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
+    ) -> None:
+        self._sub_store = submission_store
+        self._app_store = app_store
+        self._js_engine = js_engine
+        self._use_docker = use_docker
+        self._snapshot_builder = snapshot_builder
+        self._epoch_block_number = epoch_block_number
+        self._round_store = round_store
+        self._on_champion_adopted = on_champion_adopted
+        self._genesis_solver_image = genesis_solver_image or GENESIS_SOLVER_IMAGE or None
+        self._simulator = simulator
+        self._running = False
+
+    def set_epoch_block(self, block_number: int) -> None:
+        """Set the block number for this epoch's snapshot.
+
+        Called by EpochManager before run_once() to pin snapshots to
+        a specific block for deterministic benchmarking.
+        """
+        self._epoch_block_number = block_number
+
+    async def run_loop(self, interval: float = 30.0) -> None:
+        """Continuously poll for and process BENCHMARKING submissions.
+
+        Args:
+            interval: Seconds between polls when no work is found.
+        """
+        self._running = True
+        logger.info("Benchmark worker started (interval=%ds)", interval)
+
+        while self._running:
+            try:
+                processed = await self.run_once()
+                if processed == 0:
+                    await asyncio.sleep(interval)
+            except Exception as exc:
+                logger.exception("Benchmark worker error: %s", exc)
+                await asyncio.sleep(interval)
+
+    def stop(self) -> None:
+        """Signal the worker to stop after the current batch."""
+        self._running = False
+
+    def _current_replay_round(self) -> Any | None:
+        """Return the active replay-ready round when explicit round gating is enabled."""
+        if self._round_store is None:
+            return None
+        current = self._round_store.get_current_round()
+        if current is None:
+            return None
+        if current.status in (RoundStatus.CLOSED, RoundStatus.REPLAYING):
+            return current
+        return None
+
+    async def run_once(self) -> int:
+        """Process all BENCHMARKING submissions in a single pass.
+
+        Returns the number of submissions processed.
+        """
+        replay_round = self._current_replay_round()
+        benchmarking = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
+        if replay_round is not None:
+            benchmarking = [
+                sub for sub in benchmarking
+                if sub.round_id == replay_round.round_id
+            ]
+        elif self._round_store is not None:
+            current_round = self._round_store.get_current_round()
+            if current_round is not None:
+                # Filter to submissions for the current round — benchmark
+                # them eagerly so they're scored before the round closes.
+                # Submissions from other rounds are skipped (already scored
+                # or will be picked up in their round's evaluation).
+                round_subs = [
+                    s for s in benchmarking
+                    if s.round_id == current_round.round_id
+                ]
+                if round_subs:
+                    benchmarking = round_subs
+                else:
+                    # No submissions for this round — run genesis/bootstrap
+                    processed = await self._maybe_bootstrap_solving_apps_with_champion()
+                    if processed:
+                        return processed
+                    return await self._maybe_run_genesis()
+
+        if not benchmarking:
+            if self._round_store is not None and replay_round is not None:
+                if self._sub_store.list_by_round(replay_round.round_id):
+                    return 0
+            processed = await self._maybe_run_genesis()
+            if processed:
+                return processed
+            return await self._maybe_bootstrap_solving_apps_with_champion()
+
+        print(f"[BENCHMARK] Found {len(benchmarking)} submissions to benchmark", flush=True)
+        for s in benchmarking:
+            print(f"[BENCHMARK]   {s.submission_id}: image_tag={s.image_tag} solver_path={s.solver_path} round={s.round_id}", flush=True)
+        logger.info("Found %d submissions to benchmark", len(benchmarking))
+
+        # Load intents to benchmark against
+        intents = self._load_benchmark_intents()
+        if not intents:
+            logger.warning("No active intents for benchmarking")
+            for sub in benchmarking:
+                self._sub_store.set_benchmark_result(
+                    sub.submission_id,
+                    score=0.0,
+                    details={"error": "no_active_intents"},
+                )
+            return len(benchmarking)
+
+        # Build scoring function from JS engine (also loads JS into engine)
+        score_fn = await self._build_score_fn(intents)
+
+        # Stage 1: enrich intents with synthetic scenarios from manifest
+        intents = self._enrich_intents_with_manifests(intents)
+
+        # Stage 2: append historical order scenarios (deterministic from round_id).
+        # Uses the current round's ID so all validators sample the same orders.
+        if self._round_store is not None:
+            current_round = self._round_store.get_current_round()
+            if current_round is not None:
+                try:
+                    historical = self._load_historical_scenarios(current_round.round_id)
+                    if historical:
+                        intents.extend(historical)
+                        logger.info(
+                            "Added %d Stage 2 historical scenarios for round %s",
+                            len(historical), current_round.round_id,
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to load historical scenarios: %s", exc)
+
+        # Benchmark each submission (route by solver_path or image_tag)
+        for sub in benchmarking:
+            # Skip already-scored submissions (may appear in BENCHMARKING
+            # from a previous pass that scored then persisted)
+            if sub.benchmark_score is not None and sub.benchmark_score > 0:
+                logger.info("Skipping already-scored submission %s (%.3f)", sub.submission_id, sub.benchmark_score)
+                continue
+            if sub.solver_path is not None:
+                if not _allow_subprocess_benchmark():
+                    self._sub_store.reject(
+                        sub.submission_id,
+                        (
+                            "Subprocess benchmarking is disabled by policy. "
+                            "Use signed git/docker submissions."
+                        ),
+                    )
+                    logger.warning(
+                        "Rejected %s: subprocess benchmarking disabled by policy",
+                        sub.submission_id,
+                    )
+                    continue
+                # Source submission → subprocess mode (no Docker)
+                logger.info(
+                    "Benchmarking %s (solver=%s, path=%s)",
+                    sub.submission_id,
+                    sub.solver_name or "unknown",
+                    sub.solver_path,
+                )
+                try:
+                    results = await self._benchmark_solver_path(
+                        sub.solver_path, intents, score_fn,
+                    )
+                    avg_score = self._compute_avg_score(results)
+                    details = self._results_to_details(results)
+
+                    self._sub_store.set_benchmark_result(
+                        sub.submission_id,
+                        score=avg_score,
+                        details=details,
+                    )
+                    logger.info(
+                        "Submission %s scored %.4f (%d intents)",
+                        sub.submission_id, avg_score, len(results),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Benchmarking failed for %s: %s",
+                        sub.submission_id, exc,
+                    )
+                    self._sub_store.set_benchmark_result(
+                        sub.submission_id,
+                        score=0.0,
+                        details={"error": str(exc)},
+                    )
+
+            elif sub.image_tag is not None:
+                # Docker submission → existing Docker-based benchmark
+                print(f"[BENCHMARK] Starting Docker benchmark for {sub.submission_id} image={sub.image_tag}", flush=True)
+                try:
+                    results = await self._benchmark_submission(
+                        sub.image_tag, intents, score_fn,
+                    )
+                    print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
+                    for r in results[:3]:
+                        print(f"[BENCHMARK]   {r.intent_id}: score={r.score} error={r.error} plan={r.plan is not None}", flush=True)
+                    avg_score = self._compute_avg_score(results)
+                    details = self._results_to_details(results)
+                    print(f"[BENCHMARK] avg_score={avg_score:.4f}", flush=True)
+
+                    self._sub_store.set_benchmark_result(
+                        sub.submission_id,
+                        score=avg_score,
+                        details=details,
+                    )
+                    logger.info(
+                        "Submission %s scored %.4f (%d intents)",
+                        sub.submission_id, avg_score, len(results),
+                    )
+                except Exception as exc:
+                    import traceback
+                    print(f"[BENCHMARK] Docker benchmark FAILED for {sub.submission_id}: {exc}", flush=True)
+                    traceback.print_exc()
+                    logger.exception(
+                        "Benchmarking failed for %s: %s",
+                        sub.submission_id, exc,
+                    )
+                    self._sub_store.set_benchmark_result(
+                        sub.submission_id,
+                        score=0.0,
+                        details={"error": str(exc)},
+                    )
+
+            else:
+                print(f"[BENCHMARK] No solver_path or image_tag for {sub.submission_id}", flush=True)
+                self._sub_store.reject(
+                    sub.submission_id,
+                    "No solver_path or image_tag available for benchmarking",
+                )
+
+        # Transition SOLVING → SOLVED for apps that got a positive score
+        self._transition_solving_apps(benchmarking)
+
+        # Assign ranks within the replay batch; champion activation happens later.
+        self._rank_scored_submissions(benchmarking)
+
+        return len(benchmarking)
+
+    async def _benchmark_submission(
+        self,
+        image_tag: str,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        score_fn: Any,
+    ) -> list[BenchmarkResult]:
+        """Run the benchmark harness against one submission's Docker image."""
+        orch = SolverOrchestrator()
+
+        if self._use_docker:
+            session = await orch.start_docker(image_tag)
+        else:
+            # For testing without Docker — find the solver path from image tag
+            # This path is only used in tests
+            raise ValueError(
+                "Subprocess mode requires a solver_path, not an image_tag. "
+                "Use use_docker=True for production."
+            )
+
+        try:
+            results = await run_benchmark(
+                session, intents,
+                config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
+                score_fn=score_fn,
+                simulator=self._simulator,
+            )
+            return results
+        finally:
+            await session.shutdown()
+
+    async def _benchmark_one_scenario_with_rpc(
+        self,
+        image_tag: str,
+        intent: "AppIntentDefinition",
+        state: "IntentState",
+        snapshot: "MarketSnapshot",
+        score_fn: Any,
+        rpc_overrides: dict[int, str],
+    ) -> "BenchmarkResult":
+        """Run a single scenario through a Docker solver pointed at an
+        override RPC. Used by Stage 3 regression gate to replay one order
+        against a historical-block Anvil fork.
+
+        Returns a BenchmarkResult with the score (0 if the solver could
+        not produce a valid plan or simulation reverted).
+        """
+        orch = SolverOrchestrator()
+        session = await orch.start_docker(image_tag, rpc_overrides=rpc_overrides)
+        try:
+            results = await run_benchmark(
+                session,
+                [(intent, state, snapshot)],
+                config=BenchmarkConfig(chain_ids=[state.chain_id]),
+                score_fn=score_fn,
+                simulator=self._simulator,
+            )
+            if results:
+                return results[0]
+            return BenchmarkResult(intent_id=intent.app_id, score=0.0, error="no_result")
+        finally:
+            await session.shutdown()
+
+    async def _benchmark_solver_path(
+        self,
+        solver_path: str,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        score_fn: Any,
+    ) -> list[BenchmarkResult]:
+        """Run the benchmark harness against a local solver file (subprocess mode)."""
+        orch = SolverOrchestrator()
+        session = await orch.start_subprocess(solver_path)
+        try:
+            results = await run_benchmark(
+                session, intents,
+                config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
+                score_fn=score_fn,
+                simulator=self._simulator,
+            )
+            return results
+        finally:
+            await session.shutdown()
+
+    async def _build_score_fn(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+    ) -> Any:
+        """Build an async scoring callback using JsExecutionEngine.
+
+        Loads each intent's JS scoring code into the engine so that
+        score_fn(app_id, plan, simulation, state) works for any intent.
+        """
+        if self._js_engine is not None:
+            engine = self._js_engine
+        else:
+            from minotaur_subnet.engine import JsExecutionEngine
+            engine = JsExecutionEngine(timeout_ms=10000)
+            self._js_engine = engine  # Save for _enrich_intents_with_manifests()
+
+        # Load JS scoring code for each intent
+        for intent_def, _, _ in intents:
+            if intent_def.app_id not in engine.list_loaded_intents():
+                js_code = intent_def.js_code
+                if not js_code or len(js_code.strip()) < 20:
+                    logger.warning(
+                        "App %s has no JS scoring code, skipping",
+                        intent_def.app_id,
+                    )
+                    continue
+                await engine.load_intent(intent_def.app_id, js_code)
+
+        async def score_fn(
+            app_id: str,
+            plan: ExecutionPlan,
+            simulation: SimulationResult,
+            state: IntentState,
+        ) -> ScoreResult:
+            return await engine.score(app_id, plan, simulation, state)
+
+        return score_fn
+
+    def _enrich_intents_with_manifests(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+    ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
+        """Enrich intents with manifest benchmark_scenarios or example_params.
+
+        Priority:
+        1. If manifest has benchmark_scenarios, expand one intent per scenario
+        2. Else if manifest has intent_functions with example_params, expand
+           one intent per function (existing behavior)
+        3. Else return intent unchanged
+        """
+        # Need JS engine for manifest lookup
+        engine = self._js_engine
+        if engine is None:
+            try:
+                from minotaur_subnet.engine import JsExecutionEngine
+                # Engine should already be created by _build_score_fn()
+                # If not available, return intents unchanged
+                return intents
+            except Exception:
+                return intents
+
+        enriched: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
+
+        for app_def, state, snapshot in intents:
+            manifest = engine.get_manifest(app_def.app_id)
+            if manifest is None:
+                # No manifest — return intent unchanged
+                enriched.append((app_def, state, snapshot))
+                continue
+
+            # Check for benchmark_scenarios first
+            all_scenarios = manifest.get("benchmark_scenarios", [])
+            # Filter scenarios by chain_id — scenarios with a "chains" field
+            # only run on matching chains. Scenarios without "chains" run
+            # everywhere (backward compat).
+            scenarios = [
+                s for s in all_scenarios
+                if not s.get("chains") or state.chain_id in s["chains"]
+            ]
+            if scenarios:
+                for scenario in scenarios:
+                    fn_name = scenario.get("intent_function", "execute")
+                    params = scenario.get("params", {})
+
+                    new_raw_params = {**state.raw_params_view(), **params}
+                    new_control = {
+                        **state.control_view(),
+                        "_intent_function": fn_name,
+                        "_scenario_name": scenario.get("name", ""),
+                        "_stage": "synthetic",
+                    }
+                    fund = scenario.get("fund")
+                    if fund:
+                        new_control["_fund"] = fund
+
+                    new_state = IntentState(
+                        contract_address=state.contract_address,
+                        chain_id=state.chain_id,
+                        nonce=state.nonce,
+                        owner=state.owner,
+                        raw_params=new_raw_params,
+                        control=new_control,
+                        context_version=state.context_version,
+                        policy_tier=state.policy_tier,
+                    )
+                    enriched.append((app_def, new_state, snapshot))
+
+                logger.info(
+                    "App %s: expanded %d benchmark scenarios from manifest",
+                    app_def.app_id, len(scenarios),
+                )
+                continue
+
+            # Fall back to example_params per intent function
+            intent_functions = manifest.get("intent_functions", [])
+            if not intent_functions:
+                enriched.append((app_def, state, snapshot))
+                continue
+
+            # Expand: one test intent per manifest function
+            for fn_def in intent_functions:
+                fn_name = fn_def.get("name", "execute")
+                example_params = fn_def.get("example_params", {})
+
+                new_raw_params = {**state.raw_params_view(), **example_params}
+                new_control = {
+                    **state.control_view(),
+                    "_intent_function": fn_name,
+                }
+
+                new_state = IntentState(
+                    contract_address=state.contract_address,
+                    chain_id=state.chain_id,
+                    nonce=state.nonce,
+                    owner=state.owner,
+                    raw_params=new_raw_params,
+                    control=new_control,
+                    context_version=state.context_version,
+                    policy_tier=state.policy_tier,
+                )
+                enriched.append((app_def, new_state, snapshot))
+
+            logger.info(
+                "App %s: expanded %d intent functions from manifest",
+                app_def.app_id, len(intent_functions),
+            )
+
+        return enriched
+
+    async def _build_snapshot(self, chain_id: int) -> MarketSnapshot:
+        """Build a market snapshot for the given chain.
+
+        Uses SnapshotBuilder with the epoch block number if both are available.
+        Falls back to build_synthetic_snapshot() if builder is unavailable or
+        if the build fails.
+        """
+        if self._snapshot_builder is not None and self._epoch_block_number is not None:
+            try:
+                return await self._snapshot_builder.build_chain_snapshot(
+                    chain_id=chain_id,
+                    block_number=self._epoch_block_number,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "SnapshotBuilder failed for chain %d at block %d, "
+                    "falling back to synthetic: %s",
+                    chain_id, self._epoch_block_number, exc,
+                )
+
+        from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+        return build_synthetic_snapshot(chain_id)
+
+    def _load_benchmark_intents(
+        self,
+        *,
+        deployment_statuses: set[Any] | None = None,
+    ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
+        """Load active intents from the app store for benchmarking.
+
+        Returns (intent_definition, state, snapshot) tuples.
+        """
+        if self._app_store is None:
+            # Fallback: use synthetic intents for testing/MVP
+            from minotaur_subnet.harness.snapshot import build_synthetic_intents
+            return build_synthetic_intents()
+
+        intents = []
+        for app in self._app_store.list_apps():
+            deployment = self._app_store.get_deployment(app.app_id)
+            if deployment is None:
+                continue
+            if not deployment.status.is_operational():
+                continue
+            if (
+                deployment_statuses is not None
+                and deployment.status not in deployment_statuses
+            ):
+                continue
+
+            chain_id = deployment.chain_id or 1
+            state = IntentState(
+                contract_address=deployment.contract_address or "",
+                chain_id=chain_id,
+                nonce=0,
+                owner="",
+            )
+
+            # Use _build_snapshot (async) — but we're in a sync method.
+            # Build snapshot synchronously via event loop for compatibility.
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're already in an async context — use synthetic fallback
+                    # (the async caller should use _build_snapshot directly)
+                    from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+                    snapshot = build_synthetic_snapshot(chain_id)
+                else:
+                    snapshot = loop.run_until_complete(self._build_snapshot(chain_id))
+            except Exception:
+                from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+                snapshot = build_synthetic_snapshot(chain_id)
+
+            intents.append((app, state, snapshot))
+
+        return intents
+
+    def _load_historical_scenarios(
+        self,
+        round_id: str,
+        n_per_chain: int | None = None,
+    ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
+        """Load Stage 2 scenarios from historical order samples.
+
+        Deterministic sampling from round_id ensures all validators
+        score against the same set of historical orders without needing
+        to broadcast the sample list.
+
+        Returns (intent_def, state, snapshot) tuples tagged with
+        state.control["_stage"] == "historical" so the scoring pipeline
+        can separate Stage 1 from Stage 2 for composite scoring.
+        """
+        if self._app_store is None:
+            return []
+
+        from minotaur_subnet.harness.order_sampler import sample_historical_orders
+
+        if n_per_chain is None:
+            import os
+            try:
+                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "10"))
+            except ValueError:
+                n_per_chain = 10
+
+        sampled = sample_historical_orders(
+            app_store=self._app_store,
+            round_id=round_id,
+            n_per_chain=n_per_chain,
+        )
+        if not sampled:
+            return []
+
+        # Group sampled orders by app_id to reuse AppIntentDefinition + snapshot
+        apps_by_id = {app.app_id: app for app in self._app_store.list_apps()}
+        snapshots_by_chain: dict[int, MarketSnapshot] = {}
+
+        scenarios: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
+        for order in sampled:
+            app_id = order.get("app_id")
+            chain_id = order.get("chain_id")
+            if not app_id or chain_id is None:
+                continue
+            app_def = apps_by_id.get(app_id)
+            if app_def is None:
+                continue
+            deployment = self._app_store.get_deployment(app_id)
+            contract_address = deployment.contract_address if deployment else ""
+
+            # Snapshot per chain (cached). Use synthetic snapshot here —
+            # the solver re-queries live pool state via RPC anyway.
+            if chain_id not in snapshots_by_chain:
+                from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+                snapshots_by_chain[chain_id] = build_synthetic_snapshot(chain_id)
+            snapshot = snapshots_by_chain[chain_id]
+
+            # Build IntentState from the historical order's params
+            state = IntentState(
+                contract_address=contract_address,
+                chain_id=chain_id,
+                nonce=0,
+                owner="",
+                raw_params=dict(order.get("params", {})),
+                control={
+                    "_stage": "historical",
+                    "_scenario_name": f"hist:{order.get('order_id', '?')}",
+                    "_intent_function": order.get("intent_function", "swap"),
+                    "_original_block_number": order.get("block_number"),
+                    "_original_tx_hash": order.get("tx_hash"),
+                },
+            )
+            scenarios.append((app_def, state, snapshot))
+
+        logger.info(
+            "Loaded %d historical scenarios for round %s",
+            len(scenarios), round_id,
+        )
+        return scenarios
+
+    def _has_solving_apps(self) -> bool:
+        """Check if any deployed apps are operational (SOLVING/SOLVED/ACTIVE)."""
+        if self._app_store is None:
+            return False
+        for app in self._app_store.list_apps():
+            deployment = self._app_store.get_deployment(app.app_id)
+            if deployment is not None and deployment.status.is_operational():
+                return True
+        return False
+
+    async def _maybe_run_genesis(self) -> int:
+        """Auto-register and benchmark the baseline solver when no champion exists.
+
+        The genesis submission goes through the same replay-scoring pipeline as
+        any miner submission: create -> benchmark -> score -> rank.
+
+        Prefers Docker image (genesis_solver_image) over subprocess path
+        (baseline_solver_path). Docker mode uses the same sandboxed pipeline
+        as miner submissions. Subprocess mode is deprecated.
+
+        Returns the number of submissions processed (0 or 1).
+        """
+        if self._genesis_solver_image is None:
+            return 0
+
+        if self._sub_store.get_champion() is not None:
+            return 0
+
+        if not self._has_solving_apps():
+            return 0
+
+        # Idempotency: skip if genesis submission already exists
+        existing = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+        if existing is not None:
+            return 0
+
+        logger.info("Genesis: no champion and SOLVING apps exist — bootstrapping baseline solver")
+
+        round_id = None
+        if self._round_store is not None:
+            current_round = self._round_store.get_current_round()
+            if current_round is not None:
+                round_id = current_round.round_id
+
+        # Create genesis submission (skip screening, go straight to BENCHMARKING)
+        sub = self._sub_store.create(
+            repo_url=GENESIS_REPO_URL,
+            commit_hash="builtin",
+            epoch=GENESIS_EPOCH,
+            hotkey=GENESIS_HOTKEY,
+            round_id=round_id,
+        )
+        self._sub_store.set_solver_info(
+            sub.submission_id, name="baseline-swap-solver", version="2.0.0",
+        )
+        self._sub_store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+        logger.info("Genesis submission created: %s", sub.submission_id)
+
+        # Load intents, build scoring, enrich with manifests (same as run_once)
+        intents = self._load_benchmark_intents()
+        if not intents:
+            logger.warning("Genesis: no active intents for benchmarking")
+            self._sub_store.set_benchmark_result(
+                sub.submission_id, score=0.0, details={"error": "no_active_intents"},
+            )
+            return 1
+
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+
+        # Stage 2: historical scenarios (if any order history exists)
+        if self._round_store is not None:
+            current_round = self._round_store.get_current_round()
+            if current_round is not None:
+                try:
+                    historical = self._load_historical_scenarios(current_round.round_id)
+                    if historical:
+                        intents.extend(historical)
+                except Exception as exc:
+                    logger.warning("Failed to load genesis historical scenarios: %s", exc)
+
+        # Genesis benchmark via Docker — same sandboxed pipeline as miner submissions.
+        try:
+            logger.info("Genesis benchmark via Docker image: %s", self._genesis_solver_image)
+            results = await self._benchmark_submission(
+                self._genesis_solver_image, intents, score_fn,
+            )
+            avg_score = self._compute_avg_score(results)
+            details = self._results_to_details(results)
+
+            self._sub_store.set_benchmark_result(
+                sub.submission_id, score=avg_score, details=details,
+            )
+            logger.info(
+                "Genesis submission scored %.4f (%d intents)", avg_score, len(results),
+            )
+        except Exception as exc:
+            logger.exception("Genesis benchmarking failed: %s", exc)
+            self._sub_store.set_benchmark_result(
+                sub.submission_id, score=0.0, details={"error": str(exc)},
+            )
+
+        # Transition SOLVING apps and rank the replay result (same pipeline as run_once)
+        self._transition_solving_apps([sub])
+        self._rank_scored_submissions([sub])
+
+        return 1
+
+    async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
+        """Benchmark the current champion against newly deployed solving apps.
+
+        This keeps newly deployed apps from getting stuck in SOLVING once a
+        champion already exists, without creating synthetic submissions or
+        disturbing current rankings/adoption state.
+        """
+        if self._app_store is None:
+            return 0
+
+        champion = self._sub_store.get_champion()
+        if champion is None:
+            genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+            if genesis is not None and genesis.status in (
+                SubmissionStatus.SCORED,
+                SubmissionStatus.ADOPTED,
+            ):
+                champion = genesis
+        if champion is None:
+            return 0
+
+        from minotaur_subnet.shared.types import AppStatus
+
+        intents = self._load_benchmark_intents(
+            deployment_statuses={AppStatus.SOLVING},
+        )
+        if not intents:
+            return 0
+
+        logger.info(
+            "Champion bootstrap: benchmarking %s against %d solving intents",
+            champion.submission_id,
+            len(intents),
+        )
+
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+
+        try:
+            image_tag = champion.image_tag
+            if image_tag is None and champion.hotkey == GENESIS_HOTKEY and self._genesis_solver_image:
+                image_tag = self._genesis_solver_image
+
+            if image_tag is None:
+                logger.warning(
+                    "Champion bootstrap skipped for %s: no image_tag",
+                    champion.submission_id,
+                )
+                return 0
+
+            results = await self._benchmark_submission(
+                image_tag, intents, score_fn,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Champion bootstrap failed for %s: %s",
+                champion.submission_id,
+                exc,
+            )
+            return 1
+
+        app_best: dict[str, float] = {}
+        for result in results:
+            bare_app_id = (
+                result.intent_id.split(":")[0]
+                if ":" in result.intent_id
+                else result.intent_id
+            )
+            if result.score > app_best.get(bare_app_id, 0.0):
+                app_best[bare_app_id] = result.score
+
+        transitioned = 0
+        for app_id, best_score in app_best.items():
+            if best_score <= 0:
+                continue
+            dep = self._app_store.get_deployment(app_id)
+            if dep is not None and dep.status == AppStatus.SOLVING:
+                self._app_store.update_deployment_status(
+                    app_id, dep.chain_id, AppStatus.SOLVED,
+                )
+                transitioned += 1
+                logger.info(
+                    "Champion bootstrap: app %s transitioned SOLVING -> SOLVED (best_score=%.4f)",
+                    app_id,
+                    best_score,
+                )
+
+        return 1 if results or transitioned else 0
+
+    def _compute_avg_score(self, results: list[BenchmarkResult]) -> float:
+        """Compute composite score: 40% Stage 1 (synthetic) + 60% Stage 2 (historical).
+
+        If no Stage 2 (historical) results exist (e.g. new app with no order
+        history), falls back to pure Stage 1 to avoid penalizing bootstrap.
+
+        Failures and timeouts count as 0 in the denominator — prevents a
+        solver that handles 1/10 well from outscoring one that handles 10/10.
+
+        Mock-simulation results are heavily penalized (score zeroed) to
+        prevent fabricated passing scores from inflating benchmarks.
+        """
+        if not results:
+            return 0.0
+
+        stage1 = self._compute_stage_score(results, stage_tag="synthetic")
+        stage2 = self._compute_stage_score(results, stage_tag="historical")
+
+        # If no historical scenarios ran, use pure Stage 1 (bootstrap case)
+        if stage2.count == 0:
+            return stage1.avg_score
+        # If no synthetic scenarios ran, use pure Stage 2 (unusual, but possible)
+        if stage1.count == 0:
+            return stage2.avg_score
+
+        return 0.4 * stage1.avg_score + 0.6 * stage2.avg_score
+
+    def _compute_stage_score(
+        self,
+        results: list[BenchmarkResult],
+        stage_tag: str,
+    ) -> "_StageScore":
+        """Compute average score for a single stage.
+
+        Stage is identified by the _stage tag in each result's intent_id
+        (via the state.control["_stage"] field preserved through scoring).
+        For backward compat: results without a _stage tag are counted as
+        "synthetic".
+        """
+        from dataclasses import dataclass
+
+        stage_results = [
+            r for r in results
+            if _result_stage(r) == stage_tag
+        ]
+        if not stage_results:
+            return _StageScore(avg_score=0.0, count=0, success_count=0)
+
+        total = 0.0
+        successes = 0
+        for r in stage_results:
+            if r.score <= 0:
+                continue
+            if getattr(r, "mock_simulation", False):
+                continue
+            total += r.score
+            successes += 1
+        avg = total / len(stage_results)
+        return _StageScore(avg_score=avg, count=len(stage_results), success_count=successes)
+
+    def _build_scorecard(self, results: list[BenchmarkResult]) -> BenchmarkScorecard:
+        """Build a per-app scorecard from benchmark results."""
+        # Group results by app_id
+        by_app: dict[str, list[BenchmarkResult]] = {}
+        for r in results:
+            app_id = r.intent_id or "unknown"
+            by_app.setdefault(app_id, []).append(r)
+
+        app_scores: dict[str, float] = {}
+        scenario_scores: dict[str, float] = {}
+        failures = 0
+
+        for app_id, app_results in by_app.items():
+            # Per-app: failures count in denominator
+            app_total = sum(r.score for r in app_results if r.score > 0)
+            app_scores[app_id] = app_total / len(app_results) if app_results else 0.0
+
+            # Per-scenario
+            for r in app_results:
+                scenario_key = f"{app_id}:{r.intent_id}" if r.intent_id != app_id else app_id
+                scenario_scores[scenario_key] = r.score
+                if r.error is not None or r.plan is None or r.score <= 0:
+                    failures += 1
+
+        global_score = self._compute_avg_score(results)
+
+        mock_count = sum(1 for r in results if getattr(r, "mock_simulation", False))
+
+        return BenchmarkScorecard(
+            global_score=global_score,
+            app_scores=app_scores,
+            scenario_scores=scenario_scores,
+            failures=failures,
+            total=len(results),
+            mock_simulation_count=mock_count,
+        )
+
+    def _results_to_details(
+        self, results: list[BenchmarkResult],
+    ) -> dict[str, Any]:
+        """Convert benchmark results to a details dict for storage."""
+        scorecard = self._build_scorecard(results)
+        return {
+            "total_intents": len(results),
+            "plans_generated": sum(1 for r in results if r.plan is not None),
+            "errors": sum(1 for r in results if r.error is not None),
+            "avg_score": scorecard.global_score,
+            "scorecard": scorecard.to_dict(),
+            "per_intent": [
+                {
+                    "intent_id": r.intent_id,
+                    "score": r.score,
+                    "plan_score": r.plan_score,
+                    "trigger_score": r.trigger_score,
+                    "elapsed_ms": r.elapsed_ms,
+                    "error": r.error,
+                    "has_plan": r.plan is not None,
+                    "mock_simulation": getattr(r, "mock_simulation", False),
+                }
+                for r in results
+            ],
+        }
+
+    def _transition_solving_apps(self, submissions: list) -> None:
+        """Transition SOLVING → SOLVED for apps proven by benchmark results.
+
+        After benchmarking, check per-app scores in the best submission's
+        details. If any SOLVING app achieved avg_score > 0, transition it.
+        """
+        if self._app_store is None:
+            return
+
+        from minotaur_subnet.shared.types import AppStatus
+
+        # Collect the best per-app scores across all submissions
+        app_best: dict[str, float] = {}
+        for sub in submissions:
+            refreshed = self._sub_store.get(sub.submission_id)
+            if refreshed is None or not refreshed.benchmark_details:
+                continue
+            per_intent = refreshed.benchmark_details.get("per_intent", [])
+            for entry in per_intent:
+                aid = entry.get("intent_id", "")
+                sc = entry.get("score", 0.0)
+                if aid and sc > app_best.get(aid, 0.0):
+                    app_best[aid] = sc
+
+        # Transition SOLVING apps that scored > 0
+        for app_id, best_sc in app_best.items():
+            if best_sc <= 0:
+                continue
+            # Strip scenario suffix (e.g., "app_xxx:WETH_to_USDC" → "app_xxx")
+            bare_app_id = app_id.split(":")[0] if ":" in app_id else app_id
+            dep = self._app_store.get_deployment(bare_app_id)
+            if dep and dep.status == AppStatus.SOLVING:
+                self._app_store.update_deployment_status(
+                    bare_app_id, dep.chain_id, AppStatus.SOLVED,
+                )
+                logger.info(
+                    "App %s transitioned SOLVING → SOLVED (best_score=%.4f)",
+                    bare_app_id, best_sc,
+                )
+
+    def _rank_scored_submissions(
+        self,
+        submissions: list,
+    ) -> list[Any]:
+        """Assign benchmark ranks for the current replay-scored batch."""
+        scored = []
+        for sub in submissions:
+            refreshed = self._sub_store.get(sub.submission_id)
+            if refreshed and refreshed.status == SubmissionStatus.SCORED:
+                scored.append(refreshed)
+
+        if not scored:
+            return []
+
+        # Sort by benchmark score descending
+        scored.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
+
+        # Assign ranks
+        for i, sub in enumerate(scored):
+            self._sub_store.set_benchmark_result(
+                sub.submission_id,
+                score=sub.benchmark_score or 0.0,
+                rank=i + 1,
+                details=sub.benchmark_details,
+            )
+        return scored

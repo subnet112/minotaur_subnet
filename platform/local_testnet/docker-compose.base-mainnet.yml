@@ -1,0 +1,167 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Minotaur Base Mainnet Overlay
+#
+# Runs the full validator/miner stack against real Base mainnet.
+# Anvil-Base still runs as a local fork for simulation (evm_snapshot etc).
+# Execution (relayer) targets real Base.
+#
+# Usage:
+#   cp .env.base-mainnet.example .env.base-mainnet  # fill in secrets
+#   docker compose -f docker-compose.yml -f docker-compose.base-mainnet.yml \
+#     --env-file .env --env-file .env.base-mainnet up --build -d
+#
+# Or simply:
+#   bash start-base-mainnet.sh
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # Anvil-Base: fork real Base mainnet for simulation
+  anvil-base:
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8546"
+      - "--fork-url"
+      - "${BASE_MAINNET_RPC_URL}"
+      - "--chain-id"
+      - "8453"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+      - "--block-time"
+      - "${BLOCK_TIME:-2}"
+      - "--no-storage-caching"
+
+  # Init: deploy contracts to real Base
+  init:
+    environment:
+      BASE_RPC_URL: "${BASE_MAINNET_RPC_URL}"
+      DEPLOYER_PRIVATE_KEY: "${BASE_RELAYER_PRIVATE_KEY}"
+      VALIDATORS: "${BASE_VALIDATOR_ADDRESSES}"
+
+  # Leader API: execution on real Base, simulation on Anvil fork
+  api:
+    environment:
+      BASE_RPC_URL: "${BASE_MAINNET_RPC_URL}"
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      RELAYER_PRIVATE_KEY: "${BASE_RELAYER_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEYS: "${BASE_VALIDATOR_KEY_0},${BASE_VALIDATOR_KEY_1},${BASE_VALIDATOR_KEY_2}"
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_0}"
+      # Peer addresses must reference the Base validator addresses
+      ORDER_CONSENSUS_PEERS: "${BASE_ORDER_CONSENSUS_PEERS:-}"
+      VALIDATOR_PEERS: "${BASE_API_CLUSTER_PEERS:-}"
+      CHAIN_ID: "8453"
+      CONSENSUS_MODE: real
+      FOLLOWER_PROPOSAL_RESIMULATE: "1"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+      SUBTENSOR_URL: "${BASE_SUBTENSOR_URL:-ws://subtensor:9944}"
+      ENABLE_NATIVE_BITTENSOR_PROXY: "${ENABLE_NATIVE_BITTENSOR_PROXY:-0}"
+      NATIVE_BITTENSOR_NETWORK: "${NATIVE_BITTENSOR_NETWORK:-}"
+      RELAYER_RECEIPT_TIMEOUT: "${RELAYER_RECEIPT_TIMEOUT:-60}"
+      RELAYER_MIN_BALANCE_WEI: "${RELAYER_MIN_BALANCE_WEI:-1000000000000000}"
+      CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "120"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_RPC_URL:-https://lite.chain.opentensor.ai}"
+
+  # Champion consensus peers
+  api-peer-1:
+    environment:
+      BASE_RPC_URL: "${BASE_MAINNET_RPC_URL}"
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      RELAYER_PRIVATE_KEY: "${BASE_RELAYER_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_1}"
+      CHAIN_ID: "8453"
+
+  api-peer-2:
+    environment:
+      BASE_RPC_URL: "${BASE_MAINNET_RPC_URL}"
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      RELAYER_PRIVATE_KEY: "${BASE_RELAYER_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_2}"
+      CHAIN_ID: "8453"
+
+  # Relayer: submit to real Base
+  relayer:
+    environment:
+      BASE_RPC_URL: "${BASE_MAINNET_RPC_URL}"
+      RELAYER_PRIVATE_KEY: "${BASE_RELAYER_PRIVATE_KEY}"
+
+  # Per-validator Anvil forks — each validator gets its own fork so
+  # concurrent scoreIntent transactions don't interfere via shared state.
+  anvil-base-v1:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8546"
+      - "--fork-url"
+      - "${BASE_MAINNET_RPC_URL}"
+      - "--chain-id"
+      - "8453"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+      - "--no-storage-caching"
+    networks:
+      - minotaur-testnet
+
+  anvil-base-v2:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8546"
+      - "--fork-url"
+      - "${BASE_MAINNET_RPC_URL}"
+      - "--chain-id"
+      - "8453"
+      - "--accounts"
+      - "10"
+      - "--balance"
+      - "10000"
+      - "--no-storage-caching"
+    networks:
+      - minotaur-testnet
+
+  # Order consensus validators: each with its own Anvil fork for independent re-simulation
+  validator:
+    environment:
+      BASE_RPC_URL: http://anvil-base:8546
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_0}"
+      VALIDATOR_PEERS: "${BASE_VALIDATOR_PEER_SPEC_0}"
+      CHAIN_ID: "8453"
+      FOLLOWER_PROPOSAL_RESIMULATE: "1"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+
+  validator-peer-1:
+    environment:
+      BASE_RPC_URL: http://anvil-base-v1:8546
+      BASE_SIM_RPC_URL: http://anvil-base-v1:8546
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_1}"
+      VALIDATOR_PEERS: "${BASE_VALIDATOR_PEER_SPEC_1}"
+      CHAIN_ID: "8453"
+      FOLLOWER_PROPOSAL_RESIMULATE: "1"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+
+  validator-peer-2:
+    environment:
+      BASE_RPC_URL: http://anvil-base-v2:8546
+      BASE_SIM_RPC_URL: http://anvil-base-v2:8546
+      VALIDATOR_PRIVATE_KEY: "${BASE_VALIDATOR_KEY_2}"
+      VALIDATOR_PEERS: "${BASE_VALIDATOR_PEER_SPEC_2}"
+      CHAIN_ID: "8453"
+      FOLLOWER_PROPOSAL_RESIMULATE: "1"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+
+  # Seed: deploy DexAggregator via API (targets whatever chain API is on)
+  seed:
+    environment:
+      MINOTAUR_API_URL: http://api:8080

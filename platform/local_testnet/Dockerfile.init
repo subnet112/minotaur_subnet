@@ -1,0 +1,23 @@
+FROM python:3.12-slim-bookworm
+
+# Install system deps + Foundry
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
+    && curl -L https://foundry.paradigm.xyz | bash \
+    && /root/.foundry/bin/foundryup \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.foundry/bin:${PATH}"
+
+WORKDIR /app
+
+# Install Python deps (bittensor for subnet registration + web3 for Anvil)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir bittensor web3
+
+# Copy the full repo (needed for contracts/ and platform/)
+COPY . /app
+
+ENV PYTHONPATH=/app
+
+CMD ["python", "/app/platform/local_testnet/init.py"]

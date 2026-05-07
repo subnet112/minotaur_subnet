@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# solver-base — Official base image for Minotaur IntentSolver submissions
+#
+# Published as: ghcr.io/subnet112/solver-base:v1
+#
+# Miners MUST use this as their base image:
+#   FROM ghcr.io/subnet112/solver-base:v1
+#
+# Includes:
+#   - Python 3.12 (slim)
+#   - Minotaur SDK (minotaur_subnet.sdk, minotaur_subnet.shared)
+#   - Harness runner (minotaur_subnet.harness.runner) — stdin/stdout protocol
+#   - Common ML/data libraries (numpy, scipy, pandas)
+#   - eth-abi for ABI encoding
+#
+# Does NOT include:
+#   - Network access (containers run with --network=none)
+#   - Validator-side code (engine, API, blockchain)
+#   - Node.js / JS runtime
+#   - Bittensor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FROM python:3.12-slim-bookworm
+
+LABEL org.opencontainers.image.source="https://github.com/subnet112/minotaur_subnet"
+LABEL org.opencontainers.image.description="Base image for Minotaur IntentSolver submissions"
+LABEL org.opencontainers.image.version="1"
+
+# No network in final container, but we need it during build
+# to install packages. The orchestrator adds --network=none at runtime.
+
+# System deps (minimal)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        python3-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install base Python dependencies
+COPY minotaur_subnet/docker/requirements.solver-base.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+    && rm -rf /root/.cache/pip
+
+# Copy SDK and shared types (what solvers import)
+COPY minotaur_subnet/__init__.py /app/minotaur_subnet/__init__.py
+COPY minotaur_subnet/shared/ /app/minotaur_subnet/shared/
+COPY minotaur_subnet/sdk/ /app/minotaur_subnet/sdk/
+COPY minotaur_subnet/v3/ /app/minotaur_subnet/v3/
+COPY minotaur_subnet/bridge/ /app/minotaur_subnet/bridge/
+COPY minotaur_subnet/blockchain/tokens.py /app/minotaur_subnet/blockchain/tokens.py
+COPY minotaur_subnet/blockchain/chains.py /app/minotaur_subnet/blockchain/chains.py
+# Use a minimal __init__.py instead of the repo's — the full one imports
+# wallet, contracts, and proxy_executor which aren't in the base image
+# and pull in Substrate/Lit/Bittensor deps solvers don't need.
+RUN echo '"""Minimal blockchain package — only tokens.py and chains.py are available to solvers."""' \
+    > /app/minotaur_subnet/blockchain/__init__.py
+COPY minotaur_subnet/harness/__init__.py /app/minotaur_subnet/harness/__init__.py
+COPY minotaur_subnet/harness/protocol.py /app/minotaur_subnet/harness/protocol.py
+COPY minotaur_subnet/harness/runner.py /app/minotaur_subnet/harness/runner.py
+
+# Solver code goes in /app/solver/ — miners COPY their code here
+RUN mkdir -p /app/solver
+WORKDIR /app/solver
+
+# PYTHONPATH so both SDK and solver code are importable
+ENV PYTHONPATH=/app:/app/solver
+
+# The harness runner is the entrypoint — it reads JSON commands from stdin
+# and dispatches to the solver's IntentSolver implementation.
+# Miners must NOT set CMD or ENTRYPOINT in their Dockerfiles.
+ENTRYPOINT ["python", "-m", "minotaur_subnet.harness.runner"]
+
+# Default: load solver.py from /app/solver/
+CMD ["/app/solver/solver.py"]

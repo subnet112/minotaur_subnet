@@ -1,0 +1,546 @@
+"""Durable solver round state store.
+
+Tracks the currently open solver submission round plus the last activated
+champion snapshot. This is the phase-1 foundation for closed-round solver
+evaluation; later phases will add finalist, shadow, and certificate state.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class RoundStatus(str, Enum):
+    """Lifecycle state for a solver submission round."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+    REPLAYING = "replaying"
+    SHADOWING = "shadowing"
+    CERTIFYING = "certifying"
+    CERTIFIED = "certified"
+    ACTIVATED = "activated"
+    ABORTED = "aborted"
+
+
+@dataclass
+class ChampionSnapshot:
+    """Minimal metadata for the last activated champion artifact."""
+
+    submission_id: str | None = None
+    image_id: str | None = None
+    solver_name: str | None = None
+    solver_version: str | None = None
+    hotkey: str | None = None
+    activated_round_id: str | None = None
+    activated_epoch: int = 0
+    activated_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "submission_id": self.submission_id,
+            "image_id": self.image_id,
+            "solver_name": self.solver_name,
+            "solver_version": self.solver_version,
+            "hotkey": self.hotkey,
+            "activated_round_id": self.activated_round_id,
+            "activated_epoch": self.activated_epoch,
+            "activated_at": self.activated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "ChampionSnapshot":
+        data = raw or {}
+        return cls(
+            submission_id=data.get("submission_id"),
+            image_id=data.get("image_id"),
+            solver_name=data.get("solver_name"),
+            solver_version=data.get("solver_version"),
+            hotkey=data.get("hotkey"),
+            activated_round_id=data.get("activated_round_id"),
+            activated_epoch=int(data.get("activated_epoch") or 0),
+            activated_at=float(data.get("activated_at") or 0.0),
+        )
+
+
+@dataclass
+class ChampionApproval:
+    """Validator approval envelope for champion certification.
+
+    commit_hash, nonce, and deadline are part of the signed EIP-712 digest
+    (v2 of the ChampionApproval struct). See ChampionRegistry.sol.
+    """
+
+    validator_id: str
+    round_id: str
+    committee_hash: str | None = None
+    incumbent_image_id: str | None = None
+    candidate_submission_id: str | None = None
+    candidate_image_id: str | None = None
+    benchmark_pack_hash: str | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int = 0
+    # Signed replay-protection + commit-binding fields.
+    commit_hash: str | None = None
+    nonce: int = 0
+    deadline: int = 0
+    # Envelope metadata (not signed).
+    timestamp: float = 0.0
+    signature: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "validator_id": self.validator_id,
+            "round_id": self.round_id,
+            "committee_hash": self.committee_hash,
+            "incumbent_image_id": self.incumbent_image_id,
+            "candidate_submission_id": self.candidate_submission_id,
+            "candidate_image_id": self.candidate_image_id,
+            "benchmark_pack_hash": self.benchmark_pack_hash,
+            "shadow_case_log_hash": self.shadow_case_log_hash,
+            "effective_epoch": self.effective_epoch,
+            "commit_hash": self.commit_hash,
+            "nonce": self.nonce,
+            "deadline": self.deadline,
+            "timestamp": self.timestamp,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "ChampionApproval":
+        data = raw or {}
+        return cls(
+            validator_id=str(data.get("validator_id") or ""),
+            round_id=str(data.get("round_id") or ""),
+            committee_hash=data.get("committee_hash"),
+            incumbent_image_id=data.get("incumbent_image_id"),
+            candidate_submission_id=data.get("candidate_submission_id"),
+            candidate_image_id=data.get("candidate_image_id"),
+            benchmark_pack_hash=data.get("benchmark_pack_hash"),
+            shadow_case_log_hash=data.get("shadow_case_log_hash"),
+            effective_epoch=int(data.get("effective_epoch") or 0),
+            commit_hash=data.get("commit_hash"),
+            nonce=int(data.get("nonce") or 0),
+            deadline=int(data.get("deadline") or 0),
+            timestamp=float(data.get("timestamp") or 0.0),
+            signature=str(data.get("signature") or ""),
+        )
+
+
+@dataclass
+class ChampionCertificate:
+    """Quorum certificate authorizing a round finalist to become champion."""
+
+    round_id: str
+    committee_hash: str | None = None
+    candidate_submission_id: str | None = None
+    candidate_image_id: str | None = None
+    incumbent_image_id: str | None = None
+    benchmark_pack_hash: str | None = None
+    shadow_case_log_hash: str | None = None
+    effective_epoch: int = 0
+    quorum_required: int = 0
+    approvals: list[ChampionApproval] = field(default_factory=list)
+    certified_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "round_id": self.round_id,
+            "committee_hash": self.committee_hash,
+            "candidate_submission_id": self.candidate_submission_id,
+            "candidate_image_id": self.candidate_image_id,
+            "incumbent_image_id": self.incumbent_image_id,
+            "benchmark_pack_hash": self.benchmark_pack_hash,
+            "shadow_case_log_hash": self.shadow_case_log_hash,
+            "effective_epoch": self.effective_epoch,
+            "quorum_required": self.quorum_required,
+            "approvals": [approval.to_dict() for approval in self.approvals],
+            "certified_at": self.certified_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "ChampionCertificate | None":
+        if raw is None:
+            return None
+        return cls(
+            round_id=str(raw.get("round_id") or ""),
+            committee_hash=raw.get("committee_hash"),
+            candidate_submission_id=raw.get("candidate_submission_id"),
+            candidate_image_id=raw.get("candidate_image_id"),
+            incumbent_image_id=raw.get("incumbent_image_id"),
+            benchmark_pack_hash=raw.get("benchmark_pack_hash"),
+            shadow_case_log_hash=raw.get("shadow_case_log_hash"),
+            effective_epoch=int(raw.get("effective_epoch") or 0),
+            quorum_required=int(raw.get("quorum_required") or 0),
+            approvals=[
+                ChampionApproval.from_dict(item)
+                for item in (raw.get("approvals") or [])
+            ],
+            certified_at=float(raw.get("certified_at") or 0.0),
+        )
+
+
+@dataclass
+class RoundState:
+    """Persisted metadata about a solver submission round."""
+
+    round_id: str
+    status: RoundStatus = RoundStatus.OPEN
+    opened_epoch: int = 0
+    close_epoch: int | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    incumbent_submission_id: str | None = None
+    incumbent_image_id: str | None = None
+    incumbent_hotkey: str | None = None
+    benchmark_pack_hash: str | None = None
+    committee_block: int | None = None
+    committee_hash: str | None = None
+    quorum_required: int | None = None
+    decision_deadline_epoch: int | None = None
+    finalist_submission_id: str | None = None
+    finalist_image_id: str | None = None
+    finalist_score: float | None = None
+    shadow_case_log_hash: str | None = None
+    certificate: ChampionCertificate | None = None
+    effective_epoch: int | None = None
+    abort_reason: str | None = None
+
+    def accepting_submissions(self) -> bool:
+        return self.status == RoundStatus.OPEN
+
+    def sync_incumbent(self, champion: ChampionSnapshot | None) -> None:
+        snapshot = champion or ChampionSnapshot()
+        self.incumbent_submission_id = snapshot.submission_id
+        self.incumbent_image_id = snapshot.image_id
+        self.incumbent_hotkey = snapshot.hotkey
+        self.updated_at = time.time()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "round_id": self.round_id,
+            "status": self.status.value,
+            "opened_epoch": self.opened_epoch,
+            "close_epoch": self.close_epoch,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "incumbent_submission_id": self.incumbent_submission_id,
+            "incumbent_image_id": self.incumbent_image_id,
+            "incumbent_hotkey": self.incumbent_hotkey,
+            "benchmark_pack_hash": self.benchmark_pack_hash,
+            "committee_block": self.committee_block,
+            "committee_hash": self.committee_hash,
+            "quorum_required": self.quorum_required,
+            "decision_deadline_epoch": self.decision_deadline_epoch,
+            "finalist_submission_id": self.finalist_submission_id,
+            "finalist_image_id": self.finalist_image_id,
+            "finalist_score": self.finalist_score,
+            "shadow_case_log_hash": self.shadow_case_log_hash,
+            "certificate": self.certificate.to_dict() if self.certificate else None,
+            "effective_epoch": self.effective_epoch,
+            "abort_reason": self.abort_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RoundState":
+        return cls(
+            round_id=raw["round_id"],
+            status=RoundStatus(raw.get("status", RoundStatus.OPEN.value)),
+            opened_epoch=int(raw.get("opened_epoch") or 0),
+            close_epoch=raw.get("close_epoch"),
+            created_at=float(raw.get("created_at") or time.time()),
+            updated_at=float(raw.get("updated_at") or time.time()),
+            incumbent_submission_id=raw.get("incumbent_submission_id"),
+            incumbent_image_id=raw.get("incumbent_image_id"),
+            incumbent_hotkey=raw.get("incumbent_hotkey"),
+            benchmark_pack_hash=raw.get("benchmark_pack_hash"),
+            committee_block=raw.get("committee_block"),
+            committee_hash=raw.get("committee_hash"),
+            quorum_required=raw.get("quorum_required"),
+            decision_deadline_epoch=raw.get("decision_deadline_epoch"),
+            finalist_submission_id=raw.get("finalist_submission_id"),
+            finalist_image_id=raw.get("finalist_image_id"),
+            finalist_score=raw.get("finalist_score"),
+            shadow_case_log_hash=raw.get("shadow_case_log_hash"),
+            certificate=ChampionCertificate.from_dict(raw.get("certificate")),
+            effective_epoch=raw.get("effective_epoch"),
+            abort_reason=raw.get("abort_reason"),
+        )
+
+
+class RoundStore:
+    """In-memory round store with optional JSON persistence."""
+
+    def __init__(self, persist_path: Path | None = None) -> None:
+        self._persist_path = persist_path
+        self._persist_mtime_ns: int | None = None
+        self._rounds: dict[str, RoundState] = {}
+        self._current_round_id: str | None = None
+        self._active_champion = ChampionSnapshot()
+
+        if persist_path and persist_path.exists():
+            self._load()
+
+    def get_current_round(self) -> RoundState | None:
+        self._maybe_reload()
+        current = self._get_current_round_ref()
+        return copy.deepcopy(current) if current is not None else None
+
+    def get_round(self, round_id: str) -> RoundState | None:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        return copy.deepcopy(state) if state is not None else None
+
+    def list_rounds(self) -> list[RoundState]:
+        self._maybe_reload()
+        rounds = sorted(self._rounds.values(), key=lambda r: (r.created_at, r.round_id))
+        return [copy.deepcopy(state) for state in rounds]
+
+    def get_active_champion(self) -> ChampionSnapshot:
+        self._maybe_reload()
+        return copy.deepcopy(self._active_champion)
+
+    def set_active_champion(
+        self,
+        champion: ChampionSnapshot,
+        *,
+        sync_open_round: bool = True,
+    ) -> ChampionSnapshot:
+        self._maybe_reload()
+        self._active_champion = copy.deepcopy(champion)
+        current = self._get_current_round_ref()
+        if sync_open_round and current is not None and current.status == RoundStatus.OPEN:
+            current.sync_incumbent(champion)
+        self._persist()
+        return self.get_active_champion()
+
+    def ensure_open_round(
+        self,
+        *,
+        opened_epoch: int,
+        incumbent: ChampionSnapshot | None = None,
+    ) -> RoundState:
+        self._maybe_reload()
+        current = self._get_current_round_ref()
+        if current is not None and current.status == RoundStatus.OPEN:
+            if incumbent is not None:
+                self._active_champion = copy.deepcopy(incumbent)
+                current.sync_incumbent(incumbent)
+                self._persist()
+            return copy.deepcopy(current)
+
+        now = time.time()
+        round_id = self._build_round_id(opened_epoch)
+        state = RoundState(
+            round_id=round_id,
+            status=RoundStatus.OPEN,
+            opened_epoch=opened_epoch,
+            created_at=now,
+            updated_at=now,
+        )
+        if incumbent is not None:
+            self._active_champion = copy.deepcopy(incumbent)
+            state.sync_incumbent(incumbent)
+        self._rounds[round_id] = state
+        self._current_round_id = round_id
+        self._persist()
+        return copy.deepcopy(state)
+
+    def close_current_round(
+        self,
+        *,
+        close_epoch: int,
+        benchmark_pack_hash: str | None = None,
+        committee_block: int | None = None,
+        committee_hash: str | None = None,
+        quorum_required: int | None = None,
+        decision_deadline_epoch: int | None = None,
+        effective_epoch: int | None = None,
+    ) -> RoundState:
+        self._maybe_reload()
+        current = self._require_current_round()
+        current.close_epoch = close_epoch
+        current.status = RoundStatus.CLOSED
+        if benchmark_pack_hash is not None:
+            current.benchmark_pack_hash = benchmark_pack_hash
+        if committee_block is not None:
+            current.committee_block = committee_block
+        if committee_hash is not None:
+            current.committee_hash = committee_hash
+        if quorum_required is not None:
+            current.quorum_required = quorum_required
+        if decision_deadline_epoch is not None:
+            current.decision_deadline_epoch = decision_deadline_epoch
+        if effective_epoch is not None:
+            current.effective_epoch = effective_epoch
+        current.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(current)
+
+    def set_round_status(self, round_id: str, status: RoundStatus) -> RoundState:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.status = status
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def set_round_finalist(
+        self,
+        round_id: str,
+        *,
+        submission_id: str,
+        image_id: str | None,
+        benchmark_score: float | None = None,
+        shadow_case_log_hash: str | None = None,
+    ) -> RoundState:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.finalist_submission_id = submission_id
+        state.finalist_image_id = image_id
+        state.finalist_score = benchmark_score
+        if shadow_case_log_hash is not None:
+            state.shadow_case_log_hash = shadow_case_log_hash
+        state.status = RoundStatus.CERTIFYING
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def certify_round(
+        self,
+        round_id: str,
+        certificate: ChampionCertificate,
+    ) -> RoundState:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.certificate = copy.deepcopy(certificate)
+        state.finalist_submission_id = certificate.candidate_submission_id
+        state.finalist_image_id = certificate.candidate_image_id
+        state.shadow_case_log_hash = certificate.shadow_case_log_hash
+        state.committee_hash = certificate.committee_hash
+        state.benchmark_pack_hash = certificate.benchmark_pack_hash
+        state.quorum_required = certificate.quorum_required
+        state.effective_epoch = certificate.effective_epoch
+        state.status = RoundStatus.CERTIFIED
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def activate_round(self, round_id: str, *, effective_epoch: int) -> RoundState:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.status = RoundStatus.ACTIVATED
+        state.effective_epoch = effective_epoch
+        state.abort_reason = None
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def open_next_round(
+        self,
+        *,
+        opened_epoch: int,
+        incumbent: ChampionSnapshot | None = None,
+    ) -> RoundState:
+        self._maybe_reload()
+        current = self._get_current_round_ref()
+        if current is not None and current.status == RoundStatus.OPEN:
+            raise ValueError(f"Round {current.round_id} is still open")
+        return self.ensure_open_round(opened_epoch=opened_epoch, incumbent=incumbent)
+
+    def abort_round(self, round_id: str, reason: str) -> RoundState:
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.status = RoundStatus.ABORTED
+        state.abort_reason = reason
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def _get_current_round_ref(self) -> RoundState | None:
+        if not self._current_round_id:
+            return None
+        return self._rounds.get(self._current_round_id)
+
+    def _require_current_round(self) -> RoundState:
+        current = self._get_current_round_ref()
+        if current is None:
+            raise ValueError("No current solver round")
+        return current
+
+    def _build_round_id(self, opened_epoch: int) -> str:
+        count = sum(1 for state in self._rounds.values() if state.opened_epoch == opened_epoch)
+        return f"round-e{opened_epoch}-n{count + 1}"
+
+    def _maybe_reload(self) -> None:
+        """Refresh persisted round state when another process updates the file."""
+        if self._persist_path is None or not self._persist_path.exists():
+            return
+        try:
+            current_mtime_ns = self._persist_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if self._persist_mtime_ns is None or current_mtime_ns > self._persist_mtime_ns:
+            self._load()
+
+    def _persist(self) -> None:
+        if self._persist_path is None:
+            return
+        try:
+            data = {
+                "current_round_id": self._current_round_id,
+                "active_champion": self._active_champion.to_dict(),
+                "rounds": {
+                    round_id: state.to_dict()
+                    for round_id, state in self._rounds.items()
+                },
+            }
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            self._persist_path.write_text(json.dumps(data, indent=2))
+            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to persist round store: %s", exc)
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self._persist_path.read_text())
+            current_round_id = data.get("current_round_id")
+            active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))
+            rounds_raw = data.get("rounds", {}) or {}
+            rounds: dict[str, RoundState] = {}
+            for round_id, raw in rounds_raw.items():
+                payload = dict(raw)
+                payload.setdefault("round_id", round_id)
+                rounds[round_id] = RoundState.from_dict(payload)
+            if current_round_id not in rounds:
+                current_round_id = None
+            self._current_round_id = current_round_id
+            self._active_champion = active_champion
+            self._rounds = rounds
+            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
+            logger.info(
+                "Loaded %d solver rounds from %s",
+                len(self._rounds),
+                self._persist_path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load round store: %s", exc)

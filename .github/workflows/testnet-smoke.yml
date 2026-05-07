@@ -1,0 +1,41 @@
+name: Local Testnet Smoke
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  local_testnet-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -r requirements.txt
+
+      - name: Prepare local testnet RPC config
+        run: |
+          cat > platform/local_testnet/.env <<EOF
+          ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+          BASE_ALCHEMY_RPC_URL=https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+          EOF
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+
+      - name: Run local testnet smoke suite
+        run: make test-testnet
+
+      - name: Tear down local testnet
+        if: always()
+        run: make testnet-down

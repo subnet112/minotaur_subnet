@@ -1,0 +1,942 @@
+"""Tests for the EpochManager — solver lifecycle across epochs."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import asyncio
+import os
+import time
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# Disable provenance requirements for all tests in this module.
+# The champion_policy now defaults REQUIRE_SIGNED_PROVENANCE=True
+# and REQUIRE_ASYMMETRIC_PROVENANCE=True, which would reject all
+# test submissions that lack provenance signatures.
+_PROVENANCE_OFF = {
+    "REQUIRE_SIGNED_PROVENANCE": "0",
+    "REQUIRE_ASYMMETRIC_PROVENANCE": "0",
+}
+
+@pytest.fixture(autouse=True)
+def _disable_provenance(monkeypatch):
+    for k, v in _PROVENANCE_OFF.items():
+        monkeypatch.setenv(k, v)
+
+from minotaur_subnet.epoch.manager import EpochManager, ChampionInfo
+from minotaur_subnet.harness.round_store import (
+    ChampionApproval,
+    ChampionCertificate,
+    RoundStatus,
+    RoundStore,
+)
+from minotaur_subnet.harness.submission_store import (
+    Submission,
+    SubmissionStatus,
+    SubmissionStore,
+)
+from minotaur_subnet.weight_policy import GENESIS_HOTKEY
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _make_submission(
+    submission_id: str = "sub_1",
+    epoch: int = 1,
+    round_id: str = "",
+    status: SubmissionStatus = SubmissionStatus.SCORED,
+    score: float = 0.8,
+    solver_name: str = "test-solver",
+    image_tag: str = "solver:v1",
+    image_id: str | None = None,
+    hotkey: str = "5Gtest",
+) -> Submission:
+    return Submission(
+        submission_id=submission_id,
+        repo_url="https://github.com/test/solver",
+        commit_hash="abc123",
+        epoch=epoch,
+        hotkey=hotkey,
+        round_id=round_id,
+        status=status,
+        created_at=time.time(),
+        updated_at=time.time(),
+        image_tag=image_tag,
+        image_id=image_id or ("sha256:" + submission_id.replace("_", "").ljust(64, "0")[:64]),
+        solver_name=solver_name,
+        solver_version="1.0.0",
+        benchmark_score=score,
+        benchmark_rank=1,
+        benchmark_details={"total_intents": 5},
+    )
+
+
+def _make_store_with_subs(*submissions: Submission) -> SubmissionStore:
+    store = SubmissionStore()
+    for sub in submissions:
+        store._submissions[sub.submission_id] = sub
+    return store
+
+
+def _make_mock_block_loop():
+    loop = MagicMock()
+    loop.set_solver = MagicMock()
+    return loop
+
+
+def _make_mock_benchmark_worker():
+    worker = MagicMock()
+    worker.run_once = AsyncMock()
+    return worker
+
+
+def _make_mock_orchestrator():
+    orch = MagicMock()
+    session = AsyncMock()
+    session.initialize = AsyncMock()
+    session.restore_state = AsyncMock()
+    session.serialize_state = AsyncMock(return_value=b"state")
+    session.shutdown = AsyncMock()
+    session.metadata = MagicMock(return_value=MagicMock(name="test-solver"))
+    orch.start_docker = AsyncMock(return_value=session)
+    return orch, session
+
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+
+class TestEpochManager:
+
+    @pytest.mark.asyncio
+    async def test_first_epoch_adopts_champion(self):
+        """First epoch with a scored submission adopts it as champion."""
+        sub = _make_submission(epoch=1, score=0.85)
+        store = _make_store_with_subs(sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["champion_changed"] is True
+        assert mgr.champion.submission_id == "sub_1"
+        assert mgr.champion.benchmark_score == 0.85
+        assert mgr.champion.epoch_adopted == 1
+
+    @pytest.mark.asyncio
+    async def test_no_submissions_keeps_current(self):
+        """Epoch with no submissions keeps the current solver."""
+        store = SubmissionStore()
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["champion_changed"] is False
+        assert mgr.champion.submission_id is None
+
+    @pytest.mark.asyncio
+    async def test_dethrone_margin_enforced(self):
+        """Challenger must beat champion by >0.5% to be adopted."""
+        # Set up existing champion at 0.80
+        old_sub = _make_submission(
+            submission_id="sub_old", epoch=1, score=0.80,
+            solver_name="old-solver",
+        )
+        # New challenger at 0.802 (0.25% better, not enough for 0.5% margin)
+        new_sub = _make_submission(
+            submission_id="sub_new", epoch=2, score=0.802,
+            solver_name="new-solver",
+        )
+        store = _make_store_with_subs(old_sub, new_sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        # First epoch: adopt old champion
+        await mgr.on_epoch_boundary(epoch=1)
+        assert mgr.champion.submission_id == "sub_old"
+
+        # Second epoch: challenger doesn't beat margin
+        result = await mgr.on_epoch_boundary(epoch=2)
+        assert result["champion_changed"] is False
+        assert mgr.champion.submission_id == "sub_old"
+
+    @pytest.mark.asyncio
+    async def test_challenger_beats_margin(self):
+        """Challenger beating champion by >5% gets adopted."""
+        old_sub = _make_submission(
+            submission_id="sub_old", epoch=1, score=0.80,
+            solver_name="old-solver",
+        )
+        # New challenger at 0.90 (12.5% better, exceeds 5%)
+        new_sub = _make_submission(
+            submission_id="sub_new", epoch=2, score=0.90,
+            solver_name="new-solver",
+        )
+        store = _make_store_with_subs(old_sub, new_sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        # Adopt old champion
+        await mgr.on_epoch_boundary(epoch=1)
+        assert mgr.champion.submission_id == "sub_old"
+
+        # Challenger beats margin
+        result = await mgr.on_epoch_boundary(epoch=2)
+        assert result["champion_changed"] is True
+        assert mgr.champion.submission_id == "sub_new"
+        assert mgr.champion.benchmark_score == 0.90
+
+    @pytest.mark.asyncio
+    async def test_hot_swap_with_orchestrator(self):
+        """When orchestrator is available, solver session is started and swapped."""
+        sub = _make_submission(epoch=1, score=0.85, image_tag="solver:v1")
+        store = _make_store_with_subs(sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+        orch, session = _make_mock_orchestrator()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+            orchestrator=orch,
+        )
+
+        # 4.3: hot-swap verifies local image_id matches certified image_id.
+        # In this test, both come from _make_submission's deterministic
+        # sha256 fake; patch the docker-inspect helper to return the same.
+        from unittest.mock import patch, AsyncMock as _AM
+        with patch(
+            "minotaur_subnet.epoch.manager._resolve_image_id_via_docker",
+            new=_AM(return_value=sub.image_id),
+        ):
+            await mgr.on_epoch_boundary(epoch=1)
+
+        # Orchestrator should have started a docker session
+        orch.start_docker.assert_awaited_once_with("solver:v1")
+        session.initialize.assert_awaited_once_with({"epoch": 1})
+
+        # Block loop should have received the new session
+        block_loop.set_solver.assert_called_once_with(session)
+
+    @pytest.mark.asyncio
+    async def test_hot_swap_with_runtime_builder(self):
+        """Custom runtime builder is used for live solver activation."""
+        sub = _make_submission(epoch=1, score=0.85, image_tag="solver:v1")
+        store = _make_store_with_subs(sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+        live_solver = MagicMock()
+        builder_calls = []
+
+        async def runtime_builder(submission, epoch):
+            builder_calls.append((submission.submission_id, epoch))
+            return live_solver
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+            runtime_builder=runtime_builder,
+        )
+
+        await mgr.on_epoch_boundary(epoch=1)
+
+        assert builder_calls == [("sub_1", 1)]
+        block_loop.set_solver.assert_called_once_with(live_solver)
+
+    @pytest.mark.asyncio
+    async def test_previous_session_shutdown(self):
+        """Previous solver session is shut down and state serialized."""
+        sub1 = _make_submission(
+            submission_id="sub_1", epoch=1, score=0.80,
+            image_tag="solver:v1", solver_name="solver-a",
+        )
+        sub2 = _make_submission(
+            submission_id="sub_2", epoch=2, score=0.95,
+            image_tag="solver:v2", solver_name="solver-b",
+        )
+        store = _make_store_with_subs(sub1, sub2)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+        orch, session1 = _make_mock_orchestrator()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+            orchestrator=orch,
+        )
+
+        from unittest.mock import patch, AsyncMock as _AM
+
+        def _match(image_tag):
+            return sub1.image_id if image_tag == "solver:v1" else sub2.image_id
+
+        # Epoch 1: adopt first champion
+        with patch(
+            "minotaur_subnet.epoch.manager._resolve_image_id_via_docker",
+            new=_AM(side_effect=lambda tag: _match(tag)),
+        ):
+            await mgr.on_epoch_boundary(epoch=1)
+        first_session = session1
+
+        # Create a new session for epoch 2
+        session2 = AsyncMock()
+        session2.initialize = AsyncMock()
+        session2.restore_state = AsyncMock()
+        orch.start_docker = AsyncMock(return_value=session2)
+
+        # Epoch 2: new champion
+        with patch(
+            "minotaur_subnet.epoch.manager._resolve_image_id_via_docker",
+            new=_AM(side_effect=lambda tag: _match(tag)),
+        ):
+            await mgr.on_epoch_boundary(epoch=2)
+
+        # Previous session should have been shut down
+        first_session.serialize_state.assert_awaited_once()
+        first_session.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_benchmark_worker_run_once_called(self):
+        """Benchmark worker's run_once is called on epoch boundary."""
+        store = SubmissionStore()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        await mgr.on_epoch_boundary(epoch=1)
+        worker.run_once.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_benchmark_failure_recorded(self):
+        """If benchmark worker fails, error is recorded but manager continues."""
+        store = SubmissionStore()
+        worker = _make_mock_benchmark_worker()
+        worker.run_once = AsyncMock(side_effect=RuntimeError("Docker not available"))
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["error"] == "Docker not available"
+        assert result["champion_changed"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_champion_returns_dict(self):
+        """get_champion returns a dict with all expected fields."""
+        mgr = EpochManager()
+        champion = mgr.get_champion()
+
+        assert isinstance(champion, dict)
+        assert "submission_id" in champion
+        assert "solver_name" in champion
+        assert "benchmark_score" in champion
+        assert "epoch_adopted" in champion
+
+    @pytest.mark.asyncio
+    async def test_epoch_history_tracked(self):
+        """Each epoch boundary is recorded in history."""
+        sub1 = _make_submission(submission_id="s1", epoch=1, score=0.7)
+        sub2 = _make_submission(submission_id="s2", epoch=2, score=0.9)
+        store = _make_store_with_subs(sub1, sub2)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        await mgr.on_epoch_boundary(epoch=1)
+        await mgr.on_epoch_boundary(epoch=2)
+
+        history = mgr.get_epoch_history()
+        assert len(history) == 2
+        assert history[0]["epoch"] == 1
+        assert history[1]["epoch"] == 2
+
+    @pytest.mark.asyncio
+    async def test_same_submission_not_readopted(self):
+        """Same submission doesn't trigger a champion change."""
+        sub = _make_submission(submission_id="sub_1", epoch=1, score=0.85)
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        # First epoch adopts
+        result1 = await mgr.on_epoch_boundary(epoch=1)
+        assert result1["champion_changed"] is True
+
+        # Same epoch/submission — no change
+        result2 = await mgr.on_epoch_boundary(epoch=1)
+        assert result2["champion_changed"] is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_previous_epoch_champion(self):
+        """If no submissions in current epoch, falls back to recent epochs."""
+        sub = _make_submission(submission_id="sub_old", epoch=1, score=0.85)
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+        )
+
+        # Epoch 1: adopt
+        await mgr.on_epoch_boundary(epoch=1)
+        assert mgr.champion.submission_id == "sub_old"
+
+        # Epoch 2: no new submissions, same champion stays
+        result = await mgr.on_epoch_boundary(epoch=2)
+        assert result["champion_changed"] is False
+        assert mgr.champion.submission_id == "sub_old"
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_updates_metadata_only(self):
+        """Without orchestrator, champion metadata is updated but no session started."""
+        sub = _make_submission(epoch=1, score=0.85)
+        store = _make_store_with_subs(sub)
+        block_loop = _make_mock_block_loop()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            benchmark_worker=worker,
+            submission_store=store,
+            # No orchestrator
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["champion_changed"] is True
+        assert mgr.champion.submission_id == "sub_1"
+        # Block loop should NOT have set_solver called (no session)
+        block_loop.set_solver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_round_store_activates_round_and_opens_next_round(self):
+        """Round-aware epoch flow activates the processed round and reopens intake."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=1)
+        sub = _make_submission(
+            submission_id="sub_round",
+            epoch=1,
+            round_id=current_round.round_id,
+            score=0.85,
+        )
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        processed_round = round_store.get_round(current_round.round_id)
+        next_round = round_store.get_current_round()
+        champion = round_store.get_active_champion()
+
+        assert result["champion_changed"] is True
+        assert result["round_id"] == current_round.round_id
+        assert result["next_round_id"] == next_round.round_id
+        assert processed_round.status == RoundStatus.ACTIVATED
+        assert processed_round.effective_epoch == 1
+        assert next_round.status == RoundStatus.OPEN
+        assert next_round.round_id != current_round.round_id
+        assert next_round.incumbent_submission_id == sub.submission_id
+        assert champion.submission_id == sub.submission_id
+        assert champion.activated_round_id == current_round.round_id
+        assert store.get(sub.submission_id).status == SubmissionStatus.ADOPTED
+
+    @pytest.mark.asyncio
+    async def test_round_store_aborts_round_when_no_candidate(self):
+        """If no eligible candidate exists, the round aborts and a new one opens."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=3)
+        store = SubmissionStore()
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=3)
+
+        processed_round = round_store.get_round(current_round.round_id)
+        next_round = round_store.get_current_round()
+
+        assert result["champion_changed"] is False
+        assert processed_round.status == RoundStatus.ABORTED
+        assert processed_round.abort_reason == "no_champion_candidate"
+        assert next_round.status == RoundStatus.OPEN
+        assert next_round.round_id != current_round.round_id
+
+    @pytest.mark.asyncio
+    async def test_round_scope_ignores_other_round_submissions(self):
+        """Round-aware champion selection only considers the active round cohort."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=1)
+        current_sub = _make_submission(
+            submission_id="sub_current",
+            epoch=1,
+            round_id=current_round.round_id,
+            score=0.80,
+        )
+        other_round_sub = _make_submission(
+            submission_id="sub_other",
+            epoch=1,
+            round_id="round-e1-n999",
+            score=0.99,
+        )
+        store = _make_store_with_subs(current_sub, other_round_sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["champion_changed"] is True
+        assert mgr.champion.submission_id == "sub_current"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_selects_finalist_without_adoption(self):
+        """Closed-round evaluation should pick a finalist but not activate it."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=4)
+        round_store.close_current_round(
+            close_epoch=4,
+            benchmark_pack_hash="pack-4",
+            committee_hash="committee-4",
+            quorum_required=2,
+        )
+        sub = _make_submission(
+            submission_id="sub_finalist",
+            epoch=4,
+            round_id=current_round.round_id,
+            score=0.93,
+        )
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        updated_round = round_store.get_round(current_round.round_id)
+        assert result["status_after"] == RoundStatus.CERTIFYING.value
+        assert result["finalist_submission_id"] == "sub_finalist"
+        assert updated_round.finalist_submission_id == "sub_finalist"
+        assert store.get("sub_finalist").status == SubmissionStatus.SCORED
+        assert mgr.current_epoch == 4
+        assert mgr.champion.submission_id is None
+
+    @pytest.mark.asyncio
+    async def test_activate_certified_round_adopts_finalist(self):
+        """Certified finalists activate only through the explicit activation path."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=5)
+        round_store.close_current_round(
+            close_epoch=5,
+            benchmark_pack_hash="pack-5",
+            committee_hash="committee-5",
+            quorum_required=1,
+        )
+        sub = _make_submission(
+            submission_id="sub_certified",
+            epoch=5,
+            round_id=current_round.round_id,
+            score=0.94,
+        )
+        store = _make_store_with_subs(sub)
+        block_loop = _make_mock_block_loop()
+        live_solver = MagicMock()
+
+        async def runtime_builder(submission, epoch):
+            assert submission.submission_id == "sub_certified"
+            assert epoch == 6
+            return live_solver
+
+        round_store.set_round_finalist(
+            current_round.round_id,
+            submission_id="sub_certified",
+            image_id=sub.image_id,
+            benchmark_score=sub.benchmark_score,
+        )
+        round_store.certify_round(
+            current_round.round_id,
+            ChampionCertificate(
+                round_id=current_round.round_id,
+                committee_hash="committee-5",
+                candidate_submission_id="sub_certified",
+                candidate_image_id=sub.image_id,
+                incumbent_image_id=None,
+                benchmark_pack_hash="pack-5",
+                effective_epoch=6,
+                quorum_required=1,
+                approvals=[
+                    ChampionApproval(
+                        validator_id="0xabc",
+                        round_id=current_round.round_id,
+                        candidate_submission_id="sub_certified",
+                        candidate_image_id=sub.image_id,
+                        effective_epoch=6,
+                        signature="sig",
+                    ),
+                ],
+            ),
+        )
+
+        mgr = EpochManager(
+            block_loop=block_loop,
+            submission_store=store,
+            round_store=round_store,
+            runtime_builder=runtime_builder,
+        )
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        activated_round = round_store.get_round(current_round.round_id)
+        next_round = round_store.get_current_round()
+        assert result["champion_changed"] is True
+        assert activated_round.status == RoundStatus.ACTIVATED
+        assert mgr.champion.submission_id == "sub_certified"
+        assert store.get("sub_certified").status == SubmissionStatus.ADOPTED
+        assert next_round.status == RoundStatus.OPEN
+        block_loop.set_solver.assert_called_once_with(live_solver)
+
+
+class TestChampionInfo:
+
+    def test_to_dict(self):
+        info = ChampionInfo(
+            submission_id="s1",
+            solver_name="my-solver",
+            solver_version="2.0.0",
+            benchmark_score=0.92,
+            epoch_adopted=5,
+            image_tag="solver:v2",
+            hotkey="5Gtest",
+            adopted_at=1000.0,
+        )
+        d = info.to_dict()
+        assert d["submission_id"] == "s1"
+        assert d["solver_name"] == "my-solver"
+        assert d["benchmark_score"] == 0.92
+        assert d["epoch_adopted"] == 5
+
+    def test_default_values(self):
+        info = ChampionInfo()
+        assert info.submission_id is None
+        assert info.benchmark_score == 0.0
+        assert info.epoch_adopted == 0
+
+
+# ── Weight Emission Tests ────────────────────────────────────────────────────
+
+
+class TestWeightEmission:
+
+    @pytest.mark.asyncio
+    async def test_weights_emitted_after_adoption(self):
+        """Weights are emitted after champion selection in on_epoch_boundary."""
+        sub = _make_submission(epoch=1, score=0.85, hotkey="5Gminer1")
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+        emitter = MagicMock()
+        emitter.emit_async = AsyncMock(return_value=True)
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            weights_emitter=emitter,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["weights_emitted"] is True
+        emitter.emit_async.assert_awaited_once()
+        # Check the mapping has the miner's hotkey
+        mapping = emitter.emit_async.call_args[0][0]
+        assert "5Gminer1" in mapping
+        assert abs(sum(mapping.values()) - 1.0) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_weights_exponential_decay(self):
+        """Weight mapping uses exponential decay: champion gets most weight."""
+        sub1 = _make_submission(
+            submission_id="sub_best", epoch=1, score=0.90,
+            hotkey="5Gminer_best",
+            status=SubmissionStatus.ADOPTED,
+        )
+        sub2 = _make_submission(
+            submission_id="sub_mid", epoch=1, score=0.70,
+            hotkey="5Gminer_mid",
+            status=SubmissionStatus.SCORED,
+        )
+        sub3 = _make_submission(
+            submission_id="sub_low", epoch=1, score=0.50,
+            hotkey="5Gminer_low",
+            status=SubmissionStatus.SCORED,
+        )
+        store = _make_store_with_subs(sub1, sub2, sub3)
+        worker = _make_mock_benchmark_worker()
+        emitter = MagicMock()
+        emitter.emit_async = AsyncMock(return_value=True)
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            weights_emitter=emitter,
+            weight_decay=0.6,
+        )
+
+        await mgr.on_epoch_boundary(epoch=1)
+
+        mapping = emitter.emit_async.call_args[0][0]
+        # All three miners should have weight
+        assert len(mapping) == 3
+        # Champion gets highest weight
+        assert mapping["5Gminer_best"] > mapping["5Gminer_mid"]
+        assert mapping["5Gminer_mid"] > mapping["5Gminer_low"]
+        # Verify decay ratios: rank1/rank0 ≈ 0.6, rank2/rank1 ≈ 0.6
+        ratio_1 = mapping["5Gminer_mid"] / mapping["5Gminer_best"]
+        ratio_2 = mapping["5Gminer_low"] / mapping["5Gminer_mid"]
+        assert abs(ratio_1 - 0.6) < 0.01
+        assert abs(ratio_2 - 0.6) < 0.01
+
+    @pytest.mark.asyncio
+    async def test_no_champion_burns_to_owner(self):
+        """Before any real champion exists, 100% of weights burn to owner."""
+        store = SubmissionStore()
+        worker = _make_mock_benchmark_worker()
+        emitter = MagicMock()
+        emitter.emit_async = AsyncMock(return_value=True)
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            weights_emitter=emitter,
+            owner_hotkey="5Gowner",
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        assert result["champion_changed"] is False
+        assert result["weights_emitted"] is True
+        mapping = emitter.emit_async.call_args[0][0]
+        assert mapping == {"5Gowner": 1.0}
+
+    @pytest.mark.asyncio
+    async def test_genesis_champion_burns_to_owner(self):
+        """Synthetic genesis champion still burns 100% until a real miner wins.
+
+        An ADOPTED genesis submission is restored at init, so on_epoch_boundary
+        does not re-adopt it (champion_changed=False). Weights still burn to owner.
+        """
+        genesis = _make_submission(
+            submission_id="sub_genesis",
+            epoch=1,
+            status=SubmissionStatus.ADOPTED,
+            score=0.85,
+            solver_name="baseline-swap-solver",
+            hotkey=GENESIS_HOTKEY,
+        )
+        store = _make_store_with_subs(genesis)
+        worker = _make_mock_benchmark_worker()
+        emitter = MagicMock()
+        emitter.emit_async = AsyncMock(return_value=True)
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            weights_emitter=emitter,
+            owner_hotkey="5Gowner",
+        )
+
+        # Genesis submission is restored at init from ADOPTED status
+        assert mgr.champion.submission_id == "sub_genesis"
+        assert mgr.champion.hotkey == GENESIS_HOTKEY
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        # Already adopted at init, so no change on epoch boundary
+        assert result["champion_changed"] is False
+        assert mgr.champion.hotkey == GENESIS_HOTKEY
+        assert result["weights_emitted"] is True
+        mapping = emitter.emit_async.call_args[0][0]
+        assert mapping == {"5Gowner": 1.0}
+
+    @pytest.mark.asyncio
+    async def test_no_emitter_no_crash(self):
+        """When no weights_emitter is configured, weights_emitted is False."""
+        sub = _make_submission(epoch=1, score=0.85)
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            # No weights_emitter
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+        assert result["weights_emitted"] is False
+
+    @pytest.mark.asyncio
+    async def test_emission_failure_nonfatal(self):
+        """Weight emission failure doesn't crash the epoch boundary."""
+        sub = _make_submission(epoch=1, score=0.85, hotkey="5Gminer1")
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+        emitter = MagicMock()
+        emitter.emit_async = AsyncMock(side_effect=RuntimeError("network error"))
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            weights_emitter=emitter,
+        )
+
+        result = await mgr.on_epoch_boundary(epoch=1)
+
+        # Should not crash, weights_emitted should be False
+        assert result["weights_emitted"] is False
+        assert result["champion_changed"] is True  # Champion still adopted
+
+
+# ── Benchmark Snapshot Wiring Tests ──────────────────────────────────────────
+
+
+class TestBenchmarkSnapshotWiring:
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_synthetic(self):
+        """Without snapshot_builder, _build_snapshot returns synthetic."""
+        from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+        store = SubmissionStore()
+        worker = BenchmarkWorker(submission_store=store)
+
+        snapshot = await worker._build_snapshot(chain_id=1)
+
+        # Synthetic snapshot has block_number=18500000
+        assert snapshot.block_number == 18500000
+        assert snapshot.chain_id == 1
+        assert "ETH/USD" in snapshot.prices
+
+    @pytest.mark.asyncio
+    async def test_uses_builder_when_available(self):
+        """With snapshot_builder + epoch_block, uses the builder."""
+        from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+        from minotaur_subnet.sdk.intent_solver import MarketSnapshot
+
+        mock_builder = MagicMock()
+        live_snapshot = MarketSnapshot(
+            chain_id=1,
+            block_number=19000000,
+            timestamp=1700100000,
+            prices={"ETH/USD": 2000.0},
+            dex_config={},
+        )
+        mock_builder.build_chain_snapshot = AsyncMock(return_value=live_snapshot)
+
+        store = SubmissionStore()
+        worker = BenchmarkWorker(
+            submission_store=store,
+            snapshot_builder=mock_builder,
+            epoch_block_number=19000000,
+        )
+
+        snapshot = await worker._build_snapshot(chain_id=1)
+
+        assert snapshot.block_number == 19000000
+        assert snapshot.prices == {"ETH/USD": 2000.0}
+        mock_builder.build_chain_snapshot.assert_awaited_once_with(
+            chain_id=1, block_number=19000000,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_builder_error(self):
+        """If builder raises, falls back to synthetic."""
+        from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+        mock_builder = MagicMock()
+        mock_builder.build_chain_snapshot = AsyncMock(
+            side_effect=ConnectionError("RPC unreachable")
+        )
+
+        store = SubmissionStore()
+        worker = BenchmarkWorker(
+            submission_store=store,
+            snapshot_builder=mock_builder,
+            epoch_block_number=19000000,
+        )
+
+        snapshot = await worker._build_snapshot(chain_id=1)
+
+        # Should fall back to synthetic
+        assert snapshot.block_number == 18500000
+        assert "ETH/USD" in snapshot.prices
+
+    def test_set_epoch_block(self):
+        """set_epoch_block updates the worker's block number."""
+        from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+        store = SubmissionStore()
+        worker = BenchmarkWorker(submission_store=store)
+
+        assert worker._epoch_block_number is None
+        worker.set_epoch_block(19500000)
+        assert worker._epoch_block_number == 19500000
