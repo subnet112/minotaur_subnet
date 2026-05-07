@@ -12,6 +12,14 @@ from minotaur_subnet.miner.agent.claude_runner import ClaudeRunner, ClaudeResult
 from minotaur_subnet.miner.agent.app_discovery import AppContext
 from minotaur_subnet.miner.agent.score_tracker import ScoreFeedback
 
+# These tests exercise ClaudeRunner, which spawns the `claude` CLI binary.
+# CI doesn't have it installed — skip the whole module when it's absent so
+# the suite stays green for contributors who don't have the CLI either.
+pytestmark = pytest.mark.skipif(
+    shutil.which("claude") is None,
+    reason="claude CLI not installed",
+)
+
 
 # ── Valid strategy code ────────────────────────────────────────────────────
 

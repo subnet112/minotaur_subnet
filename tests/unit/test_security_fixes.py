@@ -18,6 +18,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# The platform contracts (AppIntentBase, ChampionRegistry, etc.) live in a
+# separate repo (subnet112/minotaur_contracts). The contract-source-pattern
+# checks in this file only run if contracts/ is present (e.g. monorepo
+# checkouts or the dev tree); they're skipped in the OSS minotaur_subnet
+# repo where contracts/ is intentionally absent.
+_CONTRACTS_AVAILABLE = (REPO_ROOT / "contracts" / "src" / "AppIntentBase.sol").exists()
+requires_contracts = pytest.mark.skipif(
+    not _CONTRACTS_AVAILABLE,
+    reason="contracts/ lives in subnet112/minotaur_contracts; not vendored here",
+)
+
 
 # ── #5: Subprocess Benchmark Blocked in Production ─────────────────────────
 
@@ -158,6 +169,7 @@ class TestJsPrototypeFreezing:
 
 # ── #20: Path Traversal in Compiler ────────────────────────────────────────
 
+@requires_contracts
 class TestCompilerPathTraversal:
     """Issue #20: ForgeCompiler must reject path traversal in contract names."""
 
@@ -223,6 +235,7 @@ class TestHttpGetDenyByDefault:
 
 # ── #22: Per-User Nonce Sentinel Value ─────────────────────────────────────
 
+@requires_contracts
 class TestNonceSentinel:
     """Issue #22: Contract should support sentinel nonce for concurrent orders."""
 
@@ -258,6 +271,7 @@ class TestMockSimulationFlag:
 
 # ── #27: Score Threshold Floor ─────────────────────────────────────────────
 
+@requires_contracts
 class TestScoreThresholdFloor:
     """Issue #27: Score threshold cannot be set below 5000 BPS (0.5)."""
 
@@ -282,6 +296,7 @@ class TestScoreThresholdFloor:
 
 # ── #8: Cross-Chain Leg Signature Verification ─────────────────────────────
 
+@requires_contracts
 class TestCrossChainLegSignature:
     """Issue #8: executeCrossChainLeg should verify user signature when provided."""
 

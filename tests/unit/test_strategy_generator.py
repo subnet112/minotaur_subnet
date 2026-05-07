@@ -11,6 +11,14 @@ from minotaur_subnet.miner.agent.strategy_generator import StrategyGenerator
 from minotaur_subnet.miner.agent.app_discovery import AppContext
 from minotaur_subnet.miner.agent.score_tracker import ScoreFeedback
 
+# StrategyGenerator drives the `claude` CLI binary. CI doesn't ship the
+# binary — skip the module when it's absent rather than failing every test
+# with FileNotFoundError.
+pytestmark = pytest.mark.skipif(
+    shutil.which("claude") is None,
+    reason="claude CLI not installed",
+)
+
 
 # ── Fake LLM response (valid strategy code) ────────────────────────────────
 
