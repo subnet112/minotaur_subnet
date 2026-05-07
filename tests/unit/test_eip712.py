@@ -328,8 +328,12 @@ class TestLitWalletEip712Signing:
     """Test sign_eip712_order on LitMpcWallet using local fallback (WAL-6)."""
 
     @pytest.fixture
-    def wallet(self, tmp_path):
+    def wallet(self, tmp_path, monkeypatch):
         """Create a LitMpcWallet that falls back to local."""
+        # LocalWalletManager refuses to start without an explicit passphrase
+        # (no default fallback for security). Set a test value so the
+        # fallback path used here can run.
+        monkeypatch.setenv("APP_INTENTS_WALLET_PASSPHRASE", "test-only-passphrase")
         from minotaur_subnet.wallet.lit_wallet import LitMpcWallet
         wallet = LitMpcWallet(
             bridge_url="http://localhost:99999",  # unreachable → fallback
