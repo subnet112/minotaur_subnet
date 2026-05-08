@@ -1,5 +1,11 @@
 name: Tests
 
+# Scope: Python package tests only. Contract (Foundry) tests live alongside
+# the contracts in subnet112/minotaur_contracts and are exercised by that
+# repo's own CI. Anvil/Docker-bound emulation and fork suites still live in
+# the dev tree but aren't gated here — GitHub-hosted runners don't have the
+# fork RPC creds or the running containers those suites assume.
+
 on:
   push:
     branches: [main, crosschain]
@@ -21,8 +27,6 @@ jobs:
           ./.venv/bin/pip install -r requirements.txt
       - name: Unit tests
         run: make test-unit
-      - name: App tests
-        run: make test-app
 
   cross-chain-tests:
     # Dev-track lane: exercises minotaur_subnet/bridge/* and the multi-leg
@@ -42,86 +46,3 @@ jobs:
           ./.venv/bin/pip install -r requirements.txt
       - name: Cross-chain tests (dev-track)
         run: make test-cross-chain
-
-  integration-tests:
-    runs-on: ubuntu-latest
-    needs: [unit-tests]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Create virtualenv and install dependencies
-        run: |
-          python -m venv .venv
-          ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install -r requirements.txt
-      - name: Integration tests
-        run: make test-integration
-
-  emulation-tests:
-    runs-on: ubuntu-latest
-    needs: [unit-tests]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Create virtualenv and install dependencies
-        run: |
-          python -m venv .venv
-          ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install -r requirements.txt
-      - name: Emulation tests
-        run: make test-emulation
-
-  forge-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-      - name: Forge tests
-        run: make test-forge
-
-  e2e-tests:
-    runs-on: ubuntu-latest
-    needs: [unit-tests, integration-tests, emulation-tests, forge-tests]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: foundry-rs/foundry-toolchain@v1
-      - name: Create virtualenv and install dependencies
-        run: |
-          python -m venv .venv
-          ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install -r requirements.txt
-      - name: E2E tests
-        run: make test-e2e
-
-  fork-tests:
-    runs-on: ubuntu-latest
-    needs: [e2e-tests]
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: foundry-rs/foundry-toolchain@v1
-      - name: Create virtualenv and install dependencies
-        run: |
-          python -m venv .venv
-          ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install -r requirements.txt
-      - name: Fork tests
-        run: make test-fork
-        env:
-          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
