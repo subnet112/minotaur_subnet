@@ -23,7 +23,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Hyphen, not the underscored repo name — GHCR auto-link to the
+  # `minotaur_subnet` repo silently rejected `packages: write` under the
+  # subnet112 org. Decoupling the package name from the repo name dodges
+  # that, and "minotaur-validator" is a more meaningful name for operators
+  # anyway (vs the package-only-incidental "minotaur_subnet" repo path).
+  IMAGE_NAME: subnet112/minotaur-validator
 
 jobs:
   build-and-push:
