@@ -2,6 +2,98 @@
 
 This guide walks you through setting up and running a Minotaur validator on Bittensor Subnet 112.
 
+## Hardware Requirements
+
+The "validator" role spans from a minimal consensus follower up to running the full leader stack. Pick the tier that matches what you intend to run.
+
+### Tier 1 — Follower validator (minimum)
+
+You run `python -m minotaur_subnet.validator.main` and participate in order-consensus quorum. You receive proposals from the leader, independently re-score them via the JS scoring engine, and return EIP-712 attestations. With the default `FOLLOWER_PROPOSAL_RESIMULATE=0`, you trust the leader's Anvil simulation and only re-run JS scoring.
+
+| Spec | Value |
+|------|-------|
+| vCPU | 2 |
+| RAM | 2 GB |
+| Storage | 30 GB SSD |
+| GPU | none |
+| Network out | ~50 GB/month |
+
+Realistic provider: $5-10/mo VPS (Hetzner CX21, DigitalOcean basic droplet, OVH VLE-1).
+
+### Tier 2 — Independent-simulation validator (recommended)
+
+Same as Tier 1 with `FOLLOWER_PROPOSAL_RESIMULATE=1`. You run your own Anvil ETH + Base forks and never trust the leader's simulation result. This is the configuration we recommend for any validator that wants the full trustless guarantees the protocol provides.
+
+| Spec | Value |
+|------|-------|
+| vCPU | 4 |
+| RAM | 8 GB |
+| Storage | 100 GB SSD |
+| GPU | none |
+| Network out | ~200 GB/month (Anvil forks pull a lot of mainnet state) |
+
+A **daily Anvil recycle cron** is required: Anvil's overlay filesystem grows ~15 GB/day per fork even with tmpfs mounted at `/root` and `/tmp`. The recommended cron at 03:00 UTC is:
+
+```
+0 3 * * * root docker compose -f /path/to/docker-compose.yml rm -fsv anvil-eth anvil-base && docker compose -f /path/to/docker-compose.yml up -d anvil-eth anvil-base
+```
+
+Realistic provider: $20-40/mo VPS (Hetzner CX31, DigitalOcean 4 GB droplet, OVH VLE-2).
+
+### Tier 3 — Leader / full subnet stack
+
+This bundle runs the entire subnet infrastructure: leader API, two API peers for champion-consensus, three validators for order-consensus, the relayer, four Anvil forks (ETH + Base + BT EVM + benchmark), the subtensor connection, and the Docker benchmark sandbox. This is the central operator role -- almost certainly **not** what you want as an external validator.
+
+| Spec | Value |
+|------|-------|
+| vCPU | 8 |
+| RAM | 16-32 GB |
+| Storage | 200 GB SSD (daily Anvil recycle still required) |
+| GPU | none |
+
+Realistic provider: $80-150/mo dedicated or compute-optimized cloud (Hetzner AX52, AWS c6i.xlarge or larger, dedicated Linode).
+
+## Third-Party APIs
+
+Required for Tier 2 and Tier 3, optional for Tier 1.
+
+| Provider | Used for | Free tier sufficient? |
+|----------|----------|-----------------------|
+| **Alchemy or Infura** (Ethereum mainnet) | Source RPC for the Anvil ETH fork; archive endpoint needed | Yes, the free tier handles one validator comfortably |
+| **Alchemy or Infura** (Base mainnet, chain 8453) | Source RPC for the Anvil Base fork | Yes, same account |
+| **Public BT EVM RPC** | `https://lite.chain.opentensor.ai` (chain 964) -- ChampionRegistry reads | Public endpoint, no signup |
+| **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads | Public endpoint, no signup |
+| **GitHub API (read-only)** | Cloning miner submissions for benchmark (Tier 3 only) | Anonymous works, but a PAT raises the rate limit |
+
+No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, deterministic, and CPU-bound.
+
+## Ports
+
+### Inbound (must be reachable from the public internet)
+
+| Port | Service | Required for |
+|------|---------|--------------|
+| `9100/tcp` | Validator HTTP API -- consensus signing endpoint | All tiers |
+| `8080/tcp` | Leader API | Tier 3 only |
+| `8091/tcp` | Relayer | Tier 3 only |
+
+If you are behind NAT, forward `9100/tcp` to the validator host. On a cloud VPS with a public IP, simply open `9100/tcp` in the firewall.
+
+### Outbound (egress, no special configuration)
+
+| Destination | Port | Purpose |
+|-------------|------|---------|
+| `entrypoint-finney.opentensor.ai` | 443 (WSS) | Subtensor metagraph reads |
+| `lite.chain.opentensor.ai` | 443 (HTTPS) | BT EVM RPC |
+| Alchemy / Infura host | 443 (HTTPS) | ETH and Base fork source RPCs |
+| Other validator peers | 9100 (HTTPS) | Consensus signing |
+| Leader API host | 8080 (HTTPS) | Proposal pull (followers) |
+| `github.com`, `ghcr.io` | 443 (HTTPS) | Image and repo pulls |
+
+### Internal only (not exposed externally)
+
+Anvil ports (`8545` for ETH, `8546` for Base, `8547` for BT EVM) are bound to the Docker network and must never be exposed to the public internet.
+
 ## Prerequisites
 
 - **Python 3.12+**
