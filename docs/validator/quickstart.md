@@ -4,52 +4,69 @@ This guide walks you through setting up and running a Minotaur validator on Bitt
 
 ## Hardware Requirements
 
-**Every validator must be leader-capable.** Leadership on Subnet 112 is awarded by stake at the metagraph level -- the highest-stake validator runs the leader role, ties broken by hotkey lexicographic order. Leadership rotates whenever stakes shift on the chain, with no advance notice. A validator that cannot immediately accept the leader role on stake change is effectively a free-rider: it collects the same emissions as a fully-provisioned validator while only signing follower attestations, and it drags the network's resilience down. There is one supported configuration, sized so any validator can take the leader role in seconds when it wins the election.
+**Every validator must be leader-capable.** Leadership on Subnet 112 is awarded by stake at the metagraph level -- the highest-stake validator runs the leader role, ties broken by hotkey lexicographic order. Leadership rotates whenever stakes shift on chain, with no advance notice. A validator that cannot immediately accept the leader role on stake change is a free-rider: it collects the same emissions as a fully-provisioned validator while only signing follower attestations, and it drags down the network's resilience to leader rotation.
 
-### Required spec
+The spec below is sized for *today's* network and scales up as the protocol expands. Start at the baseline; scale up on the trigger events listed.
+
+### Baseline (today)
+
+Subnet 112 currently operates one App (DexAggregator) across two real chains (Ethereum mainnet, Base) plus BT EVM. User volume is light. The baseline spec handles this comfortably with room for the leader role.
 
 | Spec | Value |
 |------|-------|
-| vCPU | 8 (modern x86_64, AVX2 or better) |
-| RAM | 16 GB minimum, 32 GB recommended |
-| Storage | 200 GB SSD/NVMe |
+| vCPU | 4 (modern x86_64) |
+| RAM | 8 GB |
+| Storage | 100 GB SSD/NVMe |
 | GPU | none |
-| Network out | ~200 GB/month (Anvil forks + leader user traffic) |
-| Public IPv4 | yes (consensus and leader API must be reachable) |
+| Network out | ~100 GB/month |
+| Public IPv4 | yes (consensus + leader API + relayer must be reachable) |
 
 What runs on this box (always, whether you are currently leader or follower):
 
-- Validator service (`python -m minotaur_subnet.validator.main`) -- order-consensus signing
-- API service (`python -m minotaur_subnet.api.server`) -- user gateway, champion-consensus, benchmark coordinator. Only serves real user traffic when you are leader, but stays warm.
+- Validator service (`python -m minotaur_subnet.validator.main`) -- order-consensus signing.
+- API service (`python -m minotaur_subnet.api.server`) -- user gateway, champion-consensus participation, benchmark coordinator. Only serves real user traffic when you are leader, but stays warm so promotion is instant.
 - Relayer (`python -m minotaur_subnet.relayer.main`) -- transaction submission. Only signs on-chain when you are leader.
-- Anvil forks: ETH mainnet (chain 1), Base mainnet (chain 8453), BT EVM (chain 964). All three running and warm so the leader role can simulate plans immediately.
-- Docker benchmark sandbox -- spins up containers from miner submissions for scoring.
+- Anvil forks for each supported chain (currently Ethereum mainnet, Base, BT EVM). All running warm so the leader role can simulate plans immediately. Cold-starting an Anvil fork costs 30+ seconds, which would drop the first minute of orders after every stake-change-driven leader rotation.
+- Docker benchmark sandbox -- spins up containers from miner submissions for scoring (active mainly during champion benchmarks).
 - JS scoring engine (Node.js subprocess) -- deterministic, on-demand.
 - Subtensor connection -- WebSocket to `wss://entrypoint-finney.opentensor.ai:443` or your own node.
 
-The leader-ready posture matters because Anvil forks take 30+ seconds to warm up from cold; a validator that boots Anvil only on leader promotion would drop the first minute of orders after every metagraph stake change. By keeping all forks running, the leader transition is just "now you also accept user traffic and submit on-chain" -- on the order of seconds.
+Steady-state at this spec uses about 5-6 GB RAM and well under 1 vCPU. Active leader load (handling orders + running a benchmark) peaks around 9-10 GB RAM and 3-4 vCPU. 8 GB / 4 vCPU leaves a healthy margin.
+
+### Growth path
+
+The baseline grows mostly along two axes: number of chains we support (each adds an Anvil fork) and concurrent user volume (each adds parallel scoring + simulation work). Scale up when one of these triggers fires.
+
+| Trigger event | Recommended spec |
+|---------------|------------------|
+| Baseline (today) | **4 vCPU / 8 GB / 100 GB SSD** |
+| +1 chain added (e.g. Arbitrum or Optimism announcement) -- one extra Anvil fork per chain costs ~1.5-2 GB RAM | **4 vCPU / 12 GB / 150 GB SSD** |
+| 2+ new chains, or sustained user volume making JS scoring run continuously in parallel | **8 vCPU / 16 GB / 200 GB SSD** |
+| Multi-app phase (several Apps live simultaneously, each with independent benchmarks running in parallel) | **8 vCPU / 32 GB / 200 GB SSD** |
+
+Scaling is vertical -- no horizontal sharding needed at the validator level. You can typically resize an existing VPS in under five minutes with a reboot. Plan to upsize at the announcement of each new chain integration; the subnet roadmap publishes these ahead of activation.
 
 ### Required maintenance cron
 
-Anvil's overlay filesystem grows roughly 15 GB per fork per day even with tmpfs mounted at `/root` and `/tmp`. Without a daily recycle, a 200 GB volume fills in under a week. Install this cron:
+Anvil's overlay filesystem grows roughly 15 GB per fork per day even with tmpfs mounted at `/root` and `/tmp`. Without a daily recycle, a 100 GB volume fills in under a week with three forks. Install this cron:
 
 ```
 0 3 * * * root docker compose -f /path/to/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /path/to/docker-compose.yml up -d anvil anvil-base anvil-btevm
 ```
 
-The recycle window (03:00 UTC by default) drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from neighbours to avoid simultaneous reorg pauses.
+The recycle window (03:00 UTC by default) drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from peers to avoid simultaneous reorg pauses.
 
-### Realistic hosting
+### Realistic hosting (baseline 4 vCPU / 8 GB)
 
 | Provider | Plan | Approx. monthly cost |
 |----------|------|----------------------|
-| Hetzner | AX52 dedicated, or CCX23 cloud | EUR 50-70 |
-| OVH | Advance-1 dedicated | EUR 60-90 |
-| AWS | c6i.2xlarge (8 vCPU / 16 GB) + 200 GB gp3 | USD 250-300 |
-| DigitalOcean | CPU-Optimized 16 GB | USD 160 |
-| Vultr | High Frequency 16 GB | USD 120 |
+| Hetzner | CCX13 (4 vCPU dedicated / 16 GB / 80 GB NVMe) -- already at the next tier with headroom | EUR 25-30 |
+| OVH | VPS Comfort | EUR 18-25 |
+| DigitalOcean | Premium AMD 4 vCPU / 8 GB / 160 GB | USD 48 |
+| Vultr | Cloud Compute 4 vCPU / 8 GB | USD 40 |
+| AWS | c6i.xlarge (4 vCPU / 8 GB) + 100 GB gp3 | USD 130-160 |
 
-The c6i.large currently running production is undersized -- it works only because the leader has been the only one doing real load; do not replicate that as a third-party validator.
+Most validators will run on a $25-50/month box at the baseline tier and resize up when chain expansions are announced.
 
 ## Third-Party APIs
 
