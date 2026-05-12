@@ -136,13 +136,33 @@ class AppIntentsValidator:
             sim_rpc_urls[1] = anvil_url
         if base_sim_url:
             sim_rpc_urls[8453] = base_sim_url
+
+        # Upstream RPCs (same endpoints anvil containers fork from) so
+        # AnvilSimulator can advance the fork to current upstream head
+        # before each simulation. Without this, anvil_reset is a no-op
+        # and sims run against stale fork-time state.
+        upstream_rpc_urls: dict[int, str] = {}
+        eth_upstream = (os.environ.get("ETH_UPSTREAM_RPC_URL") or "").strip()
+        if eth_upstream:
+            upstream_rpc_urls[1] = eth_upstream
+        base_upstream = (os.environ.get("BASE_UPSTREAM_RPC_URL") or "").strip()
+        if base_upstream:
+            upstream_rpc_urls[8453] = base_upstream
+        btevm_upstream = (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL") or "").strip()
+        if btevm_upstream:
+            upstream_rpc_urls[964] = btevm_upstream
+
         if sim_rpc_urls:
             try:
                 from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
-                simulator = MultiChainSimulator(sim_rpc_urls)
+                simulator = MultiChainSimulator(
+                    sim_rpc_urls,
+                    upstream_rpc_urls=upstream_rpc_urls,
+                )
                 logger.info(
-                    "MultiChainSimulator initialized (chains=%s)",
+                    "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
                     list(sim_rpc_urls.keys()),
+                    [c for c in sim_rpc_urls if c in upstream_rpc_urls],
                 )
             except Exception as exc:
                 logger.warning("MultiChainSimulator init failed: %s", exc)

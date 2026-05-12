@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Any
 
+import requests
 from web3 import Web3
 
 from minotaur_subnet.shared.types import (
@@ -60,11 +61,21 @@ class AnvilSimulator:
         default_executor: str = _DEFAULT_EXECUTOR,
         fund_executor: bool = True,
         sim_timeout: float = 30.0,
+        upstream_rpc_url: str | None = None,
     ) -> None:
         self.rpc_url = rpc_url
         self.default_executor = Web3.to_checksum_address(default_executor)
         self.fund_executor = fund_executor
         self.sim_timeout = sim_timeout
+        # Upstream RPC the local Anvil is forking from (e.g. Alchemy
+        # Base mainnet). Used by _reset_fork to advance the fork to
+        # the current upstream head before each simulation. Without
+        # this, anvil_reset({}) silently no-ops back to the original
+        # fork-block (a foundry quirk) and simulations run against
+        # stale state. Optional — local-testnet sims (chain 31337,
+        # not forked from anything) leave this unset and skip the
+        # head-fetch path entirely.
+        self.upstream_rpc_url = (upstream_rpc_url or "").strip() or None
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
 
         if not self.w3.is_connected():
@@ -72,7 +83,9 @@ class AnvilSimulator:
         else:
             block = self.w3.eth.block_number
             logger.info(
-                "AnvilSimulator connected: %s (block %d)", rpc_url, block
+                "AnvilSimulator connected: %s (block %d, upstream=%s)",
+                rpc_url, block,
+                "configured" if self.upstream_rpc_url else "none (fork stays static)",
             )
 
     async def simulate(
@@ -447,22 +460,64 @@ class AnvilSimulator:
     def _reset_fork(self, block_number: int | None = None) -> None:
         """Reset the Anvil fork to re-fetch all state from upstream RPC.
 
-        Calls ``anvil_reset`` which resets to the original fork URL.
-        When ``block_number`` is None the fork rewinds to the upstream's
-        latest block (the default, used for current-state simulations).
+        Calls ``anvil_reset`` with an explicit ``forking.blockNumber``.
+        When ``block_number`` is None we fetch the current upstream
+        head (via self.upstream_rpc_url) and reset to that block — this
+        is the default path, used so every current-state simulation
+        sees fresh pool prices + sees any contracts deployed since the
+        anvil container started.
+
         When a block number is provided, the fork rewinds to THAT block
-        — needed for historical-order replays so the strategy's plan
-        is evaluated against pool prices as they were when the original
-        order was filled, not today's prices. Requires an archive-
-        capable upstream RPC.
+        instead — used by historical-order replays so the strategy's
+        plan is evaluated against pool prices as they were when the
+        original order was filled. Requires an archive-capable upstream.
+
+        Subtle: ``anvil_reset`` with empty params ``[{}]`` is a no-op
+        in Foundry — the fork stays at its initial block. The explicit
+        ``forking.blockNumber`` is what actually advances the fork.
+        That's why the upstream-head fetch is required.
+
+        If self.upstream_rpc_url is unset (e.g., local-testnet chain
+        31337 which isn't forked from anything), this no-ops gracefully
+        — local Anvil already has the state we want.
         """
+        if block_number is None:
+            if not self.upstream_rpc_url:
+                # No upstream configured (local-testnet or test path).
+                # Skip the reset; local Anvil state is authoritative.
+                return
+            try:
+                block_number = self._fetch_upstream_head()
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch upstream head for fork reset (upstream=%s): %s",
+                    self.upstream_rpc_url, exc,
+                )
+                # Best-effort: leave fork at its current block. Better
+                # than a half-reset that leaves Anvil in an inconsistent
+                # state.
+                return
+
         try:
-            params: list = [{}]
-            if block_number is not None:
-                params = [{"forking": {"blockNumber": int(block_number)}}]
+            params = [{"forking": {"blockNumber": int(block_number)}}]
             self.w3.provider.make_request("anvil_reset", params)
         except Exception as exc:
             logger.warning("anvil_reset failed (block=%s): %s", block_number, exc)
+
+    def _fetch_upstream_head(self) -> int:
+        """Query the upstream RPC for the current head block number."""
+        if not self.upstream_rpc_url:
+            raise RuntimeError("No upstream_rpc_url configured")
+        resp = requests.post(
+            self.upstream_rpc_url,
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result")
+        if not result:
+            raise RuntimeError(f"Upstream RPC returned no result: {resp.text[:200]}")
+        return int(result, 16)
 
     def _snapshot(self) -> str:
         """Take an EVM state snapshot."""
@@ -996,17 +1051,25 @@ class MultiChainSimulator:
         self,
         rpc_urls: dict[int, str],
         default_chain_id: int = 31337,
+        upstream_rpc_urls: dict[int, str] | None = None,
         **kwargs: Any,
     ) -> None:
         self.simulators: dict[int, AnvilSimulator] = {}
         self.default_chain_id = default_chain_id
+        upstream_rpc_urls = upstream_rpc_urls or {}
 
         for chain_id, url in rpc_urls.items():
             try:
-                sim = AnvilSimulator(rpc_url=url, **kwargs)
+                sim = AnvilSimulator(
+                    rpc_url=url,
+                    upstream_rpc_url=upstream_rpc_urls.get(chain_id),
+                    **kwargs,
+                )
                 self.simulators[chain_id] = sim
                 logger.info(
-                    "MultiChainSimulator: chain %d → %s", chain_id, url,
+                    "MultiChainSimulator: chain %d → %s (upstream %s)",
+                    chain_id, url,
+                    "configured" if upstream_rpc_urls.get(chain_id) else "none",
                 )
             except Exception as exc:
                 logger.warning(

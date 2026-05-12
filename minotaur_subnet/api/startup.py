@@ -853,13 +853,37 @@ async def initialize(ctx: ServerContext) -> dict:
             sim_rpc_urls[8453] = base_sim_url
         if btevm_url:
             sim_rpc_urls[964] = btevm_url
+
+        # Upstream RPC URLs — the same endpoints the anvil containers
+        # are forking from. Used by AnvilSimulator._reset_fork to advance
+        # each fork to the current upstream head before every simulation
+        # (otherwise anvil_reset is a no-op and sims run against stale
+        # fork-time state — pool prices that no longer match real chain).
+        # Optional: when unset for a given chain, that chain's fork stays
+        # static (acceptable for local-testnet chain 31337 which isn't
+        # forked from anything).
+        upstream_rpc_urls: dict[int, str] = {}
+        eth_upstream = (os.environ.get("ETH_UPSTREAM_RPC_URL") or "").strip()
+        if eth_upstream:
+            upstream_rpc_urls[1] = eth_upstream
+        base_upstream = (os.environ.get("BASE_UPSTREAM_RPC_URL") or "").strip()
+        if base_upstream:
+            upstream_rpc_urls[8453] = base_upstream
+        btevm_upstream = (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL") or "").strip()
+        if btevm_upstream:
+            upstream_rpc_urls[964] = btevm_upstream
+
         if sim_rpc_urls:
             try:
                 from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
-                simulator = MultiChainSimulator(sim_rpc_urls)
+                simulator = MultiChainSimulator(
+                    sim_rpc_urls,
+                    upstream_rpc_urls=upstream_rpc_urls,
+                )
                 logger.info(
-                    "MultiChainSimulator initialized (chains=%s)",
+                    "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
                     list(sim_rpc_urls.keys()),
+                    [c for c in sim_rpc_urls if c in upstream_rpc_urls],
                 )
             except Exception as exc:
                 logger.warning("MultiChainSimulator unavailable: %s", exc)
