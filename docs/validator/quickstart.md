@@ -4,66 +4,62 @@ This guide walks you through setting up and running a Minotaur validator on Bitt
 
 ## Hardware Requirements
 
-The "validator" role spans from a minimal consensus follower up to running the full leader stack. Pick the tier that matches what you intend to run.
+**Every validator must be leader-capable.** Leadership on Subnet 112 is awarded by stake at the metagraph level -- the highest-stake validator runs the leader role, ties broken by hotkey lexicographic order. Leadership rotates whenever stakes shift on the chain, with no advance notice. A validator that cannot immediately accept the leader role on stake change is effectively a free-rider: it collects the same emissions as a fully-provisioned validator while only signing follower attestations, and it drags the network's resilience down. There is one supported configuration, sized so any validator can take the leader role in seconds when it wins the election.
 
-### Tier 1 — Follower validator (minimum)
-
-You run `python -m minotaur_subnet.validator.main` and participate in order-consensus quorum. You receive proposals from the leader, independently re-score them via the JS scoring engine, and return EIP-712 attestations. With the default `FOLLOWER_PROPOSAL_RESIMULATE=0`, you trust the leader's Anvil simulation and only re-run JS scoring.
+### Required spec
 
 | Spec | Value |
 |------|-------|
-| vCPU | 2 |
-| RAM | 2 GB |
-| Storage | 30 GB SSD |
+| vCPU | 8 (modern x86_64, AVX2 or better) |
+| RAM | 16 GB minimum, 32 GB recommended |
+| Storage | 200 GB SSD/NVMe |
 | GPU | none |
-| Network out | ~50 GB/month |
+| Network out | ~200 GB/month (Anvil forks + leader user traffic) |
+| Public IPv4 | yes (consensus and leader API must be reachable) |
 
-Realistic provider: $5-10/mo VPS (Hetzner CX21, DigitalOcean basic droplet, OVH VLE-1).
+What runs on this box (always, whether you are currently leader or follower):
 
-### Tier 2 — Independent-simulation validator (recommended)
+- Validator service (`python -m minotaur_subnet.validator.main`) -- order-consensus signing
+- API service (`python -m minotaur_subnet.api.server`) -- user gateway, champion-consensus, benchmark coordinator. Only serves real user traffic when you are leader, but stays warm.
+- Relayer (`python -m minotaur_subnet.relayer.main`) -- transaction submission. Only signs on-chain when you are leader.
+- Anvil forks: ETH mainnet (chain 1), Base mainnet (chain 8453), BT EVM (chain 964). All three running and warm so the leader role can simulate plans immediately.
+- Docker benchmark sandbox -- spins up containers from miner submissions for scoring.
+- JS scoring engine (Node.js subprocess) -- deterministic, on-demand.
+- Subtensor connection -- WebSocket to `wss://entrypoint-finney.opentensor.ai:443` or your own node.
 
-Same as Tier 1 with `FOLLOWER_PROPOSAL_RESIMULATE=1`. You run your own Anvil ETH + Base forks and never trust the leader's simulation result. This is the configuration we recommend for any validator that wants the full trustless guarantees the protocol provides.
+The leader-ready posture matters because Anvil forks take 30+ seconds to warm up from cold; a validator that boots Anvil only on leader promotion would drop the first minute of orders after every metagraph stake change. By keeping all forks running, the leader transition is just "now you also accept user traffic and submit on-chain" -- on the order of seconds.
 
-| Spec | Value |
-|------|-------|
-| vCPU | 4 |
-| RAM | 8 GB |
-| Storage | 100 GB SSD |
-| GPU | none |
-| Network out | ~200 GB/month (Anvil forks pull a lot of mainnet state) |
+### Required maintenance cron
 
-A **daily Anvil recycle cron** is required: Anvil's overlay filesystem grows ~15 GB/day per fork even with tmpfs mounted at `/root` and `/tmp`. The recommended cron at 03:00 UTC is:
+Anvil's overlay filesystem grows roughly 15 GB per fork per day even with tmpfs mounted at `/root` and `/tmp`. Without a daily recycle, a 200 GB volume fills in under a week. Install this cron:
 
 ```
-0 3 * * * root docker compose -f /path/to/docker-compose.yml rm -fsv anvil-eth anvil-base && docker compose -f /path/to/docker-compose.yml up -d anvil-eth anvil-base
+0 3 * * * root docker compose -f /path/to/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /path/to/docker-compose.yml up -d anvil anvil-base anvil-btevm
 ```
 
-Realistic provider: $20-40/mo VPS (Hetzner CX31, DigitalOcean 4 GB droplet, OVH VLE-2).
+The recycle window (03:00 UTC by default) drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from neighbours to avoid simultaneous reorg pauses.
 
-### Tier 3 — Leader / full subnet stack
+### Realistic hosting
 
-This bundle runs the entire subnet infrastructure: leader API, two API peers for champion-consensus, three validators for order-consensus, the relayer, four Anvil forks (ETH + Base + BT EVM + benchmark), the subtensor connection, and the Docker benchmark sandbox. This is the central operator role -- almost certainly **not** what you want as an external validator.
+| Provider | Plan | Approx. monthly cost |
+|----------|------|----------------------|
+| Hetzner | AX52 dedicated, or CCX23 cloud | EUR 50-70 |
+| OVH | Advance-1 dedicated | EUR 60-90 |
+| AWS | c6i.2xlarge (8 vCPU / 16 GB) + 200 GB gp3 | USD 250-300 |
+| DigitalOcean | CPU-Optimized 16 GB | USD 160 |
+| Vultr | High Frequency 16 GB | USD 120 |
 
-| Spec | Value |
-|------|-------|
-| vCPU | 8 |
-| RAM | 16-32 GB |
-| Storage | 200 GB SSD (daily Anvil recycle still required) |
-| GPU | none |
-
-Realistic provider: $80-150/mo dedicated or compute-optimized cloud (Hetzner AX52, AWS c6i.xlarge or larger, dedicated Linode).
+The c6i.large currently running production is undersized -- it works only because the leader has been the only one doing real load; do not replicate that as a third-party validator.
 
 ## Third-Party APIs
 
-Required for Tier 2 and Tier 3, optional for Tier 1.
-
 | Provider | Used for | Free tier sufficient? |
 |----------|----------|-----------------------|
-| **Alchemy or Infura** (Ethereum mainnet) | Source RPC for the Anvil ETH fork; archive endpoint needed | Yes, the free tier handles one validator comfortably |
-| **Alchemy or Infura** (Base mainnet, chain 8453) | Source RPC for the Anvil Base fork | Yes, same account |
+| **Alchemy or Infura** (Ethereum mainnet) | Source RPC for the Anvil ETH fork; archive endpoint needed | Yes for moderate load. Premium tier recommended once you take leader for non-trivial periods (free-tier quotas can throttle under burst). |
+| **Alchemy or Infura** (Base mainnet, chain 8453) | Source RPC for the Anvil Base fork | Same as above, same account |
 | **Public BT EVM RPC** | `https://lite.chain.opentensor.ai` (chain 964) -- ChampionRegistry reads | Public endpoint, no signup |
 | **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads | Public endpoint, no signup |
-| **GitHub API (read-only)** | Cloning miner submissions for benchmark (Tier 3 only) | Anonymous works, but a PAT raises the rate limit |
+| **GitHub API (read-only)** | Cloning miner submissions for benchmark during leader role | Anonymous works for small subnets, but provision a PAT to raise rate limits before you ever take leader |
 
 No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, deterministic, and CPU-bound.
 
@@ -71,13 +67,13 @@ No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, de
 
 ### Inbound (must be reachable from the public internet)
 
-| Port | Service | Required for |
-|------|---------|--------------|
-| `9100/tcp` | Validator HTTP API -- consensus signing endpoint | All tiers |
-| `8080/tcp` | Leader API | Tier 3 only |
-| `8091/tcp` | Relayer | Tier 3 only |
+| Port | Service | Notes |
+|------|---------|-------|
+| `9100/tcp` | Validator HTTP API -- consensus signing | Reachable by peer validators and the current leader. |
+| `8080/tcp` | API service -- user gateway + champion-consensus | Reachable by users and other validators. Only handles real user traffic while you are leader, but the port stays open for champion-consensus participation regardless. |
+| `8091/tcp` | Relayer | Only active during leader role, but keep the port open so it works immediately on promotion. |
 
-If you are behind NAT, forward `9100/tcp` to the validator host. On a cloud VPS with a public IP, simply open `9100/tcp` in the firewall.
+If you are behind NAT, forward all three to the validator host. On a cloud VPS with a public IP, open all three in the firewall.
 
 ### Outbound (egress, no special configuration)
 
