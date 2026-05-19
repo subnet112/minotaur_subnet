@@ -1023,11 +1023,13 @@ def main() -> None:
         registry_address = (
             args.validator_registry_address
             or os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "").strip()
+            or os.environ.get(f"VALIDATOR_REGISTRY_{chain_id}", "").strip()
         )
         if not registry_address:
             raise SystemExit(
                 "Consensus enabled but no ValidatorRegistry address provided. "
-                "Set --validator-registry-address or VALIDATOR_REGISTRY_ADDRESS."
+                f"Set --validator-registry-address, VALIDATOR_REGISTRY_ADDRESS, "
+                f"or VALIDATOR_REGISTRY_{chain_id}."
             )
         anvil_rpc = (
             os.environ.get("ANVIL_RPC_URL")
