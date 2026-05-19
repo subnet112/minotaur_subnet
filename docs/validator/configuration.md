@@ -35,8 +35,12 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANVIL_RPC_URL` | -- | Anvil fork URL for plan simulation. Required for realistic execution. Typically an Alchemy or Infura URL (the validator starts an Anvil fork against this). |
-| `BASE_RPC_URL` | -- | Base chain RPC URL for multi-chain simulation (chain ID 8453) |
+| `ANVIL_RPC_URL` | -- | URL of the Ethereum Anvil fork the validator should connect to for plan simulation. The validator does **not** spawn Anvil — start it separately (see the Validator Quickstart, Step 5). Usually `http://localhost:8545` when Anvil runs on the same host. |
+| `BASE_RPC_URL` | -- | URL of the Base Anvil fork the validator should connect to (chain ID 8453). Started separately, same pattern as `ANVIL_RPC_URL`. |
+| `BITTENSOR_EVM_RPC_URL` | -- | URL of the BT EVM Anvil fork the validator should connect to (chain ID 964). Started separately. |
+| `ETH_UPSTREAM_RPC_URL` | -- | Upstream Ethereum RPC (e.g. Alchemy/Infura) that the validator uses to advance the local Anvil fork to current head between simulations. Without it, the fork stays frozen at startup. |
+| `BASE_UPSTREAM_RPC_URL` | -- | Upstream Base RPC, same role as `ETH_UPSTREAM_RPC_URL` for the Base fork. |
+| `BITTENSOR_EVM_UPSTREAM_RPC_URL` | -- | Upstream BT EVM RPC (typically `https://lite.chain.opentensor.ai`), same role for the BT EVM fork. |
 
 ### Consensus and Signing
 

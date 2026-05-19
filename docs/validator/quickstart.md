@@ -176,19 +176,154 @@ export HOTKEY_NAME=my-hotkey
 export NETUID=112
 export SUBTENSOR_URL=wss://entrypoint-finney.opentensor.ai:443
 
-# Simulation (Anvil fork)
-export ANVIL_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+# Anvil forks the validator will *connect to* (it does not spawn them; see Step 5).
+# Point these at wherever you start the forks — localhost when they run on the
+# same box, or your internal Docker hostnames if you bridge networks.
+export ANVIL_RPC_URL=http://localhost:8545          # Ethereum fork
+export BASE_RPC_URL=http://localhost:8546           # Base fork
+export BITTENSOR_EVM_RPC_URL=http://localhost:8547  # BT EVM fork
+
+# Upstream RPCs — used by the validator to advance each Anvil fork to the
+# current chain head between simulations. Without these the fork stays frozen
+# at startup and sims run against stale state.
+export ETH_UPSTREAM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+export BASE_UPSTREAM_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+export BITTENSOR_EVM_UPSTREAM_RPC_URL=https://lite.chain.opentensor.ai
 
 # Consensus signing (EVM private key, hex-encoded with 0x prefix)
 export VALIDATOR_PRIVATE_KEY=0xYOUR_EVM_PRIVATE_KEY
-
-# Optional: Base chain for multi-chain support
-export BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
 ```
 
 See [Configuration](./configuration.md) for the full list of options.
 
-## Step 5: Run the Validator
+## Step 5: Start the Anvil Forks
+
+The validator process does **not** spawn Anvil itself — it opens RPC connections to whatever URLs you set in `ANVIL_RPC_URL`, `BASE_RPC_URL`, and `BITTENSOR_EVM_RPC_URL`. You start the three forks separately and keep them running. Docker Compose is the supported pattern: it provides restart policies, health checks, and dovetails with the [recycle cron](#required-maintenance-cron).
+
+Save this as `/opt/minotaur/docker-compose.yml` (any stable path works — the cron just needs to reference the same file):
+
+```yaml
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8545"
+      - "--fork-url"
+      - "${ETH_UPSTREAM_RPC_URL}"
+      - "--block-time"
+      - "2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  anvil-base:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8546"
+      - "--fork-url"
+      - "${BASE_UPSTREAM_RPC_URL}"
+      - "--chain-id"
+      - "8453"
+      - "--no-storage-caching"
+      - "--block-time"
+      - "2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "8546:8546"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  anvil-btevm:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8547"
+      - "--fork-url"
+      - "${BITTENSOR_EVM_UPSTREAM_RPC_URL}"
+      - "--chain-id"
+      - "964"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff"
+      - "5000"
+      - "--retries"
+      - "10"
+      - "--timeout"
+      - "60000"
+      - "--block-time"
+      - "2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "8547:8547"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8547 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+```
+
+The `tmpfs` mounts on `/root` and `/tmp` keep Anvil's writable layer in RAM rather than the host disk. Without them, each fork bloats its container overlay by ~15 GB/day — the daily [recycle cron](#required-maintenance-cron) is still needed on top of this, but the tmpfs mounts buy you the time between recycles.
+
+Start the forks (the `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, and `BITTENSOR_EVM_UPSTREAM_RPC_URL` you exported in Step 4 are read from the environment):
+
+```bash
+docker compose -f /opt/minotaur/docker-compose.yml up -d
+```
+
+Wait for all three to report healthy:
+
+```bash
+docker compose -f /opt/minotaur/docker-compose.yml ps
+```
+
+Quick sanity check (each should return a block number that increments over a few seconds):
+
+```bash
+cast block-number --rpc-url http://localhost:8545
+cast block-number --rpc-url http://localhost:8546
+cast block-number --rpc-url http://localhost:8547
+```
+
+### Running without Docker
+
+If you prefer to run Anvil directly (e.g. under systemd), the equivalent commands are:
+
+```bash
+anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" --block-time 2
+anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" --chain-id 8453 --no-storage-caching --block-time 2
+anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" --chain-id 964 --no-storage-caching --block-time 2
+```
+
+Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloat issue described in the [maintenance cron](#required-maintenance-cron) section applies either way — adjust the cron to bounce your systemd units instead of `docker compose up`.
+
+## Step 6: Run the Validator
 
 ### Standalone Mode (Production)
 
