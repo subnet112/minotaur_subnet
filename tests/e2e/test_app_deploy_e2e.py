@@ -171,9 +171,8 @@ contract TestGenerated is AppIntentBase {
     constructor(
         address _relayer,
         address _validatorRegistry,
-        uint256 _quorumBps,
         uint256 _scoreThreshold
-    ) AppIntentBase(_relayer, _validatorRegistry, _quorumBps, _scoreThreshold) {}
+    ) AppIntentBase(_relayer, _validatorRegistry, _scoreThreshold) {}
 
     function _checkIntent(
         IntentOrder calldata,
