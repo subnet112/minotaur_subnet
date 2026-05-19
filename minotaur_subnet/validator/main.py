@@ -26,6 +26,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.engine import JsExecutionEngine
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.blockloop.loop import BlockLoop
@@ -97,7 +98,7 @@ class AppIntentsValidator:
         # Consensus (optional)
         validator_private_key: str = "",
         validator_peers: list[str] | None = None,
-        quorum_bps: int = 10000,
+        protocol_config: "ProtocolConfig | None" = None,
         chain_id: int = 31337,
         contract_address: str = "0x" + "00" * 20,
     ) -> None:
@@ -292,8 +293,15 @@ class AppIntentsValidator:
         self._consensus = None
         self._peer_network = None
         self._validator_id = ""
+        self.protocol_config = protocol_config
 
         if validator_private_key:
+            if protocol_config is None:
+                raise RuntimeError(
+                    "validator_private_key set but no protocol_config supplied; "
+                    "consensus cannot start without a quorum source"
+                )
+
             from minotaur_subnet.consensus.eip712 import address_from_key
             self._validator_id = address_from_key(validator_private_key)
 
@@ -315,7 +323,7 @@ class AppIntentsValidator:
             self._consensus = ConsensusManager(
                 validator_id=self._validator_id,
                 private_key=validator_private_key,
-                quorum_bps=quorum_bps,
+                protocol_config=protocol_config,
                 validators=all_validators,
                 chain_id=chain_id,
                 contract_address=contract_address,
@@ -332,7 +340,7 @@ class AppIntentsValidator:
 
             logger.info(
                 "Consensus enabled (id=%s, peers=%d, quorum=%d bps)",
-                self._validator_id[:10], len(peer_endpoints), quorum_bps,
+                self._validator_id[:10], len(peer_endpoints), protocol_config.quorum_bps,
             )
 
         # ── Extracted sub-components ─────────────────────────────────────
@@ -392,6 +400,14 @@ class AppIntentsValidator:
         # Background tasks
         self._epoch_task = asyncio.create_task(self._epoch_loop())
         self._rescan_task = asyncio.create_task(self._rescan_loop())
+        if self.protocol_config is not None:
+            self._protocol_refresh_task = asyncio.create_task(
+                self.protocol_config.refresh_loop()
+            )
+            logger.info(
+                "ProtocolConfig refresh task started (interval=%ds)",
+                self.protocol_config.refresh_interval_seconds,
+            )
 
         # Only start block loop if we're the leader (or standalone)
         if self._is_leader:
@@ -948,8 +964,9 @@ def main() -> None:
         help="Peer validators in addr@url format",
     )
     parser.add_argument(
-        "--quorum-bps", type=int, default=10000,
-        help="Quorum threshold in basis points (10000 = 100%%)",
+        "--validator-registry-address", type=str, default=None,
+        help="ValidatorRegistry contract address (source of canonical quorumBps). "
+             "Falls back to VALIDATOR_REGISTRY_ADDRESS env.",
     )
     args = parser.parse_args()
 
@@ -983,7 +1000,6 @@ def main() -> None:
     hotkey_name = args.hotkey_name or os.environ.get("HOTKEY_NAME")
     validator_hotkey_ss58 = os.environ.get("VALIDATOR_HOTKEY_SS58", "").strip()
     validator_key = args.validator_key or os.environ.get("VALIDATOR_PRIVATE_KEY", "")
-    quorum_bps = args.quorum_bps if args.quorum_bps != 10000 else int(os.environ.get("QUORUM_BPS", "10000"))
 
     validator_peers = args.validator_peers
     if validator_peers is None:
@@ -999,6 +1015,30 @@ def main() -> None:
         contract_address = "0x" + "00" * 20
     chain_id = int(os.environ.get("CHAIN_ID", "31337"))
 
+    # ── Load canonical quorum from ValidatorRegistry ───────────────────
+    # Only loaded when consensus is enabled (validator_key is set). Solo /
+    # standalone validators don't need it.
+    protocol_config = None
+    if validator_key:
+        registry_address = (
+            args.validator_registry_address
+            or os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "").strip()
+        )
+        if not registry_address:
+            raise SystemExit(
+                "Consensus enabled but no ValidatorRegistry address provided. "
+                "Set --validator-registry-address or VALIDATOR_REGISTRY_ADDRESS."
+            )
+        anvil_rpc = (
+            os.environ.get("ANVIL_RPC_URL")
+            or os.environ.get("BASE_RPC_URL")
+            or "http://localhost:8545"
+        )
+        protocol_config = ProtocolConfig.from_validator_registry(
+            rpc_url=anvil_rpc,
+            registry_address=registry_address,
+        )
+
     validator = AppIntentsValidator(
         store=store,
         port=args.port,
@@ -1011,7 +1051,7 @@ def main() -> None:
         validator_hotkey_ss58=validator_hotkey_ss58,
         validator_private_key=validator_key,
         validator_peers=validator_peers,
-        quorum_bps=quorum_bps,
+        protocol_config=protocol_config,
         chain_id=chain_id,
         contract_address=contract_address,
     )
