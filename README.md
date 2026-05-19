@@ -187,7 +187,8 @@ Most runtime behavior is controlled via environment variables.
 | `VALIDATOR_HOTKEY_SS58` | Optional explicit hotkey override for solver-round leader election |
 | `VALIDATOR_PRIVATE_KEY` | EVM key used for consensus signatures |
 | `VALIDATOR_PEERS` | Comma-separated `validatorAddress@http://host:port` list |
-| `QUORUM_BPS` | Consensus quorum in basis points |
+| `VALIDATOR_REGISTRY_ADDRESS` | On-chain `ValidatorRegistry` holding the canonical `quorumBps`. Order-consensus daemons read it at startup and refresh once per epoch. See [Quorum management](docs/operator/quorum-management.md) for changing the value. |
+| `CHAMPION_QUORUM_BPS` | Quorum for champion-certification consensus (separate from order consensus; ChampionRegistry on BT EVM holds its own value to mirror) |
 | `SOLVER_ROUND_INTERNAL_API_KEY` | Shared secret for validator-to-validator round control (`x-solver-round-internal-key`) |
 | `SOLVER_ROUND_EPOCH_SECONDS` | Wall-clock fallback solver-round epoch size used only when native tempo is unavailable |
 | `SOLVER_ROUND_EPOCH_BLOCKS` | Optional block-based fallback solver-round epoch size when native tempo is unavailable |
@@ -244,7 +245,8 @@ HOTKEY_NAME=default
 # VALIDATOR_HOTKEY_SS58=5....
 VALIDATOR_PRIVATE_KEY=0x__this_validator_evm_key__
 VALIDATOR_PEERS=0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080
-QUORUM_BPS=8000
+VALIDATOR_REGISTRY_ADDRESS=0x__validator_registry_on_this_chain__
+CHAMPION_QUORUM_BPS=8000
 
 ALLOW_CHAMPION_HOT_SWAP=1
 CHAMPION_SWAP_TIMEOUT_SECONDS=90
