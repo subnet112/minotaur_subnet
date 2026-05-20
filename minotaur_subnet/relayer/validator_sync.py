@@ -23,9 +23,11 @@ class ValidatorSync:
         relayer: EvmRelayer instance for on-chain updates.
         subtensor_url: WebSocket URL for the subtensor node.
         netuid: Bittensor subnet UID.
-        quorum_bps: Quorum basis points for the contract.
         max_validators: Maximum number of validators to sync.
         poll_interval: Seconds between sync checks.
+
+    Note: quorum_bps is not managed here. It lives on the ValidatorRegistry
+    and is consumed off-chain via ProtocolConfig.refresh_loop().
     """
 
     def __init__(

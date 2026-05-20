@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from minotaur_subnet.shared.types import ExecutionPlan, SignedApproval, ConsensusResult
+from .protocol_config import ProtocolConfig
 from .signatures import sign_plan_approval, verify_plan_approval, hash_plan
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,11 @@ class ConsensusManager:
     Args:
         validator_id: This validator's address/ID.
         private_key: This validator's signing key.
-        quorum_bps: Required quorum in basis points (8000 = 80%).
+        protocol_config: Holds the canonical quorum_bps (read from
+            ValidatorRegistry, refreshed in place). The ConsensusManager
+            reads ``protocol_config.quorum_bps`` whenever it needs the
+            current threshold, so on-chain ``setQuorumBps`` changes
+            propagate without restart.
         validators: List of all validator addresses in the set.
         timeout: Seconds to wait for signatures before giving up.
     """
@@ -39,7 +44,7 @@ class ConsensusManager:
         self,
         validator_id: str,
         private_key: str,
-        quorum_bps: int = 10000,  # 100% for single-validator MVP
+        protocol_config: ProtocolConfig,
         validators: list[str] | None = None,
         timeout: float = 30.0,
         chain_id: int = 31337,
@@ -49,7 +54,7 @@ class ConsensusManager:
     ) -> None:
         self.validator_id = validator_id
         self.private_key = private_key
-        self.quorum_bps = quorum_bps
+        self.protocol_config = protocol_config
         self.validators = validators or [validator_id]
         self.timeout = timeout
         self.chain_id = chain_id
@@ -66,6 +71,16 @@ class ConsensusManager:
         # Pending proposals awaiting signatures
         self._pending: dict[str, _PendingProposal] = {}
         self._lock = asyncio.Lock()
+
+    @property
+    def quorum_bps(self) -> int:
+        """Current network quorum threshold in basis points.
+
+        Reads through to ``protocol_config.quorum_bps`` so an on-chain
+        ``ValidatorRegistry.setQuorumBps`` is picked up without restart
+        on the next refresh tick.
+        """
+        return self.protocol_config.quorum_bps
 
     @property
     def quorum_required(self) -> int:

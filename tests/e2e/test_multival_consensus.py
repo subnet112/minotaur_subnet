@@ -27,6 +27,7 @@ from minotaur_subnet.consensus.eip712 import (
     hash_plan_eip712,
 )
 from minotaur_subnet.consensus.manager import ConsensusManager
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.consensus.peer_network import ValidatorPeerNetwork, PeerEndpoint
 from minotaur_subnet.consensus.signatures import hash_plan, sign_plan_approval, verify_plan_approval
 from minotaur_subnet.validator.metagraph_sync import PeerInfo, elect_leader
@@ -107,12 +108,15 @@ def validator_cluster(test_accounts, eip712_domain, deployed_contracts, w3):
     all_addrs = accts.validator_addrs
     all_keys = accts.validator_keys
 
+    # Share one ProtocolConfig across all three managers — mirrors production
+    # where every off-chain component reads the same canonical value.
+    shared_cfg = ProtocolConfig(quorum_bps=5000, rpc_url="", registry_address="")
     managers = []
     for key, addr in zip(all_keys, all_addrs):
         mgr = ConsensusManager(
             validator_id=addr,
             private_key=key,
-            quorum_bps=5000,  # 50% → ceil(1.5) = 2 of 3
+            protocol_config=shared_cfg,  # 50% → ceil(1.5) = 2 of 3
             validators=all_addrs,
             timeout=5.0,
             chain_id=CHAIN_ID,

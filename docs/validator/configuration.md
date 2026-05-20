@@ -48,7 +48,8 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 |----------|---------|-------------|
 | `VALIDATOR_PRIVATE_KEY` | `""` | EVM private key (hex, with `0x` prefix) for EIP-712 consensus signing (same as `--validator-key`) |
 | `VALIDATOR_PEERS` | `""` | Comma-separated list of peer validators in `addr@url` format (same as `--validator-peers`) |
-| `QUORUM_BPS` | `10000` | Quorum threshold in basis points. 10000 = all validators must sign. (same as `--quorum-bps`) |
+| `VALIDATOR_REGISTRY_ADDRESS` | -- | Address of the on-chain `ValidatorRegistry` (same as `--validator-registry-address`). Holds the canonical `quorumBps`; the daemon reads it at startup and refreshes once per epoch. See [Quorum management](../operator/quorum-management.md) for how to change it. |
+| `QUORUM_BPS_OVERRIDE` | -- | Emergency / local-testnet escape hatch: forces a local quorum value and skips the on-chain read. Production deployments should leave this unset so `ValidatorRegistry.quorumBps()` stays authoritative. |
 
 ### Leader Election
 

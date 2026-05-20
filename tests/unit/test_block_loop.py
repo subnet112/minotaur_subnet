@@ -706,9 +706,13 @@ class TestOnLeaderChanged:
         key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
         addr = address_from_key(key)
         from minotaur_subnet.consensus.manager import ConsensusManager
+        from minotaur_subnet.consensus.protocol_config import ProtocolConfig
         cm = ConsensusManager(
             validator_id=addr,
             private_key=key,
+            protocol_config=ProtocolConfig(
+                quorum_bps=10000, rpc_url="", registry_address="",
+            ),
             validators=[addr, "0x" + "11" * 20],  # multi-validator
         )
         loop = BlockLoop(

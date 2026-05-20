@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
+
 
 @dataclass
 class PendingExecution:
@@ -31,23 +33,31 @@ class SignatureCollector:
     transaction to the target chain.
 
     Args:
-        quorum_bps: Required quorum in basis points (8000 = 80%).
+        protocol_config: Holds the canonical quorum_bps (read from
+            ValidatorRegistry, refreshed in place). Read through on every
+            quorum check so on-chain ``setQuorumBps`` changes propagate
+            without restarting the relayer.
         validators: Set of valid validator addresses.
         timeout: Seconds before expiring incomplete collections.
     """
 
     def __init__(
         self,
-        quorum_bps: int = 8000,
+        protocol_config: ProtocolConfig,
         validators: list[str] | None = None,
         timeout: float = 120.0,
     ) -> None:
-        self.quorum_bps = quorum_bps
+        self.protocol_config = protocol_config
         self.validators = set(v.lower() for v in (validators or []))
         self.timeout = timeout
 
         # plan_hash -> collected signatures
         self._pending: dict[str, _CollectionState] = {}
+
+    @property
+    def quorum_bps(self) -> int:
+        """Current network quorum threshold in basis points (live-read)."""
+        return self.protocol_config.quorum_bps
 
     @property
     def quorum_required(self) -> int:

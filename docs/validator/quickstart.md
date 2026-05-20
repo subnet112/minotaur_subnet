@@ -51,8 +51,10 @@ Scaling is vertical -- no horizontal sharding needed at the validator level. You
 Anvil's overlay filesystem grows roughly 15 GB per fork per day even with tmpfs mounted at `/root` and `/tmp`. Without a daily recycle, a 100 GB volume fills in under a week with three forks. Install this cron:
 
 ```
-0 3 * * * root docker compose -f /path/to/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /path/to/docker-compose.yml up -d anvil anvil-base anvil-btevm
+0 3 * * * root docker compose -f /opt/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /opt/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
 ```
+
+(The path matches the compose file you write in Step 6. Adjust if you put it elsewhere.)
 
 The recycle window (03:00 UTC by default) drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from peers to avoid simultaneous reorg pauses.
 
@@ -112,9 +114,11 @@ Anvil ports (`8545` for ETH, `8546` for Base, `8547` for BT EVM) are bound to th
 - **Python 3.12+**
 - **Node.js 20.x** (for the JS scoring engine)
 - **Foundry** (anvil, forge, cast) -- install via `curl -L https://foundry.paradigm.xyz | bash && foundryup`
+- **Docker + Docker Compose** (for running Anvil forks; see Step 6)
 - **Bittensor CLI** (`btcli`) with a registered wallet on subnet 112
 - **Ethereum RPC URL** from Alchemy or Infura (for Anvil mainnet fork simulation)
 - **EVM private key** for EIP-712 consensus signing (a fresh key is fine -- it does not hold funds)
+- **Coordination with the subnet operator** to be added to the on-chain `ValidatorRegistry` (Step 4) — without this, your signatures won't count
 
 ## Step 1: Clone and Install
 
@@ -165,7 +169,45 @@ btcli subnet metagraph --netuid 112 --subtensor.network finney
 
 Your hotkey should appear in the metagraph. Ensure you have sufficient TAO staked to participate in leader election.
 
-## Step 4: Configure Environment
+## Step 4: Get onboarded to the on-chain ValidatorRegistry
+
+Before your signatures count toward quorum, your **EVM signing address** (the one derived from `VALIDATOR_PRIVATE_KEY`) must be added to the `ValidatorRegistry` contract on each chain you'll operate on. This is a coordinated step with the current registry owner (typically the subnet operator).
+
+What you need to send to the registry owner:
+
+```
+Validator hotkey (SS58):  5...
+EVM signing address:      0x...   (from your VALIDATOR_PRIVATE_KEY)
+Public axon URL:          http://your-host:9100
+```
+
+What the registry owner runs on their side, once per chain:
+
+```bash
+# Read the current set
+cast call $VALIDATOR_REGISTRY 'getValidators()(address[])' --rpc-url $RPC_URL
+
+# Add you to the set (replace with the full new list, sorted ascending)
+cast send $VALIDATOR_REGISTRY \
+  'updateValidators(address[])' \
+  '[0xExistingValidator1,0xExistingValidator2,0xYourEvmAddress]' \
+  --rpc-url $RPC_URL \
+  --private-key $REGISTRY_OWNER_KEY
+```
+
+Repeat per chain (Ethereum, Base, BT EVM — addresses listed in the [network reference](../operator/network-reference.md)).
+
+**Verify you've been added** before continuing:
+
+```bash
+cast call $VALIDATOR_REGISTRY 'isValidator(address)(bool)' 0xYourEvmAddress --rpc-url $RPC_URL
+```
+
+If this returns `true` on every chain, you're cleared to bring up the daemon. If it returns `false`, your consensus signatures will be ignored and your validator will be a free-rider — emissions but no real participation.
+
+> **Note**: until this handshake exists as an on-chain registration flow (similar to Bittensor's subnet-register), it's a manual coordination step. The subnet operator publishes a process; check the project README for the current contact channel.
+
+## Step 5: Configure Environment
 
 Export the required environment variables:
 
@@ -176,7 +218,7 @@ export HOTKEY_NAME=my-hotkey
 export NETUID=112
 export SUBTENSOR_URL=wss://entrypoint-finney.opentensor.ai:443
 
-# Anvil forks the validator will *connect to* (it does not spawn them; see Step 5).
+# Anvil forks the validator will *connect to* (it does not spawn them; see Step 6).
 # Point these at wherever you start the forks — localhost when they run on the
 # same box, or your internal Docker hostnames if you bridge networks.
 export ANVIL_RPC_URL=http://localhost:8545          # Ethereum fork
@@ -192,11 +234,25 @@ export BITTENSOR_EVM_UPSTREAM_RPC_URL=https://lite.chain.opentensor.ai
 
 # Consensus signing (EVM private key, hex-encoded with 0x prefix)
 export VALIDATOR_PRIVATE_KEY=0xYOUR_EVM_PRIVATE_KEY
+
+# On-chain ValidatorRegistry that holds the canonical quorum threshold.
+# These addresses come from the subnet operator — see "Onboarding" below
+# and the [network reference](../operator/network-reference.md) for current
+# mainnet values per chain. The daemon reads quorumBps from this contract
+# at startup and refreshes once per epoch.
+export VALIDATOR_REGISTRY_ADDRESS=0xYOUR_VALIDATOR_REGISTRY_ON_BASE
+# Optional per-chain forms if you run the daemon against a non-default
+# CHAIN_ID and don't want to set VALIDATOR_REGISTRY_ADDRESS directly:
+#   export VALIDATOR_REGISTRY_1=0x...     # Ethereum mainnet
+#   export VALIDATOR_REGISTRY_8453=0x...  # Base
+#   export VALIDATOR_REGISTRY_964=0x...   # BT EVM
 ```
 
-See [Configuration](./configuration.md) for the full list of options.
+See [Configuration](./configuration.md) for the full list of options and
+[Quorum management](../operator/quorum-management.md) for how to change the
+network-wide quorum value once you're an operator.
 
-## Step 5: Start the Anvil Forks
+## Step 6: Start the Anvil Forks
 
 The validator process does **not** spawn Anvil itself — it opens RPC connections to whatever URLs you set in `ANVIL_RPC_URL`, `BASE_RPC_URL`, and `BITTENSOR_EVM_RPC_URL`. You start the three forks separately and keep them running. Docker Compose is the supported pattern: it provides restart policies, health checks, and dovetails with the [recycle cron](#required-maintenance-cron).
 
@@ -291,7 +347,7 @@ services:
 
 The `tmpfs` mounts on `/root` and `/tmp` keep Anvil's writable layer in RAM rather than the host disk. Without them, each fork bloats its container overlay by ~15 GB/day — the daily [recycle cron](#required-maintenance-cron) is still needed on top of this, but the tmpfs mounts buy you the time between recycles.
 
-Start the forks (the `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, and `BITTENSOR_EVM_UPSTREAM_RPC_URL` you exported in Step 4 are read from the environment):
+Start the forks (the `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, and `BITTENSOR_EVM_UPSTREAM_RPC_URL` you exported in Step 5 are read from the environment):
 
 ```bash
 docker compose -f /opt/minotaur/docker-compose.yml up -d
@@ -323,9 +379,9 @@ anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" --
 
 Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloat issue described in the [maintenance cron](#required-maintenance-cron) section applies either way — adjust the cron to bounce your systemd units instead of `docker compose up`.
 
-## Step 6: Run the Validator
+## Step 7: Run the Validator Daemon
 
-### Standalone Mode (Production)
+The validator daemon handles order-consensus signing and weight emission.
 
 ```bash
 python -m minotaur_subnet.validator.main \
@@ -335,17 +391,23 @@ python -m minotaur_subnet.validator.main \
   --hotkey-name "$HOTKEY_NAME" \
   --subtensor-url "$SUBTENSOR_URL" \
   --validator-key "$VALIDATOR_PRIVATE_KEY" \
+  --validator-registry-address "$VALIDATOR_REGISTRY_ADDRESS" \
   --tick-interval 12.0
 ```
 
-The validator will:
+If `VALIDATOR_REGISTRY_ADDRESS` (or a chain-keyed `VALIDATOR_REGISTRY_<CHAIN_ID>`) is exported in Step 5, the `--validator-registry-address` flag can be omitted — the daemon picks it up from the environment.
+
+The daemon will:
 
 1. Load app definitions from the store.
-2. Start the BlockLoop (processing orders every ~12 seconds).
-3. Listen on port 9100 for validator/consensus and execution endpoints.
-4. Emit weights once per epoch (default: 60 seconds).
+2. Read `quorumBps` from `ValidatorRegistry` at startup, refresh every epoch.
+3. Start the BlockLoop (processing orders every ~12 seconds).
+4. Listen on port 9100 for validator/consensus and execution endpoints.
+5. Emit weights once per epoch (default: 60 seconds).
 
-### Verify It Is Running
+If the daemon exits at startup with `"Consensus enabled but no ValidatorRegistry address provided"`, the env var or flag is missing — set it and restart.
+
+### Verify it is running
 
 ```bash
 # Health check
@@ -357,9 +419,88 @@ curl http://localhost:9100/blockloop/status
 # Leader info
 curl http://localhost:9100/leader
 
+# Consensus info — confirms quorum_bps was loaded from chain
+curl http://localhost:9100/consensus/info
+
 # Current weight/champion view
 curl http://localhost:9100/weights
 ```
+
+`/consensus/info` should report a non-zero `quorum_bps` matching the value on the registry (`cast call $VALIDATOR_REGISTRY_ADDRESS 'quorumBps()(uint256)'`). If the daemon's value drifts from the on-chain value, the local refresh loop failed — check logs.
+
+## Step 8: Run the API Service
+
+The API service is the user gateway and the champion-consensus coordinator. It must be running on every validator (not only the leader) so champion certification can collect signatures across the cluster.
+
+```bash
+python -m minotaur_subnet.api.server \
+  --port 8080 \
+  --store-path /var/lib/minotaur/store.json
+```
+
+Required env (in addition to Step 5):
+
+- `VALIDATOR_PRIVATE_KEY` — same key used by the daemon
+- `VALIDATOR_PEERS` — peer **API** endpoints for champion consensus (different from order-consensus peers, which point at port 9100). Format: `0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080`
+- `CHAMPION_QUORUM_BPS` — quorum for champion certification (currently env-driven; mirror what other operators are using, default `6666`)
+- `CONSENSUS_MODE=real` — production setting; `local` is for the single-box testnet only
+
+Verify:
+
+```bash
+curl http://localhost:8080/health
+```
+
+## Step 9: Run the Relayer
+
+The relayer submits co-signed transactions on chain. It only fires when this validator is leader, but must stay running so promotion is instant.
+
+```bash
+python -m minotaur_subnet.relayer.main \
+  --port 8091
+```
+
+Required env:
+
+- `RELAYER_PRIVATE_KEY` — EOA that pays gas. **This key holds real funds** — keep it in HSM / KMS or a hardware-isolated process; do not commit to disk in plaintext.
+- `CHAIN_ID` — primary chain (matches what your `VALIDATOR_REGISTRY_ADDRESS` is on)
+- All the per-chain RPC URLs from Step 5
+
+Verify:
+
+```bash
+curl http://localhost:8091/health
+curl http://localhost:8091/gas-balances
+```
+
+`/gas-balances` should show non-zero balances for each chain you operate on. Fund the relayer wallet on every chain — typical bootstrap is 0.05 ETH on Ethereum, 0.01 ETH on Base, a few TAO on BT EVM.
+
+## Production process supervision
+
+Run the three services under a process supervisor so they restart on crash. Two common patterns:
+
+**systemd** — one unit per service:
+
+```ini
+# /etc/systemd/system/minotaur-validator.service
+[Unit]
+Description=Minotaur Validator Daemon
+After=network-online.target docker.service
+
+[Service]
+EnvironmentFile=/etc/minotaur/env
+ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main --port 9100
+Restart=on-failure
+RestartSec=5
+User=minotaur
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Repeat for `minotaur-api.service` (port 8080) and `minotaur-relayer.service` (port 8091). Put shared env (RPC URLs, registry addresses, validator key) in `/etc/minotaur/env` with mode 0600. Enable with `systemctl enable --now minotaur-{validator,api,relayer}`.
+
+**docker compose** — extend the file you wrote in Step 6 with validator/api/relayer services. The local-testnet `platform/local_testnet/docker-compose.yml` is the reference.
 
 ## Local Testnet (Development)
 
@@ -392,6 +533,7 @@ make testnet-up
 | Relayer | 8091 | http://localhost:8091 |
 | Anvil (ETH fork) | 8545 | http://localhost:8545 |
 | Anvil (Base fork) | 8546 | http://localhost:8546 |
+| Anvil (BT EVM fork) | 8547 | http://localhost:8547 |
 | Subtensor | 9944 | ws://localhost:9944 |
 
 The init container automatically registers the subnet (netuid=1 on local), registers validator and miner neurons, and deploys contracts. The validator starts with `FORCE_LEADER=1` so it immediately begins processing orders.

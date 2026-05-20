@@ -6,8 +6,28 @@ This guide reflects the current `minotaur_subnet.miner.main` CLI and submission 
 
 - Python 3.12+
 - Git
-- Optional: Docker (required for git-based submission screening on validator/API side)
-- Optional: Bittensor wallet hotkey (required for git-based signed submissions)
+- Docker (required for git-based submission screening; recommended for local testing)
+- Bittensor wallet with a hotkey registered on subnet 112 (required for submitting against mainnet)
+
+## Targets: local dev vs mainnet
+
+The CLI flags are the same; only the `--validator-url` changes:
+
+| Target | URL | When to use |
+|---|---|---|
+| Local testnet | `http://localhost:8080` | After `make testnet-up`. Submissions auto-benchmark, fast iteration. |
+| Production | `<PRODUCTION_API_URL>` (see project announcement channel) | Real subnet 112 mining; emissions, real benchmarks. |
+
+The rest of this guide uses `$VALIDATOR_URL` as a placeholder — set it to one of the above:
+
+```bash
+export VALIDATOR_URL=http://localhost:8080            # local dev
+# For production, fetch the current API URL from the project announcement
+# channel (see project README) and export it:
+# export VALIDATOR_URL=<PRODUCTION_API_URL>
+```
+
+See the [network reference](../operator/network-reference.md) for where to find the active production endpoint.
 
 ## 1) Install
 
@@ -18,32 +38,47 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 2) Start services
+## 2) Register on subnet 112 (mainnet only)
 
-Local development usually targets the API service on `:8080`:
+Local testnet auto-registers a test miner. For mainnet, register your hotkey first:
 
 ```bash
-python -m minotaur_subnet.api.server --port 8080
+btcli subnet register --netuid 112 --subtensor.network finney \
+  --wallet.name my-miner --wallet.hotkey my-miner-hotkey
 ```
 
-Or bring up the full local testnet:
+Verify:
+
+```bash
+btcli subnet metagraph --netuid 112 --subtensor.network finney
+```
+
+Your hotkey should appear in the metagraph. The `--hotkey` argument in CLI commands below refers to the **hotkey name** (e.g. `my-miner-hotkey`), not the wallet name.
+
+## 3) Start the target API (local testnet only)
+
+For mainnet, skip — you submit against the production endpoint.
+
+For local dev:
 
 ```bash
 make testnet-up
+# or, lighter, just the API:
+python -m minotaur_subnet.api.server --port 8080
 ```
 
-## 3) Run the agent loop (recommended)
+## 4) Run the agent loop (recommended)
 
 Agent mode discovers active apps, generates strategies, tests them, and submits source code to `/v1/submissions/source`.
 
 ```bash
 python -m minotaur_subnet.miner.main agent \
-  --validator-url http://localhost:8080 \
+  --validator-url "$VALIDATOR_URL" \
   --strategy-dir ./strategies \
   --miner-id my-miner-001
 ```
 
-## 4) Submit a git-based solver
+## 5) Submit a git-based solver
 
 Current CLI subcommand:
 
@@ -51,18 +86,19 @@ Current CLI subcommand:
 python -m minotaur_subnet.miner.main submit \
   --repo-url https://github.com/youruser/my-solver \
   --commit-hash <commit> \
-  --hotkey <wallet-name> \
+  --hotkey my-miner-hotkey \
   --epoch 0 \
-  --validator-url http://localhost:8080 \
+  --validator-url "$VALIDATOR_URL" \
   --poll
 ```
 
 Notes:
 
+- `--hotkey` is the bittensor **hotkey name** (matches `--wallet.hotkey` in `btcli`), not the wallet name. The signed submission is verified against the metagraph by the API.
 - `--epoch` is required in practice unless your target exposes `GET /v1/status` for auto-detection.
-- The `submit`/`status` CLI defaults are `http://localhost:9100`, but local testnet submissions are typically handled by the API service on `:8080`.
+- `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
 
-## 5) Optional: direct source submission (local/dev)
+## 6) Optional: direct source submission (local/dev)
 
 You can submit inline solver code directly:
 
@@ -79,27 +115,42 @@ curl -X POST http://localhost:8080/v1/submissions/source \
 
 This route skips screening and queues directly into benchmarking.
 
-## 6) Check submission status
+## 7) Check submission status
 
 ```bash
 python -m minotaur_subnet.miner.main status \
   --submission-id sub_xxx \
-  --validator-url http://localhost:8080
+  --validator-url "$VALIDATOR_URL"
 ```
 
 Common statuses:
 
 - `queued`
-- `screening_stage_1`
-- `screening_stage_2`
-- `screening_stage_3`
-- `benchmarking`
-- `scored`
-- `adopted`
-- `rejected`
+- `screening_stage_1` — static checks (imports, no banned syscalls, basic shape)
+- `screening_stage_2` — Docker build + import
+- `screening_stage_3` — smoke-test run on a benchmark scenario
+- `benchmarking` — full replay against the current scenario suite
+- `scored` — benchmark complete; ranked against current champion
+- `adopted` — promoted to champion; running in BlockLoop
+- `rejected` — failed screening or scored below threshold
+
+## What happens after submission
+
+Once `submit` returns, the API queues your solver for evaluation. The lifecycle on the validator/API side:
+
+1. **Screening (seconds–minutes)**: three stages run in sequence. Most failures show up here — Docker build errors, missing `SOLVER_CLASS`, banned imports.
+2. **Benchmarking (minutes)**: the benchmark worker runs your solver against the active scenario suite for each live App. Each scenario produces a score; your final score is the aggregate.
+3. **Champion comparison**: if your aggregate exceeds the current champion by at least `DETHRONE_MARGIN` (currently 5%), you become the new champion.
+4. **Adoption**: champion adoption requires N-of-M validator signatures via champion-certification consensus (separate from order consensus). This typically completes in seconds once the leader proposes the new champion.
+5. **Weight emission**: the active champion's submitter gets 100% of the miner emission weight on the next subtensor epoch (~60s). Champion-takes-all.
+
+Wall-clock times depend on the live network's queue depth. On a quiet network, screening + benchmarking takes 1–3 minutes. During a benchmark spike (multiple submissions queued), it can stretch to 10+ minutes.
+
+Poll with `status` or watch the agent loop logs — both surface state transitions in real time.
 
 ## Next steps
 
 - [Configuration](./configuration.md) for full CLI flags
 - [Solver API](./solver-api.md) for `IntentSolver` and `Strategy` contracts
 - [Custom Solver](./custom-solver.md) for implementation guidance
+- [Network reference](../operator/network-reference.md) for production endpoints and contract addresses
