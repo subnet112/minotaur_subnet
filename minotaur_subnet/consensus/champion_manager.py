@@ -80,13 +80,18 @@ class ChampionConsensusManager:
         validator_id: str,
         private_key: str,
         *,
-        quorum_bps: int = 10000,
+        quorum_bps: int,
         validators: list[str] | None = None,
         timeout: float = 30.0,
         chain_id: int = 31337,
         contract_address: str = "0x" + "00" * 20,
         domain_separator: bytes | None = None,
     ) -> None:
+        # Note: champion quorum is sourced separately from order-consensus
+        # quorum — it lives on ChampionRegistry (BT EVM only), which is out
+        # of scope for the ProtocolConfig consolidation. Operators must keep
+        # this value in sync with the on-chain ChampionRegistry.quorumBps()
+        # until a future refactor unifies the two registries.
         self.validator_id = validator_id
         self.private_key = private_key
         self.quorum_bps = quorum_bps

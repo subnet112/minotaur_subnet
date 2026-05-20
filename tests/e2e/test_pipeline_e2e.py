@@ -24,6 +24,7 @@ from minotaur_subnet.blockloop.loop import BlockLoop, TickResult
 from minotaur_subnet.blockchain.chains import _web3_cache
 from minotaur_subnet.consensus.eip712 import build_domain_separator
 from minotaur_subnet.consensus.manager import ConsensusManager
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.consensus.signatures import sign_plan_approval, hash_plan
 from minotaur_subnet.shared.types import SignedApproval, ConsensusResult
 from minotaur_subnet.store import AppIntentStore
@@ -171,7 +172,7 @@ def pipeline_components(w3, deployed_contracts, test_accounts, eip712_domain, tm
     consensus = AutoQuorumConsensus(
         all_keys=all_keys,
         all_addrs=all_addrs,
-        quorum_bps=10000,
+        protocol_config=ProtocolConfig(quorum_bps=10000, rpc_url="", registry_address=""),
         chain_id=CHAIN_ID,
         contract_address=dc.dex_app,
         domain_separator=eip712_domain,

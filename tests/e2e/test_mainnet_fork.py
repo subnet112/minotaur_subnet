@@ -235,11 +235,12 @@ def fork_deployed(mainnet_fork, fork_accounts) -> ForkContracts:
     quorum_bps = 8000
     score_threshold = 5000
 
-    # Deploy shared ValidatorRegistry first
+    # Deploy shared ValidatorRegistry first — now also holds the canonical
+    # quorumBps that every App deployed against it reads at execution time.
     registry_abi, registry_bytecode = _load_artifact("ValidatorRegistry")
     registry_addr = _deploy_contract(
         w3, deployer_key, registry_abi, registry_bytecode,
-        deployer_addr, validator_addrs,
+        deployer_addr, validator_addrs, quorum_bps,
     )
 
     # Deploy UniswapForwarder
@@ -249,11 +250,11 @@ def fork_deployed(mainnet_fork, fork_accounts) -> ForkContracts:
         w3.to_checksum_address(UNISWAP_V3_ROUTER),
     )
 
-    # Deploy DexAggregatorApp
+    # Deploy DexAggregatorApp — no quorum arg; reads from ValidatorRegistry.
     dex_abi, dex_bytecode = _load_artifact("DexAggregatorApp")
     dex_app_addr = _deploy_contract(
         w3, deployer_key, dex_abi, dex_bytecode,
-        deployer_addr, registry_addr, quorum_bps, score_threshold,
+        deployer_addr, registry_addr, score_threshold,
         deployer_addr, 5000,
     )
 
@@ -261,7 +262,7 @@ def fork_deployed(mainnet_fork, fork_accounts) -> ForkContracts:
     arb_abi, arb_bytecode = _load_artifact("ArbitrageApp")
     arb_app_addr = _deploy_contract(
         w3, deployer_key, arb_abi, arb_bytecode,
-        deployer_addr, registry_addr, quorum_bps, score_threshold,
+        deployer_addr, registry_addr, score_threshold,
     )
 
     # Fund forwarder with WETH:

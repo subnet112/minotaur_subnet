@@ -21,6 +21,11 @@ from minotaur_subnet.orderbook import IntentOrderBook
 from minotaur_subnet.blockloop import BlockLoop
 from minotaur_subnet.relayer import MockRelayer
 from minotaur_subnet.consensus import ConsensusManager, ValidatorPeerNetwork, PeerEndpoint
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
+
+
+def _cfg(quorum_bps: int = 10000) -> ProtocolConfig:
+    return ProtocolConfig(quorum_bps=quorum_bps, rpc_url="", registry_address="")
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.shared.types import (
     AppIntentConfig,
@@ -162,6 +167,7 @@ def consensus_manager():
     return ConsensusManager(
         validator_id=addr,
         private_key=key,
+        protocol_config=_cfg(),
     )
 
 
@@ -172,7 +178,7 @@ def multi_validator_consensus():
     return ConsensusManager(
         validator_id=addrs[0],
         private_key=VALIDATOR_KEYS[0],
-        quorum_bps=6700,  # 2 of 3
+        protocol_config=_cfg(6700),  # 2 of 3
         validators=addrs,
     )
 

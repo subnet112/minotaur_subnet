@@ -64,7 +64,8 @@ Common issues and solutions for running the Minotaur validator.
   ```
 - Verify `VALIDATOR_PEERS` contains all peer validators in the correct format: `0xAddress@http://host:port`
 - Ensure all peers are reachable from this validator (network/firewall rules).
-- Check `QUORUM_BPS` -- a value of 10000 (100%) requires every peer to sign. Lower this during testing if not all peers are available.
+- Check the live quorum value: `make get-quorum-<chain>` (or `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)'`). 10000 (100%) requires every peer to sign — see [Quorum management](../operator/quorum-management.md) to change it via `make set-quorum-<chain> BPS=...`.
+- For local testnet only: set `QUORUM_BPS_OVERRIDE` to force a local value without going through the registry. Production deployments should leave it unset.
 - Verify `VALIDATOR_PRIVATE_KEY` is set and valid. The validator uses this to sign EIP-712 consensus messages.
 - Followers independently re-simulate and re-score. If a follower's scores do not both exceed threshold, it will not sign.
 

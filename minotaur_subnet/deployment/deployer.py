@@ -41,16 +41,14 @@ class DeployService:
         compiler: ForgeCompiler,
         relayer: Any,
         registry_address: str = "",
-        quorum_bps: int | None = None,
         score_threshold: int = 5000,
     ) -> None:
+        # Note: quorum_bps is no longer a deploy-time parameter. AppIntentBase
+        # reads quorum from the ValidatorRegistry at execution time, so a
+        # single owner tx on the registry reconfigures every App on the chain.
         self.compiler = compiler
         self.relayer = relayer
         self.registry_address = registry_address
-        import os as _os
-        self.quorum_bps = quorum_bps if quorum_bps is not None else int(
-            _os.environ.get("QUORUM_BPS", _os.environ.get("ORDER_CONSENSUS_QUORUM_BPS", "6666"))
-        )
         self.score_threshold = score_threshold
 
     async def deploy(
@@ -136,14 +134,16 @@ class DeployService:
         platform_fee_collector = relayer_cs  # Relayer collects fees by default
         max_platform_fee = int(os.environ.get("MAX_PLATFORM_FEE_WEI", str(10**17)))  # 0.1 ETH
 
-        arg_types = ["address", "address", "uint256", "uint256",
+        # AppIntentBase constructor (post-refactor): no quorumBps — read from
+        # ValidatorRegistry at execution time.
+        arg_types = ["address", "address", "uint256",
                      "address", "address", "uint256"]
-        arg_values: list = [relayer_cs, registry_cs, self.quorum_bps, self.score_threshold,
+        arg_values: list = [relayer_cs, registry_cs, self.score_threshold,
                             wnt_cs, platform_fee_collector, max_platform_fee]
         logger.info(
-            "Deploy constructor: relayer=%s registry=%s quorum=%d score_threshold=%d "
+            "Deploy constructor: relayer=%s registry=%s score_threshold=%d "
             "wrappedNative=%s feeCollector=%s maxFee=%d",
-            relayer_cs[:10], registry_cs[:10], self.quorum_bps, self.score_threshold,
+            relayer_cs[:10], registry_cs[:10], self.score_threshold,
             wnt_cs[:10], platform_fee_collector[:10], max_platform_fee,
         )
 

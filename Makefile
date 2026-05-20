@@ -132,3 +132,63 @@ solver-base-push:
 miner-cycle:
 	@echo "Running one miner improvement cycle..."
 	.venv/bin/python -c "import asyncio, logging; logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s: %(message)s', datefmt='%H:%M:%S'); from minotaur_subnet.miner.agent.loop import AgentLoop; agent = AgentLoop(validator_url='http://localhost:8080', strategy_dir='strategies', miner_id='test-miner-001', anvil_rpc_url='http://localhost:18545', model='sonnet', claude_timeout=600, cooldown=0); agent._load_existing_strategies(); asyncio.run(agent._cycle())"
+
+# ── Quorum management ──────────────────────────────────────────────────
+#
+# Reconfigure the network-wide quorumBps on a chain by calling
+# ValidatorRegistry.setQuorumBps(BPS) as the registry owner. Every
+# AppIntentBase on that chain reads from the registry at execution time,
+# and off-chain validators pick up the new value on the next ProtocolConfig
+# refresh tick (default ~60s).
+#
+# Required env per chain:
+#   <CHAIN>_RPC_URL                  RPC endpoint
+#   <CHAIN>_VALIDATOR_REGISTRY       registry contract address
+#   REGISTRY_OWNER_PRIVATE_KEY       hex key of the registry owner
+# Usage:
+#   make set-quorum-base BPS=8000
+#   make set-quorum-eth  BPS=6666
+#   make set-quorum-btevm BPS=7500
+
+set-quorum-base:
+	@test -n "$(BPS)" || (echo "BPS=<basis points> is required (e.g. BPS=6666)"; exit 1)
+	cd contracts && QUORUM_BPS=$(BPS) \
+	  VALIDATOR_REGISTRY=$$BASE_VALIDATOR_REGISTRY \
+	  REGISTRY_OWNER_PRIVATE_KEY=$$REGISTRY_OWNER_PRIVATE_KEY \
+	  forge script script/SetQuorum.s.sol:SetQuorum \
+	  --rpc-url $$BASE_RPC_URL --broadcast
+
+set-quorum-eth:
+	@test -n "$(BPS)" || (echo "BPS=<basis points> is required (e.g. BPS=6666)"; exit 1)
+	cd contracts && QUORUM_BPS=$(BPS) \
+	  VALIDATOR_REGISTRY=$$ETH_VALIDATOR_REGISTRY \
+	  REGISTRY_OWNER_PRIVATE_KEY=$$REGISTRY_OWNER_PRIVATE_KEY \
+	  forge script script/SetQuorum.s.sol:SetQuorum \
+	  --rpc-url $$ETH_RPC_URL --broadcast
+
+set-quorum-btevm:
+	@test -n "$(BPS)" || (echo "BPS=<basis points> is required (e.g. BPS=6666)"; exit 1)
+	cd contracts && QUORUM_BPS=$(BPS) \
+	  VALIDATOR_REGISTRY=$$BTEVM_VALIDATOR_REGISTRY \
+	  REGISTRY_OWNER_PRIVATE_KEY=$$REGISTRY_OWNER_PRIVATE_KEY \
+	  forge script script/SetQuorum.s.sol:SetQuorum \
+	  --rpc-url $$BITTENSOR_EVM_UPSTREAM_RPC_URL --broadcast
+
+# Read the current quorumBps from a chain's ValidatorRegistry.
+get-quorum-base:
+	cast call $$BASE_VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $$BASE_RPC_URL
+
+get-quorum-eth:
+	cast call $$ETH_VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $$ETH_RPC_URL
+
+get-quorum-btevm:
+	cast call $$BTEVM_VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $$BITTENSOR_EVM_UPSTREAM_RPC_URL
+
+# ChampionRegistry on BT EVM has its own independent quorum knob (out of
+# scope for the ValidatorRegistry-backed ProtocolConfig refactor). Keep
+# in sync with ValidatorRegistry on BT EVM manually for now.
+set-champion-quorum:
+	@test -n "$(BPS)" || (echo "BPS=<basis points> is required"; exit 1)
+	cast send $$CHAMPION_REGISTRY 'setQuorumBps(uint256)' $(BPS) \
+	  --rpc-url $$BITTENSOR_EVM_UPSTREAM_RPC_URL \
+	  --private-key $$REGISTRY_OWNER_PRIVATE_KEY

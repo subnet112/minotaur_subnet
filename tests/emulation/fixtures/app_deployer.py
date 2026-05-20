@@ -24,11 +24,11 @@ class AppDeployer:
         app_intent_base_address: str,
         relayer_address: str,
         validators: list[str],
-        quorum_bps: int = 8000,
     ) -> str:
         """Deploy the canonical swap app on the Anvil fork.
 
-        Returns the deployed contract address.
+        Returns the deployed contract address. Quorum is no longer a deploy
+        arg — AppIntentBase reads it from ValidatorRegistry at execution time.
         """
         # In real implementation: forge script with constructor args
         # For testing, return a mock address

@@ -14,7 +14,17 @@ from minotaur_subnet.consensus.signatures import (
 )
 from minotaur_subnet.consensus.eip712 import address_from_key, build_domain_separator
 from minotaur_subnet.consensus.manager import ConsensusManager
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.shared.types import ExecutionPlan, Interaction
+
+
+def _cfg(quorum_bps: int = 10000) -> ProtocolConfig:
+    """Test helper — build a ProtocolConfig with the given quorum."""
+    return ProtocolConfig(
+        quorum_bps=quorum_bps,
+        rpc_url="",
+        registry_address="",
+    )
 
 
 # ── Test keys (Anvil deterministic keys) ─────────────────────────────────────
@@ -122,6 +132,7 @@ class TestConsensusManagerSingleValidator:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
         )
         plan_hash = hash_plan(sample_plan)
         result = await cm.propose("order_1", sample_plan, 0.85, plan_hash)
@@ -138,6 +149,7 @@ class TestConsensusManagerSingleValidator:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
         )
         plan_hash = hash_plan(sample_plan)
         approval = cm.sign_approval("order_1", plan_hash, 0.85)
@@ -154,7 +166,7 @@ class TestConsensusManagerMultiValidator:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
-            quorum_bps=8000,  # 80% of 3 = 3 required (ceil)
+            protocol_config=_cfg(8000),  # 80% of 3 = 3 required (ceil)
             validators=validators,
         )
         plan_hash = hash_plan(sample_plan)
@@ -168,7 +180,7 @@ class TestConsensusManagerMultiValidator:
         cm = ConsensusManager(
             validator_id="v1",
             private_key=VALIDATOR_1_KEY,
-            quorum_bps=8000,
+            protocol_config=_cfg(8000),
             validators=["v1", "v2", "v3"],
         )
         # 80% of 3 = 2.4, ceil = 3
@@ -177,7 +189,7 @@ class TestConsensusManagerMultiValidator:
         cm2 = ConsensusManager(
             validator_id="v1",
             private_key=VALIDATOR_1_KEY,
-            quorum_bps=6700,  # 67%
+            protocol_config=_cfg(6700),  # 67%
             validators=["v1", "v2", "v3"],
         )
         # 67% of 3 = 2.01, ceil = 3
@@ -186,11 +198,26 @@ class TestConsensusManagerMultiValidator:
         cm3 = ConsensusManager(
             validator_id="v1",
             private_key=VALIDATOR_1_KEY,
-            quorum_bps=5000,  # 50%
+            protocol_config=_cfg(5000),  # 50%
             validators=["v1", "v2", "v3", "v4"],
         )
         # 50% of 4 = 2
         assert cm3.quorum_required == 2
+
+    def test_quorum_live_refresh(self):
+        """Mutating ProtocolConfig.quorum_bps must propagate without restart."""
+        cfg = _cfg(5000)
+        cm = ConsensusManager(
+            validator_id="v1",
+            private_key=VALIDATOR_1_KEY,
+            protocol_config=cfg,
+            validators=["v1", "v2", "v3"],
+        )
+        assert cm.quorum_required == 2  # 50% of 3 = 1.5, ceil = 2
+
+        cfg.quorum_bps = 8000  # simulate a setQuorumBps refresh
+        assert cm.quorum_bps == 8000
+        assert cm.quorum_required == 3  # 80% of 3 = 2.4, ceil = 3
 
 
 class TestPruneExpired:
@@ -200,7 +227,7 @@ class TestPruneExpired:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
-            quorum_bps=10000,
+            protocol_config=_cfg(10000),
             validators=validators,
             timeout=0.1,  # Short timeout for fast test
         )
@@ -223,6 +250,7 @@ class TestClearAllPending:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
         )
         # Manually add proposals
         cm._pending["order_A"] = _PendingProposal(
@@ -241,6 +269,7 @@ class TestClearAllPending:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
         )
         count = await cm.clear_all_pending()
         assert count == 0
@@ -252,6 +281,7 @@ class TestReceiveApproval:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
             validators=[VALIDATOR_1_ADDR],
         )
         plan_hash = hash_plan(sample_plan)
@@ -274,6 +304,7 @@ class TestReceiveApproval:
         cm = ConsensusManager(
             validator_id=VALIDATOR_1_ADDR,
             private_key=VALIDATOR_1_KEY,
+            protocol_config=_cfg(),
         )
         from minotaur_subnet.shared.types import SignedApproval
         fake = SignedApproval(

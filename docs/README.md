@@ -104,6 +104,11 @@ AppIntentBase.executeIntent() verifies quorum + user sig + executes via proxy
 - **[Validator Configuration](./validator/configuration.md)** — Complete configuration reference
 - **[Validator Troubleshooting](./validator/troubleshooting.md)** — Common issues and solutions
 
+### Operator
+
+- **[Network reference](./operator/network-reference.md)** — Mainnet addresses, endpoints, cluster expectations
+- **[Quorum management](./operator/quorum-management.md)** — Reading and changing the network-wide quorum threshold
+
 ### Solver
 
 - **[Solver Guide](./solver/solver_guide.md)** — Comprehensive guide to writing solvers

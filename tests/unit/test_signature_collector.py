@@ -7,13 +7,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.relayer.signature_collector import SignatureCollector
+
+
+def _cfg(quorum_bps: int) -> ProtocolConfig:
+    return ProtocolConfig(
+        quorum_bps=quorum_bps,
+        rpc_url="",
+        registry_address="",
+    )
 
 
 @pytest.fixture
 def collector():
     return SignatureCollector(
-        quorum_bps=8000,
+        protocol_config=_cfg(8000),
         validators=["0xval1", "0xval2", "0xval3"],
         timeout=60.0,
     )
@@ -25,11 +34,11 @@ class TestQuorum:
         assert collector.quorum_required == 3
 
     def test_quorum_two_validators(self):
-        c = SignatureCollector(quorum_bps=5000, validators=["0xa", "0xb"])
+        c = SignatureCollector(protocol_config=_cfg(5000), validators=["0xa", "0xb"])
         assert c.quorum_required == 1
 
     def test_quorum_single_validator(self):
-        c = SignatureCollector(quorum_bps=10000, validators=["0xa"])
+        c = SignatureCollector(protocol_config=_cfg(10000), validators=["0xa"])
         assert c.quorum_required == 1
 
 

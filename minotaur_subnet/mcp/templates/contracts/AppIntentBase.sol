@@ -31,8 +31,11 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
     address public immutable relayer;
     address public immutable validatorRegistry;
-    uint256 public quorumBps;          // e.g. 8000 = 80%
     uint256 public scoreThreshold;     // BPS, default 5000
+
+    // Note: the network-wide quorum threshold lives on the ValidatorRegistry
+    // (IValidatorRegistry.quorumBps()) and is read at verification time. A
+    // single owner tx on the registry reconfigures every App on the chain.
 
     // ── Platform fee state ──────────────────────────────────────────────
 
@@ -78,7 +81,6 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     constructor(
         address _relayer,
         address _validatorRegistry,
-        uint256 _quorumBps,
         uint256 _scoreThreshold,
         address _wrappedNativeToken,
         address _platformFeeCollector,
@@ -86,11 +88,9 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
     ) {
         require(_relayer != address(0), "Invalid relayer");
         require(_validatorRegistry != address(0), "Invalid registry");
-        require(_quorumBps > 0 && _quorumBps <= 10000, "Invalid quorum");
 
         relayer = _relayer;
         validatorRegistry = _validatorRegistry;
-        quorumBps = _quorumBps;
         scoreThreshold = _scoreThreshold >= 5000 ? _scoreThreshold : 5000;
 
         // Platform fee setup (zero address = fees disabled)
@@ -160,7 +160,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         // 6. Verify validator quorum
         bytes32 planHash = EIP712Verifier.hashPlan(plan);
         uint256 validatorCount = IValidatorRegistry(validatorRegistry).getValidatorCount();
-        uint256 quorumRequired = (validatorCount * quorumBps + 9999) / 10000;
+        uint256 quorumRequired = (validatorCount * IValidatorRegistry(validatorRegistry).quorumBps() + 9999) / 10000;
         uint256 validSigs = EIP712Verifier.verifyValidatorSignatures(
             order.orderId,
             planHash,
@@ -285,7 +285,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
         // 5. Verify validator quorum for THIS leg's plan
         bytes32 planHash = EIP712Verifier.hashPlan(plan);
         uint256 validatorCount = IValidatorRegistry(validatorRegistry).getValidatorCount();
-        uint256 quorumRequired = (validatorCount * quorumBps + 9999) / 10000;
+        uint256 quorumRequired = (validatorCount * IValidatorRegistry(validatorRegistry).quorumBps() + 9999) / 10000;
         uint256 validSigs = EIP712Verifier.verifyValidatorSignatures(
             order.orderId,
             planHash,
@@ -491,7 +491,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
         // Verify validator quorum approves this release
         uint256 validatorCount = IValidatorRegistry(validatorRegistry).getValidatorCount();
-        uint256 quorumRequired = (validatorCount * quorumBps + 9999) / 10000;
+        uint256 quorumRequired = (validatorCount * IValidatorRegistry(validatorRegistry).quorumBps() + 9999) / 10000;
         uint256 validSigs = EIP712Verifier.verifyValidatorSignatures(
             orderId,
             releaseHash,
@@ -627,7 +627,7 @@ abstract contract AppIntentBase is IAppIntentBase, ReentrancyGuard {
 
     function getQuorumRequired() external view returns (uint256) {
         uint256 n = IValidatorRegistry(validatorRegistry).getValidatorCount();
-        return (n * quorumBps + 9999) / 10000;
+        return (n * IValidatorRegistry(validatorRegistry).quorumBps() + 9999) / 10000;
     }
 
     /// @notice Accept ETH for execution plans that need value

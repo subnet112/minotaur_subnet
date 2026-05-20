@@ -66,7 +66,10 @@ interface IAppIntentBase {
 
     // ── Views ────────────────────────────────────────────────────────────
 
-    function quorumBps() external view returns (uint256);
+    /// @notice Address of the ValidatorRegistry that holds the canonical quorum.
+    /// @dev Callers that need the current quorumBps should read it from the
+    ///      registry: IValidatorRegistry(app.validatorRegistry()).quorumBps().
+    function validatorRegistry() external view returns (address);
     function scoreThreshold() external view returns (uint256);
     function relayer() external view returns (address);
 }

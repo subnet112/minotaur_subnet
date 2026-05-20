@@ -576,21 +576,17 @@ async def initialize(ctx: ServerContext) -> dict:
         registry_address = os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "")
         if not registry_address:
             registry_address = os.environ.get("VALIDATOR_REGISTRY_31337", "")
-        onchain_quorum_bps = int(os.environ.get(
-            "QUORUM_BPS",
-            os.environ.get("ORDER_CONSENSUS_QUORUM_BPS", "6666"),
-        ))
+        # Quorum is no longer a deploy-time arg — AppIntentBase reads it from
+        # the ValidatorRegistry at execution time.
         deploy_service = DeployService(
             ForgeCompiler(),
             relayer_instance,
             registry_address,
-            quorum_bps=onchain_quorum_bps,
         )
         set_deploy_service(deploy_service)
         logger.info(
-            "DeployService configured (registry=%s, quorum=%d bps)",
+            "DeployService configured (registry=%s)",
             registry_address[:20] if registry_address else "none",
-            onchain_quorum_bps,
         )
 
     # ── chain info ───────────────────────────────────────────────────────
@@ -958,18 +954,39 @@ async def initialize(ctx: ServerContext) -> dict:
                         if ep.validator_id not in all_validator_addrs:
                             all_validator_addrs.append(ep.validator_id)
 
-                    order_quorum_bps = int(
-                        os.environ.get("ORDER_CONSENSUS_QUORUM_BPS", "6666")
-                    )
                     consensus_timeout = float(
                         os.environ.get("CHAMPION_CONSENSUS_TIMEOUT_SECONDS", "30")
                     )
                     chain_id = int(os.environ.get("CHAIN_ID", "31337"))
 
+                    # Load canonical quorum from the on-chain ValidatorRegistry.
+                    # The same registry is read by AppIntentBase at verification
+                    # time, so daemon and contract always agree.
+                    from minotaur_subnet.consensus.protocol_config import ProtocolConfig
+                    order_registry_address = (
+                        os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "")
+                        or os.environ.get(f"VALIDATOR_REGISTRY_{chain_id}", "")
+                    )
+                    if not order_registry_address:
+                        raise RuntimeError(
+                            f"Real consensus enabled but no ValidatorRegistry "
+                            f"address for chain {chain_id}; set "
+                            f"VALIDATOR_REGISTRY_ADDRESS"
+                        )
+                    order_rpc_url = (
+                        os.environ.get("ANVIL_RPC_URL")
+                        or os.environ.get("BASE_RPC_URL")
+                        or "http://anvil:8545"
+                    )
+                    order_protocol_config = ProtocolConfig.from_validator_registry(
+                        rpc_url=order_rpc_url,
+                        registry_address=order_registry_address,
+                    )
+
                     consensus = ConsensusManager(
                         validator_id=leader_addr,
                         private_key=leader_key,
-                        quorum_bps=order_quorum_bps,
+                        protocol_config=order_protocol_config,
                         validators=all_validator_addrs,
                         timeout=consensus_timeout,
                         chain_id=chain_id,
@@ -983,10 +1000,12 @@ async def initialize(ctx: ServerContext) -> dict:
                         timeout=consensus_timeout,
                     )
                     logger.info(
-                        "Real order consensus: leader=%s, peers=%d, quorum=%d bps, chain=%d",
+                        "Real order consensus: leader=%s, peers=%d, "
+                        "quorum=%d bps (from ValidatorRegistry %s), chain=%d",
                         leader_addr[:10],
                         len(order_peer_endpoints),
-                        order_quorum_bps,
+                        order_protocol_config.quorum_bps,
+                        order_registry_address[:20],
                         chain_id,
                     )
                 else:
@@ -1095,12 +1114,18 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
                     from minotaur_subnet.consensus.eip712 import address_from_key
 
+                    # Champion consensus is sourced from ChampionRegistry on
+                    # BT EVM, which keeps its own quorum knob — out of scope
+                    # for the ValidatorRegistry-backed ProtocolConfig refactor.
+                    # CHAMPION_QUORUM_BPS env should mirror the on-chain
+                    # ChampionRegistry.quorumBps() value until a future PR
+                    # consolidates the two registries.
                     try:
                         champion_quorum_bps = int(
-                            os.environ.get("QUORUM_BPS", "10000").strip() or "10000",
+                            os.environ.get("CHAMPION_QUORUM_BPS", "6666").strip() or "6666",
                         )
                     except ValueError:
-                        champion_quorum_bps = 10000
+                        champion_quorum_bps = 6666
                     try:
                         # Prefer CHAMPION_CONSENSUS_CHAIN_ID (BT EVM = 964 in production).
                         # The domain separator must use the chain where ChampionRegistry

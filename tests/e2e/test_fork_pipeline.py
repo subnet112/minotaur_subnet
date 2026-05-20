@@ -35,6 +35,7 @@ from minotaur_subnet.orderbook import IntentOrderBook
 from minotaur_subnet.blockloop import BlockLoop
 from minotaur_subnet.relayer.base import MockRelayer
 from minotaur_subnet.consensus import ConsensusManager
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.shared.types import (
     AppIntentConfig,
@@ -288,7 +289,7 @@ class TestForkPipeline:
         consensus = ConsensusManager(
             validator_id=leader.evm_address,
             private_key=leader.private_key,
-            quorum_bps=10000,
+            protocol_config=ProtocolConfig(quorum_bps=10000, rpc_url="", registry_address=""),
             validators=[leader.evm_address],
         )
 
@@ -354,7 +355,7 @@ class TestForkPipeline:
         consensus = ConsensusManager(
             validator_id=leader.evm_address,
             private_key=leader.private_key,
-            quorum_bps=10000,
+            protocol_config=ProtocolConfig(quorum_bps=10000, rpc_url="", registry_address=""),
             validators=[leader.evm_address],
         )
 

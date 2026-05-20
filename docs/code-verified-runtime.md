@@ -232,7 +232,7 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 - Source (`solver_path`) submissions can be benchmarked when enabled, but are never champion-eligible.
 - The benchmark worker performs replay scoring only; live champion activation is handled by the solver round coordinator via `EpochManager`.
 - Round closure may still be forced manually via `POST /v1/solver/round/close`, but when metagraph leader election is configured the elected leader now auto-closes rounds after `SOLVER_ROUND_OPEN_SECONDS`, replay-evaluates them, auto-certifies finalists, and activates certified champions once the current solver-round epoch reaches `effective_epoch`.
-- Champion certification collects real validator quorum through `POST /v1/solver/round/certify` when `VALIDATOR_PRIVATE_KEY` / `VALIDATOR_PEERS` / `QUORUM_BPS` are configured on the API service, and followers answer `POST /v1/solver/round/consensus/proposal`.
+- Champion certification collects real validator quorum through `POST /v1/solver/round/certify` when `VALIDATOR_PRIVATE_KEY` / `VALIDATOR_PEERS` / `CHAMPION_QUORUM_BPS` are configured on the API service, and followers answer `POST /v1/solver/round/consensus/proposal`. Order consensus uses a separate value sourced from the on-chain `ValidatorRegistry` via `VALIDATOR_REGISTRY_ADDRESS`.
 - Operators may abort a round explicitly via `POST /v1/solver/round/abort` to retain the incumbent and reopen intake.
 - The leader and manual round-control endpoints now push explicit authenticated round state syncs (`/v1/solver/round/internal/close`, `/v1/solver/round/internal/certify`, `/v1/solver/round/internal/activate`, `/v1/solver/round/internal/abort`) so followers persist closed/certified/activated/aborted state before failover.
 - The coordinator now enforces `decision_deadline_epoch`: once the current solver-round epoch passes the deadline without a certificate, the round aborts and the incumbent stays active.
@@ -279,7 +279,8 @@ HOTKEY_NAME=default
 # VALIDATOR_HOTKEY_SS58=5....
 VALIDATOR_PRIVATE_KEY=0x__this_validator_evm_key__
 VALIDATOR_PEERS=0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080
-QUORUM_BPS=8000
+VALIDATOR_REGISTRY_ADDRESS=0x__validator_registry_on_this_chain__
+CHAMPION_QUORUM_BPS=8000
 ALLOW_CHAMPION_HOT_SWAP=1
 CHAMPION_SWAP_TIMEOUT_SECONDS=90
 

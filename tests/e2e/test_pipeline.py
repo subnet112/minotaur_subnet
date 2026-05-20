@@ -23,6 +23,7 @@ from minotaur_subnet.consensus.eip712 import (
     hash_plan_eip712,
 )
 from minotaur_subnet.consensus.manager import ConsensusManager
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.orderbook.orderbook import IntentOrderBook, OrderStatus
 from minotaur_subnet.blockloop.loop import BlockLoop
 from minotaur_subnet.store import AppIntentStore
@@ -148,7 +149,7 @@ class TestPipelineFlow:
         consensus_mgr = ConsensusManager(
             validator_id=validator_addrs[0],
             private_key=validator_keys[0],
-            quorum_bps=8000,
+            protocol_config=ProtocolConfig(quorum_bps=8000, rpc_url="", registry_address=""),
             validators=validator_addrs,
             domain_separator=eip712_domain,
             score_threshold_bps=score_threshold,
@@ -306,7 +307,7 @@ class TestPipelineFlow:
         consensus_mgr = ConsensusManager(
             validator_id=sorted_vals[0][0],
             private_key=sorted_vals[0][1],
-            quorum_bps=10000,  # 100% of 1 = 1
+            protocol_config=ProtocolConfig(quorum_bps=10000, rpc_url="", registry_address=""),
             validators=[sorted_vals[0][0]],
             domain_separator=eip712_domain,
             score_threshold_bps=score_threshold,

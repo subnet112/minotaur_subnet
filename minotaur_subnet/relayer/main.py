@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from aiohttp import web
 
+from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.relayer.chain_config import get_supported_chains
 from minotaur_subnet.relayer.evm_relayer import EvmRelayer
 from minotaur_subnet.relayer.signature_collector import SignatureCollector
@@ -41,8 +42,24 @@ class RelayerService:
             chains=self.chains,
             private_key=os.environ.get("RELAYER_PRIVATE_KEY", ""),
         )
+
+        # Load canonical quorum from the primary chain's ValidatorRegistry.
+        # The relayer is single-chain at signature-collection time (orders are
+        # scoped to a chain), but we read from one registry at startup because
+        # the network-wide value is the same across chains by convention.
+        primary_chain_id = int(os.environ.get("CHAIN_ID", "31337"))
+        primary = self.chains.get(primary_chain_id)
+        if primary is None or not primary.validator_registry_address:
+            raise RuntimeError(
+                f"No ValidatorRegistry configured for chain {primary_chain_id}; "
+                "relayer cannot load ProtocolConfig"
+            )
+        self.protocol_config = ProtocolConfig.from_validator_registry(
+            rpc_url=primary.rpc_url,
+            registry_address=primary.validator_registry_address,
+        )
         self.collector = SignatureCollector(
-            quorum_bps=8000,
+            protocol_config=self.protocol_config,
             validators=[],  # Populated by validator_sync
         )
         self.gas_manager = GasManager(chains=self.chains)
@@ -139,6 +156,25 @@ def create_app() -> web.Application:
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
     app.router.add_get("/gas-balances", service.handle_gas_balances)
     app.router.add_get("/health", service.handle_health)
+
+    # Background refresh of ProtocolConfig so on-chain setQuorumBps changes
+    # propagate without restarting the relayer.
+    async def _start_protocol_refresh(_app: web.Application) -> None:
+        _app["protocol_refresh"] = asyncio.create_task(
+            service.protocol_config.refresh_loop()
+        )
+
+    async def _stop_protocol_refresh(_app: web.Application) -> None:
+        task = _app.get("protocol_refresh")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_protocol_refresh)
+    app.on_cleanup.append(_stop_protocol_refresh)
 
     return app
 
