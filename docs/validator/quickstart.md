@@ -235,6 +235,11 @@ export BITTENSOR_EVM_UPSTREAM_RPC_URL=https://lite.chain.opentensor.ai
 # Consensus signing (EVM private key, hex-encoded with 0x prefix)
 export VALIDATOR_PRIVATE_KEY=0xYOUR_EVM_PRIVATE_KEY
 
+# Public URL where your daemon serves /identity. Required for peer
+# discovery — other validators sign and verify against this. See the
+# Peer discovery section below.
+export VALIDATOR_AXON_URL=http://your-public-host:9100
+
 # On-chain ValidatorRegistry that holds the canonical quorum threshold.
 # These addresses come from the subnet operator — see "Onboarding" below
 # and the [network reference](../operator/network-reference.md) for current
@@ -441,7 +446,7 @@ python -m minotaur_subnet.api.server \
 Required env (in addition to Step 5):
 
 - `VALIDATOR_PRIVATE_KEY` — same key used by the daemon
-- `VALIDATOR_PEERS` — peer **API** endpoints for champion consensus (different from order-consensus peers, which point at port 9100). Format: `0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080`
+- `VALIDATOR_PEERS` — peer **API** endpoints for champion consensus (port 8080 targets). Format: `0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080`. Champion-consensus peer discovery is not yet automated (ChampionRegistry is out of scope of the discovery refactor); for order-consensus, peers are discovered automatically — see [Peer discovery](#peer-discovery) below.
 - `CHAMPION_QUORUM_BPS` — quorum for champion certification (currently env-driven; mirror what other operators are using, default `6666`)
 - `CONSENSUS_MODE=real` — production setting; `local` is for the single-box testnet only
 
@@ -474,6 +479,45 @@ curl http://localhost:8091/gas-balances
 ```
 
 `/gas-balances` should show non-zero balances for each chain you operate on. Fund the relayer wallet on every chain — typical bootstrap is 0.05 ETH on Ethereum, 0.01 ETH on Base, a few TAO on BT EVM.
+
+## Peer discovery
+
+Order-consensus peers are discovered automatically — no `VALIDATOR_PEERS` env required for the daemon's order-consensus path. The flow:
+
+1. **Your daemon publishes its identity**: a `GET /identity` endpoint on port 9100 returns a fresh EIP-712 signed payload binding `(evm_address, hotkey, axon_url)`. Each request regenerates the signature so it's never stale.
+2. **You publish your axon URL**: set `VALIDATOR_AXON_URL=http://your-host:9100` in the daemon env. This is what the signed payload claims. Also call `btcli` to register your axon on the Bittensor metagraph so other validators can find you.
+3. **Other validators discover you**: their `ProtocolConfig.refresh_loop` (default 60s tick) walks the metagraph axon list, probes each `/identity`, verifies the EIP-712 signature, and cross-checks the recovered EVM address is in `ValidatorRegistry.getValidators()` (Step 4 handshake) and the hotkey matches the metagraph.
+
+What this gives operators:
+
+- **No coordinated restart when a new validator joins.** The new validator's EVM gets added on-chain by the registry owner, they start their daemon, others pick them up within one refresh tick.
+- **No `VALIDATOR_PEERS` env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
+- **IP changes are self-served.** A validator changing hosts just updates `VALIDATOR_AXON_URL` and restarts; the signed `/identity` payload re-publishes the new URL automatically.
+
+### Required env for discovery
+
+| Variable | Purpose |
+|---|---|
+| `VALIDATOR_AXON_URL` | The public URL you serve `/identity` on. Typically `http://<your-public-ip>:9100`. The signed payload includes this; if it's missing, `/identity` returns 503. |
+| `SUBTENSOR_URL` | Required so the daemon can read the metagraph for axon discovery (already required in Step 5). |
+| `VALIDATOR_REGISTRY_ADDRESS` | Required so the daemon can read the authorized EVM set (already required in Step 5). |
+
+### Optional override
+
+If you need to pin the peer list (local testnet, isolated cluster, debugging a discovery failure), set `VALIDATOR_PEERS` env or pass `--validator-peers` on the daemon CLI. The pinned list overrides discovery entirely. Production deployments should leave it unset.
+
+### Verifying discovery is working
+
+```bash
+# Confirm your daemon publishes a valid identity
+curl http://localhost:9100/identity
+# Should return {"evm_address": "0x...", "hotkey": "5...", "axon_url": "...",
+#                "expiry": <timestamp>, "nonce": "0x...", "signature": "0x..."}
+
+# Confirm your daemon sees other peers (via /consensus/info)
+curl http://localhost:9100/consensus/info
+# .peers should list discovered peers; this list refreshes on each ProtocolConfig tick.
+```
 
 ## Production process supervision
 
