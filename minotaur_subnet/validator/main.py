@@ -305,26 +305,30 @@ class AppIntentsValidator:
             from minotaur_subnet.consensus.eip712 import address_from_key
             self._validator_id = address_from_key(validator_private_key)
 
-            # Parse peers
             from minotaur_subnet.consensus.peer_network import (
                 ValidatorPeerNetwork,
                 PeerEndpoint,
                 parse_peers_env,
             )
-            peer_endpoints: list[PeerEndpoint] = []
-            if validator_peers:
-                peer_endpoints = parse_peers_env(",".join(validator_peers))
 
-            all_validators = [self._validator_id] + [
-                p.validator_id for p in peer_endpoints
-            ]
+            # Peer set comes from ProtocolConfig discovery by default. The
+            # optional validator_peers arg pins a manual list (escape hatch
+            # for local testnet / pre-discovery setups).
+            pinned_peers: list[PeerEndpoint] | None = None
+            if validator_peers:
+                pinned_peers = parse_peers_env(",".join(validator_peers))
 
             from minotaur_subnet.consensus import ConsensusManager
             self._consensus = ConsensusManager(
                 validator_id=self._validator_id,
                 private_key=validator_private_key,
                 protocol_config=protocol_config,
-                validators=all_validators,
+                # When pinned_peers is None, ConsensusManager.validators reads
+                # through to protocol_config.peers automatically.
+                validators=(
+                    [self._validator_id] + [p.validator_id for p in pinned_peers]
+                    if pinned_peers is not None else None
+                ),
                 chain_id=chain_id,
                 contract_address=contract_address,
             )
@@ -334,14 +338,24 @@ class AppIntentsValidator:
                 validator_id=self._validator_id,
                 private_key=validator_private_key,
                 consensus=self._consensus,
-                peers=peer_endpoints,
+                peers=pinned_peers,
+                protocol_config=protocol_config,
             )
             self.block_loop.set_peer_network(self._peer_network)
 
+            mode = "pinned" if pinned_peers is not None else "discovered"
             logger.info(
-                "Consensus enabled (id=%s, peers=%d, quorum=%d bps)",
-                self._validator_id[:10], len(peer_endpoints), protocol_config.quorum_bps,
+                "Consensus enabled (id=%s, peer-mode=%s, quorum=%d bps)",
+                self._validator_id[:10], mode, protocol_config.quorum_bps,
             )
+
+            # Wire peer discovery: if we have a metagraph and we're in
+            # discovery mode (no pinned peers), tell ProtocolConfig how to
+            # fetch the current metagraph peer list. The refresh loop calls
+            # this each tick and probes /identity on each axon.
+            if pinned_peers is None and self._metagraph_sync is not None:
+                protocol_config.my_evm_address = self._validator_id
+                protocol_config.metagraph_provider = self._metagraph_peers_for_discovery
 
         # ── Extracted sub-components ─────────────────────────────────────
         self._scoring_engine = ScoringEngine(
@@ -520,19 +534,12 @@ class AppIntentsValidator:
             elif not self._is_leader and was_leader:
                 await self._become_follower()
 
-            # Update peer network endpoints from metagraph
-            if self._peer_network is not None and self._metagraph_sync.state is not None:
-                from minotaur_subnet.consensus.peer_network import PeerEndpoint
-                peers = [
-                    PeerEndpoint(
-                        validator_id=p.evm_address,
-                        url=p.axon_url,
-                    )
-                    for p in self._metagraph_sync.state.validators
-                    if p.axon_url and p.hotkey != self._metagraph_sync.my_hotkey
-                ]
-                if peers:
-                    self._peer_network.set_peers(peers)
+            # Peer set refresh is owned by ProtocolConfig.refresh_loop, which
+            # combines metagraph axon URLs with the on-chain ValidatorRegistry
+            # and verifies each peer's /identity attestation. The old
+            # keccak(hotkey)-derived EVM-address path that lived here never
+            # actually matched the validators' real signing addresses; the
+            # discovery loop replaces it.
 
     async def _become_leader(self) -> None:
         """Transition to leader role: start the block loop."""
@@ -567,6 +574,8 @@ class AppIntentsValidator:
         app.router.add_post("/consensus/proposal", self._handle_consensus_proposal)
         app.router.add_get("/consensus/info", self._handle_consensus_info)
         app.router.add_get("/leader", self._handle_leader)
+        # Self-attested identity for peer discovery
+        app.router.add_get("/identity", self._handle_identity)
         return app
 
     async def _handle_health(self, request: web.Request) -> web.Response:
@@ -905,6 +914,54 @@ class AppIntentsValidator:
                 for p in self._peer_network.peers
             ]
         return web.json_response(info)
+
+    async def _metagraph_peers_for_discovery(self):
+        """Adapter: convert MetagraphSync's current state into the
+        MetagraphPeer dataclass that peer_discovery expects.
+
+        Returns an empty list when no metagraph sync has happened yet —
+        ProtocolConfig.refresh_loop is fault-tolerant and will retry.
+        """
+        from minotaur_subnet.consensus.peer_discovery import MetagraphPeer
+        if self._metagraph_sync is None or self._metagraph_sync.state is None:
+            return []
+        out = []
+        for v in self._metagraph_sync.state.validators:
+            if v.axon_url and v.hotkey:
+                out.append(MetagraphPeer(hotkey=v.hotkey, axon_url=v.axon_url))
+        return out
+
+    async def _handle_identity(self, request: web.Request) -> web.Response:
+        """Self-attested identity payload for peer discovery.
+
+        Returns a fresh EIP-712 signature binding (evm_address, hotkey,
+        axon_url) so other validators can verify this is the correct
+        binding before adding us to their peer list.
+        """
+        if self._consensus is None:
+            return web.json_response(
+                {"error": "Consensus not enabled — no signing key"},
+                status=503,
+            )
+        if self._metagraph_sync is None or not self._metagraph_sync.my_hotkey:
+            return web.json_response(
+                {"error": "No bittensor hotkey configured"},
+                status=503,
+            )
+        axon_url = os.environ.get("VALIDATOR_AXON_URL", "").strip()
+        if not axon_url:
+            return web.json_response(
+                {"error": "VALIDATOR_AXON_URL not configured"},
+                status=503,
+            )
+
+        from minotaur_subnet.consensus.identity import sign_identity
+        identity = sign_identity(
+            self._consensus.private_key,
+            self._metagraph_sync.my_hotkey,
+            axon_url,
+        )
+        return web.json_response(identity.to_dict())
 
     async def _handle_leader(self, request: web.Request) -> web.Response:
         """Return leader status and metagraph info."""
