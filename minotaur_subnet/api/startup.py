@@ -992,18 +992,23 @@ async def initialize(ctx: ServerContext) -> dict:
                         chain_id=chain_id,
                         score_threshold_bps=int(score_threshold * 10000),
                     )
+                    # Pin the peer list only when explicit env was provided.
+                    # Otherwise pass protocol_config so the peer network reads
+                    # through to the discovery loop's verified set.
+                    use_pinned = bool(order_peer_endpoints)
                     order_peer_network = ValidatorPeerNetwork(
                         validator_id=leader_addr,
                         private_key=leader_key,
                         consensus=consensus,
-                        peers=order_peer_endpoints,
+                        peers=order_peer_endpoints if use_pinned else None,
+                        protocol_config=order_protocol_config,
                         timeout=consensus_timeout,
                     )
                     logger.info(
-                        "Real order consensus: leader=%s, peers=%d, "
+                        "Real order consensus: leader=%s, peer-mode=%s, "
                         "quorum=%d bps (from ValidatorRegistry %s), chain=%d",
                         leader_addr[:10],
-                        len(order_peer_endpoints),
+                        "pinned" if use_pinned else "discovered",
                         order_protocol_config.quorum_bps,
                         order_registry_address[:20],
                         chain_id,
