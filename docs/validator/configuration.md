@@ -47,8 +47,9 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VALIDATOR_PRIVATE_KEY` | `""` | EVM private key (hex, with `0x` prefix) for EIP-712 consensus signing (same as `--validator-key`) |
-| `VALIDATOR_PEERS` | `""` | Comma-separated list of peer validators in `addr@url` format (same as `--validator-peers`) |
-| `VALIDATOR_REGISTRY_ADDRESS` | -- | Address of the on-chain `ValidatorRegistry` (same as `--validator-registry-address`). Holds the canonical `quorumBps`; the daemon reads it at startup and refreshes once per epoch. See [Quorum management](../operator/quorum-management.md) for how to change it. |
+| `VALIDATOR_AXON_URL` | -- | Public URL where this daemon serves the `/identity` endpoint, e.g. `http://your-host:9100`. Used by peer discovery: the daemon signs this URL into its `/identity` attestation so other validators can verify the binding. If unset, `/identity` returns 503 and other validators can't include you in their peer set. |
+| `VALIDATOR_PEERS` | `""` | Optional manual override of the peer list (`addr@url` format, comma-separated). Without it, the daemon discovers peers automatically from the Bittensor metagraph + on-chain `ValidatorRegistry`. Set it only for local testnet, isolated clusters, or to pin a specific set while debugging a discovery failure. |
+| `VALIDATOR_REGISTRY_ADDRESS` | -- | Address of the on-chain `ValidatorRegistry` (same as `--validator-registry-address`). Holds the canonical `quorumBps` and the authorized validator EVM list; the daemon reads both at startup and refreshes once per epoch. See [Quorum management](../operator/quorum-management.md) for how to change quorum. |
 | `QUORUM_BPS_OVERRIDE` | -- | Emergency / local-testnet escape hatch: forces a local quorum value and skips the on-chain read. Production deployments should leave this unset so `ValidatorRegistry.quorumBps()` stays authoritative. |
 
 ### Leader Election

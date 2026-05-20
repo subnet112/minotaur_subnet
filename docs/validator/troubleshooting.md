@@ -62,12 +62,26 @@ Common issues and solutions for running the Minotaur validator.
   ```bash
   curl http://localhost:9100/consensus/info
   ```
-- Verify `VALIDATOR_PEERS` contains all peer validators in the correct format: `0xAddress@http://host:port`
-- Ensure all peers are reachable from this validator (network/firewall rules).
+- Verify peer discovery is finding the other validators: the `peers` field in `/consensus/info` should be non-empty. If it's empty, see [No peers discovered](#no-peers-discovered) below.
+- Ensure peer axon URLs are reachable from this validator (network/firewall rules).
+- If `VALIDATOR_PEERS` env is set (override mode), confirm the `addr@url` format is correct. In production it should usually be unset and discovery handles it.
 - Check the live quorum value: `make get-quorum-<chain>` (or `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)'`). 10000 (100%) requires every peer to sign — see [Quorum management](../operator/quorum-management.md) to change it via `make set-quorum-<chain> BPS=...`.
 - For local testnet only: set `QUORUM_BPS_OVERRIDE` to force a local value without going through the registry. Production deployments should leave it unset.
 - Verify `VALIDATOR_PRIVATE_KEY` is set and valid. The validator uses this to sign EIP-712 consensus messages.
 - Followers independently re-simulate and re-score. If a follower's scores do not both exceed threshold, it will not sign.
+
+## No peers discovered
+
+**Symptom**: `curl http://localhost:9100/consensus/info` returns an empty `peers` list, or `/consensus/info` shows `peer-mode=discovered` but the daemon log says `ProtocolConfig: peer discovery: probed 0 candidates → 0 verified`.
+
+Discovery requires four things to line up. Check each in order:
+
+1. **Your `VALIDATOR_AXON_URL` is set and reachable**. From any other host: `curl $VALIDATOR_AXON_URL/identity`. Should return a JSON payload, not a 503. If 503, the daemon is missing one of: bittensor wallet (no `my_hotkey`), `VALIDATOR_AXON_URL` env, or a signing key.
+2. **Your hotkey is on the metagraph with the correct axon URL.** Run `btcli subnet metagraph --netuid 112 --subtensor.network finney` and find your hotkey. The `axon` column must match `VALIDATOR_AXON_URL`. If it's wrong, call `btcli` to update it (or your bittensor wallet's `serve_axon` runner).
+3. **Your EVM signing address is in the on-chain `ValidatorRegistry`.** Run `cast call $VALIDATOR_REGISTRY 'isValidator(address)(bool)' 0xYourEvmAddress --rpc-url $RPC_URL` — must return `true` on every chain you operate on. If false, see [validator quickstart Step 4](./quickstart.md#step-4-get-onboarded-to-the-on-chain-validatorregistry) for the handshake with the registry owner.
+4. **Other validators' `/identity` endpoints are reachable from your host.** Test: `curl <their-axon-url>/identity`. If unreachable, it's a network issue (firewall, NAT).
+
+**Symptom**: identity probe returns valid JSON but discovery still rejects it. Check the daemon logs for `Identity probe ... recovered EVM X but it is not in ValidatorRegistry.getValidators() — rejecting`. That's the on-chain handshake (step 3) for the OTHER validator — they need to be added to the registry too.
 
 ## JS Scoring Engine Issues
 
