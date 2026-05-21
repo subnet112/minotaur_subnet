@@ -297,6 +297,26 @@ class ScoringEngine:
                 "status": 400,
             }
 
+        # Off-chain mirror of the on-chain AppRegistry gate. A compromised
+        # leader could propose plans for unregistered apps; a follower that
+        # signed anyway would be participating in unauthorised execution.
+        # No-op on chains with no APP_REGISTRY_{chain_id} env configured.
+        if app_id and self.store is not None:
+            from minotaur_subnet.consensus.app_registry_cache import is_registered_app
+            _dep = self.store.get_deployment(app_id, chain_id=chain_id)
+            if _dep and _dep.contract_address and not is_registered_app(
+                _dep.contract_address, chain_id,
+            ):
+                return {
+                    "approved": False,
+                    "reason": (
+                        f"App {app_id} contract {_dep.contract_address} not "
+                        f"registered in AppRegistry on chain {chain_id}"
+                    ),
+                    "reason_code": RejectionCode.APP_NOT_REGISTERED.value,
+                    "status": 403,
+                }
+
         # Re-score via JS engine if the app is loaded (CON-4, VAL-14)
         local_score = score  # Default: trust leader's score
         plan_data = body.get("plan", {})

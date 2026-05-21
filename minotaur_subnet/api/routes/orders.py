@@ -233,6 +233,24 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                 detail=f"App {app_id} is not ready for orders (status: {status_label})",
             )
 
+        # Off-chain mirror of the on-chain AppRegistry gate
+        # (see subnet112/minotaur_contracts/src/AppRegistry.sol). Reject at
+        # ingestion when the App contract is not authorised on this chain;
+        # otherwise we'd burn validator + relayer work only to revert in the
+        # contract's _requireRegistered() check. No-op on chains with no
+        # APP_REGISTRY_{chain_id} env configured.
+        from minotaur_subnet.consensus.app_registry_cache import is_registered_app
+        if deployment.contract_address and not is_registered_app(
+            deployment.contract_address, req.chain_id,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"App {app_id} contract {deployment.contract_address} is "
+                    f"not registered in the AppRegistry on chain {req.chain_id}"
+                ),
+            )
+
         # ── Auto-resolve: intent_function ──
         # If default "execute" isn't valid and only 1 function exists, use it
         if _js_engine is not None and req.intent_function == "execute":
