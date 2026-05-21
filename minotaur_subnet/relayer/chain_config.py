@@ -19,6 +19,7 @@ class ChainDeployment:
     rpc_url: str
     app_intent_base_address: str = ""
     validator_registry_address: str = ""
+    app_registry_address: str = ""     # AppRegistry on this chain; "" disables the on-chain gate
     relayer_wallet: str = ""           # Relayer's EOA on this chain
     gas_price_gwei: float = 0.0        # 0 = use provider estimate
     max_gas_price_gwei: float = 100.0
@@ -60,6 +61,9 @@ def get_supported_chains() -> dict[int, ChainDeployment]:
             ),
             validator_registry_address=os.environ.get(
                 f"VALIDATOR_REGISTRY_{chain_id}", "",
+            ),
+            app_registry_address=os.environ.get(
+                f"APP_REGISTRY_{chain_id}", "",
             ),
             relayer_wallet=os.environ.get(
                 f"RELAYER_WALLET_{chain_id}",
