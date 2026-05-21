@@ -55,28 +55,52 @@ class ValidatorPeerNetwork:
         private_key: str,
         consensus: Any,
         peers: list[PeerEndpoint] | None = None,
+        protocol_config: Any = None,
         timeout: float = 10.0,
         default_headers: dict[str, str] | None = None,
     ) -> None:
         self.validator_id = validator_id
         self.private_key = private_key
         self.consensus = consensus
-        self._peers: list[PeerEndpoint] = [
-            p for p in (peers or []) if p.validator_id != validator_id
-        ]
+        # When peers is explicitly passed, pin it (tests, manual override).
+        # When None and protocol_config is set, the peers property reads
+        # through to discovered peers so this network automatically targets
+        # whatever peers the discovery loop has found.
+        self._peers_override: list[PeerEndpoint] | None = (
+            [p for p in peers if p.validator_id != validator_id]
+            if peers is not None else None
+        )
+        self.protocol_config = protocol_config
         self.timeout = timeout
         self._default_headers = dict(default_headers or {})
         self._session: aiohttp.ClientSession | None = None
 
     def set_peers(self, peers: list[PeerEndpoint]) -> None:
-        """Update the peer list (e.g. after metagraph sync)."""
+        """Update the pinned peer list (test / manual-override path).
+
+        Has no effect when the network is configured to read through to
+        ``protocol_config.peers`` — discovery loop drives the set in that mode.
+        """
         # Exclude self
-        self._peers = [p for p in peers if p.validator_id != self.validator_id]
-        logger.info("Peer list updated: %d peers", len(self._peers))
+        self._peers_override = [p for p in peers if p.validator_id != self.validator_id]
+        logger.info("Peer list updated (pinned): %d peers", len(self._peers_override))
 
     @property
     def peers(self) -> list[PeerEndpoint]:
-        return list(self._peers)
+        """Current peer list.
+
+        Pinned override (if set) takes precedence; otherwise reads through
+        to ``protocol_config.peers`` from the discovery loop, filtering self.
+        """
+        if self._peers_override is not None:
+            return list(self._peers_override)
+        if self.protocol_config is None:
+            return []
+        return [
+            PeerEndpoint(validator_id=p.evm_address, url=p.axon_url)
+            for p in self.protocol_config.peers
+            if p.evm_address.lower() != self.validator_id.lower()
+        ]
 
     def set_default_headers(self, headers: dict[str, str] | None) -> None:
         """Update default headers sent to peer validators."""
@@ -90,7 +114,7 @@ class ValidatorPeerNetwork:
             )
         logger.info(
             "PeerNetwork started (validator=%s, peers=%d)",
-            self.validator_id[:10], len(self._peers),
+            self.validator_id[:10], len(self.peers),
         )
 
     async def stop(self) -> None:
@@ -118,7 +142,9 @@ class ValidatorPeerNetwork:
         Returns:
             List of successfully collected SignedApprovals.
         """
-        if not self._peers:
+        # Snapshot once — discovery loop may swap the list during broadcast.
+        peers = self.peers
+        if not peers:
             return []
 
         if self._session is None or self._session.closed:
@@ -134,10 +160,10 @@ class ValidatorPeerNetwork:
         # Send to all peers concurrently, feeding approvals as they arrive
         # so ConsensusManager.propose() can reach quorum without waiting
         # for ALL peers to respond.
-        print(f"[CONSENSUS] Broadcasting to {len(self._peers)} peers: {[p.url for p in self._peers]}", flush=True)
+        print(f"[CONSENSUS] Broadcasting to {len(peers)} peers: {[p.url for p in peers]}", flush=True)
         tasks = {
             asyncio.ensure_future(self._send_proposal(peer, payload)): peer
-            for peer in self._peers
+            for peer in peers
         }
         approvals: list[SignedApproval] = []
         for coro in asyncio.as_completed(tasks):
@@ -154,7 +180,7 @@ class ValidatorPeerNetwork:
 
         logger.info(
             "Broadcast complete: %d/%d approvals collected",
-            len(approvals), len(self._peers),
+            len(approvals), len(peers),
         )
         return approvals
 
@@ -164,7 +190,8 @@ class ValidatorPeerNetwork:
         payload: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Broadcast an authenticated JSON payload to all peers."""
-        if not self._peers:
+        peers = self.peers
+        if not peers:
             return []
 
         if self._session is None or self._session.closed:
@@ -172,12 +199,12 @@ class ValidatorPeerNetwork:
 
         tasks = [
             self._send_json(peer, payload, path=path)
-            for peer in self._peers
+            for peer in peers
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         responses: list[dict[str, Any]] = []
-        for peer, result in zip(self._peers, results):
+        for peer, result in zip(peers, results):
             if isinstance(result, Exception):
                 logger.warning(
                     "JSON sync to %s failed: %s",
@@ -191,7 +218,7 @@ class ValidatorPeerNetwork:
             "JSON sync complete for %s: %d/%d responses",
             path,
             len(responses),
-            len(self._peers),
+            len(peers),
         )
         return responses
 
@@ -207,7 +234,8 @@ class ValidatorPeerNetwork:
         path: str = "/v1/solver/round/consensus/proposal",
     ) -> list[ChampionApproval]:
         """Broadcast a champion certification proposal to validator peers."""
-        if not self._peers:
+        peers = self.peers
+        if not peers:
             return []
 
         if self._session is None or self._session.closed:
@@ -230,7 +258,7 @@ class ValidatorPeerNetwork:
 
         tasks = [
             asyncio.create_task(_send_with_peer(peer))
-            for peer in self._peers
+            for peer in peers
         ]
 
         approvals: list[ChampionApproval] = []
@@ -250,7 +278,7 @@ class ValidatorPeerNetwork:
 
         logger.info(
             "Champion broadcast complete: %d/%d approvals collected",
-            len(approvals), len(self._peers),
+            len(approvals), len(peers),
         )
         return approvals
 

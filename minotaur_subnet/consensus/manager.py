@@ -55,7 +55,11 @@ class ConsensusManager:
         self.validator_id = validator_id
         self.private_key = private_key
         self.protocol_config = protocol_config
-        self.validators = validators or [validator_id]
+        # When validators is explicitly passed (tests, manual override),
+        # it pins the set. When None, the validators property reads through
+        # to protocol_config.peers + self.validator_id, picking up newly
+        # discovered peers automatically.
+        self._validators_override = validators
         self.timeout = timeout
         self.chain_id = chain_id
         self.contract_address = contract_address
@@ -81,6 +85,22 @@ class ConsensusManager:
         on the next refresh tick.
         """
         return self.protocol_config.quorum_bps
+
+    @property
+    def validators(self) -> list[str]:
+        """Current trusted validator set.
+
+        When ``validators=...`` was passed at construction, that pinned list
+        is returned (used by tests and any caller that wants a fixed set).
+        Otherwise this reads through to ``protocol_config.peers`` plus this
+        validator's own id — so new peers picked up by the discovery loop
+        become trusted signers automatically.
+        """
+        if self._validators_override is not None:
+            return self._validators_override
+        return [self.validator_id] + [
+            p.evm_address for p in self.protocol_config.peers
+        ]
 
     @property
     def quorum_required(self) -> int:
