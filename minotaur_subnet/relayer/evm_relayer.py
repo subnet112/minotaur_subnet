@@ -203,6 +203,22 @@ class EvmRelayer(RelayerBase):
                 chain_id=chain_id,
             )
 
+        # Off-chain mirror of the on-chain AppRegistry gate. Refuse to spend
+        # gas on an unregistered app — the contract's _requireRegistered()
+        # would revert it anyway, but failing here saves the gas burn and
+        # gives a structured error. No-op when APP_REGISTRY_{chain_id} is
+        # unset (matches the contract's address(0) escape hatch).
+        from minotaur_subnet.consensus.app_registry_cache import is_registered_app
+        if not is_registered_app(app_address, chain_id):
+            return SubmitResult(
+                success=False,
+                error=(
+                    f"App contract {app_address} is not registered in the "
+                    f"AppRegistry on chain {chain_id}"
+                ),
+                chain_id=chain_id,
+            )
+
         # Warn when submitting to a real (non-Anvil) chain
         rpc_url = (config.rpc_url or "").lower()
         if chain_id in (1, 8453) and not any(
