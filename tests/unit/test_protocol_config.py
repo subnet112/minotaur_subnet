@@ -125,7 +125,7 @@ async def test_refresh_loop_survives_rpc_error():
 
 
 @pytest.mark.asyncio
-async def test_refresh_loop_noops_under_override():
+async def test_refresh_loop_skips_quorum_under_override():
     os.environ["QUORUM_BPS_OVERRIDE"] = "9000"
     cfg = ProtocolConfig(
         quorum_bps=9000,
@@ -137,6 +137,14 @@ async def test_refresh_loop_noops_under_override():
     with patch(
         "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
     ) as mock_read:
-        # The loop should return immediately without calling _read.
-        await asyncio.wait_for(cfg.refresh_loop(), timeout=0.5)
+        # The loop continues to spin (it may run peer discovery if wired)
+        # but must NOT call _read_quorum_bps while override is active.
+        task = asyncio.create_task(cfg.refresh_loop())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         mock_read.assert_not_called()
