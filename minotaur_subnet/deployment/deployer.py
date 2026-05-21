@@ -127,24 +127,81 @@ class DeployService:
         relayer_cs = Web3.to_checksum_address(relayer_addr)
         registry_cs = Web3.to_checksum_address(registry_addr)
 
-        # Platform fee constructor args (AppIntentBase params 5-7)
+        # Platform constructor args — ordered to match AppIntentBase constructor
+        # signature in subnet112/minotaur_contracts/src/AppIntentBase.sol:
+        #   (_relayer, _validatorRegistry, _scoreThreshold,
+        #    _wrappedNativeToken, _platformFeeCollector,
+        #    _minPlatformFeeWei, _maxPlatformFeeWei,
+        #    _feeMode, _appPaymaster, _appRegistry)
         from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
         wnt = WRAPPED_NATIVE_TOKEN.get(chain_id, "0x" + "0" * 40)
         wnt_cs = Web3.to_checksum_address(wnt)
         platform_fee_collector = relayer_cs  # Relayer collects fees by default
+        min_platform_fee = int(os.environ.get("MIN_PLATFORM_FEE_WEI", "0"))
         max_platform_fee = int(os.environ.get("MAX_PLATFORM_FEE_WEI", str(10**17)))  # 0.1 ETH
+        fee_mode_str = os.environ.get("FEE_MODE_DEFAULT", "USER").upper()
+        if fee_mode_str not in ("USER", "APP"):
+            return DeploymentResult(
+                app_id=app.app_id,
+                status=AppStatus.DRAFT,
+                js_code_hash=js_hash,
+                chain_id=chain_id,
+                error=f"FEE_MODE_DEFAULT must be USER or APP, got {fee_mode_str!r}",
+            )
+        fee_mode = 1 if fee_mode_str == "APP" else 0  # FeeMode enum: USER=0, APP=1
+        zero_addr = Web3.to_checksum_address("0x" + "0" * 40)
+        app_paymaster = zero_addr  # informational; apps override via constructor_args if needed
 
-        # AppIntentBase constructor (post-refactor): no quorumBps — read from
-        # ValidatorRegistry at execution time.
-        arg_types = ["address", "address", "uint256",
-                     "address", "address", "uint256"]
-        arg_values: list = [relayer_cs, registry_cs, self.score_threshold,
-                            wnt_cs, platform_fee_collector, max_platform_fee]
+        # AppRegistry address — when configured, the deployed App enforces
+        # `_requireRegistered()` against it. Unset/zero disables the check,
+        # which matches the contract's escape hatch.
+        chain_cfg = self.relayer.chains.get(chain_id)
+        app_registry_addr = (
+            (chain_cfg.app_registry_address if chain_cfg and chain_cfg.app_registry_address else "")
+            or os.environ.get(f"APP_REGISTRY_{chain_id}", "")
+        )
+        if app_registry_addr:
+            app_registry_cs = Web3.to_checksum_address(app_registry_addr)
+        else:
+            logger.warning(
+                "Deploy on chain %d: no AppRegistry configured (APP_REGISTRY_%d unset); "
+                "deployed App will run with the on-chain registry gate disabled",
+                chain_id, chain_id,
+            )
+            app_registry_cs = zero_addr
+
+        arg_types = [
+            "address",  # _relayer
+            "address",  # _validatorRegistry
+            "uint256",  # _scoreThreshold
+            "address",  # _wrappedNativeToken
+            "address",  # _platformFeeCollector
+            "uint256",  # _minPlatformFeeWei
+            "uint256",  # _maxPlatformFeeWei
+            "uint8",    # _feeMode (FeeMode enum)
+            "address",  # _appPaymaster
+            "address",  # _appRegistry
+        ]
+        arg_values: list = [
+            relayer_cs,
+            registry_cs,
+            self.score_threshold,
+            wnt_cs,
+            platform_fee_collector,
+            min_platform_fee,
+            max_platform_fee,
+            fee_mode,
+            app_paymaster,
+            app_registry_cs,
+        ]
         logger.info(
-            "Deploy constructor: relayer=%s registry=%s score_threshold=%d "
-            "wrappedNative=%s feeCollector=%s maxFee=%d",
+            "Deploy constructor: relayer=%s registry=%s scoreThreshold=%d "
+            "wrappedNative=%s feeCollector=%s minFee=%d maxFee=%d "
+            "feeMode=%s appPaymaster=%s appRegistry=%s",
             relayer_cs[:10], registry_cs[:10], self.score_threshold,
-            wnt_cs[:10], platform_fee_collector[:10], max_platform_fee,
+            wnt_cs[:10], platform_fee_collector[:10],
+            min_platform_fee, max_platform_fee, fee_mode_str,
+            app_paymaster[:10], app_registry_cs[:10],
         )
 
         if app.constructor_args:
