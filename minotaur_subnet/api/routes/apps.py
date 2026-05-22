@@ -112,8 +112,19 @@ def _store():
 
 
 @router.post("/apps/")
-def create_app(body: CreateAppRequest) -> dict[str, Any]:
-    """Create a new App Intent with developer-provided JS and Solidity code."""
+def create_app(
+    body: CreateAppRequest,
+    x_admin_key: str | None = Header(None),
+) -> dict[str, Any]:
+    """Create a new App Intent with developer-provided JS and Solidity code.
+
+    Requires X-Admin-Key header when ADMIN_API_KEY is set. Open in development
+    mode (when ADMIN_API_KEY is unset). The on-chain AppRegistry gate is the
+    final authority — even an unauthenticated app record can't be routed
+    against an unregistered contract — but the admin gate prevents wasted
+    relayer gas from spurious deploy attempts.
+    """
+    _require_admin(x_admin_key)
     return _tools.create_app_intent(
         _store(),
         name=body.name,
@@ -137,12 +148,23 @@ async def validate_app(body: ValidateAppRequest) -> dict[str, Any]:
 
 
 @router.post("/apps/{app_id}/deploy")
-async def deploy_app(app_id: str, chain_id: int | None = None) -> dict[str, Any]:
+async def deploy_app(
+    app_id: str,
+    chain_id: int | None = None,
+    x_admin_key: str | None = Header(None),
+) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
+
+    Requires X-Admin-Key header when ADMIN_API_KEY is set. Open in development
+    mode (when ADMIN_API_KEY is unset). Without this gate, an unauthenticated
+    caller could trigger the relayer to spend gas on attacker-defined Solidity;
+    the deployed contract still can't execute orders (AppRegistry gate is
+    GATED + allowlist) but the gas burn is real.
 
     Runs in a thread executor so the synchronous compile + deploy chain
     can call asyncio.run() without conflicting with the FastAPI event loop.
     """
+    _require_admin(x_admin_key)
     import asyncio
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
