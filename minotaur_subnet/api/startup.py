@@ -943,12 +943,14 @@ async def initialize(ctx: ServerContext) -> dict:
                     if leader_addr not in all_validator_addrs:
                         all_validator_addrs.insert(0, leader_addr)
 
+                    # ORDER_CONSENSUS_PEERS is a named manual override used by
+                    # tests + local-testnet to pin a specific peer set. In
+                    # production it stays unset and ProtocolConfig.refresh_loop
+                    # discovers peers from the metagraph + on-chain
+                    # ValidatorRegistry. (The older VALIDATOR_PEERS fallback
+                    # was removed during the registry-consolidation refactor.)
                     order_peers_env = os.environ.get("ORDER_CONSENSUS_PEERS", "")
                     order_peer_endpoints = parse_peers_env(order_peers_env)
-
-                    if not order_peer_endpoints:
-                        vp_env = os.environ.get("VALIDATOR_PEERS", "")
-                        order_peer_endpoints = parse_peers_env(vp_env)
 
                     for ep in order_peer_endpoints:
                         if ep.validator_id not in all_validator_addrs:

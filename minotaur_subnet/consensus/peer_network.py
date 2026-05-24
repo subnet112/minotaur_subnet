@@ -5,8 +5,13 @@ Non-leaders receive proposals, re-score, sign approvals, and return them.
 The leader's ConsensusManager collects approvals for quorum.
 
 Peer discovery:
-- Local testnet: ``VALIDATOR_PEERS`` env var (``addr@url`` pairs)
-- Production: MetagraphSync axon_info
+- Production: ``ProtocolConfig.refresh_loop`` walks the Bittensor metagraph
+  axon list, probes each ``/identity``, and cross-checks against the on-chain
+  ``ValidatorRegistry``. The peer list is mutated in place; ``peers``
+  property reads through to ``protocol_config.peers`` on every call.
+- Test / local-testnet override: pass an explicit ``peers`` list to the
+  constructor, or set ``ORDER_CONSENSUS_PEERS`` env (``addr@url`` pairs)
+  and let api/startup.py parse it via ``parse_peers_env``.
 """
 
 from __future__ import annotations
@@ -682,7 +687,11 @@ class ValidatorPeerNetwork:
 
 
 def parse_peers_env(peers_str: str) -> list[PeerEndpoint]:
-    """Parse VALIDATOR_PEERS env var format: ``addr@url,addr@url,...``
+    """Parse the ``addr@url,addr@url,...`` peer-list format.
+
+    Used to interpret the ``ORDER_CONSENSUS_PEERS`` env var (named manual
+    override for tests + local-testnet). Production code relies on
+    ``ProtocolConfig.refresh_loop`` discovery and leaves the override unset.
 
     Example:
         ``0xAbC1@http://host1:9100,0xDeF2@http://host2:9100``
