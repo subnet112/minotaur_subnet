@@ -48,15 +48,21 @@ Scaling is vertical -- no horizontal sharding needed at the validator level. You
 
 ### Required maintenance cron
 
-Anvil's overlay filesystem grows roughly 15 GB per fork per day even with tmpfs mounted at `/root` and `/tmp`. Without a daily recycle, a 100 GB volume fills in under a week with three forks. Install this cron:
+Anvil's overlay filesystem grows fast even with tmpfs mounted at `/root` and `/tmp`. A production deployment in May 2026 measured **~40-50 GB per fork per day**; the rate has grown over time as the chain head moves further from the fork block and as user/simulation load increases. With three forks that's ~150 GB/day of bloat. Without a frequent recycle, a 100 GB volume fills in well under a day and the host OS hangs (status check: impaired) once the disk hits 100% — at which point SSH is dead and the only recovery is a force stop+start of the VM.
+
+Install this cron — **every 6 hours**, not daily:
 
 ```
-0 3 * * * root docker compose -f /opt/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /opt/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
+0 */6 * * * root docker compose -f /opt/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /opt/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
 ```
 
 (The path matches the compose file you write in Step 6. Adjust if you put it elsewhere.)
 
-The recycle window (03:00 UTC by default) drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from peers to avoid simultaneous reorg pauses.
+At every-6h cadence, max accumulation between recycles is ~37 GB across three forks, which fits in a 100 GB volume with other services taking ~10-15 GB. If you skip a recycle (cron failure, host unreachable, manual stop without restart), the disk can fill in 12-15 hours from there — monitor `df -h /` and treat low disk as a paging event. If the rate grows further (more chains added, much higher load), drop the cadence to every 4 or 3 hours.
+
+Each recycle window drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from peers to avoid simultaneous reorg pauses.
+
+**If you do hit a disk-full OS hang**: the SSH daemon is dead at that point, so `docker compose down`, cron tightening, or any in-VM cleanup won't help. The only recovery is a force stop+start at the hypervisor layer (on AWS: `aws ec2 stop-instances --force --instance-ids <id>`, wait for stopped, then `start-instances`). EBS-backed instances preserve all state across this; containers with `restart: unless-stopped` come back automatically. Once the host is up, immediately `docker compose rm -fsv` the anvil services to release their snapshot overlays — `docker system prune` alone won't reclaim them.
 
 ### Realistic hosting (baseline 4 vCPU / 8 GB)
 
@@ -350,7 +356,7 @@ services:
       retries: 20
 ```
 
-The `tmpfs` mounts on `/root` and `/tmp` keep Anvil's writable layer in RAM rather than the host disk. Without them, each fork bloats its container overlay by ~15 GB/day — the daily [recycle cron](#required-maintenance-cron) is still needed on top of this, but the tmpfs mounts buy you the time between recycles.
+The `tmpfs` mounts on `/root` and `/tmp` keep Anvil's writable layer in RAM rather than the host disk. Without them, each fork bloats its container overlay much faster — the [every-6h recycle cron](#required-maintenance-cron) is still needed on top of this (forks still accumulate ~40-50 GB/day each even with tmpfs), but the tmpfs mounts substantially reduce the rate.
 
 Start the forks (the `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, and `BITTENSOR_EVM_UPSTREAM_RPC_URL` you exported in Step 5 are read from the environment):
 
@@ -397,7 +403,8 @@ python -m minotaur_subnet.validator.main \
   --subtensor-url "$SUBTENSOR_URL" \
   --validator-key "$VALIDATOR_PRIVATE_KEY" \
   --validator-registry-address "$VALIDATOR_REGISTRY_ADDRESS" \
-  --tick-interval 12.0
+  --tick-interval 12.0 \
+  --epoch-seconds 1200
 ```
 
 If `VALIDATOR_REGISTRY_ADDRESS` (or a chain-keyed `VALIDATOR_REGISTRY_<CHAIN_ID>`) is exported in Step 5, the `--validator-registry-address` flag can be omitted — the daemon picks it up from the environment.
@@ -408,7 +415,7 @@ The daemon will:
 2. Read `quorumBps` from `ValidatorRegistry` at startup, refresh every epoch.
 3. Start the BlockLoop (processing orders every ~12 seconds).
 4. Listen on port 9100 for validator/consensus and execution endpoints.
-5. Emit weights once per epoch (default: 60 seconds).
+5. Emit weights once per epoch — set to **1200 seconds / 20 min** above to match Bittensor's `weights_set_rate_limit` of 100 blocks (~20 min). The daemon's older 60-second default will spam-reject ~95% of attempts on subnet 112; always pass `--epoch-seconds 1200` explicitly.
 
 If the daemon exits at startup with `"Consensus enabled but no ValidatorRegistry address provided"`, the env var or flag is missing — set it and restart.
 
