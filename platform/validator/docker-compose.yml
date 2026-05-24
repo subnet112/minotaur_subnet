@@ -1,17 +1,24 @@
 # Canonical Minotaur Subnet 112 validator stack — follower role.
 #
-# Six containers:
+# Six core containers + one optional auto-update side-container:
 #   - 3× Anvil forks (Ethereum, Base, BT EVM) for proposal re-simulation
 #   - 1× validator daemon (order-consensus signer + weight emitter)
 #   - 1× api service (champion-consensus signer)
 #   - 1× docker-socket-proxy (limits the api service's Docker access to
 #     just spawning solver containers — used during reactive benchmarking
 #     of champion candidates, rejected if it can't validate them)
+#   - 1× watchtower (OPT-IN via `--profile autoupdate`) — polls GHCR for
+#     new :stable image and recreates validator + api when the tag moves.
+#     Subnet team controls promotion cadence; third-party validators
+#     don't get surprise upgrades from every commit to main.
 #
 # Quickstart:
 #   cp .env.example .env
 #   # fill in YOUR_* placeholders in .env
-#   docker compose up -d
+#   docker compose --profile autoupdate up -d   # with auto-update
+#   # ── or ──
+#   docker compose up -d                         # without auto-update (manual pulls)
+#
 #   docker compose logs -f validator api
 #
 # What this stack does NOT do:
@@ -137,8 +144,11 @@ services:
   # to avoid surprise upgrades. Watchtower auto-update lands in B.5.
 
   validator:
-    image: ghcr.io/subnet112/minotaur-validator:latest
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
     restart: unless-stopped
+    labels:
+      # Tell Watchtower to auto-update this container when :stable moves
+      com.centurylinklabs.watchtower.enable: "true"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "exec python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200"
@@ -222,8 +232,10 @@ services:
   # it cannot inspect or exec arbitrary containers on the host.
 
   api:
-    image: ghcr.io/subnet112/minotaur-validator:latest
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
     restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "exec python -m minotaur_subnet.api.server --port 8080"
@@ -309,6 +321,39 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  # ── Watchtower — auto-update validator + api on :stable promotion ─────
+  # Polls GHCR every hour for a new image SHA on the configured tag (default
+  # :stable). When the SHA moves, Watchtower pulls the new image, stops the
+  # affected containers, and recreates them with the new image. The subnet
+  # team controls when :stable moves via the promote-stable.yml workflow
+  # (manually triggered after a release has soaked on our prod), so
+  # third-party validators don't get surprise upgrades from every commit
+  # to main.
+  #
+  # Trust note: Watchtower needs full Docker socket access to stop+recreate
+  # containers. This is the second container in this stack with that access
+  # (docker-socket-proxy is the first, but it proxies a *filtered* subset
+  # — Watchtower needs the unrestricted socket). Containrrr's Watchtower
+  # is a widely-deployed maintenance image; if you're uncomfortable with the
+  # trust model, set MINOTAUR_DISABLE_WATCHTOWER=1 in your .env (the
+  # ``profiles: [autoupdate]`` directive below makes this service opt-out)
+  # and run `docker compose pull && docker compose up -d` manually on the
+  # cadence we publish.
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    restart: unless-stopped
+    profiles: [autoupdate]
+    environment:
+      WATCHTOWER_POLL_INTERVAL: "3600"      # 1 hour
+      WATCHTOWER_CLEANUP: "true"             # remove old image after upgrade
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"        # only update labelled containers
+      WATCHTOWER_NOTIFICATIONS: ""           # silent — host-side monitoring should watch instead
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [minotaur]
 
   # ── docker-socket-proxy — limit api's Docker access ──────────────────
   # Mounts /var/run/docker.sock read-only and exposes a filtered subset
