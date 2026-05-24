@@ -1,0 +1,195 @@
+# Canonical Minotaur Subnet 112 validator stack — follower role.
+#
+# Four containers: three Anvil forks + the validator daemon.
+# Sign order-consensus proposals from the current leader, emit weights
+# to the metagraph at the calibrated network cadence.
+#
+# Quickstart:
+#   cp .env.example .env
+#   # fill in YOUR_* placeholders in .env
+#   docker compose up -d
+#   docker compose logs -f validator
+#
+# What this stack does NOT do:
+#   - Run the relayer (transaction submitter is operated by the subnet team).
+#   - Participate in champion-consensus signing (separate optional service).
+#   - Propose orders (only the highest-stake validator's leader-api does that).
+#
+# See docs/validator/quickstart.md for the full setup, on-chain registration,
+# and operational notes including the every-6h anvil-recycle cron.
+
+services:
+  # ── Anvil forks ──────────────────────────────────────────────────────
+  # One per supported chain. Anvil's "fork" mode replays a real chain
+  # locally so the validator can re-simulate execution plans against the
+  # same state the leader saw, without touching mainnet.
+  #
+  # `tmpfs` on /root and /tmp keep Anvil's writable layer in RAM rather
+  # than the container overlay. Reduces but does not eliminate disk
+  # bloat (~40-50 GB/fork/day in current production, May 2026). The
+  # every-6h recycle cron in docs/validator/quickstart.md is required.
+
+  anvil-eth:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8545"
+      - "--fork-url=${ETH_UPSTREAM_RPC_URL}"
+      - "--chain-id=1"
+      - "--block-time=2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-base:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8546"
+      - "--fork-url=${BASE_UPSTREAM_RPC_URL}"
+      - "--chain-id=8453"
+      - "--no-storage-caching"
+      - "--block-time=2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:8546:8546"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-btevm:
+    image: ghcr.io/foundry-rs/foundry:latest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8547"
+      - "--fork-url=${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      - "--chain-id=964"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+      - "--block-time=2"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:8547:8547"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8547 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    networks: [minotaur]
+
+  # ── Validator daemon ─────────────────────────────────────────────────
+  # Order-consensus follower role: receives proposals from the current
+  # leader, re-simulates them on the local Anvil forks, signs approvals
+  # if both JS and on-chain scores meet threshold. Emits weights to the
+  # subnet 112 metagraph at the chain rate-limit cadence.
+  #
+  # Image is pinned to `:latest` in this example; in production, pin to
+  # a specific sha-tagged image (ghcr.io/subnet112/minotaur-validator:sha-<sha>)
+  # to avoid surprise upgrades.
+
+  validator:
+    image: ghcr.io/subnet112/minotaur-validator:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "exec python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200"
+    ports:
+      # MUST be reachable from the current leader for proposal broadcast.
+      # If behind NAT, forward 9100/tcp to this host.
+      - "0.0.0.0:9100:9100"
+    depends_on:
+      anvil-eth:
+        condition: service_healthy
+      anvil-base:
+        condition: service_healthy
+      anvil-btevm:
+        condition: service_healthy
+    environment:
+      # Bittensor identity
+      WALLET_NAME: "${WALLET_NAME}"
+      HOTKEY_NAME: "${HOTKEY_NAME}"
+      SUBTENSOR_URL: "${SUBTENSOR_URL:-finney}"
+      NETUID: "${NETUID:-112}"
+
+      # Public URL where this daemon serves /identity for peer discovery.
+      # Other validators verify the EIP-712 signed payload and cross-check
+      # against ValidatorRegistry + the metagraph.
+      VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
+
+      # EVM signing key (no funds, just identity)
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+
+      # Per-chain ValidatorRegistry addresses
+      # (current values in docs/operator/network-reference.md)
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964}"
+
+      # AppRegistry addresses — off-chain gate that mirrors the on-chain
+      # AppRegistry.isRegistered() check
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964}"
+
+      # Anvil RPCs (internal docker hostnames)
+      ANVIL_RPC_URL: http://anvil-base:8546
+      BASE_RPC_URL: http://anvil-base:8546
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
+      BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+
+      # Upstream RPCs — used when Anvil restarts to re-fork at the
+      # current head. Public BT EVM RPC is fine; ETH + Base need your
+      # own (Alchemy / Infura / etc).
+      ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BASE_UPSTREAM_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_UPSTREAM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+
+      # Primary chain for default consensus context
+      CHAIN_ID: "8453"
+
+      # Consensus mode + safety
+      CONSENSUS_MODE: "real"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+      FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
+
+      # Score threshold (network norm)
+      SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
+    volumes:
+      # Bittensor wallet directory — read-only.
+      # btcli typically stores wallets at ~/.bittensor/wallets on the host.
+      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
+    networks: [minotaur]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+networks:
+  minotaur:
+    driver: bridge

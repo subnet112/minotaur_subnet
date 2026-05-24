@@ -142,9 +142,13 @@ Discovery requires four things to line up. Check each in order:
   - The wallet directory must be accessible (default: `~/.bittensor/wallets/`).
 - On Bittensor 10.x, `set_weights` uses commit-reveal. On fast local chains, you may need to wait a few blocks between weight emissions.
 
-## Miner Submissions Rejected
+## Miner Submissions Rejected (leader-only)
 
 **Symptom**: Miner solver submissions fail or are not adopted.
+
+This section only applies if you are running the optional API service and are currently the leader (highest-stake validator). Third-party validators running only the canonical `platform/validator/` stack don't accept submissions — the leader does. If you're not the leader, miners shouldn't be hitting your box for submissions.
+
+If you are the leader:
 
 - Check submission endpoints on the API service:
   ```bash
@@ -178,8 +182,9 @@ Discovery requires four things to line up. Check each in order:
   docker compose logs validator
   docker compose logs anvil
   ```
-- The validator depends on the API service being healthy. If the API is unhealthy, the validator will not start.
-- Ensure the `.env` file in `platform/local_testnet/` has valid `ALCHEMY_RPC_URL` and `BASE_ALCHEMY_RPC_URL` values.
+- The validator daemon waits for its three Anvil forks to report healthy before starting (see `depends_on` in `platform/validator/docker-compose.yml`). On a first cold start this can take 60-90 seconds — anvil-btevm in particular waits on a public RPC. If you see "dependency failed to start", wait a bit and `docker compose up -d` again; the `start_period` on each anvil healthcheck gives them grace time on subsequent retries.
+- The validator daemon and the optional API service are independent processes — neither depends on the other for startup.
+- Ensure the `.env` file in `platform/local_testnet/` has valid `ALCHEMY_RPC_URL` and `BASE_ALCHEMY_RPC_URL` values (for the local-testnet path; the canonical validator stack reads from `platform/validator/.env`).
 - If containers are stuck, do a clean restart:
   ```bash
   make testnet-down
