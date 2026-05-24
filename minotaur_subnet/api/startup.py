@@ -1117,6 +1117,7 @@ async def initialize(ctx: ServerContext) -> dict:
                     from minotaur_subnet.consensus import (
                         ChampionConsensusManager,
                         ValidatorPeerNetwork,
+                        parse_peers_env,
                     )
                     from minotaur_subnet.consensus.eip712 import address_from_key
                     from minotaur_subnet.consensus.protocol_config import ProtocolConfig
@@ -1208,10 +1209,38 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
                     ctx.champion_protocol_config = champion_protocol_config
 
+                    # Named manual override for environments where the
+                    # ProtocolConfig discovery loop can't populate peers
+                    # automatically — e.g., production where the metagraph
+                    # axon URLs are unpublished, or local-testnet pinned
+                    # mode. When set, this bypasses discovery and pins the
+                    # champion-consensus peer set + validator list.
+                    # Parallel to ORDER_CONSENSUS_PEERS for order consensus.
+                    champion_peers_env = os.environ.get(
+                        "CHAMPION_CONSENSUS_PEERS", "",
+                    ).strip()
+                    champion_peer_endpoints = parse_peers_env(champion_peers_env)
+                    if champion_peer_endpoints:
+                        pinned_champion_validators = [validator_id] + [
+                            ep.validator_id for ep in champion_peer_endpoints
+                        ]
+                        logger.info(
+                            "Champion consensus pinned via CHAMPION_CONSENSUS_PEERS: "
+                            "%d peers (validator-set: %d)",
+                            len(champion_peer_endpoints),
+                            len(pinned_champion_validators),
+                        )
+                    else:
+                        pinned_champion_validators = None  # discovery mode
+
                     champion_consensus = ChampionConsensusManager(
                         validator_id=validator_id,
                         private_key=validator_key,
                         protocol_config=champion_protocol_config,
+                        # Pinned validators (when override env is set) take
+                        # precedence over protocol_config.peers — see
+                        # ChampionConsensusManager._validators_override.
+                        validators=pinned_champion_validators,
                         timeout=champion_consensus_timeout,
                         chain_id=champion_chain_id,
                         contract_address=champion_contract_address,
@@ -1220,6 +1249,9 @@ async def initialize(ctx: ServerContext) -> dict:
                         validator_id=validator_id,
                         private_key=validator_key,
                         consensus=champion_consensus,
+                        # Pinned peers (when override env is set) bypass the
+                        # protocol_config discovery loop's peer cache.
+                        peers=champion_peer_endpoints if champion_peer_endpoints else None,
                         protocol_config=champion_protocol_config,
                         timeout=champion_consensus_timeout,
                         default_headers=(
