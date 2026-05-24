@@ -215,7 +215,7 @@ If this returns `true` on every chain, you're cleared to bring up the daemon. If
 
 ## Step 5: Configure Environment
 
-Export the required environment variables:
+The recommended path (Step 6) reads configuration from `platform/validator/.env`. The variables below also work as shell exports if you're running the daemon directly under systemd instead of Docker Compose ("Running without Docker", below).
 
 ```bash
 # Bittensor identity
@@ -263,138 +263,73 @@ See [Configuration](./configuration.md) for the full list of options and
 [Quorum management](../operator/quorum-management.md) for how to change the
 network-wide quorum value once you're an operator.
 
-## Step 6: Start the Anvil Forks
+## Step 6: Bring up the validator stack
 
-The validator process does **not** spawn Anvil itself — it opens RPC connections to whatever URLs you set in `ANVIL_RPC_URL`, `BASE_RPC_URL`, and `BITTENSOR_EVM_RPC_URL`. You start the three forks separately and keep them running. Docker Compose is the supported pattern: it provides restart policies, health checks, and dovetails with the [recycle cron](#required-maintenance-cron).
-
-Save this as `/opt/minotaur/docker-compose.yml` (any stable path works — the cron just needs to reference the same file):
-
-```yaml
-services:
-  anvil:
-    image: ghcr.io/foundry-rs/foundry:latest
-    restart: unless-stopped
-    entrypoint: ["anvil"]
-    command:
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8545"
-      - "--fork-url"
-      - "${ETH_UPSTREAM_RPC_URL}"
-      - "--block-time"
-      - "2"
-    tmpfs:
-      - /root:size=2g
-      - /tmp:size=512m
-    ports:
-      - "8545:8545"
-    healthcheck:
-      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
-  anvil-base:
-    image: ghcr.io/foundry-rs/foundry:latest
-    restart: unless-stopped
-    entrypoint: ["anvil"]
-    command:
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8546"
-      - "--fork-url"
-      - "${BASE_UPSTREAM_RPC_URL}"
-      - "--chain-id"
-      - "8453"
-      - "--no-storage-caching"
-      - "--block-time"
-      - "2"
-    tmpfs:
-      - /root:size=2g
-      - /tmp:size=512m
-    ports:
-      - "8546:8546"
-    healthcheck:
-      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
-  anvil-btevm:
-    image: ghcr.io/foundry-rs/foundry:latest
-    restart: unless-stopped
-    entrypoint: ["anvil"]
-    command:
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8547"
-      - "--fork-url"
-      - "${BITTENSOR_EVM_UPSTREAM_RPC_URL}"
-      - "--chain-id"
-      - "964"
-      - "--no-storage-caching"
-      - "--fork-retry-backoff"
-      - "5000"
-      - "--retries"
-      - "10"
-      - "--timeout"
-      - "60000"
-      - "--block-time"
-      - "2"
-    tmpfs:
-      - /root:size=2g
-      - /tmp:size=512m
-    ports:
-      - "8547:8547"
-    healthcheck:
-      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8547 || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-```
-
-The `tmpfs` mounts on `/root` and `/tmp` keep Anvil's writable layer in RAM rather than the host disk. Without them, each fork bloats its container overlay much faster — the [every-6h recycle cron](#required-maintenance-cron) is still needed on top of this (forks still accumulate ~40-50 GB/day each even with tmpfs), but the tmpfs mounts substantially reduce the rate.
-
-Start the forks (the `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, and `BITTENSOR_EVM_UPSTREAM_RPC_URL` you exported in Step 5 are read from the environment):
+The validator role for a third-party operator is **four containers**: three Anvil forks (Ethereum mainnet, Base, BT EVM) plus the validator daemon. The canonical compose file ships in this repo at `platform/validator/`:
 
 ```bash
-docker compose -f /opt/minotaur/docker-compose.yml up -d
+cd platform/validator
+cp .env.example .env
+# Open .env in your editor and fill in every YOUR_* placeholder
+$EDITOR .env
+
+docker compose up -d
 ```
 
-Wait for all three to report healthy:
+The first cold start takes ~60-90 seconds while the three Anvil forks fetch their initial state from the upstream RPCs (`ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, `BITTENSOR_EVM_UPSTREAM_RPC_URL`). The validator daemon waits for all three to report healthy before it starts.
+
+Check the state:
 
 ```bash
-docker compose -f /opt/minotaur/docker-compose.yml ps
+docker compose ps
+# All four services should show "(healthy)" after ~90s.
+
+docker compose logs -f validator
+# Should show: "ProtocolConfig: loaded quorum_bps=6666 from ValidatorRegistry ..."
+#              "Consensus enabled (id=0x..., peer-mode=discovered, quorum=6666 bps)"
+#              "Validator starting as ORDER CONSENSUS PEER ..."
+#              "BlockLoop started (tick_interval=12.0s)"
 ```
 
-Quick sanity check (each should return a block number that increments over a few seconds):
+### Verify
 
 ```bash
-cast block-number --rpc-url http://localhost:8545
-cast block-number --rpc-url http://localhost:8546
-cast block-number --rpc-url http://localhost:8547
+# Health
+curl http://localhost:9100/health
+# {"status": "ok", "service": "app-intents-validator", "block_loop_running": true, ...}
+
+# Confirm the daemon read the right quorum from chain
+curl http://localhost:9100/consensus/info
+# {"consensus_enabled": true, "quorum_bps": 6666, "validator_id": "0x...", ...}
+
+# Confirm /identity serves a fresh signed EIP-712 payload (requires a working
+# Bittensor wallet — returns 503 if WALLET_NAME/HOTKEY_NAME aren't loaded)
+curl http://localhost:9100/identity
 ```
+
+If `/consensus/info` shows `quorum_bps: 0` or `quorum_bps` doesn't match `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)'` on chain, your `VALIDATOR_REGISTRY_8453` env points at a stale or wrong contract — check the [network reference](../operator/network-reference.md).
+
+### What the daemon does
+
+1. Reads `quorumBps` from `ValidatorRegistry` at startup, refreshes every 60 s.
+2. Starts the BlockLoop (processes new orders every ~12 s).
+3. Listens on port 9100 for proposal-signing and `/identity` endpoints.
+4. Emits weights to the metagraph every **1200 s / 20 min** (matches Bittensor's `weights_set_rate_limit` of 100 blocks — the older 60 s default spam-rejects ~95% of attempts).
+
+### What this stack does NOT include
+
+- **Relayer**: the transaction submitter is a singleton service operated by the subnet team. Your validator signs proposals; the leader's submission path uses our relayer.
+- **API service (champion consensus)**: covered in a future optional compose. Until then, our internal nodes carry champion-certification quorum.
 
 ### Running without Docker
 
-If you prefer to run Anvil directly (e.g. under systemd), the equivalent commands are:
+If you prefer Anvil under systemd plus the daemon as a native process, the equivalent invocations are:
 
 ```bash
 anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" --block-time 2
 anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" --chain-id 8453 --no-storage-caching --block-time 2
 anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" --chain-id 964 --no-storage-caching --block-time 2
-```
 
-Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloat issue described in the [maintenance cron](#required-maintenance-cron) section applies either way — adjust the cron to bounce your systemd units instead of `docker compose up`.
-
-## Step 7: Run the Validator Daemon
-
-The validator daemon handles order-consensus signing and weight emission.
-
-```bash
 python -m minotaur_subnet.validator.main \
   --port 9100 \
   --netuid 112 \
@@ -402,90 +337,11 @@ python -m minotaur_subnet.validator.main \
   --hotkey-name "$HOTKEY_NAME" \
   --subtensor-url "$SUBTENSOR_URL" \
   --validator-key "$VALIDATOR_PRIVATE_KEY" \
-  --validator-registry-address "$VALIDATOR_REGISTRY_ADDRESS" \
   --tick-interval 12.0 \
   --epoch-seconds 1200
 ```
 
-If `VALIDATOR_REGISTRY_ADDRESS` (or a chain-keyed `VALIDATOR_REGISTRY_<CHAIN_ID>`) is exported in Step 5, the `--validator-registry-address` flag can be omitted — the daemon picks it up from the environment.
-
-The daemon will:
-
-1. Load app definitions from the store.
-2. Read `quorumBps` from `ValidatorRegistry` at startup, refresh every epoch.
-3. Start the BlockLoop (processing orders every ~12 seconds).
-4. Listen on port 9100 for validator/consensus and execution endpoints.
-5. Emit weights once per epoch — set to **1200 seconds / 20 min** above to match Bittensor's `weights_set_rate_limit` of 100 blocks (~20 min). The daemon's older 60-second default will spam-reject ~95% of attempts on subnet 112; always pass `--epoch-seconds 1200` explicitly.
-
-If the daemon exits at startup with `"Consensus enabled but no ValidatorRegistry address provided"`, the env var or flag is missing — set it and restart.
-
-### Verify it is running
-
-```bash
-# Health check
-curl http://localhost:9100/health
-
-# Block loop status
-curl http://localhost:9100/blockloop/status
-
-# Leader info
-curl http://localhost:9100/leader
-
-# Consensus info — confirms quorum_bps was loaded from chain
-curl http://localhost:9100/consensus/info
-
-# Current weight/champion view
-curl http://localhost:9100/weights
-```
-
-`/consensus/info` should report a non-zero `quorum_bps` matching the value on the registry (`cast call $VALIDATOR_REGISTRY_ADDRESS 'quorumBps()(uint256)'`). If the daemon's value drifts from the on-chain value, the local refresh loop failed — check logs.
-
-## Step 8: Run the API Service
-
-The API service is the user gateway and the champion-consensus coordinator. It must be running on every validator (not only the leader) so champion certification can collect signatures across the cluster.
-
-```bash
-python -m minotaur_subnet.api.server \
-  --port 8080 \
-  --store-path /var/lib/minotaur/store.json
-```
-
-Required env (in addition to Step 5):
-
-- `VALIDATOR_PRIVATE_KEY` — same key used by the daemon
-- `VALIDATOR_PEERS` — peer **API** endpoints for champion consensus (port 8080 targets). Format: `0xPeer1@http://peer1-api:8080,0xPeer2@http://peer2-api:8080`. Champion-consensus peer discovery is not yet automated (ChampionRegistry is out of scope of the discovery refactor); for order-consensus, peers are discovered automatically — see [Peer discovery](#peer-discovery) below.
-- `CHAMPION_QUORUM_BPS` — quorum for champion certification (currently env-driven; mirror what other operators are using, default `6666`)
-- `CONSENSUS_MODE=real` — production setting; `local` is for the single-box testnet only
-
-Verify:
-
-```bash
-curl http://localhost:8080/health
-```
-
-## Step 9: Run the Relayer
-
-The relayer submits co-signed transactions on chain. It only fires when this validator is leader, but must stay running so promotion is instant.
-
-```bash
-python -m minotaur_subnet.relayer.main \
-  --port 8091
-```
-
-Required env:
-
-- `RELAYER_PRIVATE_KEY` — EOA that pays gas. **This key holds real funds** — keep it in HSM / KMS or a hardware-isolated process; do not commit to disk in plaintext.
-- `CHAIN_ID` — primary chain (matches what your `VALIDATOR_REGISTRY_ADDRESS` is on)
-- All the per-chain RPC URLs from Step 5
-
-Verify:
-
-```bash
-curl http://localhost:8091/health
-curl http://localhost:8091/gas-balances
-```
-
-`/gas-balances` should show non-zero balances for each chain you operate on. Fund the relayer wallet on every chain — typical bootstrap is 0.05 ETH on Ethereum, 0.01 ETH on Base, a few TAO on BT EVM.
+Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloat issue described in the [maintenance cron](#required-maintenance-cron) section applies either way — adjust the cron to bounce your systemd units instead of `docker compose rm -fsv`.
 
 ## Peer discovery
 
@@ -528,9 +384,9 @@ curl http://localhost:9100/consensus/info
 
 ## Production process supervision
 
-Run the three services under a process supervisor so they restart on crash. Two common patterns:
+The canonical compose in `platform/validator/` already sets `restart: unless-stopped` on every container — Docker handles crash recovery and reboot survival. No additional process supervisor needed for the Docker path.
 
-**systemd** — one unit per service:
+If you went with "Running without Docker" instead, wrap the daemon in systemd:
 
 ```ini
 # /etc/systemd/system/minotaur-validator.service
@@ -540,7 +396,7 @@ After=network-online.target docker.service
 
 [Service]
 EnvironmentFile=/etc/minotaur/env
-ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main --port 9100
+ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200
 Restart=on-failure
 RestartSec=5
 User=minotaur
@@ -549,9 +405,7 @@ User=minotaur
 WantedBy=multi-user.target
 ```
 
-Repeat for `minotaur-api.service` (port 8080) and `minotaur-relayer.service` (port 8091). Put shared env (RPC URLs, registry addresses, validator key) in `/etc/minotaur/env` with mode 0600. Enable with `systemctl enable --now minotaur-{validator,api,relayer}`.
-
-**docker compose** — extend the file you wrote in Step 6 with validator/api/relayer services. The local-testnet `platform/local_testnet/docker-compose.yml` is the reference.
+Put shared env (RPC URLs, registry addresses, validator key) in `/etc/minotaur/env` with mode 0600. Enable with `systemctl enable --now minotaur-validator`. Repeat the pattern for each Anvil systemd unit.
 
 ## Local Testnet (Development)
 
