@@ -31,24 +31,27 @@ Miners pointing the agent loop at production use `--validator-url <PRODUCTION_AP
 
 ## Mainnet contract addresses
 
-> The ValidatorRegistry and DexAggregatorApp addresses listed here are valid for the **pre-quorum-refactor** stack. When the new `ValidatorRegistry` (which holds the canonical `quorumBps`) and the matching new `DexAggregatorApp` are deployed and switched over, these addresses change. Check the project announcement channel before relying on a specific address.
+> Addresses below reflect the **post-quorum-refactor** stack landed on 2026-05-21. `ValidatorRegistry` now holds the canonical `quorumBps` (single source of truth — `AppIntentBase` reads it at verification time, off-chain code reads it through `ProtocolConfig.from_validator_registry`). `AppRegistry` (introduced 2026-05-19) gates which `AppIntentBase`-derived contracts are accepted by validators and the relayer. All `AppIntentBase`-derived contracts were redeployed at the same time because their constructor signature changed. Verify any address against on-chain state before relying on it — `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)'` should return a non-zero value on a current contract.
 
 ### Base (chain `8453`)
 
 | Contract | Address | Valid since |
 |---|---|---|
-| `ValidatorRegistry` (pre-refactor) | `0xD3c8eaf62ff29fe459bfBF523545b288600b4777` | 2026-04 |
-| `DexAggregatorApp` | `0x27e789F6AFC7c77f2Cb094d868e7AD850ff4D45a` | 2026-04 |
-
-Once the ValidatorRegistry redeploy lands, this page will list both the old and new addresses with a transition window.
+| `ValidatorRegistry` | `0x88a08d1105393EACE9B6f5ff678DbE508B8639aC` | 2026-05-21 |
+| `AppRegistry` | `0x0B5fE44e90515571761D86C28c4855F325EDE098` | 2026-05-19 (state preserved across the 2026-05-21 refactor) |
+| `DexAggregatorApp` | `0x0AeA6Ab70B384ADC6493d40e927ce53A7cefE035` | 2026-05-21 |
 
 ### BT EVM (chain `964`)
 
 | Contract | Address | Valid since |
 |---|---|---|
-| `ChampionRegistry` | `0x553F8651C7Ee73D11fD7b3b80f3ec96DBD28a16c` | 2026-04 |
+| `ValidatorRegistry` | `0x0B5fE44e90515571761D86C28c4855F325EDE098` | 2026-05-21 |
+| `ChampionRegistry` | `0x33105027d03e76bf1F3679C0CB9b2688da383fb3` | 2026-05-21 |
+| `AppRegistry` | `0x80758D3Bf11715c82dB9964C634d5Fd8a0C58aBF` | 2026-05-19 |
 
-ChampionRegistry holds its own independent `quorumBps` for champion-certification consensus. The validator-side env var `CHAMPION_QUORUM_BPS` should mirror whatever `cast call $CHAMPION_REGISTRY 'quorumBps()(uint256)'` returns.
+> The string `0x0B5fE44e9...` appears on both chains (Base `AppRegistry`, BT EVM `ValidatorRegistry`). They are independent contracts on independent chains — the deployer's nonce happened to align across the two deploys. Different code at each address; the collision is purely cosmetic.
+
+ChampionRegistry holds its own independent `quorumBps` for champion-certification consensus. The validator-side env var `CHAMPION_QUORUM_BPS` should mirror whatever `cast call $CHAMPION_REGISTRY 'quorumBps()(uint256)' --rpc-url https://lite.chain.opentensor.ai` returns (currently `6666`).
 
 ### Ethereum mainnet (chain `1`)
 
@@ -59,10 +62,11 @@ The platform supports Ethereum mainnet execution, but the canonical DexAggregato
 | Metric | Current target |
 |---|---|
 | Active validator count | 3 (post-refactor migration may grow this) |
-| Quorum threshold (`quorumBps` on `ValidatorRegistry`) | `6666` (2-of-3 BFT). Read live with `make get-quorum-base`. |
+| Quorum threshold (`quorumBps` on `ValidatorRegistry`) | `6666` (2-of-3 BFT). Read live with `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $BASE_RPC`. |
 | Champion quorum (`quorumBps` on `ChampionRegistry`) | `6666` — mirror the on-chain value with `CHAMPION_QUORUM_BPS` |
 | Tick interval | `12s` (matches Ethereum block time) |
-| Epoch duration | `60s` (weight emission cadence, `ProtocolConfig` refresh cadence) |
+| Weight emission cadence | `1200s` (20 min) — matches Bittensor's `weights_set_rate_limit` of 100 blocks. Pass `--epoch-seconds 1200` to the validator daemon. The 60s default spam-rejects ~95% of attempts on subnet 112. |
+| `ProtocolConfig` refresh cadence | `60s` — how often the daemon re-reads `quorumBps` and the validator set from `ValidatorRegistry`. Independent of weight emission. |
 | Stake requirement for emissions | (TBD — set by Bittensor subnet rules; check current `metagraph` output) |
 
 ## Onboarding handshake
