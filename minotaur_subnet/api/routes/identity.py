@@ -25,18 +25,25 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter(tags=["identity"])
 
 
-# Module-level handles, populated by server.py at startup.
+# Module-level handles, populated by startup.py via setters.
 # Match the pattern used by api/routes/apps.py (_js_engine, _simulator).
-_consensus: Any = None
+_signing_key: str = ""
 _metagraph_sync: Any = None
 
 
-def set_consensus(consensus: Any) -> None:
-    global _consensus
-    _consensus = consensus
+def set_signing_key(private_key: str) -> None:
+    """Wire the EVM private key used to sign identity attestations.
+
+    Same key that signs order/champion consensus approvals (it's the
+    operator's VALIDATOR_PRIVATE_KEY). Empty string disables /identity
+    (returns 503).
+    """
+    global _signing_key
+    _signing_key = (private_key or "").strip()
 
 
 def set_metagraph_sync(metagraph_sync: Any) -> None:
+    """Wire the MetagraphSync instance so /identity can read my_hotkey."""
     global _metagraph_sync
     _metagraph_sync = metagraph_sync
 
@@ -51,7 +58,7 @@ def get_identity() -> dict[str, Any]:
     Each request generates a new signature so the payload is never stale —
     the freshness check on the verifier side compares against `expiry`.
     """
-    if _consensus is None:
+    if not _signing_key:
         raise HTTPException(
             status_code=503,
             detail="Consensus not enabled — no signing key",
@@ -71,7 +78,7 @@ def get_identity() -> dict[str, Any]:
     from minotaur_subnet.consensus.identity import sign_identity
 
     identity = sign_identity(
-        _consensus.private_key,
+        _signing_key,
         _metagraph_sync.my_hotkey,
         axon_url,
     )
