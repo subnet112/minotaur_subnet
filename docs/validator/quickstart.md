@@ -423,6 +423,12 @@ What this gives operators:
 | `SUBTENSOR_URL` | Required so the daemon can read the metagraph for axon discovery (already required in Step 5). |
 | `VALIDATOR_REGISTRY_ADDRESS` | Required so the daemon can read the authorized EVM set (already required in Step 5). |
 
+### Internal-only envs — DO NOT set as a third party
+
+`ORDER_CONSENSUS_PEERS` and `CHAMPION_CONSENSUS_PEERS` are pinned-peer escape hatches used by the subnet team's own production deployment, where metagraph axon URLs aren't published yet for operational-security reasons. Both bypass automatic peer discovery and pin to a fixed peer list.
+
+**Third-party validators should always leave these unset.** Setting them locks you to a stale set that won't include the rest of the network — your validator becomes invisible to other peers and never reaches quorum. The discovery path (metagraph axon list + on-chain `ValidatorRegistry.getValidators()` + each peer's signed `/identity` payload) is the supported flow and works out of the box once you complete the [on-chain registration handshake](#on-chain-registration).
+
 ### Optional override
 
 If you need to pin the peer list (local testnet, isolated cluster, debugging a discovery failure), set `VALIDATOR_PEERS` env or pass `--validator-peers` on the daemon CLI. The pinned list overrides discovery entirely. Production deployments should leave it unset.
