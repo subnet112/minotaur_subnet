@@ -1125,15 +1125,18 @@ async def initialize(ctx: ServerContext) -> dict:
                         # CHAMPION_CONSENSUS_CHAIN_ID (BT EVM = 964 in production).
                         # The domain separator must use the chain where
                         # ChampionRegistry is deployed, not the main operational
-                        # chain (Base = 8453).
+                        # chain (Base = 8453). Falls back to CHAIN_ID (the
+                        # operational chain) when CHAMPION_CONSENSUS_CHAIN_ID is
+                        # unset — that keeps the local testnet (CHAIN_ID=31337)
+                        # working without a separate champion-chain env.
                         champion_chain_id = int(
                             os.environ.get(
                                 "CHAMPION_CONSENSUS_CHAIN_ID",
-                                "964",
-                            ).strip() or "964",
+                                os.environ.get("CHAIN_ID", "31337"),
+                            ).strip() or "31337",
                         )
                     except ValueError:
-                        champion_chain_id = 964
+                        champion_chain_id = 31337
                     try:
                         champion_consensus_timeout = float(
                             os.environ.get(
@@ -1151,15 +1154,24 @@ async def initialize(ctx: ServerContext) -> dict:
                     validator_id = address_from_key(validator_key)
 
                     # Build the champion-consensus ProtocolConfig.
-                    # Validator set is read from the BT EVM ValidatorRegistry
-                    # (the same one ChampionRegistry delegates to on-chain via
-                    # constructor wiring — see ChampionRegistry.sol).
-                    # Quorum threshold is read from ChampionRegistry itself,
-                    # which keeps an independent quorumBps from
-                    # ValidatorRegistry's.
-                    champion_validator_registry = os.environ.get(
-                        f"VALIDATOR_REGISTRY_{champion_chain_id}", "",
-                    ).strip()
+                    #
+                    # Validator set is read from the BT EVM ValidatorRegistry —
+                    # the same one ChampionRegistry delegates to on-chain via
+                    # constructor wiring (see ChampionRegistry.sol). On the
+                    # local testnet (chain_id 31337), the same VALIDATOR_REGISTRY
+                    # env is reused.
+                    #
+                    # Quorum threshold is read from ChampionRegistry itself
+                    # when configured (production), since it keeps an
+                    # independent quorumBps from ValidatorRegistry's. On the
+                    # local testnet, where ChampionRegistry isn't deployed,
+                    # quorum falls back to ValidatorRegistry's quorumBps —
+                    # ProtocolConfig handles that automatically when
+                    # quorum_address is empty.
+                    champion_validator_registry = (
+                        os.environ.get(f"VALIDATOR_REGISTRY_{champion_chain_id}", "").strip()
+                        or os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "").strip()
+                    )
                     champion_registry_address = (
                         os.environ.get(f"CHAMPION_REGISTRY_{champion_chain_id}", "").strip()
                         or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
@@ -1167,13 +1179,17 @@ async def initialize(ctx: ServerContext) -> dict:
                     if not champion_validator_registry:
                         raise RuntimeError(
                             f"Champion consensus enabled but no "
-                            f"VALIDATOR_REGISTRY_{champion_chain_id} configured",
+                            f"VALIDATOR_REGISTRY_{champion_chain_id} (or "
+                            f"VALIDATOR_REGISTRY_ADDRESS) configured",
                         )
-                    if not champion_registry_address:
-                        raise RuntimeError(
-                            f"Champion consensus enabled but no "
-                            f"CHAMPION_REGISTRY_{champion_chain_id} configured",
-                        )
+                    # contract_address for the EIP-712 domain. Falls back to
+                    # zero address when ChampionRegistry isn't deployed (local
+                    # testnet) — sigs are still well-formed for off-chain
+                    # consensus testing; on-chain certify() would fail but
+                    # local testnet doesn't call it.
+                    champion_contract_address = (
+                        champion_registry_address or ("0x" + "00" * 20)
+                    )
                     champion_rpc_url = (
                         os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
                         or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
@@ -1182,6 +1198,9 @@ async def initialize(ctx: ServerContext) -> dict:
                     champion_protocol_config = ProtocolConfig.from_validator_registry(
                         rpc_url=champion_rpc_url,
                         registry_address=champion_validator_registry,
+                        # When ChampionRegistry isn't configured, fall back to
+                        # using ValidatorRegistry's quorumBps (quorum_address
+                        # empty → ProtocolConfig uses registry_address for both).
                         quorum_address=champion_registry_address,
                         my_evm_address=validator_id,
                         # metagraph_provider wired below, after
@@ -1195,7 +1214,7 @@ async def initialize(ctx: ServerContext) -> dict:
                         protocol_config=champion_protocol_config,
                         timeout=champion_consensus_timeout,
                         chain_id=champion_chain_id,
-                        contract_address=champion_registry_address,
+                        contract_address=champion_contract_address,
                     )
                     champion_peer_network = ValidatorPeerNetwork(
                         validator_id=validator_id,
@@ -1224,11 +1243,14 @@ async def initialize(ctx: ServerContext) -> dict:
 
                     logger.info(
                         "Champion consensus enabled (validator=%s, quorum=%d bps "
-                        "from ChampionRegistry %s, validator-set from "
-                        "VR %s on chain %d)",
+                        "from %s, validator-set from VR %s on chain %d)",
                         validator_id[:10],
                         champion_protocol_config.quorum_bps,
-                        champion_registry_address[:20],
+                        (
+                            "ChampionRegistry " + champion_registry_address[:20]
+                            if champion_registry_address
+                            else "ValidatorRegistry (no separate ChampionRegistry)"
+                        ),
                         champion_validator_registry[:20],
                         champion_chain_id,
                     )
