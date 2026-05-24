@@ -351,6 +351,10 @@ services:
       WATCHTOWER_INCLUDE_RESTARTING: "true"
       WATCHTOWER_LABEL_ENABLE: "true"        # only update labelled containers
       WATCHTOWER_NOTIFICATIONS: ""           # silent — host-side monitoring should watch instead
+      # Pin the Docker client API version. Watchtower 1.7.1's bundled SDK
+      # defaults to API v1.25 which Docker daemon ≥25 rejects ("client
+      # version 1.25 is too old"). Forcing a newer client version fixes it.
+      DOCKER_API_VERSION: "1.45"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [minotaur]
