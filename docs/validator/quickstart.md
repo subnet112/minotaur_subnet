@@ -19,19 +19,18 @@ Subnet 112 currently operates one App (DexAggregator) across two real chains (Et
 | Storage | 100 GB SSD/NVMe |
 | GPU | none |
 | Network out | ~100 GB/month |
-| Public IPv4 | yes (consensus + leader API + relayer must be reachable) |
+| Public IPv4 | yes (port 9100/tcp must be reachable by the current leader for proposal broadcast) |
 
-What runs on this box (always, whether you are currently leader or follower):
+What runs on this box:
 
-- Validator service (`python -m minotaur_subnet.validator.main`) -- order-consensus signing.
-- API service (`python -m minotaur_subnet.api.server`) -- user gateway, champion-consensus participation, benchmark coordinator. Only serves real user traffic when you are leader, but stays warm so promotion is instant.
-- Relayer (`python -m minotaur_subnet.relayer.main`) -- transaction submission. Only signs on-chain when you are leader.
-- Anvil forks for each supported chain (currently Ethereum mainnet, Base, BT EVM). All running warm so the leader role can simulate plans immediately. Cold-starting an Anvil fork costs 30+ seconds, which would drop the first minute of orders after every stake-change-driven leader rotation.
-- Docker benchmark sandbox -- spins up containers from miner submissions for scoring (active mainly during champion benchmarks).
-- JS scoring engine (Node.js subprocess) -- deterministic, on-demand.
+- Validator daemon (`python -m minotaur_subnet.validator.main`) -- order-consensus signing + weight emission to the metagraph.
+- Anvil forks for each supported chain (currently Ethereum mainnet, Base, BT EVM). Used to independently re-simulate execution plans the leader proposes. Cold-starting an Anvil fork costs 30+ seconds, so they run warm.
+- JS scoring engine (Node.js subprocess inside the validator container) -- deterministic, on-demand.
 - Subtensor connection -- WebSocket to `wss://entrypoint-finney.opentensor.ai:443` or your own node.
 
-Steady-state at this spec uses about 5-6 GB RAM and well under 1 vCPU. Active leader load (handling orders + running a benchmark) peaks around 9-10 GB RAM and 3-4 vCPU. 8 GB / 4 vCPU leaves a healthy margin.
+The transaction submitter (relayer) is a singleton operated by the subnet team — third-party validators don't run it. Champion-consensus participation (the API service) is an optional add-on covered separately when ready.
+
+Steady-state at this spec uses about 4-5 GB RAM and well under 1 vCPU. Re-simulation bursts (when the leader proposes a new order) peak around 6-7 GB RAM and 2-3 vCPU. 8 GB / 4 vCPU leaves a healthy margin.
 
 ### Growth path
 
@@ -94,11 +93,9 @@ No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, de
 
 | Port | Service | Notes |
 |------|---------|-------|
-| `9100/tcp` | Validator HTTP API -- consensus signing | Reachable by peer validators and the current leader. |
-| `8080/tcp` | API service -- user gateway + champion-consensus | Reachable by users and other validators. Only handles real user traffic while you are leader, but the port stays open for champion-consensus participation regardless. |
-| `8091/tcp` | Relayer | Only active during leader role, but keep the port open so it works immediately on promotion. |
+| `9100/tcp` | Validator HTTP API -- consensus signing + `/identity` | Must be reachable by the current leader to receive proposals, and by other peers for peer discovery. |
 
-If you are behind NAT, forward all three to the validator host. On a cloud VPS with a public IP, open all three in the firewall.
+If you are behind NAT, forward 9100 to the validator host. On a cloud VPS with a public IP, open 9100 in the firewall.
 
 ### Outbound (egress, no special configuration)
 
