@@ -95,17 +95,20 @@ Git/source solver submissions are currently served by the API server (`/v1/submi
 
 There are three ways to run a validator:
 
-1. **Standalone validator** -- Direct Python process, connects to external Anvil and Subtensor:
+1. **Canonical validator stack (recommended)** -- Docker Compose with the daemon and its three Anvil forks pre-configured. Start here:
    ```bash
-   python -m minotaur_subnet.validator.main --port 9100
+   cd platform/validator
+   cp .env.example .env  # fill in YOUR_* placeholders
+   docker compose up -d
+   ```
+   This is what a third-party validator runs in production. See the [quickstart](./quickstart.md) for the full end-to-end setup including on-chain `ValidatorRegistry` onboarding.
+
+2. **Standalone validator daemon** -- Direct Python process, you bring your own Anvil + Subtensor connections. Useful for advanced operators who want systemd supervision instead of Docker:
+   ```bash
+   python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200
    ```
 
-2. **API server** (also runs BlockLoop) -- For development and the REST API:
-   ```bash
-   python -m minotaur_subnet.api.server --port 8080
-   ```
-
-3. **Local testnet** -- Full Docker Compose stack including subtensor, Anvil forks, API, validator, miner, relayer, and frontend:
+3. **Local testnet (development only)** -- Full Docker Compose stack including subtensor, Anvil forks, API, validator, miner, relayer, and frontend. For local development of the protocol itself, not for connecting to mainnet:
    ```bash
    make testnet-up
    ```
