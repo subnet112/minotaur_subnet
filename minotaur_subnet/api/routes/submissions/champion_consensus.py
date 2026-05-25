@@ -503,7 +503,8 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                 status_code=503,
                 detail=(
                     "Champion consensus not configured; supply approvals manually "
-                    "or configure VALIDATOR_PRIVATE_KEY/VALIDATOR_PEERS"
+                    "or configure VALIDATOR_PRIVATE_KEY plus VALIDATOR_REGISTRY_<chain> "
+                    "and CHAMPION_REGISTRY_<chain> so peer discovery can run"
                 ),
             )
         if body.quorum_required not in (None, 0, consensus_manager.quorum_required):

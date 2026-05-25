@@ -1,28 +1,49 @@
 # Canonical Minotaur Subnet 112 validator stack — follower role.
 #
-# Four containers: three Anvil forks + the validator daemon.
-# Sign order-consensus proposals from the current leader, emit weights
-# to the metagraph at the calibrated network cadence.
+# Six core containers + one optional auto-update side-container:
+#   - 3× Anvil forks (Ethereum, Base, BT EVM) for proposal re-simulation
+#   - 1× validator daemon (order-consensus signer + weight emitter)
+#   - 1× api service (champion-consensus signer)
+#   - 1× docker-socket-proxy (limits the api service's Docker access to
+#     just spawning solver containers — used during reactive benchmarking
+#     of champion candidates, rejected if it can't validate them)
+#   - 1× watchtower (OPT-IN via `--profile autoupdate`) — polls GHCR for
+#     new :stable image and recreates validator + api when the tag moves.
+#     Subnet team controls promotion cadence; third-party validators
+#     don't get surprise upgrades from every commit to main.
 #
 # Quickstart:
 #   cp .env.example .env
 #   # fill in YOUR_* placeholders in .env
-#   docker compose up -d
-#   docker compose logs -f validator
+#   docker compose --profile autoupdate up -d   # with auto-update
+#   # ── or ──
+#   docker compose up -d                         # without auto-update (manual pulls)
+#
+#   docker compose logs -f validator api
 #
 # What this stack does NOT do:
-#   - Run the relayer (transaction submitter is operated by the subnet team).
-#   - Participate in champion-consensus signing (separate optional service).
-#   - Propose orders (only the highest-stake validator's leader-api does that).
+#   - Run the relayer (transaction submitter is operated by the subnet
+#     team — third-party validators never deal with gas keys).
+#   - Propose orders or champion certifications (only the highest-stake
+#     validator's leader-api does that). Followers receive proposals
+#     from the leader, verify them, and sign approvals.
 #
-# See docs/validator/quickstart.md for the full setup, on-chain registration,
-# and operational notes including the every-6h anvil-recycle cron.
+# See docs/validator/quickstart.md for the full setup, on-chain
+# registration, and operational notes including the every-6h
+# anvil-recycle cron.
 
 services:
   # ── Anvil forks ──────────────────────────────────────────────────────
   # One per supported chain. Anvil's "fork" mode replays a real chain
   # locally so the validator can re-simulate execution plans against the
   # same state the leader saw, without touching mainnet.
+  #
+  # Multi-homed onto two networks:
+  #   - minotaur:           the main bridge; validator + api reach forks here
+  #   - benchmark-sandbox:  the internal sealed network; solver containers
+  #                         spawned during reactive benchmarking reach forks
+  #                         here via static IP (since hostnames don't resolve
+  #                         across compose projects when api launches solvers)
   #
   # `tmpfs` on /root and /tmp keep Anvil's writable layer in RAM rather
   # than the container overlay. Reduces but does not eliminate disk
@@ -50,7 +71,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 60s
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.2
 
   anvil-base:
     image: ghcr.io/foundry-rs/foundry:latest
@@ -74,7 +98,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 60s
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.3
 
   anvil-btevm:
     image: ghcr.io/foundry-rs/foundry:latest
@@ -101,7 +128,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 90s
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.4
 
   # ── Validator daemon ─────────────────────────────────────────────────
   # Order-consensus follower role: receives proposals from the current
@@ -111,11 +141,14 @@ services:
   #
   # Image is pinned to `:latest` in this example; in production, pin to
   # a specific sha-tagged image (ghcr.io/subnet112/minotaur-validator:sha-<sha>)
-  # to avoid surprise upgrades.
+  # to avoid surprise upgrades. Watchtower auto-update lands in B.5.
 
   validator:
-    image: ghcr.io/subnet112/minotaur-validator:latest
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
     restart: unless-stopped
+    labels:
+      # Tell Watchtower to auto-update this container when :stable moves
+      com.centurylinklabs.watchtower.enable: "true"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "exec python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200"
@@ -138,8 +171,6 @@ services:
       NETUID: "${NETUID:-112}"
 
       # Public URL where this daemon serves /identity for peer discovery.
-      # Other validators verify the EIP-712 signed payload and cross-check
-      # against ValidatorRegistry + the metagraph.
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
 
       # EVM signing key (no funds, just identity)
@@ -181,7 +212,6 @@ services:
       SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
     volumes:
       # Bittensor wallet directory — read-only.
-      # btcli typically stores wallets at ~/.bittensor/wallets on the host.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
     networks: [minotaur]
     healthcheck:
@@ -190,6 +220,213 @@ services:
       timeout: 5s
       retries: 20
 
+  # ── API service (champion-consensus follower) ────────────────────────
+  # Signs champion certification proposals from the current leader.
+  # Re-benchmarks the candidate solver inside a sandboxed Docker container
+  # before signing (peer integrity check — leader can't push a bad champion
+  # through if peers re-bench and disagree).
+  #
+  # Same image as the validator daemon, different entrypoint. The
+  # docker-socket-proxy side-container limits this service's Docker
+  # access to just `containers/create + start + wait + logs + remove` —
+  # it cannot inspect or exec arbitrary containers on the host.
+
+  api:
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "exec python -m minotaur_subnet.api.server --port 8080"
+    ports:
+      # MUST be reachable from the current leader for champion-consensus
+      # proposals (POST /v1/submissions/champion-consensus/propose).
+      - "0.0.0.0:8080:8080"
+    depends_on:
+      anvil-eth:
+        condition: service_healthy
+      anvil-base:
+        condition: service_healthy
+      anvil-btevm:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    environment:
+      # Same Bittensor identity as the validator daemon — both processes
+      # use the same hotkey + EVM signing key.
+      WALLET_NAME: "${WALLET_NAME}"
+      HOTKEY_NAME: "${HOTKEY_NAME}"
+      SUBTENSOR_URL: "${SUBTENSOR_URL:-finney}"
+      NETUID: "${NETUID:-112}"
+      VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+
+      # Per-chain registry addresses
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964}"
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964}"
+      CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964}"
+
+      # Champion consensus reads validators from BT EVM ValidatorRegistry
+      # and quorum from ChampionRegistry (both on chain 964).
+      CHAMPION_CONSENSUS_CHAIN_ID: "964"
+
+      # Anvil RPCs (internal docker hostnames)
+      ANVIL_RPC_URL: http://anvil-base:8546
+      BASE_RPC_URL: http://anvil-base:8546
+      BASE_SIM_RPC_URL: http://anvil-base:8546
+      BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
+      BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+
+      # Upstream RPCs for refork-time state
+      ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BASE_UPSTREAM_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_UPSTREAM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+
+      CHAIN_ID: "8453"
+      CONSENSUS_MODE: "real"
+      CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
+
+      # Follower role — these are LEADER-ONLY responsibilities:
+      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # Leader manages round lifecycle
+      ENABLE_BENCHMARK_WORKER: "0"          # Proactive bench is leader-only
+      SUBMISSIONS_ACCEPTING: "0"            # Users send submissions to the leader
+
+      # Reactive benchmark (runs when a champion proposal arrives) DOES
+      # still happen on followers — that's the peer integrity check. The
+      # api spawns the solver container via the docker-socket-proxy.
+      ALLOW_CHAMPION_HOT_SWAP: "1"
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+
+      # Benchmark sandbox network — the api launches solver containers
+      # into this sealed network so they can't reach the internet but
+      # can hit the local anvils for price discovery.
+      BENCHMARK_DOCKER_NETWORK: "benchmark-sandbox"
+      BENCHMARK_ALLOWED_HOSTS: "172.30.0.2,172.30.0.3,172.30.0.4"
+      BENCHMARK_ANVIL_RPC_ETH: "http://172.30.0.2:8545"
+      BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
+      BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
+
+      # Admin gate (matches the prod ADMIN_API_KEY pattern landed in PR #6)
+      # — gates create_app / update_scoring / deploy_app endpoints.
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+    volumes:
+      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
+      - store-data:/data
+    networks: [minotaur]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ── Watchtower — auto-update validator + api on :stable promotion ─────
+  # Polls GHCR every hour for a new image SHA on the configured tag (default
+  # :stable). When the SHA moves, Watchtower pulls the new image, stops the
+  # affected containers, and recreates them with the new image. The subnet
+  # team controls when :stable moves via the promote-stable.yml workflow
+  # (manually triggered after a release has soaked on our prod), so
+  # third-party validators don't get surprise upgrades from every commit
+  # to main.
+  #
+  # Trust note: Watchtower needs full Docker socket access to stop+recreate
+  # containers. This is the second container in this stack with that access
+  # (docker-socket-proxy is the first, but it proxies a *filtered* subset
+  # — Watchtower needs the unrestricted socket). Containrrr's Watchtower
+  # is a widely-deployed maintenance image; if you're uncomfortable with the
+  # trust model, set MINOTAUR_DISABLE_WATCHTOWER=1 in your .env (the
+  # ``profiles: [autoupdate]`` directive below makes this service opt-out)
+  # and run `docker compose pull && docker compose up -d` manually on the
+  # cadence we publish.
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    restart: unless-stopped
+    profiles: [autoupdate]
+    environment:
+      WATCHTOWER_POLL_INTERVAL: "3600"      # 1 hour
+      WATCHTOWER_CLEANUP: "true"             # remove old image after upgrade
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"        # only update labelled containers
+      WATCHTOWER_NOTIFICATIONS: ""           # silent — host-side monitoring should watch instead
+      # Pin the Docker client API version. Watchtower 1.7.1's bundled SDK
+      # defaults to API v1.25 which Docker daemon ≥25 rejects ("client
+      # version 1.25 is too old"). Forcing a newer client version fixes it.
+      DOCKER_API_VERSION: "1.45"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [minotaur]
+
+  # ── docker-socket-proxy — limit api's Docker access ──────────────────
+  # Mounts /var/run/docker.sock read-only and exposes a filtered subset
+  # of the Docker API on tcp://docker-socket-proxy:2375. The api reaches
+  # it via the DOCKER_HOST env above. Without this proxy, the api would
+  # need full read-write access to the host's Docker socket, which is
+  # effective root on the host.
+  #
+  # Allowed: containers (read+create+start+wait+logs+rm), networks (for
+  # attaching solver containers to benchmark-sandbox), images (for pulling
+  # solver images). NOT allowed: exec, host control, build, services,
+  # swarm, anything that would let a compromised api take over the host.
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: warning
+      # Read endpoints (HTTP GET)
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VERSION: 1
+      INFO: 1
+      # Write endpoints (HTTP POST/DELETE) — required to spawn benchmark
+      # containers
+      POST: 1
+      # Explicitly deny everything else
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      GRPC: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [minotaur]
+    # Not exposed to host — only the api service can reach it via the
+    # internal docker network.
+
+volumes:
+  store-data:
+
 networks:
+  # Main bridge — validator, api, anvils, docker-socket-proxy.
   minotaur:
     driver: bridge
+
+  # Sealed network for benchmark containers spawned by the api during
+  # reactive champion verification. `internal: true` removes the Docker-
+  # installed MASQUERADE rule, so containers attached only to this
+  # network cannot egress to the internet, the host, or other Docker
+  # networks. The three anvils are multi-homed onto this network with
+  # static IPs (.2, .3, .4) so solvers can still reach them for price
+  # discovery, but nothing else.
+  benchmark-sandbox:
+    name: benchmark-sandbox
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

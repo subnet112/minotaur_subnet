@@ -278,7 +278,6 @@ services:
       # ChampionRegistry retains its own independent quorum knob; mirror the
       # on-chain ChampionRegistry.quorumBps() value here.
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_0:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
-      VALIDATOR_PEERS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8@http://api-peer-1:8080,0x90F79bf6EB2c4f870365E785982E1f101E93b906@http://api-peer-2:8080"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
@@ -357,7 +356,6 @@ services:
       SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS: "${SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS:-1}"
       CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_1:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
-      VALIDATOR_PEERS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC@http://api:8080,0x90F79bf6EB2c4f870365E785982E1f101E93b906@http://api-peer-2:8080"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
@@ -432,7 +430,6 @@ services:
       SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS: "${SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS:-1}"
       CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_2:-0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6}"
-      VALIDATOR_PEERS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC@http://api:8080,0x70997970C51812dc3A010C7d01b50e0d17dc79C8@http://api-peer-1:8080"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
@@ -502,7 +499,6 @@ services:
       HOTKEY_NAME: default
       # Anvil account 2 — deterministic validator key
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_0:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
-      VALIDATOR_PEERS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8@http://validator-peer-1:9100,0x90F79bf6EB2c4f870365E785982E1f101E93b906@http://validator-peer-2:9100"
       CHAIN_ID: "31337"
       # Local testnet override: re-simulation off for faster iteration.
       # Production default is "1" (re-simulate) for security. Set to "0" here
@@ -545,7 +541,6 @@ services:
       HOTKEY_NAME: default
       # Anvil account 1 — deterministic follower validator key
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_1:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
-      VALIDATOR_PEERS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC@http://validator:9100,0x90F79bf6EB2c4f870365E785982E1f101E93b906@http://validator-peer-2:9100"
       CHAIN_ID: "31337"
       # Local testnet override: re-simulation off for faster iteration.
       # Production default is "1" (re-simulate) for security. Set to "0" here
@@ -588,7 +583,6 @@ services:
       # Anvil account 3 — deterministic follower validator key
       BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_2:-0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6}"
-      VALIDATOR_PEERS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC@http://validator:9100,0x70997970C51812dc3A010C7d01b50e0d17dc79C8@http://validator-peer-1:9100"
       CHAIN_ID: "31337"
       # Local testnet override: re-simulation off for faster iteration.
       # Production default is "1" (re-simulate) for security. Set to "0" here

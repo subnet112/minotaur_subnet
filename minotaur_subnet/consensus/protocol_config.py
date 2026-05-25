@@ -90,6 +90,15 @@ class ProtocolConfig:
     metagraph_provider: MetagraphPeerProvider | None = None
     probe_timeout_seconds: float = 3.0
 
+    # ── Quorum source override (optional) ────────────────────────────────
+    # Champion-consensus reads its validator set from BT EVM ValidatorRegistry
+    # (same as order-consensus uses on Base) but its quorum threshold from
+    # ChampionRegistry, which keeps an independent ``quorumBps``. When set,
+    # ``_read_quorum_bps`` reads from this address instead of registry_address.
+    # When unset (the default), the same contract serves both reads — matches
+    # the order-consensus topology where ValidatorRegistry holds both.
+    quorum_address: str = ""
+
     @classmethod
     def from_validator_registry(
         cls,
@@ -99,6 +108,7 @@ class ProtocolConfig:
         *,
         my_evm_address: str = "",
         metagraph_provider: MetagraphPeerProvider | None = None,
+        quorum_address: str = "",
     ) -> "ProtocolConfig":
         """Read protocol parameters from the on-chain ValidatorRegistry once.
 
@@ -113,12 +123,13 @@ class ProtocolConfig:
         at startup is the right behaviour: a misconfigured registry address or
         unreachable RPC should be loud, not silently fall back to a default.
         """
+        quorum_source = quorum_address or registry_address
         override = _read_override()
         if override is not None:
             logger.warning(
                 "ProtocolConfig: using %s=%d (env override), skipping on-chain "
                 "read from registry %s",
-                _OVERRIDE_ENV, override, registry_address,
+                _OVERRIDE_ENV, override, quorum_source,
             )
             return cls(
                 quorum_bps=override,
@@ -127,13 +138,21 @@ class ProtocolConfig:
                 refresh_interval_seconds=refresh_interval_seconds,
                 my_evm_address=my_evm_address,
                 metagraph_provider=metagraph_provider,
+                quorum_address=quorum_address,
             )
 
-        value = _read_quorum_bps(rpc_url, registry_address)
-        logger.info(
-            "ProtocolConfig: loaded quorum_bps=%d from ValidatorRegistry %s",
-            value, registry_address,
-        )
+        value = _read_quorum_bps(rpc_url, quorum_source)
+        if quorum_address and quorum_address != registry_address:
+            logger.info(
+                "ProtocolConfig: loaded quorum_bps=%d from quorum source %s "
+                "(validator set from %s)",
+                value, quorum_source, registry_address,
+            )
+        else:
+            logger.info(
+                "ProtocolConfig: loaded quorum_bps=%d from ValidatorRegistry %s",
+                value, registry_address,
+            )
         return cls(
             quorum_bps=value,
             rpc_url=rpc_url,
@@ -141,6 +160,7 @@ class ProtocolConfig:
             refresh_interval_seconds=refresh_interval_seconds,
             my_evm_address=my_evm_address,
             metagraph_provider=metagraph_provider,
+            quorum_address=quorum_address,
         )
 
     async def refresh_loop(self) -> None:
@@ -183,13 +203,13 @@ class ProtocolConfig:
                     )
 
     async def _refresh_quorum(self) -> None:
-        new_value = _read_quorum_bps(self.rpc_url, self.registry_address)
+        quorum_source = self.quorum_address or self.registry_address
+        new_value = _read_quorum_bps(self.rpc_url, quorum_source)
         if new_value != self.quorum_bps:
             logger.warning(
-                "ProtocolConfig: quorum_bps changed %d -> %d on "
-                "ValidatorRegistry %s — consumers pick up the new value "
-                "on their next tick",
-                self.quorum_bps, new_value, self.registry_address,
+                "ProtocolConfig: quorum_bps changed %d -> %d on %s — "
+                "consumers pick up the new value on their next tick",
+                self.quorum_bps, new_value, quorum_source,
             )
             self.quorum_bps = new_value
 

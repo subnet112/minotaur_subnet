@@ -13,6 +13,7 @@ from eth_hash.auto import keccak
 
 from minotaur_subnet.harness.round_store import ChampionApproval, ChampionCertificate
 from .eip712 import build_domain_separator
+from .protocol_config import ProtocolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -73,29 +74,51 @@ class ChampionConsensusResult:
 
 
 class ChampionConsensusManager:
-    """Collect validator signatures for a champion certification tuple."""
+    """Collect validator signatures for a champion certification tuple.
+
+    The validator set and quorum threshold are sourced from a
+    ``ProtocolConfig`` instance that reads on-chain state (BT EVM
+    ``ValidatorRegistry.getValidators()`` for the set + the configured
+    quorum source — typically ``ChampionRegistry.quorumBps()`` since it
+    keeps an independent threshold). The manager reads through to the
+    config on every operation, so on-chain ``updateValidators`` and
+    ``setQuorumBps`` changes propagate without restart on the next
+    refresh tick.
+
+    Backwards-compat (tests, manual override): if ``validators`` is
+    passed at construction or ``quorum_bps`` is supplied without a
+    ``protocol_config``, those pinned values take precedence.
+    """
 
     def __init__(
         self,
         validator_id: str,
         private_key: str,
         *,
-        quorum_bps: int,
+        protocol_config: ProtocolConfig | None = None,
+        quorum_bps: int | None = None,
         validators: list[str] | None = None,
         timeout: float = 30.0,
         chain_id: int = 31337,
         contract_address: str = "0x" + "00" * 20,
         domain_separator: bytes | None = None,
     ) -> None:
-        # Note: champion quorum is sourced separately from order-consensus
-        # quorum — it lives on ChampionRegistry (BT EVM only), which is out
-        # of scope for the ProtocolConfig consolidation. Operators must keep
-        # this value in sync with the on-chain ChampionRegistry.quorumBps()
-        # until a future refactor unifies the two registries.
+        if protocol_config is None and quorum_bps is None:
+            raise ValueError(
+                "ChampionConsensusManager requires either protocol_config "
+                "(production) or quorum_bps (tests / manual override)",
+            )
         self.validator_id = validator_id
         self.private_key = private_key
-        self.quorum_bps = quorum_bps
-        self.validators = validators or [validator_id]
+        self.protocol_config = protocol_config
+        # When validators is explicitly passed, it pins the set (tests /
+        # local-testnet). When None, the validators property reads through to
+        # protocol_config.peers + self.validator_id — picking up newly
+        # discovered peers automatically on each refresh tick.
+        self._validators_override = validators
+        # When quorum_bps is explicitly passed, it pins (tests). Else the
+        # property reads through to protocol_config.quorum_bps.
+        self._quorum_bps_override = quorum_bps
         self.timeout = timeout
         self.chain_id = chain_id
         self.contract_address = contract_address
@@ -106,6 +129,25 @@ class ChampionConsensusManager:
             version="1",
         )
         self._pending: dict[str, _PendingChampionProposal] = {}
+
+    @property
+    def quorum_bps(self) -> int:
+        """Current champion-consensus quorum threshold in basis points."""
+        if self._quorum_bps_override is not None:
+            return self._quorum_bps_override
+        assert self.protocol_config is not None
+        return self.protocol_config.quorum_bps
+
+    @property
+    def validators(self) -> list[str]:
+        """Current trusted validator set."""
+        if self._validators_override is not None:
+            return self._validators_override
+        if self.protocol_config is None:
+            return [self.validator_id]
+        return [self.validator_id] + [
+            p.evm_address for p in self.protocol_config.peers
+        ]
 
     @property
     def quorum_required(self) -> int:
@@ -120,13 +162,18 @@ class ChampionConsensusManager:
         return "0x" + keccak("|".join(ordered).encode("utf-8")).hex()
 
     def set_validators(self, validators: list[str]) -> None:
-        """Replace the validator set used for subsequent rounds."""
+        """Pin the validator set (overrides the protocol_config view).
+
+        Used by tests and any caller that wants a fixed set. Production
+        code should leave the override unset and let the protocol_config
+        refresh loop drive the set.
+        """
         cleaned = [validator for validator in validators if validator]
         if not cleaned:
             cleaned = [self.validator_id]
         if cleaned != self.validators:
             self.clear_all_pending()
-        self.validators = cleaned
+        self._validators_override = cleaned
 
     async def propose(self, proposal: ChampionProposal) -> ChampionConsensusResult:
         """Start a new certification quorum attempt for a finalist."""

@@ -1,0 +1,77 @@
+name: Promote SHA to :stable
+
+# Manually triggered workflow to re-tag an existing GHCR image as :stable.
+# The third-party validator compose pins MINOTAUR_IMAGE_TAG=stable by
+# default, and (optionally) runs Watchtower against it — so moving :stable
+# is the upgrade trigger across every external validator running auto-update.
+#
+# Procedure:
+#   1. New commit lands on main → docker-publish.yml builds + pushes
+#      :latest + :sha-<short> (both immutable per-commit) to GHCR.
+#   2. The new image runs on our own prod for a soak period (suggested:
+#      at least one full champion-consensus cycle + one epoch boundary).
+#   3. When happy, run this workflow with the short SHA as input. It
+#      pulls :sha-<input>, re-tags as :stable, pushes back to GHCR.
+#   4. Validators with Watchtower auto-update pull on their next poll.
+#      Validators on manual updates `docker compose pull && up -d` when
+#      we announce the promotion.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Short SHA already tagged sha-<...> on GHCR (e.g. abc1234)"
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: subnet112/minotaur-validator
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify source tag exists
+        run: |
+          SHORT_SHA="${{ inputs.sha }}"
+          SRC="${REGISTRY}/${IMAGE_NAME}:sha-${SHORT_SHA}"
+          echo "Promoting $SRC → :stable"
+          docker manifest inspect "$SRC" > /dev/null
+
+      - name: Re-tag and push :stable (preserves multi-arch manifest)
+        run: |
+          SHORT_SHA="${{ inputs.sha }}"
+          SRC="${REGISTRY}/${IMAGE_NAME}:sha-${SHORT_SHA}"
+          DST="${REGISTRY}/${IMAGE_NAME}:stable"
+          # Use docker buildx imagetools so the multi-arch manifest is
+          # preserved (a `docker pull && tag && push` from a single-arch
+          # runner would silently strip the other arch's manifest).
+          docker buildx imagetools create \
+            --tag "$DST" \
+            "$SRC"
+          echo "Promoted $SRC → $DST"
+
+      - name: Summary
+        run: |
+          {
+            echo "## :stable now points at \`sha-${{ inputs.sha }}\`"
+            echo ""
+            echo "Validators with Watchtower auto-update will pull the new image on their next poll (default 1h cadence)."
+            echo ""
+            echo "Validators on manual update should run:"
+            echo '```bash'
+            echo "cd platform/validator"
+            echo "docker compose pull validator api"
+            echo "docker compose up -d --force-recreate validator api"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY

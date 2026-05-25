@@ -943,12 +943,14 @@ async def initialize(ctx: ServerContext) -> dict:
                     if leader_addr not in all_validator_addrs:
                         all_validator_addrs.insert(0, leader_addr)
 
+                    # ORDER_CONSENSUS_PEERS is a named manual override used by
+                    # tests + local-testnet to pin a specific peer set. In
+                    # production it stays unset and ProtocolConfig.refresh_loop
+                    # discovers peers from the metagraph + on-chain
+                    # ValidatorRegistry. (The older VALIDATOR_PEERS fallback
+                    # was removed during the registry-consolidation refactor.)
                     order_peers_env = os.environ.get("ORDER_CONSENSUS_PEERS", "")
                     order_peer_endpoints = parse_peers_env(order_peers_env)
-
-                    if not order_peer_endpoints:
-                        vp_env = os.environ.get("VALIDATOR_PEERS", "")
-                        order_peer_endpoints = parse_peers_env(vp_env)
 
                     for ep in order_peer_endpoints:
                         if ep.validator_id not in all_validator_addrs:
@@ -1118,23 +1120,16 @@ async def initialize(ctx: ServerContext) -> dict:
                         parse_peers_env,
                     )
                     from minotaur_subnet.consensus.eip712 import address_from_key
+                    from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 
-                    # Champion consensus is sourced from ChampionRegistry on
-                    # BT EVM, which keeps its own quorum knob — out of scope
-                    # for the ValidatorRegistry-backed ProtocolConfig refactor.
-                    # CHAMPION_QUORUM_BPS env should mirror the on-chain
-                    # ChampionRegistry.quorumBps() value until a future PR
-                    # consolidates the two registries.
                     try:
-                        champion_quorum_bps = int(
-                            os.environ.get("CHAMPION_QUORUM_BPS", "6666").strip() or "6666",
-                        )
-                    except ValueError:
-                        champion_quorum_bps = 6666
-                    try:
-                        # Prefer CHAMPION_CONSENSUS_CHAIN_ID (BT EVM = 964 in production).
-                        # The domain separator must use the chain where ChampionRegistry
-                        # is deployed, not the main operational chain (Base = 8453).
+                        # CHAMPION_CONSENSUS_CHAIN_ID (BT EVM = 964 in production).
+                        # The domain separator must use the chain where
+                        # ChampionRegistry is deployed, not the main operational
+                        # chain (Base = 8453). Falls back to CHAIN_ID (the
+                        # operational chain) when CHAMPION_CONSENSUS_CHAIN_ID is
+                        # unset — that keeps the local testnet (CHAIN_ID=31337)
+                        # working without a separate champion-chain env.
                         champion_chain_id = int(
                             os.environ.get(
                                 "CHAMPION_CONSENSUS_CHAIN_ID",
@@ -1153,34 +1148,111 @@ async def initialize(ctx: ServerContext) -> dict:
                         )
                     except ValueError:
                         champion_consensus_timeout = 30.0
-                    peers_env = os.environ.get("VALIDATOR_PEERS", "").strip()
-                    peer_endpoints = parse_peers_env(peers_env)
                     internal_round_api_key = os.environ.get(
                         "SOLVER_ROUND_INTERNAL_API_KEY",
                         "",
                     ).strip() or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
                     validator_id = address_from_key(validator_key)
-                    all_validators = [validator_id] + [
-                        peer.validator_id for peer in peer_endpoints
-                    ]
+
+                    # Build the champion-consensus ProtocolConfig.
+                    #
+                    # Validator set is read from the BT EVM ValidatorRegistry —
+                    # the same one ChampionRegistry delegates to on-chain via
+                    # constructor wiring (see ChampionRegistry.sol). On the
+                    # local testnet (chain_id 31337), the same VALIDATOR_REGISTRY
+                    # env is reused.
+                    #
+                    # Quorum threshold is read from ChampionRegistry itself
+                    # when configured (production), since it keeps an
+                    # independent quorumBps from ValidatorRegistry's. On the
+                    # local testnet, where ChampionRegistry isn't deployed,
+                    # quorum falls back to ValidatorRegistry's quorumBps —
+                    # ProtocolConfig handles that automatically when
+                    # quorum_address is empty.
+                    champion_validator_registry = (
+                        os.environ.get(f"VALIDATOR_REGISTRY_{champion_chain_id}", "").strip()
+                        or os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "").strip()
+                    )
+                    champion_registry_address = (
+                        os.environ.get(f"CHAMPION_REGISTRY_{champion_chain_id}", "").strip()
+                        or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
+                    )
+                    if not champion_validator_registry:
+                        raise RuntimeError(
+                            f"Champion consensus enabled but no "
+                            f"VALIDATOR_REGISTRY_{champion_chain_id} (or "
+                            f"VALIDATOR_REGISTRY_ADDRESS) configured",
+                        )
+                    # contract_address for the EIP-712 domain. Falls back to
+                    # zero address when ChampionRegistry isn't deployed (local
+                    # testnet) — sigs are still well-formed for off-chain
+                    # consensus testing; on-chain certify() would fail but
+                    # local testnet doesn't call it.
+                    champion_contract_address = (
+                        champion_registry_address or ("0x" + "00" * 20)
+                    )
+                    champion_rpc_url = (
+                        os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
+                        or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
+                        or "https://lite.chain.opentensor.ai"
+                    )
+                    champion_protocol_config = ProtocolConfig.from_validator_registry(
+                        rpc_url=champion_rpc_url,
+                        registry_address=champion_validator_registry,
+                        # When ChampionRegistry isn't configured, fall back to
+                        # using ValidatorRegistry's quorumBps (quorum_address
+                        # empty → ProtocolConfig uses registry_address for both).
+                        quorum_address=champion_registry_address,
+                        my_evm_address=validator_id,
+                        # metagraph_provider wired below, after
+                        # solver_round_metagraph_sync is initialized.
+                    )
+                    ctx.champion_protocol_config = champion_protocol_config
+
+                    # Named manual override for environments where the
+                    # ProtocolConfig discovery loop can't populate peers
+                    # automatically — e.g., production where the metagraph
+                    # axon URLs are unpublished, or local-testnet pinned
+                    # mode. When set, this bypasses discovery and pins the
+                    # champion-consensus peer set + validator list.
+                    # Parallel to ORDER_CONSENSUS_PEERS for order consensus.
+                    champion_peers_env = os.environ.get(
+                        "CHAMPION_CONSENSUS_PEERS", "",
+                    ).strip()
+                    champion_peer_endpoints = parse_peers_env(champion_peers_env)
+                    if champion_peer_endpoints:
+                        pinned_champion_validators = [validator_id] + [
+                            ep.validator_id for ep in champion_peer_endpoints
+                        ]
+                        logger.info(
+                            "Champion consensus pinned via CHAMPION_CONSENSUS_PEERS: "
+                            "%d peers (validator-set: %d)",
+                            len(champion_peer_endpoints),
+                            len(pinned_champion_validators),
+                        )
+                    else:
+                        pinned_champion_validators = None  # discovery mode
+
                     champion_consensus = ChampionConsensusManager(
                         validator_id=validator_id,
                         private_key=validator_key,
-                        quorum_bps=champion_quorum_bps,
-                        validators=all_validators,
+                        protocol_config=champion_protocol_config,
+                        # Pinned validators (when override env is set) take
+                        # precedence over protocol_config.peers — see
+                        # ChampionConsensusManager._validators_override.
+                        validators=pinned_champion_validators,
                         timeout=champion_consensus_timeout,
                         chain_id=champion_chain_id,
-                        contract_address=(
-                            os.environ.get("CHAMPION_REGISTRY_964", "").strip()
-                            or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
-                            or ("0x" + "00" * 20)
-                        ),
+                        contract_address=champion_contract_address,
                     )
                     champion_peer_network = ValidatorPeerNetwork(
                         validator_id=validator_id,
                         private_key=validator_key,
                         consensus=champion_consensus,
-                        peers=peer_endpoints,
+                        # Pinned peers (when override env is set) bypass the
+                        # protocol_config discovery loop's peer cache.
+                        peers=champion_peer_endpoints if champion_peer_endpoints else None,
+                        protocol_config=champion_protocol_config,
                         timeout=champion_consensus_timeout,
                         default_headers=(
                             {
@@ -1194,17 +1266,25 @@ async def initialize(ctx: ServerContext) -> dict:
                     submissions.set_champion_consensus_manager(champion_consensus)
                     submissions.set_champion_peer_network(champion_peer_network)
                     locals_bag["champion_peer_network"] = champion_peer_network
-                    if peer_endpoints and not internal_round_api_key:
-                        logger.warning(
-                            "Champion peer network started without SOLVER_ROUND_INTERNAL_API_KEY; "
-                            "internal round control requests are unauthenticated",
-                        )
+
+                    # Wire /identity endpoint (api side, port 8080). It needs
+                    # the signing key now; metagraph_sync gets wired below
+                    # after solver_round_metagraph_sync is initialized.
+                    from minotaur_subnet.api.routes import identity as identity_route
+                    identity_route.set_signing_key(validator_key)
+
                     logger.info(
-                        "Champion consensus enabled (validator=%s, peers=%d, quorum=%d/%d)",
+                        "Champion consensus enabled (validator=%s, quorum=%d bps "
+                        "from %s, validator-set from VR %s on chain %d)",
                         validator_id[:10],
-                        len(peer_endpoints),
-                        champion_consensus.quorum_required,
-                        len(all_validators),
+                        champion_protocol_config.quorum_bps,
+                        (
+                            "ChampionRegistry " + champion_registry_address[:20]
+                            if champion_registry_address
+                            else "ValidatorRegistry (no separate ChampionRegistry)"
+                        ),
+                        champion_validator_registry[:20],
+                        champion_chain_id,
                     )
                 except Exception:
                     logger.warning(
@@ -1338,13 +1418,43 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
                     initial_state = await ctx.solver_round_metagraph_sync.sync_once()
                     ctx.solver_round_role = initial_state.my_role
-                    manager = submissions.get_champion_consensus_manager()
-                    if manager is not None:
-                        manager.set_validators([
-                            peer.evm_address
-                            for peer in initial_state.validators
-                            if peer.evm_address
-                        ])
+
+                    # Wire /identity now that metagraph_sync exists. The
+                    # signing key was already set when ChampionConsensusManager
+                    # was constructed above.
+                    from minotaur_subnet.api.routes import identity as identity_route
+                    identity_route.set_metagraph_sync(ctx.solver_round_metagraph_sync)
+
+                    # Wire metagraph_provider into champion ProtocolConfig
+                    # and start its refresh loop. The refresh loop walks the
+                    # metagraph axon list, probes each /identity, verifies
+                    # signatures, and cross-checks against the BT EVM
+                    # ValidatorRegistry. ChampionConsensusManager reads
+                    # protocol_config.peers through its validators property,
+                    # so new peers propagate automatically without restart.
+                    if ctx.champion_protocol_config is not None:
+                        from minotaur_subnet.consensus.peer_discovery import MetagraphPeer
+
+                        async def _champion_metagraph_peers():
+                            sync = ctx.solver_round_metagraph_sync
+                            if sync is None or sync.state is None:
+                                return []
+                            return [
+                                MetagraphPeer(hotkey=v.hotkey, axon_url=v.axon_url)
+                                for v in sync.state.validators
+                                if v.axon_url and v.hotkey
+                            ]
+
+                        ctx.champion_protocol_config.metagraph_provider = _champion_metagraph_peers
+                        ctx.champion_protocol_config_task = asyncio.create_task(
+                            ctx.champion_protocol_config.refresh_loop(),
+                        )
+                        logger.info(
+                            "Champion ProtocolConfig refresh loop started "
+                            "(metagraph discovery + on-chain quorum, %ds interval)",
+                            ctx.champion_protocol_config.refresh_interval_seconds,
+                        )
+
                     logger.info(
                         "Solver round metagraph sync enabled (role=%s, validators=%d)",
                         initial_state.my_role,

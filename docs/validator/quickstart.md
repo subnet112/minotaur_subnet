@@ -262,7 +262,16 @@ network-wide quorum value once you're an operator.
 
 ## Step 6: Bring up the validator stack
 
-The validator role for a third-party operator is **four containers**: three Anvil forks (Ethereum mainnet, Base, BT EVM) plus the validator daemon. The canonical compose file ships in this repo at `platform/validator/`:
+The validator role for a third-party operator is **six containers**:
+
+- Three Anvil forks (Ethereum mainnet, Base, BT EVM)
+- The validator daemon (order-consensus signer + weight emitter, port 9100)
+- An api service (champion-consensus signer, port 8080)
+- A docker-socket-proxy (limits the api's Docker access to spawning sandboxed solver containers — used during reactive benchmarking of champion candidates)
+
+Plus an OPT-IN seventh container: Watchtower, for auto-update on `:stable` tag promotion. Bring it up via the `autoupdate` compose profile.
+
+The canonical compose ships in this repo at `platform/validator/`:
 
 ```bash
 cd platform/validator
@@ -270,53 +279,105 @@ cp .env.example .env
 # Open .env in your editor and fill in every YOUR_* placeholder
 $EDITOR .env
 
-docker compose up -d
+docker compose --profile autoupdate up -d         # with Watchtower auto-update
+# ── or ──
+docker compose up -d                                # without (manual pulls)
 ```
 
-The first cold start takes ~60-90 seconds while the three Anvil forks fetch their initial state from the upstream RPCs (`ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, `BITTENSOR_EVM_UPSTREAM_RPC_URL`). The validator daemon waits for all three to report healthy before it starts.
+The first cold start takes ~60-90 seconds while the three Anvil forks fetch their initial state from the upstream RPCs (`ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, `BITTENSOR_EVM_UPSTREAM_RPC_URL`). The validator and api services both wait for all three anvils to report healthy before they start.
 
 Check the state:
 
 ```bash
 docker compose ps
-# All four services should show "(healthy)" after ~90s.
+# All six services should show "(healthy)" or "Up" after ~90s.
 
-docker compose logs -f validator
-# Should show: "ProtocolConfig: loaded quorum_bps=6666 from ValidatorRegistry ..."
-#              "Consensus enabled (id=0x..., peer-mode=discovered, quorum=6666 bps)"
-#              "Validator starting as ORDER CONSENSUS PEER ..."
-#              "BlockLoop started (tick_interval=12.0s)"
+docker compose logs -f validator api
+# Validator should show:
+#   "ProtocolConfig: loaded quorum_bps=6666 from ValidatorRegistry ..."
+#   "Consensus enabled (id=0x..., peer-mode=discovered, quorum=6666 bps)"
+#   "Validator starting as ORDER CONSENSUS PEER ..."
+#   "BlockLoop started (tick_interval=12.0s)"
+# Api should show:
+#   "Champion consensus enabled (validator=0x..., quorum=N bps from
+#    ChampionRegistry 0x..., validator-set from VR 0x... on chain 964)"
 ```
 
 ### Verify
 
 ```bash
-# Health
+# Validator health (order-consensus)
 curl http://localhost:9100/health
 # {"status": "ok", "service": "app-intents-validator", "block_loop_running": true, ...}
 
-# Confirm the daemon read the right quorum from chain
+# Api health (champion-consensus)
+curl http://localhost:8080/health
+# {"status": "ok", "champion_consensus": {"enabled": true, ...}, ...}
+
+# Confirm the validator read the right quorum from chain
 curl http://localhost:9100/consensus/info
 # {"consensus_enabled": true, "quorum_bps": 6666, "validator_id": "0x...", ...}
 
 # Confirm /identity serves a fresh signed EIP-712 payload (requires a working
-# Bittensor wallet — returns 503 if WALLET_NAME/HOTKEY_NAME aren't loaded)
+# Bittensor wallet — returns 503 if WALLET_NAME/HOTKEY_NAME aren't loaded).
+# Both the validator daemon (port 9100) and the api service (port 8080)
+# expose /identity so peer-discovery works on both consensus loops.
 curl http://localhost:9100/identity
+curl http://localhost:8080/identity
 ```
 
-If `/consensus/info` shows `quorum_bps: 0` or `quorum_bps` doesn't match `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)'` on chain, your `VALIDATOR_REGISTRY_8453` env points at a stale or wrong contract — check the [network reference](../operator/network-reference.md).
+If either `/consensus/info` or the api's `champion_consensus.quorum_required` looks wrong, your `VALIDATOR_REGISTRY_*` envs may point at a stale contract — check the [network reference](../operator/network-reference.md).
 
-### What the daemon does
+### What each service does
 
-1. Reads `quorumBps` from `ValidatorRegistry` at startup, refreshes every 60 s.
-2. Starts the BlockLoop (processes new orders every ~12 s).
-3. Listens on port 9100 for proposal-signing and `/identity` endpoints.
-4. Emits weights to the metagraph every **1200 s / 20 min** (matches Bittensor's `weights_set_rate_limit` of 100 blocks — the older 60 s default spam-rejects ~95% of attempts).
+| Service | Role |
+|---|---|
+| `validator` | Order-consensus signing (re-simulates leader's order proposals on Anvil, signs approvals if both JS + on-chain scores meet threshold). Emits weights to the metagraph every ~20 min. |
+| `api` | Champion-consensus signing (reactively re-benchmarks the leader's champion candidate inside a sandboxed Docker container, signs the certification if scores hold up). |
+| `anvil-eth`, `anvil-base`, `anvil-btevm` | Local forks of each chain so independent re-simulation doesn't touch mainnet. |
+| `docker-socket-proxy` | Filtered Docker socket access for the api service. Only `CONTAINERS + IMAGES + NETWORKS + POST` allowed; no `EXEC`, no `BUILD`, no `SWARM`. |
+| `watchtower` (opt-in) | Polls GHCR every hour for a new `:stable` SHA; recreates `validator` + `api` when the tag moves. |
 
 ### What this stack does NOT include
 
-- **Relayer**: the transaction submitter is a singleton service operated by the subnet team. Your validator signs proposals; the leader's submission path uses our relayer.
-- **API service (champion consensus)**: covered in a future optional compose. Until then, our internal nodes carry champion-certification quorum.
+- **Relayer**: the transaction submitter is a singleton service operated by the subnet team. Your validator signs proposals; the leader's submission path uses our relayer. You never deal with a gas wallet.
+- **Order/champion proposing**: only the highest-stake validator's leader-api does that. As a follower, you receive proposals + verify + sign.
+
+## Auto-update
+
+The default `MINOTAUR_IMAGE_TAG=stable` (in `.env.example`) and the optional Watchtower container together give you hands-off updates:
+
+1. New commit lands on `main` → `docker-publish.yml` builds + pushes `:latest` and `:sha-<short>` (immutable per-commit) to GHCR.
+2. The new image runs on the subnet team's prod for a soak period.
+3. When the team is happy with the soak, they run the `promote-stable.yml` workflow with the short SHA. That re-tags `:sha-<short>` as `:stable` on GHCR.
+4. Your Watchtower polls GHCR within the next hour, pulls the new image, recreates the `validator` and `api` containers with the new SHA. ~30-60 second downtime during the recreate.
+
+If you want manual control instead of Watchtower, leave the `autoupdate` profile off and run on the subnet team's announced cadence:
+
+```bash
+docker compose pull validator api
+docker compose up -d --force-recreate validator api
+```
+
+To pin a specific SHA (opt out of auto-update entirely without removing Watchtower):
+
+```bash
+# In .env:
+MINOTAUR_IMAGE_TAG=sha-abc1234
+```
+
+then `docker compose up -d` — Watchtower won't update a container whose image tag isn't tracking `:stable`.
+
+## On-chain registration
+
+Your EVM signing address needs to be in the on-chain `ValidatorRegistry` on both Base and BT EVM before your signatures count toward quorum. The subnet team runs the on-chain handshake for you — open an issue using the [Request validator onboarding template](https://github.com/subnet112/minotaur_subnet/issues/new?template=onboard-validator.yml).
+
+The template captures the three required fields:
+- EVM signing address (checksummed)
+- Bittensor SS58 hotkey
+- Public axon URL (`http://<host>:9100`)
+
+Once the team comments with the tx hashes, your validator is live. Within ~60 seconds, every existing validator's `ProtocolConfig` refresh loop discovers your `/identity` endpoint, verifies the EIP-712 binding, and starts including you in proposals.
 
 ### Running without Docker
 
@@ -361,6 +422,12 @@ What this gives operators:
 | `VALIDATOR_AXON_URL` | The public URL you serve `/identity` on. Typically `http://<your-public-ip>:9100`. The signed payload includes this; if it's missing, `/identity` returns 503. |
 | `SUBTENSOR_URL` | Required so the daemon can read the metagraph for axon discovery (already required in Step 5). |
 | `VALIDATOR_REGISTRY_ADDRESS` | Required so the daemon can read the authorized EVM set (already required in Step 5). |
+
+### Internal-only envs — DO NOT set as a third party
+
+`ORDER_CONSENSUS_PEERS` and `CHAMPION_CONSENSUS_PEERS` are pinned-peer escape hatches used by the subnet team's own production deployment, where metagraph axon URLs aren't published yet for operational-security reasons. Both bypass automatic peer discovery and pin to a fixed peer list.
+
+**Third-party validators should always leave these unset.** Setting them locks you to a stale set that won't include the rest of the network — your validator becomes invisible to other peers and never reaches quorum. The discovery path (metagraph axon list + on-chain `ValidatorRegistry.getValidators()` + each peer's signed `/identity` payload) is the supported flow and works out of the box once you complete the [on-chain registration handshake](#on-chain-registration).
 
 ### Optional override
 

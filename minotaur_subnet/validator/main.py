@@ -97,7 +97,6 @@ class AppIntentsValidator:
         validator_hotkey_ss58: str | None = None,
         # Consensus (optional)
         validator_private_key: str = "",
-        validator_peers: list[str] | None = None,
         protocol_config: "ProtocolConfig | None" = None,
         chain_id: int = 31337,
         contract_address: str = "0x" + "00" * 20,
@@ -305,30 +304,16 @@ class AppIntentsValidator:
             from minotaur_subnet.consensus.eip712 import address_from_key
             self._validator_id = address_from_key(validator_private_key)
 
-            from minotaur_subnet.consensus.peer_network import (
-                ValidatorPeerNetwork,
-                PeerEndpoint,
-                parse_peers_env,
-            )
-
-            # Peer set comes from ProtocolConfig discovery by default. The
-            # optional validator_peers arg pins a manual list (escape hatch
-            # for local testnet / pre-discovery setups).
-            pinned_peers: list[PeerEndpoint] | None = None
-            if validator_peers:
-                pinned_peers = parse_peers_env(",".join(validator_peers))
-
+            from minotaur_subnet.consensus.peer_network import ValidatorPeerNetwork
             from minotaur_subnet.consensus import ConsensusManager
+
+            # ConsensusManager.validators reads through to
+            # protocol_config.peers, so newly discovered peers are picked up
+            # automatically without restart on the next refresh tick.
             self._consensus = ConsensusManager(
                 validator_id=self._validator_id,
                 private_key=validator_private_key,
                 protocol_config=protocol_config,
-                # When pinned_peers is None, ConsensusManager.validators reads
-                # through to protocol_config.peers automatically.
-                validators=(
-                    [self._validator_id] + [p.validator_id for p in pinned_peers]
-                    if pinned_peers is not None else None
-                ),
                 chain_id=chain_id,
                 contract_address=contract_address,
             )
@@ -338,22 +323,20 @@ class AppIntentsValidator:
                 validator_id=self._validator_id,
                 private_key=validator_private_key,
                 consensus=self._consensus,
-                peers=pinned_peers,
                 protocol_config=protocol_config,
             )
             self.block_loop.set_peer_network(self._peer_network)
 
-            mode = "pinned" if pinned_peers is not None else "discovered"
             logger.info(
-                "Consensus enabled (id=%s, peer-mode=%s, quorum=%d bps)",
-                self._validator_id[:10], mode, protocol_config.quorum_bps,
+                "Consensus enabled (id=%s, peer-mode=discovered, quorum=%d bps)",
+                self._validator_id[:10], protocol_config.quorum_bps,
             )
 
-            # Wire peer discovery: if we have a metagraph and we're in
-            # discovery mode (no pinned peers), tell ProtocolConfig how to
-            # fetch the current metagraph peer list. The refresh loop calls
-            # this each tick and probes /identity on each axon.
-            if pinned_peers is None and self._metagraph_sync is not None:
+            # Wire peer discovery: when a metagraph exists, tell
+            # ProtocolConfig how to fetch the current metagraph peer list.
+            # The refresh loop calls this each tick and probes /identity on
+            # each axon.
+            if self._metagraph_sync is not None:
                 protocol_config.my_evm_address = self._validator_id
                 protocol_config.metagraph_provider = self._metagraph_peers_for_discovery
 
@@ -1017,10 +1000,6 @@ def main() -> None:
         help="Validator EVM private key (hex) for consensus signing",
     )
     parser.add_argument(
-        "--validator-peers", type=str, nargs="*", default=None,
-        help="Peer validators in addr@url format",
-    )
-    parser.add_argument(
         "--validator-registry-address", type=str, default=None,
         help="ValidatorRegistry contract address (source of canonical quorumBps). "
              "Falls back to VALIDATOR_REGISTRY_ADDRESS env.",
@@ -1057,12 +1036,6 @@ def main() -> None:
     hotkey_name = args.hotkey_name or os.environ.get("HOTKEY_NAME")
     validator_hotkey_ss58 = os.environ.get("VALIDATOR_HOTKEY_SS58", "").strip()
     validator_key = args.validator_key or os.environ.get("VALIDATOR_PRIVATE_KEY", "")
-
-    validator_peers = args.validator_peers
-    if validator_peers is None:
-        peers_env = os.environ.get("VALIDATOR_PEERS", "")
-        if peers_env:
-            validator_peers = peers_env.split(",")
 
     store_path = Path(args.store_path) if args.store_path else None
     store = AppIntentStore(store_path=store_path)
@@ -1109,7 +1082,6 @@ def main() -> None:
         hotkey_name=hotkey_name,
         validator_hotkey_ss58=validator_hotkey_ss58,
         validator_private_key=validator_key,
-        validator_peers=validator_peers,
         protocol_config=protocol_config,
         chain_id=chain_id,
         contract_address=contract_address,
