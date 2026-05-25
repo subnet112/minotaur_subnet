@@ -93,6 +93,26 @@ class ScoringEngine:
             logger.warning("Proposal signature recovery failed: %s", exc)
             return False, f"Signature recovery failed: {exc}"
 
+        # Leader-lock: when LOCKED_LEADER_EVM_ADDRESS is set, only that
+        # signer may propose. Counterpart to the election-side lock in
+        # elect_leader; prevents a registered-but-rogue validator from
+        # spamming proposals or staging a competing-leadership scenario.
+        # Any-validator acceptance is only used when the lock is cleared.
+        from minotaur_subnet.validator.metagraph_sync import (
+            LOCKED_LEADER_EVM_ADDRESS,
+        )
+        if LOCKED_LEADER_EVM_ADDRESS:
+            if recovered_address.lower() != LOCKED_LEADER_EVM_ADDRESS.lower():
+                logger.warning(
+                    "Proposal signed by %s but locked leader is %s",
+                    recovered_address, LOCKED_LEADER_EVM_ADDRESS,
+                )
+                return False, (
+                    f"Proposer {recovered_address} is not the locked leader "
+                    f"({LOCKED_LEADER_EVM_ADDRESS})"
+                )
+            return True, ""
+
         # Check that the recovered address is a known validator peer
         known_validators: set[str] = set()
         if self.consensus is not None:

@@ -230,6 +230,21 @@ def _verify_champion_proposal_signature(body: Any) -> str | None:
             f"but proposer declared {signer_declared[:10]}..."
         )
 
+    # Leader-lock: when LOCKED_LEADER_EVM_ADDRESS is set, only that signer
+    # may propose champion adoptions. Mirrors the order-consensus lock in
+    # validator/scoring_engine.py:verify_proposer_signature. Falls back to
+    # the on-chain registry check only when the lock is cleared.
+    from minotaur_subnet.validator.metagraph_sync import (
+        LOCKED_LEADER_EVM_ADDRESS,
+    )
+    if LOCKED_LEADER_EVM_ADDRESS:
+        if recovered.lower() != LOCKED_LEADER_EVM_ADDRESS.lower():
+            return (
+                f"Signer {recovered[:10]}... is not the locked leader "
+                f"({LOCKED_LEADER_EVM_ADDRESS})"
+            )
+        return None
+
     # Verify the signer is a registered validator on the order's chain OR
     # (for champion consensus) the BT EVM validator registry. Re-uses the
     # Phase 3 on-chain registry cache.
