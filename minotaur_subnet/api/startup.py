@@ -661,19 +661,23 @@ async def initialize(ctx: ServerContext) -> dict:
         )
 
     # ── chain info ───────────────────────────────────────────────────────
+    # GET /v1/chains is the public chain list users route through. The
+    # underlying chain_config map ALSO includes internal-only RPCs (e.g.
+    # the simulation Anvil fork in prod, reached via ANVIL_RPC_URL) which
+    # have no ValidatorRegistry deployed. build_public_chain_info filters
+    # those out — a chain is exposed publicly only if we've stood up the
+    # consensus stack on it. Local testnet still works because in that env
+    # ValidatorRegistry is deployed to chain 31337 too.
     from minotaur_subnet.relayer.chain_config import get_supported_chains as _get_chains
     from minotaur_subnet.api.services import set_chain_info
+    from minotaur_subnet.api.services.chain_service import build_public_chain_info
     _chains = _get_chains()
-    set_chain_info([
-        {
-            "chain_id": c.chain_id,
-            "name": c.name,
-            "rpc_available": bool(c.rpc_url),
-            "registry_address": c.validator_registry_address,
-        }
-        for c in _chains.values()
-    ])
-    logger.info("Chain info: %s", [c.chain_id for c in _chains.values()])
+    set_chain_info(build_public_chain_info(_chains.values()))
+    logger.info(
+        "Chain info: public=%s, internal-only=%s",
+        [c.chain_id for c in _chains.values() if c.validator_registry_address],
+        [c.chain_id for c in _chains.values() if not c.validator_registry_address],
+    )
 
     # ── wallet manager ───────────────────────────────────────────────────
     lit_bridge_url = os.environ.get("LIT_BRIDGE_URL")
