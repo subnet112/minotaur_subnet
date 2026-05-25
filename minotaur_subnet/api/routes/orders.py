@@ -11,6 +11,7 @@ GET  /v1/blockloop/status            → Block loop tick stats
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -56,6 +57,70 @@ def _require_orderbook():
             detail="OrderBook not initialized",
         )
     return _orderbook
+
+
+def _enforce_order_owner_sig(
+    order: Any,
+    *,
+    action: bytes,
+    content_hash: str,
+    deadline: int,
+    signature: str,
+    claimed_owner: str | None = None,
+) -> None:
+    """Verify ``signature`` proves the caller controls ``order.submitted_by``.
+
+    M3 + M4 (2026-05-25 audit): three order-modifying endpoints previously
+    accepted unsigned ownership claims (cancel via query param, signature
+    PATCH with no auth at all, tx-confirmed PATCH with no auth). This
+    helper enforces an EIP-191 signature from the order owner over a
+    domain-separated, content-bound, deadline-bound payload.
+
+    Override: set ``REQUIRE_ORDER_OWNER_SIG=0`` to bypass for one-off
+    incident handling. Default is enforce.
+
+    Args:
+        order: The Order object whose ``submitted_by`` is the authoritative owner.
+        action: One of ACTION_CANCEL / ACTION_CONFIRM_TX / ACTION_ATTACH_SIG.
+        content_hash: Hash of the action-specific content (e.g. tx_hash being
+            confirmed, signature being attached). Empty string for cancel.
+        deadline: Unix-seconds deadline that was included in the signed payload.
+        signature: Hex EIP-191 signature from the order owner.
+        claimed_owner: If provided (cancel passes ``submitted_by`` query
+            param), must match order.submitted_by — second-layer check
+            against the legacy ``submitted_by`` plumbing on cancel.
+    """
+    if os.environ.get("REQUIRE_ORDER_OWNER_SIG", "1").strip().lower() in ("0", "false", "no"):
+        return
+
+    from minotaur_subnet.consensus.order_owner_sig import verify_order_action
+
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+    if claimed_owner and claimed_owner.lower() != owner.lower():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"submitted_by query param ({claimed_owner[:10]}...) does not "
+                f"match order owner ({owner[:10]}...)"
+            ),
+        )
+
+    ok, err = verify_order_action(
+        expected_owner=owner,
+        action=action,
+        order_id=getattr(order, "order_id", "") or "",
+        content_hash=content_hash or "",
+        deadline=int(deadline or 0),
+        chain_id=int(getattr(order, "chain_id", 0) or 0),
+        signature_hex=signature or "",
+    )
+    if not ok:
+        raise HTTPException(status_code=403, detail=err)
 
 
 def _resolve_token_params(params: dict, chain_id: int) -> dict:
@@ -551,10 +616,17 @@ async def confirm_user_submitted_tx(order_id: str, request: Request) -> dict:
     confirms the receipt, the frontend calls this endpoint with the tx_hash
     so the API can finalize the order status.
 
-    Only valid for orders that were submitted with ``_user_submit = True``
-    and are currently in APPROVED state — guards against a random client
-    fabricating FILLED states for someone else's order.
+    M4 (2026-05-25 audit): previously accepted any caller marking any
+    APPROVED ``_user_submit`` order as FILLED with any tx_hash. Now
+    requires an EIP-191 ``owner_signature`` over the ``ConfirmTx`` action
+    payload (action, order_id, keccak(tx_hash), deadline, chain_id) from
+    the order's ``submitted_by``.
+
+    Body shape: ``{"tx_hash": "0x...", "owner_signature": "0x...", "deadline": int}``
     """
+    from minotaur_subnet.consensus.order_owner_sig import (
+        ACTION_CONFIRM_TX, content_hash_of,
+    )
     from minotaur_subnet.orderbook.orderbook import OrderStatus
 
     ob = _require_orderbook()
@@ -578,6 +650,13 @@ async def confirm_user_submitted_tx(order_id: str, request: Request) -> dict:
     if not tx_hash:
         raise HTTPException(status_code=400, detail="tx_hash required")
 
+    _enforce_order_owner_sig(
+        order, action=ACTION_CONFIRM_TX,
+        content_hash=content_hash_of(tx_hash),
+        deadline=int(body.get("deadline") or 0),
+        signature=body.get("owner_signature", ""),
+    )
+
     ob.update_order(
         order_id,
         status=OrderStatus.FILLED,
@@ -600,7 +679,22 @@ async def attach_signature(order_id: str, request: Request) -> dict:
     the order_id, constructs the EIP-712 typed data using the exact
     order fields, signs with MetaMask, and submits the signature here.
     The on-chain contract verifies the signature at executeIntent time.
+
+    M4 (2026-05-25 audit): previously accepted any user_signature from
+    any caller, allowing griefing (overwrite a real user's pending sig
+    with garbage; front-run their submission by attaching their sig
+    before they do). Now requires a SECOND signature — ``owner_signature``
+    — over the ``AttachSig`` action payload binding the user_signature
+    being attached. This proves the caller controls the order owner
+    address without changing the user_signature semantics consumed
+    on-chain at executeIntent time.
+
+    Body shape: ``{"user_signature": "0x...", "owner_signature": "0x...", "deadline": int}``
     """
+    from minotaur_subnet.consensus.order_owner_sig import (
+        ACTION_ATTACH_SIG, content_hash_of,
+    )
+
     ob = _require_orderbook()
     order = ob.get(order_id)
     if order is None:
@@ -610,6 +704,13 @@ async def attach_signature(order_id: str, request: Request) -> dict:
     sig = body.get("user_signature", "")
     if not sig:
         raise HTTPException(status_code=400, detail="user_signature required")
+
+    _enforce_order_owner_sig(
+        order, action=ACTION_ATTACH_SIG,
+        content_hash=content_hash_of(sig),
+        deadline=int(body.get("deadline") or 0),
+        signature=body.get("owner_signature", ""),
+    )
 
     ob.update_order(order_id, user_signature=sig)
     if _app_store is not None:
@@ -654,15 +755,44 @@ def list_orders(
 
 
 @router.delete("/orders/{order_id}")
-def cancel_order(order_id: str, submitted_by: str = Query(...)) -> dict:
+def cancel_order(
+    order_id: str,
+    submitted_by: str = Query(...),
+    owner_signature: str = Query(""),
+    deadline: int = Query(0),
+) -> dict:
     """Cancel an open order.
+
+    M3 (2026-05-25 audit): previously trusted the client-supplied
+    ``submitted_by`` query param. Anyone who could read ``GET /orders/{id}``
+    learned the owner address and could cancel the order. Now requires
+    an EIP-191 ``owner_signature`` from the order owner over a
+    ``Cancel`` action payload with a freshness ``deadline``.
 
     Args:
         order_id: The order to cancel.
         submitted_by: Wallet address of the order owner (required).
-            Only the original submitter can cancel their own order.
+        owner_signature: Hex EIP-191 signature from the owner over the
+            canonical Cancel payload (action="Cancel", order_id, "",
+            deadline, chain_id). Required unless
+            ``REQUIRE_ORDER_OWNER_SIG=0`` (audit-incident-only override).
+        deadline: Unix-seconds deadline included in the signed payload.
     """
+    from minotaur_subnet.consensus.order_owner_sig import (
+        ACTION_CANCEL, verify_order_action,
+    )
+
     ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+
+    _enforce_order_owner_sig(
+        order, action=ACTION_CANCEL,
+        content_hash="", deadline=deadline, signature=owner_signature,
+        claimed_owner=submitted_by,
+    )
+
     try:
         success = ob.cancel(order_id, submitted_by=submitted_by)
     except PermissionError as exc:
