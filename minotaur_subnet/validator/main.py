@@ -262,6 +262,49 @@ class AppIntentsValidator:
                         block_time=0.25 if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url else 12.0,
                     )
 
+                    # Auto-publish the axon URL on the metagraph. Bittensor
+                    # convention is for the validator daemon to call
+                    # ``serve_axon`` on startup so other validators' peer-
+                    # discovery loops can find us via ``metagraph.axons``.
+                    # Without this, the metagraph row stays at ``0.0.0.0:0``
+                    # and the discovery loop logs "no metagraph peers with
+                    # axon URLs" indefinitely. Gated on VALIDATOR_AXON_URL
+                    # being set — operators that prefer to publish out-of-
+                    # band can leave it unset and serve manually.
+                    axon_url = os.environ.get("VALIDATOR_AXON_URL", "").strip()
+                    if axon_url:
+                        try:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(axon_url)
+                            axon_ip = parsed.hostname or ""
+                            axon_port = parsed.port or 9100
+                            if axon_ip:
+                                served = subtensor.serve_axon(
+                                    netuid=netuid,
+                                    axon=bt.Axon(
+                                        wallet=self._bt_wallet,
+                                        ip=axon_ip,
+                                        port=axon_port,
+                                    ),
+                                )
+                                logger.info(
+                                    "Auto-served axon on metagraph (netuid=%d ip=%s port=%d ok=%s)",
+                                    netuid, axon_ip, axon_port, served,
+                                )
+                            else:
+                                logger.warning(
+                                    "VALIDATOR_AXON_URL %r has no hostname; skipping serve_axon",
+                                    axon_url,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "Auto-serve axon failed (continuing startup): %s. "
+                                "Other validators won't find you on the metagraph "
+                                "until a successful serve_axon — re-check VALIDATOR_AXON_URL, "
+                                "coldkey TAO balance, and subtensor reachability.",
+                                exc,
+                            )
+
                 logger.info(
                     "Bittensor integration enabled (netuid=%d, hotkey=%s, wallet_loaded=%s)",
                     netuid,
