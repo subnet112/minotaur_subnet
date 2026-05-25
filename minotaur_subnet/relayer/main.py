@@ -23,10 +23,16 @@ if str(_REPO_ROOT) not in sys.path:
 
 from aiohttp import web
 
+from minotaur_subnet.consensus.leader_wrapper import (
+    WrapperPayload,
+    is_wrapper_fresh,
+    recover_wrapper_signer,
+)
 from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.consensus.signatures import hash_plan, verify_plan_approval
 from minotaur_subnet.relayer.chain_config import get_supported_chains
 from minotaur_subnet.relayer.evm_relayer import EvmRelayer
+from minotaur_subnet.relayer.safeguards import Safeguards
 from minotaur_subnet.relayer.signature_collector import SignatureCollector
 from minotaur_subnet.relayer.gas_manager import GasManager
 from minotaur_subnet.relayer.validator_sync import ValidatorSync
@@ -146,6 +152,7 @@ class RelayerService:
         )
         self.gas_manager = GasManager(chains=self.chains)
         self.validator_sync = ValidatorSync(chains=self.chains)
+        self.safeguards = Safeguards.from_env()
 
     async def handle_submit_signature(self, request: web.Request) -> web.Response:
         """POST /signatures — validator submits a plan approval signature."""
@@ -245,6 +252,19 @@ class RelayerService:
                 status=400,
             )
 
+        # ── Safeguard 1: deadline check ─────────────────────────────────
+        # Cheapest possible check, no state, no RPC.
+        ok, err = self.safeguards.check_deadline(plan.deadline)
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=400)
+
+        # ── Safeguard 2: daily gas cap precheck ────────────────────────
+        # If we've already burned the daily budget, refuse all new submissions.
+        # Doesn't change state; just bails before sig recovery.
+        ok, err = self.safeguards.check_daily_gas_room()
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=429)
+
         # Verify plan hash matches what each approval claims to have signed
         expected_plan_hash = hash_plan(plan)
         for ap in consensus_result.approvals:
@@ -260,6 +280,64 @@ class RelayerService:
                     },
                     status=400,
                 )
+
+        # ── Safeguard 3: leader-signed wrapper verification ────────────
+        # The api includes a wrapper {plan_hash, submission_nonce, timestamp,
+        # chain_id} signed by its VALIDATOR_PRIVATE_KEY. The signer must be a
+        # registered validator on the target chain. Wrapper freshness +
+        # monotonic-nonce-per-signer give cryptographic replay protection
+        # even if the plan_hash dedup cache is wiped (e.g., relayer restart).
+        wrapper_data = data.get("wrapper")
+        wrapper_sig = data.get("wrapper_signature")
+        if not wrapper_data or not wrapper_sig:
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": (
+                        "missing wrapper or wrapper_signature in payload — the api "
+                        "must sign a freshness wrapper around the bundle before "
+                        "submitting (see consensus.leader_wrapper.sign_wrapper)"
+                    ),
+                },
+                status=400,
+            )
+
+        try:
+            wrapper = WrapperPayload(
+                plan_hash=wrapper_data["plan_hash"],
+                submission_nonce=int(wrapper_data["submission_nonce"]),
+                timestamp=int(wrapper_data["timestamp"]),
+                chain_id=int(wrapper_data["chain_id"]),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return web.json_response(
+                {"success": False, "error": f"malformed wrapper: {exc}"},
+                status=400,
+            )
+
+        # Wrapper binds the same plan + chain we're submitting.
+        if wrapper.plan_hash != expected_plan_hash:
+            return web.json_response(
+                {"success": False, "error": "wrapper plan_hash doesn't match plan"},
+                status=400,
+            )
+        if wrapper.chain_id != chain_id:
+            return web.json_response(
+                {"success": False, "error": "wrapper chain_id doesn't match order"},
+                status=400,
+            )
+
+        ok, err = is_wrapper_fresh(wrapper)
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=400)
+
+        try:
+            wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
+        except Exception as exc:
+            return web.json_response(
+                {"success": False, "error": f"wrapper sig invalid: {exc}"},
+                status=400,
+            )
 
         # Read the authorized validator set from on-chain ValidatorRegistry.
         # We deliberately read fresh per-request rather than from a cache:
@@ -285,6 +363,29 @@ class RelayerService:
                 status=502,
             )
         authorized_lower = {addr.lower() for addr in authorized}
+
+        # ── Safeguard 4: wrapper signer must be a registered validator ─
+        if wrapper_signer.lower() not in authorized_lower:
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": (
+                        f"wrapper signer {wrapper_signer} not in ValidatorRegistry on "
+                        f"chain {chain_id} — only registered validators can submit"
+                    ),
+                },
+                status=403,
+            )
+
+        # ── Safeguard 5: monotonic nonce per signer ─────────────────────
+        ok, err = self.safeguards.check_signer_nonce(wrapper_signer, wrapper.submission_nonce)
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=409)
+
+        # ── Safeguard 6: per-caller rate limit ─────────────────────────
+        ok, err = self.safeguards.check_caller_rate(wrapper_signer)
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=429)
 
         # Determine the contract_address that the signatures bind to.
         # Same precedence the EvmRelayer uses internally — explicit
@@ -347,13 +448,23 @@ class RelayerService:
                 status=400,
             )
 
+        # ── Safeguard 7: plan-hash dedup (committed last, after all
+        # cheaper checks — so we don't waste a slot on a request that
+        # would have failed verification anyway). ────────────────────
+        ok, err = self.safeguards.check_plan_hash_unseen(expected_plan_hash, plan.deadline)
+        if not ok:
+            return web.json_response({"success": False, "error": err}, status=409)
+
         logger.info(
-            "Relayer: submit-plan accepted (order=%s chain=%d signers=%d/%d required=%d)",
+            "Relayer: submit-plan accepted (order=%s chain=%d signers=%d/%d required=%d "
+            "wrapper-signer=%s nonce=%d)",
             order_data.get("order_id", "")[:12],
             chain_id,
             len(verified_signers),
             total_validators,
             quorum_required,
+            wrapper_signer[:10],
+            wrapper.submission_nonce,
         )
 
         # Wrap order_data as a light attribute-bag so EvmRelayer can
@@ -378,6 +489,18 @@ class RelayerService:
             return web.json_response(
                 {"success": False, "error": f"submit_plan crashed: {exc}"},
                 status=500,
+            )
+
+        # Charge against the daily gas budget. Only on a successful submit.
+        if submit_result.success and submit_result.gas_used:
+            # Approximate gas price — Base mainnet typically 0.001-0.1 gwei.
+            # The Web3 instance inside EvmRelayer has the actual value, but
+            # we'd need to thread it through SubmitResult. For now, charge
+            # a conservative 0.05 gwei × gas_used per submission.
+            approx_gas_price_wei = 50_000_000  # 0.05 gwei
+            self.safeguards.record_gas_used(
+                gas_used=int(submit_result.gas_used),
+                gas_price_wei=approx_gas_price_wei,
             )
 
         return web.json_response({
@@ -428,6 +551,7 @@ class RelayerService:
             "status": "ok",
             "service": "relayer",
             "chains": list(self.chains.keys()),
+            "safeguards": self.safeguards.stats(),
         })
 
 

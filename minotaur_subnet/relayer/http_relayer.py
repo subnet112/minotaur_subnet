@@ -36,10 +36,15 @@ during the transition.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import logging
+import time
 from typing import Any
 
 import aiohttp
+
+from minotaur_subnet.consensus.leader_wrapper import sign_wrapper
+from minotaur_subnet.consensus.signatures import hash_plan
 
 from .base import RelayerBase, SubmitResult
 
@@ -82,10 +87,30 @@ class HttpRelayer(RelayerBase):
             transit. Bump this in slow-RPC environments.
     """
 
-    def __init__(self, url: str, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        signing_key: str = "",
+        timeout: float = 60.0,
+    ) -> None:
+        """
+        Args:
+            url: Base URL of the remote relayer service.
+            signing_key: The api's EVM private key (same as
+                ``VALIDATOR_PRIVATE_KEY``). Used to sign the freshness
+                wrapper around each submission so the relayer can
+                verify the caller is a registered validator.
+            timeout: Seconds to wait for the relayer's response.
+        """
         self.url = url.rstrip("/")
+        self.signing_key = signing_key.strip()
         self.timeout = timeout
         self._current_leader: str = ""
+        # Initial nonce — wall-clock seconds gives us a monotonic seed
+        # that's unique-enough across api restarts; the itertools counter
+        # makes it strictly monotonic within a process.
+        self._nonce_counter = itertools.count(int(time.time() * 1000))
 
     async def submit_plan(
         self,
@@ -95,16 +120,41 @@ class HttpRelayer(RelayerBase):
         consensus_result: Any = None,
         contract_address: str | None = None,
     ) -> SubmitResult:
+        chain_id = int(getattr(order, "chain_id", 0) or 0)
+        order_id = getattr(order, "order_id", "")
+
+        # Sign the freshness wrapper. The relayer rejects submissions
+        # whose wrapper doesn't recover to a registered validator. Same
+        # key the api uses for validator consensus signing.
+        if not self.signing_key:
+            return SubmitResult(
+                success=False,
+                error="HttpRelayer requires signing_key (set VALIDATOR_PRIVATE_KEY on the api)",
+                chain_id=chain_id,
+            )
+        plan_hash = hash_plan(plan)
+        nonce = next(self._nonce_counter)
+        wrapper, wrapper_sig = sign_wrapper(
+            self.signing_key,
+            plan_hash=plan_hash,
+            submission_nonce=nonce,
+            chain_id=chain_id,
+        )
+
         payload = {
             "order": _to_jsonable(order),
             "plan": _to_jsonable(plan),
             "score": float(score),
             "consensus_result": _to_jsonable(consensus_result),
             "contract_address": contract_address,
+            "wrapper": {
+                "plan_hash": wrapper.plan_hash,
+                "submission_nonce": wrapper.submission_nonce,
+                "timestamp": wrapper.timestamp,
+                "chain_id": wrapper.chain_id,
+            },
+            "wrapper_signature": wrapper_sig,
         }
-
-        chain_id = int(getattr(order, "chain_id", 0) or 0)
-        order_id = getattr(order, "order_id", "")
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
