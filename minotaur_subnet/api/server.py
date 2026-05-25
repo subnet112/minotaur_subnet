@@ -165,6 +165,19 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
+# H4 (2026-05-25 audit): /docs, /redoc, /openapi.json publicly enumerate
+# every admin/internal endpoint — exploit catalog. Disabled by default;
+# only LOCAL_TESTNET=1 (dev) or EXPOSE_OPENAPI=1 (operator opt-in) re-enables.
+_expose_openapi = (
+    os.environ.get("LOCAL_TESTNET", "").strip() == "1"
+    or os.environ.get("EXPOSE_OPENAPI", "").strip() == "1"
+)
+_openapi_kwargs: dict[str, str | None] = (
+    {}  # FastAPI's defaults: /docs, /redoc, /openapi.json
+    if _expose_openapi
+    else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+)
+
 app = FastAPI(
     title="Minotaur App Intents API",
     version="0.2.0",
@@ -182,12 +195,26 @@ app = FastAPI(
         "Production endpoints will require validator signatures."
     ),
     lifespan=lifespan,
+    **_openapi_kwargs,
 )
+
+# H5 (2026-05-25 audit): default ``["*"]`` lets any origin hit any endpoint
+# from a browser. Restrict to the published frontend; allow override via
+# ``CORS_ALLOW_ORIGINS`` (comma-separated) for dev/staging. LOCAL_TESTNET=1
+# preserves the old open-by-default behavior for local development.
+def _resolve_cors_origins() -> list[str]:
+    raw = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    if os.environ.get("LOCAL_TESTNET", "").strip() == "1":
+        return ["*"]
+    return ["https://app.minotaursubnet.com"]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=_resolve_cors_origins(),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
