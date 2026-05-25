@@ -43,6 +43,7 @@ from minotaur_subnet.api.routes import (
     submissions,
     orders,
     native_bittensor,
+    identity,
 )
 from minotaur_subnet.store import AppIntentStore
 
@@ -274,6 +275,11 @@ app.include_router(monitoring.router, prefix="/v1")
 app.include_router(submissions.router, prefix="/v1")
 app.include_router(orders.router, prefix="/v1")
 app.include_router(native_bittensor.router, prefix="/v1")
+
+# /identity is registered WITHOUT the /v1 prefix to mirror the validator
+# daemon's convention (port 9100). Peer-discovery code can probe the same
+# path regardless of which port it's hitting.
+app.include_router(identity.router)
 
 
 def main() -> None:

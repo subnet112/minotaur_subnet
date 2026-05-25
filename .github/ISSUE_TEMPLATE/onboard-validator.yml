@@ -1,0 +1,91 @@
+name: Request validator onboarding
+description: Apply to be added to the on-chain ValidatorRegistry on subnet 112.
+title: "[onboarding] Add validator <evm-addr>"
+labels: ["onboarding"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for running a third-party validator on Minotaur Subnet 112!
+
+        Once you submit this issue, the subnet team will:
+
+        1. Verify your hotkey is on the subnet 112 metagraph.
+        2. Add your EVM address to the on-chain `ValidatorRegistry` on both
+           **Base** (chain 8453) and **BT EVM** (chain 964) via
+           [`scripts/onboard_validator.sh`](https://github.com/subnet112/minotaur_subnet/blob/main/scripts/onboard_validator.sh).
+        3. Comment on this issue confirming the tx hashes + closing it.
+
+        Within ~60 seconds of step 2, our validators' `ProtocolConfig` refresh
+        loop will discover your `/identity` endpoint, verify the EIP-712
+        binding, and start including you in proposals.
+
+        **Pre-requisites you should have done before filing:**
+
+        - Registered a hotkey on subnet 112 (`btcli subnet register --netuid 112 --subtensor.network finney ...`).
+        - Generated an EVM signing key (`cast wallet new`) — does NOT need funds.
+        - Deployed the `platform/validator/` compose stack on a host with public
+          IPv4 + port 9100 reachable + port 8080 reachable.
+        - Confirmed `curl http://your-public-host:9100/identity` returns a signed
+          payload (i.e. the validator daemon loaded your bittensor wallet and
+          the EVM key correctly).
+
+        See [`docs/validator/quickstart.md`](https://github.com/subnet112/minotaur_subnet/blob/main/docs/validator/quickstart.md)
+        for the full setup walkthrough.
+
+  - type: input
+    id: evm_address
+    attributes:
+      label: EVM signing address (checksummed)
+      description: |
+        From `cast wallet new` or your existing key. Will be written to
+        ValidatorRegistry on both Base and BT EVM. Does NOT need funds.
+      placeholder: "0x..."
+    validations:
+      required: true
+
+  - type: input
+    id: hotkey
+    attributes:
+      label: Bittensor SS58 hotkey
+      description: |
+        The hotkey you registered on subnet 112. We will verify it appears on
+        the metagraph before adding your EVM address on-chain.
+      placeholder: "5..."
+    validations:
+      required: true
+
+  - type: input
+    id: axon_url
+    attributes:
+      label: Public axon URL
+      description: |
+        The URL your validator daemon serves `/identity` on. Format:
+        `http://<host>:9100`. Must be reachable from the public internet —
+        our `ProtocolConfig.refresh_loop` will probe it.
+      placeholder: "http://your-host:9100"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Pre-flight self-checks
+      description: Tick all four before submitting.
+      options:
+        - label: My hotkey is registered on subnet 112 (visible in `btcli subnet metagraph --netuid 112`).
+          required: true
+        - label: My validator daemon is running and `curl http://<my-axon-url>/identity` returns a JSON payload with a `signature` field (not a 503).
+          required: true
+        - label: I generated the EVM signing key fresh and it is NOT shared with any other validator.
+          required: true
+        - label: I have read [`docs/validator/quickstart.md`](https://github.com/subnet112/minotaur_subnet/blob/main/docs/validator/quickstart.md) and operate the recommended every-6h anvil-recycle cron.
+          required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: |
+        Optional — hosting provider, hardware spec, deviations from the canonical
+        compose, or anything else you want us to know.

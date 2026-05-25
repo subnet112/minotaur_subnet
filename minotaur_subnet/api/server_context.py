@@ -37,6 +37,14 @@ class ServerContext:
     block_loop: Any = None
     block_loop_task: Any = None
 
+    # ── champion-consensus ProtocolConfig ────────────────────────────────
+    # Created at startup pointed at BT EVM ValidatorRegistry (for the
+    # validator set) + ChampionRegistry (for the quorum threshold). The
+    # metagraph_provider is wired LATER, after solver_round_metagraph_sync
+    # is initialized, so the refresh loop can do real peer discovery.
+    champion_protocol_config: Any = None
+    champion_protocol_config_task: Any = None
+
     # ── health snapshots ─────────────────────────────────────────────────
     provenance_policy_health: dict = field(default_factory=lambda: {
         "valid": False,
