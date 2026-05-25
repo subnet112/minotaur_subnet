@@ -559,14 +559,46 @@ async def initialize(ctx: ServerContext) -> dict:
         logger.info("Benchmark worker started (poll every %ds)", poll_interval)
 
     # ── relayer ──────────────────────────────────────────────────────────
+    # Two modes, picked by env:
+    #
+    #   RELAYER_URL set  → HttpRelayer client. Validators sign quorum
+    #     approvals; the api process POSTs the signed bundle to the
+    #     subnet team's singleton relayer service, which verifies sigs
+    #     against the on-chain ValidatorRegistry and pays gas. The api
+    #     process never holds RELAYER_PRIVATE_KEY. This is the path for
+    #     third-party validators (and the new prod cutover target —
+    #     gas budget stays with the singleton even if leadership rotates).
+    #
+    #   USE_EVM_RELAYER set + RELAYER_URL unset → embedded EvmRelayer.
+    #     The legacy path: the api process holds RELAYER_PRIVATE_KEY
+    #     and submits directly via web3. Used by local-testnet, existing
+    #     tests, and prod during the transition until we cut over to
+    #     RELAYER_URL.
+    #
+    #   Neither set → no relayer (api stays in read-only mode, useful
+    #     for the third-party canonical compose's pre-cutover phase).
     relayer_instance = None
-    if os.environ.get("USE_EVM_RELAYER", "").lower() in ("1", "true", "yes"):
+    relayer_url = os.environ.get("RELAYER_URL", "").strip()
+    use_embedded = os.environ.get("USE_EVM_RELAYER", "").lower() in ("1", "true", "yes")
+
+    if relayer_url:
+        from minotaur_subnet.relayer.http_relayer import HttpRelayer
+        relayer_instance = HttpRelayer(url=relayer_url)
+        logger.info(
+            "Relayer mode: HTTP client → %s (no local gas wallet)",
+            relayer_url,
+        )
+    elif use_embedded:
         from minotaur_subnet.relayer import EvmRelayer
         from minotaur_subnet.relayer.chain_config import get_supported_chains
         relayer_key = os.environ.get("RELAYER_PRIVATE_KEY", "")
         relayer_instance = EvmRelayer(
             chains=get_supported_chains(),
             private_key=relayer_key,
+        )
+        logger.info(
+            "Relayer mode: embedded EvmRelayer (RELAYER_PRIVATE_KEY in this process). "
+            "Set RELAYER_URL to use a remote singleton relayer instead.",
         )
 
         from minotaur_subnet.deployment.compiler import ForgeCompiler
