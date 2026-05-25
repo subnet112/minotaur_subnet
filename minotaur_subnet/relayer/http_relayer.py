@@ -146,13 +146,44 @@ class HttpRelayer(RelayerBase):
     ) -> tuple[str, str]:
         """Deploy a contract via the remote relayer's ``POST /deploy``.
 
+        Signs an EIP-191 freshness wrapper around ``(bytecode, args, chain_id)``
+        using ``self.signing_key``. The relayer recovers the signer and
+        rejects deploys whose signer isn't in the on-chain ``ValidatorRegistry``.
+        Same protocol as ``submit_plan``, with the wrapper's ``plan_hash``
+        field repurposed as ``compute_deploy_hash(bytecode, args)``.
+
         Returns ``(contract_address, tx_hash)``. Raises on relayer error
         or transport failure — DeployService expects this contract.
         """
+        if not self.signing_key:
+            raise RuntimeError(
+                "deploy_contract: HttpRelayer requires signing_key — set "
+                "VALIDATOR_PRIVATE_KEY on the api so it can sign the deploy wrapper"
+            )
+
+        from minotaur_subnet.consensus.leader_wrapper import compute_deploy_hash
+
+        constructor_args_list = list(constructor_args or [])
+        deploy_hash = compute_deploy_hash(bytecode, constructor_args_list)
+        nonce = next(self._nonce_counter)
+        wrapper, wrapper_sig = sign_wrapper(
+            self.signing_key,
+            plan_hash=deploy_hash,
+            submission_nonce=nonce,
+            chain_id=int(chain_id),
+        )
+
         payload = {
             "bytecode": bytecode,
-            "constructor_args": list(constructor_args or []),
+            "constructor_args": constructor_args_list,
             "chain_id": int(chain_id),
+            "wrapper": {
+                "plan_hash": wrapper.plan_hash,
+                "submission_nonce": wrapper.submission_nonce,
+                "timestamp": wrapper.timestamp,
+                "chain_id": wrapper.chain_id,
+            },
+            "wrapper_signature": wrapper_sig,
         }
         timeout = aiohttp.ClientTimeout(total=self.deploy_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:

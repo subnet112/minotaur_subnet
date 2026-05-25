@@ -25,6 +25,7 @@ from aiohttp import web
 
 from minotaur_subnet.consensus.leader_wrapper import (
     WrapperPayload,
+    compute_deploy_hash,
     is_wrapper_fresh,
     recover_wrapper_signer,
 )
@@ -513,23 +514,169 @@ class RelayerService:
         })
 
     async def handle_deploy(self, request: web.Request) -> web.Response:
-        """POST /deploy — deploy an App contract."""
+        """POST /deploy — deploy an App contract.
+
+        Same wrapper-sig + safeguards path as ``/v1/submit-plan``: the caller
+        must include an EIP-191 wrapper whose recovered signer is in the
+        on-chain ``ValidatorRegistry`` for the target chain. The wrapper's
+        ``plan_hash`` field is bound to ``compute_deploy_hash(bytecode, args)``
+        — so a captured wrapper signature can't be replayed against different
+        bytecode or different constructor args.
+
+        Audit: 2026-05-25 found this endpoint fully unauthenticated. A 1-byte
+        garbage contract was deployed to Base mainnet from the open relayer.
+        Anyone could drain the gas wallet in a loop.
+        """
         try:
             data = await request.json()
-            address, tx_hash = await self.relayer.deploy_contract(
-                bytecode=data["bytecode"],
-                constructor_args=data.get("constructor_args", []),
-                chain_id=data["chain_id"],
-            )
-            return web.json_response({
-                "status": "deployed",
-                "address": address,
-                "tx_hash": tx_hash,
-            })
         except Exception as exc:
             return web.json_response(
-                {"error": str(exc)}, status=400,
+                {"error": f"malformed JSON: {exc}"}, status=400,
             )
+
+        bytecode = data.get("bytecode")
+        constructor_args = data.get("constructor_args", []) or []
+        chain_id_raw = data.get("chain_id")
+        if not bytecode or chain_id_raw is None:
+            return web.json_response(
+                {"error": "bytecode + chain_id required"}, status=400,
+            )
+        try:
+            chain_id = int(chain_id_raw)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": f"invalid chain_id: {chain_id_raw!r}"}, status=400,
+            )
+
+        chain_cfg = self.chains.get(chain_id)
+        if chain_cfg is None:
+            return web.json_response(
+                {"error": f"unsupported chain_id {chain_id}"}, status=400,
+            )
+
+        # ── Safeguard 1: daily gas cap precheck ─────────────────────────
+        ok, err = self.safeguards.check_daily_gas_room()
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        # ── Safeguard 2: wrapper-sig verification ──────────────────────
+        wrapper_data = data.get("wrapper")
+        wrapper_sig = data.get("wrapper_signature")
+        if not wrapper_data or not wrapper_sig:
+            return web.json_response(
+                {
+                    "error": (
+                        "missing wrapper or wrapper_signature — the caller must "
+                        "sign a freshness wrapper around the deploy request "
+                        "(see consensus.leader_wrapper.sign_wrapper with "
+                        "plan_hash=compute_deploy_hash(bytecode, constructor_args))"
+                    ),
+                },
+                status=400,
+            )
+
+        try:
+            wrapper = WrapperPayload(
+                plan_hash=wrapper_data["plan_hash"],
+                submission_nonce=int(wrapper_data["submission_nonce"]),
+                timestamp=int(wrapper_data["timestamp"]),
+                chain_id=int(wrapper_data["chain_id"]),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return web.json_response(
+                {"error": f"malformed wrapper: {exc}"}, status=400,
+            )
+
+        try:
+            expected_deploy_hash = compute_deploy_hash(bytecode, constructor_args)
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"bad bytecode/args: {exc}"}, status=400,
+            )
+
+        if wrapper.plan_hash != expected_deploy_hash:
+            return web.json_response(
+                {"error": "wrapper plan_hash doesn't match deploy params"},
+                status=400,
+            )
+        if wrapper.chain_id != chain_id:
+            return web.json_response(
+                {"error": "wrapper chain_id doesn't match request"},
+                status=400,
+            )
+
+        ok, err = is_wrapper_fresh(wrapper)
+        if not ok:
+            return web.json_response({"error": err}, status=400)
+
+        try:
+            wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"wrapper sig invalid: {exc}"}, status=400,
+            )
+
+        if not chain_cfg.validator_registry_address:
+            return web.json_response(
+                {"error": f"no ValidatorRegistry configured on chain {chain_id}"},
+                status=500,
+            )
+        try:
+            authorized = _read_authorized_validators(
+                chain_cfg.rpc_url,
+                chain_cfg.validator_registry_address,
+            )
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"ValidatorRegistry read failed: {exc}"}, status=502,
+            )
+        authorized_lower = {addr.lower() for addr in authorized}
+
+        if wrapper_signer.lower() not in authorized_lower:
+            return web.json_response(
+                {
+                    "error": (
+                        f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                        f"on chain {chain_id} — only registered validators can deploy"
+                    ),
+                },
+                status=403,
+            )
+
+        # ── Safeguard 3: monotonic nonce ────────────────────────────────
+        ok, err = self.safeguards.check_signer_nonce(wrapper_signer, wrapper.submission_nonce)
+        if not ok:
+            return web.json_response({"error": err}, status=409)
+
+        # ── Safeguard 4: per-caller rate limit ─────────────────────────
+        ok, err = self.safeguards.check_caller_rate(wrapper_signer)
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        logger.info(
+            "Relayer: deploy accepted (chain=%d wrapper-signer=%s nonce=%d "
+            "bytecode_len=%d args=%d)",
+            chain_id, wrapper_signer[:10], wrapper.submission_nonce,
+            len(bytecode), len(constructor_args),
+        )
+
+        try:
+            address, tx_hash = await self.relayer.deploy_contract(
+                bytecode=bytecode,
+                constructor_args=constructor_args,
+                chain_id=chain_id,
+            )
+        except Exception as exc:
+            logger.exception("Relayer: deploy_contract crashed on chain %d", chain_id)
+            return web.json_response(
+                {"error": f"deploy_contract crashed: {exc}"}, status=500,
+            )
+
+        return web.json_response({
+            "status": "deployed",
+            "address": address,
+            "tx_hash": tx_hash,
+        })
 
     async def handle_tx_status(self, request: web.Request) -> web.Response:
         """GET /status/{tx_hash} — check transaction status."""

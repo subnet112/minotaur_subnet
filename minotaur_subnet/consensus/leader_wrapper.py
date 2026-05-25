@@ -31,8 +31,10 @@ Signed with EIP-191 personal_sign over keccak256(abi_encode(...)).
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from eth_abi import encode as abi_encode
 from eth_account import Account
@@ -116,6 +118,36 @@ def recover_wrapper_signer(payload: WrapperPayload, signature_hex: str) -> str:
         sig_bytes_hex = "0x" + sig_bytes_hex
     msg = encode_defunct(primitive=_digest(payload))
     return Account.recover_message(msg, signature=sig_bytes_hex)
+
+
+def compute_deploy_hash(bytecode: str, constructor_args: Any) -> str:
+    """Hash a contract-deploy request for use as the wrapper's ``plan_hash`` field.
+
+    The wrapper protocol (originally built for order submissions) commits
+    to a ``plan_hash``. When the same wrapper protects ``POST /deploy`` we
+    repurpose that field to bind the deploy params, so a captured wrapper
+    signature can't be replayed against a different bytecode or args.
+
+    Inputs:
+        bytecode: 0x-prefixed hex of the contract bytecode.
+        constructor_args: JSON-serializable list of constructor args.
+
+    Returns:
+        0x-prefixed 32-byte hex digest. Both the api client and the relayer
+        compute this independently — they must agree byte-for-byte.
+    """
+    bc_hex = bytecode[2:] if bytecode.startswith("0x") else bytecode
+    bc_bytes = bytes.fromhex(bc_hex)
+    # Canonical JSON: sorted keys + minimal whitespace + utf-8. Any other
+    # serialization choice would let an attacker mutate the args without
+    # changing the hash.
+    args_canonical = json.dumps(
+        constructor_args or [], sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    digest = keccak(
+        abi_encode(["bytes", "bytes"], [bc_bytes, args_canonical]),
+    )
+    return "0x" + digest.hex()
 
 
 def is_wrapper_fresh(
