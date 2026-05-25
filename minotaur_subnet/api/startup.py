@@ -947,6 +947,12 @@ async def initialize(ctx: ServerContext) -> dict:
 
         if simulator is not None:
             apps.set_simulator(simulator)
+            # Also wire the simulator into the local-testnet replay-debug
+            # handler when its router was mounted. Importing the module is
+            # cheap (no side effects); the route is what's conditional.
+            if os.environ.get("LOCAL_TESTNET", "").strip() == "1":
+                from minotaur_subnet.api.routes import local_testnet
+                local_testnet.set_simulator(simulator)
 
         if simulator is not None and ctx.benchmark_worker is not None:
             ctx.benchmark_worker._simulator = simulator
