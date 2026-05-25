@@ -481,6 +481,10 @@ class TestSubmissionAPI(unittest.TestCase):
         os.environ["SUBMISSIONS_ACCEPTING"] = "1"
         os.environ["ENABLE_SOURCE_SUBMISSIONS"] = "1"
         os.environ["SUBMISSIONS_RATE_LIMIT_PER_MINUTE"] = "0"
+        # M1 (2026-05-25 audit) made the metagraph gate fail CLOSED.
+        # Test fixtures don't wire a real metagraph, so opt into the
+        # operator-override env for the duration of these tests.
+        os.environ["SUBMISSIONS_ALLOW_UNREGISTERED"] = "1"
         os.environ.pop("SUBMISSIONS_API_KEY", None)
         os.environ.pop("SOLVER_ROUND_INTERNAL_API_KEY", None)
         os.environ.pop("SOLVER_ROUND_EPOCH_SECONDS", None)
@@ -515,6 +519,7 @@ class TestSubmissionAPI(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("SUBMISSIONS_API_KEY", None)
+        os.environ.pop("SUBMISSIONS_ALLOW_UNREGISTERED", None)
         os.environ.pop("SOLVER_ROUND_INTERNAL_API_KEY", None)
         os.environ.pop("SOLVER_ROUND_EPOCH_SECONDS", None)
         os.environ.pop("SOLVER_ROUND_EPOCH_BLOCKS", None)
@@ -1577,8 +1582,11 @@ class TestRequireRegisteredMiner(unittest.TestCase):
         state = SimpleNamespace(peers=peers)
         return SimpleNamespace(state=state)
 
-    def test_failopen_when_metagraph_sync_unset(self):
-        """Local dev / test stacks lacking a subtensor connection bypass the gate."""
+    def test_failclosed_when_metagraph_sync_unset(self):
+        """M1 (2026-05-25 audit): gate now fails CLOSED when metagraph sync
+        is not wired. Operators must opt in via LOCAL_TESTNET=1 or
+        SUBMISSIONS_ALLOW_UNREGISTERED=1 to bypass."""
+        from fastapi import HTTPException
         from minotaur_subnet.api.server_context import ctx
         from minotaur_subnet.api.routes.submissions.routes import (
             _require_registered_miner,
@@ -1587,12 +1595,15 @@ class TestRequireRegisteredMiner(unittest.TestCase):
         prev = ctx.solver_round_metagraph_sync
         try:
             ctx.solver_round_metagraph_sync = None
-            _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+            with self.assertRaises(HTTPException) as exc_ctx:
+                _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+            self.assertEqual(exc_ctx.exception.status_code, 503)
         finally:
             ctx.solver_round_metagraph_sync = prev
 
-    def test_failopen_when_state_never_synced(self):
-        """During startup the state is None — gate must not falsely reject."""
+    def test_failclosed_when_state_never_synced(self):
+        """M1: state-None now rejects with 503 instead of accepting silently."""
+        from fastapi import HTTPException
         from minotaur_subnet.api.server_context import ctx
         from minotaur_subnet.api.routes.submissions.routes import (
             _require_registered_miner,
@@ -1601,9 +1612,29 @@ class TestRequireRegisteredMiner(unittest.TestCase):
         prev = ctx.solver_round_metagraph_sync
         try:
             ctx.solver_round_metagraph_sync = SimpleNamespace(state=None)
-            _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+            with self.assertRaises(HTTPException) as exc_ctx:
+                _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+            self.assertEqual(exc_ctx.exception.status_code, 503)
         finally:
             ctx.solver_round_metagraph_sync = prev
+
+    def test_local_testnet_bypasses_metagraph_check(self):
+        """M1 carve-out: LOCAL_TESTNET=1 preserves the previous open behavior
+        for dev workflows where there's no subtensor to sync against."""
+        import os
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev_env = os.environ.get("LOCAL_TESTNET")
+        try:
+            os.environ["LOCAL_TESTNET"] = "1"
+            _require_registered_miner("any_hotkey")  # no raise
+        finally:
+            if prev_env is None:
+                os.environ.pop("LOCAL_TESTNET", None)
+            else:
+                os.environ["LOCAL_TESTNET"] = prev_env
 
     def test_accepts_registered_hotkey(self):
         from fastapi import HTTPException
