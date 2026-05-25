@@ -33,7 +33,6 @@ from minotaur_subnet.consensus.signatures import hash_plan, verify_plan_approval
 from minotaur_subnet.relayer.chain_config import get_supported_chains
 from minotaur_subnet.relayer.evm_relayer import EvmRelayer
 from minotaur_subnet.relayer.safeguards import Safeguards
-from minotaur_subnet.relayer.signature_collector import SignatureCollector
 from minotaur_subnet.relayer.gas_manager import GasManager
 from minotaur_subnet.relayer.validator_sync import ValidatorSync
 from minotaur_subnet.shared.types import (
@@ -146,52 +145,24 @@ class RelayerService:
             rpc_url=primary.rpc_url,
             registry_address=primary.validator_registry_address,
         )
-        self.collector = SignatureCollector(
-            protocol_config=self.protocol_config,
-            validators=[],  # Populated by validator_sync
-        )
+        # SignatureCollector removed in H3 audit fix; sig collection happens
+        # at the api leader, the relayer only verifies pre-formed quorum
+        # bundles via /v1/submit-plan.
         self.gas_manager = GasManager(chains=self.chains)
         self.validator_sync = ValidatorSync(chains=self.chains)
         self.safeguards = Safeguards.from_env()
 
-    async def handle_submit_signature(self, request: web.Request) -> web.Response:
-        """POST /signatures — validator submits a plan approval signature."""
-        try:
-            data = await request.json()
-            plan_hash = data["plan_hash"]
-            validator_address = data["validator_address"]
-            signature = bytes.fromhex(data["signature"].replace("0x", ""))
-            order_id = data.get("order_id", "")
-            score = data.get("score", 0.0)
-
-            result = self.collector.add_signature(
-                plan_hash=plan_hash,
-                validator_address=validator_address,
-                signature=signature,
-                order_id=order_id,
-                score=score,
-            )
-
-            if result is not None:
-                # Quorum reached — submit to chain
-                submit_result = await self.relayer.submit_plan(
-                    result.order, result.plan, result.score,
-                )
-                return web.json_response({
-                    "status": "submitted",
-                    "tx_hash": submit_result.tx_hash,
-                    "success": submit_result.success,
-                })
-
-            return web.json_response({
-                "status": "collected",
-                "pending": self.collector.pending_count,
-            })
-
-        except Exception as exc:
-            return web.json_response(
-                {"error": str(exc)}, status=400,
-            )
+    # H3 (2026-05-25 audit): the legacy ``POST /signatures`` handler used
+    # to live here. It accepted individual validator EIP-712 sigs and
+    # auto-submitted on quorum, bypassing ALL of the Phase C/D safeguards
+    # (no wrapper sig, no monotonic nonce, no rate limit, no gas cap,
+    # no plan-hash dedup). Anyone who could observe a quorum's worth of
+    # validator approvals on the consensus mesh could replay them through
+    # this back door and force a gas-burning submission.
+    #
+    # Deleted. The authoritative submission path is ``POST /v1/submit-plan``
+    # — see ``handle_submit_plan`` below. It accepts a pre-formed quorum
+    # bundle + wrapper sig and runs the full safeguard chain.
 
     async def handle_submit_plan(self, request: web.Request) -> web.Response:
         """POST /v1/submit-plan — submit a fully-signed quorum bundle.
@@ -560,7 +531,8 @@ def create_app() -> web.Application:
     service = RelayerService()
     app = web.Application()
 
-    app.router.add_post("/signatures", service.handle_submit_signature)
+    # /signatures route removed in H3 audit fix; only /v1/submit-plan is
+    # the canonical submission path now.
     app.router.add_post("/v1/submit-plan", service.handle_submit_plan)
     app.router.add_post("/deploy", service.handle_deploy)
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
