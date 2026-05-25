@@ -16,9 +16,32 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _reset_local_testnet_env():
+    """Always restore ``LOCAL_TESTNET`` env to its pre-test value.
+
+    Previously these tests set ``os.environ["LOCAL_TESTNET"] = "1"`` and
+    never cleaned up, bleeding into other test files (notably
+    ``test_submissions.py::TestRequireRegisteredMiner``) where the M1
+    fail-closed gate has a carve-out for ``LOCAL_TESTNET=1``. Caught
+    when the full suite went red after PR #34 made the rot visible to
+    CI again.
+    """
+    prev = os.environ.get("LOCAL_TESTNET")
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("LOCAL_TESTNET", None)
+        else:
+            os.environ["LOCAL_TESTNET"] = prev
 
 
 DEV_ONLY_PATHS = {
