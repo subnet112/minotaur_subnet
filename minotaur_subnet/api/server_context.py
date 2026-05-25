@@ -45,6 +45,15 @@ class ServerContext:
     champion_protocol_config: Any = None
     champion_protocol_config_task: Any = None
 
+    # ── order-consensus ProtocolConfig ───────────────────────────────────
+    # Sibling of champion's: pointed at Base ValidatorRegistry. Used by
+    # the leader's ``ValidatorPeerNetwork`` to auto-discover external
+    # validators via metagraph + on-chain registry cross-attestation,
+    # combined with any ``ORDER_CONSENSUS_PEERS`` env-pinned set via the
+    # peer_network union mode.
+    order_protocol_config: Any = None
+    order_protocol_config_task: Any = None
+
     # ── health snapshots ─────────────────────────────────────────────────
     provenance_policy_health: dict = field(default_factory=lambda: {
         "valid": False,

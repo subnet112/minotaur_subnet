@@ -1051,6 +1051,9 @@ async def initialize(ctx: ServerContext) -> dict:
                         rpc_url=order_rpc_url,
                         registry_address=order_registry_address,
                     )
+                    # Stash on ctx so the refresh_loop task can be wired
+                    # later, after solver_round_metagraph_sync is up.
+                    ctx.order_protocol_config = order_protocol_config
 
                     consensus = ConsensusManager(
                         validator_id=leader_addr,
@@ -1520,6 +1523,25 @@ async def initialize(ctx: ServerContext) -> dict:
                             "Champion ProtocolConfig refresh loop started "
                             "(metagraph discovery + on-chain quorum, %ds interval)",
                             ctx.champion_protocol_config.refresh_interval_seconds,
+                        )
+
+                    # Same wiring for ORDER consensus's ProtocolConfig — the
+                    # leader's ValidatorPeerNetwork reads its discovered set
+                    # through this. Without the refresh loop running, the
+                    # discovery side of peer_network's union-mode stays empty
+                    # and only env-pinned peers get proposals. The same
+                    # metagraph provider works for both: discover_peers
+                    # cross-attests against the order/champion-specific
+                    # ValidatorRegistry, which filters out non-members.
+                    if ctx.order_protocol_config is not None and ctx.order_protocol_config_task is None:
+                        ctx.order_protocol_config.metagraph_provider = _champion_metagraph_peers
+                        ctx.order_protocol_config_task = asyncio.create_task(
+                            ctx.order_protocol_config.refresh_loop(),
+                        )
+                        logger.info(
+                            "Order ProtocolConfig refresh loop started "
+                            "(metagraph discovery + on-chain quorum, %ds interval)",
+                            ctx.order_protocol_config.refresh_interval_seconds,
                         )
 
                     logger.info(
