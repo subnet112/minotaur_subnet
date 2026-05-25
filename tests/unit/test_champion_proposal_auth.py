@@ -13,6 +13,14 @@ from minotaur_subnet.api.routes.submissions.routes import (
     _champion_proposal_rate_limit_check,
     _CHAMPION_PROPOSAL_LAST_SEEN,
 )
+from minotaur_subnet.validator import metagraph_sync as metagraph_sync_module
+
+
+@pytest.fixture
+def unlock_leader(monkeypatch):
+    """Clear the leader lock so any-validator acceptance is exercised."""
+    monkeypatch.setattr(metagraph_sync_module, "LOCKED_LEADER_EVM_ADDRESS", "")
+    yield
 
 
 def _make_body(**overrides):
@@ -44,7 +52,7 @@ def test_sig_verify_on_rejects_missing(monkeypatch):
     assert "Missing proposer" in err
 
 
-def test_sig_verify_on_accepts_real_signature(monkeypatch):
+def test_sig_verify_on_accepts_real_signature(monkeypatch, unlock_leader):
     """A real ECDSA sig over the canonical payload from a consistent signer passes."""
     monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
     monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
@@ -63,6 +71,57 @@ def test_sig_verify_on_accepts_real_signature(monkeypatch):
     body.model_dump.return_value["proposer_signature"] = body.proposer_signature
 
     assert _verify_champion_proposal_signature(body) is None
+
+
+def test_sig_verify_locked_leader_accepts_matching_signer(monkeypatch):
+    """When LOCKED_LEADER_EVM_ADDRESS is set, only that address is accepted."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
+    monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
+
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    acct = Account.create()
+    monkeypatch.setattr(
+        metagraph_sync_module, "LOCKED_LEADER_EVM_ADDRESS", acct.address,
+    )
+
+    body = _make_body(proposer=acct.address)
+    payload = body.model_dump()
+    payload.pop("proposer_signature", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    signed = Account.sign_message(encode_defunct(text=canonical), private_key=acct.key)
+    body.proposer_signature = signed.signature.hex()
+    body.model_dump.return_value["proposer_signature"] = body.proposer_signature
+
+    assert _verify_champion_proposal_signature(body) is None
+
+
+def test_sig_verify_locked_leader_rejects_other_signer(monkeypatch):
+    """A signature from any non-locked address is rejected even if registered."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
+    monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
+
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    locked = Account.create()
+    other = Account.create()
+    monkeypatch.setattr(
+        metagraph_sync_module, "LOCKED_LEADER_EVM_ADDRESS", locked.address,
+    )
+
+    body = _make_body(proposer=other.address)
+    payload = body.model_dump()
+    payload.pop("proposer_signature", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    signed = Account.sign_message(encode_defunct(text=canonical), private_key=other.key)
+    body.proposer_signature = signed.signature.hex()
+    body.model_dump.return_value["proposer_signature"] = body.proposer_signature
+
+    err = _verify_champion_proposal_signature(body)
+    assert err is not None
+    assert "locked leader" in err
 
 
 def test_sig_verify_on_rejects_wrong_signer(monkeypatch):

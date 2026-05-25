@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from minotaur_subnet.validator import metagraph_sync as metagraph_sync_module
 from minotaur_subnet.validator.metagraph_sync import (
     MetagraphSync,
     MetagraphState,
@@ -18,13 +19,55 @@ from minotaur_subnet.validator.metagraph_sync import (
 )
 
 
-# ── Leader Election Tests ────────────────────────────────────────────────────
+@pytest.fixture
+def unlock_leader(monkeypatch):
+    """Clear LOCKED_LEADER_HOTKEY for tests that exercise stake-based election."""
+    monkeypatch.setattr(metagraph_sync_module, "LOCKED_LEADER_HOTKEY", "")
+    yield
+
+
+# ── Leader Election Tests (locked leader) ────────────────────────────────────
+
+
+class TestElectLeaderLocked:
+    """Locked-leader election: only LOCKED_LEADER_HOTKEY is eligible."""
+
+    def test_returns_locked_hotkey_regardless_of_stake(self, monkeypatch):
+        monkeypatch.setattr(metagraph_sync_module, "LOCKED_LEADER_HOTKEY", "hk_locked")
+        peers = [
+            PeerInfo(uid=0, hotkey="hk_a", stake=1_000_000.0, evm_address="0xaaa"),
+            PeerInfo(uid=1, hotkey="hk_locked", stake=1.0, evm_address="0xlll"),
+            PeerInfo(uid=2, hotkey="hk_c", stake=500.0, evm_address="0xccc"),
+        ]
+        leader = elect_leader(peers)
+        assert leader is not None
+        assert leader.hotkey == "hk_locked"
+
+    def test_returns_none_when_locked_hotkey_absent(self, monkeypatch):
+        monkeypatch.setattr(metagraph_sync_module, "LOCKED_LEADER_HOTKEY", "hk_locked")
+        peers = [
+            PeerInfo(uid=0, hotkey="hk_a", stake=100.0, evm_address="0xaaa"),
+            PeerInfo(uid=1, hotkey="hk_b", stake=200.0, evm_address="0xbbb"),
+        ]
+        assert elect_leader(peers) is None
+
+    def test_returns_locked_hotkey_even_with_zero_stake(self, monkeypatch):
+        monkeypatch.setattr(metagraph_sync_module, "LOCKED_LEADER_HOTKEY", "hk_locked")
+        peers = [
+            PeerInfo(uid=0, hotkey="hk_locked", stake=0.0, evm_address="0xlll"),
+        ]
+        leader = elect_leader(peers)
+        assert leader is not None
+        assert leader.hotkey == "hk_locked"
+
+
+# ── Leader Election Tests (stake-based, unlocked) ───────────────────────────
 
 
 class TestElectLeader:
-    """Test deterministic leader election."""
+    """Stake-based election (exercised by clearing the lock)."""
 
-    def test_highest_stake_wins(self):
+    def test_highest_stake_wins(self, unlock_leader):
         peers = [
             PeerInfo(uid=0, hotkey="hk_a", stake=100.0, evm_address="0xaaa"),
             PeerInfo(uid=1, hotkey="hk_b", stake=200.0, evm_address="0xbbb"),
@@ -35,7 +78,7 @@ class TestElectLeader:
         assert leader.hotkey == "hk_b"
         assert leader.stake == 200.0
 
-    def test_tiebreaker_by_hotkey_ascending(self):
+    def test_tiebreaker_by_hotkey_ascending(self, unlock_leader):
         peers = [
             PeerInfo(uid=0, hotkey="hk_c", stake=100.0, evm_address="0xccc"),
             PeerInfo(uid=1, hotkey="hk_a", stake=100.0, evm_address="0xaaa"),
@@ -45,7 +88,7 @@ class TestElectLeader:
         assert leader is not None
         assert leader.hotkey == "hk_a"  # Lexicographically smallest
 
-    def test_no_staked_peers_returns_none(self):
+    def test_no_staked_peers_returns_none(self, unlock_leader):
         peers = [
             PeerInfo(uid=0, hotkey="hk_a", stake=0.0, evm_address="0xaaa"),
             PeerInfo(uid=1, hotkey="hk_b", stake=0.0, evm_address="0xbbb"),
@@ -53,11 +96,11 @@ class TestElectLeader:
         leader = elect_leader(peers)
         assert leader is None
 
-    def test_empty_peer_list(self):
+    def test_empty_peer_list(self, unlock_leader):
         leader = elect_leader([])
         assert leader is None
 
-    def test_single_staked_peer(self):
+    def test_single_staked_peer(self, unlock_leader):
         peers = [
             PeerInfo(uid=0, hotkey="hk_a", stake=0.0, evm_address="0xaaa"),
             PeerInfo(uid=1, hotkey="hk_b", stake=50.0, evm_address="0xbbb"),
@@ -66,7 +109,7 @@ class TestElectLeader:
         assert leader is not None
         assert leader.hotkey == "hk_b"
 
-    def test_deterministic_across_calls(self):
+    def test_deterministic_across_calls(self, unlock_leader):
         """Same input always produces same leader."""
         peers = [
             PeerInfo(uid=0, hotkey="hk_a", stake=100.0, evm_address="0xaaa"),
@@ -75,7 +118,7 @@ class TestElectLeader:
         results = [elect_leader(peers) for _ in range(10)]
         assert all(r.hotkey == results[0].hotkey for r in results)
 
-    def test_leader_changes_when_stake_changes(self):
+    def test_leader_changes_when_stake_changes(self, unlock_leader):
         peers = [
             PeerInfo(uid=0, hotkey="hk_a", stake=100.0, evm_address="0xaaa"),
             PeerInfo(uid=1, hotkey="hk_b", stake=200.0, evm_address="0xbbb"),

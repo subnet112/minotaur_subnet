@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
+from minotaur_subnet.validator import metagraph_sync as metagraph_sync_module
 from minotaur_subnet.validator.scoring_engine import ScoringEngine
 
 
@@ -92,3 +93,59 @@ def test_signed_proposals_env_reads_at_decision_time():
         "verify_proposer_signature must read the env at call time so the "
         "toggle takes effect without a process restart."
     )
+
+
+def test_locked_leader_rejects_non_leader_signer(monkeypatch):
+    """When the leader is locked, any other registered validator's sig is rejected."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_PROPOSALS", "1")
+
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    locked = Account.create()
+    other = Account.create()
+    monkeypatch.setattr(
+        metagraph_sync_module, "LOCKED_LEADER_EVM_ADDRESS", locked.address,
+    )
+
+    engine = _fresh_engine()
+    body = {
+        "order_id": "ord_1",
+        "plan_hash": "0xdead",
+        "score": 0.9,
+        "plan": {},
+    }
+    canonical = __import__("json").dumps(body, sort_keys=True, separators=(",", ":"))
+    signed = Account.sign_message(encode_defunct(text=canonical), private_key=other.key)
+    body["proposer_signature"] = signed.signature.hex()
+
+    ok, reason = engine.verify_proposer_signature(body)
+    assert ok is False
+    assert "locked leader" in reason
+
+
+def test_locked_leader_accepts_matching_signer(monkeypatch):
+    """The locked leader's signature passes without needing peer-set membership."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_PROPOSALS", "1")
+
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    locked = Account.create()
+    monkeypatch.setattr(
+        metagraph_sync_module, "LOCKED_LEADER_EVM_ADDRESS", locked.address,
+    )
+
+    engine = _fresh_engine()
+    body = {
+        "order_id": "ord_1",
+        "plan_hash": "0xdead",
+        "score": 0.9,
+        "plan": {},
+    }
+    canonical = __import__("json").dumps(body, sort_keys=True, separators=(",", ":"))
+    signed = Account.sign_message(encode_defunct(text=canonical), private_key=locked.key)
+    body["proposer_signature"] = signed.signature.hex()
+
+    ok, reason = engine.verify_proposer_signature(body)
+    assert ok is True, f"locked leader should be accepted, got: {reason}"
