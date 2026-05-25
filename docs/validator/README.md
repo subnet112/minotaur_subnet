@@ -69,11 +69,14 @@ The Intent OrderBook is the universal entry point for all intent execution:
 
 ## HTTP API Endpoints
 
-The validator exposes an HTTP API on its configured port (default: 9100):
+The canonical third-party validator stack exposes HTTP on two ports.
+
+### Validator daemon — port 9100
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Service health, loaded intents, uptime |
+| `GET` | `/identity` | Self-attested EIP-712 binding `(evm_address, hotkey, axon_url)` for peer discovery |
 | `GET` | `/intents/available` | Active intents available for miners |
 | `GET` | `/intents/{app_id}/details` | Detailed info for a specific app |
 | `GET` | `/intents/{app_id}/scores` | Score history for a specific app |
@@ -84,10 +87,24 @@ The validator exposes an HTTP API on its configured port (default: 9100):
 | `POST` | `/orders/submit` | Submit an order to the OrderBook |
 | `GET` | `/orders` | List orders in the OrderBook |
 | `POST` | `/apps/{app_id}/quote` | Get a dry-run quote for an intent |
-| `POST` | `/consensus/proposal` | Receive a proposal from the leader (followers) |
-| `GET` | `/consensus/info` | Consensus configuration and peer info |
+| `POST` | `/consensus/proposal` | Receive an order-consensus proposal from the leader (followers) |
+| `GET` | `/consensus/info` | Order-consensus configuration and peer info |
 | `GET` | `/leader` | Leader status and metagraph info |
 | `POST` | `/reload` | Reload app definitions from store |
+
+### API service — port 8080
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Service health + champion-consensus state |
+| `GET` | `/identity` | Same EIP-712 binding as 9100 (api-side peer discovery) |
+| `GET` | `/v1/apps/` | List App Intents (read endpoint, no auth) |
+| `POST` | `/v1/apps/` | Create an App Intent (gated by `X-Admin-Key` header when `ADMIN_API_KEY` is set) |
+| `POST` | `/v1/apps/{app_id}/deploy` | Deploy an App Intent on-chain (admin-gated) |
+| `POST` | `/v1/solver/round/consensus/proposal` | Receive a champion-consensus proposal from the leader (followers) |
+| `POST` | `/v1/solver/round/certify` | Submit a certified champion (leader-only) |
+
+Both ports must be reachable from the public internet so the current leader can deliver proposals; see [quickstart.md](./quickstart.md#ports) for the full firewall guidance.
 
 Git/source solver submissions are currently served by the API server (`/v1/submissions*`), not by the standalone validator endpoint set above.
 
