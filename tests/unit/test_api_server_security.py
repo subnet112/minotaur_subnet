@@ -193,6 +193,13 @@ def test_demo_mode_native_proxy_startup_guard_rejects_missing_subtensor_url():
             "SUBTENSOR_URL": "",
             "SUBTENSOR_NETWORK": "finney",
             "NATIVE_BITTENSOR_NETWORK": "",
+            # Required by api/startup env_check (added 2026-05). Set to
+            # non-empty stubs + skip the contract-presence check so this
+            # test reaches the SUBTENSOR_URL guard rather than earlier
+            # guards.
+            "VALIDATOR_REGISTRY_8453": "0x" + "00" * 20,
+            "VALIDATOR_REGISTRY_964": "0x" + "00" * 20,
+            "SKIP_CONTRACT_PRESENCE_CHECK": "1",
         },
         clear=False,
     ):
