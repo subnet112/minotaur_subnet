@@ -164,7 +164,17 @@ class TestValidatorPeerNetworkDiscoveryMode:
         cfg.peers.append(_peer(2))
         assert len(net.peers) == 2
 
-    def test_explicit_peers_override_pins_set(self):
+    def test_explicit_peers_union_with_discovered(self):
+        """Pinned override + discovered peers combine into a union.
+
+        Updated 2026-05-25 from the previous mutually-exclusive
+        behavior to support the third-party-validator use case:
+        team-internal peers stay env-pinned (they aren't on the
+        Bittensor metagraph) while externally-reachable validators
+        are auto-discovered. Pinned still wins on EVM collision —
+        see test_union_pinned_takes_precedence_on_conflict in
+        test_peer_network_union_mode.py.
+        """
         cfg = _cfg(peers=[_peer(1), _peer(2)])
         pinned = [PeerEndpoint(validator_id="0xpinned", url="http://pin:9100")]
         net = ValidatorPeerNetwork(
@@ -174,13 +184,19 @@ class TestValidatorPeerNetworkDiscoveryMode:
             peers=pinned,
             protocol_config=cfg,
         )
-        # Pinned wins
+        # Union: pinned first, then discovered (deduped — no overlap here)
         urls = [p.url for p in net.peers]
-        assert urls == ["http://pin:9100"]
+        assert urls == ["http://pin:9100", "http://peer-1:9100", "http://peer-2:9100"]
 
-        # And discovery mutations don't break it
+        # Discovery mutations are reflected — the union recomputes on read
         cfg.peers.append(_peer(99))
-        assert [p.url for p in net.peers] == ["http://pin:9100"]
+        urls_after = [p.url for p in net.peers]
+        assert urls_after == [
+            "http://pin:9100",
+            "http://peer-1:9100",
+            "http://peer-2:9100",
+            "http://peer-99:9100",
+        ]
 
     def test_no_protocol_config_and_no_peers_returns_empty(self):
         net = ValidatorPeerNetwork(

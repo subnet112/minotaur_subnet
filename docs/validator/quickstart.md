@@ -111,13 +111,39 @@ Alchemy Growth (660M compute units / month) is overkill for a single follower. F
 
 If you already operate Bittensor validators with your own archive Ethereum nodes, point `ETH_UPSTREAM_RPC_URL` and `BASE_UPSTREAM_RPC_URL` at your local endpoints. The Anvil containers will fork from there with zero rate-limit risk.
 
-For **BT EVM** specifically, the public `https://lite.chain.opentensor.ai` works fine for a single validator's load. Switch to a private endpoint or omit the env var entirely (the validator falls back to the canonical default) if you see throttling.
+### Run your own subtensor (recommended for datacenter operators)
+
+The public `wss://entrypoint-finney.opentensor.ai:443` (substrate / metagraph) and `https://lite.chain.opentensor.ai` (BT EVM RPC) endpoints rate-limit **per source IP**. Operators sharing egress with other tenants in a datacenter colo often see throttling even at modest validator load — the cap is consumed by neighbors before their own traffic lands.
+
+If you already run your own `subtensor` node — and if you operate Bittensor validators at scale, you probably do — **the same node also serves the BT EVM JSON-RPC on the same port**. Frontier is built into the subtensor binary; no separate process, no separate port, no extra flag beyond the standard `--rpc-external --rpc-cors all`. The substrate RPC port (default `9944`) accepts both substrate WS *and* Ethereum-shaped JSON-RPC (`eth_call`, `eth_getStorageAt`, etc.) on the same listener.
+
+To point this validator stack at your own subtensor instead of the public endpoints:
+
+```bash
+# In platform/validator/.env
+SUBTENSOR_URL=ws://your-subtensor-host:9944
+BITTENSOR_EVM_UPSTREAM_RPC_URL=http://your-subtensor-host:9944
+```
+
+(Use `wss://` / `https://` if you've terminated TLS in front of your node. Anvil's `--fork-url` does HTTP polling, so use `http`/`https` for the EVM upstream — not `ws`/`wss`.)
+
+On the subtensor node itself, the standard `opentensor/subtensor` mainnet run script already does what you need:
+
+```
+subtensor --chain finney --rpc-external --rpc-cors all --rpc-max-connections 10000
+```
+
+See [opentensor/subtensor scripts/run/subtensor.sh](https://github.com/opentensor/subtensor/blob/main/scripts/run/subtensor.sh) for the upstream reference. Verify with `cast chain-id --rpc-url http://your-subtensor-host:9944` — it should return `964` (BT EVM mainnet). If it doesn't, you're either pointed at a non-finney chain or at a non-subtensor node.
+
+### Fall back to public endpoints
+
+Both env vars are optional and default to the public endpoints, which work fine for a single home-IP validator at the current early-network swap volume. If you're on a residential IP or a VPS with a unique egress IP and see no rate-limit logs, you can leave them unset.
 
 ### Other external services
 
 | Provider | Used for | Free tier sufficient? |
 |----------|----------|-----------------------|
-| **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads | Public endpoint, no signup |
+| **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads (default; replace with your own subtensor for DC operators) | Public endpoint, no signup |
 | **GitHub API (read-only)** | Pulling validator image from GHCR | Anonymous works for image pulls; benchmark-related miner clones go through the leader, not third-party followers |
 
 No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, deterministic, and CPU-bound.
@@ -144,8 +170,8 @@ For AWS security groups, allow inbound TCP 9100 and 8080 from `0.0.0.0/0`. For o
 
 | Destination | Port | Purpose |
 |-------------|------|---------|
-| `entrypoint-finney.opentensor.ai` | 443 (WSS) | Subtensor metagraph reads |
-| `lite.chain.opentensor.ai` | 443 (HTTPS) | BT EVM RPC |
+| `entrypoint-finney.opentensor.ai` | 443 (WSS) | Subtensor metagraph reads — **default only**; replaced by your own subtensor if `SUBTENSOR_URL` is overridden |
+| `lite.chain.opentensor.ai` | 443 (HTTPS) | BT EVM RPC — **default only**; replaced by your own subtensor if `BITTENSOR_EVM_UPSTREAM_RPC_URL` is overridden (the same subtensor node serves both) |
 | Alchemy / Infura host | 443 (HTTPS) | ETH and Base fork source RPCs |
 | Other validator peers | 9100 (HTTPS) | Consensus signing |
 | Leader API host | 8080 (HTTPS) | Proposal pull (followers) |

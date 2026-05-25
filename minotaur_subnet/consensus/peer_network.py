@@ -81,10 +81,15 @@ class ValidatorPeerNetwork:
         self._session: aiohttp.ClientSession | None = None
 
     def set_peers(self, peers: list[PeerEndpoint]) -> None:
-        """Update the pinned peer list (test / manual-override path).
+        """Set the pinned peer override.
 
-        Has no effect when the network is configured to read through to
-        ``protocol_config.peers`` — discovery loop drives the set in that mode.
+        The override and the discovery loop combine into a union when the
+        ``peers`` property is read — pinned entries take precedence on
+        ``validator_id`` collisions, then any discovered peers not in the
+        override are appended. This lets operators env-pin in-cluster peers
+        (which aren't on the Bittensor metagraph) while still picking up
+        externally-reachable validators auto-discovered via metagraph +
+        on-chain ``ValidatorRegistry`` cross-attestation.
         """
         # Exclude self
         self._peers_override = [p for p in peers if p.validator_id != self.validator_id]
@@ -92,20 +97,47 @@ class ValidatorPeerNetwork:
 
     @property
     def peers(self) -> list[PeerEndpoint]:
-        """Current peer list.
+        """Current peer list — union of pinned override + discovered set.
 
-        Pinned override (if set) takes precedence; otherwise reads through
-        to ``protocol_config.peers`` from the discovery loop, filtering self.
+        Sources, in order:
+          1. ``set_peers()`` override (typically ``ORDER_CONSENSUS_PEERS``
+             env at startup — the team's in-cluster peers that aren't on
+             the Bittensor metagraph).
+          2. ``protocol_config.peers`` from the discovery loop (metagraph
+             walk + ``ValidatorRegistry`` cross-attestation + ``/identity``
+             EIP-712 verification).
+
+        Deduped by lowercased ``validator_id``. Pinned entries win on
+        collision so an operator URL override is respected even if
+        discovery still reports an older URL. Self filtered from both
+        sources.
+
+        Backward-compat with the previous mutually-exclusive behavior:
+        if only one source has entries, the union is exactly that source.
         """
+        result: list[PeerEndpoint] = []
+        seen: set[str] = set()
+        me_lower = self.validator_id.lower()
+
         if self._peers_override is not None:
-            return list(self._peers_override)
-        if self.protocol_config is None:
-            return []
-        return [
-            PeerEndpoint(validator_id=p.evm_address, url=p.axon_url)
-            for p in self.protocol_config.peers
-            if p.evm_address.lower() != self.validator_id.lower()
-        ]
+            for p in self._peers_override:
+                key = p.validator_id.lower()
+                if key == me_lower or key in seen:
+                    continue
+                seen.add(key)
+                result.append(p)
+
+        if self.protocol_config is not None:
+            for p in self.protocol_config.peers:
+                key = p.evm_address.lower()
+                if key == me_lower or key in seen:
+                    continue
+                seen.add(key)
+                result.append(
+                    PeerEndpoint(validator_id=p.evm_address, url=p.axon_url)
+                )
+
+        return result
 
     def set_default_headers(self, headers: dict[str, str] | None) -> None:
         """Update default headers sent to peer validators."""
