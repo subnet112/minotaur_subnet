@@ -246,27 +246,44 @@ def _require_registered_miner(hotkey: str) -> None:
     """Reject submissions from hotkeys not currently in the subnet metagraph.
 
     Resource-hygiene gate — keeps the leaderboard, benchmark queue, and
-    Docker build cache scoped to actual subnet participants. Weight-system
-    safety is enforced separately in the emitter (which reroutes any
-    non-registered hotkey to the owner UID at emission time), so this gate
-    is allowed to fail open when the metagraph isn't available — it never
-    needs to be the only thing standing between an unregistered hotkey and
-    a malformed weight emission.
+    Docker build cache scoped to actual subnet participants.
 
-    Bypass cases:
-      - ``SUBMISSIONS_ALLOW_UNREGISTERED=1`` — emergency operator override.
-      - ``solver_round_metagraph_sync`` is None — local dev / test stacks
-        without a subtensor connection.
-      - Metagraph state has never synced yet — fail open during startup.
+    M1 (2026-05-25 audit): previously failed OPEN when ``solver_round_metagraph_sync``
+    was None or its state had never synced yet. The audit demonstrated a
+    live exploit: a fake hotkey was accepted on prod because metagraph
+    state was momentarily None. The gate is now FAIL-CLOSED — unavailable
+    metagraph means we reject, not accept. Operators can override via
+    ``SUBMISSIONS_ALLOW_UNREGISTERED=1`` for emergency or local dev.
+
+    Bypass cases (explicit only):
+      - ``SUBMISSIONS_ALLOW_UNREGISTERED=1`` — operator opt-in.
+      - ``LOCAL_TESTNET=1`` — dev stacks without a subtensor connection.
     """
     if _env_true("SUBMISSIONS_ALLOW_UNREGISTERED", default=False):
         return
+    if _env_true("LOCAL_TESTNET", default=False):
+        return
     from minotaur_subnet.api.server_context import ctx
     if ctx.solver_round_metagraph_sync is None:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Submissions temporarily unavailable: metagraph sync is not "
+                "wired on this node. Operator: ensure SUBTENSOR_URL is set "
+                "and the metagraph poller is running, or set "
+                "SUBMISSIONS_ALLOW_UNREGISTERED=1 to override (not recommended "
+                "in production)."
+            ),
+        )
     state = ctx.solver_round_metagraph_sync.state
     if state is None:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Submissions temporarily unavailable: metagraph state has not "
+                "synced yet. Retry in a few seconds; subtensor poll is in flight."
+            ),
+        )
     hotkey = (hotkey or "").strip()
     registered = {p.hotkey for p in state.peers}
     if hotkey not in registered:
@@ -277,6 +294,32 @@ def _require_registered_miner(hotkey: str) -> None:
                 "metagraph. Register a miner UID before submitting."
             ),
         )
+
+
+def _resolve_client_ip(request: Request) -> str:
+    """Determine the real client IP behind a reverse proxy.
+
+    M2 (2026-05-25 audit): when the api runs behind nginx,
+    ``request.client.host`` is always ``127.0.0.1`` (the proxy upstream).
+    The rate limiter was keyed off that value, so every external caller
+    shared one global bucket regardless of source IP. Reading
+    ``X-Real-IP`` / ``X-Forwarded-For`` first restores per-source-IP
+    isolation. The nginx config sets both headers; we only honor them
+    when ``TRUST_PROXY_HEADERS=1`` is set (default in prod compose),
+    otherwise we fall back to ``request.client.host`` to avoid header
+    spoofing on direct-exposure deployments.
+    """
+    if _env_true("TRUST_PROXY_HEADERS", default=False):
+        # X-Real-IP first (nginx sets this with ``$remote_addr``, single value).
+        xri = request.headers.get("x-real-ip", "").strip()
+        if xri:
+            return xri
+        # X-Forwarded-For is a comma-separated chain; the LEFTMOST entry is
+        # the original client. Subsequent hops are transparent proxies.
+        xff = request.headers.get("x-forwarded-for", "").strip()
+        if xff:
+            return xff.split(",", 1)[0].strip()
+    return request.client.host if request.client and request.client.host else "unknown"
 
 
 def _enforce_rate_limit(request: Request, principal: str) -> None:
@@ -291,7 +334,7 @@ def _enforce_rate_limit(request: Request, principal: str) -> None:
 
     now = time.monotonic()
     window_start = now - 60.0
-    remote = request.client.host if request.client and request.client.host else "unknown"
+    remote = _resolve_client_ip(request)
     bucket_key = f"{request.url.path}:{principal or remote}"
 
     with _rate_limit_lock:
