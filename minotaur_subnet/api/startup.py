@@ -1489,6 +1489,24 @@ async def initialize(ctx: ServerContext) -> dict:
                     initial_state = await ctx.solver_round_metagraph_sync.sync_once()
                     ctx.solver_round_role = initial_state.my_role
 
+                    # Restore logging — instantiating MetagraphSync above
+                    # imports bittensor, which clears all root logging
+                    # handlers, sets the root logger to WARNING, and sets
+                    # every existing logger to CRITICAL. Without this the
+                    # api goes silent after this point: no order/champion
+                    # ProtocolConfig refresh-loop logs, no peer-discovery
+                    # logs, no submission logs, nothing. Mirrors the same
+                    # workaround in ``validator/main.py``.
+                    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+                    logging.basicConfig(
+                        level=getattr(logging, _log_level, logging.INFO),
+                        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+                        force=True,
+                    )
+                    for name in list(logging.Logger.manager.loggerDict):
+                        if name.startswith("minotaur_subnet"):
+                            logging.getLogger(name).setLevel(logging.NOTSET)
+
                     # Wire /identity now that metagraph_sync exists. The
                     # signing key was already set when ChampionConsensusManager
                     # was constructed above.
