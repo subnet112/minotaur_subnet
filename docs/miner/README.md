@@ -43,5 +43,5 @@ Typical loop:
 ## Champion/challenger model
 
 - Submissions are benchmarked and ranked by score.
-- A challenger must exceed the current champion by `DETHRONE_MARGIN` (currently 5%).
+- A challenger must exceed the current champion by `DETHRONE_MARGIN` (currently 0.5%).
 - On adoption, block loop hot-swaps to the new solver.

@@ -64,6 +64,8 @@ Return solver identification and capabilities. Used for logging, benchmarking re
 
 Compute a quote without generating a full execution plan. Override for fast quoting support. Raises `NotImplementedError` by default.
 
+> The reference solver shipped with the DEX Aggregator App (`subnet112/minotaur-solver`) implements `quote()` end-to-end, which is what powers the "binding quote before signature" UX on the launched product. App-defined Apps may opt out, in which case the UI falls back to plan-then-sign.
+
 #### `check_trigger(intent, state, snapshot=None) -> bool`
 
 For auto-triggered (perpetual) intents: should this intent execute now? Returns `True` when conditions are met. Default: `False`.

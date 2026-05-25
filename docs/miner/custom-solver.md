@@ -14,7 +14,7 @@ my-solver/
 └── README.md         # Description of your solver's approach
 ```
 
-The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it beats the current champion by at least 5%.
+The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it beats the current champion by at least 0.5% (`DETHRONE_MARGIN = 0.005`).
 
 ## Dockerfile Requirements
 
@@ -241,7 +241,7 @@ Plans are scored by each app's JS scoring function (`score(plan, state, context)
 
 - The currently active solver is the **champion**.
 - A new submission is a **challenger**.
-- The challenger must beat the champion's average score by at least **5%** to be adopted.
+- The challenger must beat the champion's average score by at least **0.5%** to be adopted.
 - Once adopted, the challenger becomes the new champion and processes real orders.
 
 ### Auto-Triggered Intents

@@ -65,7 +65,7 @@ docker run --rm --network=none --read-only --tmpfs=/tmp:size=64m --memory=2g --c
 `/v1/submissions/source` skips screening and goes straight to benchmarking. If not adopted:
 
 - score may be lower than champion
-- challenger must beat champion by at least 5% (`DETHRONE_MARGIN`)
+- challenger must beat champion by at least 0.5% (`DETHRONE_MARGIN = 0.005`)
 
 Use status endpoint to inspect:
 

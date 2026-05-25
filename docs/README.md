@@ -43,7 +43,7 @@ Users can connect their own wallet (MetaMask, any EIP-712 signer) or use a manag
 
 ### Fees
 
-Fixed fees in wTAO, paid upfront. Users pay zero EVM gas — the Relayer fronts all gas costs.
+Platform fees are charged in the chain's wrapped native token — WETH on Ethereum/Base, wTAO on Bittensor EVM (per `AppIntentBase.wrappedNativeToken`). Each App declares a `[minPlatformFeeWei, maxPlatformFeeWei]` band that clamps the per-execution fee. Users pay zero EVM gas — the Relayer fronts all gas costs.
 
 ## How It Works
 
@@ -172,7 +172,7 @@ current `DexAggregatorApp` ABI and execution path.
 
 ## Current Status
 
-Minotaur is live on Bittensor testnet as **NETUID 112**. The platform supports Ethereum mainnet and cross-chain execution via bridge adapters.
+Minotaur is in **Alpha** on Bittensor Subnet 112 (NETUID `112`) with real mainnet execution. The flagship `DexAggregatorApp` is live on **Base**; Bittensor EVM and Ethereum follow within Phase 4. Permissionless App deployment opens in Phase 6 (Jun 23, 2026); cross-chain settlement opens in Phase 5 (Jun 9, 2026). At Alpha launch only **5% of miner emissions** are enabled, ramping as the network proves out (champion-takes-all, `DETHRONE_MARGIN = 0.005`). See [`ROADMAP.md`](../ROADMAP.md) for the phase-by-phase plan.
 
 ## Getting Help
 

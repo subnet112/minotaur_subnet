@@ -435,7 +435,7 @@ After passing screening, solvers enter the benchmarking phase where they compete
 - The **champion** is the currently active solver used for live order processing
 - A new submission is the **challenger**
 - Both are benchmarked against the same set of active intents
-- The challenger must beat the champion's average score by a **5% dethrone margin** to be adopted
+- The challenger must beat the champion's average score by a **0.5% dethrone margin** to be adopted
 - Scores come from the JS scoring engine: `score(plan, state, context)` returns 0.0-1.0
 
 ### Scoring Pipeline
