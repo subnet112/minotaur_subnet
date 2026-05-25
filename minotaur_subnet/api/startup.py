@@ -614,24 +614,50 @@ async def initialize(ctx: ServerContext) -> dict:
             "Set RELAYER_URL to use a remote singleton relayer instead.",
         )
 
+    # ── DeployService — admin-gated contract deploys ─────────────────────
+    # Decoupled from BlockLoop's relayer wiring above. App-deploys are
+    # admin-gated by ADMIN_API_KEY and rare; they need a local EvmRelayer
+    # with a gas wallet to broadcast the CREATE2. HttpRelayer doesn't
+    # carry `deploy_contract` (not in RelayerBase), so when BlockLoop is
+    # on the HTTP-relayer path we still want a dedicated EvmRelayer for
+    # deploys — gated independently by USE_EVM_RELAYER=1.
+    #
+    # Third-party validator stacks leave USE_EVM_RELAYER unset → no
+    # DeployService → admin endpoints return 503, matching the "validators
+    # don't deploy apps" model.
+    if use_embedded:
         from minotaur_subnet.deployment.compiler import ForgeCompiler
         from minotaur_subnet.deployment.deployer import DeployService
         from minotaur_subnet.api.services import set_deploy_service
 
+        # Reuse BlockLoop's embedded EvmRelayer when possible (avoids a
+        # second wallet + a second nonce manager). Spin up a dedicated
+        # one when BlockLoop is in HTTP mode.
+        if relayer_instance is not None and not relayer_url:
+            deploy_relayer = relayer_instance
+        else:
+            from minotaur_subnet.relayer import EvmRelayer as _DeployEvmRelayer
+            from minotaur_subnet.relayer.chain_config import get_supported_chains as _deploy_chains
+            deploy_relayer = _DeployEvmRelayer(
+                chains=_deploy_chains(),
+                private_key=os.environ.get("RELAYER_PRIVATE_KEY", ""),
+            )
+
         registry_address = os.environ.get("VALIDATOR_REGISTRY_ADDRESS", "")
         if not registry_address:
             registry_address = os.environ.get("VALIDATOR_REGISTRY_31337", "")
-        # Quorum is no longer a deploy-time arg — AppIntentBase reads it from
-        # the ValidatorRegistry at execution time.
+        # Quorum is no longer a deploy-time arg — AppIntentBase reads it
+        # from the ValidatorRegistry at execution time.
         deploy_service = DeployService(
             ForgeCompiler(),
-            relayer_instance,
+            deploy_relayer,
             registry_address,
         )
         set_deploy_service(deploy_service)
         logger.info(
-            "DeployService configured (registry=%s)",
+            "DeployService configured (registry=%s, dedicated EvmRelayer=%s)",
             registry_address[:20] if registry_address else "none",
+            relayer_instance is None or bool(relayer_url),
         )
 
     # ── chain info ───────────────────────────────────────────────────────
