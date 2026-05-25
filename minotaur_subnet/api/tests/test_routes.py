@@ -83,9 +83,16 @@ class TestOrderRoutes(unittest.TestCase):
         self.ob = IntentOrderBook()
         orders_module.set_orderbook(self.ob)
         self.client = TestClient(app, raise_server_exceptions=False)
+        # M3 (PR #26) added an EIP-191 owner-signature requirement on
+        # DELETE /orders/{id}. The route tests below don't reproduce the
+        # signing flow — that's covered by tests/unit/test_order_owner_sig.py.
+        # Disable the gate here so these tests stay focused on the routing
+        # + error-handling surface they were originally written for.
+        os.environ["REQUIRE_ORDER_OWNER_SIG"] = "0"
 
     def tearDown(self):
         orders_module.set_orderbook(None)
+        os.environ.pop("REQUIRE_ORDER_OWNER_SIG", None)
 
     def test_submit_order(self):
         resp = self.client.post("/v1/apps/test-app/orders", json={
@@ -138,20 +145,31 @@ class TestOrderRoutes(unittest.TestCase):
     def test_list_orders_filter_by_status(self):
         o1 = self._submit(app_id="app-1", submitted_by="0xA")
         self._submit(app_id="app-1", submitted_by="0xB")
-        self.ob.cancel(o1.order_id)
+        # IntentOrderBook.cancel requires submitted_by (owner check at the
+        # orderbook layer) — pass the original submitter.
+        self.ob.cancel(o1.order_id, submitted_by="0xA")
         resp = self.client.get("/v1/orders?status=open")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["count"], 1)
 
     def test_cancel_order(self):
         order = self._submit(app_id="app-1", submitted_by="0xA")
-        resp = self.client.delete(f"/v1/orders/{order.order_id}")
+        # M3 (PR #26): submitted_by is a required query param on the
+        # cancel route. The EIP-191 owner-signature requirement is
+        # disabled in setUp via REQUIRE_ORDER_OWNER_SIG=0.
+        resp = self.client.delete(
+            f"/v1/orders/{order.order_id}?submitted_by=0xA",
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "cancelled")
 
     def test_cancel_nonexistent_order(self):
-        resp = self.client.delete("/v1/orders/nonexistent")
-        self.assertEqual(resp.status_code, 400)
+        resp = self.client.delete(
+            "/v1/orders/nonexistent?submitted_by=0xA",
+        )
+        # The route now 404s on unknown order before reaching the
+        # orderbook (M3 added that check).
+        self.assertEqual(resp.status_code, 404)
 
     def test_orderbook_not_initialized_503(self):
         orders_module.set_orderbook(None)
