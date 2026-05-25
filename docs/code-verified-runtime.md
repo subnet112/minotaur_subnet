@@ -176,7 +176,7 @@ Pipeline:
 4. Benchmarking
 5. Ranking + champion adoption
 
-A challenger must beat the current champion by **5%** (`DETHRONE_MARGIN = 0.05`) to dethrone.
+A challenger must beat the current champion by **0.5%** (`DETHRONE_MARGIN = 0.005`) to dethrone.
 
 ### Source-based (`POST /v1/submissions/source`)
 
