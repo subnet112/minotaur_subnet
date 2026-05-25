@@ -262,6 +262,15 @@ services:
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
 
+      # Singleton relayer: the api submits signed quorum bundles here.
+      # Third-party validators do NOT hold a gas wallet — the subnet
+      # team's relayer at https://relayer.minotaursubnet.com is the
+      # only address that ever pays gas for swap execution. Wrapped in
+      # an EIP-191 freshness signature using VALIDATOR_PRIVATE_KEY above;
+      # the relayer rejects bundles whose wrapper signer isn't in the
+      # on-chain ValidatorRegistry.
+      RELAYER_URL: "${RELAYER_URL:-https://relayer.minotaursubnet.com}"
+
       # Per-chain registry addresses
       VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
       VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964}"
