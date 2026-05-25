@@ -93,6 +93,7 @@ class HttpRelayer(RelayerBase):
         *,
         signing_key: str = "",
         timeout: float = 60.0,
+        deploy_timeout: float = 120.0,
     ) -> None:
         """
         Args:
@@ -101,16 +102,74 @@ class HttpRelayer(RelayerBase):
                 ``VALIDATOR_PRIVATE_KEY``). Used to sign the freshness
                 wrapper around each submission so the relayer can
                 verify the caller is a registered validator.
-            timeout: Seconds to wait for the relayer's response.
+            timeout: Seconds to wait for ``submit_plan``'s round-trip.
+            deploy_timeout: Seconds to wait for ``deploy_contract``.
+                Contract deploys are heavier than a single swap submit —
+                constructor + CREATE2 + receipt can easily push past 30s,
+                and on Base mainnet we've seen 60-90s on cold chains.
         """
         self.url = url.rstrip("/")
         self.signing_key = signing_key.strip()
         self.timeout = timeout
+        self.deploy_timeout = deploy_timeout
         self._current_leader: str = ""
         # Initial nonce — wall-clock seconds gives us a monotonic seed
         # that's unique-enough across api restarts; the itertools counter
         # makes it strictly monotonic within a process.
         self._nonce_counter = itertools.count(int(time.time() * 1000))
+
+    # ── DeployService-compatible surface ─────────────────────────────────
+    # DeployService reads ``self.relayer.chains`` and calls
+    # ``self.relayer.deploy_contract(...)``. Neither is part of the
+    # RelayerBase contract, but DeployService needs them, so HttpRelayer
+    # exposes both for transparent drop-in replacement of EvmRelayer.
+
+    @property
+    def chains(self) -> dict:
+        """Return the local chain config map.
+
+        Both the api process and the remote relayer service use the same
+        ``get_supported_chains()`` library to load chain config from env.
+        The chains dict the api reads is identical to the one the relayer
+        operates against, so we can serve it locally without an extra
+        round-trip. (If/when configurations ever diverge, we'd switch to
+        a ``GET /v1/chains`` fetch — for now, local is correct and faster.)
+        """
+        from minotaur_subnet.relayer.chain_config import get_supported_chains
+        return get_supported_chains()
+
+    async def deploy_contract(
+        self,
+        bytecode: str,
+        constructor_args: list,
+        chain_id: int,
+    ) -> tuple[str, str]:
+        """Deploy a contract via the remote relayer's ``POST /deploy``.
+
+        Returns ``(contract_address, tx_hash)``. Raises on relayer error
+        or transport failure — DeployService expects this contract.
+        """
+        payload = {
+            "bytecode": bytecode,
+            "constructor_args": list(constructor_args or []),
+            "chain_id": int(chain_id),
+        }
+        timeout = aiohttp.ClientTimeout(total=self.deploy_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"{self.url}/deploy", json=payload) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    err = body.get("error") or f"HTTP {resp.status}"
+                    raise RuntimeError(
+                        f"deploy_contract: relayer {self.url} rejected with {err}",
+                    )
+                addr = body.get("address")
+                tx_hash = body.get("tx_hash")
+                if not addr or not tx_hash:
+                    raise RuntimeError(
+                        f"deploy_contract: malformed response from {self.url}: {body!r}",
+                    )
+                return addr, tx_hash
 
     async def submit_plan(
         self,
