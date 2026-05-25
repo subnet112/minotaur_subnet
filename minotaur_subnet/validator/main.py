@@ -30,7 +30,6 @@ from minotaur_subnet.consensus.protocol_config import ProtocolConfig
 from minotaur_subnet.engine import JsExecutionEngine
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.blockloop.loop import BlockLoop
-from minotaur_subnet.shared.simulation import build_mock_simulation
 from minotaur_subnet.orderbook import IntentOrderBook
 from minotaur_subnet.shared.types import (
     AppStatus,
@@ -41,7 +40,9 @@ from minotaur_subnet.shared.types import (
     IntentState,
     SignedApproval,
 )
-from minotaur_subnet.weight_policy import build_bootstrap_or_champion_weights
+# build_mock_simulation + build_bootstrap_or_champion_weights imports removed
+# 2026-05-25: their only callers in this module (_handle_submit,
+# _handle_app_details, etc.) were deleted in the validator-surface cleanup.
 
 # Extracted modules
 from minotaur_subnet.validator.weight_policy import ChampionWeights
@@ -51,22 +52,6 @@ from minotaur_subnet.validator.proposal_handler import ProposalHandler
 import os
 
 logger = logging.getLogger("minotaur_subnet.validator")
-
-
-def _build_intent_state_from_params(
-    app_def: AppIntentDefinition,
-    deployment: DeploymentResult,
-    params: dict[str, Any],
-) -> IntentState:
-    """Build an IntentState from app definition and order params."""
-    return IntentState(
-        contract_address=deployment.contract_address or "",
-        chain_id=deployment.chain_id,
-        nonce=0,
-        owner=app_def.deployer or "",
-        raw_params=params,
-        control={"_intent_function": params.get("intent_function", "execute")},
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -539,26 +524,38 @@ class AppIntentsValidator:
     # ── HTTP endpoints ───────────────────────────────────────────────────
 
     def _build_app(self) -> web.Application:
+        """Validator daemon HTTP surface.
+
+        Three load-bearing routes drive the consensus loop:
+          - GET  /health             Docker healthcheck
+          - GET  /identity           peer cross-attestation (consensus.peer_discovery)
+          - POST /consensus/proposal leader → follower proposal handoff (consensus.peer_network)
+
+        Five ops-debug routes are kept for operator inspection — no automated
+        callers reach them, but they're useful for ``curl``-from-inside-container
+        debugging of emission, blockloop progress, and consensus identity:
+          - GET /weights
+          - GET /weights/history
+          - GET /blockloop/status
+          - GET /consensus/info
+          - GET /leader
+
+        Eight pre-OrderBook / duplicate routes were removed 2026-05-25 audit
+        cleanup: /intents/{available,*/submit,*/details,*/scores}, /reload,
+        /orders, /orders/submit, /apps/*/quote. Each had 0 cross-codebase
+        callers; the api at port 8080 carries the equivalent live endpoints.
+        """
         app = web.Application()
+        # Load-bearing
         app.router.add_get("/health", self._handle_health)
-        app.router.add_get("/intents/available", self._handle_available)
-        app.router.add_post("/intents/{app_id}/submit", self._handle_submit)
-        app.router.add_post("/reload", self._handle_reload)
+        app.router.add_get("/identity", self._handle_identity)
+        app.router.add_post("/consensus/proposal", self._handle_consensus_proposal)
+        # Ops-debug
         app.router.add_get("/weights", self._handle_weights)
         app.router.add_get("/weights/history", self._handle_weights_history)
         app.router.add_get("/blockloop/status", self._handle_blockloop_status)
-        app.router.add_post("/orders/submit", self._handle_order_submit)
-        app.router.add_get("/orders", self._handle_orders_list)
-        app.router.add_get("/intents/{app_id}/details", self._handle_app_details)
-        app.router.add_get("/intents/{app_id}/scores", self._handle_app_scores)
-        # Quoting: dry-run the solver without creating an order
-        app.router.add_post("/apps/{app_id}/quote", self._handle_quote)
-        # Consensus endpoints
-        app.router.add_post("/consensus/proposal", self._handle_consensus_proposal)
         app.router.add_get("/consensus/info", self._handle_consensus_info)
         app.router.add_get("/leader", self._handle_leader)
-        # Self-attested identity for peer discovery
-        app.router.add_get("/identity", self._handle_identity)
         return app
 
     async def _handle_health(self, request: web.Request) -> web.Response:
@@ -573,115 +570,6 @@ class AppIntentsValidator:
             "orderbook": ob_stats,
         })
 
-    async def _handle_reload(self, request: web.Request) -> web.Response:
-        """Trigger an immediate rescan for new deployed intents."""
-        self.store._load()
-        before = len(self.engine.list_loaded_intents())
-        await self._load_active_intents()
-        after = len(self.engine.list_loaded_intents())
-        return web.json_response({
-            "reloaded": True,
-            "loaded_before": before,
-            "loaded_after": after,
-        })
-
-    async def _handle_available(self, request: web.Request) -> web.Response:
-        """Return active intents for miners to discover. No JS code exposed."""
-        loaded_ids = self.engine.list_loaded_intents()
-        intents = []
-        for app_id in loaded_ids:
-            app_def = self.store.get_app(app_id)
-            if app_def is None:
-                continue
-            intents.append({
-                "app_id": app_def.app_id,
-                "name": app_def.name,
-                "intent_type": app_def.intent_type,
-                "description": app_def.description,
-                "config": {
-                    "supported_chains": app_def.config.supported_chains,
-                    "trigger_type": app_def.config.trigger_type.value,
-                    "max_gas": app_def.config.max_gas,
-                },
-            })
-        return web.json_response({"intents": intents})
-
-    async def _handle_submit(self, request: web.Request) -> web.Response:
-        """Accept a miner plan submission and score it."""
-        app_id = request.match_info["app_id"]
-
-        # Validate intent is loaded
-        if app_id not in self.engine.list_loaded_intents():
-            return web.json_response(
-                {"error": f"Intent not loaded: {app_id}"}, status=404
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
-
-        miner_id = body.get("miner_id", "unknown")
-        plan_data = body.get("plan")
-        params = body.get("params", {})
-
-        if not plan_data:
-            return web.json_response({"error": "plan is required"}, status=400)
-
-        # Reconstruct ExecutionPlan from submitted data
-        try:
-            interactions = [
-                Interaction(
-                    target=ix.get("target", ""),
-                    value=ix.get("value", "0"),
-                    call_data=ix.get("call_data", ""),
-                    chain_id=ix.get("chain_id", 1),
-                )
-                for ix in plan_data.get("interactions", [])
-            ]
-            plan = ExecutionPlan(
-                intent_id=plan_data.get("intent_id", app_id),
-                interactions=interactions,
-                deadline=plan_data.get("deadline", 0),
-                nonce=plan_data.get("nonce", 0),
-                metadata=plan_data.get("metadata", {}),
-            )
-        except Exception as exc:
-            return web.json_response(
-                {"error": f"Invalid plan format: {exc}"}, status=400
-            )
-
-        # Build state and mock simulation
-        app_def = self.store.get_app(app_id)
-        deployment = self.store.get_deployment(app_id)
-        if app_def is None or deployment is None:
-            return web.json_response({"error": "App not found"}, status=404)
-
-        state = _build_intent_state_from_params(app_def, deployment, params)
-        simulation = build_mock_simulation(plan, params)
-
-        # Score via JS engine
-        try:
-            score = await self.engine.score(app_id, plan, simulation, state)
-        except Exception as exc:
-            logger.error("Scoring error for %s: %s", app_id, exc)
-            return web.json_response(
-                {"error": "Scoring failed"}, status=500
-            )
-
-        # Record in store stats
-        self.store.record_execution(
-            app_id, score.score, success=score.valid and score.score >= 0.5
-        )
-
-        return web.json_response({
-            "score": score.score,
-            "valid": score.valid,
-            "reason": score.reason,
-            "breakdown": score.breakdown,
-            "metadata": score.metadata,
-        })
-
     async def _handle_weights(self, request: web.Request) -> web.Response:
         return web.json_response({
             "champion": self._champion_miner_id,
@@ -693,184 +581,6 @@ class AppIntentsValidator:
 
     async def _handle_blockloop_status(self, request: web.Request) -> web.Response:
         return web.json_response(self.block_loop.status())
-
-    async def _handle_order_submit(self, request: web.Request) -> web.Response:
-        """Submit an order directly to the validator's OrderBook."""
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        try:
-            order = self.orderbook.submit(
-                app_id=body["app_id"],
-                intent_function=body.get("intent_function", "execute"),
-                params=body.get("params", {}),
-                submitted_by=body.get("submitted_by", ""),
-                chain_id=body.get("chain_id", 1),
-                deadline=body.get("deadline", 0),
-                perpetual=body.get("perpetual", False),
-                max_executions=body.get("max_executions", 1),
-                cooldown=body.get("cooldown", 0),
-            )
-            logger.info("Order submitted: %s for %s", order.order_id, order.app_id)
-            return web.json_response(order.to_dict())
-        except (KeyError, ValueError) as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-
-    async def _handle_orders_list(self, request: web.Request) -> web.Response:
-        """List orders in the validator's OrderBook."""
-        app_id = request.query.get("app_id")
-        status = request.query.get("status")
-        orders = self.orderbook.list_orders(
-            app_id=app_id or None,
-            status=status or None,
-        )
-        return web.json_response({
-            "orders": [o.to_dict() for o in orders],
-            "count": len(orders),
-        })
-
-    async def _handle_app_details(self, request: web.Request) -> web.Response:
-        """Return full app context for strategy generation (no JS code)."""
-        app_id = request.match_info["app_id"]
-        app_def = self.store.get_app(app_id)
-        if app_def is None:
-            return web.json_response({"error": f"App not found: {app_id}"}, status=404)
-
-        deployment = self.store.get_deployment(app_id)
-
-        # Get manifest from JS engine if loaded
-        manifest = None
-        if app_id in self.engine.list_loaded_intents():
-            manifest = self.engine.get_manifest(app_id)
-
-        result: dict[str, Any] = {
-            "app_id": app_def.app_id,
-            "name": app_def.name,
-            "description": app_def.description,
-            "intent_type": app_def.intent_type,
-            "supported_chains": app_def.config.supported_chains,
-            "config": {
-                "trigger_type": app_def.config.trigger_type.value,
-                "max_gas": app_def.config.max_gas,
-                "score_threshold": app_def.config.score_threshold,
-            },
-            "solidity_code": app_def.solidity_code,
-            "manifest": manifest,
-            "contract_address": deployment.contract_address if deployment else None,
-        }
-
-        return web.json_response(result)
-
-    async def _handle_app_scores(self, request: web.Request) -> web.Response:
-        """Return execution stats for an app."""
-        app_id = request.match_info["app_id"]
-        app_def = self.store.get_app(app_id)
-        if app_def is None:
-            return web.json_response({"error": f"App not found: {app_id}"}, status=404)
-
-        stats = self.store.get_stats(app_id)
-        return web.json_response(stats)
-
-    async def _handle_quote(self, request: web.Request) -> web.Response:
-        """Compute a quote via the solver's quote() method — no simulation needed.
-
-        POST /apps/{app_id}/quote
-        Body: { params: {...}, chain_id: 1, slippage_bps: 50 }
-
-        Returns estimated_output, suggested_min_output, gas_estimate.
-        No order is created. No signature required. No simulation.
-        """
-        app_id = request.match_info["app_id"]
-
-        app_def = self.store.get_app(app_id)
-        if app_def is None:
-            return web.json_response({"error": f"App not found: {app_id}"}, status=404)
-
-        # Need a solver
-        if self.block_loop.solver is None:
-            return web.json_response(
-                {"error": "No solver available — submit one via the git-based submission pipeline"},
-                status=503,
-            )
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
-
-        params = body.get("params", {})
-        chain_id = int(body.get("chain_id", 1))
-        slippage_bps = max(0, min(int(body.get("slippage_bps", 50)), 10000))
-
-        state = IntentState(
-            contract_address="",
-            chain_id=chain_id,
-            nonce=0,
-            owner="",
-            raw_params=params,
-        )
-
-        # Solver builds its own data from RPC; no snapshot needed
-        try:
-            quote_result = self.block_loop.solver.quote(app_def, state)
-        except NotImplementedError:
-            return web.json_response(
-                {"error": "Solver does not support quoting"}, status=501,
-            )
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-        except Exception as exc:
-            return web.json_response(
-                {"error": f"Solver quote failed: {exc}"}, status=500,
-            )
-
-        estimated_output = quote_result.estimated_output
-
-        # Apply slippage
-        suggested_min_output = "0"
-        try:
-            est_int = int(estimated_output)
-            if est_int > 0:
-                suggested_min_output = str(est_int * (10000 - slippage_bps) // 10000)
-        except (ValueError, TypeError):
-            pass
-
-        # Build computed_params from manifest's quote-sourced param definitions
-        intent_function = body.get("intent_function", "execute")
-        quote_values = {
-            "estimated_output": estimated_output,
-            "suggested_min_output": suggested_min_output,
-        }
-        computed_params: dict[str, str] = dict(quote_result.computed_params)
-        if hasattr(self.engine, "get_manifest"):
-            try:
-                manifest = self.engine.get_manifest(app_id)
-                if manifest and "intent_functions" in manifest:
-                    for fn_def in manifest["intent_functions"]:
-                        if fn_def.get("name") == intent_function:
-                            for pname, pdef in fn_def.get("params", {}).items():
-                                if pdef.get("source") == "quote":
-                                    qf = pdef.get("quote_field", "")
-                                    if qf and qf in quote_values:
-                                        computed_params[pname] = quote_values[qf]
-                            break
-            except Exception:
-                pass
-
-        return web.json_response({
-            "app_id": app_id,
-            "estimated_output": estimated_output,
-            "suggested_min_output": suggested_min_output,
-            "slippage_bps": slippage_bps,
-            "route_summary": quote_result.route_summary,
-            "gas_estimate": quote_result.gas_estimate,
-            "valid_for_seconds": 30,
-            "chain_id": chain_id,
-            "computed_params": computed_params,
-        })
-
 
     # ── Consensus HTTP endpoints ────────────────────────────────────────
 
