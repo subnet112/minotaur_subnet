@@ -4,13 +4,13 @@ This guide walks you through setting up and running a Minotaur validator on Bitt
 
 ## Hardware Requirements
 
-**Every validator must be leader-capable.** Leadership on Subnet 112 is awarded by stake at the metagraph level -- the highest-stake validator runs the leader role, ties broken by hotkey lexicographic order. Leadership rotates whenever stakes shift on chain, with no advance notice. A validator that cannot immediately accept the leader role on stake change is a free-rider: it collects the same emissions as a fully-provisioned validator while only signing follower attestations, and it drags down the network's resilience to leader rotation.
+**Third-party validators run as order-consensus followers during the early-network operating period.** Leader election is currently locked to the subnet team's hotkey via a hardcoded `LOCKED_LEADER_HOTKEY` constant in `validator/metagraph_sync.py` (see PR #27 for the rationale: prevents a misconfigured or rogue high-stake peer from auto-winning the election and stalling consensus). Stake-based election is the documented fallback and is restored by clearing both `LOCKED_LEADER_HOTKEY` and `LOCKED_LEADER_EVM_ADDRESS` together. While the lock is active, your validator receives proposals from the leader, re-simulates them on your local Anvil forks, and signs approvals — it cannot itself become leader regardless of its stake.
 
-The spec below is sized for *today's* network and scales up as the protocol expands. Start at the baseline; scale up on the trigger events listed.
+Because the lock spares you from leader-readiness, you don't need to keep cold Anvil starts on the critical path. The spec below is sized for follower work only and scales up if the team announces an unlock or multi-app expansion. Start at the baseline; scale up on the trigger events listed.
 
-### Baseline (today)
+### Baseline (today, follower-only)
 
-Subnet 112 currently operates one App (DexAggregator) across two real chains (Ethereum mainnet, Base) plus BT EVM. User volume is light. The baseline spec handles this comfortably with room for the leader role.
+Subnet 112 currently operates one App (DexAggregator) across two real chains (Ethereum mainnet, Base) plus BT EVM. User volume is light. The baseline spec handles follower work comfortably.
 
 | Spec | Value |
 |------|-------|
@@ -38,12 +38,12 @@ The baseline grows mostly along two axes: number of chains we support (each adds
 
 | Trigger event | Recommended spec |
 |---------------|------------------|
-| Baseline (today) | **4 vCPU / 8 GB / 100 GB SSD** |
+| Baseline (today, follower-only) | **4 vCPU / 8 GB / 100 GB SSD** |
 | +1 chain added (e.g. Arbitrum or Optimism announcement) -- one extra Anvil fork per chain costs ~1.5-2 GB RAM | **4 vCPU / 12 GB / 150 GB SSD** |
 | 2+ new chains, or sustained user volume making JS scoring run continuously in parallel | **8 vCPU / 16 GB / 200 GB SSD** |
-| Multi-app phase (several Apps live simultaneously, each with independent benchmarks running in parallel) | **8 vCPU / 32 GB / 200 GB SSD** |
+| Multi-app phase, OR the team announces unlocking leader election and rotating leadership back to stake-based | **8 vCPU / 32 GB / 200 GB SSD** |
 
-Scaling is vertical -- no horizontal sharding needed at the validator level. You can typically resize an existing VPS in under five minutes with a reboot. Plan to upsize at the announcement of each new chain integration; the subnet roadmap publishes these ahead of activation.
+Scaling is vertical -- no horizontal sharding needed at the validator level. You can typically resize an existing VPS in under five minutes with a reboot. Plan to upsize at the announcement of each new chain integration; the subnet roadmap publishes these ahead of activation. If you want to be ready to take leadership the moment the lock is cleared, run at the top tier from the start — but for the locked-leader phase it's not required.
 
 ### Required maintenance cron
 
@@ -59,7 +59,7 @@ Install this cron — **every 6 hours**, not daily:
 
 At every-6h cadence, max accumulation between recycles is ~37 GB across three forks, which fits in a 100 GB volume with other services taking ~10-15 GB. If you skip a recycle (cron failure, host unreachable, manual stop without restart), the disk can fill in 12-15 hours from there — monitor `df -h /` and treat low disk as a paging event. If the rate grows further (more chains added, much higher load), drop the cadence to every 4 or 3 hours.
 
-Each recycle window drops in-flight Anvil state for ~60 seconds while the containers restart. During that window the leader cannot simulate new plans; if you are running a high-stake validator, stagger your cron a few minutes from peers to avoid simultaneous reorg pauses.
+Each recycle window drops in-flight Anvil state for ~60 seconds while the containers restart. During that window your follower cannot re-simulate proposals — the leader's order-consensus tick will see a missing signature from you and fall back to the remaining peers. If the rest of the active validator set is small enough that quorum needs your signature, stagger your cron a few minutes offset from peers to avoid simultaneous reorg pauses.
 
 **If you do hit a disk-full OS hang**: the SSH daemon is dead at that point, so `docker compose down`, cron tightening, or any in-VM cleanup won't help. The only recovery is a force stop+start at the hypervisor layer (on AWS: `aws ec2 stop-instances --force --instance-ids <id>`, wait for stopped, then `start-instances`). EBS-backed instances preserve all state across this; containers with `restart: unless-stopped` come back automatically. Once the host is up, immediately `docker compose rm -fsv` the anvil services to release their snapshot overlays — `docker system prune` alone won't reclaim them.
 
@@ -75,15 +75,50 @@ Each recycle window drops in-flight Anvil state for ~60 seconds while the contai
 
 Most validators will run on a $25-50/month box at the baseline tier and resize up when chain expansions are announced.
 
-## Third-Party APIs
+## Third-Party APIs (upstream RPCs)
+
+This is the step that catches most operators. Your validator runs three local Anvil instances that fork Ethereum mainnet, Base mainnet, and BT EVM. Every time a swap proposal arrives, your forks re-execute it locally to re-score and decide whether to sign — **archive reads against your upstream RPCs on every order**, plus a fresh fork every time the recycle cron triggers (every 6h on the default schedule).
+
+**Public RPC endpoints will not survive prod load.** Free-tier `eth.merkle.io`, `cloudflare-eth.com`, `mainnet.base.org`, etc. rate-limit at thresholds you'll hit within the first few simulations of a single order. When that happens your validator silently fails proposals, consensus drops to the leader's other peers, and you stop earning emissions.
+
+### Required (archive endpoints)
+
+| Chain | Env var | Provider |
+|---|---|---|
+| Ethereum mainnet (chain 1) | `ETH_UPSTREAM_RPC_URL` | Alchemy / Infura / QuickNode |
+| Base mainnet (chain 8453) | `BASE_UPSTREAM_RPC_URL` | Alchemy / Infura / QuickNode |
+| BT EVM (chain 964) | `BITTENSOR_EVM_UPSTREAM_RPC_URL` | Public endpoint OK at single-validator load |
+
+### How to provision (Alchemy example)
+
+1. Sign up at https://www.alchemy.com. **Growth plan (~$49/mo)** handles a single validator comfortably with headroom for swap-volume bursts; the **free Sandbox plan (30M compute units / month)** works for the early-network phase but may rate-limit during heavy trading periods.
+2. Create one app per chain:
+   - Ethereum → Mainnet
+   - Base → Base Mainnet
+3. Copy the HTTPS endpoint URL, formatted like `https://eth-mainnet.g.alchemy.com/v2/<your_long_key>`.
+4. **Enable Archive Node access** on each app. Alchemy Growth+ enables this by default; on Infura you may need to opt in. Your Anvil forks issue `eth_getStorageAt` / `eth_getProof` calls at historical blocks during simulation — non-archive endpoints will 400 on those and your validator will silently fail to sign.
+
+### Request volume to expect (per validator)
+
+- ~1-5 requests per swap proposal (per chain the swap touches)
+- ~50-200 requests on a fresh `anvil --fork-url` startup (every 6h on the default recycle cron)
+- Steady-state under low traffic: well under 1 RPS per chain
+- Burst during heavy trading: tens of RPS per chain briefly
+
+Alchemy Growth (660M compute units / month) is overkill for a single follower. Free Sandbox (30M) is borderline — fine during early-network testing; watch for rate-limit logs once swap volume picks up.
+
+### Cheap alternatives
+
+If you already operate Bittensor validators with your own archive Ethereum nodes, point `ETH_UPSTREAM_RPC_URL` and `BASE_UPSTREAM_RPC_URL` at your local endpoints. The Anvil containers will fork from there with zero rate-limit risk.
+
+For **BT EVM** specifically, the public `https://lite.chain.opentensor.ai` works fine for a single validator's load. Switch to a private endpoint or omit the env var entirely (the validator falls back to the canonical default) if you see throttling.
+
+### Other external services
 
 | Provider | Used for | Free tier sufficient? |
 |----------|----------|-----------------------|
-| **Alchemy or Infura** (Ethereum mainnet) | Source RPC for the Anvil ETH fork; archive endpoint needed | Yes for moderate load. Premium tier recommended once you take leader for non-trivial periods (free-tier quotas can throttle under burst). |
-| **Alchemy or Infura** (Base mainnet, chain 8453) | Source RPC for the Anvil Base fork | Same as above, same account |
-| **Public BT EVM RPC** | `https://lite.chain.opentensor.ai` (chain 964) -- ChampionRegistry reads | Public endpoint, no signup |
 | **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads | Public endpoint, no signup |
-| **GitHub API (read-only)** | Cloning miner submissions for benchmark during leader role | Anonymous works for small subnets, but provision a PAT to raise rate limits before you ever take leader |
+| **GitHub API (read-only)** | Pulling validator image from GHCR | Anonymous works for image pulls; benchmark-related miner clones go through the leader, not third-party followers |
 
 No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, deterministic, and CPU-bound.
 
@@ -93,8 +128,8 @@ No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, de
 
 | Port | Service | Notes |
 |------|---------|-------|
-| `9100/tcp` | Validator daemon — order-consensus signing + `/identity` | Reached by the current leader for proposal broadcast and by peers for discovery. |
-| `8080/tcp` | API service — champion-consensus signing + `/identity` | Reached by the current leader for champion-certification proposals. |
+| `9100/tcp` | Validator daemon — order-consensus signing + `/identity` | Reached by the leader for proposal broadcast and by other validators for cross-attestation against the on-chain ValidatorRegistry. |
+| `8080/tcp` | API service — `/identity` + champion-consensus signing | Required by the canonical compose's api service for hotkey ↔ EVM-address cross-attestation. Champion-consensus participation goes live once the registry-consolidation work (Phase B) completes; in the interim, port 8080 still needs to be reachable so other validators can verify the binding via the api's `/identity` mirror. |
 
 If you are behind NAT, forward both ports. On a cloud VPS with a public IP, open both in the firewall. Quick example on Ubuntu with `ufw`:
 
@@ -103,7 +138,7 @@ sudo ufw allow 9100/tcp comment "minotaur validator daemon"
 sudo ufw allow 8080/tcp comment "minotaur api service"
 ```
 
-For AWS security groups, allow inbound TCP 9100 and 8080 from `0.0.0.0/0`. For other clouds the procedure is equivalent — the only requirement is that both ports are reachable from the public internet so the leader can deliver proposals.
+For AWS security groups, allow inbound TCP 9100 and 8080 from `0.0.0.0/0`. For other clouds the procedure is equivalent — the only requirement is that both ports are reachable from the public internet so the leader can deliver proposals and peers can verify your `/identity` claim.
 
 ### Outbound (egress, no special configuration)
 
@@ -184,7 +219,7 @@ Verify registration:
 btcli subnet metagraph --netuid 112 --subtensor.network finney
 ```
 
-Your hotkey should appear in the metagraph. Ensure you have sufficient TAO staked to participate in leader election.
+Your hotkey should appear in the metagraph. Note that during the early-network operating period, **leader election is locked to the subnet team's hotkey** — your stake determines your weight-emission share but does not make you eligible for leadership while the lock is active. See the leader-election explanation in the Hardware Requirements section above.
 
 ## Step 4: Get onboarded to the on-chain ValidatorRegistry
 
@@ -220,7 +255,7 @@ Repeat per chain (Ethereum, Base, BT EVM — addresses listed in the [network re
 cast call $VALIDATOR_REGISTRY 'isValidator(address)(bool)' 0xYourEvmAddress --rpc-url $RPC_URL
 ```
 
-If this returns `true` on every chain, you're cleared to bring up the daemon. If it returns `false`, your consensus signatures will be ignored and your validator will be a free-rider — emissions but no real participation.
+If this returns `true` on every chain, you're cleared to bring up the daemon. If it returns `false`, your consensus signatures will be ignored — the daemon will run but the leader's `verify_proposer_signature` and the relayer's wrapper-sig check will both reject anything you sign, so you'll appear in the metagraph without contributing to quorum.
 
 > **Note**: until this handshake exists as an on-chain registration flow (similar to Bittensor's subnet-register), it's a manual coordination step. The subnet operator publishes a process; check the project README for the current contact channel.
 
@@ -365,7 +400,7 @@ If either `/consensus/info` or the api's `champion_consensus.quorum_required` lo
 ### What this stack does NOT include
 
 - **Relayer**: the transaction submitter is a singleton service operated by the subnet team. Your validator signs proposals; the leader's submission path uses our relayer. You never deal with a gas wallet.
-- **Order/champion proposing**: only the highest-stake validator's leader-api does that. As a follower, you receive proposals + verify + sign.
+- **Order/champion proposing**: only the locked leader's api does that. Under the current `LOCKED_LEADER_HOTKEY` constant, that's the subnet team's hotkey; as a follower, you receive proposals + verify + sign. If/when the lock is cleared, election reverts to highest-stake-wins.
 
 ## Auto-update
 
@@ -374,7 +409,16 @@ The default `MINOTAUR_IMAGE_TAG=stable` (in `.env.example`) and the optional Wat
 1. New commit lands on `main` → `docker-publish.yml` builds + pushes `:latest` and `:sha-<short>` (immutable per-commit) to GHCR.
 2. The new image runs on the subnet team's prod for a soak period.
 3. When the team is happy with the soak, they run the `promote-stable.yml` workflow with the short SHA. That re-tags `:sha-<short>` as `:stable` on GHCR.
-4. Your Watchtower polls GHCR within the next hour, pulls the new image, recreates the `validator` and `api` containers with the new SHA. ~30-60 second downtime during the recreate.
+4. Your Watchtower polls GHCR within the next interval, pulls the new image, recreates the `validator` and `api` containers with the new SHA. ~30-60 second downtime during the recreate.
+
+The poll interval is controlled by `WATCHTOWER_POLL_INTERVAL` (seconds) in your `.env`. The canonical default is `3600` (1 hour). **During the early-network shake-out phase, set `WATCHTOWER_POLL_INTERVAL=300` (5 minutes)** so audit fixes and config changes propagate faster across the network:
+
+```bash
+# In .env:
+WATCHTOWER_POLL_INTERVAL=300
+```
+
+Once the network is stable and `:stable` promotions are infrequent, bump it back up to the hourly default to save GHCR bandwidth.
 
 If you want manual control instead of Watchtower, leave the `autoupdate` profile off and run on the subnet team's announced cadence:
 
