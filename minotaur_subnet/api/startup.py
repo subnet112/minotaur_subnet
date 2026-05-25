@@ -583,9 +583,22 @@ async def initialize(ctx: ServerContext) -> dict:
 
     if relayer_url:
         from minotaur_subnet.relayer.http_relayer import HttpRelayer
-        relayer_instance = HttpRelayer(url=relayer_url)
+        # The api signs a freshness wrapper around each submission. The
+        # relayer rejects wrappers whose recovered signer isn't in the
+        # on-chain ValidatorRegistry, so we MUST use a validator key
+        # here. Same key the api uses for consensus signing.
+        validator_key_for_wrapper = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+        if not validator_key_for_wrapper:
+            logger.warning(
+                "RELAYER_URL set but VALIDATOR_PRIVATE_KEY missing — "
+                "wrapper signing will fail; submissions will be rejected by the relayer",
+            )
+        relayer_instance = HttpRelayer(
+            url=relayer_url,
+            signing_key=validator_key_for_wrapper,
+        )
         logger.info(
-            "Relayer mode: HTTP client → %s (no local gas wallet)",
+            "Relayer mode: HTTP client → %s (no local gas wallet, wrapper-signed)",
             relayer_url,
         )
     elif use_embedded:
