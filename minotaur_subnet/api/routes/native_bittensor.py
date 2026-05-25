@@ -196,55 +196,8 @@ def sim_swap(body: SimSwapRequest) -> dict[str, Any]:
         return {"error": str(exc)}
 
 
-class DirectStakeRequest(BaseModel):
-    """Direct stake/unstake without requiring a pre-created permission."""
-    action: str = Field(..., description="add_stake or remove_stake")
-    owner_ss58: str = Field(..., description="User's Bittensor SS58 address")
-    hotkey_ss58: str = Field("", description="Validator hotkey (defaults to owner)")
-    netuid: int = Field(..., description="Subnet netuid")
-    amount_rao: int = Field(..., description="Amount in RAO (1 TAO = 1e9 RAO)")
-
-
-@router.post("/native-bittensor/stake")
-async def direct_stake(body: DirectStakeRequest) -> dict[str, Any]:
-    """Execute a stake or unstake directly via the SubstrateRelayer.
-
-    Testnet shortcut: bypasses the permission system and executes
-    using the local subtensor.
-    """
-    import asyncio
-    loop = asyncio.get_running_loop()
-
-    def _run():
-        import os
-        from minotaur_subnet.relayer.substrate_relayer import SubstrateRelayer
-        from minotaur_subnet.shared.types import SubstrateAction
-        from minotaur_subnet.blockchain.bittensor_proxy_executor import BittensorProxyExecutor
-
-        subtensor_url = os.environ.get("SUBTENSOR_URL", "ws://subtensor:9944")
-        executor = BittensorProxyExecutor(network=subtensor_url)
-        relayer = SubstrateRelayer(executor)
-
-        action = SubstrateAction(
-            action=body.action,
-            owner_ss58=body.owner_ss58,
-            amount_rao=body.amount_rao,
-            netuid=body.netuid,
-            hotkey_ss58=body.hotkey_ss58 or body.owner_ss58,
-        )
-
-        import asyncio as aio
-        return aio.run(relayer.submit_action(action))
-
-    try:
-        result = await loop.run_in_executor(None, _run)
-        return {
-            "success": result.success,
-            "tx_hash": result.tx_hash,
-            "error": result.error,
-            "action": body.action,
-            "netuid": body.netuid,
-            "amount_rao": body.amount_rao,
-        }
-    except Exception as exc:
-        return {"success": False, "error": str(exc)}
+# DirectStakeRequest + /native-bittensor/stake handler moved to
+# ``routes/local_testnet.py`` (2026-05-25 audit). The stake bypass was
+# documented as a "testnet shortcut" but mounted unconditionally on prod —
+# now only registered when ``LOCAL_TESTNET=1``. Production stake operations
+# go through the permission-system path (``/permissions/{id}/actions/add-stake``).
