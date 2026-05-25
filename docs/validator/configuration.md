@@ -17,8 +17,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `--wallet-name` | `None` | Bittensor wallet name |
 | `--hotkey-name` | `None` | Bittensor hotkey name |
 | `--validator-key` | `""` | EVM private key (hex) for EIP-712 consensus signing |
-| `--validator-peers` | `None` | Peer validators in `addr@url` format (space-separated) |
-| `--quorum-bps` | `10000` | Quorum threshold in basis points (10000 = 100%) |
+| `--quorum-bps` | `10000` | Quorum threshold in basis points (10000 = 100%). Mostly informational — the daemon reads the canonical value from `ValidatorRegistry.quorumBps()` at startup and refreshes once per epoch. |
 
 ## Environment Variables
 

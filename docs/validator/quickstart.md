@@ -403,7 +403,7 @@ Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloa
 
 ## Peer discovery
 
-Order-consensus peers are discovered automatically — no `VALIDATOR_PEERS` env required for the daemon's order-consensus path. The flow:
+Order-consensus and champion-consensus peers are both discovered automatically — no peer-list env required for either. The flow:
 
 1. **Your daemon publishes its identity**: a `GET /identity` endpoint on port 9100 returns a fresh EIP-712 signed payload binding `(evm_address, hotkey, axon_url)`. Each request regenerates the signature so it's never stale.
 2. **You publish your axon URL**: set `VALIDATOR_AXON_URL=http://your-host:9100` in the daemon env. This is what the signed payload claims. Also call `btcli` to register your axon on the Bittensor metagraph so other validators can find you.
@@ -412,7 +412,7 @@ Order-consensus peers are discovered automatically — no `VALIDATOR_PEERS` env 
 What this gives operators:
 
 - **No coordinated restart when a new validator joins.** The new validator's EVM gets added on-chain by the registry owner, they start their daemon, others pick them up within one refresh tick.
-- **No `VALIDATOR_PEERS` env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
+- **No peer-list env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
 - **IP changes are self-served.** A validator changing hosts just updates `VALIDATOR_AXON_URL` and restarts; the signed `/identity` payload re-publishes the new URL automatically.
 
 ### Required env for discovery
