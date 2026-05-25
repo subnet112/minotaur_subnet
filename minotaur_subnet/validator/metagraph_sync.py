@@ -1,12 +1,18 @@
 """MetagraphSync — periodic metagraph polling and deterministic leader election.
 
 Provides a uniform view of the validator peer set and deterministic leader
-election based on stake. Used by the validator to determine its role
-(leader vs follower) and discover peer endpoints.
+election. Used by the validator to determine its role (leader vs follower)
+and discover peer endpoints.
 
-Leader election rule: highest stake wins, ties broken by hotkey
-(lexicographic ascending). Matches the pattern in
-tests/emulation/fixtures/validator_cluster.py.
+Leader election rule (current): the hotkey listed in ``LOCKED_LEADER_HOTKEY``
+is the only validator allowed to take leadership. Stake ordering is ignored.
+If that hotkey isn't present in the metagraph, ``elect_leader`` returns
+``None`` and the network has no proposer — order/champion consensus halts
+until the locked validator comes back online. This is intentional: it
+removes the risk of a higher-stake but misconfigured (or malicious) peer
+being auto-promoted to leader.
+
+To unlock (return to stake-based election), set ``LOCKED_LEADER_HOTKEY = ""``.
 """
 
 from __future__ import annotations
@@ -20,6 +26,23 @@ from typing import Any
 from eth_hash.auto import keccak
 
 logger = logging.getLogger(__name__)
+
+
+# Locked leader identity. Both fields must match the same operator:
+# - ``LOCKED_LEADER_HOTKEY`` is the SS58 of the subnet 112 validator hotkey
+#   that we permit to act as consensus leader.
+# - ``LOCKED_LEADER_EVM_ADDRESS`` is the EVM address that signs that
+#   validator's EIP-712 consensus payloads (i.e. the address derived from
+#   ``VALIDATOR_PRIVATE_KEY``). Followers refuse proposals whose
+#   ``proposer_signature`` recovers to anything else.
+#
+# Empty string disables the lock and restores stake-based election +
+# any-validator proposer acceptance. Treat both fields as a pair — changing
+# only one breaks consensus (election would point one way, sig-check the
+# other). Both values are public information already published in the
+# on-chain ValidatorRegistry / metagraph.
+LOCKED_LEADER_HOTKEY = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
+LOCKED_LEADER_EVM_ADDRESS = "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D"
 
 
 def _extract_int(value: Any) -> int | None:
@@ -248,14 +271,30 @@ def _hotkey_to_evm(hotkey_ss58: str) -> str:
 
 
 def elect_leader(peers: list[PeerInfo]) -> PeerInfo | None:
-    """Deterministic leader election: highest stake, ties broken by hotkey ascending.
+    """Deterministic leader election.
+
+    When ``LOCKED_LEADER_HOTKEY`` is set (the default), only the peer whose
+    hotkey matches it is eligible to be leader, regardless of stake. Returns
+    ``None`` if that peer isn't in the metagraph — in which case every
+    validator's ``my_role`` resolves to ``follower``/``unregistered`` and no
+    one proposes. The lock is intentional: a misconfigured high-stake peer
+    cannot disrupt service by auto-winning the election.
+
+    When ``LOCKED_LEADER_HOTKEY`` is empty (unlock), falls back to the
+    original stake-based election: highest stake wins, ties broken by
+    hotkey ascending.
 
     Args:
         peers: List of all peers (any stake level).
 
     Returns:
-        The elected leader, or None if no staked peers exist.
+        The elected leader, or None if no eligible peer exists.
     """
+    if LOCKED_LEADER_HOTKEY:
+        for peer in peers:
+            if peer.hotkey == LOCKED_LEADER_HOTKEY:
+                return peer
+        return None
     staked = [p for p in peers if p.stake > 0]
     if not staked:
         return None
