@@ -28,7 +28,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `NETUID` | `112` | Subnet UID. Set to `1` for local testnet. |
 | `WALLET_NAME` | -- | Bittensor wallet name (same as `--wallet-name`) |
 | `HOTKEY_NAME` | -- | Bittensor hotkey name (same as `--hotkey-name`) |
-| `SUBTENSOR_URL` | -- | Subtensor WebSocket endpoint (same as `--subtensor-url`) |
+| `SUBTENSOR_URL` | -- | Subtensor WebSocket endpoint (same as `--subtensor-url`). Accepts the alias `finney` (= public `wss://entrypoint-finney.opentensor.ai:443`) or any explicit `ws://`/`wss://` URL. If you operate your own subtensor node, point this at it (e.g. `ws://your-subtensor:9944`) to avoid the per-IP rate limits on the public endpoint — see [Run your own subtensor](./quickstart.md#run-your-own-subtensor-recommended-for-datacenter-operators) in the quickstart. |
 
 ### Simulation (Anvil)
 
@@ -39,7 +39,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `BITTENSOR_EVM_RPC_URL` | -- | URL of the BT EVM Anvil fork the validator should connect to (chain ID 964). Started separately. |
 | `ETH_UPSTREAM_RPC_URL` | -- | Upstream Ethereum RPC (e.g. Alchemy/Infura) that the validator uses to advance the local Anvil fork to current head between simulations. Without it, the fork stays frozen at startup. |
 | `BASE_UPSTREAM_RPC_URL` | -- | Upstream Base RPC, same role as `ETH_UPSTREAM_RPC_URL` for the Base fork. |
-| `BITTENSOR_EVM_UPSTREAM_RPC_URL` | -- | Upstream BT EVM RPC (typically `https://lite.chain.opentensor.ai`), same role for the BT EVM fork. |
+| `BITTENSOR_EVM_UPSTREAM_RPC_URL` | -- | Upstream BT EVM RPC, same role for the BT EVM fork. Defaults to the public `https://lite.chain.opentensor.ai` (rate-limited per source IP). A self-hosted subtensor node serves the EVM JSON-RPC on the same port as its substrate RPC (Frontier is built into the binary); if you set `SUBTENSOR_URL=ws://your-subtensor:9944` you can typically set this to `http://your-subtensor:9944` against the same host. Use `http`/`https` here — Anvil's `--fork-url` does HTTP polling, not WS. |
 
 ### Consensus and Signing
 
