@@ -276,6 +276,16 @@ app.include_router(submissions.router, prefix="/v1")
 app.include_router(orders.router, prefix="/v1")
 app.include_router(native_bittensor.router, prefix="/v1")
 
+# Local-testnet routes: Anvil faucet, direct subtensor stake, arbitrary-Python
+# strategy replay. Off by default; opt-in via LOCAL_TESTNET=1. The local
+# testnet compose sets this; production deployments leave it unset so these
+# handlers are never registered on the route table — defense in depth beyond
+# the per-handler auth gates.
+if os.environ.get("LOCAL_TESTNET", "").strip() == "1":
+    from minotaur_subnet.api.routes import local_testnet
+    app.include_router(local_testnet.router, prefix="/v1")
+    logger.info("LOCAL_TESTNET=1: mounting dev-only routes (faucet, direct-stake, replay-debug)")
+
 # /identity is registered WITHOUT the /v1 prefix to mirror the validator
 # daemon's convention (port 9100). Peer-discovery code can probe the same
 # path regardless of which port it's hitting.

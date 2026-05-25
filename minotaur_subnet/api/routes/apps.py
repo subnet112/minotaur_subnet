@@ -90,13 +90,9 @@ class ScorePlanRequest(BaseModel):
     )
 
 
-class ReplayDebugRequest(BaseModel):
-    """Run a strategy on one scenario and return per-interaction state trace."""
-    code: str = Field(..., description="Python source for the strategy")
-    params: dict[str, Any] = Field(..., description="Scenario params (input_token, etc.)")
-    intent_function: str = Field("execute", description="Intent function name")
-    scenario_name: str = Field("", description="Manifest scenario name (for logging)")
-    fork_block: int | None = Field(None, description="Optional historical block to rewind to")
+# ReplayDebugRequest model + ``/apps/{app_id}/replay-debug`` handler moved
+# to ``routes/local_testnet.py`` (2026-05-25 audit). Arbitrary-Python strategy
+# replay is a miner-dev debugging tool; only registered with LOCAL_TESTNET=1.
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -479,108 +475,4 @@ async def score_plan(app_id: str, body: ScorePlanRequest) -> dict[str, Any]:
         )
 
 
-@router.post("/apps/{app_id}/replay-debug")
-async def replay_debug(app_id: str, body: ReplayDebugRequest) -> dict[str, Any]:
-    """Replay a strategy on one scenario with per-interaction state trace.
-
-    Powers the miner's ``replay_failed_swap`` MCP tool. Loads the strategy
-    code, runs ``generate_plan`` against the supplied params, executes the
-    plan via the simulator's manual-execution path with state snapshots
-    between interactions (executor balances + allowances to each target).
-    Returns a structured trace that lets Claude pinpoint *which*
-    interaction's state mutation broke the chain.
-    """
-    import tempfile
-    import asyncio
-    from minotaur_subnet.shared.types import (
-        AppIntentConfig, AppIntentDefinition, IntentState, TriggerType,
-    )
-    from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-    from minotaur_subnet.miner.agent.strategy_tester import load_strategy
-
-    s = _store()
-    app = s.get_app(app_id)
-    if app is None:
-        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
-    deployment = s.get_deployment(app_id)
-    if deployment is None:
-        raise HTTPException(
-            status_code=400, detail=f"No deployment for {app_id}",
-        )
-
-    if _simulator is None:
-        raise HTTPException(
-            status_code=503, detail="Simulator not available on this node",
-        )
-
-    # Load the user's strategy from a temp file
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, prefix="replay_",
-        ) as f:
-            f.write(body.code)
-            tmp = f.name
-        try:
-            strategy = load_strategy(tmp)
-        except Exception as exc:
-            return {"error": f"Strategy load failed: {exc}"}
-
-        chain_id = deployment.chain_id or 1
-        snapshot = build_synthetic_snapshot(chain_id=chain_id)
-        intent = AppIntentDefinition(
-            app_id=app_id, name=app.name or "Replay", version="1.0.0",
-            intent_type="swap", js_code="//",
-            config=AppIntentConfig(
-                supported_chains=[chain_id], trigger_type=TriggerType.USER_TRIGGERED,
-            ),
-        )
-        state = IntentState(
-            contract_address=deployment.contract_address or "",
-            chain_id=chain_id, nonce=1,
-            owner=body.params.get("owner") or "0x0000000000000000000000000000000000000001",
-            raw_params=body.params,
-            control={"_intent_function": body.intent_function},
-        )
-        try:
-            plan = strategy.generate_plan(intent, state, snapshot)
-        except Exception as exc:
-            return {"error": f"generate_plan raised: {exc}"}
-
-        # Build token_balances seed: input_token to input_amount
-        in_token = body.params.get("input_token") or ""
-        in_amount = int(body.params.get("input_amount") or "0")
-        token_balances: dict[str, int] = {}
-        if in_token and in_amount:
-            token_balances[in_token] = in_amount
-
-        # MultiChainSimulator's _get_simulator expects a plan with
-        # metadata.chain_id set. Forward the chain hint and let the
-        # multi-chain dispatcher pick the right per-chain AnvilSimulator.
-        plan.metadata["chain_id"] = chain_id
-
-        def _run_trace():
-            if hasattr(_simulator, "_get_simulator"):
-                sim = _simulator._get_simulator(plan)
-            else:
-                sim = _simulator
-            return sim.simulate_with_trace(
-                plan, token_balances=token_balances,
-                focus_tokens=[
-                    in_token,
-                    body.params.get("output_token") or "",
-                ],
-            )
-        trace = await asyncio.to_thread(_run_trace)
-
-        return {
-            "scenario": body.scenario_name,
-            "plan_size": len(plan.interactions),
-            **trace,
-        }
-    finally:
-        if tmp:
-            try:
-                Path(tmp).unlink()
-            except OSError:
-                pass
+# replay_debug handler moved to ``routes/local_testnet.py``.

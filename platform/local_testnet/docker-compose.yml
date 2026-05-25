@@ -223,6 +223,10 @@ services:
     ports:
       - "${HOST_API_PORT:-8080}:8080"
     environment:
+      # Enable dev-only routes (faucet, direct-stake, replay-debug). Prod
+      # leaves this unset so the local_testnet router is never mounted.
+      LOCAL_TESTNET: "1"
+
       ANVIL_RPC_URL: http://anvil:8545
       BASE_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547

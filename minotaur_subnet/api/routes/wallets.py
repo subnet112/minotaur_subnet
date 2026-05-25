@@ -74,29 +74,5 @@ def fund_wallet(app_id: str, body: FundWalletRequest) -> dict[str, Any]:
     )
 
 
-# ── testnet ─────────────────────────────────────────────────────────────────
-
-
-class FaucetRequest(BaseModel):
-    address: str = Field(..., description="Ethereum address (plain 0x or CAIP-10)")
-    amount_eth: float = Field(10.0, description="Amount of ETH to fund")
-    chain_id: int = Field(0, description="Target chain (0=first available, 31337=ETH fork, 8453=Base fork)")
-
-
-@router.post("/testnet/faucet")
-def faucet_eth(body: FaucetRequest) -> dict[str, Any]:
-    """Fund an address with ETH on a local Anvil testnet fork."""
-    return _tools.faucet_eth(body.address, body.amount_eth, chain_id=body.chain_id)
-
-
-class FaucetErc20Request(BaseModel):
-    token: str = Field(..., description="Token address, symbol (USDC), or chain-qualified (USDC@8453)")
-    address: str = Field(..., description="Recipient address (plain 0x or CAIP-10)")
-    amount: str = Field(..., description="Amount in token's smallest unit (decimal string)")
-    chain_id: int = Field(0, description="Target chain (0=first available)")
-
-
-@router.post("/testnet/faucet_erc20")
-def faucet_erc20(body: FaucetErc20Request) -> dict[str, Any]:
-    """Fund an address with ERC-20 tokens on a local Anvil testnet fork."""
-    return _tools.faucet_erc20(body.token, body.address, body.amount, chain_id=body.chain_id)
+# Faucet endpoints moved to ``routes/local_testnet.py`` (2026-05-25 audit).
+# Only registered when ``LOCAL_TESTNET=1`` is set — prod stacks never expose them.
