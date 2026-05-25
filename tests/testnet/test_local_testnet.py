@@ -850,14 +850,18 @@ def _wait_for_validator_cluster(timeout: int = 180) -> dict[str, dict]:
 
 
 def _wait_for_validator_intent_loaded(base_url: str, app_id: str, timeout: int = 120) -> dict:
+    """Poll the validator's /health (which exposes ``loaded_intents`` count)
+    until at least one intent is loaded. Used to be ``/intents/available``,
+    which was removed in the 2026-05-25 validator surface cleanup. The
+    /health count is a coarser signal but sufficient for "is the intent
+    actually loaded yet" sequencing.
+    """
     deadline = time.time() + timeout
     last_payload: dict | None = None
     while time.time() < deadline:
-        status, payload = _request_json("GET", f"{base_url}/intents/available")
+        status, payload = _request_json("GET", f"{base_url}/health")
         last_payload = payload
-        if status == 200 and any(
-            item.get("app_id") == app_id for item in payload.get("intents", [])
-        ):
+        if status == 200 and int(payload.get("loaded_intents", 0)) > 0:
             return payload
         time.sleep(2)
 
@@ -1112,25 +1116,15 @@ def test_validator_cluster_reaches_real_quorum_on_order_execution(deployed_test_
 
     prepared = _prepare_swap(app_id, submitted_by=address)
     quote = _wait_for_quote(app_id, prepared["resolved_params"])
-    enriched_order = _submit_order(
+    # Submit via the api gateway (the prod path); the validator picks up
+    # the order from the shared store-data volume via its BlockLoop. The
+    # validator's direct ``/orders/submit`` was removed in the 2026-05-25
+    # surface cleanup — it was a duplicate that bypassed the api gateway.
+    order = _submit_order(
         app_id,
         submitted_by=address,
         params=quote.get("ready_params", prepared["resolved_params"]),
     )
-    validator_params = enriched_order.get("params", {})
-    status, order = _request_json(
-        "POST",
-        f"{leader_url}/orders/submit",
-        {
-            "app_id": app_id,
-            "chain_id": 31337,
-            "intent_function": "swap",
-            "submitted_by": address,
-            "params": validator_params,
-        },
-        timeout=30,
-    )
-    assert status == 200, order
 
     terminal = _wait_for_validator_order_terminal(
         leader_url,
