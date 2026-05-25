@@ -83,6 +83,20 @@ body:
           required: true
 
   - type: textarea
+    id: check_output
+    attributes:
+      label: Output of `scripts/check_validator.sh`
+      description: |
+        Paste the full output of `bash scripts/check_validator.sh` (run on your
+        validator host). A green run (all `✓`) is the precondition for us
+        running the on-chain registry-write — it lets us confirm your stack
+        is healthy + serving `/identity` correctly + reading the right
+        on-chain quorum before we commit gas.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
     id: notes
     attributes:
       label: Anything else?

@@ -93,9 +93,17 @@ No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, de
 
 | Port | Service | Notes |
 |------|---------|-------|
-| `9100/tcp` | Validator HTTP API -- consensus signing + `/identity` | Must be reachable by the current leader to receive proposals, and by other peers for peer discovery. |
+| `9100/tcp` | Validator daemon — order-consensus signing + `/identity` | Reached by the current leader for proposal broadcast and by peers for discovery. |
+| `8080/tcp` | API service — champion-consensus signing + `/identity` | Reached by the current leader for champion-certification proposals. |
 
-If you are behind NAT, forward 9100 to the validator host. On a cloud VPS with a public IP, open 9100 in the firewall.
+If you are behind NAT, forward both ports. On a cloud VPS with a public IP, open both in the firewall. Quick example on Ubuntu with `ufw`:
+
+```bash
+sudo ufw allow 9100/tcp comment "minotaur validator daemon"
+sudo ufw allow 8080/tcp comment "minotaur api service"
+```
+
+For AWS security groups, allow inbound TCP 9100 and 8080 from `0.0.0.0/0`. For other clouds the procedure is equivalent — the only requirement is that both ports are reachable from the public internet so the leader can deliver proposals.
 
 ### Outbound (egress, no special configuration)
 
@@ -114,29 +122,35 @@ Anvil ports (`8545` for ETH, `8546` for Base, `8547` for BT EVM) are bound to th
 
 ## Prerequisites
 
-- **Python 3.12+**
-- **Node.js 20.x** (for the JS scoring engine)
-- **Foundry** (anvil, forge, cast) -- install via `curl -L https://foundry.paradigm.xyz | bash && foundryup`
-- **Docker + Docker Compose** (for running Anvil forks; see Step 6)
-- **Bittensor CLI** (`btcli`) with a registered wallet on subnet 112
-- **Ethereum RPC URL** from Alchemy or Infura (for Anvil mainnet fork simulation)
-- **EVM private key** for EIP-712 consensus signing (a fresh key is fine -- it does not hold funds)
-- **Coordination with the subnet operator** to be added to the on-chain `ValidatorRegistry` (Step 4) — without this, your signatures won't count
+Two host-level tools you must install:
 
-## Step 1: Clone and Install
+- **Docker** (≥25 for compatibility with the bundled Watchtower) + **Docker Compose plugin**
+- **Foundry** (`cast`) — used to generate your EVM signing key + to read/verify on-chain state
+- **Bittensor CLI** (`btcli`) — used to register your hotkey on subnet 112
+
+If you're on Ubuntu/Debian and want all three in one shot, run our installer (idempotent — skips anything you already have):
 
 ```bash
-# Clone the repository
+curl -fsSL https://raw.githubusercontent.com/subnet112/minotaur_subnet/main/scripts/install_prereqs.sh | bash
+```
+
+Plus these account-level things you provide:
+
+- **Bittensor wallet** with a registered hotkey on subnet 112 (Step 3 below)
+- **EVM private key** for EIP-712 consensus signing (Step 4 — a fresh key is fine, it does NOT hold funds)
+- **Ethereum + Base RPC URLs** from Alchemy or Infura (free tier is fine for moderate load)
+- **Coordination with the subnet operator** to be added to the on-chain `ValidatorRegistry` (the GitHub Issue template — Step 11)
+
+## Step 1: Clone the repo
+
+You only need the repo for the canonical compose file + the `.env.example`. The validator + api Python code runs inside the Docker image (no local venv / pip install needed):
+
+```bash
 git clone https://github.com/subnet112/minotaur_subnet.git
 cd minotaur_subnet
-
-# Create and activate a virtual environment
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# Install Python dependencies
-pip install -r requirements.txt
 ```
+
+> **Skip ahead to [Step 5](#step-5-configure-environment)** if you ran the installer above and have an existing Bittensor wallet — Steps 2-4 are just verifying / generating those.
 
 ## Step 2: Install Foundry
 
@@ -304,6 +318,16 @@ docker compose logs -f validator api
 ```
 
 ### Verify
+
+The simplest path is the bundled check script — it runs every endpoint + verifies registry state + prints a green/red summary:
+
+```bash
+bash scripts/check_validator.sh
+```
+
+When you open the onboarding issue in Step 11, the template asks you to paste the output of this script. A green run is the precondition for us running the registry-write on our side.
+
+Or manually:
 
 ```bash
 # Validator health (order-consensus)
