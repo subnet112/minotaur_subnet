@@ -371,12 +371,24 @@ async def initialize(ctx: ServerContext) -> dict:
     Returns a dict of local-only objects needed during shutdown but NOT
     stored on ctx (bridge_tracker_task, champion_peer_network, etc.).
     """
-    # Step 0: hydrate signing keys from AWS Secrets Manager before any
+    # Step 0a: hydrate signing keys from AWS Secrets Manager before any
     # other module reads os.environ. Env values that are already set are
     # preserved — SM is fallback, not override. No-op if boto3 is missing
     # or the instance lacks the IAM role.
     from minotaur_subnet.api.secrets_loader import hydrate_env_from_secrets_manager
     _outcome = hydrate_env_from_secrets_manager()
+    # Step 0b: required-env sanity check. Runs AFTER Secrets Manager
+    # hydration so SM-provided values aren't flagged as missing, but
+    # BEFORE any other startup logic — operators who forgot
+    # ``cp .env.example .env`` get a single actionable diagnostic
+    # instead of the cryptic "Champion consensus enabled but no
+    # VALIDATOR_REGISTRY_964 configured" error several hundred lines
+    # deep into startup.
+    from minotaur_subnet.shared.env_check import (
+        REQUIRED_REGISTRY_ENV,
+        check_required_env_or_exit,
+    )
+    check_required_env_or_exit(REQUIRED_REGISTRY_ENV, process_name="api")
     if _outcome.env_vars_set:
         logger.info(
             "[secrets] hydrated %d signing key(s) from Secrets Manager",
