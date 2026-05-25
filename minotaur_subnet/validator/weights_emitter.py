@@ -74,8 +74,18 @@ class WeightsEmitter:
             return False
 
     def _emit_blocking(self, weights_mapping: dict[str, float]) -> bool:
-        """Blocking weight submission (runs in executor)."""
+        """Blocking weight submission (runs in executor).
+
+        Hotkeys absent from the live metagraph (e.g. a champion that
+        deregistered between certification and this epoch) have their
+        weight rerouted to the subnet owner UID. This keeps the burn-to-
+        owner fallback intact under all "champion not currently a miner"
+        states — never-registered, deregistered, immunity-expired, hotkey-
+        rotated — so the validator never silently emits empty weights.
+        """
         import numpy as np
+
+        from minotaur_subnet.weight_policy import get_subnet_owner_hotkey
 
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
 
@@ -84,19 +94,32 @@ class WeightsEmitter:
         for uid in range(metagraph.n.item()):
             hotkey_to_uid[metagraph.hotkeys[uid]] = uid
 
-        uids: list[int] = []
-        weights: list[float] = []
+        owner_hotkey = get_subnet_owner_hotkey()
+        owner_uid = hotkey_to_uid.get(owner_hotkey) if owner_hotkey else None
+
+        uid_weight: dict[int, float] = {}
         for hotkey, weight in weights_mapping.items():
             uid = hotkey_to_uid.get(hotkey)
             if uid is not None:
-                uids.append(uid)
-                weights.append(weight)
+                uid_weight[uid] = uid_weight.get(uid, 0.0) + weight
+            elif owner_uid is not None:
+                logger.warning(
+                    "Hotkey %s not in metagraph — routing %.4f weight to owner UID %d (%s)",
+                    hotkey[:16], weight, owner_uid, owner_hotkey[:16],
+                )
+                uid_weight[owner_uid] = uid_weight.get(owner_uid, 0.0) + weight
             else:
-                logger.warning("Hotkey %s not found in metagraph, skipping", hotkey[:16])
+                logger.error(
+                    "Hotkey %s not in metagraph and no SUBNET_OWNER_HOTKEY fallback configured — dropping %.4f weight",
+                    hotkey[:16], weight,
+                )
 
-        if not uids:
+        if not uid_weight:
             logger.warning("No valid UIDs found for weight emission")
             return False
+
+        uids = list(uid_weight.keys())
+        weights = list(uid_weight.values())
 
         # Normalize weights to sum to 1.0
         total = sum(weights)

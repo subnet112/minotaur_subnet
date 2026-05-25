@@ -55,7 +55,11 @@ class TestWeightsEmitter:
         # Check UIDs and weights are passed
         assert call_kwargs.kwargs["netuid"] == 1
 
-    def test_emit_blocking_skips_unknown_hotkeys(self):
+    def test_emit_blocking_drops_unknown_hotkeys_when_no_owner_configured(self, monkeypatch):
+        """Without SUBNET_OWNER_HOTKEY there is no fallback — unknown hotkeys drop."""
+        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+
         wallet = MagicMock()
         subtensor = MagicMock()
         subtensor.metagraph.return_value = _make_mock_metagraph(["hk_a"], [100.0])
@@ -69,18 +73,91 @@ class TestWeightsEmitter:
 
         assert result is True
         call_kwargs = subtensor.set_weights.call_args
-        # Only hk_a should be in the arrays (UID 0)
-        import numpy as np
         uids = call_kwargs.kwargs["uids"]
-        assert len(uids) == 1
+        assert len(uids) == 1  # only hk_a survives
 
-    def test_emit_blocking_no_valid_uids(self):
+    def test_emit_blocking_no_valid_uids(self, monkeypatch):
+        """Unknown hotkey + no owner fallback = nothing to emit."""
+        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+
         wallet = MagicMock()
         subtensor = MagicMock()
         subtensor.metagraph.return_value = _make_mock_metagraph(["hk_a"], [100.0])
 
         we = WeightsEmitter(wallet=wallet, subtensor=subtensor, netuid=1)
         result = we._emit_blocking({"hk_unknown": 0.5})
+        assert result is False
+        subtensor.set_weights.assert_not_called()
+
+    def test_emit_blocking_reroutes_deregistered_champion_to_owner(self, monkeypatch):
+        """A champion hotkey that's no longer in the metagraph gets its weight
+        routed to the configured owner UID instead of being silently dropped.
+
+        This guards against the failure mode where a miner wins championship,
+        deregisters, and the validator would otherwise emit empty weights
+        (losing dividends and bypassing the burn-to-owner fallback)."""
+        monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "hk_owner")
+
+        wallet = MagicMock()
+        subtensor = MagicMock()
+        # owner at UID 0, no longer-champion hotkey in metagraph
+        subtensor.metagraph.return_value = _make_mock_metagraph(
+            ["hk_owner", "hk_other"], [100.0, 10.0],
+        )
+        mock_result = MagicMock()
+        mock_result.success = True
+        subtensor.set_weights.return_value = mock_result
+
+        we = WeightsEmitter(wallet=wallet, subtensor=subtensor, netuid=1)
+        result = we._emit_blocking({"hk_dead_champion": 1.0})
+
+        assert result is True
+        call_kwargs = subtensor.set_weights.call_args
+        uids = call_kwargs.kwargs["uids"]
+        weights = call_kwargs.kwargs["weights"]
+        assert list(uids) == [0]                  # owner UID
+        assert abs(float(weights[0]) - 1.0) < 1e-6
+
+    def test_emit_blocking_merges_known_and_deregistered_into_owner(self, monkeypatch):
+        """Mixed mapping: registered miner stays at its UID, deregistered
+        portion accrues to the owner UID. Output normalizes across both."""
+        monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "hk_owner")
+
+        wallet = MagicMock()
+        subtensor = MagicMock()
+        # hk_owner at UID 0, hk_alive at UID 1
+        subtensor.metagraph.return_value = _make_mock_metagraph(
+            ["hk_owner", "hk_alive"], [100.0, 10.0],
+        )
+        mock_result = MagicMock()
+        mock_result.success = True
+        subtensor.set_weights.return_value = mock_result
+
+        we = WeightsEmitter(wallet=wallet, subtensor=subtensor, netuid=1)
+        result = we._emit_blocking({"hk_alive": 0.6, "hk_dead": 0.4})
+
+        assert result is True
+        call_kwargs = subtensor.set_weights.call_args
+        uids = list(call_kwargs.kwargs["uids"])
+        weights = list(call_kwargs.kwargs["weights"])
+        uid_to_weight = dict(zip(uids, (float(w) for w in weights)))
+        assert set(uid_to_weight.keys()) == {0, 1}
+        assert abs(uid_to_weight[1] - 0.6) < 1e-6   # hk_alive UID 1
+        assert abs(uid_to_weight[0] - 0.4) < 1e-6   # rerouted from hk_dead
+
+    def test_emit_blocking_owner_hotkey_itself_missing_drops(self, monkeypatch):
+        """If SUBNET_OWNER_HOTKEY is configured but not currently in the
+        metagraph (e.g. owner key rotated mid-flight), unknown weight has no
+        rescue path — drop and let the alarm fire. Don't silently misroute."""
+        monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "hk_owner_gone")
+
+        wallet = MagicMock()
+        subtensor = MagicMock()
+        subtensor.metagraph.return_value = _make_mock_metagraph(["hk_other"], [10.0])
+
+        we = WeightsEmitter(wallet=wallet, subtensor=subtensor, netuid=1)
+        result = we._emit_blocking({"hk_dead_champion": 1.0})
         assert result is False
         subtensor.set_weights.assert_not_called()
 
