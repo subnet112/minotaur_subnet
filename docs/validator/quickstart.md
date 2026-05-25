@@ -403,7 +403,7 @@ Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloa
 
 ## Peer discovery
 
-Order-consensus peers are discovered automatically — no `VALIDATOR_PEERS` env required for the daemon's order-consensus path. The flow:
+Order-consensus and champion-consensus peers are both discovered automatically — no peer-list env required for either. The flow:
 
 1. **Your daemon publishes its identity**: a `GET /identity` endpoint on port 9100 returns a fresh EIP-712 signed payload binding `(evm_address, hotkey, axon_url)`. Each request regenerates the signature so it's never stale.
 2. **You publish your axon URL**: set `VALIDATOR_AXON_URL=http://your-host:9100` in the daemon env. This is what the signed payload claims. Also call `btcli` to register your axon on the Bittensor metagraph so other validators can find you.
@@ -412,7 +412,7 @@ Order-consensus peers are discovered automatically — no `VALIDATOR_PEERS` env 
 What this gives operators:
 
 - **No coordinated restart when a new validator joins.** The new validator's EVM gets added on-chain by the registry owner, they start their daemon, others pick them up within one refresh tick.
-- **No `VALIDATOR_PEERS` env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
+- **No peer-list env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
 - **IP changes are self-served.** A validator changing hosts just updates `VALIDATOR_AXON_URL` and restarts; the signed `/identity` payload re-publishes the new URL automatically.
 
 ### Required env for discovery
@@ -429,9 +429,9 @@ What this gives operators:
 
 **Third-party validators should always leave these unset.** Setting them locks you to a stale set that won't include the rest of the network — your validator becomes invisible to other peers and never reaches quorum. The discovery path (metagraph axon list + on-chain `ValidatorRegistry.getValidators()` + each peer's signed `/identity` payload) is the supported flow and works out of the box once you complete the [on-chain registration handshake](#on-chain-registration).
 
-### Optional override
+### Pinned-mode override (subnet team only)
 
-If you need to pin the peer list (local testnet, isolated cluster, debugging a discovery failure), set `VALIDATOR_PEERS` env or pass `--validator-peers` on the daemon CLI. The pinned list overrides discovery entirely. Production deployments should leave it unset.
+For local testnet or the subnet team's own prod (where metagraph axons aren't published yet), `ORDER_CONSENSUS_PEERS` (`addr@url`-comma-separated) pins the order-consensus peer list and bypasses discovery entirely. `CHAMPION_CONSENSUS_PEERS` does the same for champion-consensus. Both are documented under "Internal-only envs" above — third-party validators should always leave them unset.
 
 ### Verifying discovery is working
 
