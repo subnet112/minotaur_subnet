@@ -242,6 +242,43 @@ def _verify_champion_proposal_signature(body: Any) -> str | None:
     return None
 
 
+def _require_registered_miner(hotkey: str) -> None:
+    """Reject submissions from hotkeys not currently in the subnet metagraph.
+
+    Resource-hygiene gate — keeps the leaderboard, benchmark queue, and
+    Docker build cache scoped to actual subnet participants. Weight-system
+    safety is enforced separately in the emitter (which reroutes any
+    non-registered hotkey to the owner UID at emission time), so this gate
+    is allowed to fail open when the metagraph isn't available — it never
+    needs to be the only thing standing between an unregistered hotkey and
+    a malformed weight emission.
+
+    Bypass cases:
+      - ``SUBMISSIONS_ALLOW_UNREGISTERED=1`` — emergency operator override.
+      - ``solver_round_metagraph_sync`` is None — local dev / test stacks
+        without a subtensor connection.
+      - Metagraph state has never synced yet — fail open during startup.
+    """
+    if _env_true("SUBMISSIONS_ALLOW_UNREGISTERED", default=False):
+        return
+    from minotaur_subnet.api.server_context import ctx
+    if ctx.solver_round_metagraph_sync is None:
+        return
+    state = ctx.solver_round_metagraph_sync.state
+    if state is None:
+        return
+    hotkey = (hotkey or "").strip()
+    registered = {p.hotkey for p in state.peers}
+    if hotkey not in registered:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Hotkey {hotkey[:12]}... is not registered on the subnet "
+                "metagraph. Register a miner UID before submitting."
+            ),
+        )
+
+
 def _enforce_rate_limit(request: Request, principal: str) -> None:
     """Simple in-memory fixed-window limiter for submission creation endpoints."""
     raw_limit = os.environ.get("SUBMISSIONS_RATE_LIMIT_PER_MINUTE", "60").strip()
@@ -437,6 +474,7 @@ async def create_source_submission(
     _require_source_enabled()
     _require_submission_api_key(request)
     _enforce_rate_limit(request, body.hotkey.strip())
+    _require_registered_miner(body.hotkey)
 
     store = get_store()
     current_round = _require_open_submission_round(
@@ -499,6 +537,7 @@ async def create_submission(
     _require_submissions_enabled()
     _require_submission_api_key(request)
     _enforce_rate_limit(request, body.hotkey.strip())
+    _require_registered_miner(body.hotkey)
 
     store = get_store()
     current_round = _require_open_submission_round(

@@ -1564,5 +1564,124 @@ class TestScreeningBackground(unittest.TestCase):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#                  REGISTERED-MINER GATE TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRequireRegisteredMiner(unittest.TestCase):
+    """Tests for the _require_registered_miner gate on submission endpoints."""
+
+    def _make_metagraph_sync(self, hotkeys: list[str]):
+        peers = [SimpleNamespace(hotkey=hk) for hk in hotkeys]
+        state = SimpleNamespace(peers=peers)
+        return SimpleNamespace(state=state)
+
+    def test_failopen_when_metagraph_sync_unset(self):
+        """Local dev / test stacks lacking a subtensor connection bypass the gate."""
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        try:
+            ctx.solver_round_metagraph_sync = None
+            _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+
+    def test_failopen_when_state_never_synced(self):
+        """During startup the state is None — gate must not falsely reject."""
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        try:
+            ctx.solver_round_metagraph_sync = SimpleNamespace(state=None)
+            _require_registered_miner("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+
+    def test_accepts_registered_hotkey(self):
+        from fastapi import HTTPException
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        try:
+            ctx.solver_round_metagraph_sync = self._make_metagraph_sync(
+                ["hk_owner", "hk_miner_1", "hk_miner_2"],
+            )
+            try:
+                _require_registered_miner("hk_miner_1")
+            except HTTPException:
+                self.fail("registered hotkey should pass the gate")
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+
+    def test_rejects_unregistered_hotkey(self):
+        from fastapi import HTTPException
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        try:
+            ctx.solver_round_metagraph_sync = self._make_metagraph_sync(
+                ["hk_owner", "hk_miner_1"],
+            )
+            with self.assertRaises(HTTPException) as exc_ctx:
+                _require_registered_miner("hk_outsider")
+            self.assertEqual(exc_ctx.exception.status_code, 403)
+            self.assertIn("not registered", exc_ctx.exception.detail)
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+
+    def test_emergency_override_env_bypasses_gate(self):
+        """SUBMISSIONS_ALLOW_UNREGISTERED=1 is the operator escape hatch."""
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        prev_env = os.environ.get("SUBMISSIONS_ALLOW_UNREGISTERED")
+        try:
+            ctx.solver_round_metagraph_sync = self._make_metagraph_sync(["hk_owner"])
+            os.environ["SUBMISSIONS_ALLOW_UNREGISTERED"] = "1"
+            _require_registered_miner("hk_outsider")  # would normally 403
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+            if prev_env is None:
+                os.environ.pop("SUBMISSIONS_ALLOW_UNREGISTERED", None)
+            else:
+                os.environ["SUBMISSIONS_ALLOW_UNREGISTERED"] = prev_env
+
+    def test_strips_whitespace_before_lookup(self):
+        """Whitespace in body.hotkey shouldn't masquerade an outsider as registered."""
+        from fastapi import HTTPException
+        from minotaur_subnet.api.server_context import ctx
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _require_registered_miner,
+        )
+
+        prev = ctx.solver_round_metagraph_sync
+        try:
+            ctx.solver_round_metagraph_sync = self._make_metagraph_sync(["hk_miner_1"])
+            # Trailing whitespace on a registered hotkey is normalized → accepted.
+            _require_registered_miner("  hk_miner_1  ")
+            # Outsider with whitespace still rejected.
+            with self.assertRaises(HTTPException):
+                _require_registered_miner(" hk_outsider ")
+        finally:
+            ctx.solver_round_metagraph_sync = prev
+
+
 if __name__ == "__main__":
     unittest.main()
