@@ -21,6 +21,11 @@
   - [Configuration](validator/configuration.md)
   - [Troubleshooting](validator/troubleshooting.md)
 
+## Operator
+
+- [Network Reference](operator/network-reference.md)
+- [Quorum Management](operator/quorum-management.md)
+
 ## Solver
 
 - [Solver Guide](solver/solver_guide.md)
