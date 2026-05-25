@@ -429,9 +429,9 @@ What this gives operators:
 
 **Third-party validators should always leave these unset.** Setting them locks you to a stale set that won't include the rest of the network — your validator becomes invisible to other peers and never reaches quorum. The discovery path (metagraph axon list + on-chain `ValidatorRegistry.getValidators()` + each peer's signed `/identity` payload) is the supported flow and works out of the box once you complete the [on-chain registration handshake](#on-chain-registration).
 
-### Optional override
+### Pinned-mode override (subnet team only)
 
-If you need to pin the peer list (local testnet, isolated cluster, debugging a discovery failure), set `VALIDATOR_PEERS` env or pass `--validator-peers` on the daemon CLI. The pinned list overrides discovery entirely. Production deployments should leave it unset.
+For local testnet or the subnet team's own prod (where metagraph axons aren't published yet), `ORDER_CONSENSUS_PEERS` (`addr@url`-comma-separated) pins the order-consensus peer list and bypasses discovery entirely. `CHAMPION_CONSENSUS_PEERS` does the same for champion-consensus. Both are documented under "Internal-only envs" above — third-party validators should always leave them unset.
 
 ### Verifying discovery is working
 
