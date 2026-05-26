@@ -47,8 +47,9 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 |----------|---------|-------------|
 | `VALIDATOR_PRIVATE_KEY` | `""` | EVM private key (hex, with `0x` prefix) for EIP-712 consensus signing (same as `--validator-key`) |
 | `VALIDATOR_AXON_URL` | -- | Public URL where this daemon serves the `/identity` endpoint, e.g. `http://your-host:9100`. Used by peer discovery: the daemon signs this URL into its `/identity` attestation so other validators can verify the binding. If unset, `/identity` returns 503 and other validators can't include you in their peer set. |
-| `VALIDATOR_REGISTRY_ADDRESS` | -- | Address of the on-chain `ValidatorRegistry` (same as `--validator-registry-address`). Holds the canonical `quorumBps` and the authorized validator EVM list; the daemon reads both at startup and refreshes once per epoch. See [Quorum management](../operator/quorum-management.md) for how to change quorum. |
-| `VALIDATOR_REGISTRY_<chain>` | -- | Per-chain form of the above (e.g. `VALIDATOR_REGISTRY_8453` for Base, `VALIDATOR_REGISTRY_964` for BT EVM). The daemon picks the right one based on `CHAIN_ID`. Preferred over the generic `VALIDATOR_REGISTRY_ADDRESS` in multi-chain deployments. |
+| `VALIDATOR_REGISTRY_8453` | -- | **Required.** Address of the on-chain `ValidatorRegistry` on Base (chain 8453). Holds the authorized validator EVM list + canonical `quorumBps` for order-consensus; the daemon reads both at startup and refreshes once per epoch. See [Quorum management](../operator/quorum-management.md). |
+| `VALIDATOR_REGISTRY_964` | -- | **Required.** Same contract on BT EVM (chain 964). Used by the api service for champion-consensus signer verification. |
+| `VALIDATOR_REGISTRY_ADDRESS` | -- | Legacy single-chain form. Deprecated — use the chain-specific `VALIDATOR_REGISTRY_<chain>` variables above. The canonical `.env.example` ships the chain-specific forms with current production addresses pre-filled. |
 | `QUORUM_BPS_OVERRIDE` | -- | Emergency / local-testnet escape hatch: forces a local quorum value and skips the on-chain read. Production deployments should leave this unset so `ValidatorRegistry.quorumBps()` stays authoritative. |
 | `ORDER_CONSENSUS_PEERS` | `""` | **Internal-only escape hatch.** Pinned-peer list (`addr@url`, comma-separated) for order-consensus. Bypasses automatic discovery. Used only by the subnet team's prod (where metagraph axons aren't published yet) and by test harnesses. **Third-party validators should always leave this unset** — discovery via the metagraph + on-chain `ValidatorRegistry` is the supported path. |
 | `CHAMPION_CONSENSUS_PEERS` | `""` | **Internal-only escape hatch.** Same pattern for champion-consensus. Same warning: third-party validators should leave it unset. |
@@ -120,9 +121,12 @@ ANVIL_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
 BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
 
 # Consensus — peer set comes from on-chain ValidatorRegistry + metagraph,
-# not from env. Just supply the signing key and registry address.
+# not from env. Just supply the signing key + the per-chain registry
+# addresses (both chains are required — the canonical .env.example ships
+# current values pre-filled).
 VALIDATOR_PRIVATE_KEY=0xYOUR_EVM_PRIVATE_KEY
 VALIDATOR_REGISTRY_8453=0x88a08d1105393EACE9B6f5ff678DbE508B8639aC
+VALIDATOR_REGISTRY_964=0x0B5fE44e90515571761D86C28c4855F325EDE098
 QUORUM_BPS=10000
 
 # Chain
