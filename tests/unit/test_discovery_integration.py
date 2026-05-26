@@ -80,7 +80,15 @@ class TestConsensusManagerDiscoveryMode:
         cfg.peers[:] = [_peer(1)]
         assert len(cm.validators) == 2
 
-    def test_explicit_validators_override_pins_set(self):
+    def test_explicit_validators_union_with_discovered(self):
+        """Pinned ``validators=...`` arg combines with discovered peers.
+
+        Updated 2026-05-26 from the previous mutually-exclusive override
+        behavior to the union shape — mirrors what ``PeerNetwork.peers``
+        already does. The motivation: in-cluster peers (no metagraph
+        hotkey) need env-pinning, while third-party validators only
+        appear via discovery. Both must contribute signers.
+        """
         cfg = _cfg(peers=[_peer(1), _peer(2)])
         pinned = ["0xself", "0xother"]
         cm = ConsensusManager(
@@ -89,12 +97,24 @@ class TestConsensusManagerDiscoveryMode:
             protocol_config=cfg,
             validators=pinned,
         )
-        # Override wins even when discovery has different peers
-        assert cm.validators == pinned
+        # Union: self + pinned-not-overlapping + discovered. Self dedupes
+        # against the pinned list (case-insensitive on EVM address).
+        assert cm.validators == [
+            "0xself",
+            "0xother",
+            _peer(1).evm_address,
+            _peer(2).evm_address,
+        ]
 
-        # And it stays pinned across discovery mutations
+        # And discovery mutations propagate live — union recomputes on read
         cfg.peers.append(_peer(3))
-        assert cm.validators == pinned
+        assert cm.validators == [
+            "0xself",
+            "0xother",
+            _peer(1).evm_address,
+            _peer(2).evm_address,
+            _peer(3).evm_address,
+        ]
 
     def test_quorum_required_recalculates_on_peer_change(self):
         # 50% quorum with 3 total (self + 2 peers) → ceil(1.5) = 2
