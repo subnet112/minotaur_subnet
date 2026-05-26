@@ -13,10 +13,18 @@ from the configured leader and upserts both ``AppIntentDefinition`` and
 ``_rescan_loop`` in ``validator/main.py`` picks up the new JS on its next
 tick and hot-loads it into the engine.
 
-SECURITY: ``js_code`` is fetched from the leader and trusted as-is. There is
-no on-chain hash anchor at this layer — a compromised leader could push
-malicious JS to followers. Anchoring ``keccak256(js_code)`` on-chain via the
-``AppRegistry`` is tracked as a follow-up.
+SECURITY (audit H8): ``js_code`` is fetched from the leader and trusted
+as-is. There is no on-chain hash anchor at this layer — a compromised
+leader could push malicious JS to followers. Anchoring
+``keccak256(js_code)`` on-chain via the ``AppRegistry`` is tracked as a
+follow-up. Until the on-chain anchor lands, operators can:
+
+* set ``MINOTAUR_JS_CODE_ALLOWLIST_SHA256`` to a comma-separated list of
+  hex sha256 digests of known-good JS modules; anything not in the list
+  is refused at sync time.
+* leave ``LEADER_API_URL`` on https:// — http:// is rejected at
+  construction time so a passive on-path attacker cannot swap the JS
+  payload mid-flight.
 """
 
 from __future__ import annotations
@@ -24,7 +32,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -81,11 +91,38 @@ class ValidatorAppCatalogSync:
         request_timeout: float = 15.0,
     ) -> None:
         self.store = store
+        # Audit H8: refuse plaintext leader URLs at construction time so a
+        # passive on-path attacker can't swap the JS payload. Operators
+        # who explicitly want http for local testing must opt in.
+        parsed = urlparse(leader_url)
+        allow_http = os.environ.get(
+            "MINOTAUR_LEADER_ALLOW_HTTP", "0",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if parsed.scheme == "http" and not allow_http:
+            raise ValueError(
+                f"LEADER_API_URL must use https:// (got {parsed.scheme}://). "
+                f"Set MINOTAUR_LEADER_ALLOW_HTTP=1 for local testing only."
+            )
         self.leader_url = leader_url.rstrip("/")
         self.poll_interval = poll_interval
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
         self._stopped = False
         self._task: asyncio.Task | None = None
+        # Optional operator-side JS hash pinning. Empty set = no pinning,
+        # i.e. trust whatever the leader sends (current behaviour). When
+        # populated, any JS module not matching one of these sha256
+        # digests is refused at upsert time.
+        raw = os.environ.get("MINOTAUR_JS_CODE_ALLOWLIST_SHA256", "")
+        self._js_sha256_allowlist: set[str] = {
+            h.strip().lower().removeprefix("0x")
+            for h in raw.split(",")
+            if h.strip()
+        }
+        if self._js_sha256_allowlist:
+            logger.warning(
+                "JS code allowlist active: %d sha256 digest(s) accepted",
+                len(self._js_sha256_allowlist),
+            )
 
     async def start(self) -> None:
         """Run an initial sync, then start the background poll loop."""
@@ -174,6 +211,18 @@ class ValidatorAppCatalogSync:
         except KeyError as exc:
             logger.warning("Malformed app payload (missing %s); skipping", exc)
             return 0, 0
+
+        # Audit H8: operator-side JS pinning. Refuse any js_code whose
+        # sha256 isn't in the allowlist. Empty allowlist = no-op (current
+        # default trust-the-leader behaviour).
+        if self._js_sha256_allowlist:
+            js_digest = hashlib.sha256(new_def.js_code.encode()).hexdigest()
+            if js_digest.lower() not in self._js_sha256_allowlist:
+                logger.warning(
+                    "Refusing app %s: js_code sha256=%s not in allowlist",
+                    new_def.app_id, js_digest,
+                )
+                return 0, 0
 
         apps_updated = 0
         existing = self.store.get_app(new_def.app_id)
