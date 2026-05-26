@@ -138,3 +138,69 @@ async def test_emission_exception_is_swallowed_not_killing_loop():
     await _run_one_iteration(self_stub)
 
     self_stub._weights_emitter.emit_async.assert_awaited_once()
+
+
+# ── last_emit observability (surfaced in /health) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_last_emit_records_success():
+    """Successful emit_async returning True must record result=ok."""
+    self_stub = MagicMock()
+    self_stub.weights = MagicMock()
+    self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
+    self_stub._champion_miner_id = None
+    self_stub._weights_emitter = MagicMock()
+    self_stub._weights_emitter.emit_async = AsyncMock(return_value=True)
+    self_stub._is_leader = False
+    self_stub._last_emit_state = None
+
+    await _run_one_iteration(self_stub)
+
+    assert self_stub._last_emit_state is not None
+    assert self_stub._last_emit_state["result"] == "ok"
+    assert self_stub._last_emit_state["error"] is None
+    assert self_stub._last_emit_state["uids_attempted"] == 1
+    assert isinstance(self_stub._last_emit_state["attempted_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_last_emit_records_emit_returning_false():
+    """emit_async returning False (chain-side rejection that didn't raise)
+    is the silent-failure case PR #69's leader-gate fix unmasked. Surface it."""
+    self_stub = MagicMock()
+    self_stub.weights = MagicMock()
+    self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
+    self_stub._champion_miner_id = None
+    self_stub._weights_emitter = MagicMock()
+    self_stub._weights_emitter.emit_async = AsyncMock(return_value=False)
+    self_stub._is_leader = False
+    self_stub._last_emit_state = None
+
+    await _run_one_iteration(self_stub)
+
+    assert self_stub._last_emit_state["result"] == "error"
+    assert "emit_async returned False" in self_stub._last_emit_state["error"]
+
+
+@pytest.mark.asyncio
+async def test_last_emit_records_exception_truncated():
+    """An exception's str() is recorded but truncated to 300 chars so a
+    verbose substrate stack trace doesn't make /health huge."""
+    long_err = "substrate error: " + ("X" * 1000)
+    self_stub = MagicMock()
+    self_stub.weights = MagicMock()
+    self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
+    self_stub._champion_miner_id = None
+    self_stub._weights_emitter = MagicMock()
+    self_stub._weights_emitter.emit_async = AsyncMock(
+        side_effect=RuntimeError(long_err),
+    )
+    self_stub._is_leader = False
+    self_stub._last_emit_state = None
+
+    await _run_one_iteration(self_stub)
+
+    assert self_stub._last_emit_state["result"] == "error"
+    assert len(self_stub._last_emit_state["error"]) <= 300
+    assert self_stub._last_emit_state["error"].startswith("substrate error: ")
