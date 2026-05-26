@@ -210,6 +210,9 @@ class AppIntentsValidator:
         protocol_config: "ProtocolConfig | None" = None,
         chain_id: int = 31337,
         contract_address: str = "0x" + "00" * 20,
+        # Follower app catalog sync (optional)
+        leader_api_url: str = "",
+        app_sync_poll_interval: float = 60.0,
     ) -> None:
         self.store = store
         self.port = port
@@ -485,6 +488,29 @@ class AppIntentsValidator:
             score_threshold=self.block_loop.score_threshold,
         )
 
+        # ── Follower app catalog sync ────────────────────────────────────
+        # Pulls AppIntentDefinition + DeploymentResult from the leader's
+        # API so this validator can re-score proposals. Required for any
+        # validator that doesn't receive create_app / deploy_app calls
+        # directly (every third-party validator). Leaders should leave
+        # LEADER_API_URL unset.
+        self._app_sync = None
+        if leader_api_url:
+            from minotaur_subnet.validator.app_sync import ValidatorAppCatalogSync
+            self._app_sync = ValidatorAppCatalogSync(
+                store=self.store,
+                leader_url=leader_api_url,
+                poll_interval=app_sync_poll_interval,
+            )
+            logger.warning(
+                "SECURITY NOTICE: App catalog sync enabled (leader=%s). "
+                "JS scoring code is fetched from the leader and trusted "
+                "as-is — there is no on-chain hash anchor. A compromised "
+                "leader could push malicious JS to followers. Tracked "
+                "follow-up: AppRegistry JS hash anchoring.",
+                leader_api_url,
+            )
+
     async def start(self) -> None:
         """Load active intents, start block loop, and start HTTP server."""
         if self._consensus is not None:
@@ -492,6 +518,11 @@ class AppIntentsValidator:
                 "Validator starting as ORDER CONSENSUS PEER — "
                 "will re-simulate and re-score proposals from leader"
             )
+        # Pull the leader's catalog before loading intents so the first
+        # _load_active_intents pass sees the JS. If the leader is
+        # unreachable, sync.start() logs and the background loop retries.
+        if self._app_sync is not None:
+            await self._app_sync.start()
         await self._load_active_intents()
         self._load_orders_from_store()
 
@@ -872,6 +903,17 @@ def main() -> None:
         help="ValidatorRegistry contract address (source of canonical quorumBps). "
              "Falls back to VALIDATOR_REGISTRY_ADDRESS env.",
     )
+    parser.add_argument(
+        "--leader-api-url", type=str, default=None,
+        help="Leader API base URL to sync the app catalog from (e.g. "
+             "https://api.minotaursubnet.com). Required for follower "
+             "validators that don't receive create_app / deploy_app calls "
+             "directly. Falls back to LEADER_API_URL env.",
+    )
+    parser.add_argument(
+        "--app-sync-interval", type=float, default=60.0,
+        help="Seconds between app catalog sync ticks (default 60).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -939,6 +981,12 @@ def main() -> None:
             registry_address=registry_address,
         )
 
+    leader_api_url = (
+        args.leader_api_url
+        if args.leader_api_url is not None
+        else os.environ.get("LEADER_API_URL", "")
+    ).strip()
+
     validator = AppIntentsValidator(
         store=store,
         port=args.port,
@@ -953,6 +1001,8 @@ def main() -> None:
         protocol_config=protocol_config,
         chain_id=chain_id,
         contract_address=contract_address,
+        leader_api_url=leader_api_url,
+        app_sync_poll_interval=args.app_sync_interval,
     )
     asyncio.run(validator.start())
 

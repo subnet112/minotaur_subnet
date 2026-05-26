@@ -18,6 +18,8 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `--hotkey-name` | `None` | Bittensor hotkey name |
 | `--validator-key` | `""` | EVM private key (hex) for EIP-712 consensus signing |
 | `--quorum-bps` | `10000` | Quorum threshold in basis points (10000 = 100%). Mostly informational — the daemon reads the canonical value from `ValidatorRegistry.quorumBps()` at startup and refreshes once per epoch. |
+| `--leader-api-url` | `None` | Leader API base URL to sync the app catalog from (e.g. `https://api.minotaursubnet.com`). Required for follower validators that don't receive `create_app` / `deploy_app` calls directly. Falls back to `LEADER_API_URL` env. |
+| `--app-sync-interval` | `60.0` | Seconds between app catalog sync ticks. |
 
 ## Environment Variables
 
@@ -58,6 +60,17 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FORCE_LEADER` | `""` | Set to `"1"` to force this validator to act as the leader, bypassing stake-based election. Useful for local testnet. |
+
+### App Catalog Sync
+
+The follower validator pulls `AppIntentDefinition` (including `js_code`) and `DeploymentResult` records from the leader's API on a poll interval and writes them into the local `AppIntentStore`. Without this, a third-party validator's `JsExecutionEngine` has no scoring code loaded and cannot re-score incoming consensus proposals.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LEADER_API_URL` | -- | Leader API base URL (e.g. `https://api.minotaursubnet.com`). Set on every third-party validator. Leaders should leave this **unset** — they are the source of truth and would otherwise sync from themselves. |
+| `--app-sync-interval` (CLI only) | `60.0` | Seconds between sync ticks. |
+
+**Trust model (MVP):** `js_code` is fetched from the leader and trusted as-is. There is no on-chain hash anchor at this layer, so a compromised leader could push malicious JS to followers. Anchoring `keccak256(js_code)` on-chain via `AppRegistry` is a tracked follow-up; until then the daemon emits a `SECURITY NOTICE` log at startup whenever sync is enabled.
 
 ### Chain Configuration
 
