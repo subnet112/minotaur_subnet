@@ -236,7 +236,18 @@ WALLET_NAME=<your_wallet>
 HOTKEY_NAME=<your_hotkey>
 
 # Where btcli stored your wallets on this host
-# Default is the standard btcli location; override only if elsewhere
+# Default is the standard btcli location; override only if elsewhere.
+#
+# IMPORTANT (post-2026-05-26): the validator image runs as uid 1000
+# (audit C5). The host-side wallet directory must be readable by uid 1000:
+#
+#     chown -R 1000:1000 ~/.bittensor/wallets     # cleanest
+#     # OR
+#     chmod -R o+rX ~/.bittensor/wallets          # if you can't chown
+#
+# A freshly-created directory owned by root with 700 perms will not
+# work — validator daemon will fail to read its hotkey and /identity
+# will return 503.
 # BITTENSOR_WALLET_PATH=/home/ubuntu/.bittensor/wallets
 
 # Public URL on port 9100 — must match what you registered in Step 4
