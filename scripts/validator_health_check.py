@@ -107,6 +107,27 @@ class ValidatorStatus:
     # already includes it in bittensor 10.x.
     display_name: str | None = None
     identity_url: str | None = None
+    # /health-derived fields. Populated when the /health probe succeeded
+    # on a daemon at PR #78 or later. ``health_reachable`` is the truthy
+    # gate — when False, the rest are None / unknown.
+    #
+    # ``weight_source`` classifies who last set weights on this hotkey:
+    #   "self"     daemon emitted; ``last_emit.attempted_at`` aligns with the
+    #              chain's ``last_update`` block time (within tolerance).
+    #   "external" chain shows a recent weight-set, but our daemon's last
+    #              emit doesn't account for it (None, older, or failed).
+    #              Indicates another process is also setting weights on the
+    #              same hotkey (eg. a standalone burn script, btcli, or a
+    #              second validator implementation running in parallel).
+    #   "no-emitter" weights_emitter_configured=false — daemon can't sign
+    #              chain TXs at all (wallet didn't load).
+    #   "stale"    chain hasn't seen weights within the staleness window
+    #              AND daemon hasn't emitted recently either.
+    #   "unknown"  /health probe failed; can't classify.
+    health_reachable: bool = False
+    weights_emitter_configured: bool | None = None
+    last_emit: dict | None = None
+    weight_source: str | None = None
 
 
 def parse_registries() -> list[Registry]:
@@ -233,12 +254,49 @@ async def probe_identity(
     return None, last_err or "unknown"
 
 
+async def probe_health(
+    session: aiohttp.ClientSession,
+    axon_url: str,
+) -> tuple[dict | None, str | None]:
+    """Fetch /health at the axon. Same retry policy as ``probe_identity``.
+
+    Used to read PR #78's ``weights_emitter_configured`` /
+    ``my_last_update_block`` / ``last_emit`` fields so the workflow can
+    distinguish "weights set by our daemon" vs "weights set by some other
+    process running against the same hotkey". Daemons predating #78
+    answer 200 with the older subset of fields — callers must treat any
+    missing field as None / unknown.
+    """
+    url = axon_url.rstrip("/") + "/health"
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_SECONDS),
+            ) as r:
+                if r.status != 200:
+                    return None, f"HTTP {r.status}"
+                return await r.json(), None
+        except asyncio.TimeoutError:
+            last_err = f"timeout after {PROBE_TIMEOUT_SECONDS}s"
+            if attempt == 0:
+                continue
+        except aiohttp.ClientConnectorError as exc:
+            return None, f"connect failed: {exc}"
+        except aiohttp.ClientError as exc:
+            return None, f"client error: {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            return None, f"unexpected: {type(exc).__name__}: {exc}"
+    return None, last_err or "unknown"
+
+
 async def discover_identity_map(
     metagraph,
-) -> tuple[dict[str, dict], list[dict]]:
-    """Probe every axon-serving UID for /identity.
+) -> tuple[dict[str, dict], list[dict], dict[int, dict]]:
+    """Probe every axon-serving UID for /identity AND /health.
 
-    Returns ``(identity_map, probe_outcomes)``:
+    Returns ``(identity_map, probe_outcomes, health_by_uid)``:
       - ``identity_map``: ``{evm_lower: {hotkey, axon_url, uid}}`` for
         UIDs whose /identity returned a valid binding.
       - ``probe_outcomes``: per-axon ``{uid, hotkey, axon_url, status,
@@ -247,6 +305,11 @@ async def discover_identity_map(
         per-axon reason. Crucial for diagnosing missing rows in the
         report (e.g. when a GitHub runner can't reach an operator's
         load-balancer in 5s but locally it's fine).
+      - ``health_by_uid``: ``{uid: health_json}`` for UIDs whose /health
+        probe succeeded. The /health and /identity probes are
+        independent — one can succeed while the other fails. We key by
+        uid rather than evm because /health on a pre-#78 daemon doesn't
+        carry an evm_address.
     """
     candidates: list[tuple[int, str, str]] = []
     for uid, ax in enumerate(metagraph.axons):
@@ -254,16 +317,27 @@ async def discover_identity_map(
             candidates.append((uid, metagraph.hotkeys[uid], f"http://{ax.ip}:{ax.port}"))
 
     if not candidates:
-        return {}, []
+        return {}, [], {}
 
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *(probe_identity(session, url) for _, _, url in candidates),
+        # Run both probes in parallel per axon — single session reuses
+        # connections. ``return_exceptions=False`` would surface a probe
+        # exception as a task failure, but our probes already trap and
+        # return ``(None, err)`` so this is safe.
+        identity_results, health_results = await asyncio.gather(
+            asyncio.gather(*(probe_identity(session, url) for _, _, url in candidates)),
+            asyncio.gather(*(probe_health(session, url) for _, _, url in candidates)),
         )
 
     identity_map: dict[str, dict] = {}
     outcomes: list[dict] = []
-    for (uid, hk, url), (data, err) in zip(candidates, results):
+    health_by_uid: dict[int, dict] = {}
+    for (uid, hk, url), (data, err), (hdata, herr) in zip(
+        candidates, identity_results, health_results,
+    ):
+        if hdata is not None:
+            health_by_uid[uid] = hdata
+
         if data is not None:
             evm = (data.get("evm_address") or "").lower()
             if evm:
@@ -271,29 +345,100 @@ async def discover_identity_map(
                 outcomes.append({
                     "uid": uid, "hotkey": hk, "axon_url": url,
                     "status": "ok", "error": None, "evm": evm,
+                    "health_ok": hdata is not None,
+                    "health_error": herr,
                 })
-                print(f"[probe] uid={uid:>3} {url} → ok evm={evm}", file=sys.stderr)
+                print(
+                    f"[probe] uid={uid:>3} {url} → ok evm={evm} "
+                    f"health={'ok' if hdata is not None else f'FAIL({herr})'}",
+                    file=sys.stderr,
+                )
                 continue
             err = "200 OK but payload missing evm_address"
         outcomes.append({
             "uid": uid, "hotkey": hk, "axon_url": url,
             "status": "fail", "error": err, "evm": None,
+            "health_ok": hdata is not None,
+            "health_error": herr,
         })
         print(
-            f"[probe] uid={uid:>3} {url} → FAIL: {err}",
+            f"[probe] uid={uid:>3} {url} → FAIL identity: {err} | "
+            f"health={'ok' if hdata is not None else f'FAIL({herr})'}",
             file=sys.stderr,
         )
-    return identity_map, outcomes
+    return identity_map, outcomes, health_by_uid
+
+
+def _classify_weight_source(
+    s: ValidatorStatus,
+    health: dict | None,
+    *,
+    now: float,
+    stale_threshold_seconds: int,
+    alignment_tolerance_seconds: int = 120,
+) -> str | None:
+    """Decide who last set weights for this validator's hotkey.
+
+    See ``ValidatorStatus.weight_source`` for the codes. Logic:
+
+    * ``health is None``                                   → "unknown"
+    * health says ``weights_emitter_configured == false``  → "no-emitter"
+    * ``last_emit.result == "ok"`` AND its ``attempted_at``
+      is within ±``alignment_tolerance_seconds`` of the
+      chain's last_update wall-clock time                  → "self"
+    * chain ``last_update_seconds_ago`` fresh
+      (< ``stale_threshold_seconds``)                      → "external"
+    * otherwise                                            → "stale"
+
+    The alignment tolerance covers the gap between when our daemon called
+    ``set_weights`` and when the extrinsic actually landed in a finalized
+    block (one or two blocks of subtensor latency, plus clock skew between
+    the daemon and a GitHub runner). 120s is a generous default — false
+    "external" classifications were the larger risk than false "self"
+    ones, so we err toward "self" when in doubt.
+    """
+    if health is None:
+        return "unknown"
+    # Pre-PR-#75 daemons answer /health without ``last_emit`` at all.
+    # We can't infer source from their response — don't false-flag as
+    # "external" just because the field is missing. Dict-membership test
+    # (not truthiness) distinguishes "field absent" from "field present
+    # but None" (#75+ daemon that hasn't emitted yet).
+    if "last_emit" not in health:
+        return "unknown"
+    if health.get("weights_emitter_configured") is False:
+        return "no-emitter"
+
+    chain_seconds_ago = s.last_update_seconds_ago
+    last_emit = health.get("last_emit")
+    last_emit_at = (last_emit or {}).get("attempted_at")
+    last_emit_ok = (last_emit or {}).get("result") == "ok"
+
+    if (
+        chain_seconds_ago is not None
+        and last_emit_at is not None
+        and last_emit_ok
+    ):
+        chain_set_at = now - chain_seconds_ago
+        if abs(last_emit_at - chain_set_at) <= alignment_tolerance_seconds:
+            return "self"
+
+    if chain_seconds_ago is not None and chain_seconds_ago < stale_threshold_seconds:
+        return "external"
+
+    return "stale"
 
 
 def build_statuses(
     registered_evms: dict[str, dict[str, bool]],
     identity_map: dict[str, dict],
+    health_by_uid: dict[int, dict],
     metagraph,
     current_block: int,
     all_chain_names: list[str],
 ) -> list[ValidatorStatus]:
     """Combine the registry union with the identity-map / metagraph view."""
+    now = time.time()
     out: list[ValidatorStatus] = []
     for evm, chain_regs in sorted(registered_evms.items()):
         # Backfill any chain that wasn't in the per-EVM map at all — happens
@@ -342,6 +487,22 @@ def build_statuses(
                     return str(v).strip() or None
                 s.display_name = _get("name")
                 s.identity_url = _get("url")
+
+            # /health-derived fields. We always populate these from the
+            # uid keyed map regardless of /identity success — a daemon
+            # with a misconfigured /identity but a working /health is
+            # still meaningful diagnostic signal.
+            health = health_by_uid.get(uid)
+            if health is not None:
+                s.health_reachable = True
+                s.weights_emitter_configured = health.get("weights_emitter_configured")
+                s.last_emit = health.get("last_emit")
+            s.weight_source = _classify_weight_source(
+                s,
+                health,
+                now=now,
+                stale_threshold_seconds=STALE_THRESHOLD_SECONDS,
+            )
         out.append(s)
     return out
 
@@ -366,6 +527,45 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
             s.last_update_seconds_ago is not None
             and s.last_update_seconds_ago > STALE_THRESHOLD_SECONDS
         ):
+            # /health-derived diagnostics, when we got a probe through.
+            # These narrow the failure mode for the operator instead of
+            # leaving them to read daemon logs:
+            #   no-emitter  → wallet didn't load, daemon can't set_weights
+            #   external    → chain saw recent weights, but not from our
+            #                 daemon. Probably stale-by-coincidence (the
+            #                 weights are still fresh, just from a parallel
+            #                 process) — but if the operator only runs our
+            #                 stack, this is a smoking gun for a rogue
+            #                 emitter on the same hotkey.
+            extra = ""
+            if s.weight_source == "no-emitter":
+                extra = (
+                    " The daemon is running but its weight emitter never "
+                    "loaded (`weights_emitter_configured=false`) — almost "
+                    "certainly a wallet-load failure on startup. Check "
+                    "WALLET_NAME / HOTKEY_NAME envs and that the wallet "
+                    "dir is readable by uid 1000."
+                )
+            elif s.weight_source == "external":
+                extra = (
+                    " Note: chain `last_update` is still fresh, so this "
+                    "row may auto-resolve without operator action — but "
+                    "the recent weight-set was NOT from our daemon "
+                    "(`last_emit` doesn't account for it). Another "
+                    "process is signing for the same hotkey."
+                )
+            elif s.weight_source == "stale":
+                last_emit = (s.last_emit or {})
+                if last_emit.get("result") == "error":
+                    extra = (
+                        f" Daemon's last set_weights attempt failed: "
+                        f"`{(last_emit.get('error') or '')[:200]}`."
+                    )
+            elif s.weight_source == "unknown":
+                extra = (
+                    " (/health probe failed from this runner — cannot tell "
+                    "whether the daemon attempted recently.)"
+                )
             findings.append({
                 "type": "stale_weights",
                 "validator_evm": s.evm_address,
@@ -374,11 +574,13 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                 "axon_url": s.axon_url,
                 "display_name": s.display_name,
                 "identity_url": s.identity_url,
+                "weight_source": s.weight_source,
                 "details": (
                     f"No weight update for {s.last_update_seconds_ago // 60} min "
                     f"(threshold {STALE_THRESHOLD_SECONDS // 60} min). "
                     f"Validator may be down, rate-limited, or its weight-emitter "
                     f"has crashed."
+                    + extra
                 ),
             })
 
@@ -436,6 +638,23 @@ def _fmt_trust(t: float | None) -> str:
     return f"{t:.3f} {marker}"
 
 
+def _fmt_weight_source(src: str | None) -> str:
+    """Render the weight_source column for the dashboard.
+
+    Codes are deliberately compact emoji + label so the table stays
+    narrow at the cost of operators learning four glyphs once. The
+    workflow-generated incident issue carries the prose explanation.
+    """
+    return {
+        None:          "—",
+        "self":        "🟢 self",
+        "external":    "🟠 external",
+        "no-emitter":  "🔴 no-emitter",
+        "stale":       "⚪ stale",
+        "unknown":     "·",
+    }.get(src, src or "—")
+
+
 def render_summary(
     statuses: list[ValidatorStatus],
     findings: list[dict],
@@ -447,7 +666,7 @@ def render_summary(
 ) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    header = ["Name", "EVM", "Hotkey", "UID", "Stake (TAO)", "Last weights", "Trust", "Axon", "/identity"]
+    header = ["Name", "EVM", "Hotkey", "UID", "Stake (TAO)", "Last weights", "Last set by", "Trust", "Axon", "/identity"]
     header.extend(chain_names)
     sep = ["---"] * len(header)
 
@@ -493,6 +712,7 @@ def render_summary(
             str(s.uid) if s.uid is not None else "—",
             f"{s.stake:,.0f}" if s.stake is not None else "—",
             _fmt_seconds_ago(s.last_update_seconds_ago),
+            _fmt_weight_source(s.weight_source) if s.uid is not None else "—",
             _fmt_trust(s.trust),
             _fmt_check(s.axon_published) if s.uid is not None else "—",
             _fmt_check(s.identity_reachable) if s.uid is not None else "—",
@@ -501,6 +721,16 @@ def render_summary(
             row.append(_fmt_check(s.chain_registrations.get(chain)))
         lines.append("| " + " | ".join(row) + " |")
 
+    lines.append("")
+    lines.append(
+        "_**Last set by** legend: 🟢 self = our validator daemon emitted; "
+        "🟠 external = chain saw recent weights but `last_emit` doesn't "
+        "account for it (another process is signing on this hotkey); "
+        "🔴 no-emitter = daemon's weight emitter never loaded "
+        "(`weights_emitter_configured=false`); ⚪ stale = neither chain "
+        "nor daemon shows a recent successful set; · = /health probe "
+        "failed this run._"
+    )
     lines.append("")
     lines.append("## Active alerts")
     lines.append("")
@@ -597,19 +827,22 @@ def main() -> int:
         print(f"ERROR: subtensor query failed: {exc}", file=sys.stderr)
         return 2
 
-    identity_map, probe_outcomes = asyncio.run(discover_identity_map(metagraph))
+    identity_map, probe_outcomes, health_by_uid = asyncio.run(
+        discover_identity_map(metagraph)
+    )
     total_axons = sum(
         1 for ax in metagraph.axons if ax.ip != "0.0.0.0" and ax.port != 0
     )
     print(
         f"[info] identity-mapped {len(identity_map)} of {total_axons} "
-        f"axon-serving UIDs",
+        f"axon-serving UIDs; /health-reachable on {len(health_by_uid)}",
         file=sys.stderr,
     )
 
     statuses = build_statuses(
         registered_evms=registered,
         identity_map=identity_map,
+        health_by_uid=health_by_uid,
         metagraph=metagraph,
         current_block=current_block,
         all_chain_names=[r.name for r in registries],
@@ -639,6 +872,8 @@ def main() -> int:
             "display_name": s.display_name,
             "last_update_seconds_ago": s.last_update_seconds_ago,
             "trust": s.trust,
+            "weight_source": s.weight_source,
+            "weights_emitter_configured": s.weights_emitter_configured,
             "stale_weights": (
                 s.last_update_seconds_ago is not None
                 and s.last_update_seconds_ago > STALE_THRESHOLD_SECONDS
