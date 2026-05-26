@@ -36,6 +36,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # id-token: write is REQUIRED for cosign keyless signing (OIDC).
+      # Without it `cosign sign --yes` will fail at the final step.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,6 +68,7 @@ jobs:
             type=ref,event=tag
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -75,3 +79,48 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------------
+      # Supply-chain integrity (PR-5 of security hardening series).
+      # Closes audit H11. Every push of the validator image is:
+      #   1. Scanned by Trivy for HIGH/CRITICAL CVEs (gate the workflow).
+      #   2. Inventoried via a CycloneDX SBOM published as a workflow
+      #      artifact for operator/auditor inspection.
+      #   3. Signed by cosign keyless (OIDC) so operators can verify
+      #      the image they pull was built by this repo's CI.
+      # ------------------------------------------------------------------
+
+      # TODO(sec): pin to a release SHA from
+      # https://github.com/aquasecurity/trivy-action/releases
+      - name: Scan image for HIGH/CRITICAL CVEs
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: 'true'
+          vuln-type: 'os,library'
+
+      # TODO(sec): pin to a release SHA from
+      # https://github.com/anchore/sbom-action/releases
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0.17.8
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          upload-artifact: true
+          upload-release-assets: false
+
+      # TODO(sec): pin to a release SHA from
+      # https://github.com/sigstore/cosign-installer/releases
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign image with cosign keyless
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
