@@ -22,6 +22,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -32,6 +33,79 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROBE_TIMEOUT_S = 3.0
 _IDENTITY_PATH = "/identity"
+_DNS_RESOLVE_TIMEOUT_S = 2.0
+
+
+def _parse_axon_url(url: str) -> tuple[str, int] | None:
+    """Extract (host, port) from an axon URL. Returns None on parse failure.
+
+    Accepts ``http://host:port`` and ``http://host:port/``. Ports default
+    only when scheme is explicit (http=80, https=443) — we want explicit
+    ports for the axon comparison since validator daemons publish ip+port
+    to the metagraph.
+    """
+    try:
+        parsed = urlparse(url.rstrip("/"))
+    except Exception:
+        return None
+    host = (parsed.hostname or "").strip().lower()
+    port = parsed.port
+    if not host or port is None:
+        return None
+    return host, port
+
+
+async def _axon_urls_equivalent(
+    metagraph_url: str,
+    signed_url: str,
+) -> bool:
+    """Whether the two axon URLs point to the same network endpoint.
+
+    The metagraph URL is always ``http://<ip>:<port>`` (Bittensor stores
+    ip+port, not hostnames). The signed URL is whatever the operator put
+    in ``VALIDATOR_AXON_URL`` — often a hostname behind a load balancer.
+
+    Equivalence rules:
+      - Ports must match exactly.
+      - Hosts match if byte-equal (fast path), or
+      - The signed host (typically a hostname) resolves to an IP that
+        equals the metagraph host (always an IP). Resolves any DNS alias
+        / load-balancer hostname to its set of A/AAAA records and checks
+        membership.
+
+    A signed URL that can't be parsed or whose host can't be resolved
+    rejects (returns False) rather than crashing — same posture as the
+    pre-fix byte-equal check.
+    """
+    mg = _parse_axon_url(metagraph_url)
+    signed = _parse_axon_url(signed_url)
+    if mg is None or signed is None:
+        return False
+    mg_host, mg_port = mg
+    signed_host, signed_port = signed
+    if mg_port != signed_port:
+        return False
+    if mg_host == signed_host:
+        return True
+
+    # Different host strings — try DNS resolution. The metagraph host is
+    # always an IP literal; resolving it is a no-op (returns itself). The
+    # signed host is the one we expect to be a hostname.
+    try:
+        loop = asyncio.get_event_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(signed_host, signed_port, type=0, proto=0),
+            timeout=_DNS_RESOLVE_TIMEOUT_S,
+        )
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.debug(
+            "DNS resolution of signed axon host %s failed: %s",
+            signed_host, exc,
+        )
+        return False
+
+    resolved_ips = {info[4][0] for info in infos if info and info[4]}
+    return mg_host in resolved_ips
 
 
 @dataclass(frozen=True)
@@ -198,10 +272,19 @@ async def _probe_one(
         )
         return None
 
-    # Cross-check 3: the axon URL in the signed payload must match the URL
-    # we actually probed. Pins the binding to the specific endpoint so a
-    # MitM can't redirect us to a different host.
-    if identity.axon_url.rstrip("/") != metagraph_peer.axon_url.rstrip("/"):
+    # Cross-check 3: the axon URL in the signed payload must point to the
+    # same endpoint as the URL we actually probed. Pins the binding to a
+    # specific host so a MitM can't redirect us to a different one.
+    #
+    # The metagraph URL is always ``http://<ip>:<port>`` (Bittensor stores
+    # ip+port, not hostnames). The signed URL is whatever the operator set
+    # in ``VALIDATOR_AXON_URL`` — typically the public hostname that points
+    # to their load balancer. So byte-equal comparison rejected every
+    # operator running behind a CDN / ELB / DNS alias, even though both
+    # URLs resolve to the same place. We now compare host+port after DNS
+    # resolution: signed host must resolve to (one of) the metagraph IP(s),
+    # and ports must match.
+    if not await _axon_urls_equivalent(metagraph_peer.axon_url, identity.axon_url):
         logger.warning(
             "Identity probe %s axon mismatch: signed=%s metagraph=%s",
             url, identity.axon_url, metagraph_peer.axon_url,
