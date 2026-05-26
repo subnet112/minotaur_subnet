@@ -55,14 +55,54 @@ const BLOCKED_HOSTS_EXACT = new Set([
     "127.0.0.1", "localhost", "::1",
     // Docker service names used in the local testnet
     "api", "anvil", "anvil-base", "subtensor", "relayer", "lit-bridge",
+    // Audit H8: container-escape surfaces and cloud metadata
+    "docker-socket-proxy",
+    "host.docker.internal",
+    "169.254.169.254",   // AWS/GCP/Azure IMDS
+    "metadata.google.internal",
+    "metadata",
 ]);
 const BLOCKED_HOST_KEYWORDS = ["internal", "local"];
 const BLOCKED_IP_PATTERNS = [
     /^10\./,                       // 10.0.0.0/8
     /^172\.(1[6-9]|2\d|3[01])\./,  // 172.16.0.0/12
     /^192\.168\./,                 // 192.168.0.0/16
-    /^169\.254\./,                 // link-local
+    /^169\.254\./,                 // link-local + cloud metadata
 ];
+
+// Audit H8: JSON-RPC method allowlist for ethCall / ethBlockNumber. Cheat
+// codes (anvil_*, hardhat_*, evm_*) let scoring code mutate the local
+// fork — minting balances, time-travelling, replaying state — which
+// trivially breaks score parity between leader and followers. Debug /
+// admin / personal namespaces leak operator keys or DOS the node.
+const ALLOWED_RPC_METHODS = new Set([
+    "eth_call",
+    "eth_blockNumber",
+    "eth_getBalance",
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+    "eth_getStorageAt",
+    "eth_getCode",
+    "eth_chainId",
+    "eth_gasPrice",
+    "eth_estimateGas",
+    "eth_getLogs",
+]);
+const REJECTED_RPC_PREFIXES = [
+    "anvil_", "hardhat_", "evm_",
+    "debug_", "trace_", "txpool_",
+    "admin_", "personal_", "miner_",
+];
+
+function _validateRpcMethod(method) {
+    if (typeof method !== "string") return false;
+    for (const p of REJECTED_RPC_PREFIXES) {
+        if (method.startsWith(p)) return false;
+    }
+    return ALLOWED_RPC_METHODS.has(method);
+}
 
 /**
  * Check if a hostname targets a private/internal network.
@@ -79,16 +119,24 @@ function _isBlockedHost(hostname) {
 /**
  * Make a JSON-RPC eth_call to a chain. Read-only.
  * Returns the raw hex result string.
+ *
+ * Note: eth_call is the only method exposed here intentionally — the
+ * helper signature is (chainId, to, data, blockTag). For other methods
+ * the allowlist in _validateRpcMethod is the enforcement point.
  */
 function ethCall(chainId, to, data, blockTag) {
     const rpcUrl = RPC_URLS[chainId];
     if (!rpcUrl) {
         return Promise.reject(new Error(`No RPC URL configured for chain ${chainId}`));
     }
+    const method = "eth_call";
+    if (!_validateRpcMethod(method)) {
+        return Promise.reject(new Error(`RPC method not allowed: ${method}`));
+    }
     const payload = JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
-        method: "eth_call",
+        method,
         params: [{ to, data }, blockTag || "latest"],
     });
     return _httpPost(rpcUrl, payload, RPC_TIMEOUT_MS).then(body => {
@@ -106,10 +154,14 @@ function ethBlockNumber(chainId) {
     if (!rpcUrl) {
         return Promise.reject(new Error(`No RPC URL configured for chain ${chainId}`));
     }
+    const method = "eth_blockNumber";
+    if (!_validateRpcMethod(method)) {
+        return Promise.reject(new Error(`RPC method not allowed: ${method}`));
+    }
     const payload = JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
-        method: "eth_blockNumber",
+        method,
         params: [],
     });
     return _httpPost(rpcUrl, payload, RPC_TIMEOUT_MS).then(body => {
@@ -171,9 +223,43 @@ function httpGet(url) {
     });
 }
 
-/** Internal: HTTP POST helper for RPC calls. */
+/** Internal: HTTP POST helper for RPC calls.
+ *
+ * Audit H8: defence-in-depth — even though the only callers are
+ * ethCall / ethBlockNumber against operator-configured RPC URLs, apply
+ * the same SSRF blocklist and method allowlist that httpGet enforces.
+ * Operator-configured RPC URLs are exempt from the host blocklist
+ * (otherwise `http://anvil:8545` style local RPCs break); arbitrary
+ * URLs are still rejected if they hit internal/private targets.
+ */
 function _httpPost(url, body, timeoutMs) {
     const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const isConfiguredRpc = Object.values(RPC_URLS).some(rpc => {
+        try {
+            return new URL(rpc).hostname.toLowerCase() === host;
+        } catch (_) {
+            return false;
+        }
+    });
+    if (!isConfiguredRpc && _isBlockedHost(host)) {
+        return Promise.reject(new Error(
+            `Blocked: requests to internal/private networks are forbidden: ${host}`,
+        ));
+    }
+    // If the body parses as JSON-RPC, enforce the method allowlist.
+    try {
+        const peek = JSON.parse(body);
+        if (peek && typeof peek === "object" && "method" in peek) {
+            if (!_validateRpcMethod(peek.method)) {
+                return Promise.reject(new Error(
+                    `RPC method not allowed: ${peek.method}`,
+                ));
+            }
+        }
+    } catch (_) {
+        // Non-JSON or non-RPC body — let the caller decide.
+    }
     return new Promise((resolve, reject) => {
         const mod = parsed.protocol === "https:" ? https : http;
         const req = mod.request(url, {
