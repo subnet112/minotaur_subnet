@@ -39,6 +39,49 @@ class JsRuntimeError(JsSandboxError):
     pass
 
 
+class SandboxOverloadedError(JsSandboxError):
+    """Raised when the sandbox concurrency cap is saturated.
+
+    Caller should map this to HTTP 503 (Service Unavailable) so the leader
+    can retry, rather than crashing the daemon or queuing unbounded work.
+    Audit H9: prevents a proposal flood from spawning unbounded Node.js
+    subprocesses (each capped at ~128 MB heap).
+    """
+    pass
+
+
+# Process-wide concurrency cap on Node subprocess spawns. Both the
+# order-consensus path (validator/scoring_engine.py) and the champion-
+# consensus path (api/routes/submissions/) invoke JsSandbox; one
+# semaphore caps total in-flight subprocesses so a flood can't take
+# down the host.
+#
+# At the default cap of 4 × ~128 MB heap = ~512 MB peak — survivable on
+# the 4 GB prod box even alongside the 7 Python services. Bump via env
+# only on boxes that can absorb the larger working set.
+_SANDBOX_CONCURRENCY = int(os.environ.get("JS_SANDBOX_MAX_CONCURRENT", "4"))
+_SANDBOX_ACQUIRE_TIMEOUT_SEC = float(
+    os.environ.get("JS_SANDBOX_ACQUIRE_TIMEOUT_SEC", "5.0")
+)
+_SANDBOX_SEMAPHORE: asyncio.Semaphore | None = None
+_SANDBOX_SEMAPHORE_LOCK = asyncio.Lock()
+
+
+async def _get_sandbox_semaphore() -> asyncio.Semaphore:
+    """Lazy double-checked construction of the process-wide semaphore.
+
+    Constructing eagerly at import time would bind it to whichever event
+    loop happened to import this module first; that has bitten us before
+    when tests use a separate loop. Build on first await instead.
+    """
+    global _SANDBOX_SEMAPHORE
+    if _SANDBOX_SEMAPHORE is None:
+        async with _SANDBOX_SEMAPHORE_LOCK:
+            if _SANDBOX_SEMAPHORE is None:
+                _SANDBOX_SEMAPHORE = asyncio.Semaphore(_SANDBOX_CONCURRENCY)
+    return _SANDBOX_SEMAPHORE
+
+
 class JsSandbox:
     """Sandboxed JS execution environment using Node.js subprocess.
 
@@ -84,6 +127,10 @@ class JsSandbox:
     ) -> Any:
         """Execute a JS function in the sandbox asynchronously.
 
+        Acquires the process-wide concurrency semaphore before spawning
+        the Node subprocess. See ``_SANDBOX_CONCURRENCY`` for the cap and
+        rationale (audit H9).
+
         Args:
             js_code: The JavaScript module source code (must set module.exports).
             function_name: Name of the exported function to call.
@@ -95,8 +142,30 @@ class JsSandbox:
         Raises:
             JsTimeoutError: If execution exceeds timeout_ms.
             JsRuntimeError: If the JS code throws an error.
+            SandboxOverloadedError: If the process-wide concurrency cap is
+                saturated (configurable via JS_SANDBOX_MAX_CONCURRENT).
             JsSandboxError: For other failures (Node not found, invalid input, etc.).
         """
+        sem = await _get_sandbox_semaphore()
+        try:
+            await asyncio.wait_for(
+                sem.acquire(), timeout=_SANDBOX_ACQUIRE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            raise SandboxOverloadedError(
+                f"JS sandbox saturated (cap={_SANDBOX_CONCURRENCY}, "
+                f"acquire timeout={_SANDBOX_ACQUIRE_TIMEOUT_SEC}s) — "
+                "refusing further proposals"
+            )
+        try:
+            return await self._do_execute_async(js_code, function_name, args)
+        finally:
+            sem.release()
+
+    async def _do_execute_async(
+        self, js_code: str, function_name: str, args: list[Any]
+    ) -> Any:
+        """Inner implementation — see ``execute_async`` for semantics."""
         # Prepare the payload for runner.js
         payload = {
             "jsCode": js_code,
