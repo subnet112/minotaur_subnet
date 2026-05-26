@@ -1,0 +1,212 @@
+name: Validator Health
+
+# Periodically inspects every EVM in the on-chain ValidatorRegistries
+# (Base + BT EVM + future chains) and:
+#
+#   * Updates a pinned tracking issue with a per-validator status table
+#     (last weight-set time, Yuma trust, axon / identity reachability,
+#     per-chain registration).
+#   * Opens incident issues when a registered validator has not posted
+#     weights for STALE_THRESHOLD_SECONDS (default 1 h) or when its Yuma
+#     trust drops below LOW_TRUST_THRESHOLD (default 0.5 — healthy
+#     validators sit ~0.95+). One issue per (validator, incident type);
+#     re-runs comment on the existing open issue instead of opening
+#     duplicates.
+#
+# All data sources are public (on-chain reads + Bittensor metagraph +
+# the validators' own /identity endpoints), so no repo secrets are
+# required.
+
+on:
+  schedule:
+    # Every 15 minutes. Stale-weights threshold is 1 h, so this gives
+    # us 4 readings before the alert fires — natural debounce.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      stale_threshold_seconds:
+        description: "Override STALE_THRESHOLD_SECONDS for this run"
+        required: false
+        default: "3600"
+      low_trust_threshold:
+        description: "Override LOW_TRUST_THRESHOLD for this run"
+        required: false
+        default: "0.5"
+
+# Required to comment-on / open / find issues from this workflow.
+permissions:
+  contents: read
+  issues: write
+
+# Don't pile up if a previous run is still going.
+concurrency:
+  group: validator-health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Pinned minimal set — full repo requirements.txt pulls in
+          # heavyweight ML libs we don't need for read-only metagraph
+          # queries. Bittensor itself remains the source of truth for
+          # the subtensor RPC shape.
+          pip install "bittensor>=8,<10" "web3>=6,<8" "aiohttp>=3.9,<4"
+
+      - name: Run health check
+        id: check
+        env:
+          NETUID: "112"
+          SUBTENSOR_NETWORK: "finney"
+          STALE_THRESHOLD_SECONDS: ${{ github.event.inputs.stale_threshold_seconds || '3600' }}
+          LOW_TRUST_THRESHOLD: ${{ github.event.inputs.low_trust_threshold || '0.5' }}
+          PROBE_TIMEOUT_SECONDS: "5"
+          # Each entry: name|chain_id|rpc_url|registry_addr. Add new chains
+          # here as more registries deploy — the script unions them. Public
+          # RPC endpoints only; no secrets required.
+          REGISTRIES: >-
+            Base|8453|https://mainnet.base.org|0x88a08d1105393EACE9B6f5ff678DbE508B8639aC,BT EVM|964|https://lite.chain.opentensor.ai|0x0B5fE44e90515571761D86C28c4855F325EDE098
+        run: |
+          python scripts/validator_health_check.py
+          echo "---- findings.json ----"
+          cat findings.json
+          echo "---- summary.md (first 80 lines) ----"
+          head -80 summary.md
+
+      - name: Update pinned status issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+            const TITLE = 'Validator Health Status';
+            const LABEL = 'validator-health-status';
+
+            // Make sure the label exists (idempotent).
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: LABEL,
+                color: '0e8a16',
+                description: 'Pinned dashboard for subnet-112 validator health',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;  // 422 = already_exists
+            }
+
+            // Find the existing pinned issue (open) by title+label.
+            const found = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: LABEL,
+              state: 'open',
+              per_page: 5,
+            });
+            const existing = found.data.find(i => i.title === TITLE);
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: summary,
+              });
+              core.info(`updated status issue #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: TITLE,
+                body: summary,
+                labels: [LABEL],
+              });
+              core.info(`created status issue #${created.data.number}`);
+            }
+
+      - name: Open / update incident issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const payload = JSON.parse(fs.readFileSync('findings.json', 'utf8'));
+            const ALERT_LABEL = 'validator-health-alert';
+
+            // Idempotent label create.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: ALERT_LABEL,
+                color: 'b60205',
+                description: 'Active incident on a registered validator',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+
+            const shorten = (addr) => addr ? `${addr.slice(0,6)}…${addr.slice(-4)}` : '?';
+            const titleFor = (f) => {
+              const kind = {
+                stale_weights: 'Stale weights',
+                low_trust: 'Low Yuma trust',
+              }[f.type] || f.type;
+              return `[validator-health] ${kind}: ${shorten(f.validator_evm)} (uid=${f.uid})`;
+            };
+
+            for (const f of payload.findings) {
+              const title = titleFor(f);
+              const body = [
+                `**Validator**: \`${f.validator_evm}\``,
+                `**Hotkey**: \`${f.hotkey || '(unknown)'}\``,
+                `**UID**: ${f.uid}`,
+                `**Axon URL**: ${f.axon_url || '(none)'}`,
+                ``,
+                `**What's wrong**`,
+                ``,
+                f.details,
+                ``,
+                `**Detected at**: ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()})`,
+                ``,
+                `_This issue is filed automatically by \`.github/workflows/validator-health.yml\`._ ` +
+                `_Re-runs will comment here rather than opening duplicates. Close manually once the condition clears — auto-close is a future enhancement._`,
+              ].join('\n');
+
+              // Search for an existing open issue with the same title.
+              const existing = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title.replace(/"/g,'\\"')}"`,
+              });
+              const match = existing.data.items.find(i => i.title === title);
+              if (match) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: match.number,
+                  body: `Still failing as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block}).\n\n${f.details}`,
+                });
+                core.info(`commented on existing alert #${match.number}: ${title}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  labels: [ALERT_LABEL],
+                });
+                core.info(`opened new alert #${created.data.number}: ${title}`);
+              }
+            }
+
+            if (payload.findings.length === 0) {
+              core.info('no findings — no alerts opened');
+            }
