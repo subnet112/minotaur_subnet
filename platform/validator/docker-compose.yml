@@ -59,6 +59,13 @@ services:
       - "--port=8545"
       - "--fork-url=${ETH_UPSTREAM_RPC_URL}"
       - "--chain-id=1"
+      # Reads through to upstream every call (no in-anvil state cache).
+      # Reduces the attack surface for cache-based exploitation by a
+      # malicious solver — without this, a bias written via
+      # anvil_setStorageAt could persist in anvil's read cache even
+      # after our snapshot/revert restores the underlying state.
+      # anvil-base + anvil-btevm already carry this flag.
+      - "--no-storage-caching"
       - "--block-time=2"
     tmpfs:
       - /root:size=2g
@@ -439,6 +446,27 @@ networks:
   # networks. The three anvils are multi-homed onto this network with
   # static IPs (.2, .3, .4) so solvers can still reach them for price
   # discovery, but nothing else.
+  #
+  # PR-7 / audit C4 defense-in-depth NOTE FOR OPERATORS:
+  #   Anvil exposes the `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC
+  #   namespaces unauthenticated by design — anvil has no flag to
+  #   disable them. A malicious solver container reaching the anvils
+  #   on this network CAN call `anvil_setBalance` /
+  #   `anvil_setStorageAt` to bias its own benchmark or attempt to
+  #   poison fork state that the validator later re-reads. The
+  #   application-layer boundary that contains this is in
+  #   minotaur_subnet/simulator/anvil_simulator.py:
+  #
+  #     - per-simulation evm_snapshot + evm_revert wrap every
+  #       AnvilSimulator.simulate() call;
+  #     - a startup "baseline" snapshot lets us recover if a per-sim
+  #       revert fails (raises SimulatorStateError);
+  #     - a periodic _assert_baseline_alive() probe reads a stable
+  #       storage slot and forces a re-fork (or raises) on mismatch.
+  #
+  #   If you suspect a fork has been poisoned despite the above:
+  #     docker compose restart anvil-eth anvil-base anvil-btevm
+  #   See docs/operator/anvil-isolation.md for the full runbook.
   benchmark-sandbox:
     name: benchmark-sandbox
     driver: bridge

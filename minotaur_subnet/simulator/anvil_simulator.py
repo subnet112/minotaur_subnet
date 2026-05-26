@@ -3,6 +3,25 @@
 Uses snapshot/revert for isolation: each simulate() call leaves no
 lasting state changes on the fork.
 
+Defense-in-depth note (PR-7, audit finding C4):
+  The three anvil containers are multi-homed onto the benchmark-sandbox
+  network so reactive-benchmark solver containers can reach them on
+  static IPs. The anvil `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC
+  namespaces are unauthenticated by design (anvil has no flag to
+  disable them) — a malicious solver can call `anvil_setBalance` /
+  `anvil_setStorageAt` to bias its own benchmark or poison fork state
+  that the validator daemon later re-reads when re-simulating an
+  unrelated honest proposal.
+
+  Our boundary: snapshot at startup ("baseline"), snapshot again per
+  simulation, revert in a finally. If a revert fails, the baseline
+  lets us recover. `_assert_baseline_alive()` periodically probes a
+  known-stable storage slot to catch out-of-band state mutation; on
+  mismatch, we force a re-fork (when upstream is available) or raise
+  SimulatorStateError. The probe is cheap but does an eth_call per
+  invocation, so it runs once every `BASELINE_PROBE_EVERY` simulate()
+  calls (default 100) — trade-off between safety and per-sim overhead.
+
 Requires a running Anvil instance (local testnet or standalone).
 """
 
@@ -27,6 +46,24 @@ from minotaur_subnet.simulator.revert_decoder import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class SimulatorStateError(RuntimeError):
+    """Raised when the anvil fork's baseline state cannot be restored.
+
+    Indicates likely state poisoning by an attacker who reached the
+    unauthenticated anvil cheat-code namespace (e.g., a malicious solver
+    container reachable on the benchmark-sandbox network), AND that our
+    snapshot/revert recovery failed. Callers should treat this as a
+    hard failure — the fork must be recycled (container restart) before
+    further simulations can be trusted.
+    """
+
+
+# How often to run the baseline-alive probe inside simulate().
+# 1-in-N: at N=100 with 12s tick * ~3 sims/tick, probe fires ~once every
+# 7 minutes per simulator. Cheap (one eth_call) but not free.
+BASELINE_PROBE_EVERY = 100
 
 # ERC-20 Transfer(address,address,uint256) event topic
 # keccak256("Transfer(address,address,uint256)")
@@ -78,6 +115,22 @@ class AnvilSimulator:
         self.upstream_rpc_url = (upstream_rpc_url or "").strip() or None
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
 
+        # Baseline snapshot taken immediately after the first connect.
+        # Used by _reset_fork on no-upstream paths (local-testnet chain
+        # 31337) where re-forking isn't possible — revert to baseline
+        # instead. Also a recovery anchor if a per-simulation revert
+        # fails. Tracked + refreshed inside _reset_fork.
+        self._baseline_snapshot_id: str | None = None
+
+        # Per-process counter for the periodic baseline-alive probe.
+        # See module docstring for the cost/safety trade-off.
+        self._sim_count: int = 0
+
+        # Recorded value of the probe slot at baseline-snapshot time.
+        # If a later read disagrees, the fork has been mutated outside
+        # our snapshot/revert window — force a re-fork or raise.
+        self._baseline_probe_value: bytes | None = None
+
         if not self.w3.is_connected():
             logger.warning("Anvil not reachable at %s", rpc_url)
         else:
@@ -87,6 +140,21 @@ class AnvilSimulator:
                 rpc_url, block,
                 "configured" if self.upstream_rpc_url else "none (fork stays static)",
             )
+            # Best-effort baseline snapshot. If anvil isn't quite ready,
+            # we'll lazily take it on the first _reset_fork() call.
+            try:
+                self._baseline_snapshot_id = self._snapshot()
+                self._baseline_probe_value = self._read_probe_slot()
+                logger.info(
+                    "AnvilSimulator baseline snapshot=%s probe=%s",
+                    self._baseline_snapshot_id,
+                    self._baseline_probe_value.hex()[:16] if self._baseline_probe_value else "?",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not take baseline snapshot at init (%s) — will retry lazily",
+                    exc,
+                )
 
     async def simulate(
         self,
@@ -127,9 +195,38 @@ class AnvilSimulator:
                 error="Anvil unavailable",
             )
 
+        # PR-7: cheap periodic probe of a known-stable storage slot. Catches
+        # out-of-band state mutation from the unauthenticated anvil cheat-
+        # code namespace reachable on benchmark-sandbox. Raises
+        # SimulatorStateError on poisoning evidence with no upstream to
+        # re-fork from; surfaces as a failed simulation rather than a
+        # silently wrong score.
+        try:
+            self._assert_baseline_alive()
+        except SimulatorStateError as exc:
+            logger.error("Refusing to simulate on poisoned fork: %s", exc)
+            return SimulationResult(
+                success=False,
+                gas_used=0,
+                on_chain_score=None,
+                error=f"fork-poisoning detected: {exc}",
+            )
+
         # Re-fork at upstream head (or at fork_block for historical
         # replays) so each simulation sees the right pool state.
-        self._reset_fork(block_number=fork_block)
+        # On no-upstream chains (local-testnet 31337) this reverts to
+        # the baseline snapshot instead, undoing any state mutation
+        # from a prior simulation whose own per-sim revert failed.
+        try:
+            self._reset_fork(block_number=fork_block)
+        except SimulatorStateError as exc:
+            logger.error("Refusing to simulate; baseline revert failed: %s", exc)
+            return SimulationResult(
+                success=False,
+                gas_used=0,
+                on_chain_score=None,
+                error=f"baseline revert failed: {exc}",
+            )
 
         executor = plan.metadata.get("executor", self.default_executor)
         executor = Web3.to_checksum_address(executor)
@@ -243,7 +340,27 @@ class AnvilSimulator:
                 error=str(exc),
             )
         finally:
-            self._revert(snap_id)
+            # PR-7: per-simulation revert. The snapshot taken at the start
+            # of this call MUST be reverted before any other simulation
+            # sees state — that's the boundary against in-sim cheat-code
+            # state mutation by a malicious solver. If revert fails, clear
+            # the baseline so the next _reset_fork() call re-takes a fresh
+            # one (and surfaces a SimulatorStateError on no-upstream chains).
+            try:
+                reverted = self._evm_revert(snap_id)
+                if not reverted:
+                    logger.warning(
+                        "evm_revert failed after simulate (snap=%s, rpc=%s) — "
+                        "fork may be poisoned; forcing baseline re-take next call",
+                        snap_id, self.rpc_url,
+                    )
+                    self._baseline_snapshot_id = None
+            except Exception as exc:
+                logger.warning(
+                    "evm_revert raised after simulate (snap=%s): %s",
+                    snap_id, exc,
+                )
+                self._baseline_snapshot_id = None
             self._stop_impersonating(executor)
 
     def _simulate_via_score_intent(
@@ -458,51 +575,194 @@ class AnvilSimulator:
             return None
 
     def _reset_fork(self, block_number: int | None = None) -> None:
-        """Reset the Anvil fork to re-fetch all state from upstream RPC.
+        """Reset the Anvil fork to a clean baseline.
 
-        Calls ``anvil_reset`` with an explicit ``forking.blockNumber``.
-        When ``block_number`` is None we fetch the current upstream
-        head (via self.upstream_rpc_url) and reset to that block — this
-        is the default path, used so every current-state simulation
-        sees fresh pool prices + sees any contracts deployed since the
-        anvil container started.
+        Two paths, dispatched by whether an upstream RPC is configured:
 
-        When a block number is provided, the fork rewinds to THAT block
-        instead — used by historical-order replays so the strategy's
-        plan is evaluated against pool prices as they were when the
-        original order was filled. Requires an archive-capable upstream.
+        1. **Upstream configured** (mainnet/testnet fork — Base, BT EVM
+           in prod). Calls ``anvil_reset`` with an explicit
+           ``forking.blockNumber``. When ``block_number`` is None we
+           fetch the current upstream head; every current-state sim
+           sees fresh pool prices + any newly-deployed contracts. When
+           explicit, the fork rewinds to that block — used by
+           historical-order replays. After reset, the prior snapshot
+           ID is invalidated, so we take a fresh baseline.
+
+        2. **No upstream** (local-testnet chain 31337, or any anvil
+           started without ``--fork-url``). Re-forking isn't possible.
+           Instead, ``evm_revert`` to the baseline snapshot taken at
+           ``__init__`` time. Anvil consumes snapshot IDs on revert,
+           so immediately take a new baseline. If we have no baseline
+           yet (lazy-init path, or recovery after a prior revert
+           failure), take one now and return.
 
         Subtle: ``anvil_reset`` with empty params ``[{}]`` is a no-op
         in Foundry — the fork stays at its initial block. The explicit
         ``forking.blockNumber`` is what actually advances the fork.
         That's why the upstream-head fetch is required.
 
-        If self.upstream_rpc_url is unset (e.g., local-testnet chain
-        31337 which isn't forked from anything), this no-ops gracefully
-        — local Anvil already has the state we want.
+        Raises:
+            SimulatorStateError: when the no-upstream path tries to
+                revert to baseline and the revert fails — anvil state
+                may be poisoned and the operator must recycle the fork.
         """
-        if block_number is None:
-            if not self.upstream_rpc_url:
-                # No upstream configured (local-testnet or test path).
-                # Skip the reset; local Anvil state is authoritative.
-                return
+        if self.upstream_rpc_url:
+            # ── Upstream path: full re-fork at head (preserves old behavior) ──
+            if block_number is None:
+                try:
+                    block_number = self._fetch_upstream_head()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not fetch upstream head for fork reset (upstream=%s): %s",
+                        self.upstream_rpc_url, exc,
+                    )
+                    # Best-effort: leave fork at its current block. Better
+                    # than a half-reset that leaves Anvil in an inconsistent
+                    # state.
+                    return
+
             try:
-                block_number = self._fetch_upstream_head()
+                params = [{"forking": {"blockNumber": int(block_number)}}]
+                self.w3.provider.make_request("anvil_reset", params)
             except Exception as exc:
-                logger.warning(
-                    "Could not fetch upstream head for fork reset (upstream=%s): %s",
-                    self.upstream_rpc_url, exc,
-                )
-                # Best-effort: leave fork at its current block. Better
-                # than a half-reset that leaves Anvil in an inconsistent
-                # state.
+                logger.warning("anvil_reset failed (block=%s): %s", block_number, exc)
                 return
 
+            # After re-fork, the previous snapshot is invalidated. Take a
+            # fresh baseline so subsequent no-upstream-style reverts (if
+            # the simulator is reconfigured) and recovery paths still work.
+            try:
+                self._baseline_snapshot_id = self._snapshot()
+                self._baseline_probe_value = self._read_probe_slot()
+            except Exception as exc:
+                logger.warning("post-reset baseline snapshot failed: %s", exc)
+                self._baseline_snapshot_id = None
+            return
+
+        # ── No-upstream path: revert to baseline snapshot ─────────────
+        # (local-testnet chain 31337; the historical "no-op" path that
+        # the audit flagged as the C4 fork-poisoning vector.)
+        if self._baseline_snapshot_id is None:
+            # Lazy-init or post-failure recovery: just take a baseline now.
+            try:
+                self._baseline_snapshot_id = self._snapshot()
+                self._baseline_probe_value = self._read_probe_slot()
+            except Exception as exc:
+                logger.warning("lazy baseline snapshot failed: %s", exc)
+            return
+
+        reverted = self._evm_revert(self._baseline_snapshot_id)
+        if not reverted:
+            # Recovery attempt: clear the dead ID and try once to take
+            # a fresh snapshot at whatever state we're in. Then raise —
+            # the caller should treat this as a hard failure.
+            self._baseline_snapshot_id = None
+            raise SimulatorStateError(
+                "evm_revert to baseline snapshot failed — anvil state may be "
+                "poisoned by a malicious solver via the unauthenticated "
+                f"anvil_* JSON-RPC namespace (rpc={self.rpc_url}). Operator "
+                "should recycle the anvil container; see "
+                "docs/operator/anvil-isolation.md."
+            )
+
+        # Anvil consumes snapshot IDs on revert; take a fresh baseline.
         try:
-            params = [{"forking": {"blockNumber": int(block_number)}}]
-            self.w3.provider.make_request("anvil_reset", params)
+            self._baseline_snapshot_id = self._snapshot()
+            self._baseline_probe_value = self._read_probe_slot()
         except Exception as exc:
-            logger.warning("anvil_reset failed (block=%s): %s", block_number, exc)
+            logger.warning("post-revert baseline snapshot failed: %s", exc)
+            self._baseline_snapshot_id = None
+
+    def _evm_revert(self, snap_id: str) -> bool:
+        """Revert to a snapshot. Returns True on success, False otherwise.
+
+        Anvil's evm_revert returns `true` on success and `false` if the
+        snapshot ID was already consumed or never existed. Treats any
+        RPC error as a failed revert.
+        """
+        try:
+            result = self.w3.provider.make_request("evm_revert", [snap_id])
+            ok = result.get("result", False)
+            if not ok:
+                logger.warning(
+                    "evm_revert(%s) returned %s — snapshot may be stale",
+                    snap_id, result,
+                )
+            return bool(ok)
+        except Exception as exc:
+            logger.warning("evm_revert(%s) raised: %s", snap_id, exc)
+            return False
+
+    def _evm_snapshot(self) -> str:
+        """Take an EVM state snapshot, returning the snapshot ID."""
+        return self._snapshot()
+
+    # ── Baseline-alive probe ─────────────────────────────────────────
+    # Reads storage slot 0 of the zero address (cheap, stable, never
+    # written to in any well-known protocol). If a later read disagrees
+    # with the value captured at baseline time, the fork has been
+    # mutated OUTSIDE our snapshot/revert window — i.e., either via a
+    # direct cheat-code RPC call from an attacker on benchmark-sandbox,
+    # or via a state change inside a simulation whose revert silently
+    # failed without raising. Either way, treat as poisoning evidence.
+
+    # A well-known stable slot: storage[0] of address(0). The zero
+    # address has no code and no canonical mutator; we expect this
+    # slot to be zero on every chain and stay zero forever. If you
+    # ever see a non-zero value here, something is very wrong.
+    _PROBE_ADDRESS = "0x0000000000000000000000000000000000000000"
+    _PROBE_SLOT = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+    def _read_probe_slot(self) -> bytes:
+        """Read the probe storage slot. Cheap (one eth_call).
+
+        Returns the raw bytes; caller compares to the baseline value
+        captured at snapshot time.
+        """
+        try:
+            val = self.w3.eth.get_storage_at(self._PROBE_ADDRESS, 0)
+            return bytes(val) if val else b""
+        except Exception as exc:
+            logger.debug("probe slot read failed: %s", exc)
+            return b""
+
+    def _assert_baseline_alive(self) -> None:
+        """Verify the fork hasn't been mutated outside our snapshot window.
+
+        Runs once every BASELINE_PROBE_EVERY simulate() calls. If the
+        probe slot disagrees with the recorded baseline value, force a
+        re-fork (upstream available) or raise SimulatorStateError (no
+        upstream — local-testnet, no recovery possible without operator
+        intervention).
+        """
+        self._sim_count += 1
+        if self._sim_count % BASELINE_PROBE_EVERY != 0:
+            return
+        if self._baseline_probe_value is None:
+            # Never captured — best-effort capture now, nothing to compare.
+            self._baseline_probe_value = self._read_probe_slot()
+            return
+        observed = self._read_probe_slot()
+        if observed == self._baseline_probe_value:
+            return
+
+        logger.error(
+            "Baseline probe mismatch on %s: expected=%s observed=%s — fork "
+            "appears poisoned; forcing recovery",
+            self.rpc_url,
+            self._baseline_probe_value.hex()[:16],
+            observed.hex()[:16],
+        )
+        if self.upstream_rpc_url:
+            # Best chance of recovery: full re-fork at head.
+            self._reset_fork(block_number=None)
+            return
+        raise SimulatorStateError(
+            f"Baseline storage probe mismatch on {self.rpc_url} and no "
+            "upstream RPC configured to re-fork. Anvil state is poisoned; "
+            "operator must recycle the container. See "
+            "docs/operator/anvil-isolation.md."
+        )
 
     def _fetch_upstream_head(self) -> int:
         """Query the upstream RPC for the current head block number."""
