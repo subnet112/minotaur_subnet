@@ -10,6 +10,12 @@ from unittest.mock import patch
 
 os.environ["DISABLE_BENCHMARK_WORKER"] = "1"
 os.environ["DISABLE_BLOCK_LOOP"] = "1"
+# Required by api/startup env_check (added 2026-05). Set non-empty stubs
+# + skip the contract-presence check so TestClient lifespan reaches
+# the routes under test rather than tripping the registry guards.
+os.environ.setdefault("VALIDATOR_REGISTRY_8453", "0x" + "00" * 20)
+os.environ.setdefault("VALIDATOR_REGISTRY_964", "0x" + "00" * 20)
+os.environ.setdefault("SKIP_CONTRACT_PRESENCE_CHECK", "1")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
