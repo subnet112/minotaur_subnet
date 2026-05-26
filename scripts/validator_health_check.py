@@ -184,46 +184,99 @@ def fetch_registered_evms(
 async def probe_identity(
     session: aiohttp.ClientSession,
     axon_url: str,
-) -> dict | None:
-    """Fetch /identity at the axon. Returns None on any failure."""
+) -> tuple[dict | None, str | None]:
+    """Fetch /identity at the axon, with one retry on timeout.
+
+    Returns ``(data, error)`` — exactly one of them is non-None. ``data``
+    is the parsed JSON identity payload on success; ``error`` is a
+    short human-readable string on failure (HTTP status, timeout,
+    connection refused, etc.). The error string is propagated up so the
+    summary can show the operator WHY a probe didn't return — silent
+    Nones were the original mistake (issue #59 v1 saw "identity-mapped
+    1 of 5" from a GitHub runner and had no way to debug from the logs).
+
+    Retry policy:
+      - asyncio.TimeoutError → retry once. Cross-continent paths
+        sometimes need >5s and a single retry is cheap.
+      - HTTP 4xx/5xx, connection refused, DNS error → no retry. These
+        are definitive: the daemon is either responding with an error or
+        not listening. Retrying would only delay the (correct) failure.
+    """
     url = axon_url.rstrip("/") + "/identity"
-    try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_SECONDS),
-        ) as r:
-            if r.status != 200:
-                return None
-            return await r.json()
-    except Exception:
-        return None
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_SECONDS),
+            ) as r:
+                if r.status != 200:
+                    return None, f"HTTP {r.status}"
+                return await r.json(), None
+        except asyncio.TimeoutError:
+            last_err = f"timeout after {PROBE_TIMEOUT_SECONDS}s"
+            if attempt == 0:
+                continue
+        except aiohttp.ClientConnectorError as exc:
+            return None, f"connect failed: {exc}"
+        except aiohttp.ClientError as exc:
+            return None, f"client error: {type(exc).__name__}: {exc}"
+        except Exception as exc:  # JSON parse, etc.
+            return None, f"unexpected: {type(exc).__name__}: {exc}"
+    return None, last_err or "unknown"
 
 
-async def discover_identity_map(metagraph) -> dict[str, dict]:
-    """Probe every axon-serving UID for /identity. Returns
-    ``{evm_lower: {hotkey, axon_url, uid}}``."""
+async def discover_identity_map(
+    metagraph,
+) -> tuple[dict[str, dict], list[dict]]:
+    """Probe every axon-serving UID for /identity.
+
+    Returns ``(identity_map, probe_outcomes)``:
+      - ``identity_map``: ``{evm_lower: {hotkey, axon_url, uid}}`` for
+        UIDs whose /identity returned a valid binding.
+      - ``probe_outcomes``: per-axon ``{uid, hotkey, axon_url, status,
+        error, evm}`` — captures both successes and failures so the
+        summary can render "Probed 5 axons: 4 ok / 1 timeout" with the
+        per-axon reason. Crucial for diagnosing missing rows in the
+        report (e.g. when a GitHub runner can't reach an operator's
+        load-balancer in 5s but locally it's fine).
+    """
     candidates: list[tuple[int, str, str]] = []
     for uid, ax in enumerate(metagraph.axons):
         if ax.ip != "0.0.0.0" and ax.port != 0:
             candidates.append((uid, metagraph.hotkeys[uid], f"http://{ax.ip}:{ax.port}"))
 
     if not candidates:
-        return {}
+        return {}, []
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
             *(probe_identity(session, url) for _, _, url in candidates),
         )
 
-    out: dict[str, dict] = {}
-    for (uid, hk, url), data in zip(candidates, results):
-        if data is None:
-            continue
-        evm = (data.get("evm_address") or "").lower()
-        if not evm:
-            continue
-        out[evm] = {"hotkey": hk, "axon_url": url, "uid": uid}
-    return out
+    identity_map: dict[str, dict] = {}
+    outcomes: list[dict] = []
+    for (uid, hk, url), (data, err) in zip(candidates, results):
+        if data is not None:
+            evm = (data.get("evm_address") or "").lower()
+            if evm:
+                identity_map[evm] = {"hotkey": hk, "axon_url": url, "uid": uid}
+                outcomes.append({
+                    "uid": uid, "hotkey": hk, "axon_url": url,
+                    "status": "ok", "error": None, "evm": evm,
+                })
+                print(f"[probe] uid={uid:>3} {url} → ok evm={evm}", file=sys.stderr)
+                continue
+            err = "200 OK but payload missing evm_address"
+        outcomes.append({
+            "uid": uid, "hotkey": hk, "axon_url": url,
+            "status": "fail", "error": err, "evm": None,
+        })
+        print(
+            f"[probe] uid={uid:>3} {url} → FAIL: {err}",
+            file=sys.stderr,
+        )
+    return identity_map, outcomes
 
 
 def build_statuses(
@@ -356,6 +409,7 @@ def render_summary(
     statuses: list[ValidatorStatus],
     findings: list[dict],
     *,
+    probe_outcomes: list[dict],
     chain_names: list[str],
     current_block: int,
     netuid: int,
@@ -366,10 +420,26 @@ def render_summary(
     header.extend(chain_names)
     sep = ["---"] * len(header)
 
+    n_probes = len(probe_outcomes)
+    n_probes_ok = sum(1 for o in probe_outcomes if o["status"] == "ok")
+    coverage_incomplete = n_probes > 0 and n_probes_ok < n_probes
+
     lines: list[str] = []
     lines.append("# Validator Health Status")
     lines.append("")
     lines.append(f"_Last updated: **{ts}**  ·  netuid={netuid}  ·  block={current_block:,}_")
+    if coverage_incomplete:
+        # Visible banner above the table — a stale row can otherwise look
+        # like an (in-cluster) validator when really we just couldn't reach
+        # the operator's daemon during this run. The "Probe diagnostics"
+        # section below this table lists each failure with its reason.
+        lines.append("")
+        lines.append(
+            f"> ⚠️ **Coverage incomplete this run**: {n_probes_ok}/{n_probes} "
+            f"`/identity` probes succeeded. Validator rows without a hotkey "
+            f"below may be unreachable rather than genuinely in-cluster — see "
+            f"the Probe diagnostics section."
+        )
     lines.append("")
     lines.append(f"## Registered validators ({len(statuses)})")
     lines.append("")
@@ -408,12 +478,34 @@ def render_summary(
             )
 
     lines.append("")
+    lines.append("## Probe diagnostics")
+    lines.append("")
+    if not probe_outcomes:
+        lines.append("_No axon-serving UIDs in the metagraph this run._")
+    else:
+        lines.append(
+            f"Probed **{n_probes}** axon-serving UID(s) in the subnet-{netuid} "
+            f"metagraph; **{n_probes_ok}** answered with a valid identity, "
+            f"**{n_probes - n_probes_ok}** failed."
+        )
+        lines.append("")
+        lines.append("| UID | Axon | Outcome | EVM (if mapped) |")
+        lines.append("| --- | --- | --- | --- |")
+        for o in sorted(probe_outcomes, key=lambda x: x["uid"]):
+            outcome = "✅ ok" if o["status"] == "ok" else f"❌ {o['error']}"
+            evm_col = f"`{_short(o['evm'])}`" if o["evm"] else "—"
+            lines.append(
+                f"| {o['uid']} | `{o['axon_url']}` | {outcome} | {evm_col} |"
+            )
+
+    lines.append("")
     lines.append("---")
     lines.append("")
     lines.append(
         "_Generated by `.github/workflows/validator-health.yml` "
         "(runs every 15 min). Configuration: `STALE_THRESHOLD_SECONDS="
-        f"{STALE_THRESHOLD_SECONDS}`, `LOW_TRUST_THRESHOLD={LOW_TRUST_THRESHOLD}`._"
+        f"{STALE_THRESHOLD_SECONDS}`, `LOW_TRUST_THRESHOLD={LOW_TRUST_THRESHOLD}`, "
+        f"`PROBE_TIMEOUT_SECONDS={PROBE_TIMEOUT_SECONDS}`._"
     )
     return "\n".join(lines) + "\n"
 
@@ -458,10 +550,12 @@ def main() -> int:
         print(f"ERROR: subtensor query failed: {exc}", file=sys.stderr)
         return 2
 
-    identity_map = asyncio.run(discover_identity_map(metagraph))
+    identity_map, probe_outcomes = asyncio.run(discover_identity_map(metagraph))
+    total_axons = sum(
+        1 for ax in metagraph.axons if ax.ip != "0.0.0.0" and ax.port != 0
+    )
     print(
-        f"[info] identity-mapped {len(identity_map)} of "
-        f"{sum(1 for ax in metagraph.axons if ax.ip != '0.0.0.0' and ax.port != 0)} "
+        f"[info] identity-mapped {len(identity_map)} of {total_axons} "
         f"axon-serving UIDs",
         file=sys.stderr,
     )
@@ -479,6 +573,7 @@ def main() -> int:
     summary_md = render_summary(
         statuses=statuses,
         findings=findings,
+        probe_outcomes=probe_outcomes,
         chain_names=[r.name for r in registries],
         current_block=current_block,
         netuid=NETUID,
