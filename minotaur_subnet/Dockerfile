@@ -141,6 +141,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Runtime apt deps:
 #   - ca-certificates: TLS to RPC providers + GHCR
 #   - curl: healthchecks + the operator-side foundryup-style flows
+#   - nodejs: real runtime dep — the JS scoring sandbox
+#     (minotaur_subnet/engine/sandbox.py) spawns `node` as a subprocess
+#     to run validator-side scoring of each App's JS module. Dropping it
+#     here is a regression; npm is NOT needed at runtime (no `npm install`
+#     happens in the running container).
 #   - docker-ce-cli: spawning benchmark containers via docker-socket-proxy
 #     (NOT docker.io — that pulls dockerd, containerd, runc; we only
 #     need the CLI client because the daemon lives on the host)
@@ -152,6 +157,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         gnupg \
+        nodejs \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
