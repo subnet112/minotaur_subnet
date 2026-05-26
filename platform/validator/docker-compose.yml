@@ -210,6 +210,13 @@ services:
 
       # Score threshold (network norm)
       SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
+
+      # App catalog sync — pulls AppIntentDefinition (incl. js_code) and
+      # DeploymentResult from the leader's API every minute. Required for
+      # third-party validators: without it the local store stays empty,
+      # JsExecutionEngine has no scoring code loaded, and re-scoring of
+      # incoming consensus proposals fails. Leaders should leave this unset.
+      LEADER_API_URL: "${LEADER_API_URL:-https://api.minotaursubnet.com}"
     volumes:
       # Bittensor wallet directory — read-only.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
