@@ -5,8 +5,10 @@ the fork stays at its initial block. The simulator must pass an explicit
 ``forking.blockNumber`` to actually advance the fork. These tests verify
 that:
 
-  1. When no upstream RPC is configured, _reset_fork(None) skips silently
-     (local-testnet path, fork stays static — acceptable).
+  1. When no upstream RPC is configured, _reset_fork(None) reverts to
+     the startup baseline snapshot (PR-7 / audit C4 — was a no-op
+     before, but that allowed fork-state poisoning to persist across
+     simulations on local-testnet chain 31337).
   2. When upstream is configured, _reset_fork(None) fetches the upstream
      head and calls anvil_reset with that block number.
   3. When an explicit block_number is passed, the upstream is NOT queried
@@ -64,14 +66,35 @@ def sim_with_upstream():
         return sim
 
 
-def test_reset_fork_none_no_upstream_is_noop(sim_no_upstream):
-    """Without upstream URL, _reset_fork(None) silently skips."""
+def test_reset_fork_none_no_upstream_reverts_to_baseline(sim_no_upstream):
+    """Without upstream URL, _reset_fork(None) reverts to baseline snapshot.
+
+    Previously a no-op (the audit-flagged C4 fork-poisoning vector).
+    Now: revert to baseline, take a fresh one.
+    """
+    # Pre-seed the baseline (init couldn't because make_request is now
+    # the spy, not the real connection).
+    sim_no_upstream._baseline_snapshot_id = "0x1"
+    sim_no_upstream.w3.provider.make_request.side_effect = [
+        {"result": True},   # evm_revert
+        {"result": "0x2"},  # evm_snapshot
+    ]
+
     sim_no_upstream._reset_fork(block_number=None)
-    sim_no_upstream.w3.provider.make_request.assert_not_called()
+
+    calls = sim_no_upstream.w3.provider.make_request.call_args_list
+    assert calls[0][0][0] == "evm_revert"
+    assert calls[0][0][1] == ["0x1"]
+    assert calls[1][0][0] == "evm_snapshot"
+    assert sim_no_upstream._baseline_snapshot_id == "0x2"
 
 
 def test_reset_fork_none_with_upstream_fetches_head_and_resets(sim_with_upstream):
-    """With upstream URL, _reset_fork(None) fetches head + resets to it."""
+    """With upstream URL, _reset_fork(None) fetches head + resets to it.
+
+    After the reset, a fresh baseline snapshot is taken so post-reset
+    recovery paths still work.
+    """
     with patch("minotaur_subnet.simulator.anvil_simulator.requests.post") as mock_post:
         mock_post.return_value.json.return_value = {"result": "0xabcdef"}  # 11259375
         mock_post.return_value.raise_for_status = MagicMock()
@@ -81,11 +104,10 @@ def test_reset_fork_none_with_upstream_fetches_head_and_resets(sim_with_upstream
         mock_post.assert_called_once()
         # Verify it called the upstream URL
         assert mock_post.call_args[0][0] == "https://base-mainnet.example/v2/key"
-        # Verify it called anvil_reset with the fetched block
-        sim_with_upstream.w3.provider.make_request.assert_called_once_with(
-            "anvil_reset",
-            [{"forking": {"blockNumber": 11259375}}],
-        )
+        # Two RPC calls now: the anvil_reset, then a fresh evm_snapshot.
+        methods = [c[0][0] for c in sim_with_upstream.w3.provider.make_request.call_args_list]
+        assert "anvil_reset" in methods
+        assert "evm_snapshot" in methods
 
 
 def test_reset_fork_explicit_block_does_not_fetch_upstream(sim_with_upstream):
@@ -94,10 +116,13 @@ def test_reset_fork_explicit_block_does_not_fetch_upstream(sim_with_upstream):
         sim_with_upstream._reset_fork(block_number=5_000_000)
 
         mock_post.assert_not_called()
-        sim_with_upstream.w3.provider.make_request.assert_called_once_with(
+        # anvil_reset called with the explicit block; baseline re-snapshot follows.
+        calls = sim_with_upstream.w3.provider.make_request.call_args_list
+        assert calls[0][0] == (
             "anvil_reset",
             [{"forking": {"blockNumber": 5_000_000}}],
         )
+        assert calls[1][0][0] == "evm_snapshot"
 
 
 def test_reset_fork_upstream_fetch_failure_leaves_fork_alone(sim_with_upstream):
