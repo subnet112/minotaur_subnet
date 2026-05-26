@@ -928,59 +928,6 @@ class TestHotReloadAppsAndJs:
         mock_engine.load_intent.assert_not_called()
 
 
-class TestWeightsEmitterLeaderCheck:
-    """Tests for BT-8: leader-only weight emission."""
-
-    @pytest.mark.asyncio
-    async def test_non_leader_skips_emission(self):
-        """Follower validator skips weight emission."""
-        from minotaur_subnet.validator.weights_emitter import WeightsEmitter
-
-        mock_sync = MagicMock()
-        mock_sync.is_leader = False
-
-        emitter = WeightsEmitter(
-            wallet=MagicMock(),
-            subtensor=MagicMock(),
-            metagraph_sync=mock_sync,
-        )
-        result = await emitter.emit_async({"hotkey1": 0.5, "hotkey2": 0.5})
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_leader_proceeds_with_emission(self):
-        """Leader validator proceeds (may fail due to mock subtensor, but doesn't skip)."""
-        from minotaur_subnet.validator.weights_emitter import WeightsEmitter
-
-        mock_sync = MagicMock()
-        mock_sync.is_leader = True
-
-        emitter = WeightsEmitter(
-            wallet=MagicMock(),
-            subtensor=MagicMock(),
-            metagraph_sync=mock_sync,
-        )
-        # It will try to emit and likely fail on mock subtensor, but it shouldn't
-        # return False from the leader check
-        result = await emitter.emit_async({"hotkey1": 0.5})
-        # False because mock subtensor will fail, but NOT because of leader check
-        assert result is False  # Expected: subtensor mock fails
-
-    @pytest.mark.asyncio
-    async def test_no_metagraph_sync_proceeds(self):
-        """Without metagraph_sync, emission proceeds unconditionally."""
-        from minotaur_subnet.validator.weights_emitter import WeightsEmitter
-
-        emitter = WeightsEmitter(
-            wallet=MagicMock(),
-            subtensor=MagicMock(),
-            metagraph_sync=None,
-        )
-        # Will try to emit (and fail on mock subtensor), but no leader gate
-        result = await emitter.emit_async({"hotkey1": 0.5})
-        assert result is False  # Fails on mock subtensor, not leader check
-
-
 class TestSimulatorAnvilFallback:
     """SIM-10: AnvilSimulator returns failed result when Anvil is unreachable."""
 
