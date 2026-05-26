@@ -581,6 +581,33 @@ class AppIntentsValidator:
                     "Initial metagraph sync: role=%s, block=%d, validators=%d",
                     state.my_role, state.block, len(state.validators),
                 )
+                # Seed the local epoch clock from the AUTHORITATIVE chain state.
+                # Without this, every container restart silently delays the
+                # next set_weights by a full epoch_seconds window — even when
+                # our on-chain last_update would already permit an immediate
+                # emit. A stale validator that pulls a new image now resumes
+                # emitting on the FIRST epoch tick after restart instead of
+                # waiting another 20 min cold.
+                if state.my_last_update_block is not None and state.my_last_update_block > 0:
+                    # Mainnet: 12s/block. Local testnet (anvil-style): 0.25s.
+                    # Subtensor URL substring is the same heuristic the
+                    # WeightsEmitter uses for its own block_time arg.
+                    block_time = 0.25 if (
+                        "localhost" in (subtensor_url or "")
+                        or "127.0.0.1" in (subtensor_url or "")
+                    ) else 12.0
+                    blocks_since = max(0, state.block - state.my_last_update_block)
+                    self.weights.seed_epoch_clock_from_last_emit(blocks_since * block_time)
+                elif state.my_last_update_block == 0 and state.my_uid is not None:
+                    # Registered but never emitted — emit immediately on first
+                    # tick. Passing > epoch_seconds guarantees the clock has
+                    # "already elapsed" for the next maybe_emit call.
+                    self.weights.seed_epoch_clock_from_last_emit(
+                        self.weights.epoch_seconds + 1
+                    )
+                # If my_uid is None (unregistered), leave the clock at its
+                # process-start value — we shouldn't be emitting anyway until
+                # we're registered.
             except Exception as exc:
                 logger.error("Initial metagraph sync failed: %s (assuming leader)", exc)
                 self._is_leader = True

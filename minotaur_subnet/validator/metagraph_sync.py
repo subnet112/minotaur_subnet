@@ -259,6 +259,12 @@ class MetagraphState:
     my_role: str  # "leader" | "follower" | "unregistered"
     epoch: SubnetEpochInfo | None = None
     timestamp: float = field(default_factory=time.time)
+    # Block at which OUR hotkey last set weights on the subnet (0 if never).
+    # Used by the validator daemon at startup to backdate its local
+    # ChampionWeights epoch clock so a stale validator emits on the FIRST
+    # epoch tick after restart instead of waiting another full epoch_seconds.
+    # None when my_uid is None (unregistered).
+    my_last_update_block: int | None = None
 
 
 def _hotkey_to_evm(hotkey_ss58: str) -> str:
@@ -471,6 +477,15 @@ class MetagraphSync:
         else:
             my_role = "follower"
 
+        # Our last-update block (when we last successfully set_weights on
+        # this subnet). 0 when we've never emitted. None when unregistered.
+        my_last_update_block: int | None = None
+        if my_uid is not None:
+            try:
+                my_last_update_block = int(metagraph.last_update[my_uid])
+            except (IndexError, AttributeError, ValueError):
+                my_last_update_block = None
+
         return MetagraphState(
             block=block,
             peers=peers,
@@ -479,6 +494,7 @@ class MetagraphSync:
             my_uid=my_uid,
             my_role=my_role,
             epoch=epoch_info,
+            my_last_update_block=my_last_update_block,
         )
 
     async def sync_loop(self) -> None:
