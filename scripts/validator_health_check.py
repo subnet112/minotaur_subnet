@@ -100,6 +100,13 @@ class ValidatorStatus:
     identity_reachable: bool = False
     last_update_seconds_ago: int | None = None
     trust: float | None = None
+    # On-chain validator identity (set via subtensor's set_identity
+    # extrinsic — coldkey-scoped). None when the validator hasn't
+    # registered a display name. Pulled from ``metagraph.identities[uid]``
+    # without an extra RPC since the default ``metagraph()`` load
+    # already includes it in bittensor 10.x.
+    display_name: str | None = None
+    identity_url: str | None = None
 
 
 def parse_registries() -> list[Registry]:
@@ -315,6 +322,26 @@ def build_statuses(
             s.last_update_seconds_ago = (
                 max(0, current_block - last_update_block) * BLOCK_TIME_SECONDS
             )
+            # On-chain validator identity (set via subtensor's
+            # set_identity extrinsic, coldkey-scoped). Present in
+            # metagraph.identities for free — no extra RPC. Falsy / None
+            # for validators that haven't registered a display name.
+            ident = (metagraph.identities[uid]
+                     if metagraph.identities and uid < len(metagraph.identities)
+                     else None)
+            if ident:
+                # bittensor returns identities as a dict-like; tolerate both
+                # dict and dataclass shapes for forward-compat.
+                def _get(k):
+                    if isinstance(ident, dict):
+                        v = ident.get(k)
+                    else:
+                        v = getattr(ident, k, None)
+                    if v in ("", "~", None):
+                        return None
+                    return str(v).strip() or None
+                s.display_name = _get("name")
+                s.identity_url = _get("url")
         out.append(s)
     return out
 
@@ -345,6 +372,8 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                 "hotkey": s.hotkey,
                 "uid": s.uid,
                 "axon_url": s.axon_url,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
                 "details": (
                     f"No weight update for {s.last_update_seconds_ago // 60} min "
                     f"(threshold {STALE_THRESHOLD_SECONDS // 60} min). "
@@ -359,6 +388,8 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                 "validator_evm": s.evm_address,
                 "hotkey": s.hotkey,
                 "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
                 "axon_url": s.axon_url,
                 "details": (
                     f"Yuma trust {s.trust:.3f} < threshold {LOW_TRUST_THRESHOLD:.2f}. "
@@ -416,7 +447,7 @@ def render_summary(
 ) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    header = ["EVM", "Hotkey", "UID", "Stake (TAO)", "Last weights", "Trust", "Axon", "/identity"]
+    header = ["Name", "EVM", "Hotkey", "UID", "Stake (TAO)", "Last weights", "Trust", "Axon", "/identity"]
     header.extend(chain_names)
     sep = ["---"] * len(header)
 
@@ -447,9 +478,18 @@ def render_summary(
     lines.append("| " + " | ".join(sep) + " |")
 
     for s in statuses:
+        if s.display_name:
+            # Bold the name; if the operator set a URL, link it.
+            name_cell = (f"**[{s.display_name}]({s.identity_url})**"
+                         if s.identity_url else f"**{s.display_name}**")
+        elif s.uid is not None:
+            name_cell = "_(no identity set)_"
+        else:
+            name_cell = "_(in-cluster)_"
         row = [
+            name_cell,
             f"`{_short(s.evm_address)}`",
-            f"`{_short(s.hotkey or '—', head=8, tail=4)}`" if s.hotkey else "_(in-cluster)_",
+            f"`{_short(s.hotkey or '—', head=8, tail=4)}`" if s.hotkey else "—",
             str(s.uid) if s.uid is not None else "—",
             f"{s.stake:,.0f}" if s.stake is not None else "—",
             _fmt_seconds_ago(s.last_update_seconds_ago),
@@ -471,9 +511,16 @@ def render_summary(
             kind = {"stale_weights": "Stale weights", "low_trust": "Low Yuma trust"}.get(
                 f["type"], f["type"],
             )
+            name = f.get("display_name")
+            if name and f.get("identity_url"):
+                who = f"**[{name}]({f['identity_url']})** (`{_short(f['validator_evm'])}`)"
+            elif name:
+                who = f"**{name}** (`{_short(f['validator_evm'])}`)"
+            else:
+                who = f"`{_short(f['validator_evm'])}`"
             lines.append(
-                f"- **{kind}** — `{_short(f['validator_evm'])}` "
-                f"(uid={f['uid']}, hk=`{_short(f['hotkey'] or '?', 8, 4)}`)\n"
+                f"- **{kind}** — {who} "
+                f"— uid={f['uid']}, hk=`{_short(f['hotkey'] or '?', 8, 4)}`\n"
                 f"  {f['details']}"
             )
 
