@@ -61,7 +61,19 @@ jobs:
           # heavyweight ML libs we don't need for read-only metagraph
           # queries. Bittensor itself remains the source of truth for
           # the subtensor RPC shape.
-          pip install "bittensor>=8,<10" "web3>=6,<8" "aiohttp>=3.9,<4"
+          #
+          # Pin >=10: bittensor 9.x's resolver pulls in ``scalecodec``,
+          # but its transitively-required ``async-substrate-interface``
+          # 2.0+ has an import-time conflict check that runtime-errors
+          # when ``scalecodec`` is installed — it wants ``cyscale``
+          # instead, which is the same namespace. So a fresh ``pip
+          # install bittensor==9.x`` self-conflicts and crashes at
+          # ``import bittensor``. bittensor 10.x dropped the
+          # scalecodec dep and ships cyscale; no conflict.
+          # (Originally pinned <10 out of caution; the smoke-test
+          # locally happened to have bittensor 10.x + an older
+          # asi 1.6.x with no conflict check, which hid the issue.)
+          pip install "bittensor>=10,<11" "web3>=6,<8" "aiohttp>=3.9,<4"
 
       - name: Run health check
         id: check
