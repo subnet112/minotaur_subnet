@@ -216,9 +216,18 @@ def _verify_champion_proposal_signature(body: Any) -> str | None:
     payload.pop("proposer_signature", None)
     canonical = _json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
+    # Audit H2: prepend the champion-consensus domain prefix so that a
+    # signature minted for order consensus (or any other context) cannot
+    # be replayed here. MUST MATCH the prefix used by the signer in
+    # minotaur_subnet/consensus/peer_network.py.
+    from minotaur_subnet.consensus.peer_network import (
+        CHAMPION_PROPOSAL_DOMAIN_PREFIX,
+    )
+    message = CHAMPION_PROPOSAL_DOMAIN_PREFIX + canonical.encode()
+
     try:
         recovered = Account.recover_message(
-            encode_defunct(text=canonical),
+            encode_defunct(message),
             signature=sig_hex,
         )
     except Exception as exc:

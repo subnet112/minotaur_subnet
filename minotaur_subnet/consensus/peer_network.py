@@ -31,6 +31,21 @@ from minotaur_subnet.shared.types import SignedApproval
 logger = logging.getLogger(__name__)
 
 
+# ── EIP-191 domain separators (audit H2) ────────────────────────────────
+# Before this change, leader proposal signatures were a raw EIP-191
+# personal_sign over canonical JSON. That signature was indistinguishable
+# from any other JSON the same key might sign in another context (champion
+# proposals, identity attestations, deploy wrappers). A bytes-level prefix
+# binds each signature to one specific consensus domain so cross-protocol
+# signature replay/confusion is impossible.
+#
+# IMPORTANT: must be kept byte-identical to verifiers in
+# `minotaur_subnet/validator/scoring_engine.py` and
+# `minotaur_subnet/api/routes/submissions/routes.py`.
+PROPOSAL_DOMAIN_PREFIX = b"MinotaurOrderConsensusProposal\n"
+CHAMPION_PROPOSAL_DOMAIN_PREFIX = b"MinotaurChampionConsensusProposal\n"
+
+
 @dataclass
 class PeerEndpoint:
     """A remote validator's network endpoint."""
@@ -369,13 +384,17 @@ class ValidatorPeerNetwork:
         }
 
         # Sign the payload so peers can verify the proposer identity
-        # (required when CONSENSUS_REQUIRE_SIGNED_PROPOSALS=1)
+        # (required when CONSENSUS_REQUIRE_SIGNED_PROPOSALS=1).
+        # Audit H2: prepend PROPOSAL_DOMAIN_PREFIX so a signature minted
+        # for order consensus cannot be replayed in another signing
+        # context (champion proposals, identity attestations, etc.).
         if self.private_key:
             try:
                 from eth_account import Account
                 from eth_account.messages import encode_defunct
                 canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-                msg = encode_defunct(text=canonical)
+                message = PROPOSAL_DOMAIN_PREFIX + canonical.encode()
+                msg = encode_defunct(message)
                 sig = Account.sign_message(msg, private_key=self.private_key)
                 payload["proposer_signature"] = sig.signature.hex()
             except Exception as exc:
@@ -439,14 +458,16 @@ class ValidatorPeerNetwork:
         # Sign the canonical JSON of the payload so peers can verify the
         # leader's identity (required when CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=1).
         # Uses the same canonical-JSON-then-eth_sign-personal-message pattern
-        # as order-consensus proposals.
+        # as order-consensus proposals, with its own domain prefix so champion
+        # signatures cannot be confused with order signatures (audit H2).
         if self.private_key:
             try:
                 from eth_account import Account
                 from eth_account.messages import encode_defunct
                 canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                message = CHAMPION_PROPOSAL_DOMAIN_PREFIX + canonical.encode()
                 signed = Account.sign_message(
-                    encode_defunct(text=canonical),
+                    encode_defunct(message),
                     private_key=self.private_key,
                 )
                 payload["proposer_signature"] = signed.signature.hex()
