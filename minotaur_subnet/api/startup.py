@@ -1054,11 +1054,16 @@ async def initialize(ctx: ServerContext) -> dict:
                             f"address for chain {chain_id}; set "
                             f"VALIDATOR_REGISTRY_ADDRESS"
                         )
-                    order_rpc_url = (
-                        os.environ.get("ANVIL_RPC_URL")
-                        or os.environ.get("BASE_RPC_URL")
-                        or "http://anvil:8545"
+                    # Read consensus state from the live upstream chain —
+                    # never from the local Anvil fork. Forks snapshot at
+                    # their fork point and don't see post-fork
+                    # updateValidators / setQuorumBps writes until they're
+                    # recycled (~6 h on prod's cron). consensus_chain_rpc_url
+                    # picks the correct *_UPSTREAM_RPC_URL by chain id.
+                    from minotaur_subnet.consensus.protocol_config import (
+                        consensus_chain_rpc_url,
                     )
+                    order_rpc_url = consensus_chain_rpc_url(chain_id)
                     order_protocol_config = ProtocolConfig.from_validator_registry(
                         rpc_url=order_rpc_url,
                         registry_address=order_registry_address,
