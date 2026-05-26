@@ -224,9 +224,14 @@ def health() -> dict:
     worker_running = ctx.benchmark_worker is not None and ctx.benchmark_worker._running
     loop_running = ctx.block_loop is not None and ctx.block_loop.running
     coordinator_running = ctx.solver_round_task is not None and not ctx.solver_round_task.done()
+    # MINOTAUR_IMAGE_SHA is baked at build time (see Dockerfile + the
+    # docker-publish.yml build-args). 7-char prefix matches GHCR's
+    # sha-XXXXXXX tag scheme; "dev" for local builds without --build-arg.
+    image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
     data = {
         "status": "ok",
         "service": "app-intents-api",
+        "image_sha": image_sha,
         "benchmark_worker": "running" if worker_running else "disabled",
         "solver_round_coordinator": "running" if coordinator_running else "disabled",
         "solver_round_role": ctx.solver_round_role,
