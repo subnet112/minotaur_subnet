@@ -206,7 +206,7 @@ jobs:
                 `**Detected at**: ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()})`,
                 ``,
                 `_This issue is filed automatically by \`.github/workflows/validator-health.yml\`._ ` +
-                `_Re-runs will comment here rather than opening duplicates. Close manually once the condition clears — auto-close is a future enhancement._`,
+                `_Re-runs comment here rather than opening duplicates, and auto-close once the condition clears (positive evidence only — never on probe miss)._`,
               ].join('\n');
 
               // Search for an existing open issue with the same title.
@@ -236,4 +236,69 @@ jobs:
 
             if (payload.findings.length === 0) {
               core.info('no findings — no alerts opened');
+            }
+
+            // ── Auto-close cleared alerts ────────────────────────────
+            //
+            // For each currently-open validator-health-alert issue, decide
+            // whether to close it. We close ONLY on positive evidence:
+            //   1. We successfully probed the validator this run
+            //      (its uid is in observed_uids)
+            //   2. The alert type that titled the issue is NOT currently
+            //      raised for that uid (stale_weights / low_trust = false)
+            //
+            // If the uid is missing from observed_uids — almost always
+            // because the /identity probe failed from this runner — we
+            // leave the issue open. Closing on probe miss would create
+            // false "all clear" signals during flaky network windows.
+            const TITLE_RE = /\[validator-health\] (Stale weights|Low Yuma trust): .*\(uid=(\d+)\)/;
+            const TYPE_FROM_LABEL = { 'Stale weights': 'stale_weights', 'Low Yuma trust': 'low_trust' };
+            const observed = payload.observed_uids || {};
+
+            const openAlerts = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ALERT_LABEL,
+              state: 'open',
+              per_page: 100,
+            });
+
+            for (const issue of openAlerts.data) {
+              const m = issue.title.match(TITLE_RE);
+              if (!m) {
+                core.info(`skipping #${issue.number} (title doesn't match known format): ${issue.title}`);
+                continue;
+              }
+              const alertType = TYPE_FROM_LABEL[m[1]];
+              const uid = m[2];
+              const state = observed[uid];
+
+              if (!state) {
+                core.info(`leaving #${issue.number} open — uid=${uid} not probed this run (no positive evidence)`);
+                continue;
+              }
+              if (state[alertType]) {
+                // Still failing — handled above (comment added). Don't touch.
+                continue;
+              }
+
+              // Positive evidence the condition has cleared.
+              const closingComment = alertType === 'stale_weights'
+                ? `✅ Auto-resolved as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()}). Validator at uid=${uid} set weights ${Math.floor((state.last_update_seconds_ago || 0) / 60)}m ago — below the ${Math.floor(payload.thresholds.stale_weights_seconds / 60)}m staleness threshold.`
+                : `✅ Auto-resolved as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()}). Validator at uid=${uid} now has Yuma trust ${state.trust?.toFixed(3) ?? '?'} — above the ${payload.thresholds.low_trust} threshold.`;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: closingComment,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.info(`auto-closed #${issue.number} (uid=${uid}, type=${alertType}): ${issue.title}`);
             }
