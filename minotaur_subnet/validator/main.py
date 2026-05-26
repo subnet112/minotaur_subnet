@@ -971,13 +971,18 @@ def main() -> None:
                 f"Set --validator-registry-address, VALIDATOR_REGISTRY_ADDRESS, "
                 f"or VALIDATOR_REGISTRY_{chain_id}."
             )
-        anvil_rpc = (
-            os.environ.get("ANVIL_RPC_URL")
-            or os.environ.get("BASE_RPC_URL")
-            or "http://localhost:8545"
+        # Read consensus state from the live upstream chain — never from
+        # the local Anvil fork. Anvil snapshots upstream state at the
+        # fork point and never re-fetches; an on-chain updateValidators
+        # is invisible to the fork until it's recycled. See
+        # consensus.protocol_config.consensus_chain_rpc_url for the
+        # per-chain env resolution.
+        from minotaur_subnet.consensus.protocol_config import (
+            consensus_chain_rpc_url,
         )
+        consensus_rpc = consensus_chain_rpc_url(chain_id)
         protocol_config = ProtocolConfig.from_validator_registry(
-            rpc_url=anvil_rpc,
+            rpc_url=consensus_rpc,
             registry_address=registry_address,
         )
 
