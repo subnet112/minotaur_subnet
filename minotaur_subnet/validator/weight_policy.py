@@ -32,6 +32,9 @@ class ChampionWeights:
         self.owner_hotkey = (owner_hotkey or "").strip()
         self._epoch_start = time.time()
         self._history: list[dict[str, Any]] = []
+        # Throttle the "empty weights" warning so a misconfigured operator's
+        # log isn't spammed every 5 sec of the epoch_loop.
+        self._last_empty_warn_at: float = 0.0
 
     def seed_epoch_clock_from_last_emit(self, seconds_since_last_emit: float) -> None:
         """Backdate the local epoch clock so the next ``maybe_emit`` call
@@ -73,6 +76,29 @@ class ChampionWeights:
             champion_miner_id,
             owner_hotkey=self.owner_hotkey,
         )
+
+        # Empty weights = no champion AND no resolvable owner_hotkey. Returning
+        # here WITHOUT advancing _epoch_start is the load-bearing piece:
+        # previously the clock was reset to now even on empty, so an operator
+        # whose owner_hotkey hadn't been resolved at startup would wait
+        # another full epoch_seconds (default 20 min) for the next attempt —
+        # if the chain query later succeeded, the fix wouldn't take effect
+        # for another 20 min. Now the loop retries every tick until weights
+        # are non-empty, which is what an operator self-healing from a
+        # misconfig actually wants. (Bug surfaced 2026-05-26 when third-party
+        # validators on canonical compose lacked SUBNET_OWNER_HOTKEY env and
+        # entered a permanent silent-no-emit loop.)
+        if not weights:
+            if time.time() - self._last_empty_warn_at > 300:
+                logger.warning(
+                    "maybe_emit returned empty weights: no real champion AND "
+                    "no resolvable owner_hotkey. Validator will NOT emit until "
+                    "either is set. Check that SUBNET_OWNER_HOTKEY is set OR "
+                    "that the daemon's bittensor subtensor connection can "
+                    "reach SubnetOwnerHotkey storage at startup."
+                )
+                self._last_empty_warn_at = time.time()
+            return None
 
         self._history.append({
             "epoch_start": self._epoch_start,

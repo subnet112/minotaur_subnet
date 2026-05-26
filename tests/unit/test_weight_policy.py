@@ -1,8 +1,11 @@
 """Unit tests for weight emission bootstrap policy."""
 
+from unittest.mock import MagicMock
+
 from minotaur_subnet.weight_policy import (
     GENESIS_HOTKEY,
     build_bootstrap_or_champion_weights,
+    lookup_subnet_owner_from_chain,
 )
 from minotaur_subnet.validator.main import ChampionWeights
 
@@ -61,3 +64,63 @@ def test_seed_epoch_clock_negative_clamped_to_zero():
     tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="5Gowner")
     tracker.seed_epoch_clock_from_last_emit(-999.0)
     assert tracker.maybe_emit(None) is None  # behaves like a fresh start
+
+
+def test_maybe_emit_empty_does_not_advance_epoch_clock(monkeypatch):
+    """When weights end up empty (no champion AND no resolvable owner_hotkey)
+    the epoch clock must NOT advance — otherwise a late-resolving owner
+    (env set after startup, slow chain query) would have to wait a full
+    additional epoch_seconds before next attempt."""
+    # No owner_hotkey set anywhere — empty weights inevitable
+    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="")
+    # Seed the clock so we'd otherwise emit
+    tracker.seed_epoch_clock_from_last_emit(9999.0)
+
+    epoch_start_before = tracker._epoch_start
+    result = tracker.maybe_emit(None)
+
+    assert result is None  # empty → None (not the empty dict)
+    assert tracker._epoch_start == epoch_start_before  # clock did NOT advance
+
+
+def test_lookup_subnet_owner_from_chain_returns_value():
+    """Pull SubnetOwnerHotkey storage out of subtensor — happy path."""
+    sub = MagicMock()
+    result = MagicMock()
+    result.value = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
+    sub.query_subtensor = MagicMock(return_value=result)
+
+    owner = lookup_subnet_owner_from_chain(sub, 112)
+
+    assert owner == "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
+    sub.query_subtensor.assert_called_once_with("SubnetOwnerHotkey", params=[112])
+
+
+def test_lookup_subnet_owner_from_chain_empty_on_error():
+    """Network/RPC failure must return '' — caller falls back gracefully
+    instead of crashing the daemon at startup."""
+    sub = MagicMock()
+    sub.query_subtensor = MagicMock(side_effect=RuntimeError("rpc down"))
+
+    owner = lookup_subnet_owner_from_chain(sub, 112)
+
+    assert owner == ""
+
+
+def test_maybe_emit_recovers_after_owner_hotkey_set_late(monkeypatch):
+    """Operator-self-heal flow: daemon starts with no owner, emits None
+    every tick, then operator sets the hotkey at runtime. The very NEXT
+    maybe_emit should emit (no extra wait)."""
+    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="")
+    tracker.seed_epoch_clock_from_last_emit(9999.0)
+    assert tracker.maybe_emit(None) is None  # initially empty
+
+    # Operator sets the hotkey
+    tracker.owner_hotkey = "5Gowner"
+
+    # Next tick must emit immediately (clock wasn't advanced by the empty call)
+    assert tracker.maybe_emit(None) == {"5Gowner": 1.0}

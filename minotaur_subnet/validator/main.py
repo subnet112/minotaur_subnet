@@ -397,6 +397,27 @@ class AppIntentsValidator:
                     if name.startswith("minotaur_subnet"):
                         logging.getLogger(name).setLevel(logging.NOTSET)
 
+                # Resolve owner_hotkey from chain if env didn't provide one.
+                # Subnet owner is public on-chain data; making it an env
+                # requirement was a misconfig hazard that silently broke
+                # weight emission for third-party operators on canonical
+                # compose (they had no SUBNET_OWNER_HOTKEY set and their
+                # daemon emitted {} → silent dead loop every epoch).
+                if not self.weights.owner_hotkey:
+                    from minotaur_subnet.weight_policy import lookup_subnet_owner_from_chain
+                    chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
+                    if chain_owner:
+                        self.weights.owner_hotkey = chain_owner
+                        logger.info(
+                            "Resolved subnet %d owner hotkey from chain: %s…",
+                            netuid, chain_owner[:16],
+                        )
+                    else:
+                        logger.warning(
+                            "No SUBNET_OWNER_HOTKEY env AND chain lookup failed; "
+                            "weight emission will be empty until either resolves",
+                        )
+
                 if wallet_name and hotkey_name:
                     try:
                         self._bt_wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
@@ -879,6 +900,7 @@ class AppIntentsValidator:
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
             "weights_emitter_configured": self._weights_emitter is not None,
+            "owner_hotkey_resolved": bool(self.weights.owner_hotkey),
             "my_uid": sync_state.my_uid if sync_state is not None else None,
             "my_last_update_block": sync_state.my_last_update_block if sync_state is not None else None,
             "last_emit": self._last_emit_state,
