@@ -237,7 +237,7 @@ services:
       LEADER_API_URL: "${LEADER_API_URL:-https://api.minotaursubnet.com}"
     volumes:
       # Bittensor wallet directory — read-only.
-      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
+      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
     networks: [minotaur]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
@@ -375,7 +375,7 @@ services:
       # peer cache, which can be stale by up to 300s after a slash/removal).
       CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
     volumes:
-      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
+      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data
     networks: [minotaur]
     healthcheck:
