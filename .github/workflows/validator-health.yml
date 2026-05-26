@@ -178,13 +178,23 @@ jobs:
                 stale_weights: 'Stale weights',
                 low_trust: 'Low Yuma trust',
               }[f.type] || f.type;
-              return `[validator-health] ${kind}: ${shorten(f.validator_evm)} (uid=${f.uid})`;
+              // Prefer the validator's on-chain display name in the title;
+              // fall back to the shortened EVM. Issue dedup downstream still
+              // searches by exact title, so renaming a validator on Bittensor
+              // would open a new issue — acceptable for the visibility win.
+              const who = f.display_name
+                ? `${f.display_name} (uid=${f.uid})`
+                : `${shorten(f.validator_evm)} (uid=${f.uid})`;
+              return `[validator-health] ${kind}: ${who}`;
             };
 
             for (const f of payload.findings) {
               const title = titleFor(f);
+              const validatorLine = f.display_name
+                ? `**Validator**: ${f.identity_url ? `[${f.display_name}](${f.identity_url})` : f.display_name} (\`${f.validator_evm}\`)`
+                : `**Validator**: \`${f.validator_evm}\``;
               const body = [
-                `**Validator**: \`${f.validator_evm}\``,
+                validatorLine,
                 `**Hotkey**: \`${f.hotkey || '(unknown)'}\``,
                 `**UID**: ${f.uid}`,
                 `**Axon URL**: ${f.axon_url || '(none)'}`,
