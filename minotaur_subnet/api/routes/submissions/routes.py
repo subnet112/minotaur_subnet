@@ -134,10 +134,26 @@ def _get_internal_round_api_key() -> str:
 
 
 def _require_internal_round_api_key(request: Request) -> None:
-    """Shared-secret auth for internal solver-round coordination endpoints."""
+    """Shared-secret auth for internal solver-round coordination endpoints.
+
+    Fail-closed semantics (PR-2 of 7-PR security hardening, audit C2):
+    when neither ``SOLVER_ROUND_INTERNAL_API_KEY`` nor the legacy
+    ``SUBMISSIONS_API_KEY`` is set, this used to silently allow every
+    caller. The PR-1 compose fail-fast covers operators who deploy via
+    the canonical Docker compose, but anyone running the api directly
+    with ``python -m`` would bypass that. Now: missing env → 503 so the
+    operator notices immediately.
+    """
     expected = _get_internal_round_api_key()
     if not expected:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Champion consensus disabled: operator must set "
+                "SOLVER_ROUND_INTERNAL_API_KEY (or legacy SUBMISSIONS_API_KEY) "
+                "to enable validator-to-validator coordination endpoints."
+            ),
+        )
     provided = request.headers.get("x-solver-round-internal-key", "").strip()
     if provided != expected:
         raise HTTPException(status_code=401, detail="Invalid internal solver round key")
@@ -149,11 +165,22 @@ _CHAMPION_PROPOSAL_LAST_SEEN: dict[tuple[str, str], float] = {}
 _CHAMPION_PROPOSAL_LAST_SEEN_LOCK = Lock()
 
 
-def _champion_proposal_rate_limit_check(body: Any) -> str | None:
+def _champion_proposal_rate_limit_check(
+    body: Any,
+    request: Request | None = None,
+) -> str | None:
     """Reject champion proposals that arrive too often per (signer, round_id).
 
     Default 10s window. Controlled by CHAMPION_PROPOSAL_MIN_INTERVAL_SECONDS.
     Returns an error string to use as the rejection reason, or None on pass.
+
+    Fail-closed semantics (PR-2 of 7-PR security hardening, audit C2):
+    when the proposal omits ``proposer`` (the signer field) this used to
+    fail open — anyone with the shared API key could spam unsigned
+    proposals at unlimited rate. Now: when signer is missing, we key the
+    limit on the client IP from the request and apply a tight 10s window
+    (1 req per 10s per IP). Signed proposals keep using the original
+    (signer, round) bucket.
     """
     try:
         interval = float(
@@ -166,18 +193,38 @@ def _champion_proposal_rate_limit_check(body: Any) -> str | None:
 
     signer = (getattr(body, "proposer", "") or "").lower()
     round_id = getattr(body, "round_id", "") or ""
-    if not signer or not round_id:
-        return None  # without signer+round we can't key the limit; fail open
 
-    key = (signer, round_id)
+    # Signed path: bucket on (signer, round_id) — the original semantics.
+    if signer and round_id:
+        key: tuple[str, str] = (signer, round_id)
+        descr = f"signer {signer[:10]} for round {round_id}"
+    else:
+        # Unsigned path: bucket on client IP only. We accept slightly
+        # over-aggressive limiting here (one IP can stand in for many
+        # validators only if they share an egress NAT — vanishingly rare
+        # in subnet112 topology). 429-equivalent (returned as rejection
+        # reason RATE_LIMITED) is the right answer.
+        ip = "unknown"
+        if request is not None:
+            ip = (
+                request.headers.get("x-real-ip", "").strip()
+                or (request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+                    if request.headers.get("x-forwarded-for") else "")
+                or (request.client.host if request.client and request.client.host else "unknown")
+            )
+        key = (f"ip:{ip}", "_unsigned_")
+        descr = f"unsigned proposal from {ip}"
+        # Force the unsigned path to 10s minimum even if operator widened
+        # the signed interval.
+        interval = max(interval, 10.0)
+
     now = time.monotonic()
     with _CHAMPION_PROPOSAL_LAST_SEEN_LOCK:
         last = _CHAMPION_PROPOSAL_LAST_SEEN.get(key)
         if last is not None and (now - last) < interval:
             return (
-                f"Champion proposal rate-limited: signer {signer[:10]} already "
-                f"sent a proposal for round {round_id} "
-                f"{now - last:.1f}s ago (interval={interval}s)"
+                f"Champion proposal rate-limited: {descr} already sent "
+                f"a proposal {now - last:.1f}s ago (interval={interval}s)"
             )
         _CHAMPION_PROPOSAL_LAST_SEEN[key] = now
     return None
@@ -186,16 +233,21 @@ def _champion_proposal_rate_limit_check(body: Any) -> str | None:
 def _verify_champion_proposal_signature(body: Any) -> str | None:
     """Verify the leader's EIP-712 signature over the canonical proposal.
 
-    Opt-in via CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=1. When off,
-    returns None (the existing shared API key is still checked). When on,
-    requires ``proposer`` and ``proposer_signature`` to be present and
-    verifies the signature covers the canonical JSON of the proposal
-    payload with the signature field stripped.
+    Default ON as of PR-2 (audit C2): opt-OUT via
+    ``CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=0`` for emergency
+    incident handling only. Previously defaulted to off, which meant the
+    shared API key was the only thing standing between any leaked-key
+    holder and forging "the leader said adopt this champion" claims.
+    Mirrors the compose default flipped in PR-1.
+
+    When on, requires ``proposer`` and ``proposer_signature`` to be
+    present and verifies the signature covers the canonical JSON of the
+    proposal payload with the signature field stripped.
 
     Returns an error string on failure, or None on pass.
     """
     require = os.environ.get(
-        "CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "0",
+        "CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1",
     ).strip().lower() in ("1", "true", "yes", "on")
     if not require:
         return None
@@ -732,8 +784,10 @@ async def solver_round_consensus_proposal(
         }
 
     # Per-signer, per-round rate limit. Prevents a peer that somehow has the
-    # API key from making us burn CPU on repeated reactive benchmarks.
-    rate_err = _champion_proposal_rate_limit_check(body)
+    # API key from making us burn CPU on repeated reactive benchmarks. When
+    # the proposal is unsigned, the limiter falls back to a per-client-IP
+    # bucket so anonymous spam can't bypass it (PR-2, audit C2).
+    rate_err = _champion_proposal_rate_limit_check(body, request)
     if rate_err:
         return {
             "approved": False,

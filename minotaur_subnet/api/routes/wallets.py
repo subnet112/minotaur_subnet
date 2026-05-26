@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from minotaur_subnet.api import services as _tools
+from minotaur_subnet.api.routes.apps import _require_admin
 
 router = APIRouter(tags=["wallets"])
 
@@ -37,9 +38,17 @@ def _store():
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
-@router.post("/wallets/")
+@router.post("/wallets/", dependencies=[Depends(_require_admin)])
 def create_wallet(body: CreateWalletRequest) -> dict[str, Any]:
-    """Create a new managed wallet."""
+    """Create a new managed wallet.
+
+    Admin-gated as of PR-2 (audit M-wallets): wallet issuance writes to
+    the on-disk store (``APP_INTENTS_STORE_PATH``) and instantiates Lit
+    Protocol MPC sessions. Anonymous callers could disk-fill the store
+    + exhaust the Lit subscription's per-second cap. Third-party
+    follower validators don't issue wallets — that's a leader-API
+    concern — so the gate is safe to apply on all instances.
+    """
     return _tools.create_wallet(_store(), body.chain_ids)
 
 

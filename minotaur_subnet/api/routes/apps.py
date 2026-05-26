@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import time
+from collections import deque
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from minotaur_subnet.api import services as _tools
@@ -14,19 +17,109 @@ from minotaur_subnet.api import services as _tools
 router = APIRouter(tags=["apps"])
 
 
-def _require_admin(x_admin_key: str | None = Header(None)) -> None:
+def _env_true(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _require_admin(
+    request: Request,
+    x_admin_key: str | None = Header(None),
+) -> None:
     """Validate admin API key for protected endpoints.
 
-    If ADMIN_API_KEY is set, the request must include a matching
-    X-Admin-Key header. If ADMIN_API_KEY is not set, admin endpoints
-    are open (development mode).
+    Fail-closed semantics (PR-2 of 7-PR security hardening, audit C1):
+
+      * If ``RELAYER_URL`` is set in the environment (any value), this
+        instance is wired to a relayer that spends real gas — admin
+        gating is mandatory. ``ADMIN_API_KEY`` MUST be set AND the
+        request MUST present a matching ``X-Admin-Key`` header. Either
+        missing → 401.
+
+      * If ``RELAYER_URL`` is unset AND ``LOCAL_TESTNET=1`` is set, the
+        dev-mode open path is preserved so local stacks without a relayer
+        can be poked freely.
+
+      * Otherwise (no relayer, not local) the gate is still enforced.
+        This catches "I forgot to set LOCAL_TESTNET on my laptop"
+        footguns and makes the safe default the only default.
+
+    Use as ``dependencies=[Depends(_require_admin)]`` on the route so the
+    OpenAPI surface stays clean and the header is documented.
     """
+    relayer_url = os.environ.get("RELAYER_URL", "").strip()
     admin_key = os.environ.get("ADMIN_API_KEY", "").strip()
-    if admin_key and x_admin_key != admin_key:
+    local_testnet = _env_true("LOCAL_TESTNET", default=False)
+
+    if not relayer_url and local_testnet:
+        # Dev path: no relayer + explicit local-testnet flag → open.
+        return
+
+    if not admin_key:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Admin API key required but ADMIN_API_KEY is not configured "
+                "on this server. Operator: set ADMIN_API_KEY (and either set "
+                "LOCAL_TESTNET=1 to open dev routes, or leave it gated)."
+            ),
+        )
+
+    if x_admin_key != admin_key:
         raise HTTPException(
             status_code=401,
             detail="Admin API key required (X-Admin-Key header)",
         )
+
+
+# Per-IP, per-path rate limit buckets for the debug helper routes
+# (/apps/validate, /apps/{id}/score). Even behind the admin gate these
+# routes spawn Forge / Anvil subprocesses, so an operator-shared key
+# can be hammered. Defaults: 5 req/min/IP.
+_DEBUG_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
+_DEBUG_RATE_LIMIT_LOCK = Lock()
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve the caller IP, honoring proxy headers when TRUST_PROXY_HEADERS=1."""
+    if _env_true("TRUST_PROXY_HEADERS", default=False):
+        xri = request.headers.get("x-real-ip", "").strip()
+        if xri:
+            return xri
+        xff = request.headers.get("x-forwarded-for", "").strip()
+        if xff:
+            return xff.split(",", 1)[0].strip()
+    return request.client.host if request.client and request.client.host else "unknown"
+
+
+def _debug_rate_limit(request: Request, *, per_minute: int = 5) -> None:
+    """Per-IP fixed-window limiter for debug helper routes.
+
+    Raises 429 when the IP key exceeds ``per_minute`` requests in the
+    last 60 seconds against the same path. Mirrors the bucket style used
+    in ``submissions/routes._enforce_rate_limit``.
+    """
+    if per_minute <= 0:
+        return
+    now = time.monotonic()
+    window_start = now - 60.0
+    ip = _client_ip(request)
+    key = f"{request.url.path}:{ip}"
+    with _DEBUG_RATE_LIMIT_LOCK:
+        bucket = _DEBUG_RATE_LIMIT_BUCKETS.setdefault(key, deque())
+        while bucket and bucket[0] < window_start:
+            bucket.popleft()
+        if len(bucket) >= per_minute:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded for {request.url.path} "
+                    f"(>{per_minute} req/min/IP). Retry shortly."
+                ),
+            )
+        bucket.append(now)
 
 # Module-level JS engine reference, set by server.py at startup
 _js_engine = None
@@ -107,20 +200,19 @@ def _store():
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
-@router.post("/apps/")
+@router.post("/apps/", dependencies=[Depends(_require_admin)])
 def create_app(
     body: CreateAppRequest,
-    x_admin_key: str | None = Header(None),
 ) -> dict[str, Any]:
     """Create a new App Intent with developer-provided JS and Solidity code.
 
-    Requires X-Admin-Key header when ADMIN_API_KEY is set. Open in development
-    mode (when ADMIN_API_KEY is unset). The on-chain AppRegistry gate is the
-    final authority — even an unauthenticated app record can't be routed
-    against an unregistered contract — but the admin gate prevents wasted
-    relayer gas from spurious deploy attempts.
+    Requires X-Admin-Key header unless ``RELAYER_URL`` is unset AND
+    ``LOCAL_TESTNET=1`` (see ``_require_admin`` for the full matrix). The
+    on-chain AppRegistry gate is the final authority — even an
+    unauthenticated app record can't be routed against an unregistered
+    contract — but the admin gate prevents wasted relayer gas from
+    spurious deploy attempts.
     """
-    _require_admin(x_admin_key)
     return _tools.create_app_intent(
         _store(),
         name=body.name,
@@ -133,9 +225,20 @@ def create_app(
     )
 
 
-@router.post("/apps/validate")
-async def validate_app(body: ValidateAppRequest) -> dict[str, Any]:
-    """Pre-flight validation for App Intent JS and/or Solidity code."""
+@router.post("/apps/validate", dependencies=[Depends(_require_admin)])
+async def validate_app(
+    body: ValidateAppRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Pre-flight validation for App Intent JS and/or Solidity code.
+
+    Admin-gated as of PR-2 (audit H3): this route spawns a Forge
+    subprocess to compile attacker-supplied Solidity. Anonymous abuse
+    can DoS the validator host by burning CPU on repeated compile
+    timeouts. Also rate-limited per source IP (5 req/min) for the case
+    where the operator-shared admin key is widely distributed.
+    """
+    _debug_rate_limit(request, per_minute=5)
     return await _tools.validate_app_intent_code(
         js_code=body.js_code,
         solidity_code=body.solidity_code,
@@ -143,24 +246,22 @@ async def validate_app(body: ValidateAppRequest) -> dict[str, Any]:
     )
 
 
-@router.post("/apps/{app_id}/deploy")
+@router.post("/apps/{app_id}/deploy", dependencies=[Depends(_require_admin)])
 async def deploy_app(
     app_id: str,
     chain_id: int | None = None,
-    x_admin_key: str | None = Header(None),
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
 
-    Requires X-Admin-Key header when ADMIN_API_KEY is set. Open in development
-    mode (when ADMIN_API_KEY is unset). Without this gate, an unauthenticated
-    caller could trigger the relayer to spend gas on attacker-defined Solidity;
-    the deployed contract still can't execute orders (AppRegistry gate is
-    GATED + allowlist) but the gas burn is real.
+    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
+    ``_require_admin``). Without this gate, an unauthenticated caller
+    could trigger the relayer to spend gas on attacker-defined Solidity;
+    the deployed contract still can't execute orders (AppRegistry gate
+    is GATED + allowlist) but the gas burn is real.
 
     Runs in a thread executor so the synchronous compile + deploy chain
     can call asyncio.run() without conflicting with the FastAPI event loop.
     """
-    _require_admin(x_admin_key)
     import asyncio
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -188,17 +289,16 @@ def get_status(app_id: str) -> dict[str, Any]:
     return _tools.get_app_status(_store(), app_id)
 
 
-@router.put("/apps/{app_id}/scoring")
+@router.put("/apps/{app_id}/scoring", dependencies=[Depends(_require_admin)])
 def update_scoring(
     app_id: str,
     body: UpdateScoringRequest,
-    x_admin_key: str | None = Header(None),
 ) -> dict[str, Any]:
     """Update the JS scoring code for an App Intent.
 
-    Requires X-Admin-Key header when ADMIN_API_KEY is set.
+    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
+    ``_require_admin``).
     """
-    _require_admin(x_admin_key)
     return _tools.update_scoring(
         _store(), app_id, body.new_js_code,
         caller=body.caller,
@@ -262,17 +362,16 @@ async def get_historical_scenarios(
     }
 
 
-@router.post("/apps/{app_id}/activate")
+@router.post("/apps/{app_id}/activate", dependencies=[Depends(_require_admin)])
 def activate_app(
     app_id: str,
     chain_id: int = 0,
-    x_admin_key: str | None = Header(None),
 ) -> dict[str, Any]:
     """Admin: promote an app from solving → active (for testing).
 
-    Requires X-Admin-Key header when ADMIN_API_KEY is set.
+    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
+    ``_require_admin``).
     """
-    _require_admin(x_admin_key)
     from minotaur_subnet.shared.types import AppStatus
     s = _store()
     dep = s.get_deployment(app_id, chain_id=chain_id if chain_id else None)
@@ -282,14 +381,64 @@ def activate_app(
     return {"app_id": app_id, "chain_id": dep.chain_id, "status": "active"}
 
 
-@router.post("/apps/{app_id}/score")
-async def score_plan(app_id: str, body: ScorePlanRequest) -> dict[str, Any]:
+@router.post("/apps/{app_id}/score", dependencies=[Depends(_require_admin)])
+async def score_plan(
+    app_id: str,
+    body: ScorePlanRequest,
+    request: Request,
+) -> dict[str, Any]:
     """Score an execution plan against an app's JS scoring function.
 
     Used by miners to test how well their generated plans score.
     Runs the full pipeline when Anvil is available (simulation + JS scoring),
     falling back to mock simulation otherwise.
+
+    Admin-gated + per-IP rate-limited as of PR-2 (audit H4): each call
+    rewinds the chain's Anvil fork (potentially to an archive block) and
+    runs JS scoring in the sandbox. Anonymous abuse can pin the
+    simulator at a historical block, breaking every other ongoing
+    simulation, and burn upstream archive RPC quota.
     """
+    _debug_rate_limit(request, per_minute=5)
+
+    # Clamp fork_block: reject anything farther than 100 blocks from the
+    # current head on the target chain. Historical replay is the documented
+    # use case (Stage-2 miner validation), but unbounded rewinds destroy
+    # the live fork state every other simulation depends on. Read the head
+    # from the simulator's web3 instance so we don't double-query upstream.
+    if body.fork_block is not None and _simulator is not None:
+        try:
+            target_chain_id = body.chain_id or 0
+            target_sim = None
+            sims = getattr(_simulator, "simulators", None)
+            if sims and target_chain_id:
+                target_sim = sims.get(target_chain_id)
+            if target_sim is None and sims:
+                # Fall back to default chain if specific not set yet.
+                default_id = getattr(_simulator, "default_chain_id", None)
+                if default_id is not None:
+                    target_sim = sims.get(default_id)
+            if target_sim is None and not sims:
+                target_sim = _simulator  # plain AnvilSimulator
+            if target_sim is not None and hasattr(target_sim, "w3"):
+                head = int(target_sim.w3.eth.block_number)
+                if abs(int(body.fork_block) - head) > 100:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"fork_block {body.fork_block} is more than 100 "
+                            f"blocks from current head {head}; rewinds that "
+                            "deep would destroy live fork state."
+                        ),
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            # If we can't read the head we don't block the request — the
+            # admin gate + rate limit are still in front. Logging would be
+            # noisy under benign RPC blips.
+            pass
+
     import logging
     from minotaur_subnet.shared.types import ExecutionPlan
     from minotaur_subnet.shared.builders import build_intent_state, parse_interactions
