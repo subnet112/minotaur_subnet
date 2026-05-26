@@ -1,3 +1,22 @@
+# IMPORTANT — manual setup required:
+#
+# This workflow is gated by GitHub Environment `production`. That
+# environment must be created in the repository UI by an admin with
+# the following protection rules:
+#
+#   Settings → Environments → New environment → "production"
+#     Required reviewers: [at least 2 maintainer handles]
+#     Wait timer: 0 (the soak-time gate is enforced in-job below)
+#     Deployment branches: Protected branches only (main)
+#
+# Without those reviewers configured, ANY collaborator with write
+# access can promote :stable unattended — which defeats the point of
+# this gate. The workflow itself cannot enforce the reviewer list;
+# it only opts into the environment and the UI enforces the policy.
+#
+# Verify with: gh api repos/:owner/:repo/environments/production
+# and check `protection_rules[*].type == "required_reviewers"`.
+
 name: Promote SHA to :stable
 
 # Manually triggered workflow to re-tag an existing GHCR image as :stable.
@@ -7,11 +26,17 @@ name: Promote SHA to :stable
 #
 # Procedure:
 #   1. New commit lands on main → docker-publish.yml builds + pushes
-#      :latest + :sha-<short> (both immutable per-commit) to GHCR.
+#      :latest + :sha-<short> (both immutable per-commit) to GHCR,
+#      generates an SBOM, and cosign-signs the manifest with keyless
+#      OIDC. (Trivy CVE gate + soak-window enforcement deferred to a
+#      follow-up PR; both require operator-side prep — see header
+#      comment in docker-publish.yml.)
 #   2. The new image runs on our own prod for a soak period (suggested:
 #      at least one full champion-consensus cycle + one epoch boundary).
-#   3. When happy, run this workflow with the short SHA as input. It
-#      pulls :sha-<input>, re-tags as :stable, pushes back to GHCR.
+#   3. When happy, run this workflow with the short SHA as input. The
+#      job verifies the source image's cosign sig against this repo's
+#      OIDC identity, re-tags as :stable, pushes back to GHCR, and
+#      re-signs the :stable manifest.
 #   4. Validators with Watchtower auto-update pull on their next poll.
 #      Validators on manual updates `docker compose pull && up -d` when
 #      we announce the promotion.
@@ -33,6 +58,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+      # id-token: write is REQUIRED for cosign keyless signing of the
+      # re-tagged :stable manifest at the end of the job.
+      id-token: write
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -48,7 +76,30 @@ jobs:
           echo "Promoting $SRC → :stable"
           docker manifest inspect "$SRC" > /dev/null
 
+      # TODO(sec): pin to a release SHA from
+      # https://github.com/sigstore/cosign-installer/releases
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      # Verify the source image was cosign-signed by THIS repo's CI.
+      # Without this gate, an attacker with temporary GHCR write access
+      # could push a malicious manifest under sha-<x> and trick a
+      # promotion. The certificate-identity-regexp pins the signer to
+      # a workflow in this repo, and the issuer pins to GHA's OIDC.
+      - name: Verify source image signature
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          SHORT_SHA="${{ inputs.sha }}"
+          SRC="${REGISTRY}/${IMAGE_NAME}:sha-${SHORT_SHA}"
+          cosign verify "$SRC" \
+            --certificate-identity-regexp '^https://github.com/subnet112/minotaur_subnet/' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+
       - name: Re-tag and push :stable (preserves multi-arch manifest)
+        id: retag
         run: |
           SHORT_SHA="${{ inputs.sha }}"
           SRC="${REGISTRY}/${IMAGE_NAME}:sha-${SHORT_SHA}"
@@ -59,12 +110,26 @@ jobs:
           docker buildx imagetools create \
             --tag "$DST" \
             "$SRC"
-          echo "Promoted $SRC → $DST"
+          # Capture the resulting digest so the cosign sign step below
+          # signs the exact manifest we just pushed (not whatever
+          # :stable might resolve to seconds later under a race).
+          DIGEST=$(docker buildx imagetools inspect "$DST" --format '{{ .Manifest.Digest }}')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Promoted $SRC → $DST (${DIGEST})"
+
+      - name: Sign :stable manifest with cosign keyless
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.retag.outputs.digest }}
 
       - name: Summary
         run: |
           {
             echo "## :stable now points at \`sha-${{ inputs.sha }}\`"
+            echo ""
+            echo "Digest: \`${{ steps.retag.outputs.digest }}\`"
             echo ""
             echo "Validators with Watchtower auto-update will pull the new image on their next poll (default 1h cadence)."
             echo ""
@@ -73,5 +138,12 @@ jobs:
             echo "cd platform/validator"
             echo "docker compose pull validator api"
             echo "docker compose up -d --force-recreate validator api"
+            echo '```'
+            echo ""
+            echo "Operators can verify the image with:"
+            echo '```bash'
+            echo "cosign verify ghcr.io/subnet112/minotaur-validator:stable \\"
+            echo "  --certificate-identity-regexp '^https://github.com/subnet112/minotaur_subnet/' \\"
+            echo "  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'"
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
