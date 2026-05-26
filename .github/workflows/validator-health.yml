@@ -82,7 +82,12 @@ jobs:
           SUBTENSOR_NETWORK: "finney"
           STALE_THRESHOLD_SECONDS: ${{ github.event.inputs.stale_threshold_seconds || '3600' }}
           LOW_TRUST_THRESHOLD: ${{ github.event.inputs.low_trust_threshold || '0.5' }}
-          PROBE_TIMEOUT_SECONDS: "5"
+          # 20s gives cross-continent probes (e.g. eu-west AWS daemons
+          # behind ELBs) enough time + slack for one auto-retry inside
+          # the script. The original 5s saw only 1/5 probes succeed from
+          # us-east GitHub runners even though local probes from prod
+          # hit all of them in ~200ms.
+          PROBE_TIMEOUT_SECONDS: "20"
           # Each entry: name|chain_id|rpc_url|registry_addr. Add new chains
           # here as more registries deploy — the script unions them. Public
           # RPC endpoints only; no secrets required.
