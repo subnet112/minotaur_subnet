@@ -132,12 +132,28 @@ There are three ways to run a validator:
 
 ## Requirements
 
-- **Python 3.12** with project dependencies installed
-- **Node.js 20.x** for the JS scoring engine
-- **Foundry** (anvil, forge, cast) for simulation and contract interaction
-- **Bittensor wallet** with a registered hotkey on subnet 112
-- **Ethereum RPC URL** (Alchemy or Infura) for Anvil mainnet fork
-- **EVM private key** for EIP-712 consensus signing
-- Sufficient **TAO stake** to participate in leader election
+For the **canonical Docker stack** (the path third-party operators take):
 
-See [Quickstart](./quickstart.md) for step-by-step setup instructions.
+- **8 vCPU / 16-32 GB RAM / 200 GB SSD** (NVMe strongly preferred)
+- **Public IPv4 with a static address** — your axon URL is published on
+  the metagraph and must stay reachable for peer cross-attestation
+- **Linux** (Ubuntu 22.04+ tested; Amazon Linux works)
+- **Docker 24+ and Docker Compose v2**
+- **Foundry** (`cast`) — used to generate your EVM signing key + read
+  on-chain state
+- **Bittensor CLI** (`btcli`) — used to register your hotkey on
+  subnet 112
+- **Bittensor wallet** with a registered hotkey on subnet 112
+- **Archive RPC URLs** (Alchemy / Infura / QuickNode) for Ethereum
+  mainnet + Base mainnet
+- **EVM private key** for EIP-712 consensus signing — holds no funds
+
+The Python code, Node.js scoring engine, and Anvil binaries all run
+inside the Docker image — you do not need them installed on the host.
+
+For the standalone Python path (advanced, no Docker), you additionally
+need Python 3.12, Node.js 20.x, and Anvil installed natively. See the
+"Running without Docker" section in the
+[quickstart](./quickstart.md#running-without-docker-advanced).
+
+See [Quickstart](./quickstart.md) for the canonical step-by-step setup.
