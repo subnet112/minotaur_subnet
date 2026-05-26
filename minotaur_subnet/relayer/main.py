@@ -30,6 +30,7 @@ from minotaur_subnet.consensus.leader_wrapper import (
     recover_wrapper_signer,
 )
 from minotaur_subnet.consensus.protocol_config import ProtocolConfig
+from minotaur_subnet.consensus.score_threshold_cache import score_threshold_for
 from minotaur_subnet.consensus.signatures import hash_plan, verify_plan_approval
 from minotaur_subnet.relayer.chain_config import get_supported_chains
 from minotaur_subnet.relayer.evm_relayer import EvmRelayer
@@ -368,6 +369,15 @@ class RelayerService:
             or ""
         )
 
+        # Validators sign with score_bps = the App's on-chain scoreThreshold
+        # (see ConsensusManager.sign_approval + score_threshold_cache), NOT
+        # int(score*10000). The on-chain verifier reconstructs the digest
+        # the same way. We have to mirror that here; otherwise every signature
+        # in the bundle fails recovery and submit-plan rejects orders that
+        # already cleared consensus. Falls back to the 5000-bps floor when the
+        # contract is unreachable, which still matches what the signers used.
+        threshold_bps = score_threshold_for(contract_for_domain, chain_id)
+
         # Verify each signature: recover signer + check membership.
         # Tracks unique signers (one approval per validator counts once).
         verified_signers: set[str] = set()
@@ -391,6 +401,7 @@ class RelayerService:
                 score=ap.score,
                 chain_id=chain_id,
                 contract_address=contract_for_domain or ("0x" + "00" * 20),
+                score_bps=threshold_bps,
             )
             if not ok:
                 return web.json_response(
