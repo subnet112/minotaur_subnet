@@ -54,6 +54,131 @@ import os
 logger = logging.getLogger("minotaur_subnet.validator")
 
 
+def _auto_serve_axon_on_metagraph(
+    *,
+    subtensor: Any,
+    bt_module: Any,
+    wallet: Any,
+    netuid: int,
+    my_hotkey: str,
+    axon_url: str,
+) -> None:
+    """Publish ``axon_url`` on the subnet metagraph via ``serve_axon``.
+
+    Idempotent + rate-limit aware:
+
+    * Resolves the hostname to a numeric IP and checks the metagraph
+      entry for ``my_hotkey``. If the existing entry already matches
+      ``ip:port``, skips the on-chain call entirely. Otherwise the chain
+      rate-limits ``serve_axon`` per hotkey (~50 blocks / 10 min on
+      finney) and every restart inside that window throws ``Custom
+      error: 12 (ServingRateLimitExceeded)`` even when the desired entry
+      is already in place.
+
+    * If ``serve_axon`` is invoked and the chain replies with the rate-
+      limit error anyway (e.g. another process re-served within the
+      window), logs INFO and returns — the previous entry is still in
+      effect, no action is needed.
+
+    * Any other failure is caught and downgraded to a warning so startup
+      proceeds.
+
+    Designed as a module-level helper so it can be unit-tested with mock
+    ``subtensor`` / ``bt_module`` objects without spinning up the full
+    validator.
+    """
+    from urllib.parse import urlparse
+    import socket
+
+    parsed = urlparse(axon_url)
+    axon_ip = parsed.hostname or ""
+    axon_port = parsed.port or 9100
+    if not axon_ip:
+        logger.warning(
+            "VALIDATOR_AXON_URL %r has no hostname; skipping serve_axon",
+            axon_url,
+        )
+        return
+
+    # Resolve DNS once so the idempotency comparison against the chain's
+    # numeric ip storage actually matches.
+    try:
+        resolved_ip = socket.gethostbyname(axon_ip)
+    except OSError as exc:
+        logger.warning(
+            "Could not resolve VALIDATOR_AXON_URL host %r: %s — "
+            "falling through to serve_axon and letting the chain decide",
+            axon_ip, exc,
+        )
+        resolved_ip = axon_ip
+
+    # Idempotency pre-check: read the metagraph and skip serve_axon
+    # entirely when the published entry already matches.
+    try:
+        metagraph = subtensor.metagraph(netuid)
+        hotkeys = list(getattr(metagraph, "hotkeys", []) or [])
+        axons = list(getattr(metagraph, "axons", []) or [])
+        for uid, hk in enumerate(hotkeys):
+            if hk != my_hotkey:
+                continue
+            if uid >= len(axons):
+                break
+            existing = axons[uid]
+            existing_ip = str(getattr(existing, "ip", "") or "")
+            existing_port = int(getattr(existing, "port", 0) or 0)
+            if existing_ip == resolved_ip and existing_port == axon_port:
+                logger.info(
+                    "Axon entry on metagraph already matches "
+                    "VALIDATOR_AXON_URL (ip=%s port=%d) — skipping "
+                    "serve_axon to avoid the on-chain rate limit",
+                    resolved_ip, axon_port,
+                )
+                return
+            logger.info(
+                "Metagraph axon for this hotkey is %s:%d, want %s:%d — "
+                "calling serve_axon to update",
+                existing_ip, existing_port, resolved_ip, axon_port,
+            )
+            break
+        else:
+            logger.info(
+                "Hotkey not yet on metagraph for netuid=%d — calling "
+                "serve_axon for the first time", netuid,
+            )
+    except Exception as exc:
+        logger.debug(
+            "Metagraph idempotency check failed (%s); falling through "
+            "to serve_axon", exc,
+        )
+
+    try:
+        served = subtensor.serve_axon(
+            netuid=netuid,
+            axon=bt_module.Axon(wallet=wallet, ip=axon_ip, port=axon_port),
+        )
+        logger.info(
+            "Auto-served axon on metagraph (netuid=%d ip=%s port=%d ok=%s)",
+            netuid, axon_ip, axon_port, served,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "Custom error: 12" in msg or "ServingRateLimitExceeded" in msg:
+            logger.info(
+                "serve_axon rate-limited by chain (ServingRateLimitExceeded "
+                "/ Custom error: 12). The previous axon entry is still in "
+                "effect — no action needed. The next call will succeed "
+                "after the rate-limit window (~50 blocks on finney).",
+            )
+            return
+        logger.warning(
+            "Auto-serve axon failed (continuing startup): %s. "
+            "Other validators won't find you on the metagraph until a "
+            "successful serve_axon — re-check VALIDATOR_AXON_URL, "
+            "coldkey TAO balance, and subtensor reachability.",
+            exc,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                        APP INTENTS VALIDATOR
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,37 +398,14 @@ class AppIntentsValidator:
                     # band can leave it unset and serve manually.
                     axon_url = os.environ.get("VALIDATOR_AXON_URL", "").strip()
                     if axon_url:
-                        try:
-                            from urllib.parse import urlparse
-                            parsed = urlparse(axon_url)
-                            axon_ip = parsed.hostname or ""
-                            axon_port = parsed.port or 9100
-                            if axon_ip:
-                                served = subtensor.serve_axon(
-                                    netuid=netuid,
-                                    axon=bt.Axon(
-                                        wallet=self._bt_wallet,
-                                        ip=axon_ip,
-                                        port=axon_port,
-                                    ),
-                                )
-                                logger.info(
-                                    "Auto-served axon on metagraph (netuid=%d ip=%s port=%d ok=%s)",
-                                    netuid, axon_ip, axon_port, served,
-                                )
-                            else:
-                                logger.warning(
-                                    "VALIDATOR_AXON_URL %r has no hostname; skipping serve_axon",
-                                    axon_url,
-                                )
-                        except Exception as exc:
-                            logger.warning(
-                                "Auto-serve axon failed (continuing startup): %s. "
-                                "Other validators won't find you on the metagraph "
-                                "until a successful serve_axon — re-check VALIDATOR_AXON_URL, "
-                                "coldkey TAO balance, and subtensor reachability.",
-                                exc,
-                            )
+                        _auto_serve_axon_on_metagraph(
+                            subtensor=subtensor,
+                            bt_module=bt,
+                            wallet=self._bt_wallet,
+                            netuid=netuid,
+                            my_hotkey=resolved_hotkey,
+                            axon_url=axon_url,
+                        )
 
                 logger.info(
                     "Bittensor integration enabled (netuid=%d, hotkey=%s, wallet_loaded=%s)",
