@@ -233,6 +233,16 @@ COPY --chown=minotaur:minotaur platform/ /home/minotaur/app/platform/
 # non-root process can write store.json without a runtime chown.
 RUN mkdir -p /data && chown -R minotaur:minotaur /data
 
+# Bake the git SHA the image was built from into an env var so the
+# api + validator daemon can echo it back in /health. Operators (and us
+# in incident response) can then see which version is running in each
+# container without docker inspect. Defaults to "dev" for local builds
+# that don't pass --build-arg; CI sets it to ${{ github.sha }}. Placed
+# AFTER all heavy COPYs so a value change only invalidates this thin
+# layer + the user/workdir below, not the venv / contract / app layers.
+ARG MINOTAUR_IMAGE_SHA=dev
+ENV MINOTAUR_IMAGE_SHA=${MINOTAUR_IMAGE_SHA}
+
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONPATH=/home/minotaur/app
 

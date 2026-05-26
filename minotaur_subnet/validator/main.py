@@ -797,9 +797,15 @@ class AppIntentsValidator:
     async def _handle_health(self, request: web.Request) -> web.Response:
         loaded = self.engine.list_loaded_intents()
         ob_stats = self.orderbook.stats()
+        # MINOTAUR_IMAGE_SHA is baked at build time (docker/build-push-action
+        # build-args = ${{ github.sha }}). 7-char prefix matches GHCR's
+        # sha-XXXXXXX tag scheme so operators can pattern-match against
+        # :stable promotion history at a glance. "dev" for local builds.
+        image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
         return web.json_response({
             "status": "ok",
             "service": "app-intents-validator",
+            "image_sha": image_sha,
             "loaded_intents": len(loaded),
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
