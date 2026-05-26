@@ -10,9 +10,11 @@ consensus proposal handler. Handles:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, TYPE_CHECKING
 
 from minotaur_subnet.shared.types import (
@@ -32,6 +34,32 @@ if TYPE_CHECKING:
     from minotaur_subnet.store import AppIntentStore
 
 logger = logging.getLogger("minotaur_subnet.validator.scoring_engine")
+
+
+# ── Replay-protection cache for /consensus/proposal (audit H1) ──────────
+# (order_id, plan_hash) -> first_seen_monotonic. Captured proposals can
+# otherwise be replayed at the follower indefinitely; this short-circuits
+# expensive re-simulation when we've already processed the same payload.
+_SEEN_PROPOSALS: dict[tuple[str, str], float] = {}
+_SEEN_PROPOSALS_TTL = 600.0       # 10 minutes
+_SEEN_PROPOSALS_MAX = 10_000      # evict oldest entries above this cap
+_SEEN_PROPOSALS_LOCK = asyncio.Lock()
+
+
+def _evict_expired_locked(now: float) -> None:
+    """Drop entries older than TTL. Caller must hold the lock."""
+    if len(_SEEN_PROPOSALS) <= _SEEN_PROPOSALS_MAX:
+        # cheap path: only walk when the cache is over capacity
+        return
+    cutoff = now - _SEEN_PROPOSALS_TTL
+    stale = [k for k, ts in _SEEN_PROPOSALS.items() if ts < cutoff]
+    for k in stale:
+        _SEEN_PROPOSALS.pop(k, None)
+    # If still oversized, drop arbitrary entries (LRU-ish via dict order).
+    overflow = len(_SEEN_PROPOSALS) - _SEEN_PROPOSALS_MAX
+    if overflow > 0:
+        for k in list(_SEEN_PROPOSALS.keys())[:overflow]:
+            _SEEN_PROPOSALS.pop(k, None)
 
 
 class ScoringEngine:
@@ -77,6 +105,22 @@ class ScoringEngine:
                     "CONSENSUS_REQUIRE_SIGNED_PROPOSALS is disabled"
                 )
                 return True, ""
+
+        # Audit H1 (replay): require a fresh timestamp on every proposal so
+        # captured leader signatures cannot be replayed days later. The
+        # leader already includes ``time.time()`` in the proposal body
+        # (see ``consensus.peer_network``) — we just enforce it here. A
+        # small negative window allows for normal clock skew between hosts.
+        ts = body.get("timestamp")
+        if ts is None:
+            return False, "missing_timestamp"
+        try:
+            ts_f = float(ts)
+        except (TypeError, ValueError):
+            return False, "bad_timestamp"
+        age = time.time() - ts_f
+        if age > 60.0 or age < -10.0:
+            return False, f"stale_or_future_timestamp:{age:.1f}s"
 
         # Reconstruct the canonical message the proposer should have signed.
         # Strip the signature field so both sides hash the same content.
@@ -316,6 +360,30 @@ class ScoringEngine:
                 "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
                 "status": 400,
             }
+
+        # Audit H1 (replay): short-circuit if we've already validated this
+        # exact proposal. Re-simulation is the expensive step; we only need
+        # to do it once per (order_id, plan_hash). The cached entry holds a
+        # monotonic timestamp so eviction can age it out.
+        dedup_key = (order_id, plan_hash)
+        async with _SEEN_PROPOSALS_LOCK:
+            now_mono = time.monotonic()
+            seen_at = _SEEN_PROPOSALS.get(dedup_key)
+            if seen_at is not None and (now_mono - seen_at) < _SEEN_PROPOSALS_TTL:
+                logger.info(
+                    "Replay short-circuit for %s/%s (age=%.1fs)",
+                    order_id[:10], plan_hash[:10], now_mono - seen_at,
+                )
+                return {
+                    "approved": False,
+                    "reason": "duplicate_proposal",
+                    "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
+                    "status": 429,
+                }
+            # First-seen — record and continue. Eviction happens
+            # opportunistically when the cache grows over the cap.
+            _SEEN_PROPOSALS[dedup_key] = now_mono
+            _evict_expired_locked(now_mono)
 
         # Off-chain mirror of the on-chain AppRegistry gate. A compromised
         # leader could propose plans for unregistered apps; a follower that

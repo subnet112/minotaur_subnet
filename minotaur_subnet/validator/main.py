@@ -54,6 +54,44 @@ import os
 logger = logging.getLogger("minotaur_subnet.validator")
 
 
+# ── /consensus/proposal rate limiter (audit H1) ─────────────────────────
+# Per-IP token bucket. A flooded follower can stall the consensus loop and
+# starve the JS sandbox; we cap inbound proposal traffic before the body
+# is even parsed so a malicious/buggy leader cannot trivially saturate us.
+# Burst 30, refill 1/s — comfortably above real-traffic peak (~3/12s tick).
+_PROPOSAL_RATE: dict[str, tuple[float, float]] = {}  # ip -> (last_refill_ts, tokens)
+_PROPOSAL_RATE_LOCK = asyncio.Lock()
+_PROPOSAL_RATE_CAPACITY = 30        # burst capacity (proposals)
+_PROPOSAL_RATE_REFILL_PER_SEC = 1.0  # steady-state refill rate
+
+
+@web.middleware
+async def _proposal_rate_limit(request, handler):
+    if request.path == "/consensus/proposal":
+        ip = request.headers.get("X-Real-IP") or request.remote or "unknown"
+        async with _PROPOSAL_RATE_LOCK:
+            now = time.monotonic()
+            last_refill, tokens = _PROPOSAL_RATE.get(
+                ip, (now, float(_PROPOSAL_RATE_CAPACITY))
+            )
+            tokens = min(
+                float(_PROPOSAL_RATE_CAPACITY),
+                tokens + (now - last_refill) * _PROPOSAL_RATE_REFILL_PER_SEC,
+            )
+            if tokens < 1.0:
+                _PROPOSAL_RATE[ip] = (now, tokens)
+                logger.warning(
+                    "Rate-limited /consensus/proposal from %s (tokens=%.2f)",
+                    ip, tokens,
+                )
+                return web.json_response(
+                    {"error": "rate_limited", "ip": ip}, status=429,
+                )
+            tokens -= 1.0
+            _PROPOSAL_RATE[ip] = (now, tokens)
+    return await handler(request)
+
+
 def _auto_serve_axon_on_metagraph(
     *,
     subtensor: Any,
@@ -721,7 +759,14 @@ class AppIntentsValidator:
         /orders, /orders/submit, /apps/*/quote. Each had 0 cross-codebase
         callers; the api at port 8080 carries the equivalent live endpoints.
         """
-        app = web.Application()
+        # client_max_size=64 KiB caps inbound bodies (audit H1). Real
+        # consensus proposals are ~1-5 KB; aiohttp default of 1 MiB lets
+        # a leader flood us with megabytes per request before any handler
+        # logic runs.
+        app = web.Application(
+            middlewares=[_proposal_rate_limit],
+            client_max_size=64 * 1024,
+        )
         # Load-bearing
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/identity", self._handle_identity)
