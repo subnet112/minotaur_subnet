@@ -364,16 +364,46 @@ class ScoringEngine:
                     metadata=plan_data.get("metadata", {}),
                 )
 
-                # Follower re-simulation: use real Anvil if available
+                # Follower re-simulation: use real Anvil if available.
+                #
+                # SECURITY (C3): when the operator has opted into full
+                # re-simulation (FOLLOWER_PROPOSAL_RESIMULATE=1, the default
+                # and the production setting) we must NOT silently fall back
+                # to body["simulation"] when our local Anvil is unreachable.
+                # That fallback is leader-supplied data and a compromised
+                # leader can fabricate it. Reject with SIMULATOR_UNAVAILABLE
+                # so the quorum sees this signer drop out rather than rubber-
+                # stamp the leader's claim. The leader-sim path is only
+                # reachable when the operator explicitly disabled
+                # re-simulation by setting the env to 0.
                 if resimulate_proposals:
                     simulation = await self._simulate_plan(
                         plan, plan_data, params, deployment,
                         order_id, submitted_by, chain_id, intent_function,
                         deadline, perpetual, max_executions, cooldown,
                     )
+                    if simulation is None:
+                        logger.warning(
+                            "REFUSING TO SIGN: local Anvil unreachable for "
+                            "order %s (resimulate=1). Not falling back to "
+                            "leader-supplied simulation.", order_id,
+                        )
+                        return {
+                            "approved": False,
+                            "reason": (
+                                "Local Anvil simulator unreachable; refusing "
+                                "to sign on leader-supplied simulation data."
+                            ),
+                            "reason_code": RejectionCode.SIMULATOR_UNAVAILABLE.value,
+                            "status": 503,
+                        }
 
                 if simulation is None:
-                    # Use leader's simulation result if included in proposal
+                    # resimulate_proposals is False — operator explicitly
+                    # disabled local re-simulation (e.g. hardware can't keep
+                    # up). Fall back to leader's simulation result if
+                    # included, else a mock. The startup warning at line
+                    # 781-796 in main.py covers operators who hit this path.
                     leader_sim = body.get("simulation")
                     if leader_sim and isinstance(leader_sim, dict):
                         simulation = self._build_simulation_from_leader(leader_sim)
