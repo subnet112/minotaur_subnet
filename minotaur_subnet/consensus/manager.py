@@ -156,6 +156,7 @@ class ConsensusManager:
             quorum=self.quorum_required,
             domain_separator=order_domain,
             chain_id=chain_id if chain_id is not None else self.chain_id,
+            contract_address=contract_address,
         )
         proposal.add_approval(approval)
         self._pending[order_id] = proposal
@@ -220,16 +221,25 @@ class ConsensusManager:
         matching what verifyValidatorSignatures expects on-chain.
 
         If ``chain_id`` and ``contract_address`` are provided, a dynamic
-        domain separator is used (matching the target contract).
+        domain separator is used (matching the target contract) AND the App's
+        actual on-chain ``scoreThreshold()`` is read (and cached) so the digest
+        we sign matches the one the on-chain verifier reconstructs. Without
+        this lookup, Apps deployed with scoreThreshold > 5000 (the constructor
+        floor) silently fail on-chain quorum verification.
         """
         domain = self.domain_separator
+        threshold_bps = self.score_threshold_bps
         if chain_id is not None and contract_address:
             from .eip712 import build_domain_separator
+            from .score_threshold_cache import score_threshold_for
             domain = build_domain_separator(chain_id, contract_address)
+            threshold_bps = score_threshold_for(
+                contract_address, chain_id, fallback_bps=self.score_threshold_bps,
+            )
         signature = sign_plan_approval(
             self.private_key, order_id, plan_hash, score,
             domain_separator=domain,
-            score_bps=self.score_threshold_bps,
+            score_bps=threshold_bps,
         )
         return SignedApproval(
             validator_id=self.validator_id,
@@ -262,6 +272,18 @@ class ConsensusManager:
             proposal = self._pending[approval.order_id]
             # Use per-order domain if stored, otherwise fall back to default
             verify_domain = proposal.domain_separator or self.domain_separator
+            # Use the App's on-chain scoreThreshold so the digest we
+            # reconstruct matches the one the remote signer produced. Falls
+            # back to the legacy constant when chain_id+contract_address
+            # weren't supplied to propose().
+            verify_threshold_bps = self.score_threshold_bps
+            if proposal.chain_id and proposal.contract_address:
+                from .score_threshold_cache import score_threshold_for
+                verify_threshold_bps = score_threshold_for(
+                    proposal.contract_address,
+                    proposal.chain_id,
+                    fallback_bps=self.score_threshold_bps,
+                )
             if not verify_plan_approval(
                 approval.validator_id,
                 approval.signature,
@@ -269,7 +291,7 @@ class ConsensusManager:
                 approval.plan_hash,
                 approval.score,
                 domain_separator=verify_domain,
-                score_bps=self.score_threshold_bps,
+                score_bps=verify_threshold_bps,
             ):
                 logger.warning(
                     "Invalid signature from %s for order %s",
@@ -353,6 +375,10 @@ class _PendingProposal:
     created_at: float = field(default_factory=time.time)
     domain_separator: bytes | None = None  # Per-order domain for signature verification
     chain_id: int | None = None  # Used by the on-chain registry cross-check
+    # Needed to look up the App's on-chain scoreThreshold() so the verifier
+    # reconstructs the same digest the signer produced. Without this, Apps
+    # with non-default thresholds silently fail quorum verification.
+    contract_address: str | None = None
 
     def add_approval(self, approval: SignedApproval) -> None:
         self.approvals[approval.validator_id] = approval

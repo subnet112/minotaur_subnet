@@ -45,6 +45,11 @@ class RejectionCode(str, Enum):
     ON_CHAIN_SCORE_BELOW_THRESHOLD = "ON_CHAIN_SCORE_BELOW_THRESHOLD"
     PLAN_HASH_MISMATCH = "PLAN_HASH_MISMATCH"
     SIMULATION_FAILED = "SIMULATION_FAILED"
+    # Local Anvil unreachable/down/timed-out — distinct from SIMULATION_FAILED
+    # which means the plan was simulated but reverted. Followers refuse to sign
+    # when this fires because falling back to leader-supplied simulation data is
+    # an unverified-trust path.
+    SIMULATOR_UNAVAILABLE = "SIMULATOR_UNAVAILABLE"
     APP_NOT_REGISTERED = "APP_NOT_REGISTERED"
 
     # Semantic layer (champion consensus)
