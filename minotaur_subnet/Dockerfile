@@ -182,11 +182,23 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash minotaur
 # /root/.bittensor so the bittensor SDK's default $HOME/.bittensor lookup
 # resolves to whichever path the operator's compose actually binds. Plus
 # chmod /root traversable so uid 1000 can reach the legacy mount point
-# without dropping the read-only mount mode. (Wallet FILE perms still
-# need to be uid-1000-readable on the host — see
-# platform/validator/.env.example for the chown/chmod recipe.)
+# without dropping the read-only mount mode.
+#
+# Additionally chown the SYMLINK TARGET (/root/.bittensor) to minotaur and
+# pre-create an empty wallets/ subdir. Why: the bittensor SDK runs
+# `Path("$HOME/.bittensor/wallets").mkdir(parents=True, exist_ok=True)` at
+# IMPORT TIME (bittensor/core/settings.py). On services that don't mount a
+# wallet (the api block in some legacy composes only mounts on the
+# validator block), `exist_ok=True` still fails if Python has to create
+# the leaf and uid 1000 lacks write on /root/.bittensor — which it does
+# when the dir is root-owned 0755. Pre-creating wallets/ owned by minotaur
+# means `mkdir(exist_ok=True)` is a no-op even with no host mount, so a
+# plain `import bittensor` in the api process can't crash the metagraph
+# sync. Wallet FILE perms on the host side still need to be
+# uid-1000-readable — see platform/validator/.env.example.
 RUN chmod 0755 /root \
-    && mkdir -p /root/.bittensor && chmod 0755 /root/.bittensor \
+    && mkdir -p /root/.bittensor/wallets \
+    && chown -R minotaur:minotaur /root/.bittensor \
     && rm -rf /home/minotaur/.bittensor \
     && ln -s /root/.bittensor /home/minotaur/.bittensor \
     && chown -h minotaur:minotaur /home/minotaur/.bittensor
