@@ -628,12 +628,39 @@ def main() -> int:
     with open("summary.md", "w") as f:
         f.write(summary_md)
 
+    # ``observed_uids`` carries the per-uid health state for validators we
+    # actually probed this run. The workflow uses it to safely auto-close
+    # alert issues — closing only on POSITIVE evidence the condition has
+    # cleared, never on the absence of a finding (which could mean the
+    # probe just failed and we don't know).
+    observed_uids = {
+        s.uid: {
+            "evm": s.evm_address,
+            "display_name": s.display_name,
+            "last_update_seconds_ago": s.last_update_seconds_ago,
+            "trust": s.trust,
+            "stale_weights": (
+                s.last_update_seconds_ago is not None
+                and s.last_update_seconds_ago > STALE_THRESHOLD_SECONDS
+            ),
+            "low_trust": (
+                s.trust is not None and s.trust < LOW_TRUST_THRESHOLD
+            ),
+        }
+        for s in statuses if s.uid is not None
+    }
+
     with open("findings.json", "w") as f:
         json.dump({
             "findings": findings,
+            "observed_uids": observed_uids,
             "generated_at": int(time.time()),
             "netuid": NETUID,
             "current_block": current_block,
+            "thresholds": {
+                "stale_weights_seconds": STALE_THRESHOLD_SECONDS,
+                "low_trust": LOW_TRUST_THRESHOLD,
+            },
         }, f, indent=2)
 
     print(
