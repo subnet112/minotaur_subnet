@@ -8,12 +8,15 @@
 # Bumping any pin requires a rebuild + `make test-unit` + a deployment
 # soak on staging before promoting to :stable.
 #
-# TODO(sec): generate requirements.lock with cryptographic hashes via
-#     pip-compile --generate-hashes --output-file requirements.lock requirements.txt
-# (needs `pip install pip-tools` in a clean venv). The Dockerfile already
-# prefers requirements.lock when present and falls back to this file with
-# --no-deps. The hash-locked variant closes the residual supply-chain
-# window where a compromised PyPI mirror could swap a wheel.
+# Cryptographic hash-locked install via requirements.lock — generated
+# (and refreshed when a pin in this file changes) with:
+#     pip-compile --generate-hashes --allow-unsafe \
+#         --output-file minotaur_subnet/requirements.lock \
+#         minotaur_subnet/requirements.txt
+# The Dockerfile prefers requirements.lock when present and falls back to
+# this file with --no-deps otherwise. The hash-locked variant closes the
+# residual supply-chain window where a compromised PyPI mirror could swap
+# a wheel. --allow-unsafe is required so setuptools/wheel are pinned too.
 
 # ── Bittensor subnet integration ─────────────────────────────────────
 # Used by the validator daemon (weight emission, metagraph reads) and
@@ -33,7 +36,7 @@ requests==2.32.5
 # ── API surface ──────────────────────────────────────────────────────
 fastapi==0.135.1
 uvicorn==0.41.0
-pydantic==2.9.2
+pydantic==2.11.10  # bumped 2026-05-26 (was 2.9.2) — mcp==1.26.0 requires pydantic>=2.11.0; bittensor accepts <3,>=2.3 so this is the lowest version satisfying both
 
 # ── EVM / chain ──────────────────────────────────────────────────────
 web3==7.14.1

@@ -25,12 +25,14 @@
 #      A missing OZ submodule used to ship a half-built image.
 
 # ─── Stage 1: builder ─────────────────────────────────────────────────
-# Base pinned by digest. To refresh: `docker pull python:3.12-slim-bookworm
-# && docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim-bookworm`
-# and update the digest below + the matching one in the final stage.
-# TODO(sec): pin sha256 — replace the tag-only ref with @sha256:<digest>
-# once the dev has run the pull. Both stages MUST use the same digest.
-FROM python:3.12-slim-bookworm AS builder
+# Base pinned by digest (audit F-20). The :slim-bookworm tag is mutable;
+# pinning by sha256 stops a silent upstream retag from changing the image
+# we ship. Refresh procedure (must update BOTH stage 1 and stage 2 below
+# together — they must use the same digest):
+#   docker buildx imagetools inspect python:3.12-slim-bookworm \
+#     --format '{{ json .Manifest.Digest }}'
+# Captured 2026-05-26 against python:3.12-slim-bookworm.
+FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -57,27 +59,33 @@ RUN apt-get update \
 # Foundry: verify the installer script BEFORE piping to bash, then pin
 # foundryup to a specific release tag rather than tracking nightly.
 #
-# TODO(sec): replace KNOWN_SHA256 below with the actual sha256 of the
-# foundryup installer at a pinned git ref. Recommended procedure:
-#   1. Pick a commit SHA from
+# Pinned 2026-05-26:
+#   - foundryup/install at foundry-rs/foundry commit efcde6c99eb (2025-11-07)
+#   - sha256 of that file: e103bb7839e0c8c65263c7971d0b6bf94ffbe2e81dff89c6b3ecb6ce2d76b71c
+#   - foundryup release: v1.7.1 (2026-05-08)
+# Refresh procedure (security-relevant — read carefully before bumping):
+#   1. Pick a NEW commit hash from
 #      https://github.com/foundry-rs/foundry/commits/master/foundryup/install
-#   2. Replace `master` in the URL below with that SHA.
-#   3. Run `curl -fsSL <pinned-url> | sha256sum` and put the result here.
+#      that you've manually reviewed.
+#   2. Replace FOUNDRYUP_INSTALL_COMMIT below with it.
+#   3. curl the file from the pinned commit and sha256sum it; put that
+#      hash in FOUNDRYUP_INSTALL_SHA256.
 #   4. Pick the matching forge/cast release tag from
-#      https://github.com/foundry-rs/foundry/releases and pass it to
-#      `foundryup -v <tag>` below.
-ARG FOUNDRYUP_INSTALL_SHA256=TODO_PIN_SHA256
-ARG FOUNDRY_VERSION=stable
-RUN curl -fsSL https://raw.githubusercontent.com/foundry-rs/foundry/master/foundryup/install \
+#      https://github.com/foundry-rs/foundry/releases and update
+#      FOUNDRY_VERSION.
+ARG FOUNDRYUP_INSTALL_COMMIT=efcde6c99eb23b3aa2fec3188c1808fb6273bbcb
+ARG FOUNDRYUP_INSTALL_SHA256=e103bb7839e0c8c65263c7971d0b6bf94ffbe2e81dff89c6b3ecb6ce2d76b71c
+ARG FOUNDRY_VERSION=v1.7.1
+RUN curl -fsSL "https://raw.githubusercontent.com/foundry-rs/foundry/${FOUNDRYUP_INSTALL_COMMIT}/foundryup/install" \
         -o /tmp/foundryup-install \
-    && if [ "${FOUNDRYUP_INSTALL_SHA256}" != "TODO_PIN_SHA256" ]; then \
-         echo "${FOUNDRYUP_INSTALL_SHA256}  /tmp/foundryup-install" | sha256sum -c -; \
-       else \
-         echo "WARN: foundryup-install sha256 not pinned — see TODO(sec) in Dockerfile" >&2; \
-       fi \
+    && echo "${FOUNDRYUP_INSTALL_SHA256}  /tmp/foundryup-install" | sha256sum -c - \
     && bash /tmp/foundryup-install \
     && rm /tmp/foundryup-install \
-    && /root/.foundry/bin/foundryup -v "${FOUNDRY_VERSION}"
+    && /root/.foundry/bin/foundryup -i "${FOUNDRY_VERSION}"
+# Note: this foundryup release uses `-i / --install <version>` (the old
+# `-v <version>` flag was repurposed to "print foundryup's own version
+# and exit" — see foundry-rs/foundry@efcde6c). If you bump the pinned
+# install commit above, re-verify the CLI flags haven't shifted again.
 
 ENV PATH="/root/.foundry/bin:${PATH}"
 
@@ -85,7 +93,10 @@ ENV PATH="/root/.foundry/bin:${PATH}"
 # final stage without dragging the system site-packages along.
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
-RUN pip install --upgrade pip==24.2 setuptools==75.1.0 wheel==0.44.0
+RUN pip install --upgrade pip==24.2
+# Note: setuptools + wheel come from requirements.lock (pinned by hash via
+# --allow-unsafe). Bootstrap-installing them here would just be downgraded
+# by the lock pass below.
 
 WORKDIR /build
 
@@ -107,12 +118,20 @@ RUN if [ -f /build/requirements.lock ]; then \
 # half-built image. (audit F-03)
 COPY contracts/ /build/contracts/
 RUN cd /build/contracts \
-    && forge install --no-commit \
     && forge build --sizes
+# Note: `forge install` is intentionally skipped — it shells out to
+# `git submodule update`, but the build context excludes .git (see
+# .dockerignore). The contracts/lib/ tree is already vendored at
+# image-build time (forge-std, openzeppelin-contracts, v3-core,
+# v3-periphery). `forge build` is the load-bearing check: it fails
+# loudly if any import resolves to a missing path. (audit F-03's
+# intent — "forge install must succeed" — is preserved at the
+# different layer of `forge build`.)
 
 # ─── Stage 2: final runtime ───────────────────────────────────────────
-# Same digest-pinned base as the builder. TODO(sec): keep the two in sync.
-FROM python:3.12-slim-bookworm AS final
+# Same digest-pinned base as the builder. Keep the two in sync — refresh
+# procedure documented above the builder FROM.
+FROM python:3.12-slim-bookworm@sha256:93ab4b7fa528b25124c97bcc755415e60eb671a86b4dbe0328df2fe2d1c1193d AS final
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -166,7 +185,9 @@ COPY --from=builder --chown=minotaur:minotaur /build/contracts/out /home/minotau
 COPY --from=builder --chown=minotaur:minotaur /build/contracts/cache /home/minotaur/app/contracts/cache
 COPY --chown=minotaur:minotaur contracts/src /home/minotaur/app/contracts/src
 COPY --chown=minotaur:minotaur contracts/foundry.toml /home/minotaur/app/contracts/foundry.toml
-COPY --chown=minotaur:minotaur contracts/remappings.txt /home/minotaur/app/contracts/remappings.txt
+# Note: no separate remappings.txt — remappings are inlined in
+# contracts/foundry.toml's [profile.default] table (verified via
+# `forge remappings`).
 
 # Application code. .dockerignore at repo root prunes tests/, docs/,
 # .git/, contracts/{test,script,broadcast}, etc. from the build
