@@ -717,21 +717,30 @@ async def attach_signature(order_id: str, request: Request) -> dict:
     order fields, signs with MetaMask, and submits the signature here.
     The on-chain contract verifies the signature at executeIntent time.
 
-    M4 (2026-05-25 audit): previously accepted any user_signature from
-    any caller, allowing griefing (overwrite a real user's pending sig
-    with garbage; front-run their submission by attaching their sig
-    before they do). Now requires a SECOND signature — ``owner_signature``
-    — over the ``AttachSig`` action payload binding the user_signature
-    being attached. This proves the caller controls the order owner
-    address without changing the user_signature semantics consumed
-    on-chain at executeIntent time.
+    Auth: the EIP-712 ``user_signature`` itself proves caller identity —
+    the server ECDSA-recovers the signer from the sig + reconstructs the
+    IntentOrder typehash from this order's actual fields, then checks the
+    recovered address equals ``order.submitted_by``. That blocks every
+    attack the old EIP-191 owner-sig blocked:
 
-    Body shape: ``{"user_signature": "0x...", "owner_signature": "0x...", "deadline": int}``
+      - Garbage bytes don't recover to ``submitted_by`` → 403.
+      - A sig the user signed for a different order has a different
+        ``orderId``/``paramsHash`` in its typehash, so reconstruction
+        against THIS order's fields recovers a different (or no) signer.
+
+    Pre-2026-05-26 the audit added a separate EIP-191 ``owner_signature``
+    over an ``AttachSig`` action payload, because the server was skipping
+    EIP-712 verification server-side (the comment in ``submit_order``
+    explains why — order_id was minted after the sig). Pulling EIP-712
+    verification into this route closes the same gap with no second
+    wallet prompt. The ``owner_signature`` body field is now ignored when
+    present (kept accepted for one-version backward-compat with frontends
+    that haven't shipped the single-prompt change yet).
+
+    Body shape: ``{"user_signature": "0x..."}``
+    Legacy body fields (``owner_signature``, ``deadline``) are silently
+    accepted and ignored.
     """
-    from minotaur_subnet.consensus.order_owner_sig import (
-        ACTION_ATTACH_SIG, content_hash_of,
-    )
-
     ob = _require_orderbook()
     order = ob.get(order_id)
     if order is None:
@@ -742,12 +751,29 @@ async def attach_signature(order_id: str, request: Request) -> dict:
     if not sig:
         raise HTTPException(status_code=400, detail="user_signature required")
 
-    _enforce_order_owner_sig(
-        order, action=ACTION_ATTACH_SIG,
-        content_hash=content_hash_of(sig),
-        deadline=int(body.get("deadline") or 0),
-        signature=body.get("owner_signature", ""),
-    )
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+
+    # Skip mostly mirrors the legacy EIP-191 escape hatch — same env var,
+    # same one-off-incident semantics.
+    if os.environ.get("REQUIRE_ORDER_OWNER_SIG", "1").strip().lower() not in (
+        "0", "false", "no",
+    ):
+        from minotaur_subnet.api.routes._signature_verify import (
+            verify_user_order_signature,
+        )
+        if not verify_user_order_signature(order, sig):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "user_signature does not recover to order.submitted_by "
+                    "(or doesn't match this order's IntentOrder typehash)"
+                ),
+            )
 
     ob.update_order(order_id, user_signature=sig)
     if _app_store is not None:
