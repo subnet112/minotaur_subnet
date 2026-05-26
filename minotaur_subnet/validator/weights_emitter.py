@@ -37,7 +37,6 @@ class WeightsEmitter:
         version_key: int = 6,
         max_attempts: int = 10,
         block_time: float = 12.0,
-        metagraph_sync: Any = None,
     ) -> None:
         self.wallet = wallet
         self.subtensor = subtensor
@@ -45,7 +44,6 @@ class WeightsEmitter:
         self.version_key = version_key
         self.max_attempts = max_attempts
         self.block_time = block_time
-        self.metagraph_sync = metagraph_sync
 
     async def emit_async(self, weights_mapping: dict[str, float]) -> bool:
         """Submit weights to the chain asynchronously.
@@ -58,11 +56,6 @@ class WeightsEmitter:
         """
         if not weights_mapping:
             logger.info("No weights to emit (empty mapping)")
-            return False
-
-        # BT-8: Only the leader should emit weights
-        if self.metagraph_sync is not None and not self.metagraph_sync.is_leader:
-            logger.debug("Skipping weight emission — not leader")
             return False
 
         try:

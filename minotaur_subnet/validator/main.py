@@ -685,11 +685,26 @@ class AppIntentsValidator:
                 logger.error("Rescan error: %s", exc)
 
     async def _epoch_loop(self) -> None:
-        """Periodically emit weights for the current champion solver."""
+        """Periodically emit weights for the current champion solver.
+
+        Every validator on the subnet emits weights independently — that's
+        the whole point of Yuma's stake-weighted median. Gating this on
+        ``self._is_leader`` (the subnet-team order-consensus leader
+        election) confused two different things and silently broke
+        weight emission for every non-leader validator on subnet 112,
+        including registered third parties (Rizzo, General Tensor,
+        Kraken, TAO.com). Their dividends silently collapsed; for the
+        Bittensor network it looked like they'd stopped voting.
+
+        Cadence is rate-limited at the ``ChampionWeights.maybe_emit``
+        layer (default ``--epoch-seconds 1200`` = 20 min), so removing
+        the gate doesn't change emission frequency — it just opens
+        emission to all validators rather than the leader-only one.
+        """
         while True:
             await asyncio.sleep(5)
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
-            if epoch_weights and self._weights_emitter and self._is_leader:
+            if epoch_weights and self._weights_emitter:
                 try:
                     await self._weights_emitter.emit_async(epoch_weights)
                 except Exception as exc:
