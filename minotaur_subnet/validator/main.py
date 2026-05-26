@@ -371,6 +371,13 @@ class AppIntentsValidator:
         self._is_leader = True  # Default: standalone = always leader
         self._metagraph_task: asyncio.Task | None = None
         self._leader_monitor_task: asyncio.Task | None = None
+        # Last weight-emit attempt — surfaced in /health for self-diagnosis.
+        # Updated atomically inside _epoch_loop after every emit attempt
+        # (success OR failure). None until the first attempt completes;
+        # /health treats that as "never attempted". The error string is
+        # truncated to 300 chars before exposure — chain/substrate error
+        # messages don't typically carry secrets, but defense in depth.
+        self._last_emit_state: dict | None = None
 
         if subtensor_url:
             try:
@@ -705,9 +712,25 @@ class AppIntentsValidator:
             await asyncio.sleep(5)
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights and self._weights_emitter:
+                attempt_ts = time.time()
+                uids_attempted = len(epoch_weights)
                 try:
-                    await self._weights_emitter.emit_async(epoch_weights)
+                    success = await self._weights_emitter.emit_async(epoch_weights)
+                    self._last_emit_state = {
+                        "attempted_at": attempt_ts,
+                        "result": "ok" if success else "error",
+                        "error": None if success else "emit_async returned False (see daemon logs)",
+                        "uids_attempted": uids_attempted,
+                    }
                 except Exception as exc:
+                    # Truncate to 300 chars so a verbose substrate stack trace
+                    # doesn't make /health huge or risk leaking large blobs.
+                    self._last_emit_state = {
+                        "attempted_at": attempt_ts,
+                        "result": "error",
+                        "error": str(exc)[:300],
+                        "uids_attempted": uids_attempted,
+                    }
                     logger.error("Weight emission failed: %s", exc)
 
     async def _leader_monitor_loop(self) -> None:
@@ -802,6 +825,12 @@ class AppIntentsValidator:
         # sha-XXXXXXX tag scheme so operators can pattern-match against
         # :stable promotion history at a glance. "dev" for local builds.
         image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
+        # last_emit: surface the most recent set_weights attempt so the
+        # operator (and the subnet-team validator-health workflow) can tell
+        # whether emission is silently failing inside the daemon. None when
+        # we've never attempted (eg. uptime < epoch_seconds OR Bittensor not
+        # configured). Updated atomically in _epoch_loop. See
+        # self._last_emit_state initialization in __init__ for the schema.
         return web.json_response({
             "status": "ok",
             "service": "app-intents-validator",
@@ -809,6 +838,7 @@ class AppIntentsValidator:
             "loaded_intents": len(loaded),
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
+            "last_emit": self._last_emit_state,
             "orderbook": ob_stats,
         })
 
