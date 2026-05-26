@@ -1,10 +1,55 @@
-# App Intents stack - minimal dependencies (no bittensor)
-aiohttp>=3.9.0
-fastapi>=0.115.0
-uvicorn>=0.30.0
-pydantic>=2.0.0
-web3>=6.0.0
-eth-abi>=4.0.0
-eth-account>=0.10.0
-httpx>=0.27.0
-mcp>=1.0.0
+# Pinned runtime dependencies for the ghcr.io/subnet112/minotaur-validator
+# image (api + validator + miner processes).
+#
+# All versions are == (not >=) so rebuilds are reproducible and a silent
+# transitive upgrade can't break consensus compatibility between leader
+# and peers (signature canonicalization, EIP-712 encoding, etc).
+#
+# Bumping any pin requires a rebuild + `make test-unit` + a deployment
+# soak on staging before promoting to :stable.
+#
+# Cryptographic hash-locked install via requirements.lock — generated
+# (and refreshed when a pin in this file changes) with:
+#     pip-compile --generate-hashes --allow-unsafe \
+#         --output-file minotaur_subnet/requirements.lock \
+#         minotaur_subnet/requirements.txt
+# The Dockerfile prefers requirements.lock when present and falls back to
+# this file with --no-deps otherwise. The hash-locked variant closes the
+# residual supply-chain window where a compromised PyPI mirror could swap
+# a wheel. --allow-unsafe is required so setuptools/wheel are pinned too.
+
+# ── Bittensor subnet integration ─────────────────────────────────────
+# Used by the validator daemon (weight emission, metagraph reads) and
+# by the api process (hotkey/identity attestation). Previously installed
+# unpinned at Dockerfile build time — moved here so the version is
+# tracked under source control.
+bittensor==10.1.0
+bittensor-cli==9.18.1
+bittensor-wallet==4.0.1
+async-substrate-interface==1.6.3
+
+# ── HTTP / async core ────────────────────────────────────────────────
+aiohttp==3.13.3
+httpx==0.28.1
+requests==2.32.5
+
+# ── API surface ──────────────────────────────────────────────────────
+fastapi==0.135.1
+uvicorn==0.41.0
+pydantic==2.11.10  # bumped 2026-05-26 (was 2.9.2) — mcp==1.26.0 requires pydantic>=2.11.0; bittensor accepts <3,>=2.3 so this is the lowest version satisfying both
+
+# ── EVM / chain ──────────────────────────────────────────────────────
+web3==7.14.1
+eth-abi==5.2.0
+eth-account==0.13.7
+eth-utils==5.3.1
+eth-keys==0.7.0
+pynacl==1.6.2
+base58==2.1.1
+
+# ── Misc runtime ─────────────────────────────────────────────────────
+python-dotenv==1.2.2
+numpy==2.4.2
+
+# ── MCP (miner agent — exposes tools to the Claude CLI) ──────────────
+mcp==1.26.0
