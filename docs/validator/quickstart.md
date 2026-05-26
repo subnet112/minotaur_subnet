@@ -1,87 +1,177 @@
 # Validator Quickstart
 
-This guide walks you through setting up and running a Minotaur validator on Bittensor Subnet 112.
+Run a Minotaur validator on **Bittensor Subnet 112** and earn weight
+emissions from the subnet. You join as an **order-consensus signer** —
+re-simulating and re-scoring the locked leader's swap proposals on your
+own Anvil forks, and signing if you agree. No gas wallet is held on
+your node; the subnet team's singleton relayer pays for execution gas.
 
-## Hardware Requirements
+This page is the canonical onboarding flow. Follow it end-to-end the
+first time; once your stack is live, the day-2 operating sections at the
+bottom (auto-update, peer discovery, disk-bloat cron, troubleshooting
+links) are the parts you'll come back to.
 
-**Third-party validators run as order-consensus followers during the early-network operating period.** Leader election is currently locked to the subnet team's hotkey via a hardcoded `LOCKED_LEADER_HOTKEY` constant in `validator/metagraph_sync.py` (see PR #27 for the rationale: prevents a misconfigured or rogue high-stake peer from auto-winning the election and stalling consensus). Stake-based election is the documented fallback and is restored by clearing both `LOCKED_LEADER_HOTKEY` and `LOCKED_LEADER_EVM_ADDRESS` together. While the lock is active, your validator receives proposals from the leader, re-simulates them on your local Anvil forks, and signs approvals — it cannot itself become leader regardless of its stake.
+## 1. Hardware
 
-Because the lock spares you from leader-readiness, you don't need to keep cold Anvil starts on the critical path. The spec below is sized for follower work only and scales up if the team announces an unlock or multi-app expansion. Start at the baseline; scale up on the trigger events listed.
+One spec, sized so every validator can take leadership if the network
+unlocks election or fails over to stake-based selection:
 
-### Baseline (today, follower-only)
+- **8 vCPU / 16-32 GB RAM / 200 GB SSD** (NVMe strongly preferred)
+- **Public IPv4 with a static address** — your axon URL is published
+  on the metagraph and must stay reachable for cross-attestation
+- **Linux** (Ubuntu 22.04+ tested; Amazon Linux works)
+- **Docker 24+ and Docker Compose v2**
 
-Subnet 112 currently operates one App (DexAggregator) across two real chains (Ethereum mainnet, Base) plus BT EVM. User volume is light. The baseline spec handles follower work comfortably.
+> A smaller box (4 vCPU / 8 GB) can keep up with follower-only work
+> while the leader-election lock is in place, but you risk being
+> under-provisioned the moment a chain is added or the lock is cleared.
+> Provision at the full spec from the start unless you have a strong
+> reason to scale up later.
 
-| Spec | Value |
-|------|-------|
-| vCPU | 4 (modern x86_64) |
-| RAM | 8 GB |
-| Storage | 100 GB SSD/NVMe |
-| GPU | none |
-| Network out | ~100 GB/month |
-| Public IPv4 | yes (port 9100/tcp must be reachable by the current leader for proposal broadcast) |
+## 2. Register on Bittensor
 
-What runs on this box:
+You need a registered hotkey on subnet 112. If you do not already have
+one:
 
-- Validator daemon (`python -m minotaur_subnet.validator.main`) -- order-consensus signing + weight emission to the metagraph.
-- Anvil forks for each supported chain (currently Ethereum mainnet, Base, BT EVM). Used to independently re-simulate execution plans the leader proposes. Cold-starting an Anvil fork costs 30+ seconds, so they run warm.
-- JS scoring engine (Node.js subprocess inside the validator container) -- deterministic, on-demand.
-- Subtensor connection -- WebSocket to `wss://entrypoint-finney.opentensor.ai:443` or your own node.
+```bash
+# Install btcli
+pip install bittensor-cli
 
-The transaction submitter (relayer) is a singleton operated by the subnet team — third-party validators don't run it. Champion-consensus participation (the API service) is an optional add-on covered separately when ready.
+# Create wallet + hotkey (skip if you already have one)
+btcli wallet new --wallet-name <your_wallet> --hotkey <your_hotkey>
 
-Steady-state at this spec uses about 4-5 GB RAM and well under 1 vCPU. Re-simulation bursts (when the leader proposes a new order) peak around 6-7 GB RAM and 2-3 vCPU. 8 GB / 4 vCPU leaves a healthy margin.
+# Fund the coldkey with ~1 TAO for the registration burn
+# (transfer from an exchange or another wallet)
 
-### Growth path
-
-The baseline grows mostly along two axes: number of chains we support (each adds an Anvil fork) and concurrent user volume (each adds parallel scoring + simulation work). Scale up when one of these triggers fires.
-
-| Trigger event | Recommended spec |
-|---------------|------------------|
-| Baseline (today, follower-only) | **4 vCPU / 8 GB / 100 GB SSD** |
-| +1 chain added (e.g. Arbitrum or Optimism announcement) -- one extra Anvil fork per chain costs ~1.5-2 GB RAM | **4 vCPU / 12 GB / 150 GB SSD** |
-| 2+ new chains, or sustained user volume making JS scoring run continuously in parallel | **8 vCPU / 16 GB / 200 GB SSD** |
-| Multi-app phase, OR the team announces unlocking leader election and rotating leadership back to stake-based | **8 vCPU / 32 GB / 200 GB SSD** |
-
-Scaling is vertical -- no horizontal sharding needed at the validator level. You can typically resize an existing VPS in under five minutes with a reboot. Plan to upsize at the announcement of each new chain integration; the subnet roadmap publishes these ahead of activation. If you want to be ready to take leadership the moment the lock is cleared, run at the top tier from the start — but for the locked-leader phase it's not required.
-
-### Required maintenance cron
-
-Anvil's overlay filesystem grows fast even with tmpfs mounted at `/root` and `/tmp`. A production deployment in May 2026 measured **~40-50 GB per fork per day**; the rate has grown over time as the chain head moves further from the fork block and as user/simulation load increases. With three forks that's ~150 GB/day of bloat. Without a frequent recycle, a 100 GB volume fills in well under a day and the host OS hangs (status check: impaired) once the disk hits 100% — at which point SSH is dead and the only recovery is a force stop+start of the VM.
-
-Install this cron — **every 6 hours**, not daily:
-
-```
-0 */6 * * * root docker compose -f /opt/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /opt/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
+# Register on subnet 112
+btcli subnet register --netuid 112 \
+  --wallet-name <your_wallet> --hotkey <your_hotkey>
 ```
 
-(The path matches the compose file you write in Step 6. Adjust if you put it elsewhere.)
+Verify:
 
-At every-6h cadence, max accumulation between recycles is ~37 GB across three forks, which fits in a 100 GB volume with other services taking ~10-15 GB. If you skip a recycle (cron failure, host unreachable, manual stop without restart), the disk can fill in 12-15 hours from there — monitor `df -h /` and treat low disk as a paging event. If the rate grows further (more chains added, much higher load), drop the cadence to every 4 or 3 hours.
+```bash
+btcli s metagraph --netuid 112 | grep <your_hotkey_ss58>
+```
 
-Each recycle window drops in-flight Anvil state for ~60 seconds while the containers restart. During that window your follower cannot re-simulate proposals — the leader's order-consensus tick will see a missing signature from you and fall back to the remaining peers. If the rest of the active validator set is small enough that quorum needs your signature, stagger your cron a few minutes offset from peers to avoid simultaneous reorg pauses.
+During the early-network operating period, **leader election is locked
+to the subnet team's hotkey** via a hardcoded `LOCKED_LEADER_HOTKEY`
+constant (see PR #27). Your stake still drives your weight share but
+does not make you eligible for leadership while the lock is active —
+this is intentional. The lock is removed by clearing both
+`LOCKED_LEADER_HOTKEY` and `LOCKED_LEADER_EVM_ADDRESS` together; the
+team announces it ahead of time.
 
-**If you do hit a disk-full OS hang**: the SSH daemon is dead at that point, so `docker compose down`, cron tightening, or any in-VM cleanup won't help. The only recovery is a force stop+start at the hypervisor layer (on AWS: `aws ec2 stop-instances --force --instance-ids <id>`, wait for stopped, then `start-instances`). EBS-backed instances preserve all state across this; containers with `restart: unless-stopped` come back automatically. Once the host is up, immediately `docker compose rm -fsv` the anvil services to release their snapshot overlays — `docker system prune` alone won't reclaim them.
+## 3. Generate an EVM consensus key
 
-### Realistic hosting (baseline 4 vCPU / 8 GB)
+This is the key your validator uses to sign EIP-712 order-consensus
+approvals. **It holds no funds** — it is purely a signing identity.
+The subnet team's singleton relayer pays gas; your node never
+broadcasts a transaction.
 
-| Provider | Plan | Approx. monthly cost |
-|----------|------|----------------------|
-| Hetzner | CCX13 (4 vCPU dedicated / 16 GB / 80 GB NVMe) -- already at the next tier with headroom | EUR 25-30 |
-| OVH | VPS Comfort | EUR 18-25 |
-| DigitalOcean | Premium AMD 4 vCPU / 8 GB / 160 GB | USD 48 |
-| Vultr | Cloud Compute 4 vCPU / 8 GB | USD 40 |
-| AWS | c6i.xlarge (4 vCPU / 8 GB) + 100 GB gp3 | USD 130-160 |
+```bash
+# Install foundry's cast if you don't have it
+curl -L https://foundry.paradigm.xyz | bash && foundryup
 
-Most validators will run on a $25-50/month box at the baseline tier and resize up when chain expansions are announced.
+# Generate a fresh EVM key
+cast wallet new
+```
 
-## Third-Party APIs (upstream RPCs)
+Copy the **private key** (the `0x…` line) and the **address** (also
+`0x…`) into a password manager. You paste the private key into your
+`.env` in Step 8, and you send the address to the subnet team in
+Step 4.
 
-This is the step that catches most operators. Your validator runs three local Anvil instances that fork Ethereum mainnet, Base mainnet, and BT EVM. Every time a swap proposal arrives, your forks re-execute it locally to re-score and decide whether to sign — **archive reads against your upstream RPCs on every order**, plus a fresh fork every time the recycle cron triggers (every 6h on the default schedule).
+## 4. Get added to the on-chain ValidatorRegistry
 
-**Public RPC endpoints will not survive prod load.** Free-tier `eth.merkle.io`, `cloudflare-eth.com`, `mainnet.base.org`, etc. rate-limit at thresholds you'll hit within the first few simulations of a single order. When that happens your validator silently fails proposals, consensus drops to the leader's other peers, and you stop earning emissions.
+Send your validator EVM **address** (not the private key) to the
+subnet team. The supported channels are:
 
-### Required (archive endpoints)
+- Open an issue using the
+  [Request validator onboarding template](https://github.com/subnet112/minotaur_subnet/issues/new?template=onboard-validator.yml)
+- Or DM the team via the contact channel published in the project
+  README.
+
+The team will add your address to two on-chain registries:
+
+- **Base mainnet** `ValidatorRegistry`
+  at `0x88a08d1105393EACE9B6f5ff678DbE508B8639aC` (chain 8453)
+- **BT EVM** `ValidatorRegistry`
+  at `0x0B5fE44e90515571761D86C28c4855F325EDE098` (chain 964)
+
+Until your address is in both registries your signatures do not
+count toward quorum and your `/identity` self-attestation fails
+upstream verification. Once the team responds with tx hashes,
+confirm registration is live with:
+
+```bash
+# Verify on Base
+cast call 0x88a08d1105393EACE9B6f5ff678DbE508B8639aC \
+  "getValidators()(address[])" \
+  --rpc-url https://mainnet.base.org \
+  | tr ',' '\n' | grep -i <your_evm_address>
+
+# And on BT EVM
+cast call 0x0B5fE44e90515571761D86C28c4855F325EDE098 \
+  "getValidators()(address[])" \
+  --rpc-url https://lite.chain.opentensor.ai \
+  | tr ',' '\n' | grep -i <your_evm_address>
+```
+
+(Both commands also work as
+`cast call <addr> "isValidator(address)(bool)" <your_addr> --rpc-url <rpc>`
+if you prefer a boolean check.)
+
+The current authoritative addresses live in
+[`docs/operator/network-reference.md`](../operator/network-reference.md).
+If that page disagrees with what you see here, the network reference
+wins — re-check before opening the onboarding issue.
+
+## 5. Open firewall + decide your axon URL
+
+Open **TCP port 9100** inbound on your validator host. Other validators
+fetch `/identity` from your axon URL to verify your hotkey ↔
+EVM-address binding.
+
+```bash
+# Example for AWS EC2 security groups
+aws ec2 authorize-security-group-ingress \
+  --group-id <your-sg-id> \
+  --protocol tcp --port 9100 --cidr 0.0.0.0/0
+
+# Or on Ubuntu with ufw
+sudo ufw allow 9100/tcp comment "minotaur validator daemon"
+```
+
+Decide how third parties will reach you:
+
+- **Static IP**: `VALIDATOR_AXON_URL=http://203.0.113.7:9100`
+- **DNS**: `VALIDATOR_AXON_URL=http://validator.example.com:9100`
+
+You will fill this into `.env` in Step 8.
+
+> **Port 8080 (api service)** is also exposed by the canonical compose
+> for the champion-consensus loop's `/identity` mirror. Open it inbound
+> only if you intend to participate in champion-consensus signing once
+> the registry-consolidation work goes live; until then 9100 alone is
+> sufficient to be a useful order-consensus follower.
+
+## 6. Get upstream RPC keys (Alchemy / Infura / QuickNode)
+
+This is the step that catches most operators. Your validator runs
+three local Anvil instances that fork Ethereum mainnet, Base mainnet,
+and BT EVM. Every time a swap proposal arrives, your forks re-execute
+it locally to re-score and decide whether to sign — that means
+**archive reads against your upstream RPCs on every order**, plus a
+fresh fork every time the recycle cron triggers (every 6 hours by
+default, configurable).
+
+**Public RPC endpoints will not survive prod load.** Free-tier
+`eth.merkle.io`, `cloudflare-eth.com`, `mainnet.base.org`, etc.
+rate-limit at thresholds you hit within the first few simulations of
+a single order. When that happens your validator silently fails
+proposals, consensus drops to the leader plus the remaining peers,
+and you stop earning emissions.
 
 | Chain | Env var | Provider |
 |---|---|---|
@@ -89,398 +179,362 @@ This is the step that catches most operators. Your validator runs three local An
 | Base mainnet (chain 8453) | `BASE_UPSTREAM_RPC_URL` | Alchemy / Infura / QuickNode |
 | BT EVM (chain 964) | `BITTENSOR_EVM_UPSTREAM_RPC_URL` | Public endpoint OK at single-validator load |
 
-### How to provision (Alchemy example)
+**Provision (Alchemy example):**
 
-1. Sign up at https://www.alchemy.com. **Growth plan (~$49/mo)** handles a single validator comfortably with headroom for swap-volume bursts; the **free Sandbox plan (30M compute units / month)** works for the early-network phase but may rate-limit during heavy trading periods.
-2. Create one app per chain:
-   - Ethereum → Mainnet
-   - Base → Base Mainnet
-3. Copy the HTTPS endpoint URL, formatted like `https://eth-mainnet.g.alchemy.com/v2/<your_long_key>`.
-4. **Enable Archive Node access** on each app. Alchemy Growth+ enables this by default; on Infura you may need to opt in. Your Anvil forks issue `eth_getStorageAt` / `eth_getProof` calls at historical blocks during simulation — non-archive endpoints will 400 on those and your validator will silently fail to sign.
+1. Sign up at https://www.alchemy.com.
+   The **Growth plan (~$49/mo)** handles a single validator
+   comfortably; the **free Sandbox plan** is borderline-OK during the
+   early-network phase and may rate-limit once swap volume picks up.
+2. Create one app per chain (Ethereum → Mainnet, Base → Base Mainnet).
+3. Copy the HTTPS endpoint URL — looks like
+   `https://eth-mainnet.g.alchemy.com/v2/<your_long_key>`.
+4. **Enable Archive Node access** on each app. Alchemy Growth+ enables
+   this by default; on Infura you may need to opt in. Your Anvil forks
+   issue `eth_getStorageAt` / `eth_getProof` calls at historical
+   blocks during simulation — non-archive endpoints return 400 on
+   those and your validator silently fails to sign.
 
-### Request volume to expect (per validator)
+**Request volume to expect (per validator):**
 
-- ~1-5 requests per swap proposal (per chain the swap touches)
-- ~50-200 requests on a fresh `anvil --fork-url` startup (every 6h on the default recycle cron)
+- ~1-5 requests per swap proposal per chain it touches
+- ~50-200 requests on a fresh `anvil --fork-url` startup (every 6h on
+  the default recycle cron)
 - Steady-state under low traffic: well under 1 RPS per chain
 - Burst during heavy trading: tens of RPS per chain briefly
 
-Alchemy Growth (660M compute units / month) is overkill for a single follower. Free Sandbox (30M) is borderline — fine during early-network testing; watch for rate-limit logs once swap volume picks up.
+**Cheap alternative:** if you already operate Bittensor validators
+with your own archive Ethereum nodes, point the env vars at your local
+endpoints. The Anvil containers fork from there with zero rate-limit
+risk.
 
-### Cheap alternatives
+**BT EVM (chain 964):** the public `https://lite.chain.opentensor.ai`
+endpoint works for a single home-IP validator. If you see throttling,
+switch to a private endpoint, or — if you already run your own
+subtensor node — point at it: the same node serves the BT EVM
+JSON-RPC on its substrate RPC port (Frontier is built into the
+subtensor binary). See
+[Running your own subtensor](#running-your-own-subtensor) below.
 
-If you already operate Bittensor validators with your own archive Ethereum nodes, point `ETH_UPSTREAM_RPC_URL` and `BASE_UPSTREAM_RPC_URL` at your local endpoints. The Anvil containers will fork from there with zero rate-limit risk.
-
-### Run your own subtensor (recommended for datacenter operators)
-
-The public `wss://entrypoint-finney.opentensor.ai:443` (substrate / metagraph) and `https://lite.chain.opentensor.ai` (BT EVM RPC) endpoints rate-limit **per source IP**. Operators sharing egress with other tenants in a datacenter colo often see throttling even at modest validator load — the cap is consumed by neighbors before their own traffic lands.
-
-If you already run your own `subtensor` node — and if you operate Bittensor validators at scale, you probably do — **the same node also serves the BT EVM JSON-RPC on the same port**. Frontier is built into the subtensor binary; no separate process, no separate port, no extra flag beyond the standard `--rpc-external --rpc-cors all`. The substrate RPC port (default `9944`) accepts both substrate WS *and* Ethereum-shaped JSON-RPC (`eth_call`, `eth_getStorageAt`, etc.) on the same listener.
-
-To point this validator stack at your own subtensor instead of the public endpoints:
-
-```bash
-# In platform/validator/.env
-SUBTENSOR_URL=ws://your-subtensor-host:9944
-BITTENSOR_EVM_UPSTREAM_RPC_URL=http://your-subtensor-host:9944
-```
-
-(Use `wss://` / `https://` if you've terminated TLS in front of your node. Anvil's `--fork-url` does HTTP polling, so use `http`/`https` for the EVM upstream — not `ws`/`wss`.)
-
-On the subtensor node itself, the standard `opentensor/subtensor` mainnet run script already does what you need:
-
-```
-subtensor --chain finney --rpc-external --rpc-cors all --rpc-max-connections 10000
-```
-
-See [opentensor/subtensor scripts/run/subtensor.sh](https://github.com/opentensor/subtensor/blob/main/scripts/run/subtensor.sh) for the upstream reference. Verify with `cast chain-id --rpc-url http://your-subtensor-host:9944` — it should return `964` (BT EVM mainnet). If it doesn't, you're either pointed at a non-finney chain or at a non-subtensor node.
-
-### Fall back to public endpoints
-
-Both env vars are optional and default to the public endpoints, which work fine for a single home-IP validator at the current early-network swap volume. If you're on a residential IP or a VPS with a unique egress IP and see no rate-limit logs, you can leave them unset.
-
-### Other external services
-
-| Provider | Used for | Free tier sufficient? |
-|----------|----------|-----------------------|
-| **Public Finney WS** | `wss://entrypoint-finney.opentensor.ai:443` -- metagraph reads (default; replace with your own subtensor for DC operators) | Public endpoint, no signup |
-| **GitHub API (read-only)** | Pulling validator image from GHCR | Anonymous works for image pulls; benchmark-related miner clones go through the leader, not third-party followers |
-
-No GPU compute or LLM API is required. The JS scoring engine is pure Node.js, deterministic, and CPU-bound.
-
-## Ports
-
-### Inbound (must be reachable from the public internet)
-
-| Port | Service | Notes |
-|------|---------|-------|
-| `9100/tcp` | Validator daemon — order-consensus signing + `/identity` | Reached by the leader for proposal broadcast and by other validators for cross-attestation against the on-chain ValidatorRegistry. |
-| `8080/tcp` | API service — `/identity` + champion-consensus signing | Required by the canonical compose's api service for hotkey ↔ EVM-address cross-attestation. Champion-consensus participation goes live once the registry-consolidation work (Phase B) completes; in the interim, port 8080 still needs to be reachable so other validators can verify the binding via the api's `/identity` mirror. |
-
-If you are behind NAT, forward both ports. On a cloud VPS with a public IP, open both in the firewall. Quick example on Ubuntu with `ufw`:
+## 7. Clone the canonical compose
 
 ```bash
-sudo ufw allow 9100/tcp comment "minotaur validator daemon"
-sudo ufw allow 8080/tcp comment "minotaur api service"
+mkdir -p ~/minotaur && cd ~/minotaur
+curl -fsSL https://raw.githubusercontent.com/subnet112/minotaur_subnet/main/platform/validator/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/subnet112/minotaur_subnet/main/platform/validator/.env.example -o .env
 ```
 
-For AWS security groups, allow inbound TCP 9100 and 8080 from `0.0.0.0/0`. For other clouds the procedure is equivalent — the only requirement is that both ports are reachable from the public internet so the leader can deliver proposals and peers can verify your `/identity` claim.
+You only need these two files. The validator + api Python code runs
+inside the Docker image — no local venv or pip install required.
 
-### Outbound (egress, no special configuration)
+## 8. Configure `.env`
 
-| Destination | Port | Purpose |
-|-------------|------|---------|
-| `entrypoint-finney.opentensor.ai` | 443 (WSS) | Subtensor metagraph reads — **default only**; replaced by your own subtensor if `SUBTENSOR_URL` is overridden |
-| `lite.chain.opentensor.ai` | 443 (HTTPS) | BT EVM RPC — **default only**; replaced by your own subtensor if `BITTENSOR_EVM_UPSTREAM_RPC_URL` is overridden (the same subtensor node serves both) |
-| Alchemy / Infura host | 443 (HTTPS) | ETH and Base fork source RPCs |
-| Other validator peers | 9100 (HTTPS) | Consensus signing |
-| Leader API host | 8080 (HTTPS) | Proposal pull (followers) |
-| `github.com`, `ghcr.io` | 443 (HTTPS) | Image and repo pulls |
-
-### Internal only (not exposed externally)
-
-Anvil ports (`8545` for ETH, `8546` for Base, `8547` for BT EVM) are bound to the Docker network and must never be exposed to the public internet.
-
-## Prerequisites
-
-Two host-level tools you must install:
-
-- **Docker** (≥25 for compatibility with the bundled Watchtower) + **Docker Compose plugin**
-- **Foundry** (`cast`) — used to generate your EVM signing key + to read/verify on-chain state
-- **Bittensor CLI** (`btcli`) — used to register your hotkey on subnet 112
-
-If you're on Ubuntu/Debian and want all three in one shot, run our installer (idempotent — skips anything you already have):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/subnet112/minotaur_subnet/main/scripts/install_prereqs.sh | bash
-```
-
-Plus these account-level things you provide:
-
-- **Bittensor wallet** with a registered hotkey on subnet 112 (Step 3 below)
-- **EVM private key** for EIP-712 consensus signing (Step 4 — a fresh key is fine, it does NOT hold funds)
-- **Ethereum + Base RPC URLs** from Alchemy or Infura (free tier is fine for moderate load)
-- **Coordination with the subnet operator** to be added to the on-chain `ValidatorRegistry` (the GitHub Issue template — Step 11)
-
-## Step 1: Clone the repo
-
-You only need the repo for the canonical compose file + the `.env.example`. The validator + api Python code runs inside the Docker image (no local venv / pip install needed):
-
-```bash
-git clone https://github.com/subnet112/minotaur_subnet.git
-cd minotaur_subnet
-```
-
-> **Skip ahead to [Step 5](#step-5-configure-environment)** if you ran the installer above and have an existing Bittensor wallet — Steps 2-4 are just verifying / generating those.
-
-## Step 2: Install Foundry
-
-If you do not already have Foundry installed:
-
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-```
-
-Verify installation:
-
-```bash
-anvil --version
-forge --version
-cast --version
-```
-
-## Step 3: Register on Subnet 112
-
-If your hotkey is not yet registered:
-
-```bash
-btcli subnet register --netuid 112 --subtensor.network finney \
-  --wallet.name my-validator --wallet.hotkey my-hotkey
-```
-
-Verify registration:
-
-```bash
-btcli subnet metagraph --netuid 112 --subtensor.network finney
-```
-
-Your hotkey should appear in the metagraph. Note that during the early-network operating period, **leader election is locked to the subnet team's hotkey** — your stake determines your weight-emission share but does not make you eligible for leadership while the lock is active. See the leader-election explanation in the Hardware Requirements section above.
-
-## Step 4: Get onboarded to the on-chain ValidatorRegistry
-
-Before your signatures count toward quorum, your **EVM signing address** (the one derived from `VALIDATOR_PRIVATE_KEY`) must be added to the `ValidatorRegistry` contract on each chain you'll operate on. This is a coordinated step with the current registry owner (typically the subnet operator).
-
-What you need to send to the registry owner:
-
-```
-Validator hotkey (SS58):  5...
-EVM signing address:      0x...   (from your VALIDATOR_PRIVATE_KEY)
-Public axon URL:          http://your-host:9100
-```
-
-What the registry owner runs on their side, once per chain:
-
-```bash
-# Read the current set
-cast call $VALIDATOR_REGISTRY 'getValidators()(address[])' --rpc-url $RPC_URL
-
-# Add you to the set (replace with the full new list, sorted ascending)
-cast send $VALIDATOR_REGISTRY \
-  'updateValidators(address[])' \
-  '[0xExistingValidator1,0xExistingValidator2,0xYourEvmAddress]' \
-  --rpc-url $RPC_URL \
-  --private-key $REGISTRY_OWNER_KEY
-```
-
-Repeat per chain (Ethereum, Base, BT EVM — addresses listed in the [network reference](../operator/network-reference.md)).
-
-**Verify you've been added** before continuing:
-
-```bash
-cast call $VALIDATOR_REGISTRY 'isValidator(address)(bool)' 0xYourEvmAddress --rpc-url $RPC_URL
-```
-
-If this returns `true` on every chain, you're cleared to bring up the daemon. If it returns `false`, your consensus signatures will be ignored — the daemon will run but the leader's `verify_proposer_signature` and the relayer's wrapper-sig check will both reject anything you sign, so you'll appear in the metagraph without contributing to quorum.
-
-> **Note**: until this handshake exists as an on-chain registration flow (similar to Bittensor's subnet-register), it's a manual coordination step. The subnet operator publishes a process; check the project README for the current contact channel.
-
-## Step 5: Configure Environment
-
-The recommended path (Step 6) reads configuration from `platform/validator/.env`. The variables below also work as shell exports if you're running the daemon directly under systemd instead of Docker Compose ("Running without Docker", below).
+Edit `.env` and fill in every `YOUR_*` placeholder:
 
 ```bash
 # Bittensor identity
-export WALLET_NAME=my-validator
-export HOTKEY_NAME=my-hotkey
-export NETUID=112
-export SUBTENSOR_URL=wss://entrypoint-finney.opentensor.ai:443
+WALLET_NAME=<your_wallet>
+HOTKEY_NAME=<your_hotkey>
 
-# Anvil forks the validator will *connect to* (it does not spawn them; see Step 6).
-# Point these at wherever you start the forks — localhost when they run on the
-# same box, or your internal Docker hostnames if you bridge networks.
-export ANVIL_RPC_URL=http://localhost:8545          # Ethereum fork
-export BASE_RPC_URL=http://localhost:8546           # Base fork
-export BITTENSOR_EVM_RPC_URL=http://localhost:8547  # BT EVM fork
+# Where btcli stored your wallets on this host
+# Default is the standard btcli location; override only if elsewhere
+# BITTENSOR_WALLET_PATH=/home/ubuntu/.bittensor/wallets
 
-# Upstream RPCs — used by the validator to advance each Anvil fork to the
-# current chain head between simulations. Without these the fork stays frozen
-# at startup and sims run against stale state.
-export ETH_UPSTREAM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
-export BASE_UPSTREAM_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
-export BITTENSOR_EVM_UPSTREAM_RPC_URL=https://lite.chain.opentensor.ai
+# Public URL on port 9100 — must match what you registered in Step 4
+VALIDATOR_AXON_URL=http://<your-public-host>:9100
 
-# Consensus signing (EVM private key, hex-encoded with 0x prefix)
-export VALIDATOR_PRIVATE_KEY=0xYOUR_EVM_PRIVATE_KEY
+# EVM signing key from Step 3
+VALIDATOR_PRIVATE_KEY=0x<your_evm_private_key>
 
-# Public URL where your daemon serves /identity. Required for peer
-# discovery — other validators sign and verify against this. See the
-# Peer discovery section below.
-export VALIDATOR_AXON_URL=http://your-public-host:9100
+# Upstream RPCs — use your own Alchemy/Infura keys for production load
+ETH_UPSTREAM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/<your_key>
+BASE_UPSTREAM_RPC_URL=https://base-mainnet.g.alchemy.com/v2/<your_key>
 
-# On-chain ValidatorRegistry that holds the canonical quorum threshold.
-# These addresses come from the subnet operator — see "Onboarding" below
-# and the [network reference](../operator/network-reference.md) for current
-# mainnet values per chain. The daemon reads quorumBps from this contract
-# at startup and refreshes once per epoch.
-export VALIDATOR_REGISTRY_ADDRESS=0xYOUR_VALIDATOR_REGISTRY_ON_BASE
-# Optional per-chain forms if you run the daemon against a non-default
-# CHAIN_ID and don't want to set VALIDATOR_REGISTRY_ADDRESS directly:
-#   export VALIDATOR_REGISTRY_1=0x...     # Ethereum mainnet
-#   export VALIDATOR_REGISTRY_8453=0x...  # Base
-#   export VALIDATOR_REGISTRY_964=0x...   # BT EVM
+# (Optional) Watchtower auto-update poll interval. Default is 1 hour.
+# Drop to 300s (5 min) during the early-network shake-out so audit
+# fixes propagate faster across the network.
+WATCHTOWER_POLL_INTERVAL=300
 ```
 
-See [Configuration](./configuration.md) for the full list of options and
-[Quorum management](../operator/quorum-management.md) for how to change the
-network-wide quorum value once you're an operator.
+Leave the on-chain registry addresses (`VALIDATOR_REGISTRY_8453`,
+`VALIDATOR_REGISTRY_964`, `APP_REGISTRY_*`, `CHAMPION_REGISTRY_964`)
+at their defaults — they're pre-filled with the current production
+addresses from the 2026-05-21 quorum-refactor deployment. If startup
+errors mention `quorumBps() reverted` you're pointing at a stale
+address; refresh from the
+[network reference](../operator/network-reference.md).
 
-## Step 6: Bring up the validator stack
+> **Internal-only envs — do NOT set as a third party.**
+> `ORDER_CONSENSUS_PEERS` and `CHAMPION_CONSENSUS_PEERS` are pinned-peer
+> escape hatches used by the subnet team's own deployment where
+> metagraph axon URLs are not published yet. Setting them as a
+> third-party operator pins you to a stale set that excludes the rest
+> of the network. Discovery via the metagraph + on-chain
+> ValidatorRegistry is the supported path and works out of the box once
+> Step 4 completes.
 
-The validator role for a third-party operator is **six containers**:
-
-- Three Anvil forks (Ethereum mainnet, Base, BT EVM)
-- The validator daemon (order-consensus signer + weight emitter, port 9100)
-- An api service (champion-consensus signer, port 8080)
-- A docker-socket-proxy (limits the api's Docker access to spawning sandboxed solver containers — used during reactive benchmarking of champion candidates)
-
-Plus an OPT-IN seventh container: Watchtower, for auto-update on `:stable` tag promotion. Bring it up via the `autoupdate` compose profile.
-
-The canonical compose ships in this repo at `platform/validator/`:
+## 9. Start the stack
 
 ```bash
-cd platform/validator
-cp .env.example .env
-# Open .env in your editor and fill in every YOUR_* placeholder
-$EDITOR .env
+# With auto-update (recommended during early-network — pulls every 5
+# min from the team-promoted :stable tag)
+docker compose --profile autoupdate up -d
 
-docker compose --profile autoupdate up -d         # with Watchtower auto-update
-# ── or ──
-docker compose up -d                                # without (manual pulls)
+# Or without (you'll need `docker compose pull && up -d` manually
+# after the team announces a new :stable promotion)
+docker compose up -d
 ```
 
-The first cold start takes ~60-90 seconds while the three Anvil forks fetch their initial state from the upstream RPCs (`ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`, `BITTENSOR_EVM_UPSTREAM_RPC_URL`). The validator and api services both wait for all three anvils to report healthy before they start.
+The first cold start takes ~60-90 seconds while the three Anvil forks
+fetch their initial state from the upstream RPCs. The validator + api
+services both wait for all three Anvils to report healthy before they
+start.
 
-Check the state:
+## 10. Verify
 
 ```bash
-docker compose ps
-# All six services should show "(healthy)" or "Up" after ~90s.
+# Validator daemon health
+curl http://<your-public-host>:9100/health
+# expect: {"status":"ok","loaded_intents":N,"block_loop_running":true,...}
 
-docker compose logs -f validator api
-# Validator should show:
-#   "ProtocolConfig: loaded quorum_bps=6666 from ValidatorRegistry ..."
-#   "Consensus enabled (id=0x..., peer-mode=discovered, quorum=6666 bps)"
-#   "Validator starting as ORDER CONSENSUS PEER ..."
-#   "BlockLoop started (tick_interval=12.0s)"
-# Api should show:
-#   "Champion consensus enabled (validator=0x..., quorum=N bps from
-#    ChampionRegistry 0x..., validator-set from VR 0x... on chain 964)"
+# Self-attested identity (other validators fetch this)
+curl http://<your-public-host>:9100/identity
+# expect: {"evm_address":"0x<yours>","hotkey":"<yours>","axon_url":"...","signature":"0x..."}
+
+# Local API gateway (champion-consensus + admin surface)
+curl http://localhost:8080/health
+
+# Confirm the validator read the right quorum from chain
+curl http://localhost:9100/consensus/info
+# {"consensus_enabled": true, "quorum_bps": <N>, "validator_id": "0x...", ...}
+
+# Consensus participation: tail logs and look for proposal/approval lines
+docker compose logs -f validator | grep -iE "consensus|proposal|approval"
 ```
 
-### Verify
-
-The simplest path is the bundled check script — it runs every endpoint + verifies registry state + prints a green/red summary:
+A bundled check script runs every endpoint, verifies registry state,
+and prints a green/red summary. The onboarding issue template asks
+you to paste its output:
 
 ```bash
 bash scripts/check_validator.sh
 ```
 
-When you open the onboarding issue in Step 11, the template asks you to paste the output of this script. A green run is the precondition for us running the registry-write on our side.
+If `/consensus/info` returns `quorum_bps=0` or the api's
+`champion_consensus.quorum_required` looks wrong, your
+`VALIDATOR_REGISTRY_*` envs point at a stale contract — re-check the
+[network reference](../operator/network-reference.md).
 
-Or manually:
+## 11. What you're signing up for
+
+- **Role: order-consensus follower.** During the early-network
+  operating period leader election is locked to the subnet team's
+  hotkey (`LOCKED_LEADER_HOTKEY`). You receive proposals from the
+  leader, re-simulate them on your Anvil forks, and sign approvals.
+- **You don't hold gas.** No `RELAYER_PRIVATE_KEY` on your node. The
+  team's singleton relayer at `https://relayer.minotaursubnet.com` is
+  the only address that ever pays gas for swap execution. Your
+  validator signs an EIP-191 wrapper around each quorum bundle using
+  `VALIDATOR_PRIVATE_KEY`; the relayer verifies the wrapper signer is
+  in the on-chain `ValidatorRegistry` before submitting.
+- **Auto-updates from `:stable`.** New code is promoted to the
+  `:stable` tag by the subnet team after soak-testing on prod.
+  Watchtower (if you enabled the `autoupdate` profile) pulls on its
+  poll interval and recreates your containers. To pin to a specific
+  build, set `MINOTAUR_IMAGE_TAG=sha-<short_sha>` in `.env` and skip
+  the `autoupdate` profile.
+
+---
+
+# Operating the validator
+
+The rest of this page covers day-2 operating concerns: peer discovery,
+auto-update mechanics, disk-bloat maintenance, alternatives to Docker,
+and how to point at your own subtensor instead of the public endpoint.
+
+## Peer discovery
+
+Both consensus loops discover peers automatically — no peer-list env
+required. The flow:
+
+1. **Your daemon publishes its identity.** `GET /identity` on port
+   9100 returns a fresh EIP-712 signed payload binding
+   `(evm_address, hotkey, axon_url)`. Each request regenerates the
+   signature so it's never stale.
+2. **You publish your axon URL.** `VALIDATOR_AXON_URL` (Step 8) is what
+   the signed payload claims. Also call `btcli` to register your axon
+   on the Bittensor metagraph so other validators can find you.
+3. **Other validators discover you.** Their `ProtocolConfig.refresh_loop`
+   (default 60s tick) walks the metagraph axon list, probes each
+   `/identity`, verifies the EIP-712 signature, and cross-checks the
+   recovered EVM address is in `ValidatorRegistry.getValidators()` and
+   that the hotkey matches the metagraph.
+
+What this gives you operationally:
+
+- **No coordinated restart when a new validator joins.** The new
+  validator's EVM gets added on-chain, they start their daemon, others
+  pick them up within one refresh tick.
+- **No peer-list env to maintain.** Discovery plus the on-chain
+  registry are the source of truth.
+- **IP changes are self-served.** A validator changing hosts just
+  updates `VALIDATOR_AXON_URL` and restarts; the signed `/identity`
+  payload re-publishes the new URL automatically.
+
+### Verifying discovery is working
 
 ```bash
-# Validator health (order-consensus)
-curl http://localhost:9100/health
-# {"status": "ok", "service": "app-intents-validator", "block_loop_running": true, ...}
-
-# Api health (champion-consensus)
-curl http://localhost:8080/health
-# {"status": "ok", "champion_consensus": {"enabled": true, ...}, ...}
-
-# Confirm the validator read the right quorum from chain
-curl http://localhost:9100/consensus/info
-# {"consensus_enabled": true, "quorum_bps": 6666, "validator_id": "0x...", ...}
-
-# Confirm /identity serves a fresh signed EIP-712 payload (requires a working
-# Bittensor wallet — returns 503 if WALLET_NAME/HOTKEY_NAME aren't loaded).
-# Both the validator daemon (port 9100) and the api service (port 8080)
-# expose /identity so peer-discovery works on both consensus loops.
+# Confirm your daemon publishes a valid identity
 curl http://localhost:9100/identity
-curl http://localhost:8080/identity
+
+# Confirm your daemon sees other peers (via /consensus/info)
+curl http://localhost:9100/consensus/info
+# .peers should list discovered peers; refreshes on each ProtocolConfig tick.
 ```
 
-If either `/consensus/info` or the api's `champion_consensus.quorum_required` looks wrong, your `VALIDATOR_REGISTRY_*` envs may point at a stale contract — check the [network reference](../operator/network-reference.md).
+## Auto-update mechanics
 
-### What each service does
+The default `MINOTAUR_IMAGE_TAG=stable` (in `.env.example`) plus the
+optional Watchtower container together give you hands-off updates:
 
-| Service | Role |
-|---|---|
-| `validator` | Order-consensus signing (re-simulates leader's order proposals on Anvil, signs approvals if both JS + on-chain scores meet threshold). Emits weights to the metagraph every ~20 min. |
-| `api` | Champion-consensus signing (reactively re-benchmarks the leader's champion candidate inside a sandboxed Docker container, signs the certification if scores hold up). |
-| `anvil-eth`, `anvil-base`, `anvil-btevm` | Local forks of each chain so independent re-simulation doesn't touch mainnet. |
-| `docker-socket-proxy` | Filtered Docker socket access for the api service. Only `CONTAINERS + IMAGES + NETWORKS + POST` allowed; no `EXEC`, no `BUILD`, no `SWARM`. |
-| `watchtower` (opt-in) | Polls GHCR every hour for a new `:stable` SHA; recreates `validator` + `api` when the tag moves. |
-
-### What this stack does NOT include
-
-- **Relayer**: the transaction submitter is a singleton service operated by the subnet team. Your validator signs proposals; the leader's submission path uses our relayer. You never deal with a gas wallet.
-- **Order/champion proposing**: only the locked leader's api does that. Under the current `LOCKED_LEADER_HOTKEY` constant, that's the subnet team's hotkey; as a follower, you receive proposals + verify + sign. If/when the lock is cleared, election reverts to highest-stake-wins.
-
-## Auto-update
-
-The default `MINOTAUR_IMAGE_TAG=stable` (in `.env.example`) and the optional Watchtower container together give you hands-off updates:
-
-1. New commit lands on `main` → `docker-publish.yml` builds + pushes `:latest` and `:sha-<short>` (immutable per-commit) to GHCR.
+1. New commit lands on `main` → `docker-publish.yml` builds + pushes
+   `:latest` and `:sha-<short>` (immutable per-commit) to GHCR.
 2. The new image runs on the subnet team's prod for a soak period.
-3. When the team is happy with the soak, they run the `promote-stable.yml` workflow with the short SHA. That re-tags `:sha-<short>` as `:stable` on GHCR.
-4. Your Watchtower polls GHCR within the next interval, pulls the new image, recreates the `validator` and `api` containers with the new SHA. ~30-60 second downtime during the recreate.
+3. When the team is happy with the soak, the `promote-stable.yml`
+   workflow re-tags `:sha-<short>` as `:stable` on GHCR.
+4. Your Watchtower polls GHCR within the next interval, pulls the new
+   image, recreates the `validator` and `api` containers with the new
+   SHA. ~30-60 seconds of downtime during the recreate.
 
-The poll interval is controlled by `WATCHTOWER_POLL_INTERVAL` (seconds) in your `.env`. The canonical default is `3600` (1 hour). **During the early-network shake-out phase, set `WATCHTOWER_POLL_INTERVAL=300` (5 minutes)** so audit fixes and config changes propagate faster across the network:
+The poll interval is controlled by `WATCHTOWER_POLL_INTERVAL` (seconds)
+in your `.env`. The canonical default is `3600` (1 hour). **During the
+early-network shake-out phase, set `WATCHTOWER_POLL_INTERVAL=300`
+(5 minutes)** so audit fixes and config changes propagate faster.
 
-```bash
-# In .env:
-WATCHTOWER_POLL_INTERVAL=300
-```
+Once the network is stable and `:stable` promotions are infrequent,
+bump it back up to the hourly default to save GHCR bandwidth.
 
-Once the network is stable and `:stable` promotions are infrequent, bump it back up to the hourly default to save GHCR bandwidth.
-
-If you want manual control instead of Watchtower, leave the `autoupdate` profile off and run on the subnet team's announced cadence:
+If you prefer manual control, leave the `autoupdate` profile off and
+update on the team's announced cadence:
 
 ```bash
 docker compose pull validator api
 docker compose up -d --force-recreate validator api
 ```
 
-To pin a specific SHA (opt out of auto-update entirely without removing Watchtower):
+To pin a specific SHA (opt out of auto-update entirely without removing
+Watchtower):
 
 ```bash
 # In .env:
 MINOTAUR_IMAGE_TAG=sha-abc1234
 ```
 
-then `docker compose up -d` — Watchtower won't update a container whose image tag isn't tracking `:stable`.
+then `docker compose up -d` — Watchtower won't update a container
+whose image tag isn't tracking `:stable`.
 
-## On-chain registration
+## Required maintenance cron (Anvil disk bloat)
 
-Your EVM signing address needs to be in the on-chain `ValidatorRegistry` on both Base and BT EVM before your signatures count toward quorum. The subnet team runs the on-chain handshake for you — open an issue using the [Request validator onboarding template](https://github.com/subnet112/minotaur_subnet/issues/new?template=onboard-validator.yml).
+Anvil's overlay filesystem grows fast even with tmpfs mounted at
+`/root` and `/tmp`. A production deployment in May 2026 measured
+**~40-50 GB per fork per day**; the rate has grown over time as the
+chain head moves further from the fork block and as user/simulation
+load increases. With three forks that's ~150 GB/day of bloat. Without
+a frequent recycle, a 200 GB volume fills in well under two days and
+the host OS hangs (status check: impaired) once the disk hits 100% —
+at which point SSH is dead and the only recovery is a force stop+start
+of the VM.
 
-The template captures the three required fields:
-- EVM signing address (checksummed)
-- Bittensor SS58 hotkey
-- Public axon URL (`http://<host>:9100`)
+Install this cron — **every 6 hours**, not daily:
 
-Once the team comments with the tx hashes, your validator is live. Within ~60 seconds, every existing validator's `ProtocolConfig` refresh loop discovers your `/identity` endpoint, verifies the EIP-712 binding, and starts including you in proposals.
+```
+0 */6 * * * root docker compose -f /home/<user>/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /home/<user>/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
+```
 
-### Running without Docker
+(Adjust the path to where you put `docker-compose.yml` in Step 7.)
 
-If you prefer Anvil under systemd plus the daemon as a native process, the equivalent invocations are:
+At every-6h cadence, max accumulation between recycles is ~37 GB
+across three forks, which fits comfortably in 200 GB with other
+services taking ~10-15 GB. If you skip a recycle (cron failure, host
+unreachable, manual stop without restart), the disk can fill in 12-15
+hours from there — monitor `df -h /` and treat low disk as a paging
+event. If the rate grows further (more chains added, much higher
+load), drop the cadence to every 4 or 3 hours.
+
+Each recycle window drops in-flight Anvil state for ~60 seconds while
+the containers restart. During that window your follower cannot
+re-simulate proposals — the leader's order-consensus tick will see a
+missing signature from you and fall back to the remaining peers. If
+the rest of the active validator set is small enough that quorum
+needs your signature, stagger your cron a few minutes offset from
+peers to avoid simultaneous reorg pauses.
+
+**If you hit a disk-full OS hang**: the SSH daemon is dead at that
+point, so `docker compose down`, cron tightening, or any in-VM
+cleanup won't help. The only recovery is a force stop+start at the
+hypervisor layer (on AWS: `aws ec2 stop-instances --force
+--instance-ids <id>`, wait for `stopped`, then `start-instances`).
+EBS-backed instances preserve all state across this; containers with
+`restart: unless-stopped` come back automatically. Once the host is
+up, immediately `docker compose rm -fsv` the anvil services to release
+their snapshot overlays — `docker system prune` alone won't reclaim
+them.
+
+## Running your own subtensor
+
+The public `wss://entrypoint-finney.opentensor.ai:443` (substrate /
+metagraph) and `https://lite.chain.opentensor.ai` (BT EVM RPC)
+endpoints rate-limit **per source IP**. Operators sharing egress with
+other tenants in a datacenter colo often see throttling at modest
+validator load — the cap is consumed by neighbors before their own
+traffic lands.
+
+If you already run your own `subtensor` node — and if you operate
+Bittensor validators at scale you probably do — **the same node also
+serves the BT EVM JSON-RPC on the same port**. Frontier is built into
+the subtensor binary; no separate process, no separate port, no extra
+flag beyond the standard `--rpc-external --rpc-cors all`. The
+substrate RPC port (default `9944`) accepts both substrate WS *and*
+Ethereum-shaped JSON-RPC (`eth_call`, `eth_getStorageAt`, etc.) on the
+same listener.
+
+To point this validator stack at your own subtensor:
 
 ```bash
-anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" --block-time 2
-anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" --chain-id 8453 --no-storage-caching --block-time 2
-anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" --chain-id 964 --no-storage-caching --block-time 2
+# In ~/minotaur/.env
+SUBTENSOR_URL=ws://your-subtensor-host:9944
+BITTENSOR_EVM_UPSTREAM_RPC_URL=http://your-subtensor-host:9944
+```
+
+(Use `wss://` / `https://` if you've terminated TLS in front of your
+node. Anvil's `--fork-url` does HTTP polling, so use `http`/`https`
+for the EVM upstream — not `ws`/`wss`.)
+
+On the subtensor node itself, the standard `opentensor/subtensor`
+mainnet run script already does what you need:
+
+```
+subtensor --chain finney --rpc-external --rpc-cors all \
+  --rpc-max-connections 10000
+```
+
+See [opentensor/subtensor scripts/run/subtensor.sh](https://github.com/opentensor/subtensor/blob/main/scripts/run/subtensor.sh)
+for the upstream reference. Verify with
+`cast chain-id --rpc-url http://your-subtensor-host:9944` — it should
+return `964` (BT EVM mainnet). If it doesn't, you're either pointed
+at a non-finney chain or at a non-subtensor node.
+
+## Running without Docker (advanced)
+
+If you prefer Anvil under systemd plus the daemon as a native Python
+process, the equivalent invocations are:
+
+```bash
+anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" \
+  --block-time 2
+anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" \
+  --chain-id 8453 --no-storage-caching --block-time 2
+anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" \
+  --chain-id 964 --no-storage-caching --block-time 2
 
 python -m minotaur_subnet.validator.main \
   --port 9100 \
@@ -493,58 +547,12 @@ python -m minotaur_subnet.validator.main \
   --epoch-seconds 1200
 ```
 
-Wrap each in its own systemd unit with `Restart=on-failure`. The Anvil disk-bloat issue described in the [maintenance cron](#required-maintenance-cron) section applies either way — adjust the cron to bounce your systemd units instead of `docker compose rm -fsv`.
+Wrap each in its own systemd unit with `Restart=on-failure`. The
+Anvil disk-bloat issue described in the maintenance cron section
+above applies either way — adjust the cron to bounce your systemd
+units instead of `docker compose rm -fsv`.
 
-## Peer discovery
-
-Order-consensus and champion-consensus peers are both discovered automatically — no peer-list env required for either. The flow:
-
-1. **Your daemon publishes its identity**: a `GET /identity` endpoint on port 9100 returns a fresh EIP-712 signed payload binding `(evm_address, hotkey, axon_url)`. Each request regenerates the signature so it's never stale.
-2. **You publish your axon URL**: set `VALIDATOR_AXON_URL=http://your-host:9100` in the daemon env. This is what the signed payload claims. Also call `btcli` to register your axon on the Bittensor metagraph so other validators can find you.
-3. **Other validators discover you**: their `ProtocolConfig.refresh_loop` (default 60s tick) walks the metagraph axon list, probes each `/identity`, verifies the EIP-712 signature, and cross-checks the recovered EVM address is in `ValidatorRegistry.getValidators()` (Step 4 handshake) and the hotkey matches the metagraph.
-
-What this gives operators:
-
-- **No coordinated restart when a new validator joins.** The new validator's EVM gets added on-chain by the registry owner, they start their daemon, others pick them up within one refresh tick.
-- **No peer-list env to maintain across the cluster.** Discovery + the on-chain registry are the source of truth.
-- **IP changes are self-served.** A validator changing hosts just updates `VALIDATOR_AXON_URL` and restarts; the signed `/identity` payload re-publishes the new URL automatically.
-
-### Required env for discovery
-
-| Variable | Purpose |
-|---|---|
-| `VALIDATOR_AXON_URL` | The public URL you serve `/identity` on. Typically `http://<your-public-ip>:9100`. The signed payload includes this; if it's missing, `/identity` returns 503. |
-| `SUBTENSOR_URL` | Required so the daemon can read the metagraph for axon discovery (already required in Step 5). |
-| `VALIDATOR_REGISTRY_ADDRESS` | Required so the daemon can read the authorized EVM set (already required in Step 5). |
-
-### Internal-only envs — DO NOT set as a third party
-
-`ORDER_CONSENSUS_PEERS` and `CHAMPION_CONSENSUS_PEERS` are pinned-peer escape hatches used by the subnet team's own production deployment, where metagraph axon URLs aren't published yet for operational-security reasons. Both bypass automatic peer discovery and pin to a fixed peer list.
-
-**Third-party validators should always leave these unset.** Setting them locks you to a stale set that won't include the rest of the network — your validator becomes invisible to other peers and never reaches quorum. The discovery path (metagraph axon list + on-chain `ValidatorRegistry.getValidators()` + each peer's signed `/identity` payload) is the supported flow and works out of the box once you complete the [on-chain registration handshake](#on-chain-registration).
-
-### Pinned-mode override (subnet team only)
-
-For local testnet or the subnet team's own prod (where metagraph axons aren't published yet), `ORDER_CONSENSUS_PEERS` (`addr@url`-comma-separated) pins the order-consensus peer list and bypasses discovery entirely. `CHAMPION_CONSENSUS_PEERS` does the same for champion-consensus. Both are documented under "Internal-only envs" above — third-party validators should always leave them unset.
-
-### Verifying discovery is working
-
-```bash
-# Confirm your daemon publishes a valid identity
-curl http://localhost:9100/identity
-# Should return {"evm_address": "0x...", "hotkey": "5...", "axon_url": "...",
-#                "expiry": <timestamp>, "nonce": "0x...", "signature": "0x..."}
-
-# Confirm your daemon sees other peers (via /consensus/info)
-curl http://localhost:9100/consensus/info
-# .peers should list discovered peers; this list refreshes on each ProtocolConfig tick.
-```
-
-## Production process supervision
-
-The canonical compose in `platform/validator/` already sets `restart: unless-stopped` on every container — Docker handles crash recovery and reboot survival. No additional process supervisor needed for the Docker path.
-
-If you went with "Running without Docker" instead, wrap the daemon in systemd:
+Example systemd unit:
 
 ```ini
 # /etc/systemd/system/minotaur-validator.service
@@ -554,7 +562,8 @@ After=network-online.target docker.service
 
 [Service]
 EnvironmentFile=/etc/minotaur/env
-ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200
+ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main \
+  --port 9100 --epoch-seconds 1200
 Restart=on-failure
 RestartSec=5
 User=minotaur
@@ -563,77 +572,26 @@ User=minotaur
 WantedBy=multi-user.target
 ```
 
-Put shared env (RPC URLs, registry addresses, validator key) in `/etc/minotaur/env` with mode 0600. Enable with `systemctl enable --now minotaur-validator`. Repeat the pattern for each Anvil systemd unit.
+Put shared env (RPC URLs, registry addresses, validator key) in
+`/etc/minotaur/env` with mode `0600`. Enable with
+`systemctl enable --now minotaur-validator`. Repeat the pattern for
+each Anvil unit.
 
-## Local Testnet (Development)
+## Operator help + reporting issues
 
-For development and testing, use the full Docker Compose stack which runs subtensor, Anvil forks, API, validator, relayer, and frontend together. Run the miner agent on host (`make miner-agent`):
+- File issues at https://github.com/subnet112/minotaur_subnet/issues
+- Current image: `ghcr.io/subnet112/minotaur-validator:stable`
+- Current contract addresses live in
+  [`docs/operator/network-reference.md`](../operator/network-reference.md)
+- The validator's HTTP surface on port 9100 exposes:
+  - `/health`, `/identity`, `/consensus/proposal` (load-bearing)
+  - `/weights`, `/weights/history`, `/blockloop/status`,
+    `/consensus/info`, `/leader` (ops-debug)
 
-### Prerequisites
+## Next steps
 
-- Docker and Docker Compose
-- An Alchemy API key (for Anvil mainnet fork)
-
-### Setup
-
-```bash
-cd platform/local_testnet
-
-# Create .env from the example
-cp .env.example .env
-# Edit .env and set ALCHEMY_RPC_URL and BASE_ALCHEMY_RPC_URL
-
-# Start the full stack
-make testnet-up
-```
-
-### Local Testnet Services
-
-| Service | Port | URL |
-|---------|------|-----|
-| API | 8080 | http://localhost:8080 |
-| Validator | 9100 | (internal, via Docker network) |
-| Relayer | 8091 | http://localhost:8091 |
-| Anvil (ETH fork) | 8545 | http://localhost:8545 |
-| Anvil (Base fork) | 8546 | http://localhost:8546 |
-| Anvil (BT EVM fork) | 8547 | http://localhost:8547 |
-| Subtensor | 9944 | ws://localhost:9944 |
-
-The init container automatically registers the subnet (netuid=1 on local), registers validator and miner neurons, and deploys contracts. The validator starts with `FORCE_LEADER=1` so it immediately begins processing orders.
-
-### Stop the Testnet
-
-```bash
-make testnet-down
-```
-
-## Running Tests
-
-```bash
-# Quick: unit + app tests (no Docker/Anvil needed)
-make test
-
-# Full suite including emulation and E2E
-make test-all
-
-# Live local_testnet smoke suite (recreates the Docker stack first)
-make test-testnet
-
-# Just E2E tests (requires Foundry/Anvil)
-make test-e2e
-
-# Mainnet-fork-only E2E tests (requires ALCHEMY_API_KEY or ETHEREUM_RPC_URL)
-make test-fork
-```
-
-`make test-all` does not include `make test-testnet`; keep the latter as a
-separate live-stack check when you change API, deployment, wallet, quoting, or
-order execution flows.
-
-See the [Makefile](../../Makefile) for all available test targets.
-
-## Next Steps
-
-- Review [Configuration](./configuration.md) for all available options.
-- See [Troubleshooting](./troubleshooting.md) if you encounter issues.
-- Check the [Solver Guide](../solver/solver_guide.md) to understand what miners submit.
+- Review [Configuration](./configuration.md) for the full env-var
+  reference.
+- See [Troubleshooting](./troubleshooting.md) for common failure modes.
+- Check the [Solver Guide](../solver/solver_guide.md) to understand
+  what miners submit and how scoring works.
