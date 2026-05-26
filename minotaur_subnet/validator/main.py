@@ -727,6 +727,19 @@ class AppIntentsValidator:
 
 
 def main() -> None:
+    # Operator-friendly env check — runs before argparse so a missing
+    # .env file produces a clear "you forgot cp .env.example .env"
+    # message instead of the deeper "ValidatorRegistry address not
+    # provided" crash loop that confused multiple new operators in May.
+    from minotaur_subnet.shared.env_check import (
+        REQUIRED_REGISTRY_ENV,
+        check_required_env_or_exit,
+    )
+    check_required_env_or_exit(
+        REQUIRED_REGISTRY_ENV,
+        process_name="validator daemon",
+    )
+
     parser = argparse.ArgumentParser(description="App Intents Validator")
     parser.add_argument("--port", type=int, default=9100, help="Listen port")
     parser.add_argument(
