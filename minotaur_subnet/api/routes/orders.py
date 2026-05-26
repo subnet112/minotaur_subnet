@@ -14,10 +14,29 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from minotaur_subnet.api.routes.apps import _env_true, _require_admin
+
 router = APIRouter()
+
+
+# Leader-mode detection (PR-2, audit H5): third-party follower validators
+# set ENABLE_SOLVER_ROUND_COORDINATOR=0 in their compose (canonical
+# follower-mode flag). On those nodes, POST /v1/apps/{id}/orders MUST
+# 404 — orders go to the leader, period. Followers accepting orders is
+# how unauthenticated callers were disk-filling the local store.json.
+# Cached at module load (single env read), not per-request — operators
+# who change the flag must restart the container, same as every other
+# coordinator-mode flag.
+def _compute_is_leader_node() -> bool:
+    # Default True matches startup.py — coordinator on unless explicitly
+    # disabled. Follower compose sets ENABLE_SOLVER_ROUND_COORDINATOR=0.
+    return _env_true("ENABLE_SOLVER_ROUND_COORDINATOR", default=True)
+
+
+_IS_LEADER_NODE: bool = _compute_is_leader_node()
 
 # Module-level references set by server.py at startup
 _orderbook = None
@@ -241,7 +260,25 @@ class QuoteRequest(BaseModel):
 
 @router.post("/apps/{app_id}/orders", status_code=201)
 def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
-    """Submit a new order to the Intent OrderBook."""
+    """Submit a new order to the Intent OrderBook.
+
+    Follower-mode (audit H5, PR-2): when this api runs as a third-party
+    follower validator (``ENABLE_SOLVER_ROUND_COORDINATOR=0``), orders
+    don't belong here — they go to the leader. Reject with 404 so the
+    caller can route to the leader instead of disk-filling the
+    follower's ``store.json``.
+    """
+    if not _IS_LEADER_NODE:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Order submission is only available on the leader api. "
+                "Route orders to the elected leader of subnet 112 — the "
+                "leader's endpoint is discoverable via the on-chain "
+                "ValidatorRegistry."
+            ),
+        )
+
     from minotaur_subnet.shared.interop_address import parse_address
     from minotaur_subnet.shared.feature_flags import (
         cross_chain_enabled,
@@ -722,36 +759,109 @@ async def attach_signature(order_id: str, request: Request) -> dict:
     return {"order_id": order_id, "signature_attached": True}
 
 
+def _verify_reader_sig(submitted_by: str, order_id: str, sig_hex: str) -> bool:
+    """Verify an EIP-191 reader-sig over ``read-order:{order_id}``.
+
+    Used by GET /orders[/{id}] to decide whether to include the
+    sensitive ``user_signature`` field in the response. Reader-sigs are
+    deliberately not deadline-bound — they're a "prove you're the
+    owner" challenge, not an authorization for a state change. The
+    on-chain EIP-712 signature is the authoritative gate at execution
+    time, so leaking it via API is graveyard for replay protection but
+    not a fund-loss vector.
+
+    Returns True only when the recovered signer matches ``submitted_by``.
+    """
+    if not submitted_by or not sig_hex or not order_id:
+        return False
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except Exception:
+        return False
+    try:
+        msg = encode_defunct(text=f"read-order:{order_id}")
+        sig = sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
+        recovered = Account.recover_message(msg, signature=sig)
+    except Exception:
+        return False
+    return recovered.lower() == submitted_by.lower()
+
+
+def _strip_user_signature(order_dict: dict) -> dict:
+    """Return a copy of ``order_dict`` with ``user_signature`` stripped."""
+    if not order_dict:
+        return order_dict
+    if "user_signature" not in order_dict:
+        return order_dict
+    out = dict(order_dict)
+    out["user_signature"] = ""
+    return out
+
+
 @router.get("/orders/{order_id}")
-def get_order(order_id: str) -> dict:
+def get_order(
+    order_id: str,
+    x_reader_sig: str | None = Header(None, alias="X-Reader-Sig"),
+) -> dict:
     """Get the status of an order.
 
     Checks the in-memory OrderBook first, then falls back to the
     persistent store (for orders from before a restart).
+
+    PR-2 (audit M-orders-leak): the response previously included the
+    raw EIP-712 ``user_signature``. The on-chain contract treats that
+    sig as a one-shot authorization (consumed at execute time), so
+    leaking it lets anyone front-run / replay the execution against the
+    real owner. The field is now stripped unless the caller proves
+    ownership via an EIP-191 ``X-Reader-Sig`` header that recovers to
+    the order's ``submitted_by``. Message: ``read-order:{order_id}``.
     """
     ob = _require_orderbook()
     order = ob.get(order_id)
     if order is not None:
-        return order.to_dict()
-    # Fall back to persistent store
-    stored = _app_store.get_order(order_id) if _app_store is not None and hasattr(_app_store, "get_order") else None
-    if stored is not None:
-        return stored
-    raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+        d = order.to_dict()
+    else:
+        stored = (
+            _app_store.get_order(order_id)
+            if _app_store is not None and hasattr(_app_store, "get_order")
+            else None
+        )
+        if stored is None:
+            raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+        d = stored
+
+    submitted_by = (d.get("submitted_by", "") or "")
+    if not _verify_reader_sig(submitted_by, order_id, x_reader_sig or ""):
+        d = _strip_user_signature(d)
+    return d
 
 
 @router.get("/orders")
 def list_orders(
     app_id: str | None = None,
     status: str | None = None,
+    x_reader_sig: str | None = Header(None, alias="X-Reader-Sig"),
 ) -> dict:
-    """List orders with optional filters."""
+    """List orders with optional filters.
+
+    PR-2 (audit M-orders-leak): ``user_signature`` is stripped from
+    every entry unless the caller presents an ``X-Reader-Sig`` that
+    recovers to that specific order's owner. The list endpoint is more
+    aggressive than the single-order GET because a single bulk read
+    would otherwise leak signatures for every order at once — so a
+    reader-sig only unlocks the orders it actually owns.
+    """
     ob = _require_orderbook()
     orders = ob.list_orders(app_id=app_id, status=status)
-    return {
-        "orders": [o.to_dict() for o in orders],
-        "count": len(orders),
-    }
+    out = []
+    for o in orders:
+        d = o.to_dict()
+        submitted_by = (d.get("submitted_by", "") or "")
+        if not _verify_reader_sig(submitted_by, d.get("order_id", ""), x_reader_sig or ""):
+            d = _strip_user_signature(d)
+        out.append(d)
+    return {"orders": out, "count": len(out)}
 
 
 @router.delete("/orders/{order_id}")
@@ -805,9 +915,15 @@ def cancel_order(
     return {"order_id": order_id, "status": "cancelled"}
 
 
-@router.post("/orders/{order_id}/dry-run")
+@router.post("/orders/{order_id}/dry-run", dependencies=[Depends(_require_admin)])
 async def dry_run_order(order_id: str, req: DryRunRequest) -> dict:
-    """Score a plan against an order without side effects."""
+    """Score a plan against an order without side effects.
+
+    Admin-gated as of PR-2 (audit M-dry-run): each call runs the JS
+    sandbox + the chain's Anvil simulator. Anonymous callers could pin
+    the validator's worker threads on synthetic plans, starving live
+    order processing.
+    """
     from minotaur_subnet.api import services as _tools
 
     ob = _require_orderbook()
