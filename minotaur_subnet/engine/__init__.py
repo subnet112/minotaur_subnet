@@ -6,7 +6,13 @@ JavaScript scoring functions in a sandboxed environment.
 """
 
 from .js_engine import JsExecutionEngine, IntentNotLoadedError
-from .sandbox import JsSandbox, JsSandboxError, JsTimeoutError, JsRuntimeError
+from .sandbox import (
+    JsSandbox,
+    JsSandboxError,
+    JsTimeoutError,
+    JsRuntimeError,
+    SandboxOverloadedError,
+)
 from .context import JsContext
 from .validation import validate_js_code, validate_solidity_code, validate_app_intent
 
@@ -17,6 +23,7 @@ __all__ = [
     "JsSandboxError",
     "JsTimeoutError",
     "JsRuntimeError",
+    "SandboxOverloadedError",
     "JsContext",
     "validate_js_code",
     "validate_solidity_code",

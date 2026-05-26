@@ -70,10 +70,24 @@ class ProposalHandler:
             )
 
         # ── Verify and score the proposal ──
-        result = await self.scoring_engine.verify_and_score_proposal(
-            body,
-            score_threshold=self.score_threshold,
-        )
+        # Audit H9 / sandbox-cap (PR-6a): map sandbox overload to 503 so
+        # the leader retries, rather than letting the exception bubble
+        # out and crash the request handler. Anything else stays an
+        # exception so we get a stack trace in logs.
+        try:
+            result = await self.scoring_engine.verify_and_score_proposal(
+                body,
+                score_threshold=self.score_threshold,
+            )
+        except Exception as exc:
+            from minotaur_subnet.engine import SandboxOverloadedError
+            if isinstance(exc, SandboxOverloadedError):
+                logger.warning("Sandbox overload, returning 503: %s", exc)
+                return web.json_response(
+                    {"error": "sandbox_overloaded", "reason": str(exc)},
+                    status=503,
+                )
+            raise
 
         # Handle non-approved results
         if not result.get("approved"):
