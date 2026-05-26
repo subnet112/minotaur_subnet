@@ -35,6 +35,56 @@ from .peer_discovery import MetagraphPeer, PeerInfo, discover_peers
 
 logger = logging.getLogger(__name__)
 
+
+def consensus_chain_rpc_url(chain_id: int) -> str:
+    """Pick the right RPC URL for *consensus chain reads* on ``chain_id``.
+
+    Order-consensus + champion-consensus read on-chain state (validator
+    set, quorum bps) from this URL. They MUST hit a live upstream, not
+    a local Anvil fork: Anvil forks freeze upstream state at the fork
+    point, so an on-chain ``updateValidators`` is invisible to forks
+    until they're recycled — which can take up to the recycle-cron
+    interval (6 h on prod). That blocks new validators from being
+    recognized + delays removals.
+
+    Resolution per chain:
+      - **8453 (Base)**: ``BASE_UPSTREAM_RPC_URL`` if set.
+      - **964 (BT EVM)**: ``BITTENSOR_EVM_UPSTREAM_RPC_URL`` if set,
+        otherwise ``BITTENSOR_EVM_RPC_URL``, otherwise the public lite
+        endpoint.
+      - **1 (Ethereum mainnet)**: ``ETH_UPSTREAM_RPC_URL`` if set.
+      - **31337 / 1337 (local Anvil)**: there is no upstream — fall
+        back to ``ANVIL_RPC_URL`` / ``BASE_RPC_URL`` / localhost.
+
+    Falls back to the local Anvil URL whenever the appropriate upstream
+    env is not set, to keep local-testnet behaviour unchanged.
+    """
+    if chain_id == 8453:
+        u = os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
+        if u:
+            return u
+    elif chain_id == 964:
+        u = (
+            os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
+            or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
+        )
+        if u:
+            return u
+        return "https://lite.chain.opentensor.ai"
+    elif chain_id == 1:
+        u = os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
+        if u:
+            return u
+
+    # Local testnet (31337/1337) or no upstream configured: the local
+    # Anvil IS the live chain, so its URL is correct here.
+    return (
+        os.environ.get("ANVIL_RPC_URL", "").strip()
+        or os.environ.get("BASE_RPC_URL", "").strip()
+        or "http://localhost:8545"
+    )
+
+
 # Minimal ABI for the views ProtocolConfig needs. Kept in-file rather than
 # imported from a generated artifact so this module has no build-step coupling.
 _VALIDATOR_REGISTRY_ABI = [
