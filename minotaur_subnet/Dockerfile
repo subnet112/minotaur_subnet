@@ -169,6 +169,22 @@ RUN apt-get update \
 # "1000:1000"` directive (PR-3) and the chown on the /data volume below.
 RUN useradd --create-home --uid 1000 --shell /bin/bash minotaur
 
+# Backward-compat for the wallet mount path. The canonical 2026-05-26+
+# compose mounts the bittensor wallet at /home/minotaur/.bittensor/wallets
+# (post-uid 1000 migration), but pre-2026-05-26 compose files mounted at
+# /root/.bittensor/wallets. Symlink /home/minotaur/.bittensor →
+# /root/.bittensor so the bittensor SDK's default $HOME/.bittensor lookup
+# resolves to whichever path the operator's compose actually binds. Plus
+# chmod /root traversable so uid 1000 can reach the legacy mount point
+# without dropping the read-only mount mode. (Wallet FILE perms still
+# need to be uid-1000-readable on the host — see
+# platform/validator/.env.example for the chown/chmod recipe.)
+RUN chmod 0755 /root \
+    && mkdir -p /root/.bittensor && chmod 0755 /root/.bittensor \
+    && rm -rf /home/minotaur/.bittensor \
+    && ln -s /root/.bittensor /home/minotaur/.bittensor \
+    && chown -h minotaur:minotaur /home/minotaur/.bittensor
+
 # Bring in the venv from the builder.
 COPY --from=builder --chown=minotaur:minotaur /opt/venv /opt/venv
 
