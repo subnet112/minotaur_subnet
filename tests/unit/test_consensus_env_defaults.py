@@ -109,11 +109,17 @@ def test_locked_leader_rejects_non_leader_signer(monkeypatch):
     )
 
     engine = _fresh_engine()
+    # timestamp is REQUIRED by the H1 freshness check (added 2026-05-26).
+    # Real leaders always emit `time.time()` in the proposal body — see
+    # consensus.peer_network. Tests must mirror that to reach the
+    # locked-leader / signer-recovery checks below the timestamp gate.
+    import time as _time
     body = {
         "order_id": "ord_1",
         "plan_hash": "0xdead",
         "score": 0.9,
         "plan": {},
+        "timestamp": _time.time(),
     }
     canonical = __import__("json").dumps(body, sort_keys=True, separators=(",", ":"))
     signed = Account.sign_message(encode_defunct(text=canonical), private_key=other.key)
@@ -137,11 +143,14 @@ def test_locked_leader_accepts_matching_signer(monkeypatch):
     )
 
     engine = _fresh_engine()
+    # timestamp required by the H1 freshness check (added 2026-05-26).
+    import time as _time
     body = {
         "order_id": "ord_1",
         "plan_hash": "0xdead",
         "score": 0.9,
         "plan": {},
+        "timestamp": _time.time(),
     }
     canonical = __import__("json").dumps(body, sort_keys=True, separators=(",", ":"))
     signed = Account.sign_message(encode_defunct(text=canonical), private_key=locked.key)
