@@ -55,10 +55,11 @@ class ConsensusManager:
         self.validator_id = validator_id
         self.private_key = private_key
         self.protocol_config = protocol_config
-        # When validators is explicitly passed (tests, manual override),
-        # it pins the set. When None, the validators property reads through
-        # to protocol_config.peers + self.validator_id, picking up newly
-        # discovered peers automatically.
+        # ``validators`` is an additive env-pinned set, NOT an override.
+        # See the ``validators`` property docstring — the trusted set is the
+        # union of self, this env-pinned list, and ``protocol_config.peers``.
+        # Use this for in-cluster peers that aren't on the Bittensor
+        # metagraph and therefore can't be reached via discovery.
         self._validators_override = validators
         self.timeout = timeout
         self.chain_id = chain_id
@@ -88,19 +89,44 @@ class ConsensusManager:
 
     @property
     def validators(self) -> list[str]:
-        """Current trusted validator set.
+        """Current trusted validator set — union of self, env-pinned, discovered.
 
-        When ``validators=...`` was passed at construction, that pinned list
-        is returned (used by tests and any caller that wants a fixed set).
-        Otherwise this reads through to ``protocol_config.peers`` plus this
-        validator's own id — so new peers picked up by the discovery loop
-        become trusted signers automatically.
+        Sources, in order, deduped by lowercased EVM address (first-seen wins):
+          1. ``self.validator_id`` — always included.
+          2. ``validators=...`` ctor arg (env-pinned set, typically in-cluster
+             peers that aren't on the Bittensor metagraph and therefore can't
+             be reached via ProtocolConfig discovery).
+          3. ``protocol_config.peers`` — auto-discovered set that has passed
+             ``/identity`` EIP-712 cross-attestation against the on-chain
+             ``ValidatorRegistry``.
+
+        Updated 2026-05-26 from the previous mutually-exclusive override
+        behavior. The earlier shape forced operators to choose between
+        env-pinned in-cluster signers OR discovered third-party signers —
+        but real deployments need both: in-cluster peers have no hotkey, so
+        discovery can't reach them, while third-party validators only
+        register on-chain and only appear via discovery. Mirrors the union
+        already in ``ValidatorPeerNetwork.peers``.
         """
+        seen: set[str] = {self.validator_id.lower()}
+        result: list[str] = [self.validator_id]
+
         if self._validators_override is not None:
-            return self._validators_override
-        return [self.validator_id] + [
-            p.evm_address for p in self.protocol_config.peers
-        ]
+            for v in self._validators_override:
+                key = v.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(v)
+
+        for p in self.protocol_config.peers:
+            key = p.evm_address.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(p.evm_address)
+
+        return result
 
     @property
     def quorum_required(self) -> int:
