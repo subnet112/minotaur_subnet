@@ -208,6 +208,11 @@ services:
       CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
       FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
 
+      # On every proposal, re-check the proposer's recovered address
+      # against the on-chain ValidatorRegistry (not just the in-memory
+      # peer cache, which can be stale by up to 300s after a slash/removal).
+      CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
+
       # Score threshold (network norm)
       SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
 
@@ -325,9 +330,33 @@ services:
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
 
-      # Admin gate (matches the prod ADMIN_API_KEY pattern landed in PR #6)
-      # — gates create_app / update_scoring / deploy_app endpoints.
-      ADMIN_API_KEY: "${ADMIN_API_KEY:-}"
+      # Admin gate — REQUIRED on third-party validators. Without it, the
+      # default `RELAYER_URL` above + the wrapper-sig the api adds from
+      # `VALIDATOR_PRIVATE_KEY` means any anonymous internet caller can
+      # POST /v1/apps/{id}/deploy and have the subnet team's relayer pay
+      # gas for arbitrary contract deploys until the relayer's daily cap
+      # is exhausted. `${VAR:?msg}` makes `docker compose up` fail fast
+      # if the operator left it unset.
+      ADMIN_API_KEY: "${ADMIN_API_KEY:?ADMIN_API_KEY is required — generate with: openssl rand -hex 32}"
+
+      # Champion-consensus proposal endpoint gate. Without this, anyone
+      # on the public internet can POST /v1/solver/round/consensus/proposal
+      # to your api and trigger Docker container spawn via the
+      # docker-socket-proxy on an attacker-named image tag. Shared with
+      # the leader at registration; the leader signs all proposals with
+      # this key in an Authorization: Bearer header.
+      SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:?SOLVER_ROUND_INTERNAL_API_KEY is required — generate with: openssl rand -hex 32 and send to the subnet team at registration time}"
+
+      # Defense-in-depth: also require an EIP-191 signature on every
+      # champion proposal (recovered against the on-chain ValidatorRegistry).
+      # Default-on so a leaked SOLVER_ROUND_INTERNAL_API_KEY alone isn't
+      # sufficient — attacker would also need a registered validator key.
+      CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS: "${CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS:-1}"
+
+      # On every proposal, re-check the proposer's recovered address
+      # against the on-chain ValidatorRegistry (not just the in-memory
+      # peer cache, which can be stale by up to 300s after a slash/removal).
+      CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
     volumes:
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro"
       - store-data:/data
