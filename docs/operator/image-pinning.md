@@ -70,3 +70,90 @@ published digest:
 trivy image --severity HIGH,CRITICAL \
   ghcr.io/subnet112/minotaur-validator:stable
 ```
+
+---
+
+## Pinning by digest (defense-in-depth against tag mutation)
+
+## Why `:stable` is not a security boundary
+
+The default `MINOTAUR_IMAGE_TAG=stable` in `platform/validator/docker-compose.yml`
+is a **mutable tag**. The subnet team can — and routinely does — re-point
+`:stable` at a new image SHA when a release is promoted. That's fine for
+the auto-update flow Watchtower runs, but it means:
+
+- Anyone who can push to `ghcr.io/subnet112/minotaur-validator` can change
+  what your validator runs without your validator's image ID changing on
+  paper.
+- A compromised GHCR token at the subnet org could swap `:stable` for a
+  malicious image; Watchtower would pull and run it within one poll cycle
+  (default 1 hour).
+- Forensics after an incident are harder: `docker inspect` shows the tag,
+  not the SHA of the image you booted three weeks ago.
+
+Pinning by digest closes all three.
+
+## How to pin
+
+In your `.env` (in the same directory as `docker-compose.yml`):
+
+```bash
+# Look up the current digest of :stable
+docker manifest inspect ghcr.io/subnet112/minotaur-validator:stable \
+  | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest'
+# → sha256:abcdef0123456789...
+
+# Pin in .env
+MINOTAUR_IMAGE_TAG=stable@sha256:abcdef0123456789...
+```
+
+Then `docker compose up -d` will pull and lock to exactly that image.
+The compose `image:` line is already templated as
+`${MINOTAUR_IMAGE_TAG:-stable}`, so this Just Works.
+
+## What about Watchtower
+
+When `MINOTAUR_IMAGE_TAG` includes a digest, Watchtower **stops auto-
+updating**: the digest is the version, and only an explicit `.env` edit
++ `docker compose up -d` will move it. That is the intended behaviour
+for security-conscious operators. If you want Watchtower back on, drop
+the digest and go back to `MINOTAUR_IMAGE_TAG=stable`.
+
+## Verifying against the cosign signature (after PR-5)
+
+Once PR-5 lands, every `:stable` image is signed by the subnet team's
+cosign key and the signature is attached to the GHCR registry. To
+verify before pulling:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/subnet112/minotaur_subnet/\.github/workflows/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/subnet112/minotaur-validator:stable
+```
+
+A successful verify prints the signed digest. Cross-check that against
+the digest you're about to pin. Mismatch → do not deploy; raise on the
+subnet-team operations channel.
+
+## Updating to a new release
+
+1. Subnet team announces a new `:stable` digest on the operations
+   channel.
+2. You: `docker manifest inspect ghcr.io/subnet112/minotaur-validator:stable`
+   and confirm the digest matches the announcement.
+3. (Recommended) `cosign verify` (see above).
+4. Edit `.env`, replace the digest portion of `MINOTAUR_IMAGE_TAG`.
+5. `docker compose pull validator api && docker compose up -d validator api`.
+6. `docker compose logs -f validator api` until both pass healthcheck.
+
+## Related audit findings
+
+- F-20 (mutable base tag) — addressed by digest-pinning the base image
+  in `minotaur_subnet/Dockerfile`.
+- H10 (Watchtower auto-pull amplifies a registry compromise) —
+  addressed by this doc + by digest-pinning Watchtower itself in
+  `docker-compose.yml`.
+- H11 (operator can't tell which image was running last week) —
+  addressed by encouraging digest-pinned `.env` files committed to the
+  operator's own private infra repo.

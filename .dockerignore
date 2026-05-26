@@ -1,0 +1,66 @@
+# .dockerignore — prunes the build context shipped to `docker build`.
+#
+# Two effects:
+#   1. Faster builds + smaller layer cache: contracts/test, broadcast/,
+#      cache/, and tests/ together are >100 MB.
+#   2. Stops accidentally shipping local secrets (.env*), local store
+#      data (containing live order history), or .git history into the
+#      final image (audit F-07, F-08).
+#
+# Anything matched here is invisible to every COPY in the Dockerfile.
+
+# Version control
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Docs + READMEs — not needed at runtime
+*.md
+docs/
+
+# Test corpora — never executed in production image
+tests/
+contracts/test/
+contracts/script/
+contracts/broadcast/
+
+# Forge build cache + ABI dump — regenerated inside the builder stage
+contracts/out/
+contracts/cache/
+contracts/.git*
+contracts/lib/
+
+# Deployment-only trees
+platform/local_testnet/
+platform/local-testnet/
+platform/base-images/
+platform/validator/
+
+# Python bytecode + caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Node
+**/node_modules/
+
+# Local virtualenvs / IDE
+.venv/
+venv/
+.env*
+.idea/
+.vscode/
+
+# Logs and local state — never bake into an image
+*.log
+logs/
+minotaur_subnet/store/data/
+data/
+
+# OS junk
+.DS_Store
+Thumbs.db
