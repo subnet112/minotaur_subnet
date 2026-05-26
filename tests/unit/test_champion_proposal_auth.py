@@ -38,8 +38,18 @@ def _make_body(**overrides):
 
 # ── Signature verification ─────────────────────────────────────────────────
 
-def test_sig_verify_off_by_default(monkeypatch):
+def test_sig_verify_on_by_default(monkeypatch):
+    """PR-2 flipped the default from opt-in to opt-out (audit C2)."""
     monkeypatch.delenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", raising=False)
+    body = _make_body()  # empty proposer/signature
+    err = _verify_champion_proposal_signature(body)
+    assert err is not None
+    assert "Missing proposer" in err
+
+
+def test_sig_verify_opt_out_via_env(monkeypatch):
+    """Operators can still bypass with =0 for emergency incident handling."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "0")
     body = _make_body()
     assert _verify_champion_proposal_signature(body) is None
 

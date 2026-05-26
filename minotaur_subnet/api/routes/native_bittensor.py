@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from minotaur_subnet.api import services as _tools
+from minotaur_subnet.api.routes.apps import _debug_rate_limit, _require_admin
 
 router = APIRouter(tags=["native-bittensor"])
 
@@ -171,9 +172,19 @@ class SimSwapRequest(BaseModel):
     amount_rao: int = Field(..., description="Input amount in RAO")
 
 
-@router.post("/native-bittensor/sim-swap")
-def sim_swap(body: SimSwapRequest) -> dict[str, Any]:
-    """Simulate a TAO ↔ Alpha swap and return expected output."""
+@router.post("/native-bittensor/sim-swap", dependencies=[Depends(_require_admin)])
+def sim_swap(body: SimSwapRequest, request: Request) -> dict[str, Any]:
+    """Simulate a TAO ↔ Alpha swap and return expected output.
+
+    Admin-gated + per-IP rate-limited (1 req/min) as of PR-2 (audit H6):
+    each call opens a fresh subtensor RPC connection to
+    ``entrypoint-finney.opentensor.ai`` (or the configured SUBTENSOR_URL).
+    Anonymous abuse burns this validator's per-IP RPC quota on the
+    upstream entrypoint and can get the validator's source IP
+    rate-limited or banned by Opentensor — silently breaking on-chain
+    weight emission for hours.
+    """
+    _debug_rate_limit(request, per_minute=1)
     try:
         import os
         import bittensor as bt
