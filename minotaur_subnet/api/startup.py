@@ -991,7 +991,13 @@ async def initialize(ctx: ServerContext) -> dict:
         order_peer_network = None
         consensus_mode = os.environ.get("CONSENSUS_MODE", "local").strip().lower()
         validator_keys_env = os.environ.get("VALIDATOR_PRIVATE_KEYS", "")
-        if validator_keys_env:
+        validator_addrs_env = os.environ.get("VALIDATOR_ADDRESSES", "")
+        # Bootstrap when either env is set. ``VALIDATOR_ADDRESSES`` is the
+        # preferred public-only shape for real consensus mode; the older
+        # ``VALIDATOR_PRIVATE_KEYS`` is kept for local-testnet (where the
+        # api process genuinely signs as every validator) and for backward
+        # compatibility in real mode (with a deprecation warning).
+        if validator_keys_env or validator_addrs_env:
             try:
                 from eth_account import Account
 
@@ -1001,9 +1007,19 @@ async def initialize(ctx: ServerContext) -> dict:
                     addr = Account.from_key(key).address
                     validator_pairs.append((addr, key))
 
-                if not validator_pairs:
+                pinned_addrs_only: list[str] = [
+                    a.strip() for a in validator_addrs_env.split(",") if a.strip()
+                ]
+
+                if not validator_pairs and not pinned_addrs_only and consensus_mode == "real":
                     logger.warning(
-                        "VALIDATOR_PRIVATE_KEYS set but no validator keys parsed"
+                        "consensus envs set but no validator addresses parsed "
+                        "from VALIDATOR_ADDRESSES or VALIDATOR_PRIVATE_KEYS"
+                    )
+                elif not validator_pairs and consensus_mode == "local":
+                    logger.warning(
+                        "VALIDATOR_PRIVATE_KEYS empty in CONSENSUS_MODE=local — "
+                        "LocalTestnetConsensus signs in-process and needs the keys"
                     )
                 elif consensus_mode == "real":
                     from minotaur_subnet.consensus import ConsensusManager
@@ -1016,9 +1032,39 @@ async def initialize(ctx: ServerContext) -> dict:
                     if leader_key_env:
                         leader_key = leader_key_env
                         leader_addr = Account.from_key(leader_key).address
-                    else:
+                    elif validator_pairs:
                         leader_addr, leader_key = validator_pairs[0]
-                    all_validator_addrs = [addr for addr, _ in validator_pairs]
+                    else:
+                        raise RuntimeError(
+                            "CONSENSUS_MODE=real but no leader signing key — set "
+                            "VALIDATOR_PRIVATE_KEY (singular) to the leader's key"
+                        )
+
+                    # Build the env-pinned trusted set, preferring the public
+                    # ``VALIDATOR_ADDRESSES`` shape over ``VALIDATOR_PRIVATE_KEYS``.
+                    # In real mode the api only signs as the leader; peer
+                    # validators sign in their own processes. Holding their
+                    # private keys here just to derive their addresses widens
+                    # the blast radius for no operational benefit.
+                    if pinned_addrs_only:
+                        all_validator_addrs = list(pinned_addrs_only)
+                        if validator_keys_env and consensus_mode == "real":
+                            logger.warning(
+                                "VALIDATOR_ADDRESSES is set; ignoring "
+                                "VALIDATOR_PRIVATE_KEYS (deprecated for "
+                                "CONSENSUS_MODE=real — peer keys never sign "
+                                "here, only their addresses were used)"
+                            )
+                    else:
+                        all_validator_addrs = [addr for addr, _ in validator_pairs]
+                        if validator_keys_env:
+                            logger.warning(
+                                "VALIDATOR_PRIVATE_KEYS is deprecated in "
+                                "CONSENSUS_MODE=real — peer private keys are "
+                                "never used for signing here, only their "
+                                "addresses. Migrate to VALIDATOR_ADDRESSES "
+                                "(comma-separated 0x... EVM addresses)"
+                            )
                     if leader_addr not in all_validator_addrs:
                         all_validator_addrs.insert(0, leader_addr)
 
@@ -1064,9 +1110,19 @@ async def initialize(ctx: ServerContext) -> dict:
                         consensus_chain_rpc_url,
                     )
                     order_rpc_url = consensus_chain_rpc_url(chain_id)
+                    # ``my_evm_address`` is the discovery gate inside
+                    # ``ProtocolConfig.refresh_loop`` — without it, the
+                    # ``if metagraph_provider and my_evm_address`` check is
+                    # falsy and peer discovery is silently skipped. So
+                    # ``protocol_config.peers`` stays empty forever, the leader
+                    # broadcasts to env-pinned peers only, and quorum never
+                    # rises above the in-cluster count even after third-party
+                    # validators register on-chain. See ``validator/main.py``
+                    # for the same wiring on the third-party stack.
                     order_protocol_config = ProtocolConfig.from_validator_registry(
                         rpc_url=order_rpc_url,
                         registry_address=order_registry_address,
+                        my_evm_address=leader_addr,
                     )
                     # Stash on ctx so the refresh_loop task can be wired
                     # later, after solver_round_metagraph_sync is up.
