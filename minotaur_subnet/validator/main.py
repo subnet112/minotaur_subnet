@@ -858,6 +858,19 @@ class AppIntentsValidator:
         # we've never attempted (eg. uptime < epoch_seconds OR Bittensor not
         # configured). Updated atomically in _epoch_loop. See
         # self._last_emit_state initialization in __init__ for the schema.
+        #
+        # weights_emitter_configured + my_uid + my_last_update_block disambiguate
+        # the failure modes that ``last_emit: null`` could indicate. The chart:
+        #   weights_emitter_configured=false → wallet didn't load at startup
+        #     (likely WALLET_NAME/HOTKEY_NAME unset or wallet dir unreadable by
+        #     uid 1000). The daemon is in "metagraph-only mode" — it can sign
+        #     /identity from VALIDATOR_PRIVATE_KEY, but cannot set_weights.
+        #   weights_emitter_configured=true, my_uid=null → hotkey not on
+        #     metagraph (not registered).
+        #   weights_emitter_configured=true, my_uid=<int>, last_emit=null →
+        #     either uptime < epoch_seconds, OR the seeding path silently
+        #     failed. Compare my_last_update_block * 12s vs current chain head.
+        sync_state = getattr(self._metagraph_sync, "state", None) if self._metagraph_sync is not None else None
         return web.json_response({
             "status": "ok",
             "service": "app-intents-validator",
@@ -865,6 +878,9 @@ class AppIntentsValidator:
             "loaded_intents": len(loaded),
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
+            "weights_emitter_configured": self._weights_emitter is not None,
+            "my_uid": sync_state.my_uid if sync_state is not None else None,
+            "my_last_update_block": sync_state.my_last_update_block if sync_state is not None else None,
             "last_emit": self._last_emit_state,
             "orderbook": ob_stats,
         })
