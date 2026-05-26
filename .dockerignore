@@ -29,7 +29,12 @@ contracts/broadcast/
 contracts/out/
 contracts/cache/
 contracts/.git*
-contracts/lib/
+# Note: contracts/lib is intentionally NOT excluded (~100 MB of
+# vendored OpenZeppelin + Uniswap + forge-std). `forge install` can't
+# run in the builder (it shells out to `git submodule update`, but
+# `.git/` is excluded above), so the resolved deps must ship in the
+# build context. `forge build --sizes` is the load-bearing check for
+# completeness — a missing import surfaces as a fail-fast build error.
 
 # Deployment-only trees
 platform/local_testnet/
