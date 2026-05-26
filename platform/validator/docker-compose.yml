@@ -149,6 +149,12 @@ services:
   # Image is pinned to `:latest` in this example; in production, pin to
   # a specific sha-tagged image (ghcr.io/subnet112/minotaur-validator:sha-<sha>)
   # to avoid surprise upgrades. Watchtower auto-update lands in B.5.
+  #
+  # SECURITY: `:stable` is a MUTABLE tag. For production deployments,
+  # pin by digest in your .env:
+  #     MINOTAUR_IMAGE_TAG=stable@sha256:<digest>
+  # See docs/operator/image-pinning.md for the full procedure and the
+  # cosign verification workflow once PR-5 lands.
 
   validator:
     image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
@@ -249,6 +255,10 @@ services:
   # docker-socket-proxy side-container limits this service's Docker
   # access to just `containers/create + start + wait + logs + remove` —
   # it cannot inspect or exec arbitrary containers on the host.
+  #
+  # SECURITY: same image, same pinning guidance — set
+  # MINOTAUR_IMAGE_TAG=stable@sha256:<digest> in your .env for
+  # production. See docs/operator/image-pinning.md.
 
   api:
     image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
@@ -394,7 +404,14 @@ services:
   # cadence we publish.
 
   watchtower:
-    image: containrrr/watchtower:1.7.1
+    # Pinned by digest (audit H10). Without this a hostile re-push to
+    # the 1.7.1 tag would be auto-pulled — and Watchtower runs with
+    # full Docker-socket access. Refresh procedure (must manually
+    # review the new digest's release notes first):
+    #     docker buildx imagetools inspect containrrr/watchtower:1.7.1 \
+    #       --format '{{ json .Manifest.Digest }}'
+    # Captured 2026-05-26 against containrrr/watchtower:1.7.1.
+    image: containrrr/watchtower:1.7.1@sha256:6dd50763bbd632a83cb154d5451700530d1e44200b268a4e9488fefdfcf2b038
     restart: unless-stopped
     profiles: [autoupdate]
     environment:
