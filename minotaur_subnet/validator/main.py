@@ -190,13 +190,35 @@ def _auto_serve_axon_on_metagraph(
         )
 
     try:
+        # Pass external_ip + external_port EXPLICITLY. bittensor's Axon
+        # class has separate ``ip`` (bind address) and ``external_ip``
+        # (what gets published to the metagraph) parameters. If
+        # external_ip isn't passed, bittensor's auto-detection takes
+        # over and queries an outbound IP service (or a cached value),
+        # which on hosts that switched IPs returns the OLD address. We
+        # observed exactly that on a third-party validator (2026-05-27):
+        # serve_axon submitted ip=920929821 (=54.228.70.29, the OLD IP)
+        # while the daemon's log said ip=52.17.102.181 (the NEW one).
+        # The data field on the extrinsic response confirmed
+        # ``external_ip: '54.228.70.29'`` — bittensor's auto-detect
+        # silently overrode VALIDATOR_AXON_URL. Use ``resolved_ip`` (the
+        # already-DNS-resolved hostname from VALIDATOR_AXON_URL) for
+        # both fields so the chain entry matches what the operator
+        # actually asked for.
         served = subtensor.serve_axon(
             netuid=netuid,
-            axon=bt_module.Axon(wallet=wallet, ip=axon_ip, port=axon_port),
+            axon=bt_module.Axon(
+                wallet=wallet,
+                ip=axon_ip,
+                port=axon_port,
+                external_ip=resolved_ip,
+                external_port=axon_port,
+            ),
         )
         logger.info(
-            "Auto-served axon on metagraph (netuid=%d ip=%s port=%d ok=%s)",
-            netuid, axon_ip, axon_port, served,
+            "Auto-served axon on metagraph (netuid=%d external_ip=%s "
+            "external_port=%d ok=%s)",
+            netuid, resolved_ip, axon_port, served,
         )
     except Exception as exc:
         msg = str(exc)
