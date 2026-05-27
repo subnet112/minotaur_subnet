@@ -445,6 +445,18 @@ services:
     restart: unless-stopped
     environment:
       LOG_LEVEL: warning
+      # haproxy defaults to 1-minute idle timeouts, which is too short for
+      # `docker run --rm -i`-style invocations with attached stdio (the
+      # solver subprocess waits idle on stdin between commands). When the
+      # proxy cuts the tunnel, the docker CLI exits, the solver container
+      # exits, and the api holds a dead session reference until the next
+      # request raises SolverCrashedError. TIMEOUT_TUNNEL is the load-
+      # bearing one for stdio-attached `docker run`; client/server are
+      # bumped to match so any in-flight harness command also survives.
+      TIMEOUT_CONNECT: "30"
+      TIMEOUT_CLIENT: "3600"
+      TIMEOUT_SERVER: "3600"
+      TIMEOUT_TUNNEL: "86400"
       # Read endpoints (HTTP GET)
       CONTAINERS: 1
       IMAGES: 1
