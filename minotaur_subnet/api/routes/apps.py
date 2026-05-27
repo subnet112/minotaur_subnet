@@ -127,6 +127,19 @@ _js_engine = None
 # Module-level simulator reference, set by server.py at startup
 _simulator = None
 
+# Module-level metagraph_sync reference, set by startup.py once the
+# solver-round metagraph sync has populated state. Used by the
+# admin-or-signed-miner gate to verify a caller's hotkey is on SN112.
+# Matches the same pattern as routes/identity.py:set_metagraph_sync.
+_metagraph_sync: Any = None
+
+# Per-hotkey rate-limit buckets for signed-miner endpoints. Sliding-window
+# in-memory; resets on process restart (acceptable — the endpoint is
+# idempotent and operators shouldn't see 429s outside genuine spam).
+# Default: 60 calls/hour per hotkey, overridable via env.
+_MINER_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
+_MINER_RATE_LIMIT_LOCK = Lock()
+
 
 def set_js_engine(js_engine: Any) -> None:
     global _js_engine
@@ -136,6 +149,141 @@ def set_js_engine(js_engine: Any) -> None:
 def set_simulator(simulator: Any) -> None:
     global _simulator
     _simulator = simulator
+
+
+def set_metagraph_sync(metagraph_sync: Any) -> None:
+    """Wire the MetagraphSync instance so the signed-miner gate can check
+    membership on SN112. Called by startup.py once the periodic sync has
+    been constructed (mirrors routes/identity.py's setter)."""
+    global _metagraph_sync
+    _metagraph_sync = metagraph_sync
+
+
+def _require_admin_or_signed_miner(
+    request: Request,
+    x_admin_key: str | None = Header(None),
+    x_bittensor_hotkey: str | None = Header(None),
+    x_bittensor_signature: str | None = Header(None),
+    x_bittensor_timestamp: str | None = Header(None),
+) -> None:
+    """Allow either an admin (X-Admin-Key) OR a metagraph-registered miner
+    signing the request with their bittensor hotkey.
+
+    Designed for routes whose docstring says "miners use this" but whose
+    cost (Anvil + JS sandbox) demands DoS protection. The admin-only
+    gate was too restrictive — it locked legitimate miners out of an
+    endpoint built for them. Signed-miner path restores access without
+    opening DoS surface to anonymous callers.
+
+    Miner protocol (request headers):
+
+        X-Bittensor-Hotkey:    SS58 address of the caller's hotkey
+        X-Bittensor-Timestamp: unix seconds (must be within ±300s of now)
+        X-Bittensor-Signature: substrate signature (0x-prefixed hex) over
+                               the canonical message:
+                                   f"{METHOD} {PATH} {TIMESTAMP}"
+                               eg "POST /v1/orders/order_abc/dry-run 1779850000"
+
+    The hotkey must be present on the SN112 metagraph (proves the caller
+    is a registered participant on this subnet, not a random key). Calls
+    are rate-limited per-hotkey via a sliding 60-min window
+    (default 60 calls/hour, override with MINER_RATE_LIMIT_PER_HOUR).
+    """
+    # ── 1. admin bypass (unchanged path; admin keys can always call) ──
+    admin_key = os.environ.get("ADMIN_API_KEY", "").strip()
+    if admin_key and x_admin_key and x_admin_key == admin_key:
+        return
+
+    # ── 2. signed-miner path ──────────────────────────────────────────
+    if not (x_bittensor_hotkey and x_bittensor_signature and x_bittensor_timestamp):
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "This endpoint requires either an admin key (X-Admin-Key) "
+                "OR a signed-miner header set "
+                "(X-Bittensor-Hotkey, X-Bittensor-Signature, "
+                "X-Bittensor-Timestamp). See "
+                "scripts/miner_dry_run.py for a reference client."
+            ),
+        )
+
+    # 2a. timestamp freshness — protects against replay
+    try:
+        timestamp = int(x_bittensor_timestamp)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="X-Bittensor-Timestamp must be a unix-seconds integer",
+        )
+    skew = abs(time.time() - timestamp)
+    if skew > 300:
+        raise HTTPException(
+            status_code=401,
+            detail=f"X-Bittensor-Timestamp is {skew:.0f}s off (max ±300s)",
+        )
+
+    # 2b. canonical message + substrate signature verification
+    message = f"{request.method} {request.url.path} {timestamp}"
+    try:
+        from bittensor_wallet.keypair import Keypair  # noqa: E402
+
+        kp = Keypair(ss58_address=x_bittensor_hotkey)
+        sig_bytes = bytes.fromhex(
+            x_bittensor_signature[2:] if x_bittensor_signature.startswith("0x")
+            else x_bittensor_signature
+        )
+        if not kp.verify(message, sig_bytes):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid signature for the given hotkey",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Signature verification failed: {exc}",
+        )
+
+    # 2c. hotkey must be on the SN112 metagraph (proves participant)
+    state = getattr(_metagraph_sync, "state", None) if _metagraph_sync is not None else None
+    peers = getattr(state, "peers", None) if state is not None else None
+    if peers is None:
+        # Fail-closed: if metagraph isn't synced yet, we can't verify
+        # membership — better to 503 than to false-allow.
+        raise HTTPException(
+            status_code=503,
+            detail="Metagraph not yet synced; retry shortly",
+        )
+    if not any(p.hotkey == x_bittensor_hotkey for p in peers):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Hotkey {x_bittensor_hotkey[:12]}… not on SN112 metagraph",
+        )
+
+    # 2d. per-hotkey sliding-window rate limit
+    per_hour_raw = os.environ.get("MINER_RATE_LIMIT_PER_HOUR", "").strip()
+    try:
+        per_hour = int(per_hour_raw) if per_hour_raw else 60
+    except ValueError:
+        per_hour = 60
+    if per_hour <= 0:
+        return  # disabled — operator chose to skip rate limit
+    now_m = time.monotonic()
+    window_start = now_m - 3600.0
+    with _MINER_RATE_LIMIT_LOCK:
+        bucket = _MINER_RATE_LIMIT_BUCKETS.setdefault(x_bittensor_hotkey, deque())
+        while bucket and bucket[0] < window_start:
+            bucket.popleft()
+        if len(bucket) >= per_hour:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded for this hotkey "
+                    f"(>{per_hour} req/hour). Retry shortly."
+                ),
+            )
+        bucket.append(now_m)
 
 
 # ── request models ───────────────────────────────────────────────────────────

@@ -1586,6 +1586,13 @@ async def initialize(ctx: ServerContext) -> dict:
                     from minotaur_subnet.api.routes import identity as identity_route
                     identity_route.set_metagraph_sync(ctx.solver_round_metagraph_sync)
 
+                    # Same metagraph_sync also powers the signed-miner gate
+                    # on /orders/{id}/dry-run (PR for miner-signed access).
+                    # Both setters point at the same instance — the gate
+                    # reads .state.peers to verify hotkey membership on SN112.
+                    from minotaur_subnet.api.routes import apps as apps_route
+                    apps_route.set_metagraph_sync(ctx.solver_round_metagraph_sync)
+
                     # Wire metagraph_provider into champion ProtocolConfig
                     # and start its refresh loop. The refresh loop walks the
                     # metagraph axon list, probes each /identity, verifies
