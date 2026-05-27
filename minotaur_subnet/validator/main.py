@@ -393,6 +393,16 @@ class AppIntentsValidator:
         self._is_leader = True  # Default: standalone = always leader
         self._metagraph_task: asyncio.Task | None = None
         self._leader_monitor_task: asyncio.Task | None = None
+        # Stored references for the periodic axon-resync loop. Populated
+        # in initialize() inside the ``if subtensor_url:`` block alongside
+        # the first serve_axon call. The loop uses them to call
+        # _auto_serve_axon_on_metagraph() on a timer for operators whose
+        # public IP rotates (eg AWS ELB).
+        self._bt_subtensor: Any = None
+        self._bt_module: Any = None
+        self._bt_netuid: int | None = None
+        self._validator_axon_url: str = ""
+        self._axon_resync_task: asyncio.Task | None = None
         # Last weight-emit attempt — surfaced in /health for self-diagnosis.
         # Updated atomically inside _epoch_loop after every emit attempt
         # (success OR failure). None until the first attempt completes;
@@ -497,6 +507,14 @@ class AppIntentsValidator:
                             my_hotkey=resolved_hotkey,
                             axon_url=axon_url,
                         )
+
+                    # Stash the bittensor handles so the periodic axon-resync
+                    # loop (started later in initialize()) can reuse them
+                    # without re-creating the Subtensor client each tick.
+                    self._bt_subtensor = subtensor
+                    self._bt_module = bt
+                    self._bt_netuid = netuid
+                    self._validator_axon_url = axon_url
 
                 logger.info(
                     "Bittensor integration enabled (netuid=%d, hotkey=%s, wallet_loaded=%s)",
@@ -694,9 +712,80 @@ class AppIntentsValidator:
             self._metagraph_task = asyncio.create_task(self._metagraph_sync.sync_loop())
             self._leader_monitor_task = asyncio.create_task(self._leader_monitor_loop())
 
+        # Periodic axon re-resync. Re-resolves VALIDATOR_AXON_URL on a
+        # timer and calls serve_axon if the resolved IP drifted from
+        # what's currently on the metagraph. Required for operators
+        # behind dynamic-IP setups (AWS ELB/ALB, Cloudflare proxy,
+        # rotating residential IPs, etc.) — without this they have to
+        # restart the daemon every time their public IP rotates, which
+        # they may not even detect. Gated on having both a bittensor
+        # subtensor handle AND a configured VALIDATOR_AXON_URL.
+        if self._bt_subtensor is not None and self._validator_axon_url:
+            self._axon_resync_task = asyncio.create_task(self._axon_resync_loop())
+
         # Keep running
         while True:
             await asyncio.sleep(3600)
+
+    async def _axon_resync_loop(self) -> None:
+        """Periodically re-resolve VALIDATOR_AXON_URL and re-publish on
+        chain if the IP changed.
+
+        Composes with _auto_serve_axon_on_metagraph's existing checks:
+        the helper already (a) DNS-resolves the URL, (b) skips serve_axon
+        when the metagraph entry already matches, and (c) treats
+        Bittensor's per-hotkey serve_axon rate limit (~50 blocks / 10 min
+        on finney) as a benign no-op. So this loop just calls it on a
+        timer — the helper deduplicates work and won't spam the chain.
+
+        Default cadence 5 min (``AXON_RESYNC_INTERVAL_SECONDS``).
+        Minimum 60s — operators tempted to go faster aren't beating the
+        chain's rate limit, so it's purely log spam. Setting the env to
+        0 (or negative) disables the loop entirely for operators with
+        truly static IPs who don't want any background chain reads.
+        """
+        try:
+            interval = int(os.environ.get("AXON_RESYNC_INTERVAL_SECONDS", "300"))
+        except ValueError:
+            interval = 300
+        if interval <= 0:
+            logger.info(
+                "AXON_RESYNC_INTERVAL_SECONDS<=0; periodic axon resync disabled",
+            )
+            return
+        interval = max(60, interval)
+        logger.info(
+            "Periodic axon resync loop started (interval=%ds, VALIDATOR_AXON_URL=%s)",
+            interval, self._validator_axon_url,
+        )
+        # MetagraphSync.my_hotkey is the only authoritative copy of the
+        # hotkey ss58 after wallet load; read it each tick rather than
+        # caching so it survives a (hypothetical) hotkey-rotate restart.
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            try:
+                my_hotkey = getattr(self._metagraph_sync, "my_hotkey", "")
+                if not my_hotkey:
+                    logger.debug(
+                        "Axon resync skipped — metagraph_sync has no my_hotkey yet",
+                    )
+                    continue
+                _auto_serve_axon_on_metagraph(
+                    subtensor=self._bt_subtensor,
+                    bt_module=self._bt_module,
+                    wallet=self._bt_wallet,
+                    netuid=self._bt_netuid,
+                    my_hotkey=my_hotkey,
+                    axon_url=self._validator_axon_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Periodic axon resync iteration failed (continuing): %s",
+                    exc,
+                )
 
     def _load_orders_from_store(self) -> None:
         """Load persisted orders from the store into the in-memory OrderBook."""
