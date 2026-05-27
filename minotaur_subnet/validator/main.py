@@ -276,6 +276,7 @@ class AppIntentsValidator:
     ) -> None:
         self.store = store
         self.port = port
+        self._subtensor_url = subtensor_url
         self.engine = JsExecutionEngine(timeout_ms=10000)
         self.weights = ChampionWeights(
             epoch_seconds=epoch_seconds,
@@ -654,8 +655,8 @@ class AppIntentsValidator:
                     # Subtensor URL substring is the same heuristic the
                     # WeightsEmitter uses for its own block_time arg.
                     block_time = 0.25 if (
-                        "localhost" in (subtensor_url or "")
-                        or "127.0.0.1" in (subtensor_url or "")
+                        "localhost" in (self._subtensor_url or "")
+                        or "127.0.0.1" in (self._subtensor_url or "")
                     ) else 12.0
                     blocks_since = max(0, state.block - state.my_last_update_block)
                     self.weights.seed_epoch_clock_from_last_emit(blocks_since * block_time)
