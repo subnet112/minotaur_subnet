@@ -20,7 +20,12 @@ import subprocess
 import time
 from typing import Any
 
-from minotaur_subnet.harness.orchestrator import SolverOrchestrator, SolverSession
+from minotaur_subnet.harness.orchestrator import (
+    SolverCrashedError,
+    SolverOrchestrator,
+    SolverSession,
+    SolverTimeoutError,
+)
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
 from minotaur_subnet.shared.types import AppIntentDefinition, ExecutionPlan, IntentState, QuoteResult
 
@@ -87,6 +92,9 @@ class DockerRuntimeSolver:
         session: SolverSession,
         image_ref: str,
         metadata: SolverMetadata,
+        chain_ids: list[int] | None = None,
+        rpc_urls: dict[int, str] | None = None,
+        bridge_registry: Any = None,
     ) -> None:
         self._session = session
         self._image_ref = image_ref
@@ -102,6 +110,29 @@ class DockerRuntimeSolver:
         # caught by the Python runtime). SIGKILL will bypass this — the
         # next api boot reaps orphans via _reap_orphan_live_solvers().
         atexit.register(_atexit_reap_on_shutdown)
+        # Init args for auto-respawn after a session crash. The orchestrator
+        # kills the inner SolverSession on any per-command timeout to
+        # preserve stdio protocol sync (a half-read response from a
+        # timed-out request would desynchronize subsequent commands). A
+        # single slow Alchemy call or a malformed user order would
+        # therefore permanently break the live solver — until pre-fix
+        # 2026-05-27, the api had no way to recover without a process
+        # restart. We now keep the create-args here so the next call
+        # after a crash can rebuild the inner session transparently.
+        self._init_chain_ids = list(chain_ids or [])
+        self._init_rpc_urls = dict(rpc_urls or {})
+        self._init_bridge_registry = bridge_registry
+        # Respawn observability:
+        #   _respawn_count: how many times the session has been rebuilt
+        #     since this runtime was constructed. Surfaced in /health so
+        #     ops can spot crash-loops.
+        #   _last_respawn_at: unix seconds of the most recent respawn.
+        #     None if the runtime has never crashed.
+        #   _last_crash_error: the str() of whatever exception we caught
+        #     just before respawning. Truncated to 300 chars.
+        self._respawn_count: int = 0
+        self._last_respawn_at: float | None = None
+        self._last_crash_error: str | None = None
 
     @classmethod
     async def create(
@@ -187,7 +218,146 @@ class DockerRuntimeSolver:
                 author="unknown",
             )
 
-        return cls(session=session, image_ref=image_ref, metadata=meta)
+        return cls(
+            session=session,
+            image_ref=image_ref,
+            metadata=meta,
+            chain_ids=chain_ids,
+            rpc_urls=rpc_urls,
+            bridge_registry=bridge_registry,
+        )
+
+    async def _respawn_session(self) -> None:
+        """Rebuild the inner SolverSession after it crashed.
+
+        Caller must hold ``self._lock``. Best-effort: any failure here
+        leaves ``self._session._closed`` True so the next call will try
+        again on the next request. We don't sleep/back-off in-line —
+        respawning is fast (docker run + initialize, typically < 5s)
+        and a tight retry loop on persistent failure is preferable to
+        silently masking the problem.
+
+        Mirrors the path in ``create()`` but skips the orphan-reap
+        (handled at process boot) and the metadata refresh (cached on
+        the runtime; champion image_ref hasn't changed).
+        """
+        live_network = os.environ.get("LIVE_SOLVER_NETWORK", "").strip()
+        saved_production = os.environ.get("MINOTAUR_PRODUCTION")
+        os.environ["MINOTAUR_PRODUCTION"] = "1"
+        try:
+            orchestrator = SolverOrchestrator()
+            session = await orchestrator.start_docker(
+                self._image_ref,
+                live=True,
+                network=live_network or None,
+                labels={LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE},
+            )
+        finally:
+            if saved_production is not None:
+                os.environ["MINOTAUR_PRODUCTION"] = saved_production
+            else:
+                os.environ.pop("MINOTAUR_PRODUCTION", None)
+        await session.initialize({
+            "chain_ids": self._init_chain_ids,
+            "rpc_urls": self._init_rpc_urls,
+            "bridge_registry": self._init_bridge_registry,
+        })
+        self._session = session
+        self._respawn_count += 1
+        self._last_respawn_at = time.time()
+        logger.info(
+            "Live solver respawned (%s, respawn_count=%d)",
+            self._image_ref, self._respawn_count,
+        )
+
+    async def _ensure_session_alive(self) -> None:
+        """Respawn the inner session if it crashed since the last call.
+
+        Caller must hold ``self._lock`` so two concurrent callers don't
+        race on rebuilding. Cheap when the session is alive (one bool
+        check); only does work after a crash.
+        """
+        if self._session is not None and not self._session._closed:
+            return
+        # The session is dead (either kill-on-timeout or process exit).
+        # Rebuild it in-place so this and subsequent calls work without
+        # operator intervention.
+        try:
+            await self._respawn_session()
+        except Exception as exc:
+            # Record the failure so /health can surface it, then re-raise
+            # so the caller's request fails fast rather than hanging.
+            self._last_crash_error = f"respawn failed: {str(exc)[:280]}"
+            logger.error(
+                "Live solver respawn failed (%s): %s",
+                self._image_ref, exc,
+            )
+            raise
+
+    def is_alive(self) -> bool:
+        """Whether the underlying session can serve a request right now.
+
+        Returns False when the runtime has been explicitly shut down,
+        OR when the inner session has crashed and hasn't been respawned
+        yet. Surfaced in api's /health so ops + the validator-health
+        workflow can spot a wedged solver without waiting for a quote
+        request to fail.
+
+        Note: this is a fast property — it does NOT probe the live
+        process by sending a metadata() command. A solver that's alive
+        but unresponsive will still return True here; only an explicit
+        request will detect that state and trigger respawn.
+        """
+        return not self._closed and self._session is not None and not self._session._closed
+
+    def respawn_state(self) -> dict[str, Any]:
+        """Diagnostic snapshot for /health.
+
+        Returns the respawn count + last respawn timestamp + last crash
+        reason. Operators use this to distinguish "solver is healthy" from
+        "solver crash-looping" from "solver is wedged and respawn keeps
+        failing".
+        """
+        return {
+            "respawn_count": self._respawn_count,
+            "last_respawn_at": self._last_respawn_at,
+            "last_crash_error": self._last_crash_error,
+        }
+
+    async def _call_with_respawn(
+        self,
+        op_name: str,
+        coro_factory,
+    ) -> Any:
+        """Run a session call, respawning the session once on crash.
+
+        ``coro_factory`` is a zero-arg callable returning a fresh coroutine
+        on each invocation — needed because we may need to await the call
+        twice (first attempt → crash → respawn → second attempt). Passing
+        an already-awaited coroutine wouldn't work for the retry.
+
+        The single-retry policy is deliberate: respawning is comparatively
+        cheap, but if the second attempt also crashes the request is
+        probably hitting a real bug (malformed input that hangs the solver,
+        wedged Anvil, etc.). We surface that error to the caller rather
+        than loop forever.
+        """
+        async with self._lock:
+            await self._ensure_session_alive()
+            try:
+                return await coro_factory()
+            except (SolverCrashedError, SolverTimeoutError) as exc:
+                # Inner session is now closed (orchestrator killed it to
+                # preserve protocol sync). Respawn and retry ONCE so a
+                # single slow Alchemy roundtrip or malformed user order
+                # doesn't permanently break the live solver.
+                self._last_crash_error = f"{op_name}: {str(exc)[:280]}"
+                logger.warning(
+                    "Live solver %s crashed (%s); respawning + retrying once",
+                    op_name, type(exc).__name__,
+                )
+                await self._respawn_session()
+                return await coro_factory()
 
     async def generate_plan(
         self,
@@ -195,14 +365,23 @@ class DockerRuntimeSolver:
         state: IntentState,
         snapshot: MarketSnapshot | None = None,
     ) -> ExecutionPlan | None:
-        """Generate a plan by forwarding the request to the Docker session."""
+        """Generate a plan by forwarding the request to the Docker session.
+
+        Resilient to inner-session crashes: a single timeout (eg slow
+        Alchemy RPC, or a solver that hangs on malformed params) triggers
+        a transparent respawn-and-retry rather than permanently breaking
+        the runtime. Operators see the crash via /health.live_solver
+        but the next user request still works.
+        """
         if self._closed:
             raise RuntimeError("Champion runtime solver is closed")
         if snapshot is None:
             snapshot = MarketSnapshot.empty(chain_id=state.chain_id)
 
-        async with self._lock:
-            return await self._session.generate_plan(intent, state, snapshot)
+        return await self._call_with_respawn(
+            "generate_plan",
+            lambda: self._session.generate_plan(intent, state, snapshot),
+        )
 
     async def quote(
         self,
@@ -210,14 +389,19 @@ class DockerRuntimeSolver:
         state: IntentState,
         snapshot: MarketSnapshot | None = None,
     ) -> QuoteResult | None:
-        """Generate a quote by forwarding the request to the Docker session."""
+        """Generate a quote by forwarding the request to the Docker session.
+
+        See ``generate_plan`` for the resilience contract.
+        """
         if self._closed:
             raise RuntimeError("Champion runtime solver is closed")
         if snapshot is None:
             snapshot = MarketSnapshot.empty(chain_id=state.chain_id)
 
-        async with self._lock:
-            return await self._session.quote(intent, state, snapshot)
+        return await self._call_with_respawn(
+            "quote",
+            lambda: self._session.quote(intent, state, snapshot),
+        )
 
     async def supported_tokens(self, chain_id: int) -> list[dict[str, Any]]:
         """Forward token discovery to the solver session with a small TTL cache.
@@ -226,6 +410,8 @@ class DockerRuntimeSolver:
         open, so caching here avoids waking the solver for every refresh.
         An empty list (no discovery yet) is NOT cached — we want the first
         successful discovery to displace it.
+
+        Crash-resilient via the same respawn-and-retry path as quote/generate_plan.
         """
         if self._closed:
             raise RuntimeError("Champion runtime solver is closed")
@@ -235,8 +421,10 @@ class DockerRuntimeSolver:
         if cached and cached[1] and now - cached[0] < self._token_cache_ttl:
             return cached[1]
 
-        async with self._lock:
-            tokens = await self._session.supported_tokens(chain_id)
+        tokens = await self._call_with_respawn(
+            "supported_tokens",
+            lambda: self._session.supported_tokens(chain_id),
+        )
         if tokens:
             self._token_cache[chain_id] = (now, tokens)
         return tokens

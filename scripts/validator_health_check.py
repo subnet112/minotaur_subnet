@@ -221,6 +221,23 @@ class ValidatorStatus:
     # SHA and current :stable's SHA (commits behind). None when we can't
     # resolve (no GHCR access, no /health image_sha, etc.).
     image_commits_behind_stable: int | None = None
+    # live_solver_running: api process's view of whether its live champion
+    # solver session is currently usable. False ⇒ the Docker session crashed
+    # and respawn is pending (or no genesis solver is configured). True ⇒
+    # solver is up. None ⇒ field not present (older image) or api /health
+    # unreachable / not the leader. Sampled from the api /health (port 8080)
+    # not the validator's /health (port 9100).
+    live_solver_running: bool | None = None
+    # live_solver_respawn_count: how many times the api has respawned the
+    # live solver since its current uptime started. A fast-rising count
+    # means the solver is crash-looping (eg solver bug, persistent slow
+    # RPC, or unreachable Anvil sim). None when /health field absent.
+    live_solver_respawn_count: int | None = None
+    # live_solver_last_crash_error: truncated string of the most recent
+    # crash reason ("quote: Command quote timed out after 5.0s", etc).
+    # Used to render an "Active alerts" finding when live_solver_running
+    # is False and a recent crash is recorded.
+    live_solver_last_crash_error: str | None = None
 
 
 def parse_registries() -> list[Registry]:
@@ -384,9 +401,59 @@ async def probe_health(
     return None, last_err or "unknown"
 
 
+async def probe_api_health(
+    session: aiohttp.ClientSession,
+    axon_url: str,
+) -> tuple[dict | None, str | None]:
+    """Fetch the api process's /health (port 8080) on the same host as the axon.
+
+    The validator daemon's /health (port 9100) and the api's /health
+    (port 8080) live in separate containers but on the same Docker host
+    per the canonical compose. The api exposes solver-runtime state that
+    the daemon doesn't know about — most importantly ``live_solver_running``,
+    which tells us whether the api can currently serve quote/order
+    requests.
+
+    Best-effort: third-party operators whose api isn't exposed on 8080
+    (custom nginx, different port mapping, no api container at all) will
+    silently produce a ``(None, err)`` here. The workflow degrades to
+    "field unknown" rather than false-alarming.
+    """
+    try:
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(axon_url)
+        host = parsed.hostname
+    except Exception as exc:
+        return None, f"axon_url parse failed: {exc}"
+    if not host:
+        return None, "no host in axon_url"
+    url = f"http://{host}:8080/health"
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_SECONDS),
+            ) as r:
+                if r.status != 200:
+                    return None, f"HTTP {r.status}"
+                return await r.json(), None
+        except asyncio.TimeoutError:
+            last_err = f"timeout after {PROBE_TIMEOUT_SECONDS}s"
+            if attempt == 0:
+                continue
+        except aiohttp.ClientConnectorError as exc:
+            return None, f"connect failed: {exc}"
+        except aiohttp.ClientError as exc:
+            return None, f"client error: {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            return None, f"unexpected: {type(exc).__name__}: {exc}"
+    return None, last_err or "unknown"
+
+
 async def discover_identity_map(
     metagraph,
-) -> tuple[dict[str, dict], list[dict], dict[int, dict]]:
+) -> tuple[dict[str, dict], list[dict], dict[int, dict], dict[int, dict]]:
     """Probe every axon-serving UID for /identity AND /health.
 
     Returns ``(identity_map, probe_outcomes, health_by_uid)``:
@@ -410,26 +477,36 @@ async def discover_identity_map(
             candidates.append((uid, metagraph.hotkeys[uid], f"http://{ax.ip}:{ax.port}"))
 
     if not candidates:
-        return {}, [], {}
+        return {}, [], {}, {}
 
     async with aiohttp.ClientSession() as session:
-        # Run both probes in parallel per axon — single session reuses
-        # connections. ``return_exceptions=False`` would surface a probe
-        # exception as a task failure, but our probes already trap and
-        # return ``(None, err)`` so this is safe.
-        identity_results, health_results = await asyncio.gather(
+        # Run all three probes in parallel per axon — single session
+        # reuses connections. ``return_exceptions=False`` would surface
+        # a probe exception as a task failure, but our probes already
+        # trap and return ``(None, err)`` so this is safe.
+        #
+        # The third probe (api_health on port 8080) hits the api process
+        # on the same host. Best-effort: operators whose api isn't
+        # exposed on 8080 produce a ``(None, err)`` and the workflow
+        # leaves those fields unknown. Currently only used to surface
+        # ``live_solver_running`` for the swap-pipeline health view.
+        identity_results, health_results, api_health_results = await asyncio.gather(
             asyncio.gather(*(probe_identity(session, url) for _, _, url in candidates)),
             asyncio.gather(*(probe_health(session, url) for _, _, url in candidates)),
+            asyncio.gather(*(probe_api_health(session, url) for _, _, url in candidates)),
         )
 
     identity_map: dict[str, dict] = {}
     outcomes: list[dict] = []
     health_by_uid: dict[int, dict] = {}
-    for (uid, hk, url), (data, err), (hdata, herr) in zip(
-        candidates, identity_results, health_results,
+    api_health_by_uid: dict[int, dict] = {}
+    for (uid, hk, url), (data, err), (hdata, herr), (ahdata, aherr) in zip(
+        candidates, identity_results, health_results, api_health_results,
     ):
         if hdata is not None:
             health_by_uid[uid] = hdata
+        if ahdata is not None:
+            api_health_by_uid[uid] = ahdata
 
         if data is not None:
             evm = (data.get("evm_address") or "").lower()
@@ -509,7 +586,7 @@ async def discover_identity_map(
             f"recovered via KNOWN_VALIDATORS evm={evm_lower}",
             file=sys.stderr,
         )
-    return identity_map, outcomes, health_by_uid
+    return identity_map, outcomes, health_by_uid, api_health_by_uid
 
 
 def _classify_weight_source(
@@ -625,6 +702,7 @@ def build_statuses(
     metagraph,
     current_block: int,
     all_chain_names: list[str],
+    api_health_by_uid: dict[int, dict] | None = None,
 ) -> list[ValidatorStatus]:
     """Combine the registry union with the identity-map / metagraph view."""
     now = time.time()
@@ -716,6 +794,17 @@ def build_statuses(
                 s.my_uid_reported = health.get("my_uid")
                 s.my_last_update_block_cached = health.get("my_last_update_block")
                 s.block_loop_running = health.get("block_loop_running")
+
+            # Live-solver state from the api /health (port 8080 on the
+            # same host). Best-effort: api may not be exposed there, in
+            # which case the fields stay None and no finding fires.
+            api_health = (api_health_by_uid or {}).get(uid)
+            if api_health is not None:
+                s.live_solver_running = api_health.get("live_solver_running")
+                lsd = api_health.get("live_solver") or {}
+                s.live_solver_respawn_count = lsd.get("respawn_count")
+                s.live_solver_last_crash_error = lsd.get("last_crash_error")
+
             s.weight_source = _classify_weight_source(
                 s,
                 health,
@@ -909,6 +998,72 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                     "into an empty weights dict and are silently dropped. "
                     "Check SUBTENSOR_URL connectivity OR set "
                     "SUBNET_OWNER_HOTKEY env as the fallback."
+                ),
+            })
+
+        # Live-solver-down finding: api /health surfaced
+        # ``live_solver_running=false``, meaning the leader's swap pipeline
+        # is currently broken (quote + order endpoints will 500 until
+        # respawn or the next solver request succeeds). Only fires when
+        # api /health was reachable AND the field is present AND false —
+        # operators whose api doesn't expose /health on 8080 stay silent.
+        if s.live_solver_running is False:
+            crash_excerpt = (s.live_solver_last_crash_error or "")[:200]
+            respawn_count = s.live_solver_respawn_count
+            findings.append({
+                "type": "live_solver_down",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    f"Api process reports `live_solver_running=false` — the "
+                    f"Docker session backing /v1/apps/*/quote and /orders "
+                    f"is currently down. Quotes will 500 until the runtime "
+                    f"auto-respawns on the next request "
+                    f"(respawn_count so far: "
+                    f"`{respawn_count if respawn_count is not None else 'unknown'}`). "
+                    f"Last crash: `{crash_excerpt}`."
+                    if crash_excerpt
+                    else
+                    f"Api process reports `live_solver_running=false` — the "
+                    f"Docker session backing /v1/apps/*/quote and /orders "
+                    f"is currently down. No champion may be adopted, OR the "
+                    f"genesis solver image failed to start at boot. Check "
+                    f"the api logs for 'Live champion container started' "
+                    f"and any subsequent errors."
+                ),
+            })
+
+        # Live-solver crash-loop finding: respawn count rising fast points
+        # at a stuck/poisoned input rather than a one-off blip. Threshold
+        # picked conservatively — 3+ respawns within a single workflow run
+        # indicates real instability, not noise.
+        if (
+            s.live_solver_respawn_count is not None
+            and s.live_solver_respawn_count >= 3
+        ):
+            crash_excerpt = (s.live_solver_last_crash_error or "")[:200]
+            findings.append({
+                "type": "live_solver_crashloop",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    f"Live solver has respawned "
+                    f"**{s.live_solver_respawn_count}** times since the "
+                    f"api last started. Most recent crash: "
+                    f"`{crash_excerpt or 'unknown'}`. A persistent crash "
+                    f"loop usually means: (a) a malformed user order is "
+                    f"hanging the solver, (b) an RPC endpoint (Alchemy, "
+                    f"BT EVM) is unreachable, or (c) the solver image "
+                    f"itself has a bug. Inspect api logs near the "
+                    f"'Live solver respawned' INFO lines."
                 ),
             })
 
@@ -1182,6 +1337,8 @@ def render_summary(
                 "no_loaded_intents": "No loaded App Intents",
                 "phantom_leader": "Phantom-leader state",
                 "metagraph_sync_stuck": "Metagraph sync wedged",
+                "live_solver_down": "Live solver down",
+                "live_solver_crashloop": "Live solver crash-looping",
             }.get(f["type"], f["type"])
             name = f.get("display_name")
             if name and f.get("identity_url"):
@@ -1277,7 +1434,7 @@ def main() -> int:
         print(f"ERROR: subtensor query failed: {exc}", file=sys.stderr)
         return 2
 
-    identity_map, probe_outcomes, health_by_uid = asyncio.run(
+    identity_map, probe_outcomes, health_by_uid, api_health_by_uid = asyncio.run(
         discover_identity_map(metagraph)
     )
     total_axons = sum(
@@ -1285,7 +1442,8 @@ def main() -> int:
     )
     print(
         f"[info] identity-mapped {len(identity_map)} of {total_axons} "
-        f"axon-serving UIDs; /health-reachable on {len(health_by_uid)}",
+        f"axon-serving UIDs; /health-reachable on {len(health_by_uid)}; "
+        f"api-/health-reachable on {len(api_health_by_uid)}",
         file=sys.stderr,
     )
 
@@ -1296,6 +1454,7 @@ def main() -> int:
         metagraph=metagraph,
         current_block=current_block,
         all_chain_names=[r.name for r in registries],
+        api_health_by_uid=api_health_by_uid,
     )
 
     findings = detect_findings(statuses)
