@@ -1187,6 +1187,106 @@ def _fmt_trust(t: float | None) -> str:
     return f"{t:.3f} {marker}"
 
 
+def _fmt_image(sha: str | None) -> str:
+    """Render the image_sha column with a marker for non-standard builds.
+
+    ``image_sha`` from /health is one of:
+      - a short git SHA (e.g. "2f14b2e") — a GHCR-published build
+      - a non-hex string like "dev" / "local" — built outside CI, no
+        traceable provenance
+      - None — daemon predates PR #70 (which added the field)
+
+    Operators glance at this column to see whether everyone's on the same
+    release; the ⚠ flags rogue local builds without forcing operators to
+    learn a separate emoji legend.
+    """
+    if not sha:
+        return "—"
+    looks_like_hex = (
+        len(sha) >= 7
+        and all(c in "0123456789abcdef" for c in sha.lower())
+    )
+    if looks_like_hex:
+        return f"`{sha[:8]}`"
+    return f"`{sha}` ⚠"
+
+
+def _fmt_uptime(secs: float | None) -> str:
+    """Render uptime in a single compact unit: ``2h 14m`` / ``3d 4h``."""
+    if secs is None:
+        return "—"
+    s = int(secs)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def _fmt_block_loop(s: "ValidatorStatus") -> str:
+    """Render block_loop_running as the operator's role this run.
+
+    Distinguishes the three meaningful states:
+      - phantom_leader (block_loop_running=True but NOT the elected leader)
+        → ⚠ phantom-leader — see ``phantom_leader`` field doc for causes
+      - block_loop_running=True (and IS the elected leader) → ✅ leader
+      - block_loop_running=False → follower (normal state for non-leaders)
+      - None → field absent (older image) or /health unreachable
+    """
+    if s.block_loop_running is None:
+        return "—"
+    if s.phantom_leader:
+        return "⚠ phantom-leader"
+    return "✅ leader" if s.block_loop_running else "follower"
+
+
+def _fmt_last_emit(last_emit: dict | None, *, now: float) -> str:
+    """Render last_emit as ``Nm ago · source · ✅ ok`` (or ``❌ error``).
+
+    ``source`` field was added in PR #95's single-emit-path refactor;
+    daemons on older images report last_emit without it, rendered as
+    ``—``. Result is always present once the daemon has attempted at
+    least one emit; rendered as ``·`` when None to flag a daemon that
+    hasn't ticked an epoch boundary yet.
+    """
+    if not last_emit:
+        return "—"
+    attempted = last_emit.get("attempted_at")
+    when = "—"
+    if attempted is not None:
+        secs = int(max(0, now - attempted))
+        when = _fmt_seconds_ago(secs)
+    src = last_emit.get("source") or "—"
+    result = last_emit.get("result")
+    marker = {"ok": "✅", "error": "❌"}.get(result, "·")
+    return f"{when} · {src} · {marker} {result or '?'}"
+
+
+def _fmt_emitter(configured: bool | None) -> str:
+    if configured is None:
+        return "—"
+    return "✅" if configured else "❌"
+
+
+def _fmt_loaded_intents(n: int | None) -> str:
+    if n is None:
+        return "—"
+    return str(n)
+
+
+def _fmt_live_solver(s: "ValidatorStatus") -> str:
+    """Render live_solver state. ``—`` when api /health wasn't reachable."""
+    if s.live_solver_running is None:
+        return "—"
+    marker = "✅" if s.live_solver_running else "❌"
+    respawns = s.live_solver_respawn_count
+    if respawns is None or respawns == 0:
+        return marker
+    return f"{marker} ({respawns} respawn{'s' if respawns != 1 else ''})"
+
+
 def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     """Render the weight_source column for the dashboard.
 
@@ -1223,6 +1323,88 @@ def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     return base
 
 
+def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
+    """Render the per-validator ``/health`` deep-dive table.
+
+    Distinct from the dense main table: this one shows raw fields the
+    daemons report — useful when triaging a specific validator without
+    SSHing into their host. Rows are restricted to ``health_reachable``
+    validators; everyone else is implicitly "unknown" and already flagged
+    in the main table's "Last set by" column.
+
+    The ``Live solver`` column only appears when at least one validator's
+    api /health was reachable (typically just the elected leader running
+    the swap pipeline). Suppressing the column when uniformly empty keeps
+    the table narrow for the common case of zero leaders responding from
+    a GitHub runner.
+    """
+    now = time.time()
+    detailed = [s for s in statuses if s.health_reachable]
+    if not detailed:
+        return (
+            "## Daemon /health detail\n\n"
+            "_No `/health` probes succeeded this run — see Probe diagnostics "
+            "for per-axon reasons._"
+        )
+
+    show_live_solver = any(s.live_solver_running is not None for s in detailed)
+
+    header = [
+        "Validator", "Image", "Uptime", "Apps loaded", "Emitter",
+        "Owner HK", "Block loop", "Last emit",
+    ]
+    if show_live_solver:
+        header.append("Live solver")
+    sep = ["---"] * len(header)
+
+    lines: list[str] = []
+    lines.append("## Daemon /health detail")
+    lines.append("")
+    lines.append(
+        f"Per-validator inspection of `/health` (port 9100). Listing "
+        f"**{len(detailed)}** of {len(statuses)} validator(s) whose daemon "
+        f"answered this run; ⚠ markers flag known-bad states (non-hex "
+        f"image, missing emitter, phantom-leader). `—` cells indicate the "
+        f"daemon predates that field on its image."
+    )
+    lines.append("")
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(sep) + " |")
+
+    for s in detailed:
+        if s.display_name:
+            who = f"**{s.display_name}**"
+        elif s.uid is not None:
+            who = f"uid={s.uid}"
+        else:
+            who = f"`{_short(s.evm_address)}`"
+        row = [
+            who,
+            _fmt_image(s.image_sha),
+            _fmt_uptime(s.uptime_seconds),
+            _fmt_loaded_intents(s.loaded_intents),
+            _fmt_emitter(s.weights_emitter_configured),
+            _fmt_emitter(s.owner_hotkey_resolved),
+            _fmt_block_loop(s),
+            _fmt_last_emit(s.last_emit, now=now),
+        ]
+        if show_live_solver:
+            row.append(_fmt_live_solver(s))
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.append("")
+    lines.append(
+        "_**Last emit** format: `time ago · source · result`. ``source`` "
+        "(post-PR-#95) is ``queued_from_api`` when the api EpochManager "
+        "POSTed a per-miner ranking, or ``burn_fallback`` when the daemon "
+        "fell back to its burn-to-owner safety net. **Block loop**: ``✅ "
+        "leader`` = elected order-consensus leader; ``follower`` = normal "
+        "non-leader state; ``⚠ phantom-leader`` = daemon claims leadership "
+        "but the metagraph election picks someone else._"
+    )
+    return "\n".join(lines)
+
+
 def render_summary(
     statuses: list[ValidatorStatus],
     findings: list[dict],
@@ -1234,7 +1416,7 @@ def render_summary(
 ) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    header = ["Name", "EVM", "Hotkey", "UID", "Stake (TAO)", "Last weights", "Last set by", "Trust", "Axon", "/identity"]
+    header = ["Name", "EVM", "Hotkey", "UID", "Stake (TAO)", "Image", "Last weights", "Last set by", "Trust", "Axon", "/identity"]
     header.extend(chain_names)
     sep = ["---"] * len(header)
 
@@ -1299,6 +1481,7 @@ def render_summary(
             f"`{_short(s.hotkey or '—', head=8, tail=4)}`" if s.hotkey else "—",
             str(s.uid) if s.uid is not None else "—",
             f"{s.stake:,.0f}" if s.stake is not None else "—",
+            _fmt_image(s.image_sha) if s.uid is not None else "—",
             _fmt_seconds_ago(s.last_update_seconds_ago),
             _fmt_weight_source(s.weight_source, s.last_emit) if s.uid is not None else "—",
             _fmt_trust(s.trust),
@@ -1319,8 +1502,12 @@ def render_summary(
         "nor daemon shows a recent successful set; · = /health probe "
         "failed this run. Sub-indicators on `🟢 self`: `·queued` = "
         "per-miner ranking from api EpochManager; `·burn` = burn fallback "
-        "(no champion adopted, or queue was empty)._"
+        "(no champion adopted, or queue was empty). **Image** column "
+        "⚠ marker = non-hex `image_sha` (operator is running a local/dev "
+        "build, not a GHCR-published one)._"
     )
+    lines.append("")
+    lines.append(_render_health_detail_table(statuses))
     lines.append("")
     lines.append("## Active alerts")
     lines.append("")
