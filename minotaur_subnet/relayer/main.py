@@ -450,13 +450,28 @@ class RelayerService:
             wrapper.submission_nonce,
         )
 
-        # Wrap order_data as a light attribute-bag so EvmRelayer can
-        # read .chain_id / .order_id / .user_signature / .params off it.
+        # Wrap order_data as a light attribute-bag so EvmRelayer's
+        # downstream encoder + verifier can read the order fields off
+        # it. The encoder needs more than just the user-signing surface:
+        # it builds the on-chain ``Order`` struct from ``submitted_by``,
+        # ``deadline``, ``perpetual``, ``max_executions``, and
+        # ``cooldown`` too. Missing any of these raised
+        # ``AttributeError: '_LightOrder' object has no attribute 'X'``
+        # at submit time — caught live on prod 2026-05-27 after
+        # consensus was reached (4-of-4 sigs) but the relayer crashed
+        # on encoding. The api already includes these fields in the
+        # POST payload via ``_to_jsonable(order)``; we just weren't
+        # pulling them out here.
         light_order = _LightOrder(
             chain_id=chain_id,
             order_id=order_data.get("order_id", ""),
             user_signature=order_data.get("user_signature", ""),
             params=order_data.get("params", {}) or {},
+            submitted_by=order_data.get("submitted_by", ""),
+            deadline=order_data.get("deadline", 0),
+            perpetual=bool(order_data.get("perpetual", False)),
+            max_executions=int(order_data.get("max_executions", 1)),
+            cooldown=float(order_data.get("cooldown", 0.0)),
         )
 
         try:
