@@ -97,8 +97,8 @@ REGISTRY_ABI = [
 KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
     "0x3f1649704bacf67eeed4b373f761dfadd9df504d": {
         "hotkey": "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt",
-        "name": "Minotaur (subnet team)",
-        "url": None,
+        "name": "Minotaur Leader",
+        "url": "https://minotaursubnet.com",
     },
     "0x19235203853dd4a8dbc7c717ec669c9391e16aa1": {
         "hotkey": "5FdtBrmYC1WHKfqs34ZDpQeQqZgQjY5D32EcYChswhiWs112",
