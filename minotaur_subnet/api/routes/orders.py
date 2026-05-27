@@ -17,7 +17,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from minotaur_subnet.api.routes.apps import _env_true, _require_admin
+from minotaur_subnet.api.routes.apps import (
+    _env_true,
+    _require_admin,
+    _require_admin_or_signed_miner,
+)
 
 router = APIRouter()
 
@@ -941,14 +945,27 @@ def cancel_order(
     return {"order_id": order_id, "status": "cancelled"}
 
 
-@router.post("/orders/{order_id}/dry-run", dependencies=[Depends(_require_admin)])
+@router.post(
+    "/orders/{order_id}/dry-run",
+    dependencies=[Depends(_require_admin_or_signed_miner)],
+)
 async def dry_run_order(order_id: str, req: DryRunRequest) -> dict:
     """Score a plan against an order without side effects.
 
-    Admin-gated as of PR-2 (audit M-dry-run): each call runs the JS
-    sandbox + the chain's Anvil simulator. Anonymous callers could pin
-    the validator's worker threads on synthetic plans, starving live
-    order processing.
+    Audit M-dry-run originally admin-gated this endpoint to prevent
+    anonymous callers from pinning the validator's worker threads on
+    synthetic plans. That fixed the DoS, but also locked out the
+    legitimate miner use case the endpoint was built for ("miners use
+    this to test their plans before submitting solver code" per the
+    service docstring).
+
+    Current gate accepts EITHER:
+      - ``X-Admin-Key`` (admin path, unchanged) — full bypass for operators.
+      - Bittensor-hotkey-signed headers (miner path) — registered SN112
+        miners can call directly. Per-hotkey rate-limited (default 60/hr)
+        so DoS protection is preserved. See ``_require_admin_or_signed_miner``
+        in routes/apps.py for the signing protocol, and
+        scripts/miner_dry_run.py for a reference client.
     """
     from minotaur_subnet.api import services as _tools
 
