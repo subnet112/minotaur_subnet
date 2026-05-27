@@ -228,6 +228,32 @@ def health() -> dict:
     # docker-publish.yml build-args). 7-char prefix matches GHCR's
     # sha-XXXXXXX tag scheme; "dev" for local builds without --build-arg.
     image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
+    # Live champion solver state — surfaces whether the Docker session
+    # backing /v1/apps/*/quote and /v1/apps/*/orders is currently usable.
+    # The session can die transparently on a per-command timeout (orchestrator
+    # kills it to preserve stdio protocol sync); pre-respawn, the api would
+    # 500 every subsequent quote until the operator manually restarted the
+    # api process. Now the runtime auto-respawns on next call, but operators
+    # + the validator-health workflow still need a way to spot wedge states.
+    #
+    # ``live_solver_running`` is the simple bool the workflow's classifier
+    # uses: False ⇒ solver crashed and respawn pending OR no genesis solver
+    # configured. None ⇒ this api has no block_loop wired (only the leader's
+    # api has one), so the field is N/A.
+    #
+    # ``live_solver`` carries the diagnostic snapshot: respawn count over
+    # the runtime's lifetime, timestamp of the most recent respawn, and the
+    # truncated reason for the last crash. A non-zero ``respawn_count`` is
+    # informational; a fast-rising count is a crash-loop signal.
+    live_solver_running: bool | None = None
+    live_solver_diagnostics: dict | None = None
+    if ctx.block_loop is not None and getattr(ctx.block_loop, "solver", None) is not None:
+        _solver = ctx.block_loop.solver
+        if hasattr(_solver, "is_alive"):
+            live_solver_running = _solver.is_alive()
+        if hasattr(_solver, "respawn_state"):
+            live_solver_diagnostics = _solver.respawn_state()
+
     data = {
         "status": "ok",
         "service": "app-intents-api",
@@ -238,6 +264,8 @@ def health() -> dict:
         "solver_round_epoch": _current_solver_round_epoch(),
         "solver_round_epoch_clock": _solver_round_epoch_health(),
         "block_loop": "running" if loop_running else "disabled",
+        "live_solver_running": live_solver_running,
+        "live_solver": live_solver_diagnostics,
         "provenance_policy": dict(ctx.provenance_policy_health),
         "runtime_security_policy": dict(ctx.runtime_security_policy_health),
     }
