@@ -22,7 +22,13 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts.validator_health_check import (
     ValidatorStatus,
     _dns_resolve_first_ip,
+    _fmt_block_loop,
+    _fmt_image,
+    _fmt_last_emit,
+    _fmt_live_solver,
+    _fmt_uptime,
     _identify_leader_uid,
+    _render_health_detail_table,
     detect_findings,
 )
 
@@ -243,3 +249,182 @@ def test_multiple_findings_on_same_validator():
     assert "no_emitter" in types
     assert "no_owner_hotkey" in types
     assert "no_loaded_intents" in types
+
+
+# ── render helpers: image / uptime / block loop / last emit / live solver ──
+
+
+def test_fmt_image_published_short_sha_renders_in_code_fence():
+    """Hex SHAs (>=7 chars) render as a bare code span — the common case
+    for any GHCR-published build."""
+    assert _fmt_image("2f14b2e") == "`2f14b2e`"
+
+
+def test_fmt_image_longer_hex_is_truncated_to_8_chars():
+    """Long SHAs are truncated to 8 chars so the column stays narrow."""
+    assert _fmt_image("2f14b2ec0ffee123") == "`2f14b2ec`"
+
+
+def test_fmt_image_non_hex_string_gets_warning_marker():
+    """Local/dev builds (anything not a hex SHA) get ⚠ so operators
+    immediately see who's running an unpublished image."""
+    assert _fmt_image("dev") == "`dev` ⚠"
+    assert _fmt_image("local-build") == "`local-build` ⚠"
+
+
+def test_fmt_image_handles_missing_field():
+    """Older daemons predate ``image_sha`` and report None — render as
+    em-dash rather than the literal ``None``."""
+    assert _fmt_image(None) == "—"
+    assert _fmt_image("") == "—"
+
+
+def test_fmt_uptime_picks_largest_unit():
+    """Format picks the largest unit that fits to keep the column narrow."""
+    assert _fmt_uptime(45) == "45s"
+    assert _fmt_uptime(125) == "2m"
+    assert _fmt_uptime(3600) == "1h 0m"
+    assert _fmt_uptime(7320) == "2h 2m"
+    assert _fmt_uptime(90_000) == "1d 1h"
+
+
+def test_fmt_uptime_handles_none():
+    assert _fmt_uptime(None) == "—"
+
+
+def test_fmt_block_loop_renders_role_states():
+    """The three meaningful states must each render uniquely so a
+    glance at the table tells operators their role."""
+    follower = ValidatorStatus(evm_address="0x1", block_loop_running=False)
+    assert _fmt_block_loop(follower) == "follower"
+
+    leader = ValidatorStatus(evm_address="0x2", block_loop_running=True)
+    assert _fmt_block_loop(leader) == "✅ leader"
+
+    phantom = ValidatorStatus(
+        evm_address="0x3", block_loop_running=True, phantom_leader=True,
+    )
+    assert _fmt_block_loop(phantom) == "⚠ phantom-leader"
+
+    unknown = ValidatorStatus(evm_address="0x4", block_loop_running=None)
+    assert _fmt_block_loop(unknown) == "—"
+
+
+def test_fmt_last_emit_ok_includes_source_and_age():
+    """A successful emit renders all three pieces (age · source · ✅ ok)
+    so operators can correlate cadence vs the burn/queue source."""
+    now = 1_000_000.0
+    out = _fmt_last_emit(
+        {"attempted_at": now - 120, "source": "burn_fallback", "result": "ok"},
+        now=now,
+    )
+    assert out == "2m ago · burn_fallback · ✅ ok"
+
+
+def test_fmt_last_emit_error_keeps_failure_marker():
+    """An errored emit shows ❌ — this is the smoking-gun pattern for
+    'daemon trying, something on chain rejecting'."""
+    now = 1_000_000.0
+    out = _fmt_last_emit(
+        {"attempted_at": now - 30, "source": "burn_fallback", "result": "error"},
+        now=now,
+    )
+    assert out == "30s ago · burn_fallback · ❌ error"
+
+
+def test_fmt_last_emit_missing_source_falls_back():
+    """Pre-PR-#95 daemons report last_emit without ``source`` — render
+    as em-dash rather than the literal ``None``."""
+    now = 1_000_000.0
+    out = _fmt_last_emit(
+        {"attempted_at": now - 60, "result": "ok"},
+        now=now,
+    )
+    assert out == "1m ago · — · ✅ ok"
+
+
+def test_fmt_last_emit_none():
+    """No last_emit yet (fresh daemon, hasn't ticked an epoch boundary)."""
+    assert _fmt_last_emit(None, now=0) == "—"
+
+
+def test_fmt_live_solver_silent_when_api_unreachable():
+    """No api /health response → field stays unknown, render em-dash so
+    third-party operators without an exposed api don't get a false-bad."""
+    s = ValidatorStatus(evm_address="0x1", live_solver_running=None)
+    assert _fmt_live_solver(s) == "—"
+
+
+def test_fmt_live_solver_clean_path_is_a_bare_check():
+    """Solver up, no respawns → just ✅, no count noise."""
+    s = ValidatorStatus(
+        evm_address="0x1", live_solver_running=True, live_solver_respawn_count=0,
+    )
+    assert _fmt_live_solver(s) == "✅"
+
+
+def test_fmt_live_solver_appends_respawn_count_when_nonzero():
+    """Respawn count surfaces crash-loop signal without spawning its own column."""
+    s = ValidatorStatus(
+        evm_address="0x1", live_solver_running=True, live_solver_respawn_count=3,
+    )
+    assert _fmt_live_solver(s) == "✅ (3 respawns)"
+
+    s_one = ValidatorStatus(
+        evm_address="0x1", live_solver_running=True, live_solver_respawn_count=1,
+    )
+    assert _fmt_live_solver(s_one) == "✅ (1 respawn)"
+
+
+# ── render: full daemon-detail table ───────────────────────────────────────
+
+
+def test_render_health_detail_empty_when_no_probes_succeeded():
+    """Zero reachable daemons → render the placeholder instead of an
+    empty table (a bare header confuses operators into thinking probe
+    succeeded but everyone's silent)."""
+    unreachable = ValidatorStatus(evm_address="0x1", health_reachable=False)
+    out = _render_health_detail_table([unreachable])
+    assert "## Daemon /health detail" in out
+    assert "No `/health` probes succeeded" in out
+    assert "| Validator |" not in out  # no table header should appear
+
+
+def test_render_health_detail_renders_one_row_per_reachable_validator():
+    """Only validators with successful /health probes appear in the
+    detail table — unreachable rows are already represented in the
+    main table's 'Last set by' column as ``·``."""
+    reachable = ValidatorStatus(
+        evm_address="0xreachable", uid=1, display_name="Acme",
+        health_reachable=True, image_sha="2f14b2e",
+        uptime_seconds=3600, loaded_intents=1,
+        weights_emitter_configured=True, owner_hotkey_resolved=True,
+        block_loop_running=False,
+        last_emit={"attempted_at": 0, "source": "burn_fallback", "result": "ok"},
+    )
+    unreachable = ValidatorStatus(
+        evm_address="0xsilent", uid=2, health_reachable=False,
+    )
+    out = _render_health_detail_table([reachable, unreachable])
+    assert "**Acme**" in out
+    assert "0xsilent" not in out  # silent row excluded from this table
+    assert "Listing **1** of 2 validator(s)" in out
+
+
+def test_render_health_detail_live_solver_column_only_when_any_value():
+    """The Live solver column is suppressed when every row has None — it
+    would just add empty cells. It appears as soon as one row has
+    live_solver_running set (the elected leader, typically)."""
+    no_solver = ValidatorStatus(
+        evm_address="0x1", uid=1, health_reachable=True,
+        live_solver_running=None,
+    )
+    out = _render_health_detail_table([no_solver])
+    assert "Live solver" not in out
+
+    with_solver = ValidatorStatus(
+        evm_address="0x2", uid=2, health_reachable=True,
+        live_solver_running=True, live_solver_respawn_count=0,
+    )
+    out_with = _render_health_detail_table([no_solver, with_solver])
+    assert "| Live solver |" in out_with
