@@ -85,9 +85,10 @@ class ValidatorStatus:
 
     ``hotkey``, ``uid``, ``stake``, ``trust``, ``last_update_seconds_ago``
     are populated only when the EVM has been mapped to a metagraph entry
-    via ``/identity`` cross-attestation. Registry-only entries (in-cluster
-    validators with no metagraph hotkey) leave these fields as None and
-    the summary renders them as ``—``.
+    via ``/identity`` cross-attestation. Registry-only entries (EVMs
+    on-chain in the ValidatorRegistry but with no discoverable metagraph
+    axon — typically operators mid-deploy or with an unreachable daemon)
+    leave these fields as None and the summary renders them as ``—``.
     """
 
     evm_address: str
@@ -513,10 +514,11 @@ def build_statuses(
 def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
     """Return alert payloads for stale-weights / low-trust conditions.
 
-    EVMs without a discoverable hotkey are skipped — they're either
-    in-cluster validators (which don't post weights to Bittensor) or
-    registered-but-not-yet-deployed operators. Both states are reflected
-    in the summary; neither is an "incident".
+    EVMs without a discoverable hotkey are skipped — they're registry-only
+    entries (on-chain in the ValidatorRegistry but with no metagraph axon
+    served), typically operators mid-deploy or with a daemon we couldn't
+    reach this run. That state is reflected in the summary; it's not an
+    "incident" in itself.
     """
     findings: list[dict] = []
     for s in statuses:
@@ -680,15 +682,15 @@ def render_summary(
     lines.append(f"_Last updated: **{ts}**  ·  netuid={netuid}  ·  block={current_block:,}_")
     if coverage_incomplete:
         # Visible banner above the table — a stale row can otherwise look
-        # like an (in-cluster) validator when really we just couldn't reach
+        # like a registry-only entry when really we just couldn't reach
         # the operator's daemon during this run. The "Probe diagnostics"
         # section below this table lists each failure with its reason.
         lines.append("")
         lines.append(
             f"> ⚠️ **Coverage incomplete this run**: {n_probes_ok}/{n_probes} "
             f"`/identity` probes succeeded. Validator rows without a hotkey "
-            f"below may be unreachable rather than genuinely in-cluster — see "
-            f"the Probe diagnostics section."
+            f"below may be unreachable rather than genuinely registry-only "
+            f"(no axon served) — see the Probe diagnostics section."
         )
     lines.append("")
     lines.append(f"## Registered validators ({len(statuses)})")
@@ -704,7 +706,7 @@ def render_summary(
         elif s.uid is not None:
             name_cell = "_(no identity set)_"
         else:
-            name_cell = "_(in-cluster)_"
+            name_cell = "_(registry-only)_"
         row = [
             name_cell,
             f"`{_short(s.evm_address)}`",
