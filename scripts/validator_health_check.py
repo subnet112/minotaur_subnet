@@ -71,6 +71,63 @@ REGISTRY_ABI = [
 ]
 
 
+# Hardcoded canonical EVM ↔ hotkey ↔ display-name map for subnet-112's
+# active validator set. Two distinct fallback paths use it:
+#
+#   1. evm → uid: when the live /identity probe to an axon fails (probe
+#      timeout, "No bittensor hotkey configured", connection refused —
+#      all observed against current third-party operators), we look up
+#      the hotkey here and use ``metagraph.hotkeys.index(hk)`` to recover
+#      the uid. Without this, the row appears as "registry-only" even
+#      though we have a known-good identity for the EVM on file.
+#
+#   2. display name: when ``metagraph.identities[uid]`` is empty (the
+#      operator hasn't run subtensor's ``set_identity`` extrinsic — eg.
+#      our own validator at uid=0), we fall back to the name listed
+#      here.
+#
+# On-chain ``metagraph.identities[uid]`` always wins over this map when
+# present — operators control their own display name on subtensor and
+# we don't want to override that.
+#
+# Maintenance: whenever ``ValidatorRegistry.getValidators()`` on Base or
+# BT EVM gains a new EVM, add an entry here. Worst case if missed: that
+# operator's row falls back to "registry-only" when their axon is
+# unreachable — same behaviour the script had before this map existed.
+KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
+    "0x3f1649704bacf67eeed4b373f761dfadd9df504d": {
+        "hotkey": "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt",
+        "name": "Minotaur (subnet team)",
+        "url": None,
+    },
+    "0x19235203853dd4a8dbc7c717ec669c9391e16aa1": {
+        "hotkey": "5FdtBrmYC1WHKfqs34ZDpQeQqZgQjY5D32EcYChswhiWs112",
+        "name": "Rizzo (Insured)",
+        "url": None,
+    },
+    "0xbe93685473ce8fb096997394ea11f7ede92a0ae9": {
+        "hotkey": "5G66U8yjZJygrr8E2JGaR3PkY7UQzMtJdq9ZU2U7UQUsn112",
+        "name": "General Tensor (RoundTable21)",
+        "url": None,
+    },
+    "0x8f0bac1081661e193c21028dd1dd1002cd962d9a": {
+        "hotkey": "5HBMtn1FvqANpG8d9comQpF1gTZWr1fu9aTd8qKQMUdbbAyo",
+        "name": "TAO.com",
+        "url": None,
+    },
+    "0x8d5aba035d54128ad4d5380866af8bf33bfb6bd7": {
+        "hotkey": "5F27SMbBezy8YGdAn7zTKKNfyiHrkGP8ZdiLoJc5Prpdvsj6",
+        "name": "Kraken",
+        "url": None,
+    },
+    "0x7ef6fafcd590ad9f60fda6de093dbd238f3845b7": {
+        "hotkey": "5C7N4wGWX2QhRtyHqknp2agx4wzu3q8zP1kNvqdwkCJ7HGHa",
+        "name": "Yuma, a DCG Company",
+        "url": None,
+    },
+}
+
+
 @dataclass
 class Registry:
     name: str
@@ -342,7 +399,10 @@ async def discover_identity_map(
         if data is not None:
             evm = (data.get("evm_address") or "").lower()
             if evm:
-                identity_map[evm] = {"hotkey": hk, "axon_url": url, "uid": uid}
+                identity_map[evm] = {
+                    "hotkey": hk, "axon_url": url, "uid": uid,
+                    "source": "probe",
+                }
                 outcomes.append({
                     "uid": uid, "hotkey": hk, "axon_url": url,
                     "status": "ok", "error": None, "evm": evm,
@@ -365,6 +425,53 @@ async def discover_identity_map(
         print(
             f"[probe] uid={uid:>3} {url} → FAIL identity: {err} | "
             f"health={'ok' if hdata is not None else f'FAIL({herr})'}",
+            file=sys.stderr,
+        )
+
+    # Fallback: for any KNOWN_VALIDATORS entry the live /identity probe
+    # didn't bind, recover the uid by looking up the hardcoded hotkey in
+    # ``metagraph.hotkeys``. Two failure modes this rescues, both seen on
+    # current operators:
+    #   - axon unreachable from the runner (port closed / connect refused)
+    #   - daemon answers /identity with "No bittensor hotkey configured"
+    #     (the operator hasn't wired a hotkey into VALIDATOR_PRIVATE_KEY)
+    # Without this, the row falls through to "registry-only" even though
+    # we already know who they are. Probe still has to fail for the
+    # fallback to kick in — a successful probe whose EVM disagrees with
+    # the hardcoded map would be a real conflict, not something to paper
+    # over.
+    hotkey_to_uid = {hk: i for i, hk in enumerate(metagraph.hotkeys)}
+    outcomes_by_uid = {o["uid"]: o for o in outcomes}
+    for evm_lower, known in KNOWN_VALIDATORS.items():
+        if evm_lower in identity_map:
+            continue
+        hk = known.get("hotkey")
+        if not hk:
+            continue
+        recovered_uid = hotkey_to_uid.get(hk)
+        if recovered_uid is None:
+            continue
+        ax = metagraph.axons[recovered_uid]
+        axon_url = (
+            f"http://{ax.ip}:{ax.port}"
+            if ax.ip != "0.0.0.0" and ax.port != 0 else ""
+        )
+        identity_map[evm_lower] = {
+            "hotkey": hk, "axon_url": axon_url, "uid": recovered_uid,
+            "source": "known-validators",
+        }
+        # Mark the corresponding probe outcome (if there was one — the
+        # uid might not have been in the axon-serving candidates list at
+        # all) so the diagnostics table can render "❌ HTTP 503 →
+        # recovered" instead of a bare red X that suggests the row is
+        # missing from the table.
+        out = outcomes_by_uid.get(recovered_uid)
+        if out is not None:
+            out["recovered"] = True
+            out["evm"] = evm_lower
+        print(
+            f"[probe] uid={recovered_uid:>3} {axon_url or '(no axon)'} → "
+            f"recovered via KNOWN_VALIDATORS evm={evm_lower}",
             file=sys.stderr,
         )
     return identity_map, outcomes, health_by_uid
@@ -455,8 +562,15 @@ def build_statuses(
             s.hotkey = info["hotkey"]
             s.uid = uid
             s.axon_url = info["axon_url"]
-            s.axon_published = True
-            s.identity_reachable = True
+            # ``axon_published`` reflects the metagraph axon registration
+            # (does the operator serve an axon at all), independent of
+            # whether we could reach it. ``identity_reachable`` is the
+            # /identity probe outcome — False when we recovered the
+            # mapping from KNOWN_VALIDATORS rather than a live probe, so
+            # the operator can still tell which axons are silent.
+            ax = metagraph.axons[uid]
+            s.axon_published = ax.ip != "0.0.0.0" and ax.port != 0
+            s.identity_reachable = info.get("source") == "probe"
             s.stake = float(metagraph.stake[uid])
             # ``validator_trust`` is the post-Yuma trust score (how well
             # this UID's vote aligns with network consensus). Distinct
@@ -488,6 +602,18 @@ def build_statuses(
                     return str(v).strip() or None
                 s.display_name = _get("name")
                 s.identity_url = _get("url")
+
+            # KNOWN_VALIDATORS fallback. Subtensor's on-chain identity
+            # wins when present — operators control their own display
+            # name and we don't override it. The hardcoded entry kicks in
+            # only when the operator hasn't run ``set_identity`` (eg.
+            # the subnet team's own validator at uid=0 today).
+            if s.display_name is None:
+                fallback = KNOWN_VALIDATORS.get(evm)
+                if fallback is not None:
+                    s.display_name = fallback.get("name")
+                    if s.identity_url is None:
+                        s.identity_url = fallback.get("url")
 
             # /health-derived fields. We always populate these from the
             # uid keyed map regardless of /identity success — a daemon
@@ -674,23 +800,43 @@ def render_summary(
 
     n_probes = len(probe_outcomes)
     n_probes_ok = sum(1 for o in probe_outcomes if o["status"] == "ok")
-    coverage_incomplete = n_probes > 0 and n_probes_ok < n_probes
+    n_recovered = sum(1 for o in probe_outcomes if o.get("recovered"))
+    # "Coverage" = whether every registered validator made it into the
+    # table with a uid binding. A failed probe that was rescued by
+    # KNOWN_VALIDATORS still counts as covered; only validators whose
+    # row is genuinely missing a hotkey (and a registry-only entry that
+    # ISN'T in the known map) trigger the warning.
+    unmapped_registry = sum(1 for s in statuses if s.uid is None)
+    coverage_incomplete = unmapped_registry > 0
 
     lines: list[str] = []
     lines.append("# Validator Health Status")
     lines.append("")
     lines.append(f"_Last updated: **{ts}**  ·  netuid={netuid}  ·  block={current_block:,}_")
     if coverage_incomplete:
-        # Visible banner above the table — a stale row can otherwise look
-        # like a registry-only entry when really we just couldn't reach
-        # the operator's daemon during this run. The "Probe diagnostics"
-        # section below this table lists each failure with its reason.
+        # Visible banner above the table — a row without a hotkey can be
+        # either a registry-only entry (operator mid-deploy) or a known
+        # validator whose axon was unreachable AND isn't in
+        # KNOWN_VALIDATORS. The "Probe diagnostics" section below lists
+        # each failure with its reason.
         lines.append("")
         lines.append(
-            f"> ⚠️ **Coverage incomplete this run**: {n_probes_ok}/{n_probes} "
-            f"`/identity` probes succeeded. Validator rows without a hotkey "
-            f"below may be unreachable rather than genuinely registry-only "
-            f"(no axon served) — see the Probe diagnostics section."
+            f"> ⚠️ **{unmapped_registry} row(s) without a hotkey** — "
+            f"`/identity` succeeded on {n_probes_ok}/{n_probes} live probes "
+            f"(+{n_recovered} recovered via `KNOWN_VALIDATORS`). The rows "
+            f"below may be unreachable operators or new registrations not "
+            f"yet in the known-validators map — see the Probe diagnostics "
+            f"section."
+        )
+    elif n_recovered:
+        # Subtler — coverage is complete, but operators should know how
+        # many rows leaned on the fallback this run (so a sustained-high
+        # number flags an upstream issue like a runner-network change).
+        lines.append("")
+        lines.append(
+            f"> ℹ️ Full coverage: **{n_probes_ok}/{n_probes}** live `/identity` "
+            f"probes succeeded; **{n_recovered}** row(s) recovered via "
+            f"`KNOWN_VALIDATORS` (see Probe diagnostics for which axons)."
         )
     lines.append("")
     lines.append(f"## Registered validators ({len(statuses)})")
@@ -771,7 +917,15 @@ def render_summary(
         lines.append("| UID | Axon | Outcome | EVM (if mapped) |")
         lines.append("| --- | --- | --- | --- |")
         for o in sorted(probe_outcomes, key=lambda x: x["uid"]):
-            outcome = "✅ ok" if o["status"] == "ok" else f"❌ {o['error']}"
+            if o["status"] == "ok":
+                outcome = "✅ ok"
+            elif o.get("recovered"):
+                # Probe failed but the row IS in the table — KNOWN_VALIDATORS
+                # supplied the evm↔hotkey binding. Annotate so operators
+                # don't waste time investigating a "missing" validator.
+                outcome = f"❌ {o['error']} → recovered via `KNOWN_VALIDATORS`"
+            else:
+                outcome = f"❌ {o['error']}"
             evm_col = f"`{_short(o['evm'])}`" if o["evm"] else "—"
             lines.append(
                 f"| {o['uid']} | `{o['axon_url']}` | {outcome} | {evm_col} |"
