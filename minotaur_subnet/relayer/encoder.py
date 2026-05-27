@@ -9,9 +9,38 @@ from __future__ import annotations
 from typing import Any
 
 from eth_hash.auto import keccak
+from eth_utils import to_checksum_address
 
 from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 from minotaur_subnet.consensus.eip712 import hash_plan_eip712
+
+
+def _safe_checksum(addr: str | None, default: str = "0x" + "00" * 20) -> str:
+    """Normalize an EVM address to checksummed form, tolerating missing values.
+
+    web3.py's contract-call layer is strict about checksummed addresses —
+    passing a lowercase or mixed-case hex string raises
+    ``Web3.to_checksum_address`` complaints at submit time. We hit this
+    live on 2026-05-27: the api was storing ``app_address`` lowercase in
+    ``order.params``, the order passed consensus cleanly, then crashed
+    at relayer submit on the very first contract call.
+
+    Normalizing here at the encode boundary means downstream code can
+    keep using the address as a plain string without each call site
+    needing its own checksum guard.
+
+    Empty / falsy input returns the zero-address default rather than
+    raising — same posture as the upstream ``.get(..., default)`` pattern.
+    """
+    if not addr:
+        return default
+    try:
+        return to_checksum_address(addr)
+    except (ValueError, TypeError):
+        # Malformed hex / wrong length — pass through unchanged so the
+        # downstream web3 call raises with its native (more specific)
+        # error rather than us swallowing the bad input.
+        return addr
 
 
 def encode_intent_order(order: Any) -> tuple:
@@ -20,9 +49,13 @@ def encode_intent_order(order: Any) -> tuple:
     Returns a tuple matching the IntentOrder struct:
         (orderId, app, intentSelector, intentParams, submittedBy,
          chainId, deadline, nonce, perpetual, maxExecutions, cooldown)
+
+    Both ``app`` and ``submittedBy`` are normalized to checksummed form
+    via ``_safe_checksum`` so downstream web3 calls don't reject on the
+    strict-checksum check.
     """
     order_id_bytes = _str_to_bytes32(order.order_id)
-    app_address = order.params.get("app_address", "0x" + "00" * 20)
+    app_address = _safe_checksum(order.params.get("app_address"))
     intent_selector = bytes.fromhex(
         order.params.get("intent_selector", "00000000")
     )
@@ -35,7 +68,7 @@ def encode_intent_order(order: Any) -> tuple:
         app_address,
         intent_selector,
         intent_params,
-        order.submitted_by,
+        _safe_checksum(order.submitted_by),
         order.chain_id,
         int(order.deadline) if order.deadline else 0,
         _resolve_nonce(order.params.get("user_nonce")),  # nonce (sentinel = skip check)
