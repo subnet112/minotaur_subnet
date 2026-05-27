@@ -186,6 +186,71 @@ def test_calls_serve_when_hotkey_not_yet_on_metagraph():
     subtensor.serve_axon.assert_called_once()
 
 
+def test_axon_constructed_with_explicit_external_ip_and_port():
+    """Regression test for the silent-old-IP bug (2026-05-27): bittensor's
+    ``bt.Axon()`` auto-detects ``external_ip`` if not passed explicitly,
+    and on some hosts that auto-detect returns the wrong IP (cached, NAT
+    egress, etc.). We MUST pass external_ip + external_port explicitly so
+    serve_axon publishes the value the operator actually configured via
+    VALIDATOR_AXON_URL.
+
+    Real-world trace: a third-party operator's daemon log showed
+    ``ip=52.17.102.181`` but the extrinsic submitted ``ip=920929821``
+    which decodes to ``54.228.70.29`` (the OLD IP). The extrinsic's
+    ``data`` field confirmed bittensor's auto-detection picked the wrong
+    value.
+    """
+    subtensor = _make_subtensor(
+        metagraph_hotkeys=[_HOTKEY],
+        metagraph_axons=[SimpleNamespace(ip="10.0.0.1", port=9100)],
+    )
+    bt_stub = _bt_module_stub()
+    with patch("socket.gethostbyname", return_value="52.17.102.181"):
+        _auto_serve_axon_on_metagraph(
+            subtensor=subtensor,
+            bt_module=bt_stub,
+            wallet=MagicMock(),
+            netuid=112,
+            my_hotkey=_HOTKEY,
+            axon_url="http://52.17.102.181:9100",
+        )
+    bt_stub.Axon.assert_called_once()
+    kwargs = bt_stub.Axon.call_args.kwargs
+    assert kwargs.get("external_ip") == "52.17.102.181", (
+        "Axon(..., external_ip=...) must be the resolved IP, not auto-detected"
+    )
+    assert kwargs.get("external_port") == 9100, (
+        "Axon(..., external_port=...) must be passed explicitly to match"
+    )
+
+
+def test_axon_external_ip_uses_resolved_dns_not_raw_hostname():
+    """When VALIDATOR_AXON_URL contains a DNS name, the external_ip
+    passed to Axon must be the resolved A-record, not the hostname
+    string — the chain stores IPs as 32-bit integers and rejects
+    non-numeric input."""
+    subtensor = _make_subtensor(
+        metagraph_hotkeys=[_HOTKEY],
+        metagraph_axons=[SimpleNamespace(ip="10.0.0.1", port=9100)],
+    )
+    bt_stub = _bt_module_stub()
+    with patch("socket.gethostbyname", return_value="52.17.102.181"):
+        _auto_serve_axon_on_metagraph(
+            subtensor=subtensor,
+            bt_module=bt_stub,
+            wallet=MagicMock(),
+            netuid=112,
+            my_hotkey=_HOTKEY,
+            axon_url="http://validator.example.com:9100",
+        )
+    bt_stub.Axon.assert_called_once()
+    kwargs = bt_stub.Axon.call_args.kwargs
+    assert kwargs.get("external_ip") == "52.17.102.181"
+    # ``ip`` kwarg still gets the hostname (bind-time can use either —
+    # bittensor will resolve it locally for the socket bind).
+    assert kwargs.get("ip") == "validator.example.com"
+
+
 def test_rate_limit_error_is_treated_as_benign(caplog):
     """When serve_axon raises with the Custom error: 12 string (Serving-
     RateLimitExceeded), the helper must NOT log a warning — the previous
