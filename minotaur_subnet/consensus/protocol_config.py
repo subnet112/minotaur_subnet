@@ -152,6 +152,29 @@ class ProtocolConfig:
     # compat — see ``ConsensusManager.quorum_required``.
     on_chain_validator_count: int = 0
 
+    # Canonical authorized signer set from the on-chain ValidatorRegistry
+    # (``getValidators()``). The authoritative answer to "is this address
+    # allowed to sign?" — used by ``ConsensusManager._receive_approval`` to
+    # authorize incoming approvals.
+    #
+    # Why this is separate from ``peers``: ``peers`` is the DISCOVERED set
+    # (post-/identity-attestation, gated by network reachability). It can
+    # shrink transiently if a peer's /identity probe times out mid-refresh
+    # — even though that peer is still authorized on chain. Caught live
+    # 2026-05-27: discovery went 5→3 mid-order, and incoming approvals
+    # from the two dropped peers were rejected as "non-validator" even
+    # though they were on the chain registry and had returned valid
+    # signatures to the leader's own broadcast.
+    #
+    # The on-chain list doesn't depend on reachability — it changes only
+    # when the owner calls ``updateValidators`` (emits ``ValidatorsUpdated``).
+    # Authorization checks read THIS; broadcast targets read ``peers``.
+    #
+    # Defaults to empty for backward compat with tests that build
+    # ProtocolConfig manually without ``from_validator_registry``;
+    # ``ConsensusManager`` falls back to the in-memory union when empty.
+    on_chain_validators: list[str] = field(default_factory=list)
+
     # Populated by the refresh loop when a metagraph provider + my_evm_address
     # are configured. List is mutated in place; callers should hold a reference
     # and re-read on each operation.
@@ -231,6 +254,19 @@ class ProtocolConfig:
                 registry_address, exc,
             )
             on_chain_count = 0
+        # Also load the on-chain validator addresses. Used by the
+        # approval-authorization check (see ``ProtocolConfig.on_chain_validators``).
+        # Best-effort: same fallback semantics as the count above.
+        try:
+            on_chain_addrs = _read_validators(rpc_url, registry_address)
+        except Exception as exc:
+            logger.warning(
+                "ProtocolConfig: getValidators() failed on %s (%s); "
+                "approval-auth will fall back to in-memory validators "
+                "(may reject valid sigs during peer-discovery jitter)",
+                registry_address, exc,
+            )
+            on_chain_addrs = []
         if quorum_address and quorum_address != registry_address:
             logger.info(
                 "ProtocolConfig: loaded quorum_bps=%d (count=%d) from quorum source %s "
@@ -245,6 +281,7 @@ class ProtocolConfig:
         return cls(
             quorum_bps=value,
             on_chain_validator_count=on_chain_count,
+            on_chain_validators=on_chain_addrs,
             rpc_url=rpc_url,
             registry_address=registry_address,
             refresh_interval_seconds=refresh_interval_seconds,
@@ -323,6 +360,31 @@ class ProtocolConfig:
                 self.on_chain_validator_count, new_count, self.registry_address,
             )
             self.on_chain_validator_count = new_count
+
+        # Refresh the authorized validator address list alongside the count.
+        # Used by ConsensusManager.authorize_approver — see
+        # ``ProtocolConfig.on_chain_validators``. Lowercased for case-
+        # insensitive lookups in the auth check.
+        try:
+            new_addrs = _read_validators(self.rpc_url, self.registry_address)
+        except Exception as exc:
+            logger.warning(
+                "ProtocolConfig: getValidators() refresh failed on %s "
+                "(%s); keeping cached %d addresses",
+                self.registry_address, exc, len(self.on_chain_validators),
+            )
+            return
+        # Detect set change for operator visibility (correlated with on-chain
+        # ``updateValidators`` events).
+        before = {a.lower() for a in self.on_chain_validators}
+        after = {a.lower() for a in new_addrs}
+        if before != after:
+            logger.warning(
+                "ProtocolConfig: on-chain validator SET changed "
+                "(added=%d removed=%d total=%d)",
+                len(after - before), len(before - after), len(new_addrs),
+            )
+        self.on_chain_validators = list(new_addrs)
 
     async def _refresh_peers(self, session: aiohttp.ClientSession) -> None:
         assert self.metagraph_provider is not None

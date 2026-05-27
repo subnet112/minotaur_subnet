@@ -149,6 +149,26 @@ class ChampionConsensusManager:
             p.evm_address for p in self.protocol_config.peers
         ]
 
+    def _is_authorized_signer(self, address: str) -> bool:
+        """Whether ``address`` is allowed to sign champion-consensus approvals.
+
+        Same pattern as ``ConsensusManager._is_authorized_signer`` — reads
+        the on-chain ``ValidatorRegistry.getValidators()`` cache from
+        ``protocol_config.on_chain_validators`` when wired, with a
+        legacy fallback to the in-memory union for tests that pin the
+        validator set directly.
+        """
+        addr = address.lower()
+        if (
+            self.protocol_config is not None
+            and self.protocol_config.on_chain_validators
+        ):
+            return any(
+                a.lower() == addr
+                for a in self.protocol_config.on_chain_validators
+            )
+        return any(v.lower() == addr for v in self.validators)
+
     @property
     def quorum_required(self) -> int:
         """Number of validator approvals needed for certification.
@@ -261,7 +281,10 @@ class ChampionConsensusManager:
         proposal: ChampionProposal | None = None,
     ) -> bool:
         """Validate signer membership, tuple equality, and signature."""
-        if approval.validator_id not in self.validators:
+        # Authorization sourced from on-chain ValidatorRegistry when wired
+        # (immune to peer-discovery jitter); falls back to in-memory union.
+        # See ConsensusManager._is_authorized_signer for the rationale.
+        if not self._is_authorized_signer(approval.validator_id):
             return False
         expected = proposal or proposal_from_approval(approval)
         if not _approval_matches_proposal(approval, expected):
