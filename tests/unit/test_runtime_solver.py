@@ -22,6 +22,11 @@ from minotaur_subnet.shared.types import (
 @pytest.mark.asyncio
 async def test_create_initializes_docker_session():
     session = AsyncMock()
+    # Explicit ``_closed = False`` is required since DockerRuntimeSolver
+    # added auto-respawn — without it AsyncMock auto-attrs ``_closed`` to
+    # a truthy MagicMock, the runtime treats the session as dead, and
+    # ``_call_with_respawn`` tries to spawn a real Docker container.
+    session._closed = False
     session.metadata.return_value = SolverMetadata(
         name="champion",
         version="1.2.3",
@@ -63,6 +68,7 @@ async def test_generate_plan_forwards_to_session():
     )
 
     session = AsyncMock()
+    session._closed = False  # see test_create_initializes_docker_session
     session.metadata.return_value = SolverMetadata(
         name="champion",
         version="1.2.3",
@@ -133,6 +139,7 @@ def test_reap_orphan_live_solvers_removes_found():
 @pytest.mark.asyncio
 async def test_create_reaps_orphans_and_labels_container():
     session = AsyncMock()
+    session._closed = False  # see test_create_initializes_docker_session
     session.metadata.return_value = SolverMetadata(
         name="champion", version="1.0.0", author="m",
     )
