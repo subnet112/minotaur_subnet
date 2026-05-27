@@ -130,8 +130,29 @@ class ConsensusManager:
 
     @property
     def quorum_required(self) -> int:
-        """Number of validators needed for quorum."""
-        n = len(self.validators)
+        """Number of validators needed for quorum.
+
+        Reads from ``ProtocolConfig.on_chain_validator_count`` — the
+        canonical denominator that the on-chain ``EIP712Verifier`` would
+        use. Falls back to ``len(self.validators)`` only when no on-chain
+        count is configured (legacy test setups that construct
+        ProtocolConfig without ``from_validator_registry``).
+
+        Why not ``len(self.validators)``: that list is a UNION of self +
+        env-pinned + discovered peers, and the discovered set jitters
+        with peer availability — a transiently attested peer can briefly
+        inflate the count, pushing quorum_required up just long enough
+        for an in-flight order to require one more signature than the
+        chain truth says it should. Caught live on prod 2026-05-27 when
+        a discovery race recorded ``quorum=5`` on an order that had every
+        signature it actually needed (4 of the on-chain 6 validators).
+        """
+        n = self.protocol_config.on_chain_validator_count
+        if n == 0:
+            # Legacy / test fallback — ProtocolConfig was constructed
+            # without ``from_validator_registry``, so no on-chain count
+            # is available. Use the in-memory union as before.
+            n = len(self.validators)
         return max(1, (n * self.quorum_bps + 9999) // 10000)  # ceil division
 
     async def propose(
