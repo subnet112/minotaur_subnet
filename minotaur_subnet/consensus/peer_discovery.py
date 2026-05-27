@@ -218,38 +218,85 @@ async def _probe_one(
     """Probe a single peer's /identity endpoint and verify the binding.
 
     Returns None on any failure (network error, bad signature, unauthorized
-    EVM, hotkey/axon mismatch). Logs at debug to avoid spam from offline
-    peers.
+    EVM, hotkey/axon mismatch).
+
+    Retries network-level failures (TimeoutError, ClientError) ONCE before
+    giving up. Pre-fix, a single transient hang on a peer's /identity
+    handler would drop them from the discovered set for a full refresh
+    cycle (60s by default) — and signatures arriving from that peer
+    during the dropout window would be rejected as "non-validator" by the
+    pre-#100 auth path. Per-attempt timeout is set by the caller via
+    ``aiohttp.ClientSession.timeout``; the retry gives us roughly double
+    the budget for a peer that's just slow this tick. Permanent failures
+    (peer offline, peer not on chain, signature invalid) still reject on
+    the first attempt — only transient flakes get retried.
+
+    Failure reasons now log at INFO with the peer EVM + axon URL so
+    operators can correlate discovery jitter with specific peers. Pre-fix
+    these were all DEBUG and silently dropped, making diagnosis require
+    code reading (caught live 2026-05-27 when discovery went 5→3 mid-
+    order with zero visibility into which peers dropped or why).
     """
     url = metagraph_peer.axon_url.rstrip("/") + _IDENTITY_PATH
-    try:
-        async with session.get(url) as resp:
-            if resp.status != 200:
+    body = None
+    last_transient_err: str | None = None
+    for attempt in range(2):
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.info(
+                        "Identity probe %s returned HTTP %d — rejecting",
+                        url, resp.status,
+                    )
+                    return None
+                body = await resp.json()
+                break
+        except asyncio.TimeoutError:
+            last_transient_err = "timeout"
+            if attempt == 0:
                 logger.debug(
-                    "Identity probe %s returned HTTP %d",
-                    url, resp.status,
+                    "Identity probe %s timed out — retrying once", url,
                 )
-                return None
-            body = await resp.json()
-    except asyncio.TimeoutError:
-        logger.debug("Identity probe %s timed out", url)
-        return None
-    except aiohttp.ClientError as exc:
-        logger.debug("Identity probe %s failed: %s", url, exc)
-        return None
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("Identity probe %s raised: %s", url, exc)
+                continue
+        except aiohttp.ClientError as exc:
+            last_transient_err = f"client error: {type(exc).__name__}: {exc}"
+            if attempt == 0:
+                logger.debug(
+                    "Identity probe %s client error %s — retrying once",
+                    url, exc,
+                )
+                continue
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.info(
+                "Identity probe %s raised %s: %s — rejecting",
+                url, type(exc).__name__, str(exc)[:120],
+            )
+            return None
+        # Loop ended without ``break`` (we got an exception on this
+        # iteration). Falls through to the next iteration of the for
+        # loop, which is either the retry attempt OR the final fall-out.
+    if body is None:
+        logger.info(
+            "Identity probe %s failed after 2 attempts (%s) — rejecting",
+            url, last_transient_err or "unknown",
+        )
         return None
 
     try:
         identity = ValidatorIdentity.from_dict(body)
     except (KeyError, TypeError, ValueError) as exc:
-        logger.debug("Identity probe %s malformed payload: %s", url, exc)
+        logger.info(
+            "Identity probe %s malformed payload (%s) — rejecting",
+            url, exc,
+        )
         return None
 
     recovered = verify_identity(identity)
     if recovered is None:
-        logger.debug("Identity probe %s signature/expiry invalid", url)
+        logger.info(
+            "Identity probe %s signature or expiry invalid — rejecting",
+            url,
+        )
         return None
 
     # Cross-check 1: recovered EVM must be authorized on-chain

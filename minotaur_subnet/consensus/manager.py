@@ -128,6 +128,32 @@ class ConsensusManager:
 
         return result
 
+    def _is_authorized_signer(self, address: str) -> bool:
+        """Whether ``address`` is allowed to sign approvals on this network.
+
+        Authorization is anchored to the on-chain ``ValidatorRegistry`` —
+        the canonical answer that the on-chain ``EIP712Verifier`` would
+        give. Reads through ``protocol_config.on_chain_validators`` which
+        the refresh loop keeps current.
+
+        Falls back to ``self.validators`` (in-memory union of self +
+        env-pinned + discovered peers) when the on-chain list is empty —
+        the legacy/test path for ProtocolConfig built without
+        ``from_validator_registry``.
+
+        Case-insensitive: EVM addresses are compared lowercased so a
+        peer that attests with a checksummed address and another that
+        signs with lowercase still match.
+        """
+        addr = address.lower()
+        if self.protocol_config.on_chain_validators:
+            return any(
+                a.lower() == addr
+                for a in self.protocol_config.on_chain_validators
+            )
+        # Legacy fallback: in-memory union.
+        return any(v.lower() == addr for v in self.validators)
+
     @property
     def quorum_required(self) -> int:
         """Number of validators needed for quorum.
@@ -309,8 +335,15 @@ class ConsensusManager:
                 )
                 return None
 
-            # Verify the signature
-            if approval.validator_id not in self.validators:
+            # Authorization: is this address allowed to sign for this network?
+            # Read from the on-chain ValidatorRegistry (the canonical answer)
+            # rather than self.validators (which is the in-memory discovered
+            # set, sensitive to /identity probe failures + peer-discovery
+            # jitter). Pre-fix, a peer that returned a valid signature could
+            # be rejected as "non-validator" if its /identity probe failed
+            # during the order's consensus window — even though it was still
+            # on the chain registry. Caught live 2026-05-27.
+            if not self._is_authorized_signer(approval.validator_id):
                 logger.warning(
                     "Received approval from non-validator: %s", approval.validator_id,
                 )
