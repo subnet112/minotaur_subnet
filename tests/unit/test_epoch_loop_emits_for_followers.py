@@ -53,6 +53,12 @@ async def _run_one_iteration(self_stub) -> None:
 async def test_emits_when_validator_is_follower():
     """The fix in one sentence: follower validators emit weights too."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -71,6 +77,12 @@ async def test_emits_when_validator_is_follower():
 async def test_emits_when_validator_is_leader():
     """Leaders keep emitting too — symmetry; we removed the gate, not the call."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -89,6 +101,12 @@ async def test_skips_when_no_weights_due_to_rate_limit():
     elapsed yet. We must NOT call emit_async in that case — that's the
     rate-limiting layer."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value=None)  # rate-limited
     self_stub._champion_miner_id = None
@@ -106,6 +124,12 @@ async def test_skips_when_emitter_unset():
     """Bittensor integration disabled → ``_weights_emitter`` is None and the
     loop must not try to dereference emit_async."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -124,6 +148,12 @@ async def test_emission_exception_is_swallowed_not_killing_loop():
     epoch. Pre-fix this protection was already in place; pin it as part
     of the contract."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -147,6 +177,12 @@ async def test_emission_exception_is_swallowed_not_killing_loop():
 async def test_last_emit_records_success():
     """Successful emit_async returning True must record result=ok."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -169,6 +205,12 @@ async def test_last_emit_records_emit_returning_false():
     """emit_async returning False (chain-side rejection that didn't raise)
     is the silent-failure case PR #69's leader-gate fix unmasked. Surface it."""
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None
@@ -189,6 +231,12 @@ async def test_last_emit_records_exception_truncated():
     verbose substrate stack trace doesn't make /health huge."""
     long_err = "substrate error: " + ("X" * 1000)
     self_stub = MagicMock()
+    # PR #90 added a "defer if chain shows fresh emit" check in _epoch_loop.
+    # The check reads ``self._metagraph_sync.state`` — disabling it (state=None)
+    # keeps these older tests focused on what they were originally pinning
+    # (the gate-removal in #69, the last_emit recording in #75) without
+    # crossing concerns with the new defer logic.
+    self_stub._metagraph_sync.state = None
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value={"5HOwnerHotkey": 1.0})
     self_stub._champion_miner_id = None

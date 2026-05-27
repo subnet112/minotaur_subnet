@@ -243,6 +243,13 @@ def health() -> dict:
     }
     if ctx.epoch_manager is not None:
         data["solver_epoch"] = max(ctx.epoch_manager.current_epoch, _current_solver_round_epoch())
+        # Surface EpochManager's most recent weight-emission attempt
+        # (mirrors validator daemon's last_emit field, PR #75). On the
+        # leader, the api process emits per-miner-score weights on round
+        # close — distinct from the daemon's burn-fallback path. The
+        # ``source`` field disambiguates which code path attempted
+        # ("epoch_manager" here vs implied "epoch_loop" on the daemon).
+        data["last_emit"] = getattr(ctx.epoch_manager, "_last_emit_state", None)
     champion_consensus = submissions.get_champion_consensus_manager()
     champion_peer_network = submissions.get_champion_peer_network()
     if champion_consensus is not None:

@@ -874,6 +874,57 @@ class AppIntentsValidator:
             if epoch_weights and self._weights_emitter:
                 attempt_ts = time.time()
                 uids_attempted = len(epoch_weights)
+
+                # Defer this burn-fallback emit when chain shows a recent
+                # last_update for our own UID — something else (api's
+                # EpochManager on the leader, or an external script for
+                # operators with a hybrid setup) already set our weights
+                # within this epoch. Without this guard, the daemon and
+                # the api race for the chain rate-limit slot and the
+                # daemon's "burn fallback" sometimes wins over the api's
+                # solver-round-outcome scores (which is the WRONG vector
+                # to land — burn is meant to fill gaps, not pre-empt real
+                # ranking emissions). Threshold = 90% of epoch_seconds:
+                # leaves enough margin that a deliberately-scheduled
+                # daemon emit isn't auto-deferred by its own previous
+                # commit, while still catching cross-process races.
+                state = (
+                    getattr(self._metagraph_sync, "state", None)
+                    if self._metagraph_sync is not None else None
+                )
+                my_uid = getattr(state, "my_uid", None) if state is not None else None
+                my_last = (
+                    getattr(state, "my_last_update_block", None)
+                    if state is not None else None
+                )
+                state_block = getattr(state, "block", None) if state is not None else None
+                if (
+                    my_uid is not None
+                    and my_last is not None
+                    and my_last > 0
+                    and state_block is not None
+                ):
+                    seconds_since_chain = max(0, state_block - my_last) * 12.0
+                    defer_threshold = self.weights.epoch_seconds * 0.9
+                    if seconds_since_chain < defer_threshold:
+                        self._last_emit_state = {
+                            "attempted_at": attempt_ts,
+                            "result": "deferred",
+                            "error": (
+                                f"chain shows fresh last_update "
+                                f"({seconds_since_chain:.0f}s ago, threshold "
+                                f"{defer_threshold:.0f}s) — burn fallback "
+                                f"deferring to whichever process emitted"
+                            ),
+                            "uids_attempted": uids_attempted,
+                        }
+                        logger.info(
+                            "Burn-fallback emit deferred: chain shows "
+                            "last_update %.0fs ago (< %.0fs threshold)",
+                            seconds_since_chain, defer_threshold,
+                        )
+                        continue
+
                 try:
                     success = await self._weights_emitter.emit_async(epoch_weights)
                     self._last_emit_state = {

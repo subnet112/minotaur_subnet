@@ -146,6 +146,12 @@ class EpochManager:
         self._current_session: Any = None  # SolverSession
         self._current_epoch: int = 0
         self._epoch_history: list[dict[str, Any]] = []
+        # Last attempt by ``_emit_weights`` — surfaced via api's /health
+        # so the validator-health workflow can attribute leader-side
+        # emissions to the api process. Mirrors the schema used by the
+        # validator daemon's ``_last_emit_state`` (PR #75). None until
+        # the first attempt completes.
+        self._last_emit_state: dict | None = None
 
         restored = self._restore_active_champion_submission()
         if restored is not None:
@@ -1150,6 +1156,14 @@ class EpochManager:
         if self._weights_emitter is None:
             return False
 
+        # Mirrors the validator daemon's ``_epoch_loop`` instrumentation
+        # (PR #75): every attempt — success, error, or empty-mapping no-op
+        # — gets recorded so api's /health can attribute leader-side
+        # emissions. The validator-health workflow's "self vs external"
+        # classifier reads this AND the daemon's state; agreement on
+        # either confirms a daemon-driven emit.
+        import time as _time
+        attempt_ts = _time.time()
         try:
             mapping = self._build_weights_mapping(epoch, round_id=round_id)
             if not mapping:
@@ -1157,6 +1171,13 @@ class EpochManager:
                     "No valid weights available for emission in epoch %d",
                     epoch,
                 )
+                self._last_emit_state = {
+                    "attempted_at": attempt_ts,
+                    "result": "empty",
+                    "error": "no scored miners this epoch — nothing to emit",
+                    "uids_attempted": 0,
+                    "source": "epoch_manager",
+                }
                 return False
 
             logger.info(
@@ -1166,8 +1187,22 @@ class EpochManager:
             success = await self._weights_emitter.emit_async(mapping)
             if success:
                 logger.info("Weights emitted successfully for epoch %d", epoch)
+                self._last_emit_state = {
+                    "attempted_at": attempt_ts,
+                    "result": "ok",
+                    "error": None,
+                    "uids_attempted": len(mapping),
+                    "source": "epoch_manager",
+                }
             else:
                 logger.warning("Weight emission returned failure for epoch %d", epoch)
+                self._last_emit_state = {
+                    "attempted_at": attempt_ts,
+                    "result": "error",
+                    "error": "emit_async returned False (chain rejection — see daemon logs)",
+                    "uids_attempted": len(mapping),
+                    "source": "epoch_manager",
+                }
             return success
 
         except Exception as exc:
@@ -1175,6 +1210,13 @@ class EpochManager:
                 "Weight emission failed for epoch %d (non-fatal): %s",
                 epoch, exc,
             )
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "error",
+                "error": str(exc)[:300],
+                "uids_attempted": 0,
+                "source": "epoch_manager",
+            }
             return False
 
     def _count_scored(self, epoch: int, *, round_id: str | None = None) -> int:
