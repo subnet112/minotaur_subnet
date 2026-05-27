@@ -128,6 +128,30 @@ class ProtocolConfig:
     registry_address: str
     refresh_interval_seconds: int = 60
 
+    # Canonical validator count from the on-chain ``ValidatorRegistry``
+    # (``getValidatorCount()``). This is the DENOMINATOR for quorum
+    # calculations — ``ConsensusManager.quorum_required`` reads this,
+    # not ``len(peers)``.
+    #
+    # Why this is separate from ``peers``: ``peers`` is the OFF-CHAIN
+    # discovered set (post-/identity-attestation) and jitters with peer
+    # availability — a momentarily-attested peer that drops on the next
+    # refresh, two attestations of the same address with different
+    # case-folding, etc. We saw this bite live on prod 2026-05-27 when
+    # ``len(self.validators)`` briefly went 6 → 7 → 6 across a single
+    # order's consensus window, recording ``quorum=5`` instead of the
+    # chain-truth ``quorum=4`` and rejecting an order that had every
+    # legitimate signature it needed. The on-chain count doesn't jitter:
+    # it changes only when the owner calls ``updateValidators``, and
+    # that emits ``ValidatorsUpdated`` (auditable on chain).
+    #
+    # Defaults to ``0`` so existing tests that construct ProtocolConfig
+    # directly (without ``from_validator_registry``) continue to work;
+    # ``quorum_required`` treats ``0`` as a sentinel meaning "no on-chain
+    # source configured" and falls back to len(validators) for backward
+    # compat — see ``ConsensusManager.quorum_required``.
+    on_chain_validator_count: int = 0
+
     # Populated by the refresh loop when a metagraph provider + my_evm_address
     # are configured. List is mutated in place; callers should hold a reference
     # and re-read on each operation.
@@ -192,19 +216,35 @@ class ProtocolConfig:
             )
 
         value = _read_quorum_bps(rpc_url, quorum_source)
+        # Read the on-chain validator count alongside quorum_bps so the
+        # off-chain quorum denominator matches what the on-chain verifier
+        # would use. Best-effort: if this read fails (e.g. older deployed
+        # registry without ``getValidatorCount``), we record 0 and the
+        # consensus manager falls back to its in-memory len(validators).
+        try:
+            on_chain_count = _read_validator_count(rpc_url, registry_address)
+        except Exception as exc:
+            logger.warning(
+                "ProtocolConfig: getValidatorCount() failed on %s (%s); "
+                "quorum will fall back to in-memory validator count "
+                "(may be sensitive to peer-discovery jitter)",
+                registry_address, exc,
+            )
+            on_chain_count = 0
         if quorum_address and quorum_address != registry_address:
             logger.info(
-                "ProtocolConfig: loaded quorum_bps=%d from quorum source %s "
+                "ProtocolConfig: loaded quorum_bps=%d (count=%d) from quorum source %s "
                 "(validator set from %s)",
-                value, quorum_source, registry_address,
+                value, on_chain_count, quorum_source, registry_address,
             )
         else:
             logger.info(
-                "ProtocolConfig: loaded quorum_bps=%d from ValidatorRegistry %s",
-                value, registry_address,
+                "ProtocolConfig: loaded quorum_bps=%d (count=%d) from ValidatorRegistry %s",
+                value, on_chain_count, registry_address,
             )
         return cls(
             quorum_bps=value,
+            on_chain_validator_count=on_chain_count,
             rpc_url=rpc_url,
             registry_address=registry_address,
             refresh_interval_seconds=refresh_interval_seconds,
@@ -263,6 +303,27 @@ class ProtocolConfig:
             )
             self.quorum_bps = new_value
 
+        # Also refresh the on-chain validator count. Same source as
+        # construction; logged as a warning when it changes so operators
+        # can correlate quorum_required shifts with on-chain
+        # ``updateValidators`` calls without grepping events.
+        try:
+            new_count = _read_validator_count(self.rpc_url, self.registry_address)
+        except Exception as exc:
+            logger.warning(
+                "ProtocolConfig: getValidatorCount() refresh failed on %s "
+                "(%s); keeping cached count=%d",
+                self.registry_address, exc, self.on_chain_validator_count,
+            )
+            return
+        if new_count != self.on_chain_validator_count:
+            logger.warning(
+                "ProtocolConfig: validator_count changed %d -> %d on %s — "
+                "quorum_required will pick up the new value on next propose",
+                self.on_chain_validator_count, new_count, self.registry_address,
+            )
+            self.on_chain_validator_count = new_count
+
     async def _refresh_peers(self, session: aiohttp.ClientSession) -> None:
         assert self.metagraph_provider is not None
         try:
@@ -320,6 +381,24 @@ def _read_quorum_bps(rpc_url: str, registry_address: str) -> int:
         abi=_VALIDATOR_REGISTRY_ABI,
     )
     return int(registry.functions.quorumBps().call())
+
+
+def _read_validator_count(rpc_url: str, registry_address: str) -> int:
+    """Read the canonical validator count from the on-chain registry.
+
+    Used as the quorum denominator (see
+    ``ProtocolConfig.on_chain_validator_count`` and
+    ``ConsensusManager.quorum_required``). Reads ``getValidatorCount()``
+    — the same accessor the on-chain ``AppIntentBase`` uses when
+    verifying a quorum bundle, so off-chain and on-chain agree byte-
+    for-byte on how many signatures are required.
+    """
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    registry = w3.eth.contract(
+        address=Web3.to_checksum_address(registry_address),
+        abi=_VALIDATOR_REGISTRY_ABI,
+    )
+    return int(registry.functions.getValidatorCount().call())
 
 
 def _read_validators(rpc_url: str, registry_address: str) -> list[str]:

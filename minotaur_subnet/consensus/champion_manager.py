@@ -151,8 +151,20 @@ class ChampionConsensusManager:
 
     @property
     def quorum_required(self) -> int:
-        """Number of validator approvals needed for certification."""
-        n = len(self.validators)
+        """Number of validator approvals needed for certification.
+
+        Reads from ``ProtocolConfig.on_chain_validator_count`` when wired,
+        falling back to ``len(self.validators)`` for legacy/test setups
+        that pin the validator set directly. See
+        ``ConsensusManager.quorum_required`` for the full rationale —
+        same fix for the order-consensus path applied here so
+        champion-consensus inherits the same jitter-immunity.
+        """
+        n = 0
+        if self.protocol_config is not None:
+            n = self.protocol_config.on_chain_validator_count
+        if n == 0:
+            n = len(self.validators)
         return max(1, (n * self.quorum_bps + 9999) // 10000)
 
     @property
