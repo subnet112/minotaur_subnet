@@ -243,6 +243,13 @@ def health() -> dict:
     }
     if ctx.epoch_manager is not None:
         data["solver_epoch"] = max(ctx.epoch_manager.current_epoch, _current_solver_round_epoch())
+        # Most recent EpochManager queue POST. Schema matches the
+        # validator daemon's /health.last_emit so the validator-health
+        # workflow can read either /health endpoint and apply the same
+        # classifier. Result is "queued" / "empty" / "error" — the
+        # actual chain emit happens in the validator daemon (which
+        # records its own _last_emit_state under source="queued_from_api").
+        data["last_emit"] = getattr(ctx.epoch_manager, "_last_emit_state", None)
     champion_consensus = submissions.get_champion_consensus_manager()
     champion_peer_network = submissions.get_champion_peer_network()
     if champion_consensus is not None:
