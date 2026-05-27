@@ -186,6 +186,41 @@ class ValidatorStatus:
     weights_emitter_configured: bool | None = None
     last_emit: dict | None = None
     weight_source: str | None = None
+    # ── Tier 1 additions ──
+    # Raw fields lifted from /health when the probe succeeded. None when
+    # the daemon predates the field (older image) OR /health was unreachable.
+    image_sha: str | None = None
+    owner_hotkey_resolved: bool | None = None
+    loaded_intents: int | None = None
+    uptime_seconds: float | None = None
+    my_uid_reported: int | None = None
+    my_last_update_block_cached: int | None = None
+    block_loop_running: bool | None = None
+    # ── Tier 2 derived signals ──
+    # phantom_leader: daemon reports block_loop_running=True even though
+    # it isn't the metagraph-elected leader (highest validator-permit
+    # stake). Indicates the daemon's metagraph_sync fell through to the
+    # fail-open ``_is_leader=True`` branch (eg. silent sync errors at
+    # startup). Cosmetic on prod since real chain interactions need a
+    # gas-wallet, but worth surfacing.
+    phantom_leader: bool = False
+    # metagraph_sync_stale: their daemon's cached ``my_last_update_block``
+    # diverges from the chain's current view by more than one tempo
+    # (~360 blocks / 72 min). Means their MetagraphSync background loop
+    # is wedged — they're voting on stale snapshots.
+    metagraph_sync_stale: bool = False
+    # axon_dns_drift: /identity.axon_url's DNS resolves to a different IP
+    # than what the metagraph has on chain. Could be ELB rotation between
+    # serve_axon ticks (benign) OR a serious config drift (alarming).
+    # Surfaced for human review, no auto-alert.
+    axon_dns_drift: bool = False
+    # probe_latency_ms: wall-clock time the /identity request took. Useful
+    # to spot operators on degrading networks.
+    probe_latency_ms: int | None = None
+    # image_drift_versus_stable: count of merges between operator's image
+    # SHA and current :stable's SHA (commits behind). None when we can't
+    # resolve (no GHCR access, no /health image_sha, etc.).
+    image_commits_behind_stable: int | None = None
 
 
 def parse_registries() -> list[Registry]:
@@ -537,6 +572,52 @@ def _classify_weight_source(
     return "stale"
 
 
+def _identify_leader_uid(metagraph) -> int | None:
+    """Pick the canonical "order consensus leader" UID.
+
+    Definition matches the validator daemon's own election (see
+    minotaur_subnet/validator/metagraph_sync.py:elect_leader): highest-
+    stake permit-holder with an active axon, ties broken by hotkey
+    lexicographic order. Returns None when no validator on the metagraph
+    has both a permit and an axon — e.g. the moments after a clean redeploy.
+    """
+    candidates = []
+    n = int(metagraph.n.item()) if hasattr(metagraph.n, "item") else int(metagraph.n)
+    for uid in range(n):
+        try:
+            if not bool(metagraph.validator_permit[uid]):
+                continue
+            ax = metagraph.axons[uid]
+            if ax.ip == "0.0.0.0" or ax.port == 0:
+                continue
+            candidates.append((
+                -float(metagraph.stake[uid]),  # negative for descending stake sort
+                metagraph.hotkeys[uid],         # tie-break: ascending hotkey
+                uid,
+            ))
+        except (IndexError, AttributeError):
+            continue
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+
+def _dns_resolve_first_ip(host: str) -> str | None:
+    """Resolve ``host`` (hostname or IPv4 string) to a single IPv4 address.
+
+    Returns None on resolution failure. When ``host`` is already a numeric
+    IP, returns it unchanged. The fail-soft behaviour keeps the script
+    running through transient DNS hiccups instead of poisoning the whole
+    workflow run.
+    """
+    import socket as _socket
+    try:
+        return _socket.gethostbyname(host)
+    except (OSError, _socket.gaierror):
+        return None
+
+
 def build_statuses(
     registered_evms: dict[str, dict[str, bool]],
     identity_map: dict[str, dict],
@@ -547,6 +628,7 @@ def build_statuses(
 ) -> list[ValidatorStatus]:
     """Combine the registry union with the identity-map / metagraph view."""
     now = time.time()
+    leader_uid = _identify_leader_uid(metagraph)
     out: list[ValidatorStatus] = []
     for evm, chain_regs in sorted(registered_evms.items()):
         # Backfill any chain that wasn't in the per-EVM map at all — happens
@@ -624,12 +706,71 @@ def build_statuses(
                 s.health_reachable = True
                 s.weights_emitter_configured = health.get("weights_emitter_configured")
                 s.last_emit = health.get("last_emit")
+                # Tier 1: lift raw /health fields onto the status object.
+                # Each is None when the daemon predates the field (older
+                # image) — alert logic must handle that case gracefully.
+                s.image_sha = health.get("image_sha")
+                s.owner_hotkey_resolved = health.get("owner_hotkey_resolved")
+                s.loaded_intents = health.get("loaded_intents")
+                s.uptime_seconds = health.get("uptime_seconds")
+                s.my_uid_reported = health.get("my_uid")
+                s.my_last_update_block_cached = health.get("my_last_update_block")
+                s.block_loop_running = health.get("block_loop_running")
             s.weight_source = _classify_weight_source(
                 s,
                 health,
                 now=now,
                 stale_threshold_seconds=STALE_THRESHOLD_SECONDS,
             )
+
+            # ── Tier 2 derived signals ──
+            # phantom_leader: their daemon ran the block_loop (claims to
+            # be leader) but the canonical metagraph election says
+            # someone else holds the leadership. Two ways to land here:
+            # (a) the daemon's metagraph_sync hit an exception at startup
+            # and fell through to ``_is_leader=True`` (we saw this with
+            # Yuma DCG on 2026-05-27), or (b) the daemon explicitly
+            # honors ``FORCE_LEADER=1`` env. Both are operator-side
+            # configurations; we just surface the mismatch.
+            if (
+                leader_uid is not None
+                and uid is not None
+                and uid != leader_uid
+                and s.block_loop_running is True
+            ):
+                s.phantom_leader = True
+
+            # metagraph_sync_stale: the operator's daemon's CACHED
+            # last_update_block (populated by their MetagraphSync loop)
+            # diverges from the chain's ACTUAL current last_update for
+            # the same UID by more than one tempo. Means their sync is
+            # wedged — they emitted to chain but their daemon never saw
+            # it back. Compares the operator's view (from /health) to
+            # the workflow's fresh chain read (last_update_block).
+            # Threshold = 360 blocks ≈ 72 min on mainnet (one tempo).
+            if (
+                s.my_last_update_block_cached is not None
+                and s.my_last_update_block_cached > 0
+                and last_update_block - s.my_last_update_block_cached > 360
+            ):
+                s.metagraph_sync_stale = True
+
+            # axon_dns_drift: /identity advertises an axon_url (operator-
+            # configured VALIDATOR_AXON_URL). We DNS-resolve it from the
+            # workflow runner and compare against what the chain has on
+            # the metagraph. Mismatch = operator's host is reachable at
+            # a different IP than what they published. Common transient
+            # cause: ELB IP rotation between the daemon's serve_axon
+            # ticks (benign, expected to converge within an hour).
+            if s.axon_url:
+                from urllib.parse import urlparse as _urlparse
+                parsed = _urlparse(s.axon_url)
+                host = parsed.hostname or ""
+                if host:
+                    resolved = _dns_resolve_first_ip(host)
+                    if resolved is not None and resolved != ax.ip:
+                        s.axon_dns_drift = True
+
         out.append(s)
     return out
 
@@ -728,6 +869,131 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                     f"voting on and why it differs from the rest of the network."
                 ),
             })
+
+        # ── Tier 1 finding types ──
+        # All gated on health_reachable so we only fire when we got a
+        # /health probe through. ``None`` fields are silent (predates the
+        # daemon's PR — older operators won't false-fire).
+
+        if s.health_reachable and s.weights_emitter_configured is False:
+            findings.append({
+                "type": "no_emitter",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    "Daemon is healthy on /health but its weight emitter "
+                    "isn't configured (`weights_emitter_configured=false`). "
+                    "Cannot sign chain TXs at all — wallet load failed at "
+                    "startup. Likely cause: WALLET_NAME / HOTKEY_NAME envs "
+                    "missing OR wallet directory not readable by uid 1000."
+                ),
+            })
+
+        if s.health_reachable and s.owner_hotkey_resolved is False:
+            findings.append({
+                "type": "no_owner_hotkey",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    "Daemon's subtensor lookup of SubnetOwnerHotkey "
+                    "returned empty (`owner_hotkey_resolved=false`). "
+                    "Result: emissions before a real miner champion go "
+                    "into an empty weights dict and are silently dropped. "
+                    "Check SUBTENSOR_URL connectivity OR set "
+                    "SUBNET_OWNER_HOTKEY env as the fallback."
+                ),
+            })
+
+        if s.health_reachable and (s.last_emit or {}).get("result") == "error":
+            err = ((s.last_emit or {}).get("error") or "")[:200]
+            findings.append({
+                "type": "recent_emit_error",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    f"Most recent set_weights attempt returned error: "
+                    f"`{err}`. Single-attempt errors are usually benign "
+                    f"(chain rate-limit between epochs); persistent errors "
+                    f"indicate a signing-path bug, finney connectivity "
+                    f"loss, or chain rejection."
+                ),
+            })
+
+        if s.health_reachable and s.loaded_intents == 0:
+            findings.append({
+                "type": "no_loaded_intents",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    "Daemon's JsExecutionEngine has 0 loaded App Intents. "
+                    "Cannot score any incoming consensus proposals. Either "
+                    "the app catalog sync (LEADER_API_URL polling) hasn't "
+                    "run yet, or it's failing. Check the daemon logs for "
+                    "'Loaded JS for new app' messages."
+                ),
+            })
+
+        # ── Tier 2 finding types ──
+
+        if s.phantom_leader:
+            findings.append({
+                "type": "phantom_leader",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    "Daemon reports `block_loop_running=true` (claims to "
+                    "be the order-consensus leader) but the metagraph "
+                    "election picks a different validator. Common causes: "
+                    "(a) metagraph_sync raised an exception at startup → "
+                    "fell through to fail-open `_is_leader=true` branch, "
+                    "or (b) FORCE_LEADER=1 explicitly set in their env. "
+                    "Cosmetic on prod (followers have no relayer key) but "
+                    "wastes CPU on a no-op block_loop and pollutes logs."
+                ),
+            })
+
+        if s.metagraph_sync_stale:
+            findings.append({
+                "type": "metagraph_sync_stuck",
+                "validator_evm": s.evm_address,
+                "hotkey": s.hotkey,
+                "uid": s.uid,
+                "display_name": s.display_name,
+                "identity_url": s.identity_url,
+                "axon_url": s.axon_url,
+                "details": (
+                    "Daemon's cached `my_last_update_block` lags the "
+                    "chain's actual value by more than one tempo "
+                    "(~72 min). Their MetagraphSync background loop is "
+                    "wedged — they're scoring + voting based on stale "
+                    "metagraph snapshots. Check subtensor connectivity "
+                    "and look for repeated 'Metagraph sync failed' "
+                    "WARNINGs in the daemon log."
+                ),
+            })
+
+        # axon_dns_drift is surfaced in the diagnostics table only — not
+        # an alert (false positives during ELB rotation would spam).
 
     return findings
 
@@ -886,9 +1152,16 @@ def render_summary(
         lines.append("_None._")
     else:
         for f in findings:
-            kind = {"stale_weights": "Stale weights", "low_trust": "Low Yuma trust"}.get(
-                f["type"], f["type"],
-            )
+            kind = {
+                "stale_weights": "Stale weights",
+                "low_trust": "Low Yuma trust",
+                "no_emitter": "Weight emitter not configured",
+                "no_owner_hotkey": "Owner hotkey unresolved",
+                "recent_emit_error": "Recent emit error",
+                "no_loaded_intents": "No loaded App Intents",
+                "phantom_leader": "Phantom-leader state",
+                "metagraph_sync_stuck": "Metagraph sync wedged",
+            }.get(f["type"], f["type"])
             name = f.get("display_name")
             if name and f.get("identity_url"):
                 who = f"**[{name}]({f['identity_url']})** (`{_short(f['validator_evm'])}`)"
