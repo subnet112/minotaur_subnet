@@ -33,11 +33,20 @@ def verify_user_order_signature(order: "Order", signature_hex: str) -> bool:
         from eth_abi import encode as abi_encode
         from eth_hash.auto import keccak
 
+        # Resolve nonce via the same helper the relayer uses so the
+        # server-side EIP-712 reconstruction lines up with whatever the
+        # relayer encodes into calldata at executeIntent time. Default
+        # is the uint256-max sentinel (skip on-chain nonce check) — the
+        # frontend also signs with that value whenever it doesn't pin
+        # a nonce. Mismatch here means the recovered signer never
+        # matches submitted_by and every swap fails at PATCH
+        # /v1/orders/{id}/signature.
+        from minotaur_subnet.relayer.encoder import _resolve_nonce
+
         # Get fields from order params
         app_address = order.params.get("app_address", "0x" + "00" * 20)
         intent_params_hex = order.params.get("intent_params_hex", "")
         intent_selector_hex = order.params.get("intent_selector", "")
-        user_nonce = order.params.get("user_nonce", 0)
 
         # orderId: keccak256 of the string order_id (matches frontend)
         order_id_bytes = keccak(order.order_id.encode())
@@ -61,11 +70,7 @@ def verify_user_order_signature(order: "Order", signature_hex: str) -> bool:
             intent_params_bytes = b""
         params_hash = keccak(intent_params_bytes)
 
-        # Nonce: sentinel value or integer
-        if isinstance(user_nonce, str) and user_nonce.startswith("0x"):
-            nonce = int(user_nonce, 16)
-        else:
-            nonce = int(user_nonce or 0)
+        nonce = _resolve_nonce(order.params.get("user_nonce"))
 
         # EIP-712 type hash (matches EIP712Verifier.sol)
         INTENT_ORDER_TYPEHASH = keccak(
