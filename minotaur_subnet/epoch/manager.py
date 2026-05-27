@@ -146,6 +146,15 @@ class EpochManager:
         self._current_session: Any = None  # SolverSession
         self._current_epoch: int = 0
         self._epoch_history: list[dict[str, Any]] = []
+        # Last attempt by _emit_weights — surfaced via api's /health
+        # so the validator-health workflow can attribute leader-side
+        # emissions to the api process. Mirrors the schema used by the
+        # validator daemon's _last_emit_state. None until the first
+        # attempt completes. Records the queue POST outcome; the
+        # validator daemon records the actual chain emit outcome
+        # under its own _last_emit_state (source="queued_from_api"
+        # when this manager's POST drove the emit).
+        self._last_emit_state: dict | None = None
 
         restored = self._restore_active_champion_submission()
         if restored is not None:
@@ -1140,41 +1149,160 @@ class EpochManager:
         return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
-        """Emit weights to the Bittensor network for all scored miners.
+        """Queue weights for emission by POSTing to the validator daemon.
+
+        The validator daemon (``minotaur_subnet.validator.main``) owns the
+        only bt.Wallet on the host that can call ``subtensor.set_weights``.
+        Rather than duplicate the wallet here (which would create a race
+        condition between two chain set_weights callers competing for the
+        same rate-limit slot), we hand it the per-miner mapping via a
+        signed HTTP POST and let its ``_epoch_loop`` perform the actual
+        emit on its next tick.
+
+        Authentication: signed payload using ``VALIDATOR_PRIVATE_KEY``
+        (same key the api signs EIP-712 consensus approvals with). The
+        validator daemon derives the expected signer address from the
+        SAME env at startup, so no shared secret needs configuring.
+
+        Burn-fallback contract: if this method fails for any reason
+        (validator unreachable, auth misconfig, body malformed), the
+        validator daemon's burn fallback fires on its next tick and
+        emits via ``ChampionWeights.maybe_emit``. The validator never
+        depends on this method succeeding — burn is the unconditional
+        safety net.
 
         Non-fatal: logs errors but does not raise.
 
         Returns:
-            True if weights were emitted, False otherwise.
+            True if the validator accepted the queue POST (200 response).
+            False on any error or non-200 response.
         """
-        if self._weights_emitter is None:
-            return False
+        import json as _json
+        import time as _time
 
+        from minotaur_subnet.shared.internal_auth import sign_request
+
+        attempt_ts = _time.time()
+
+        # Short-circuit on empty mapping — no point making an HTTP call
+        # the validator will just reject as a 400.
         try:
             mapping = self._build_weights_mapping(epoch, round_id=round_id)
-            if not mapping:
-                logger.info(
-                    "No valid weights available for emission in epoch %d",
-                    epoch,
-                )
-                return False
-
-            logger.info(
-                "Emitting weights for epoch %d: %d hotkeys",
-                epoch, len(mapping),
-            )
-            success = await self._weights_emitter.emit_async(mapping)
-            if success:
-                logger.info("Weights emitted successfully for epoch %d", epoch)
-            else:
-                logger.warning("Weight emission returned failure for epoch %d", epoch)
-            return success
-
         except Exception as exc:
             logger.error(
-                "Weight emission failed for epoch %d (non-fatal): %s",
+                "Weight mapping build failed for epoch %d (non-fatal): %s",
                 epoch, exc,
             )
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "error",
+                "error": f"_build_weights_mapping raised: {str(exc)[:200]}",
+                "uids_attempted": 0,
+                "source": "epoch_manager",
+            }
+            return False
+
+        if not mapping:
+            logger.info("No valid weights available for emission in epoch %d", epoch)
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "empty",
+                "error": "no scored miners this epoch — nothing to queue",
+                "uids_attempted": 0,
+                "source": "epoch_manager",
+            }
+            return False
+
+        private_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+        if not private_key:
+            # Without a private key, internal-auth signing is impossible.
+            # This is the same condition under which the validator
+            # daemon refuses to register the queue endpoint (503), so we
+            # short-circuit before making a doomed HTTP call.
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "error",
+                "error": "VALIDATOR_PRIVATE_KEY not set — cannot sign internal request",
+                "uids_attempted": len(mapping),
+                "source": "epoch_manager",
+            }
+            logger.warning(
+                "Skipping queue POST for epoch %d: VALIDATOR_PRIVATE_KEY not set",
+                epoch,
+            )
+            return False
+
+        validator_url = os.environ.get("INTERNAL_VALIDATOR_URL", "http://validator:9100").rstrip("/")
+        path = "/internal/weights/queue"
+        body = _json.dumps({
+            "mapping": mapping,
+            "source": "epoch_manager",
+            "epoch": epoch,
+        }).encode("utf-8")
+
+        ts, sig = sign_request(
+            private_key, method="POST", path=path, body=body,
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "X-Internal-Timestamp": str(ts),
+            "X-Internal-Signature": sig,
+        }
+
+        logger.info(
+            "Queueing weights for epoch %d: %d hotkeys → %s",
+            epoch, len(mapping), validator_url + path,
+        )
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as session:
+                async with session.post(
+                    validator_url + path,
+                    data=body,
+                    headers=headers,
+                ) as resp:
+                    resp_text = await resp.text()
+                    if resp.status == 200:
+                        logger.info(
+                            "Validator accepted weight queue for epoch %d",
+                            epoch,
+                        )
+                        self._last_emit_state = {
+                            "attempted_at": attempt_ts,
+                            "result": "queued",
+                            "error": None,
+                            "uids_attempted": len(mapping),
+                            "source": "epoch_manager",
+                        }
+                        return True
+                    else:
+                        logger.warning(
+                            "Validator rejected weight queue for epoch %d: %d %s",
+                            epoch, resp.status, resp_text[:200],
+                        )
+                        self._last_emit_state = {
+                            "attempted_at": attempt_ts,
+                            "result": "error",
+                            "error": f"validator returned {resp.status}: {resp_text[:200]}",
+                            "uids_attempted": len(mapping),
+                            "source": "epoch_manager",
+                        }
+                        return False
+        except Exception as exc:
+            logger.error(
+                "Weight queue POST failed for epoch %d (non-fatal): %s",
+                epoch, exc,
+            )
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "error",
+                "error": str(exc)[:300],
+                "uids_attempted": len(mapping),
+                "source": "epoch_manager",
+            }
             return False
 
     def _count_scored(self, epoch: int, *, round_id: str | None = None) -> int:

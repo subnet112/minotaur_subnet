@@ -40,6 +40,66 @@ from minotaur_subnet.harness.submission_store import (
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
 
+# Anvil's well-known account #0 — public test fixture used to satisfy
+# the VALIDATOR_PRIVATE_KEY requirement of the new queue-POST emit path.
+_TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+
+class _FakeQueueResponse:
+    """200 response stand-in for the validator's /internal/weights/queue."""
+
+    def __init__(self, status=200, text='{"queued": true}'):
+        self.status = status
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeQueueSession:
+    """aiohttp.ClientSession stand-in that captures the POST body.
+
+    Used by the weight-emission tests below to assert on the mapping
+    EpochManager would send to the validator daemon. Pre-refactor those
+    tests checked ``emit_async.call_args``; post-refactor we check the
+    HTTP body since that's where the mapping now travels.
+    """
+
+    def __init__(self, response: _FakeQueueResponse | None = None):
+        self._response = response or _FakeQueueResponse()
+        self.posted_body: bytes | None = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, *, data, headers):
+        self.posted_body = data
+        return self._response
+
+    def posted_mapping(self) -> dict:
+        """Decode the captured body and return its ``mapping`` field."""
+        import json
+        return json.loads(self.posted_body)["mapping"]
+
+
+def _patch_queue_post(monkeypatch, session: _FakeQueueSession):
+    """Wire a fake aiohttp module so EpochManager.emit_weights POSTs to ``session``."""
+    monkeypatch.setenv("VALIDATOR_PRIVATE_KEY", _TEST_KEY)
+    fake_module = MagicMock()
+    fake_module.ClientSession = MagicMock(return_value=session)
+    fake_module.ClientTimeout = MagicMock()
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_module)
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -689,31 +749,33 @@ class TestChampionInfo:
 class TestWeightEmission:
 
     @pytest.mark.asyncio
-    async def test_weights_emitted_after_adoption(self):
-        """Weights are emitted after champion selection in on_epoch_boundary."""
+    async def test_weights_emitted_after_adoption(self, monkeypatch):
+        """Weights are queued for emission after champion selection in
+        on_epoch_boundary. Post single-emit-path refactor, EpochManager
+        POSTs the per-miner mapping to the validator daemon's
+        /internal/weights/queue endpoint rather than calling
+        emit_async directly."""
         sub = _make_submission(epoch=1, score=0.85, hotkey="5Gminer1")
         store = _make_store_with_subs(sub)
         worker = _make_mock_benchmark_worker()
-        emitter = MagicMock()
-        emitter.emit_async = AsyncMock(return_value=True)
+        session = _FakeQueueSession()
+        _patch_queue_post(monkeypatch, session)
 
         mgr = EpochManager(
             benchmark_worker=worker,
             submission_store=store,
-            weights_emitter=emitter,
         )
 
         result = await mgr.on_epoch_boundary(epoch=1)
 
         assert result["weights_emitted"] is True
-        emitter.emit_async.assert_awaited_once()
-        # Check the mapping has the miner's hotkey
-        mapping = emitter.emit_async.call_args[0][0]
+        # Check the mapping POSTed to the validator has the miner's hotkey
+        mapping = session.posted_mapping()
         assert "5Gminer1" in mapping
         assert abs(sum(mapping.values()) - 1.0) < 1e-6
 
     @pytest.mark.asyncio
-    async def test_weights_exponential_decay(self):
+    async def test_weights_exponential_decay(self, monkeypatch):
         """Weight mapping uses exponential decay: champion gets most weight."""
         sub1 = _make_submission(
             submission_id="sub_best", epoch=1, score=0.90,
@@ -732,19 +794,18 @@ class TestWeightEmission:
         )
         store = _make_store_with_subs(sub1, sub2, sub3)
         worker = _make_mock_benchmark_worker()
-        emitter = MagicMock()
-        emitter.emit_async = AsyncMock(return_value=True)
+        session = _FakeQueueSession()
+        _patch_queue_post(monkeypatch, session)
 
         mgr = EpochManager(
             benchmark_worker=worker,
             submission_store=store,
-            weights_emitter=emitter,
             weight_decay=0.6,
         )
 
         await mgr.on_epoch_boundary(epoch=1)
 
-        mapping = emitter.emit_async.call_args[0][0]
+        mapping = session.posted_mapping()
         # All three miners should have weight
         assert len(mapping) == 3
         # Champion gets highest weight
@@ -757,17 +818,23 @@ class TestWeightEmission:
         assert abs(ratio_2 - 0.6) < 0.01
 
     @pytest.mark.asyncio
-    async def test_no_champion_burns_to_owner(self):
-        """Before any real champion exists, 100% of weights burn to owner."""
+    async def test_no_champion_burns_to_owner(self, monkeypatch):
+        """Before any real champion exists, 100% of weights burn to owner.
+
+        This is the burn-fallback property the single-emit-path refactor
+        is built around: even when EpochManager has no scored miners and
+        only the owner-hotkey burn mapping to send, the queue POST still
+        carries that mapping to the validator daemon, which emits it.
+        Burn to UID-0 (owner) remains the unconditional safety net.
+        """
         store = SubmissionStore()
         worker = _make_mock_benchmark_worker()
-        emitter = MagicMock()
-        emitter.emit_async = AsyncMock(return_value=True)
+        session = _FakeQueueSession()
+        _patch_queue_post(monkeypatch, session)
 
         mgr = EpochManager(
             benchmark_worker=worker,
             submission_store=store,
-            weights_emitter=emitter,
             owner_hotkey="5Gowner",
         )
 
@@ -775,11 +842,11 @@ class TestWeightEmission:
 
         assert result["champion_changed"] is False
         assert result["weights_emitted"] is True
-        mapping = emitter.emit_async.call_args[0][0]
+        mapping = session.posted_mapping()
         assert mapping == {"5Gowner": 1.0}
 
     @pytest.mark.asyncio
-    async def test_genesis_champion_burns_to_owner(self):
+    async def test_genesis_champion_burns_to_owner(self, monkeypatch):
         """Synthetic genesis champion still burns 100% until a real miner wins.
 
         An ADOPTED genesis submission is restored at init, so on_epoch_boundary
@@ -795,13 +862,12 @@ class TestWeightEmission:
         )
         store = _make_store_with_subs(genesis)
         worker = _make_mock_benchmark_worker()
-        emitter = MagicMock()
-        emitter.emit_async = AsyncMock(return_value=True)
+        session = _FakeQueueSession()
+        _patch_queue_post(monkeypatch, session)
 
         mgr = EpochManager(
             benchmark_worker=worker,
             submission_store=store,
-            weights_emitter=emitter,
             owner_hotkey="5Gowner",
         )
 
@@ -815,7 +881,7 @@ class TestWeightEmission:
         assert result["champion_changed"] is False
         assert mgr.champion.hotkey == GENESIS_HOTKEY
         assert result["weights_emitted"] is True
-        mapping = emitter.emit_async.call_args[0][0]
+        mapping = session.posted_mapping()
         assert mapping == {"5Gowner": 1.0}
 
     @pytest.mark.asyncio

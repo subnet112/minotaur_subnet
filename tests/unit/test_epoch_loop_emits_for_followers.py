@@ -35,7 +35,26 @@ async def _run_one_iteration(self_stub) -> None:
     The loop is ``while True`` so we patch ``asyncio.sleep`` to raise
     ``CancelledError`` on the second invocation, which lets the first
     iteration's body run fully before the loop terminates.
+
+    Wires the real ``_do_emit`` method onto the stub so the existing
+    ``emit_async.assert_awaited_once`` assertions exercise the actual
+    helper introduced by the single-emit-path refactor. Also sets
+    ``_queued_weights_mapping = None`` to keep these tests focused on
+    the burn-fallback path; the queue-consumption path is exercised
+    by ``test_epoch_loop_queue_consumption.py``.
     """
+    # Default queue to empty unless the test explicitly set it.
+    if not hasattr(self_stub, "_queued_weights_mapping") or isinstance(
+        self_stub._queued_weights_mapping, MagicMock,
+    ):
+        self_stub._queued_weights_mapping = None
+        self_stub._queued_weights_source = None
+
+    # Bind the real _do_emit method so emit_async actually runs.
+    self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
+        self_stub, AppIntentsValidator,
+    )
+
     call_count = {"sleep": 0}
 
     async def fake_sleep(delay):
