@@ -1032,14 +1032,26 @@ def _fmt_trust(t: float | None) -> str:
     return f"{t:.3f} {marker}"
 
 
-def _fmt_weight_source(src: str | None) -> str:
+def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     """Render the weight_source column for the dashboard.
 
     Codes are deliberately compact emoji + label so the table stays
     narrow at the cost of operators learning four glyphs once. The
     workflow-generated incident issue carries the prose explanation.
+
+    For ``self`` classifications we append the ``last_emit.source``
+    sub-indicator when available (post single-emit-path refactor):
+
+      - ``self·queued`` — last emit was a per-miner ranking from the
+        api EpochManager's queue POST (the daemon's _epoch_loop
+        recorded ``source="queued_from_api"``).
+      - ``self·burn`` — last emit was the burn fallback (no champion
+        adopted yet, or the queue was empty when the loop ticked).
+
+    Older daemons (pre-refactor) don't populate ``last_emit.source``;
+    in that case we render just ``🟢 self`` exactly as before.
     """
-    return {
+    base = {
         None:          "—",
         "self":        "🟢 self",
         "external":    "🟠 external",
@@ -1047,6 +1059,13 @@ def _fmt_weight_source(src: str | None) -> str:
         "stale":       "⚪ stale",
         "unknown":     "·",
     }.get(src, src or "—")
+    if src == "self" and last_emit is not None:
+        emit_source = (last_emit or {}).get("source")
+        if emit_source == "queued_from_api":
+            return f"{base}·queued"
+        if emit_source == "burn_fallback":
+            return f"{base}·burn"
+    return base
 
 
 def render_summary(
@@ -1126,7 +1145,7 @@ def render_summary(
             str(s.uid) if s.uid is not None else "—",
             f"{s.stake:,.0f}" if s.stake is not None else "—",
             _fmt_seconds_ago(s.last_update_seconds_ago),
-            _fmt_weight_source(s.weight_source) if s.uid is not None else "—",
+            _fmt_weight_source(s.weight_source, s.last_emit) if s.uid is not None else "—",
             _fmt_trust(s.trust),
             _fmt_check(s.axon_published) if s.uid is not None else "—",
             _fmt_check(s.identity_reachable) if s.uid is not None else "—",
@@ -1143,7 +1162,9 @@ def render_summary(
         "🔴 no-emitter = daemon's weight emitter never loaded "
         "(`weights_emitter_configured=false`); ⚪ stale = neither chain "
         "nor daemon shows a recent successful set; · = /health probe "
-        "failed this run._"
+        "failed this run. Sub-indicators on `🟢 self`: `·queued` = "
+        "per-miner ranking from api EpochManager; `·burn` = burn fallback "
+        "(no champion adopted, or queue was empty)._"
     )
     lines.append("")
     lines.append("## Active alerts")

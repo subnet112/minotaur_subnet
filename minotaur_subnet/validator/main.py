@@ -410,7 +410,35 @@ class AppIntentsValidator:
         # /health treats that as "never attempted". The error string is
         # truncated to 300 chars before exposure — chain/substrate error
         # messages don't typically carry secrets, but defense in depth.
+        #
+        # Persisted to disk on every update so a Watchtower restart doesn't
+        # wipe the most recent attestation. Pre-fix, the validator-health
+        # workflow's "self vs external" classifier would false-positive
+        # an external attribution when chain showed a recent set_weights
+        # but the in-memory state had just been reset by a container
+        # recreate. See _persist_last_emit_state() for the write path.
         self._last_emit_state: dict | None = None
+        self._last_emit_state_path = os.environ.get(
+            "LAST_EMIT_STATE_PATH", "/data/last_emit.json",
+        )
+        self._restore_last_emit_state()
+
+        # ── Internal RPC: per-miner weight queue (from api EpochManager) ──
+        # Single-slot, newest-wins, in-process. The api process can POST a
+        # per-miner ranking here when a solver round closes; _epoch_loop
+        # consumes it on the next tick and emits via the same WeightsEmitter
+        # that handles the burn fallback. This is the ONLY supported way
+        # for any other process to drive chain weights — there is exactly
+        # one set_weights caller per validator host (this daemon's
+        # _epoch_loop), eliminating the race condition that would otherwise
+        # exist between burn fallback and per-miner ranking.
+        #
+        # If the slot is empty when _epoch_loop ticks, burn fallback fires.
+        # Burn is therefore unconditionally available as a safety net: any
+        # failure of the queue path (auth misconfig, api down, network
+        # partition, etc.) just leaves the slot empty, and burn covers it.
+        self._queued_weights_mapping: dict[str, float] | None = None
+        self._queued_weights_source: str | None = None
 
         if subtensor_url:
             try:
@@ -728,6 +756,65 @@ class AppIntentsValidator:
         while True:
             await asyncio.sleep(3600)
 
+    def _restore_last_emit_state(self) -> None:
+        """Load ``_last_emit_state`` from disk if a prior instance persisted it.
+
+        Pre-fix, every Watchtower restart wiped this in-memory field. The
+        next /health probe would return ``last_emit: null`` even though
+        chain still showed a recent set_weights — the validator-health
+        workflow's classifier then flagged the validator as "external"
+        because no self-attestation existed within the alignment window.
+
+        Best-effort: if the file is missing, malformed, or unreadable, we
+        leave _last_emit_state at None and let the next emit attempt
+        re-establish it. Never raise — startup should not block on this.
+        """
+        try:
+            import json as _json
+            with open(self._last_emit_state_path, "r") as f:
+                restored = _json.load(f)
+            if isinstance(restored, dict) and "attempted_at" in restored:
+                self._last_emit_state = restored
+                logger.info(
+                    "Restored last_emit state from %s (attempted_at=%s, result=%s, source=%s)",
+                    self._last_emit_state_path,
+                    restored.get("attempted_at"),
+                    restored.get("result"),
+                    restored.get("source", "unknown"),
+                )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "Could not restore last_emit state from %s: %s",
+                self._last_emit_state_path, exc,
+            )
+
+    def _persist_last_emit_state(self) -> None:
+        """Write ``_last_emit_state`` to disk so a restart preserves it.
+
+        Best-effort: failures (read-only volume, disk full, etc.) log a
+        single warning. We don't crash the emit path on persistence
+        failure — the chain emit already happened, the /health endpoint
+        can still surface the in-memory state, and the operator just
+        loses restart-resilience until the volume is fixed.
+        """
+        if self._last_emit_state is None:
+            return
+        try:
+            import json as _json
+            import os as _os
+            _os.makedirs(_os.path.dirname(self._last_emit_state_path) or ".", exist_ok=True)
+            tmp_path = self._last_emit_state_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                _json.dump(self._last_emit_state, f)
+            _os.replace(tmp_path, self._last_emit_state_path)
+        except Exception as exc:
+            logger.warning(
+                "Could not persist last_emit state to %s: %s",
+                self._last_emit_state_path, exc,
+            )
+
     async def _axon_resync_loop(self) -> None:
         """Periodically re-resolve VALIDATOR_AXON_URL and re-publish on
         chain if the IP changed.
@@ -852,46 +939,90 @@ class AppIntentsValidator:
                 logger.error("Rescan error: %s", exc)
 
     async def _epoch_loop(self) -> None:
-        """Periodically emit weights for the current champion solver.
+        """Periodically emit weights — single source of chain set_weights calls.
 
         Every validator on the subnet emits weights independently — that's
         the whole point of Yuma's stake-weighted median. Gating this on
         ``self._is_leader`` (the subnet-team order-consensus leader
         election) confused two different things and silently broke
         weight emission for every non-leader validator on subnet 112,
-        including registered third parties (Rizzo, General Tensor,
-        Kraken, TAO.com). Their dividends silently collapsed; for the
-        Bittensor network it looked like they'd stopped voting.
+        including registered third parties. Pre-PR-#69, their dividends
+        silently collapsed; for the Bittensor network it looked like
+        they'd stopped voting.
 
-        Cadence is rate-limited at the ``ChampionWeights.maybe_emit``
-        layer (default ``--epoch-seconds 1200`` = 20 min), so removing
-        the gate doesn't change emission frequency — it just opens
-        emission to all validators rather than the leader-only one.
+        Three input sources feed this loop, evaluated in priority order:
+
+        1. **Queued per-miner ranking** (from api EpochManager via
+           ``/internal/weights/queue``). When a solver round closes, the
+           api POSTs a per-miner mapping derived from benchmark scores
+           and replay performance. This is the richest signal we have —
+           when present, it always wins.
+
+        2. **Burn fallback** (``self.weights.maybe_emit(champion_id)``).
+           When the queue is empty, fall back to ChampionWeights' simple
+           champion-vs-owner allocation. This is the default behavior on
+           validators with no champion adopted, and the safety net when
+           the queue path fails (api down, auth misconfig, etc.). The
+           burn path is unconditionally available — anything that breaks
+           the queue just leaves the slot empty, and burn fires.
+
+        Cadence is rate-limited at the chain layer (commit-reveal on
+        sn112, ~100 blocks ~= 20 min). The loop ticks every 5s but
+        ``maybe_emit`` only returns a non-empty mapping when its
+        ``epoch_seconds`` window has elapsed.
         """
         while True:
             await asyncio.sleep(5)
+            if not self._weights_emitter:
+                continue
+
+            # Priority 1: queued per-miner mapping from api EpochManager.
+            queued = self._queued_weights_mapping
+            if queued:
+                source = self._queued_weights_source or "queued"
+                # Consume atomically — if emit fails, we DON'T re-queue.
+                # The api will POST a fresh mapping on the next round close.
+                self._queued_weights_mapping = None
+                self._queued_weights_source = None
+                await self._do_emit(queued, source=source)
+                continue
+
+            # Priority 2: burn fallback via ChampionWeights.
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
-            if epoch_weights and self._weights_emitter:
-                attempt_ts = time.time()
-                uids_attempted = len(epoch_weights)
-                try:
-                    success = await self._weights_emitter.emit_async(epoch_weights)
-                    self._last_emit_state = {
-                        "attempted_at": attempt_ts,
-                        "result": "ok" if success else "error",
-                        "error": None if success else "emit_async returned False (see daemon logs)",
-                        "uids_attempted": uids_attempted,
-                    }
-                except Exception as exc:
-                    # Truncate to 300 chars so a verbose substrate stack trace
-                    # doesn't make /health huge or risk leaking large blobs.
-                    self._last_emit_state = {
-                        "attempted_at": attempt_ts,
-                        "result": "error",
-                        "error": str(exc)[:300],
-                        "uids_attempted": uids_attempted,
-                    }
-                    logger.error("Weight emission failed: %s", exc)
+            if epoch_weights:
+                await self._do_emit(epoch_weights, source="burn_fallback")
+
+    async def _do_emit(self, mapping: dict[str, float], *, source: str) -> None:
+        """Actually call ``WeightsEmitter.emit_async`` + record + persist state.
+
+        Shared by the queue path and the burn path. The ``source`` field
+        in ``_last_emit_state`` lets the validator-health workflow tell
+        which input drove this emit (queued_from_api vs burn_fallback).
+        """
+        attempt_ts = time.time()
+        uids_attempted = len(mapping)
+        try:
+            success = await self._weights_emitter.emit_async(mapping)
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "ok" if success else "error",
+                "error": None if success else "emit_async returned False (see daemon logs)",
+                "uids_attempted": uids_attempted,
+                "source": source,
+            }
+        except Exception as exc:
+            # Truncate to 300 chars so a verbose substrate stack trace
+            # doesn't make /health huge or risk leaking large blobs.
+            self._last_emit_state = {
+                "attempted_at": attempt_ts,
+                "result": "error",
+                "error": str(exc)[:300],
+                "uids_attempted": uids_attempted,
+                "source": source,
+            }
+            logger.error("Weight emission failed (source=%s): %s", source, exc)
+
+        self._persist_last_emit_state()
 
     async def _leader_monitor_loop(self) -> None:
         """Watch for leader changes and transition between leader/follower."""
@@ -969,6 +1100,8 @@ class AppIntentsValidator:
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/identity", self._handle_identity)
         app.router.add_post("/consensus/proposal", self._handle_consensus_proposal)
+        # Internal RPC (signed payload required; same-host api → daemon)
+        app.router.add_post("/internal/weights/queue", self._handle_weights_queue)
         # Ops-debug
         app.router.add_get("/weights", self._handle_weights)
         app.router.add_get("/weights/history", self._handle_weights_history)
@@ -1039,6 +1172,133 @@ class AppIntentsValidator:
         Delegates to ProposalHandler for all verification, scoring, and signing.
         """
         return await self._proposal_handler.handle_proposal(request)
+
+    async def _handle_weights_queue(self, request: web.Request) -> web.Response:
+        """Accept a per-miner weight mapping from the api process.
+
+        Single-slot newest-wins: each POST overwrites whatever was queued.
+        ``_epoch_loop`` consumes the slot on its next tick and emits via
+        the same WeightsEmitter the burn fallback uses.
+
+        Auth: signed payload via ``X-Internal-Timestamp`` +
+        ``X-Internal-Signature`` headers (see ``shared.internal_auth``).
+        Signer must recover to this validator's own EVM address — the api
+        signs with the SAME ``VALIDATOR_PRIVATE_KEY`` env this validator
+        loaded, so the operator doesn't need a separate shared secret.
+
+        Response codes:
+          - 200: queued (caller can stop retrying)
+          - 400: body malformed (not retried)
+          - 403: signature missing / invalid / stale (not retried)
+          - 503: daemon not in weight-emit mode (no wallet loaded, or
+                 internal auth disabled because validator_private_key
+                 wasn't configured) — caller should fall back to its
+                 own logging, not retry
+        """
+        from minotaur_subnet.shared.internal_auth import (
+            InvalidSignature,
+            verify_request,
+        )
+
+        # 503 first: if the daemon can't emit, there's no point queueing.
+        # Operators see this distinct from 403 so they can diagnose
+        # "wallet not loaded" vs "auth misconfigured".
+        if self._weights_emitter is None:
+            return web.json_response(
+                {"queued": False, "reason": "weights_emitter not configured"},
+                status=503,
+            )
+        if not self._validator_id:
+            return web.json_response(
+                {"queued": False, "reason": "internal auth not configured (VALIDATOR_PRIVATE_KEY unset)"},
+                status=503,
+            )
+
+        body = await request.read()
+
+        ts_header = request.headers.get("X-Internal-Timestamp", "")
+        sig_header = request.headers.get("X-Internal-Signature", "")
+        if not ts_header or not sig_header:
+            return web.json_response(
+                {"queued": False, "reason": "missing auth headers"},
+                status=403,
+            )
+        try:
+            ts_int = int(ts_header)
+        except ValueError:
+            return web.json_response(
+                {"queued": False, "reason": "malformed X-Internal-Timestamp"},
+                status=403,
+            )
+        try:
+            verify_request(
+                method=request.method,
+                path=request.path,
+                body=body,
+                timestamp=ts_int,
+                signature_hex=sig_header,
+                expected_address=self._validator_id,
+            )
+        except InvalidSignature as exc:
+            # Don't echo the specific reason — defense in depth against
+            # a curious attacker probing which check failed.
+            logger.warning("internal-auth rejected /internal/weights/queue: %s", exc)
+            return web.json_response(
+                {"queued": False, "reason": "signature verification failed"},
+                status=403,
+            )
+
+        # Parse body. Schema:
+        #   {"mapping": {"5HOwner...": 1.0, "5Other...": 0.5},
+        #    "source":  "epoch_manager",       # optional, for /health attribution
+        #    "epoch":   10}                    # optional, debug only
+        try:
+            import json as _json
+            payload = _json.loads(body)
+        except Exception as exc:
+            return web.json_response(
+                {"queued": False, "reason": f"body is not JSON: {exc}"},
+                status=400,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"queued": False, "reason": "body must be a JSON object"},
+                status=400,
+            )
+        mapping = payload.get("mapping")
+        if not isinstance(mapping, dict) or not mapping:
+            return web.json_response(
+                {"queued": False, "reason": "mapping must be a non-empty object"},
+                status=400,
+            )
+        # Light validation: keys must be strings, values must be numeric.
+        # We trust the api's EpochManager to produce sane weights (it
+        # builds them from scored submissions) but reject obviously-
+        # malformed data before storing.
+        try:
+            cleaned: dict[str, float] = {
+                str(k): float(v) for k, v in mapping.items()
+            }
+        except (TypeError, ValueError) as exc:
+            return web.json_response(
+                {"queued": False, "reason": f"mapping values must be numeric: {exc}"},
+                status=400,
+            )
+
+        source = str(payload.get("source", "queued_from_api"))[:64]
+
+        # Single-slot newest-wins: overwriting an unconsumed queue
+        # is the documented behavior, not a race. The api only POSTs
+        # when a solver round closes (rare relative to the 5s tick),
+        # so overwrites are unusual but harmless.
+        self._queued_weights_mapping = cleaned
+        self._queued_weights_source = source
+
+        logger.info(
+            "queued per-miner mapping from api (source=%s, uids=%d, epoch=%s)",
+            source, len(cleaned), payload.get("epoch", "?"),
+        )
+        return web.json_response({"queued": True, "uids": len(cleaned)})
 
     async def _handle_consensus_info(self, request: web.Request) -> web.Response:
         """Return consensus identity and configuration."""
