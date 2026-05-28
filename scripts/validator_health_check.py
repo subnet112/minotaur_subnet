@@ -169,22 +169,29 @@ class ValidatorStatus:
     # on a daemon at PR #78 or later. ``health_reachable`` is the truthy
     # gate — when False, the rest are None / unknown.
     #
-    # ``weight_source`` classifies who last set weights on this hotkey:
-    #   "self"     daemon emitted; ``last_emit.attempted_at`` aligns with the
-    #              chain's ``last_update`` block time (within tolerance).
-    #   "external" chain shows a recent weight-set, but our daemon's last
-    #              emit doesn't account for it (None, older, or failed).
-    #              Indicates another process is also setting weights on the
-    #              same hotkey (eg. a standalone burn script, btcli, or a
-    #              second validator implementation running in parallel).
+    # ``weight_source`` classifies this validator's weight-setting health:
+    #   "self"     daemon reported a SUCCESSFUL emit within the staleness
+    #              window (``last_successful_emit``). This is the real
+    #              health question — "is it emitting often enough to stay
+    #              stable?" — and transient/rate-limited failures (which
+    #              overwrite ``last_emit``) don't mask it.
+    #   "external" daemon hasn't succeeded within the window, yet the chain
+    #              still shows recent weights — something else is keeping
+    #              them alive (a standalone burn script, btcli, etc.). NOTE
+    #              this cannot prove a second setter; it means "fresh weights
+    #              not explained by a recent self-success."
     #   "no-emitter" weights_emitter_configured=false — daemon can't sign
     #              chain TXs at all (wallet didn't load).
-    #   "stale"    chain hasn't seen weights within the staleness window
-    #              AND daemon hasn't emitted recently either.
+    #   "stale"    neither a recent self-success nor recent chain weights.
     #   "unknown"  /health probe failed; can't classify.
     health_reachable: bool = False
     weights_emitter_configured: bool | None = None
     last_emit: dict | None = None
+    # last_successful_emit: only advances on a successful set_weights (daemon
+    # PR — separate from last_emit, the latest attempt). The PRIMARY signal
+    # for weight_source. None when the daemon predates the field or /health
+    # was unreachable.
+    last_successful_emit: dict | None = None
     weight_source: str | None = None
     # ── Tier 1 additions ──
     # Raw fields lifted from /health when the probe succeeded. None when
@@ -610,43 +617,58 @@ def _classify_weight_source(
     stale_threshold_seconds: int,
     alignment_tolerance_seconds: int = 120,
 ) -> str | None:
-    """Decide who last set weights for this validator's hotkey.
+    """Classify this validator's weight-setting health.
 
-    See ``ValidatorStatus.weight_source`` for the codes. Logic:
+    See ``ValidatorStatus.weight_source`` for the codes. The question we
+    actually care about is "is this validator's daemon setting weights
+    successfully often enough to stay stable?" — answered by the LAST
+    SUCCESSFUL emit, not the latest attempt. A transient/rate-limited
+    failure overwrites ``last_emit`` with an error but leaves
+    ``last_successful_emit`` untouched, so a validator that set weights
+    minutes ago no longer false-flags as "external".
 
-    * ``health is None``                                   → "unknown"
-    * health says ``weights_emitter_configured == false``  → "no-emitter"
-    * ``last_emit.result == "ok"`` AND its ``attempted_at``
-      is within ±``alignment_tolerance_seconds`` of the
-      chain's last_update wall-clock time                  → "self"
-    * chain ``last_update_seconds_ago`` fresh
-      (< ``stale_threshold_seconds``)                      → "external"
-    * otherwise                                            → "stale"
+    Logic (primary path, daemon reports ``last_successful_emit``):
 
-    The alignment tolerance covers the gap between when our daemon called
-    ``set_weights`` and when the extrinsic actually landed in a finalized
-    block (one or two blocks of subtensor latency, plus clock skew between
-    the daemon and a GitHub runner). 120s is a generous default — false
-    "external" classifications were the larger risk than false "self"
-    ones, so we err toward "self" when in doubt.
+    * ``health is None`` or ``last_emit`` field absent     → "unknown"
+    * ``weights_emitter_configured == false``              → "no-emitter"
+    * ``last_successful_emit`` within stale window         → "self"
+    * else chain ``last_update`` fresh                     → "external"
+    * else                                                 → "stale"
+
+    Legacy fallback: daemons that predate ``last_successful_emit`` are
+    classified by the old ``last_emit`` timestamp-alignment heuristic so
+    they don't all collapse to "unknown" during the rollout window.
     """
     if health is None:
         return "unknown"
     # Pre-PR-#75 daemons answer /health without ``last_emit`` at all.
-    # We can't infer source from their response — don't false-flag as
-    # "external" just because the field is missing. Dict-membership test
-    # (not truthiness) distinguishes "field absent" from "field present
-    # but None" (#75+ daemon that hasn't emitted yet).
+    # Dict-membership (not truthiness) distinguishes "field absent" from
+    # "present but None" (daemon that hasn't emitted yet).
     if "last_emit" not in health:
         return "unknown"
     if health.get("weights_emitter_configured") is False:
         return "no-emitter"
 
     chain_seconds_ago = s.last_update_seconds_ago
+
+    # Primary signal: did our own daemon SUCCEED recently? ``last_successful_emit``
+    # only advances on a successful set_weights, so a later failed retry can't
+    # mask it. Membership test gates the new path so legacy daemons fall through.
+    if "last_successful_emit" in health:
+        lse = health.get("last_successful_emit") or {}
+        lse_at = lse.get("attempted_at")
+        if lse_at is not None and (now - lse_at) < stale_threshold_seconds:
+            return "self"
+        # Daemon hasn't succeeded within the window. Fresh chain weights mean
+        # something else is keeping them alive (can't prove who).
+        if chain_seconds_ago is not None and chain_seconds_ago < stale_threshold_seconds:
+            return "external"
+        return "stale"
+
+    # ── Legacy fallback (daemon predates last_successful_emit) ──
     last_emit = health.get("last_emit")
     last_emit_at = (last_emit or {}).get("attempted_at")
     last_emit_ok = (last_emit or {}).get("result") == "ok"
-
     if (
         chain_seconds_ago is not None
         and last_emit_at is not None
@@ -655,10 +677,8 @@ def _classify_weight_source(
         chain_set_at = now - chain_seconds_ago
         if abs(last_emit_at - chain_set_at) <= alignment_tolerance_seconds:
             return "self"
-
     if chain_seconds_ago is not None and chain_seconds_ago < stale_threshold_seconds:
         return "external"
-
     return "stale"
 
 
@@ -797,6 +817,7 @@ def build_statuses(
                 s.health_reachable = True
                 s.weights_emitter_configured = health.get("weights_emitter_configured")
                 s.last_emit = health.get("last_emit")
+                s.last_successful_emit = health.get("last_successful_emit")
                 # Tier 1: lift raw /health fields onto the status object.
                 # Each is None when the daemon predates the field (older
                 # image) — alert logic must handle that case gracefully.
@@ -1082,24 +1103,42 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
                 ),
             })
 
-        if s.health_reachable and (s.last_emit or {}).get("result") == "error":
-            err = ((s.last_emit or {}).get("error") or "")[:200]
-            findings.append({
-                "type": "recent_emit_error",
-                "validator_evm": s.evm_address,
-                "hotkey": s.hotkey,
-                "uid": s.uid,
-                "display_name": s.display_name,
-                "identity_url": s.identity_url,
-                "axon_url": s.axon_url,
-                "details": (
-                    f"Most recent set_weights attempt returned error: "
-                    f"`{err}`. Single-attempt errors are usually benign "
-                    f"(chain rate-limit between epochs); persistent errors "
-                    f"indicate a signing-path bug, finney connectivity "
-                    f"loss, or chain rejection."
-                ),
-            })
+        # No SUCCESSFUL emit in a long time — the actionable signal. We
+        # deliberately do NOT alert on a single errored attempt: with the
+        # ~100-block rate limit a daemon retrying slightly early logs routine
+        # rate-limit failures while still setting weights every window. Only
+        # a sustained gap (a daemon that WAS succeeding and then went quiet
+        # for > the staleness window) means weights/reputation are at risk.
+        # Gated on a positive last_successful_emit record so legacy daemons
+        # (no field) and never-yet-emitted fresh daemons don't false-fire.
+        lse = s.last_successful_emit
+        if (
+            s.health_reachable
+            and s.weights_emitter_configured is True
+            and lse is not None
+            and lse.get("attempted_at") is not None
+        ):
+            success_age = time.time() - lse["attempted_at"]
+            if success_age > STALE_THRESHOLD_SECONDS:
+                findings.append({
+                    "type": "no_successful_emit",
+                    "validator_evm": s.evm_address,
+                    "hotkey": s.hotkey,
+                    "uid": s.uid,
+                    "display_name": s.display_name,
+                    "identity_url": s.identity_url,
+                    "axon_url": s.axon_url,
+                    "details": (
+                        f"Daemon last set weights successfully "
+                        f"**{_fmt_seconds_ago(int(success_age))}** "
+                        f"(threshold {STALE_THRESHOLD_SECONDS // 60}m). "
+                        f"Transient/rate-limited errors are fine, but a "
+                        f"sustained gap means it's no longer landing weight-"
+                        f"sets — the validator's weights and reputation will "
+                        f"go stale. Check finney connectivity, the hotkey "
+                        f"wallet, and the daemon's set_weights logs."
+                    ),
+                })
 
         if s.health_reachable and s.loaded_intents == 0:
             findings.append({
@@ -1464,7 +1503,8 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
         ("Apps loaded", [_fmt_loaded_intents(s.loaded_intents) for s in detailed]),
         ("Weights emitter", [_fmt_emitter(s.weights_emitter_configured) for s in detailed]),
         ("Owner hotkey", [_fmt_emitter(s.owner_hotkey_resolved) for s in detailed]),
-        ("Last emit", [_fmt_last_emit(s.last_emit, now=now) for s in detailed]),
+        ("Last success", [_fmt_last_emit(s.last_successful_emit, now=now) for s in detailed]),
+        ("Last attempt", [_fmt_last_emit(s.last_emit, now=now) for s in detailed]),
         ("OrderBook", [_fmt_orderbook(s.orderbook_stats) for s in detailed]),
     ]
     _table(daemon_rows, cols)
@@ -1496,14 +1536,17 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
 
     lines.append("")
     lines.append(
-        "_**Last emit**: `time · source · result` — source ``burn`` = "
+        "_**Last success** = most recent *successful* set_weights (the "
+        "health-relevant signal); **Last attempt** = latest attempt of any "
+        "result. Format `time · source · result` — source ``burn`` = "
         "burn-to-owner fallback, ``api`` = per-miner ranking queued by the api "
         "EpochManager (PR #95 discriminator); ✅=ok ❌=error, ``·``=not yet "
-        "attempted. **Block loop**: ``✅ leader`` elected order-consensus "
-        "leader, ``follower`` normal non-leader, ``⚠ phantom-leader`` daemon "
-        "claims leadership the metagraph election doesn't grant. **OrderBook**: "
-        "live order counts by status (`status:count`); ``0`` = up but empty "
-        "(normal for followers)._"
+        "attempted. A ❌ on **Last attempt** with a recent **Last success** is "
+        "normal (a rate-limited retry between epochs). **Block loop**: ``✅ "
+        "leader`` elected order-consensus leader, ``follower`` normal non-"
+        "leader, ``⚠ phantom-leader`` daemon claims leadership the metagraph "
+        "election doesn't grant. **OrderBook**: live order counts by status "
+        "(`status:count`); ``0`` = up but empty (normal for followers)._"
     )
     return "\n".join(lines)
 
