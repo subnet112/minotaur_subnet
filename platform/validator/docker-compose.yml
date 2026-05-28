@@ -388,10 +388,11 @@ services:
   # Polls GHCR every hour for a new image SHA on the configured tag (default
   # :stable). When the SHA moves, Watchtower pulls the new image, stops the
   # affected containers, and recreates them with the new image. The subnet
-  # team controls when :stable moves via the promote-stable.yml workflow
-  # (manually triggered after a release has soaked on our prod), so
-  # third-party validators don't get surprise upgrades from every commit
-  # to main.
+  # team controls when :stable moves by merging the integration branch
+  # (`develop`, which feeds :latest) into `main` after a release has
+  # soaked on our own validator — :stable is built straight from `main`.
+  # So third-party validators don't get surprise upgrades from every
+  # in-flight commit.
   #
   # Trust note: Watchtower needs full Docker socket access to stop+recreate
   # containers. This is the second container in this stack with that access

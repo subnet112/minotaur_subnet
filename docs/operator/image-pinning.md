@@ -3,11 +3,14 @@
 The validator image is published to GHCR under
 `ghcr.io/subnet112/minotaur-validator`. Tags:
 
-- `:stable` — operator-facing rolling tag. Moved by a gated workflow
-  (`promote-stable.yml`) after manual maintainer approval. **This is
-  the tag third-party validators should track.**
-- `:latest` — latest commit on `main`. May contain unstable changes.
-  Not recommended for production.
+- `:stable` — operator-facing rolling tag, built from the **`main`**
+  branch. `main` only advances via a verified merge from `develop`
+  (after the subnet team has soaked the build on its own validator),
+  so `:stable` is always vetted. **This is the tag third-party
+  validators should track.**
+- `:latest` — built from the **`develop`** branch (the integration
+  line). May contain unstable changes; runs on the subnet team's own
+  validator for verification. Not recommended for production.
 - `:sha-<short>` — immutable per-commit tag. Useful for pinning to a
   specific build during an investigation.
 - `:vX.Y.Z` — immutable release tag pushed alongside git tags.

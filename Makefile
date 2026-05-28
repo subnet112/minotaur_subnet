@@ -128,6 +128,16 @@ solver-base:
 solver-base-push:
 	bash platform/base-images/solver-base/build.sh --push
 
+# Build the validator image locally from source with the current git SHA
+# stamped in, so /health.image_sha shows your commit (not "dev") and fleet
+# monitoring can tell you're current. Source-builders should track the
+# `main` branch (= the :stable line) and run this, then `docker compose up`.
+# Tags as :stable to match the default MINOTAUR_IMAGE_TAG operators run.
+build-validator:
+	docker build -f minotaur_subnet/Dockerfile \
+	  --build-arg MINOTAUR_IMAGE_SHA=$$(git rev-parse --short HEAD) \
+	  -t ghcr.io/subnet112/minotaur-validator:stable .
+
 # Single improvement cycle (testnet — run manually, one iteration at a time)
 miner-cycle:
 	@echo "Running one miner improvement cycle..."
