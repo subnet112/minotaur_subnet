@@ -421,6 +421,17 @@ class AppIntentsValidator:
         self._last_emit_state_path = os.environ.get(
             "LAST_EMIT_STATE_PATH", "/data/last_emit.json",
         )
+        # last_successful_emit: only advances on a SUCCESSFUL set_weights.
+        # The validator-health classifier keys off THIS, not _last_emit_state
+        # (the latest attempt) — a transient/rate-limited retry overwrites
+        # _last_emit_state with an error and would otherwise mask a perfectly
+        # healthy validator that just set weights minutes ago. The real
+        # health question is "are enough weight-sets succeeding to keep this
+        # validator stable?", which only successes answer.
+        self._last_successful_emit_state: dict | None = None
+        self._last_successful_emit_state_path = os.environ.get(
+            "LAST_SUCCESSFUL_EMIT_STATE_PATH", "/data/last_successful_emit.json",
+        )
         self._restore_last_emit_state()
 
         # ── Internal RPC: per-miner weight queue (from api EpochManager) ──
@@ -757,62 +768,78 @@ class AppIntentsValidator:
             await asyncio.sleep(3600)
 
     def _restore_last_emit_state(self) -> None:
-        """Load ``_last_emit_state`` from disk if a prior instance persisted it.
+        """Reload persisted emit state from disk so a restart preserves it.
 
-        Pre-fix, every Watchtower restart wiped this in-memory field. The
-        next /health probe would return ``last_emit: null`` even though
-        chain still showed a recent set_weights — the validator-health
-        workflow's classifier then flagged the validator as "external"
-        because no self-attestation existed within the alignment window.
+        Restores BOTH the latest-attempt state (``_last_emit_state``) and
+        the last-*successful*-emit state (``_last_successful_emit_state``).
+        Pre-fix, every Watchtower restart wiped these in-memory fields, so
+        the next /health probe returned them null even though chain still
+        showed a recent set_weights — the validator-health classifier then
+        false-flagged the validator. Persisting the success across restarts
+        keeps the "emitting often enough?" signal intact.
 
-        Best-effort: if the file is missing, malformed, or unreadable, we
-        leave _last_emit_state at None and let the next emit attempt
-        re-establish it. Never raise — startup should not block on this.
+        Best-effort: missing/malformed/unreadable files leave the state at
+        None and the next emit re-establishes it. Never raises.
         """
+        self._last_emit_state = self._read_persisted_state(
+            self._last_emit_state_path, "last_emit",
+        )
+        self._last_successful_emit_state = self._read_persisted_state(
+            self._last_successful_emit_state_path, "last_successful_emit",
+        )
+
+    @staticmethod
+    def _read_persisted_state(path: str, label: str) -> dict | None:
         try:
             import json as _json
-            with open(self._last_emit_state_path, "r") as f:
+            with open(path, "r") as f:
                 restored = _json.load(f)
             if isinstance(restored, dict) and "attempted_at" in restored:
-                self._last_emit_state = restored
                 logger.info(
-                    "Restored last_emit state from %s (attempted_at=%s, result=%s, source=%s)",
-                    self._last_emit_state_path,
-                    restored.get("attempted_at"),
-                    restored.get("result"),
-                    restored.get("source", "unknown"),
+                    "Restored %s state from %s (attempted_at=%s, result=%s, source=%s)",
+                    label, path, restored.get("attempted_at"),
+                    restored.get("result"), restored.get("source", "unknown"),
                 )
+                return restored
         except FileNotFoundError:
             pass
         except Exception as exc:
-            logger.warning(
-                "Could not restore last_emit state from %s: %s",
-                self._last_emit_state_path, exc,
-            )
+            logger.warning("Could not restore %s state from %s: %s", label, path, exc)
+        return None
 
     def _persist_last_emit_state(self) -> None:
-        """Write ``_last_emit_state`` to disk so a restart preserves it.
+        """Write emit state to disk so a restart preserves it.
 
-        Best-effort: failures (read-only volume, disk full, etc.) log a
-        single warning. We don't crash the emit path on persistence
-        failure — the chain emit already happened, the /health endpoint
-        can still surface the in-memory state, and the operator just
-        loses restart-resilience until the volume is fixed.
+        Persists BOTH ``_last_emit_state`` (latest attempt) and
+        ``_last_successful_emit_state`` (last success). Best-effort: a
+        persistence failure logs a single warning and never crashes the
+        emit path — the chain emit already happened.
         """
-        if self._last_emit_state is None:
+        self._write_persisted_state(
+            self._last_emit_state, self._last_emit_state_path, "last_emit",
+        )
+        self._write_persisted_state(
+            self._last_successful_emit_state,
+            self._last_successful_emit_state_path,
+            "last_successful_emit",
+        )
+
+    @staticmethod
+    def _write_persisted_state(state: dict | None, path: str, label: str) -> None:
+        if state is None:
             return
         try:
             import json as _json
             import os as _os
-            _os.makedirs(_os.path.dirname(self._last_emit_state_path) or ".", exist_ok=True)
-            tmp_path = self._last_emit_state_path + ".tmp"
+            _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+            tmp_path = path + ".tmp"
             with open(tmp_path, "w") as f:
-                _json.dump(self._last_emit_state, f)
-            _os.replace(tmp_path, self._last_emit_state_path)
+                _json.dump(state, f)
+            _os.replace(tmp_path, path)
         except Exception as exc:
             logger.warning(
-                "Could not persist last_emit state to %s: %s",
-                self._last_emit_state_path, exc,
+                "Could not persist %s state to %s: %s",
+                label, path, exc,
             )
 
     async def _axon_resync_loop(self) -> None:
@@ -1010,6 +1037,12 @@ class AppIntentsValidator:
                 "uids_attempted": uids_attempted,
                 "source": source,
             }
+            # Only a success advances the last-successful marker — this is the
+            # signal the health classifier trusts (transient/rate-limited
+            # failures leave it untouched so a healthy validator that set
+            # weights minutes ago isn't false-flagged by a later failed retry).
+            if success:
+                self._last_successful_emit_state = dict(self._last_emit_state)
         except Exception as exc:
             # Truncate to 300 chars so a verbose substrate stack trace
             # doesn't make /health huge or risk leaking large blobs.
@@ -1149,6 +1182,7 @@ class AppIntentsValidator:
             "my_uid": sync_state.my_uid if sync_state is not None else None,
             "my_last_update_block": sync_state.my_last_update_block if sync_state is not None else None,
             "last_emit": self._last_emit_state,
+            "last_successful_emit": self._last_successful_emit_state,
             "orderbook": ob_stats,
         })
 
