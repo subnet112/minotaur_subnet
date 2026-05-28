@@ -223,3 +223,48 @@ async def test_last_emit_records_exception_truncated():
     assert self_stub._last_emit_state["result"] == "error"
     assert len(self_stub._last_emit_state["error"]) <= 300
     assert self_stub._last_emit_state["error"].startswith("substrate error: ")
+
+
+# ── last_successful_emit: the health-relevant marker ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_last_successful_emit_set_on_success():
+    """A successful emit advances ``_last_successful_emit_state`` (the field
+    the health classifier trusts), mirroring the latest-attempt state."""
+    self_stub = MagicMock()
+    self_stub._weights_emitter = MagicMock()
+    self_stub._weights_emitter.emit_async = AsyncMock(return_value=True)
+    self_stub._last_emit_state = None
+    self_stub._last_successful_emit_state = None
+    do_emit = AppIntentsValidator._do_emit.__get__(self_stub, AppIntentsValidator)
+
+    await do_emit({"5HOwnerHotkey": 1.0}, source="burn_fallback")
+
+    assert self_stub._last_successful_emit_state is not None
+    assert self_stub._last_successful_emit_state["result"] == "ok"
+    assert self_stub._last_successful_emit_state["source"] == "burn_fallback"
+
+
+@pytest.mark.asyncio
+async def test_last_successful_emit_survives_later_failed_retry():
+    """The whole point of the field: a failed retry overwrites the latest-
+    attempt state with an error but must NOT clobber the last success — so a
+    validator that set weights minutes ago still reads healthy."""
+    self_stub = MagicMock()
+    self_stub._weights_emitter = MagicMock()
+    self_stub._last_emit_state = None
+    self_stub._last_successful_emit_state = None
+    do_emit = AppIntentsValidator._do_emit.__get__(self_stub, AppIntentsValidator)
+
+    self_stub._weights_emitter.emit_async = AsyncMock(return_value=True)
+    await do_emit({"5HOwnerHotkey": 1.0}, source="burn_fallback")
+    first_success_ts = self_stub._last_successful_emit_state["attempted_at"]
+
+    # A later attempt fails (e.g. rate-limited a few seconds too early).
+    self_stub._weights_emitter.emit_async = AsyncMock(return_value=False)
+    await do_emit({"5HOwnerHotkey": 1.0}, source="burn_fallback")
+
+    assert self_stub._last_emit_state["result"] == "error"
+    assert self_stub._last_successful_emit_state["result"] == "ok"
+    assert self_stub._last_successful_emit_state["attempted_at"] == first_success_ts

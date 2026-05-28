@@ -19,8 +19,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import time
+
 from scripts.validator_health_check import (
+    STALE_THRESHOLD_SECONDS,
     ValidatorStatus,
+    _classify_weight_source,
     _dns_resolve_first_ip,
     _fmt_block_loop,
     _fmt_champion_consensus,
@@ -172,11 +176,102 @@ def test_no_owner_hotkey_finding_fires():
     assert "no_owner_hotkey" in types
 
 
-def test_recent_emit_error_finding_fires():
-    s = _base_status(last_emit={"result": "error", "error": "rate limit"})
+def test_transient_emit_error_does_not_alert():
+    """A single errored *attempt* with a recent *success* must NOT alert —
+    that's a routine rate-limited retry between epochs, not a problem."""
+    now = time.time()
+    s = _base_status(
+        last_emit={"result": "error", "error": "rate limit"},
+        last_successful_emit={"attempted_at": now - 120, "result": "ok"},
+    )
     findings = detect_findings([s])
     types = [f["type"] for f in findings]
-    assert "recent_emit_error" in types
+    assert "no_successful_emit" not in types
+
+
+def test_no_successful_emit_finding_fires_on_sustained_gap():
+    """A validator that WAS succeeding but hasn't landed a weight-set in over
+    the staleness window is the actionable case — its reputation is at risk."""
+    now = time.time()
+    s = _base_status(
+        last_emit={"result": "error", "error": "rate limit"},
+        last_successful_emit={"attempted_at": now - (STALE_THRESHOLD_SECONDS + 600), "result": "ok"},
+    )
+    findings = detect_findings([s])
+    types = [f["type"] for f in findings]
+    assert "no_successful_emit" in types
+
+
+def test_no_successful_emit_silent_for_legacy_daemon():
+    """A daemon that never reported last_successful_emit (legacy image, field
+    absent → None on the status) must NOT false-fire the sustained-gap alert."""
+    s = _base_status(last_successful_emit=None)
+    findings = detect_findings([s])
+    types = [f["type"] for f in findings]
+    assert "no_successful_emit" not in types
+
+
+# ── _classify_weight_source (last_successful_emit primary) ──────────────────
+
+
+def _health(**kw):
+    base = {"last_emit": {"result": "ok"}, "weights_emitter_configured": True}
+    base.update(kw)
+    return base
+
+
+def test_classify_self_on_recent_success():
+    now = time.time()
+    s = _base_status(last_update_seconds_ago=120)
+    h = _health(last_successful_emit={"attempted_at": now - 60, "result": "ok"})
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "self"
+
+
+def test_classify_self_ignores_recent_failed_attempt():
+    """The whole fix: a failed latest attempt does NOT demote a validator
+    that succeeded within the window."""
+    now = time.time()
+    s = _base_status(last_update_seconds_ago=900)
+    h = _health(
+        last_emit={"attempted_at": now - 5, "result": "error"},
+        last_successful_emit={"attempted_at": now - 300, "result": "ok"},
+    )
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "self"
+
+
+def test_classify_external_when_no_recent_success_but_chain_fresh():
+    now = time.time()
+    s = _base_status(last_update_seconds_ago=600)  # chain fresh
+    h = _health(last_successful_emit={"attempted_at": now - 7200, "result": "ok"})
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "external"
+
+
+def test_classify_stale_when_no_recent_success_and_chain_stale():
+    now = time.time()
+    s = _base_status(last_update_seconds_ago=7200)  # chain stale
+    h = _health(last_successful_emit=None)  # field present, no success
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "stale"
+
+
+def test_classify_no_emitter_short_circuits():
+    now = time.time()
+    s = _base_status()
+    h = _health(weights_emitter_configured=False, last_successful_emit=None)
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "no-emitter"
+
+
+def test_classify_legacy_fallback_uses_last_emit_alignment():
+    """Daemons predating last_successful_emit (no key) keep the old
+    timestamp-alignment heuristic so they don't collapse to unknown."""
+    now = time.time()
+    s = _base_status(last_update_seconds_ago=60)
+    h = {"last_emit": {"attempted_at": now - 60, "result": "ok"}, "weights_emitter_configured": True}
+    assert "last_successful_emit" not in h
+    assert _classify_weight_source(s, h, now=now, stale_threshold_seconds=3600) == "self"
+
+
+def test_classify_unknown_when_health_none():
+    assert _classify_weight_source(_base_status(), None, now=time.time(), stale_threshold_seconds=3600) == "unknown"
 
 
 def test_no_loaded_intents_finding_fires():
@@ -499,6 +594,8 @@ def test_render_health_detail_one_column_per_reachable_validator():
     # Column header carries the validator; field labels run down the side.
     assert "**Acme**<br>uid 1" in out
     assert "| Image |" in out
+    assert "| Last success |" in out
+    assert "| Last attempt |" in out
     assert "| OrderBook |" in out
     assert "`2f14b2e`" in out
     assert "open:4" in out
