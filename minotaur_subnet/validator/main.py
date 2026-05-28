@@ -787,6 +787,19 @@ class AppIntentsValidator:
         self._last_successful_emit_state = self._read_persisted_state(
             self._last_successful_emit_state_path, "last_successful_emit",
         )
+        # First-upgrade seed: on the very first run of the image that added
+        # last_successful_emit there is no persisted success file yet, but a
+        # restored last_emit with result="ok" IS a real recent success.
+        # Adopt it so the daemon doesn't spend ~one epoch reporting null —
+        # which the health classifier would read as a (false) "external"
+        # until the next emit lands. After the first success this file
+        # exists and the seed never fires again.
+        if (
+            self._last_successful_emit_state is None
+            and self._last_emit_state is not None
+            and self._last_emit_state.get("result") == "ok"
+        ):
+            self._last_successful_emit_state = dict(self._last_emit_state)
 
     @staticmethod
     def _read_persisted_state(path: str, label: str) -> dict | None:
