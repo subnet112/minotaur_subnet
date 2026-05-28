@@ -268,3 +268,58 @@ async def test_last_successful_emit_survives_later_failed_retry():
     assert self_stub._last_emit_state["result"] == "error"
     assert self_stub._last_successful_emit_state["result"] == "ok"
     assert self_stub._last_successful_emit_state["attempted_at"] == first_success_ts
+
+
+# ── restore: first-upgrade seed of last_successful_emit ──────────────────────
+
+
+def _bare_validator(tmp_path):
+    """An AppIntentsValidator with only the fields _restore_last_emit_state
+    touches — bypasses the heavy __init__."""
+    v = AppIntentsValidator.__new__(AppIntentsValidator)
+    v._last_emit_state = None
+    v._last_successful_emit_state = None
+    v._last_emit_state_path = str(tmp_path / "last_emit.json")
+    v._last_successful_emit_state_path = str(tmp_path / "last_successful_emit.json")
+    return v
+
+
+def test_restore_seeds_last_successful_from_persisted_ok_emit(tmp_path):
+    """First upgrade: only last_emit.json exists and it's a success → seed
+    last_successful_emit from it so the daemon doesn't report a false
+    'external' for one epoch post-upgrade."""
+    import json
+    (tmp_path / "last_emit.json").write_text(
+        json.dumps({"attempted_at": 123.0, "result": "ok", "source": "burn_fallback"})
+    )
+    v = _bare_validator(tmp_path)
+    v._restore_last_emit_state()
+    assert v._last_emit_state["result"] == "ok"
+    assert v._last_successful_emit_state is not None
+    assert v._last_successful_emit_state["attempted_at"] == 123.0
+
+
+def test_restore_does_not_seed_from_errored_emit(tmp_path):
+    """A persisted last_emit that errored is NOT a success — must not seed."""
+    import json
+    (tmp_path / "last_emit.json").write_text(
+        json.dumps({"attempted_at": 123.0, "result": "error", "error": "x"})
+    )
+    v = _bare_validator(tmp_path)
+    v._restore_last_emit_state()
+    assert v._last_successful_emit_state is None
+
+
+def test_restore_prefers_persisted_success_over_seed(tmp_path):
+    """When a real last_successful_emit.json exists, it wins — the seed only
+    fills the gap on the very first upgrade."""
+    import json
+    (tmp_path / "last_emit.json").write_text(
+        json.dumps({"attempted_at": 200.0, "result": "error"})
+    )
+    (tmp_path / "last_successful_emit.json").write_text(
+        json.dumps({"attempted_at": 150.0, "result": "ok"})
+    )
+    v = _bare_validator(tmp_path)
+    v._restore_last_emit_state()
+    assert v._last_successful_emit_state["attempted_at"] == 150.0
