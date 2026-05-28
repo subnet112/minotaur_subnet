@@ -407,14 +407,17 @@ curl http://localhost:9100/consensus/info
 The default `MINOTAUR_IMAGE_TAG=stable` (in `.env.example`) plus the
 optional Watchtower container together give you hands-off updates:
 
-1. New commit lands on `main` → `docker-publish.yml` builds + pushes
-   `:latest` and `:sha-<short>` (immutable per-commit) to GHCR.
-2. The new image runs on the subnet team's prod for a soak period.
-3. When the team is happy with the soak, the `promote-stable.yml`
-   workflow re-tags `:sha-<short>` as `:stable` on GHCR.
+1. A merged PR lands on `develop` (the integration branch) →
+   `docker-publish.yml` builds + pushes `:latest` and `:sha-<short>`
+   (immutable per-commit) to GHCR.
+2. `:latest` runs on the subnet team's own validator for a soak period.
+3. When the team is happy with the soak, `develop` is merged into
+   `main` (the release branch), which builds + pushes `:stable` (and
+   its `:sha-<short>`) to GHCR. There is no separate re-tag step —
+   `main` *is* `:stable`.
 4. Your Watchtower polls GHCR within the next interval, pulls the new
-   image, recreates the `validator` and `api` containers with the new
-   SHA. ~30-60 seconds of downtime during the recreate.
+   `:stable` image, recreates the `validator` and `api` containers with
+   the new SHA. ~30-60 seconds of downtime during the recreate.
 
 The poll interval is controlled by `WATCHTOWER_POLL_INTERVAL` (seconds)
 in your `.env`. The canonical default is `3600` (1 hour). **During the
