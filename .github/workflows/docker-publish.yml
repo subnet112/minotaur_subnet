@@ -5,8 +5,12 @@ name: Build and Publish Validator Image
 # minotaur_subnet/Dockerfile and pushes to GHCR so external
 # validators can `docker pull` instead of cloning + building.
 #
-# Tags applied:
-#   - :latest                  (on main only)
+# Tags applied (branch → tag mapping is the release model):
+#   - :latest                  (push to `develop` — the integration line;
+#                               may be unstable, runs on our own validator)
+#   - :stable                  (push to `main` — the release line; `main`
+#                               only advances via a verified merge from
+#                               `develop`, so :stable is always vetted)
 #   - :sha-<short-sha>         (always, immutable per-commit)
 #   - :<git-tag>               (when a v* tag is pushed)
 #
@@ -17,7 +21,7 @@ name: Build and Publish Validator Image
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -63,7 +67,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=stable,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short
             type=ref,event=tag
 
