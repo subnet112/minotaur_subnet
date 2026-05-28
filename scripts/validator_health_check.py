@@ -238,6 +238,19 @@ class ValidatorStatus:
     # Used to render an "Active alerts" finding when live_solver_running
     # is False and a recent crash is recorded.
     live_solver_last_crash_error: str | None = None
+    # orderbook_stats: the validator /health ``orderbook`` block — a
+    # ``status_value → count`` map (open/executed/failed/…). None when the
+    # daemon predates the field or /health was unreachable; ``{}`` when the
+    # daemon is up but tracking no orders. Surfaced in the transposed dump:
+    # a leader with open orders vs. followers at zero is the steady state.
+    orderbook_stats: dict | None = None
+    # api_health: the raw api-process /health (port 8080) payload, kept for
+    # the transposed dump so the leader's extra surface (benchmark worker,
+    # solver-round coordinator, champion consensus, current round) renders
+    # without a dataclass field per key. None for validator-only nodes
+    # (third parties) and any host whose api didn't answer. The scalar
+    # live_solver_* fields above are still lifted from this for alerting.
+    api_health: dict | None = None
 
 
 def parse_registries() -> list[Registry]:
@@ -794,12 +807,14 @@ def build_statuses(
                 s.my_uid_reported = health.get("my_uid")
                 s.my_last_update_block_cached = health.get("my_last_update_block")
                 s.block_loop_running = health.get("block_loop_running")
+                s.orderbook_stats = health.get("orderbook")
 
             # Live-solver state from the api /health (port 8080 on the
             # same host). Best-effort: api may not be exposed there, in
             # which case the fields stay None and no finding fires.
             api_health = (api_health_by_uid or {}).get(uid)
             if api_health is not None:
+                s.api_health = api_health
                 s.live_solver_running = api_health.get("live_solver_running")
                 lsd = api_health.get("live_solver") or {}
                 s.live_solver_respawn_count = lsd.get("respawn_count")
@@ -1243,13 +1258,14 @@ def _fmt_block_loop(s: "ValidatorStatus") -> str:
 
 
 def _fmt_last_emit(last_emit: dict | None, *, now: float) -> str:
-    """Render last_emit as ``Nm ago · source · ✅ ok`` (or ``❌ error``).
+    """Render last_emit as a compact ``Nm · source · ✅`` triple.
 
-    ``source`` field was added in PR #95's single-emit-path refactor;
-    daemons on older images report last_emit without it, rendered as
-    ``—``. Result is always present once the daemon has attempted at
-    least one emit; rendered as ``·`` when None to flag a daemon that
-    hasn't ticked an epoch boundary yet.
+    Tuned for the transposed dump where this is one cell in a per-validator
+    column, so it stays short: the ✅/❌ glyph carries the result (no
+    trailing word) and ``source`` is abbreviated — ``burn`` for
+    ``burn_fallback``, ``api`` for ``queued_from_api`` (PR #95's single-
+    emit-path discriminator). ``—`` for the source when the daemon predates
+    that field, and ``·`` for the result when no emit has been attempted yet.
     """
     if not last_emit:
         return "—"
@@ -1258,10 +1274,66 @@ def _fmt_last_emit(last_emit: dict | None, *, now: float) -> str:
     if attempted is not None:
         secs = int(max(0, now - attempted))
         when = _fmt_seconds_ago(secs)
-    src = last_emit.get("source") or "—"
+    src_raw = last_emit.get("source")
+    src = {"burn_fallback": "burn", "queued_from_api": "api"}.get(src_raw, src_raw or "—")
     result = last_emit.get("result")
     marker = {"ok": "✅", "error": "❌"}.get(result, "·")
-    return f"{when} · {src} · {marker} {result or '?'}"
+    return f"{when} · {src} · {marker}"
+
+
+def _fmt_orderbook(stats: dict | None) -> str:
+    """Render the validator's OrderBook stats (``status → count``).
+
+    ``—`` when the field is absent (older image / unreachable). ``0`` when
+    the daemon is up but holds no orders — the normal follower state, since
+    only the leader runs the block loop that fills the book. Otherwise a
+    compact ``status:count`` join, e.g. ``open:12 executed:3``.
+    """
+    if stats is None:
+        return "—"
+    if not stats:
+        return "0"
+    return " ".join(f"{k}:{v}" for k, v in sorted(stats.items()))
+
+
+def _fmt_running(val: str | None) -> str:
+    """Render an api ``running``/``disabled`` string as a glyph + label."""
+    if val is None:
+        return "—"
+    if val == "running":
+        return "✅ running"
+    if val == "disabled":
+        return "❌ disabled"
+    return str(val)
+
+
+def _fmt_solver_round(sr: dict | None) -> str:
+    """Render the api ``solver_round`` block as ``#id status[· accepting]``."""
+    if not sr:
+        return "—"
+    rid = sr.get("round_id")
+    status = sr.get("status") or "?"
+    tail = " · accepting" if sr.get("accepting_submissions") else ""
+    return f"#{rid} {status}{tail}" if rid is not None else f"{status}{tail}"
+
+
+def _fmt_champion_consensus(cc: dict | None) -> str:
+    """Render the api ``champion_consensus`` block compactly.
+
+    ``off`` when disabled, otherwise ``{quorum}-of-{validators}, {peers} peers``
+    so config drift in the consensus set is visible at a glance.
+    """
+    if not cc:
+        return "—"
+    if not cc.get("enabled"):
+        return "off"
+    q = cc.get("quorum_required")
+    n = cc.get("validator_count")
+    peers = cc.get("peer_count")
+    base = f"{q}-of-{n}" if q is not None and n is not None else "on"
+    if peers is not None:
+        base += f", {peers} peer{'s' if peers != 1 else ''}"
+    return base
 
 
 def _fmt_emitter(configured: bool | None) -> str:
@@ -1323,23 +1395,40 @@ def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     return base
 
 
+def _health_col_label(s: ValidatorStatus) -> str:
+    """Short two-line column header for a validator: name over uid.
+
+    Names are truncated to the first word (and anything before a paren
+    dropped) so six columns stay narrow; the uid line disambiguates and
+    matches the Probe-diagnostics table. ``<br>`` stacks the two lines —
+    GitHub renders it inside table cells.
+    """
+    name = (s.display_name or "").split("(")[0].split(",")[0].strip()
+    first = name.split(" ")[0] if name else _short(s.evm_address)
+    uid = f"uid {s.uid}" if s.uid is not None else "uid —"
+    return f"**{first}**<br>{uid}"
+
+
 def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
-    """Render the per-validator ``/health`` deep-dive table.
+    """Render the per-validator ``/health`` deep-dive, transposed.
 
-    Distinct from the dense main table: this one shows raw fields the
-    daemons report — useful when triaging a specific validator without
-    SSHing into their host. Rows are restricted to ``health_reachable``
-    validators; everyone else is implicitly "unknown" and already flagged
-    in the main table's "Last set by" column.
+    Validators run *across* the columns and the fields run *down* the
+    side, so adding a field grows the table downward (scrollable) rather
+    than wider (GitHub wraps wide tables badly), and reading across any
+    row surfaces the odd-one-out — config drift becomes visible at a
+    glance. Rows are restricted to ``health_reachable`` validators;
+    everyone else is implicitly "unknown" and already flagged in the main
+    table's "Last set by" column.
 
-    The ``Live solver`` column only appears when at least one validator's
-    api /health was reachable (typically just the elected leader running
-    the swap pipeline). Suppressing the column when uniformly empty keeps
-    the table narrow for the common case of zero leaders responding from
-    a GitHub runner.
+    Two stacked sub-tables: the daemon /health (port 9100) fields are
+    present for every reachable validator; the api-process /health (port
+    8080) fields render as a second, narrower table covering only the
+    columns whose api answered — typically just the elected leader running
+    the swap pipeline — so validator-only nodes don't drag a wall of ``—``.
     """
     now = time.time()
     detailed = [s for s in statuses if s.health_reachable]
+    detailed.sort(key=lambda s: s.uid if s.uid is not None else 1 << 30)
     if not detailed:
         return (
             "## Daemon /health detail\n\n"
@@ -1347,60 +1436,74 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
             "for per-axon reasons._"
         )
 
-    show_live_solver = any(s.live_solver_running is not None for s in detailed)
-
-    header = [
-        "Validator", "Image", "Uptime", "Apps loaded", "Emitter",
-        "Owner HK", "Block loop", "Last emit",
-    ]
-    if show_live_solver:
-        header.append("Live solver")
-    sep = ["---"] * len(header)
+    cols = [_health_col_label(s) for s in detailed]
 
     lines: list[str] = []
     lines.append("## Daemon /health detail")
     lines.append("")
     lines.append(
-        f"Per-validator inspection of `/health` (port 9100). Listing "
-        f"**{len(detailed)}** of {len(statuses)} validator(s) whose daemon "
-        f"answered this run; ⚠ markers flag known-bad states (non-hex "
-        f"image, missing emitter, phantom-leader). `—` cells indicate the "
-        f"daemon predates that field on its image."
+        f"Transposed — one column per validator whose `/health` answered "
+        f"this run (**{len(detailed)}** of {len(statuses)}), fields down the "
+        f"side. Read across a row to spot the odd one out. `—` = the daemon "
+        f"predates that field (older image) or it's N/A for the daemon's role; "
+        f"⚠ flags a known-bad value (non-hex image, phantom-leader)."
     )
     lines.append("")
-    lines.append("| " + " | ".join(header) + " |")
-    lines.append("| " + " | ".join(sep) + " |")
 
-    for s in detailed:
-        if s.display_name:
-            who = f"**{s.display_name}**"
-        elif s.uid is not None:
-            who = f"uid={s.uid}"
-        else:
-            who = f"`{_short(s.evm_address)}`"
-        row = [
-            who,
-            _fmt_image(s.image_sha),
-            _fmt_uptime(s.uptime_seconds),
-            _fmt_loaded_intents(s.loaded_intents),
-            _fmt_emitter(s.weights_emitter_configured),
-            _fmt_emitter(s.owner_hotkey_resolved),
-            _fmt_block_loop(s),
-            _fmt_last_emit(s.last_emit, now=now),
+    def _table(rows: list[tuple[str, list[str]]], headers: list[str]) -> None:
+        head = ["Field"] + headers
+        lines.append("| " + " | ".join(head) + " |")
+        lines.append("| " + " | ".join(["---"] * len(head)) + " |")
+        for label, cells in rows:
+            lines.append("| " + " | ".join([label] + cells) + " |")
+
+    daemon_rows: list[tuple[str, list[str]]] = [
+        ("Image", [_fmt_image(s.image_sha) for s in detailed]),
+        ("Uptime", [_fmt_uptime(s.uptime_seconds) for s in detailed]),
+        ("Block loop", [_fmt_block_loop(s) for s in detailed]),
+        ("Apps loaded", [_fmt_loaded_intents(s.loaded_intents) for s in detailed]),
+        ("Weights emitter", [_fmt_emitter(s.weights_emitter_configured) for s in detailed]),
+        ("Owner hotkey", [_fmt_emitter(s.owner_hotkey_resolved) for s in detailed]),
+        ("Last emit", [_fmt_last_emit(s.last_emit, now=now) for s in detailed]),
+        ("OrderBook", [_fmt_orderbook(s.orderbook_stats) for s in detailed]),
+    ]
+    _table(daemon_rows, cols)
+
+    # API-process sub-table — only the columns whose port-8080 /health
+    # answered (leader only, in practice). Omitted entirely when none did,
+    # so third-party validator-only stacks don't show a dead section.
+    api = [s for s in detailed if s.api_health is not None]
+    if api:
+        api_cols = [_health_col_label(s) for s in api]
+        lines.append("")
+        lines.append("### API process `/health` (port 8080)")
+        lines.append("")
+        lines.append(
+            f"Only the elected leader runs the api / swap pipeline, so this "
+            f"covers the **{len(api)}** validator(s) whose api answered — the "
+            f"rest expose nothing on 8080."
+        )
+        lines.append("")
+        api_rows: list[tuple[str, list[str]]] = [
+            ("Live solver", [_fmt_live_solver(s) for s in api]),
+            ("Benchmark worker", [_fmt_running((s.api_health or {}).get("benchmark_worker")) for s in api]),
+            ("Solver-round coord", [_fmt_running((s.api_health or {}).get("solver_round_coordinator")) for s in api]),
+            ("Solver-round role", [(s.api_health or {}).get("solver_round_role") or "—" for s in api]),
+            ("Current round", [_fmt_solver_round((s.api_health or {}).get("solver_round")) for s in api]),
+            ("Champion consensus", [_fmt_champion_consensus((s.api_health or {}).get("champion_consensus")) for s in api]),
         ]
-        if show_live_solver:
-            row.append(_fmt_live_solver(s))
-        lines.append("| " + " | ".join(row) + " |")
+        _table(api_rows, api_cols)
 
     lines.append("")
     lines.append(
-        "_**Last emit** format: `time ago · source · result`. ``source`` "
-        "(post-PR-#95) is ``queued_from_api`` when the api EpochManager "
-        "POSTed a per-miner ranking, or ``burn_fallback`` when the daemon "
-        "fell back to its burn-to-owner safety net. **Block loop**: ``✅ "
-        "leader`` = elected order-consensus leader; ``follower`` = normal "
-        "non-leader state; ``⚠ phantom-leader`` = daemon claims leadership "
-        "but the metagraph election picks someone else._"
+        "_**Last emit**: `time · source · result` — source ``burn`` = "
+        "burn-to-owner fallback, ``api`` = per-miner ranking queued by the api "
+        "EpochManager (PR #95 discriminator); ✅=ok ❌=error, ``·``=not yet "
+        "attempted. **Block loop**: ``✅ leader`` elected order-consensus "
+        "leader, ``follower`` normal non-leader, ``⚠ phantom-leader`` daemon "
+        "claims leadership the metagraph election doesn't grant. **OrderBook**: "
+        "live order counts by status (`status:count`); ``0`` = up but empty "
+        "(normal for followers)._"
     )
     return "\n".join(lines)
 

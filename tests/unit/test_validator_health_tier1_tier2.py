@@ -23,9 +23,13 @@ from scripts.validator_health_check import (
     ValidatorStatus,
     _dns_resolve_first_ip,
     _fmt_block_loop,
+    _fmt_champion_consensus,
     _fmt_image,
     _fmt_last_emit,
     _fmt_live_solver,
+    _fmt_orderbook,
+    _fmt_running,
+    _fmt_solver_round,
     _fmt_uptime,
     _identify_leader_uid,
     _render_health_detail_table,
@@ -310,15 +314,26 @@ def test_fmt_block_loop_renders_role_states():
     assert _fmt_block_loop(unknown) == "—"
 
 
-def test_fmt_last_emit_ok_includes_source_and_age():
-    """A successful emit renders all three pieces (age · source · ✅ ok)
-    so operators can correlate cadence vs the burn/queue source."""
+def test_fmt_last_emit_ok_abbreviates_source_and_drops_result_word():
+    """A successful emit renders the compact triple — age · abbreviated
+    source · glyph — so it fits as one cell in the transposed column.
+    ``burn_fallback`` collapses to ``burn`` and the ✅ carries the result."""
     now = 1_000_000.0
     out = _fmt_last_emit(
         {"attempted_at": now - 120, "source": "burn_fallback", "result": "ok"},
         now=now,
     )
-    assert out == "2m ago · burn_fallback · ✅ ok"
+    assert out == "2m ago · burn · ✅"
+
+
+def test_fmt_last_emit_queued_source_abbreviates_to_api():
+    """The api-queued path abbreviates ``queued_from_api`` → ``api``."""
+    now = 1_000_000.0
+    out = _fmt_last_emit(
+        {"attempted_at": now - 30, "source": "queued_from_api", "result": "ok"},
+        now=now,
+    )
+    assert out == "30s ago · api · ✅"
 
 
 def test_fmt_last_emit_error_keeps_failure_marker():
@@ -329,7 +344,7 @@ def test_fmt_last_emit_error_keeps_failure_marker():
         {"attempted_at": now - 30, "source": "burn_fallback", "result": "error"},
         now=now,
     )
-    assert out == "30s ago · burn_fallback · ❌ error"
+    assert out == "30s ago · burn · ❌"
 
 
 def test_fmt_last_emit_missing_source_falls_back():
@@ -340,7 +355,7 @@ def test_fmt_last_emit_missing_source_falls_back():
         {"attempted_at": now - 60, "result": "ok"},
         now=now,
     )
-    assert out == "1m ago · — · ✅ ok"
+    assert out == "1m ago · — · ✅"
 
 
 def test_fmt_last_emit_none():
@@ -376,7 +391,81 @@ def test_fmt_live_solver_appends_respawn_count_when_nonzero():
     assert _fmt_live_solver(s_one) == "✅ (1 respawn)"
 
 
-# ── render: full daemon-detail table ───────────────────────────────────────
+# ── _fmt_orderbook ───────────────────────────────────────────────────────
+
+
+def test_fmt_orderbook_none_is_em_dash():
+    """Field absent (older image / unreachable) → em-dash, not ``0``."""
+    assert _fmt_orderbook(None) == "—"
+
+
+def test_fmt_orderbook_empty_dict_is_zero():
+    """Daemon up but holding no orders renders ``0`` — the normal follower
+    state, distinct from the ``—`` of a daemon that can't report at all."""
+    assert _fmt_orderbook({}) == "0"
+
+
+def test_fmt_orderbook_joins_status_counts_sorted():
+    """Non-empty book joins ``status:count`` pairs in sorted key order so
+    the cell is stable run-to-run."""
+    assert _fmt_orderbook({"open": 12, "executed": 3}) == "executed:3 open:12"
+
+
+# ── _fmt_running ───────────────────────────────────────────────────────────
+
+
+def test_fmt_running_maps_states_to_glyphs():
+    assert _fmt_running(None) == "—"
+    assert _fmt_running("running") == "✅ running"
+    assert _fmt_running("disabled") == "❌ disabled"
+    assert _fmt_running("weird") == "weird"
+
+
+# ── _fmt_solver_round ────────────────────────────────────────────────────────
+
+
+def test_fmt_solver_round_none_is_em_dash():
+    assert _fmt_solver_round(None) == "—"
+    assert _fmt_solver_round({}) == "—"
+
+
+def test_fmt_solver_round_with_id_and_accepting():
+    out = _fmt_solver_round(
+        {"round_id": 42, "status": "open", "accepting_submissions": True}
+    )
+    assert out == "#42 open · accepting"
+
+
+def test_fmt_solver_round_closed_not_accepting():
+    out = _fmt_solver_round(
+        {"round_id": 42, "status": "closed", "accepting_submissions": False}
+    )
+    assert out == "#42 closed"
+
+
+# ── _fmt_champion_consensus ──────────────────────────────────────────────────
+
+
+def test_fmt_champion_consensus_none_and_disabled():
+    assert _fmt_champion_consensus(None) == "—"
+    assert _fmt_champion_consensus({"enabled": False}) == "off"
+
+
+def test_fmt_champion_consensus_quorum_and_peers():
+    out = _fmt_champion_consensus(
+        {"enabled": True, "quorum_required": 2, "validator_count": 3, "peer_count": 2}
+    )
+    assert out == "2-of-3, 2 peers"
+
+
+def test_fmt_champion_consensus_singular_peer():
+    out = _fmt_champion_consensus(
+        {"enabled": True, "quorum_required": 2, "validator_count": 3, "peer_count": 1}
+    )
+    assert out == "2-of-3, 1 peer"
+
+
+# ── render: transposed daemon-detail table ──────────────────────────────────
 
 
 def test_render_health_detail_empty_when_no_probes_succeeded():
@@ -387,13 +476,13 @@ def test_render_health_detail_empty_when_no_probes_succeeded():
     out = _render_health_detail_table([unreachable])
     assert "## Daemon /health detail" in out
     assert "No `/health` probes succeeded" in out
-    assert "| Validator |" not in out  # no table header should appear
+    assert "| Field |" not in out  # no table header should appear
 
 
-def test_render_health_detail_renders_one_row_per_reachable_validator():
-    """Only validators with successful /health probes appear in the
-    detail table — unreachable rows are already represented in the
-    main table's 'Last set by' column as ``·``."""
+def test_render_health_detail_one_column_per_reachable_validator():
+    """Transposed: each reachable validator is a COLUMN (name over uid),
+    fields run down the side. Unreachable rows are excluded — they're
+    already represented in the main table's 'Last set by' column."""
     reachable = ValidatorStatus(
         evm_address="0xreachable", uid=1, display_name="Acme",
         health_reachable=True, image_sha="2f14b2e",
@@ -401,30 +490,68 @@ def test_render_health_detail_renders_one_row_per_reachable_validator():
         weights_emitter_configured=True, owner_hotkey_resolved=True,
         block_loop_running=False,
         last_emit={"attempted_at": 0, "source": "burn_fallback", "result": "ok"},
+        orderbook_stats={"open": 4},
     )
     unreachable = ValidatorStatus(
         evm_address="0xsilent", uid=2, health_reachable=False,
     )
     out = _render_health_detail_table([reachable, unreachable])
-    assert "**Acme**" in out
-    assert "0xsilent" not in out  # silent row excluded from this table
-    assert "Listing **1** of 2 validator(s)" in out
+    # Column header carries the validator; field labels run down the side.
+    assert "**Acme**<br>uid 1" in out
+    assert "| Image |" in out
+    assert "| OrderBook |" in out
+    assert "`2f14b2e`" in out
+    assert "open:4" in out
+    assert "0xsilent" not in out  # silent validator excluded
+    assert "**1** of 2" in out
 
 
-def test_render_health_detail_live_solver_column_only_when_any_value():
-    """The Live solver column is suppressed when every row has None — it
-    would just add empty cells. It appears as soon as one row has
-    live_solver_running set (the elected leader, typically)."""
-    no_solver = ValidatorStatus(
-        evm_address="0x1", uid=1, health_reachable=True,
-        live_solver_running=None,
+def test_render_health_detail_orders_columns_by_uid():
+    """Columns are uid-ascending for run-to-run stability (and to match
+    the Probe-diagnostics table ordering)."""
+    hi = ValidatorStatus(
+        evm_address="0xhi", uid=230, display_name="Yuma", health_reachable=True,
     )
-    out = _render_health_detail_table([no_solver])
-    assert "Live solver" not in out
+    lo = ValidatorStatus(
+        evm_address="0xlo", uid=1, display_name="General", health_reachable=True,
+    )
+    out = _render_health_detail_table([hi, lo])
+    # The uid=1 header must appear before the uid=230 header in the row.
+    assert out.index("uid 1") < out.index("uid 230")
 
-    with_solver = ValidatorStatus(
+
+def test_render_health_detail_api_subtable_only_when_api_health_present():
+    """The API-process sub-table is suppressed when no validator's port-8080
+    /health answered — third-party validator-only stacks shouldn't show a
+    dead section. It appears (with the leader's columns) as soon as one
+    validator carries an ``api_health`` payload."""
+    daemon_only = ValidatorStatus(
+        evm_address="0x1", uid=1, health_reachable=True, api_health=None,
+    )
+    out = _render_health_detail_table([daemon_only])
+    assert "### API process" not in out
+    assert "| Live solver |" not in out
+
+    leader = ValidatorStatus(
         evm_address="0x2", uid=2, health_reachable=True,
         live_solver_running=True, live_solver_respawn_count=0,
+        api_health={
+            "live_solver_running": True,
+            "benchmark_worker": "running",
+            "solver_round_coordinator": "running",
+            "solver_round_role": "leader",
+            "solver_round": {"round_id": 7, "status": "open", "accepting_submissions": True},
+            "champion_consensus": {
+                "enabled": True, "quorum_required": 2,
+                "validator_count": 3, "peer_count": 2,
+            },
+        },
     )
-    out_with = _render_health_detail_table([no_solver, with_solver])
+    out_with = _render_health_detail_table([daemon_only, leader])
+    assert "### API process" in out_with
     assert "| Live solver |" in out_with
+    assert "| Benchmark worker |" in out_with
+    assert "| Champion consensus |" in out_with
+    assert "✅ running" in out_with
+    assert "#7 open · accepting" in out_with
+    assert "2-of-3, 2 peers" in out_with
