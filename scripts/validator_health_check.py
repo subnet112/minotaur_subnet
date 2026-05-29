@@ -57,6 +57,12 @@ SUBTENSOR_NETWORK = os.environ.get("SUBTENSOR_NETWORK", "finney")
 STALE_THRESHOLD_SECONDS = int(os.environ.get("STALE_THRESHOLD_SECONDS", "3600"))
 LOW_TRUST_THRESHOLD = float(os.environ.get("LOW_TRUST_THRESHOLD", "0.5"))
 PROBE_TIMEOUT_SECONDS = float(os.environ.get("PROBE_TIMEOUT_SECONDS", "5"))
+# A champion-consensus node re-reads the on-chain registry every ~60s. If its
+# last SUCCESSFUL read is older than this, the cached validator count/set it's
+# computing quorum + peer discovery from is frozen → raise stale_registry_view.
+REGISTRY_REFRESH_STALE_SECONDS = int(
+    os.environ.get("REGISTRY_REFRESH_STALE_SECONDS", "600")
+)
 BLOCK_TIME_SECONDS = 12
 
 
@@ -903,7 +909,11 @@ def build_statuses(
 # ── Issue detection ──────────────────────────────────────────────────────
 
 
-def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
+def detect_findings(
+    statuses: list[ValidatorStatus],
+    *,
+    onchain_btevm_validators: set[str] | None = None,
+) -> list[dict]:
     """Return alert payloads for stale-weights / low-trust conditions.
 
     EVMs without a discoverable hotkey are skipped — they're registry-only
@@ -911,6 +921,12 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
     served), typically operators mid-deploy or with a daemon we couldn't
     reach this run. That state is reflected in the summary; it's not an
     "incident" in itself.
+
+    ``onchain_btevm_validators`` is the runner's own read of the BT-EVM
+    ValidatorRegistry ``getValidators()`` set (chain truth). When supplied,
+    each node's reported ``champion_consensus.registry_view`` is diffed
+    against it to raise ``stale_registry_view``. When None (e.g. unit tests
+    or no BT-EVM registry configured), that check is skipped.
     """
     findings: list[dict] = []
     for s in statuses:
@@ -1204,6 +1220,81 @@ def detect_findings(statuses: list[ValidatorStatus]) -> list[dict]:
         # axon_dns_drift is surfaced in the diagnostics table only — not
         # an alert (false positives during ELB rotation would spam).
 
+        # ── stale champion-registry view ──
+        # Compares the on-chain validator count + set THIS node is acting on
+        # (lifted from /health.champion_consensus.registry_view) against chain
+        # truth read by this runner. A mismatch is the root cause of an
+        # impossible-looking quorum like 5-of-5 on a 6-validator network: the
+        # node's quorum denominator AND its peer-discovery authorization both
+        # derive from this view, so a stale one mis-certifies consensus and
+        # silently drops live validators from discovery.
+        if onchain_btevm_validators is not None:
+            cc = (s.api_health or {}).get("champion_consensus") or {}
+            rv = cc.get("registry_view") if cc.get("enabled") else None
+            if rv:
+                truth = {a.lower() for a in onchain_btevm_validators}
+                reported_count = rv.get("on_chain_validator_count")
+                reported_set = {a.lower() for a in (rv.get("on_chain_validators") or [])}
+                msgs: list[str] = []
+                # Count drift (the quorum denominator). The count is read +
+                # cached separately from the set, and is sticky on RPC
+                # failure — so it can be stale even when the set looks fresh.
+                if reported_count is not None and reported_count != len(truth):
+                    msgs.append(
+                        f"reports on-chain validator count = {reported_count}, "
+                        f"chain has {len(truth)} (quorum denominator is wrong)"
+                    )
+                # Set drift (drives peer-discovery authorization).
+                missing = sorted(truth - reported_set)
+                extra = sorted(reported_set - truth)
+                if missing:
+                    msgs.append(
+                        "authorized set is MISSING current validator(s) "
+                        + ", ".join(f"`{_short(a)}`" for a in missing)
+                        + " — they get rejected by this node's peer discovery"
+                    )
+                if extra:
+                    msgs.append(
+                        "authorized set still lists departed validator(s) "
+                        + ", ".join(f"`{_short(a)}`" for a in extra)
+                    )
+                # Freshness — a frozen cache is why a drift persists.
+                err = rv.get("last_refresh_error")
+                last_ok = rv.get("last_successful_refresh")
+                if err:
+                    msgs.append(f"registry refresh is erroring (`{str(err)[:120]}`)")
+                elif last_ok is not None and (
+                    time.time() - last_ok
+                ) > REGISTRY_REFRESH_STALE_SECONDS:
+                    msgs.append(
+                        f"registry not refreshed in "
+                        f"{int((time.time() - last_ok) // 60)}m (cache frozen)"
+                    )
+                if msgs:
+                    blk = rv.get("rpc_block_number")
+                    findings.append({
+                        "type": "stale_registry_view",
+                        "validator_evm": s.evm_address,
+                        "hotkey": s.hotkey,
+                        "uid": s.uid,
+                        "display_name": s.display_name,
+                        "identity_url": s.identity_url,
+                        "axon_url": s.axon_url,
+                        "details": (
+                            "Stale on-chain validator-registry view: "
+                            + "; ".join(msgs)
+                            + f" (RPC at block {blk})."
+                            + " This node computes its champion-consensus "
+                            "quorum denominator and peer-discovery "
+                            "authorization from this view, so it can "
+                            "mis-certify consensus and drop live validators "
+                            "until its BT-EVM RPC / registry config is fixed "
+                            "and the api restarted. Verify with "
+                            "`cast call <registry> \"getValidators()(address[])\" "
+                            "--rpc-url <their-rpc>`."
+                        ),
+                    })
+
     return findings
 
 
@@ -1375,6 +1466,38 @@ def _fmt_champion_consensus(cc: dict | None) -> str:
     return base
 
 
+def _fmt_registry_view(cc: dict | None) -> str:
+    """Render champion_consensus.registry_view — the on-chain count + block +
+    refresh freshness the node is acting on.
+
+    ``—`` when absent (daemon predates the field or api unreachable). Shows
+    ``n=<count> · blk <h> · ok <age>`` normally, or ``⚠ err`` / ``⚠ <age>``
+    when the registry refresh is failing / frozen. The automated chain-truth
+    diff lives in detect_findings; this row is for eyeballing.
+    """
+    if not cc or not cc.get("enabled"):
+        return "—"
+    rv = cc.get("registry_view")
+    if not rv:
+        return "—"
+    parts: list[str] = []
+    count = rv.get("on_chain_validator_count")
+    if count is not None:
+        parts.append(f"n={count}")
+    blk = rv.get("rpc_block_number")
+    if blk:
+        parts.append(f"blk {blk / 1e6:.2f}M" if blk >= 1_000_000 else f"blk {blk}")
+    err = rv.get("last_refresh_error")
+    last_ok = rv.get("last_successful_refresh")
+    if err:
+        parts.append("⚠ err")
+    elif last_ok is not None:
+        age = int(time.time() - last_ok)
+        marker = "⚠ " if age > REGISTRY_REFRESH_STALE_SECONDS else "ok "
+        parts.append(marker + _fmt_seconds_ago(age))
+    return " · ".join(parts) if parts else "—"
+
+
 def _fmt_emitter(configured: bool | None) -> str:
     if configured is None:
         return "—"
@@ -1531,6 +1654,7 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
             ("Solver-round role", [(s.api_health or {}).get("solver_round_role") or "—" for s in api]),
             ("Current round", [_fmt_solver_round((s.api_health or {}).get("solver_round")) for s in api]),
             ("Champion consensus", [_fmt_champion_consensus((s.api_health or {}).get("champion_consensus")) for s in api]),
+            ("Registry view", [_fmt_registry_view((s.api_health or {}).get("champion_consensus")) for s in api]),
         ]
         _table(api_rows, api_cols)
 
@@ -1672,6 +1796,7 @@ def render_summary(
                 "metagraph_sync_stuck": "Metagraph sync wedged",
                 "live_solver_down": "Live solver down",
                 "live_solver_crashloop": "Live solver crash-looping",
+                "stale_registry_view": "Stale registry view",
             }.get(f["type"], f["type"])
             name = f.get("display_name")
             if name and f.get("identity_url"):
@@ -1722,7 +1847,8 @@ def render_summary(
         "_Generated by `.github/workflows/validator-health.yml` "
         "(runs every 15 min). Configuration: `STALE_THRESHOLD_SECONDS="
         f"{STALE_THRESHOLD_SECONDS}`, `LOW_TRUST_THRESHOLD={LOW_TRUST_THRESHOLD}`, "
-        f"`PROBE_TIMEOUT_SECONDS={PROBE_TIMEOUT_SECONDS}`._"
+        f"`PROBE_TIMEOUT_SECONDS={PROBE_TIMEOUT_SECONDS}`, "
+        f"`REGISTRY_REFRESH_STALE_SECONDS={REGISTRY_REFRESH_STALE_SECONDS}`._"
     )
     return "\n".join(lines) + "\n"
 
@@ -1790,7 +1916,19 @@ def main() -> int:
         api_health_by_uid=api_health_by_uid,
     )
 
-    findings = detect_findings(statuses)
+    # Chain truth for the stale_registry_view diff: the BT-EVM (chain 964)
+    # ValidatorRegistry getValidators() set this runner just read. Champion
+    # consensus is anchored on BT EVM, so that's the registry each node's
+    # registry_view should match. None if no BT-EVM registry is configured.
+    btevm_reg = next((r for r in registries if r.chain_id == 964), None)
+    onchain_btevm = None
+    if btevm_reg is not None:
+        onchain_btevm = {
+            evm for evm, regs in registered.items()
+            if regs.get(btevm_reg.name) is True
+        }
+
+    findings = detect_findings(statuses, onchain_btevm_validators=onchain_btevm)
 
     summary_md = render_summary(
         statuses=statuses,
