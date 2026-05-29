@@ -32,6 +32,7 @@ from scripts.validator_health_check import (
     _fmt_last_emit,
     _fmt_live_solver,
     _fmt_orderbook,
+    _fmt_registry_view,
     _fmt_running,
     _fmt_solver_round,
     _fmt_uptime,
@@ -330,6 +331,155 @@ def test_axon_dns_drift_not_an_alert():
     findings = detect_findings([s])
     types = [f["type"] for f in findings]
     assert "axon_dns_drift" not in types
+
+
+# ── detect_findings — stale_registry_view ────────────────────────────────
+
+_TRUTH = {"0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20}
+
+
+def _status_with_registry_view(rv: dict, **overrides) -> ValidatorStatus:
+    return _base_status(
+        api_health={"champion_consensus": {"enabled": True, "registry_view": rv}},
+        **overrides,
+    )
+
+
+def test_stale_registry_view_skipped_without_chain_truth():
+    """No chain-truth set passed (unit tests / no BT-EVM registry) ⇒ the
+    diff is silently skipped, never false-fires."""
+    now = time.time()
+    rv = {
+        "on_chain_validator_count": 99,
+        "on_chain_validators": [],
+        "last_successful_refresh": now,
+        "last_refresh_error": None,
+    }
+    findings = detect_findings([_status_with_registry_view(rv)])
+    assert "stale_registry_view" not in [f["type"] for f in findings]
+
+
+def test_stale_registry_view_clean_when_matches_truth():
+    now = time.time()
+    rv = {
+        "on_chain_validator_count": len(_TRUTH),
+        "on_chain_validators": sorted(_TRUTH),
+        "last_successful_refresh": now,
+        "last_refresh_error": None,
+    }
+    findings = detect_findings(
+        [_status_with_registry_view(rv)], onchain_btevm_validators=_TRUTH
+    )
+    assert "stale_registry_view" not in [f["type"] for f in findings]
+
+
+def test_stale_registry_view_fires_on_count_mismatch():
+    """The prod TAO scenario: validator set is fresh but the cached count is
+    stale (7 vs 6) ⇒ wrong quorum denominator."""
+    now = time.time()
+    rv = {
+        "on_chain_validator_count": len(_TRUTH) + 1,
+        "on_chain_validators": sorted(_TRUTH),
+        "last_successful_refresh": now,
+        "last_refresh_error": None,
+    }
+    findings = detect_findings(
+        [_status_with_registry_view(rv)], onchain_btevm_validators=_TRUTH
+    )
+    hits = [f for f in findings if f["type"] == "stale_registry_view"]
+    assert hits and "validator count" in hits[0]["details"]
+
+
+def test_stale_registry_view_fires_on_missing_current_validator():
+    """A stale authorized set missing a current validator ⇒ that validator is
+    dropped from this node's peer discovery (the peer_count shortfall)."""
+    now = time.time()
+    partial = sorted(_TRUTH)[:-1]
+    rv = {
+        "on_chain_validator_count": len(partial),
+        "on_chain_validators": partial,
+        "last_successful_refresh": now,
+        "last_refresh_error": None,
+    }
+    findings = detect_findings(
+        [_status_with_registry_view(rv)], onchain_btevm_validators=_TRUTH
+    )
+    hits = [f for f in findings if f["type"] == "stale_registry_view"]
+    assert hits and "MISSING" in hits[0]["details"]
+
+
+def test_stale_registry_view_fires_on_refresh_error():
+    """A registry refresh that's erroring is itself actionable even before the
+    count/set visibly drifts — the cache is about to go stale."""
+    rv = {
+        "on_chain_validator_count": len(_TRUTH),
+        "on_chain_validators": sorted(_TRUTH),
+        "last_successful_refresh": None,
+        "last_refresh_error": "getValidators: timeout",
+    }
+    findings = detect_findings(
+        [_status_with_registry_view(rv)], onchain_btevm_validators=_TRUTH
+    )
+    assert "stale_registry_view" in [f["type"] for f in findings]
+
+
+def test_stale_registry_view_silent_for_legacy_daemon():
+    """A daemon predating the registry_view field (absent) must not fire."""
+    s = _base_status(api_health={"champion_consensus": {"enabled": True}})
+    findings = detect_findings([s], onchain_btevm_validators=_TRUTH)
+    assert "stale_registry_view" not in [f["type"] for f in findings]
+
+
+# ── _fmt_registry_view ────────────────────────────────────────────────────
+
+
+def _cc(rv=None, enabled=True):
+    cc = {"enabled": enabled}
+    if rv is not None:
+        cc["registry_view"] = rv
+    return cc
+
+
+def test_fmt_registry_view_absent_renders_dash():
+    assert _fmt_registry_view(None) == "—"
+    assert _fmt_registry_view(_cc(rv=None)) == "—"
+    assert _fmt_registry_view(_cc(enabled=False)) == "—"
+
+
+def test_fmt_registry_view_fresh():
+    now = time.time()
+    rv = {
+        "on_chain_validator_count": 6,
+        "rpc_block_number": 8_287_000,
+        "last_successful_refresh": now - 30,
+        "last_refresh_error": None,
+    }
+    out = _fmt_registry_view(_cc(rv=rv))
+    assert "n=6" in out
+    assert "blk 8.29M" in out
+    assert "ok" in out
+    assert "⚠" not in out
+
+
+def test_fmt_registry_view_stale_by_age_marks_warning():
+    now = time.time()
+    rv = {
+        "on_chain_validator_count": 7,
+        "rpc_block_number": 8_000_000,
+        "last_successful_refresh": now - 5000,
+        "last_refresh_error": None,
+    }
+    assert "⚠" in _fmt_registry_view(_cc(rv=rv))
+
+
+def test_fmt_registry_view_error_marks_warning():
+    rv = {
+        "on_chain_validator_count": 7,
+        "rpc_block_number": 0,
+        "last_successful_refresh": None,
+        "last_refresh_error": "getValidators: boom",
+    }
+    assert "⚠ err" in _fmt_registry_view(_cc(rv=rv))
 
 
 # ── compound case: multiple problems on one validator ────────────────────
