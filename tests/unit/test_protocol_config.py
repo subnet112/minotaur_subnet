@@ -148,3 +148,104 @@ async def test_refresh_loop_skips_quorum_under_override():
         except asyncio.CancelledError:
             pass
         mock_read.assert_not_called()
+
+
+# ── Observability snapshot (registry_view surfaced in /health) ────────────
+
+_PC = "minotaur_subnet.consensus.protocol_config"
+_VSET = ["0x" + "aa" * 20, "0x" + "bb" * 20]
+
+
+def test_observability_snapshot_stamped_at_construction():
+    """from_validator_registry stamps chain_id / block / freshness so
+    /health can show the exact registry view without any RPC on the
+    health path."""
+    with patch(f"{_PC}._read_quorum_bps", return_value=6666), \
+         patch(f"{_PC}._read_validator_count", return_value=2), \
+         patch(f"{_PC}._read_validators", return_value=list(_VSET)), \
+         patch(f"{_PC}._read_chain_id", return_value=964), \
+         patch(f"{_PC}._read_block_number", return_value=8_000_000):
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+
+    assert cfg.chain_id == 964
+    assert cfg.last_refresh_block == 8_000_000
+    assert cfg.last_successful_refresh_at is not None
+    assert cfg.last_refresh_error is None
+
+    snap = cfg.observability_snapshot()
+    assert snap["on_chain_validator_count"] == 2
+    assert snap["on_chain_validators"] == sorted(a.lower() for a in _VSET)
+    assert snap["quorum_bps"] == 6666
+    assert snap["chain_id"] == 964
+    assert snap["rpc_block_number"] == 8_000_000
+    assert snap["registry_address"] == _REGISTRY
+    assert snap["last_refresh_error"] is None
+
+
+def test_observability_records_error_on_failed_read():
+    """A failed registry read at construction records the error and leaves
+    last_successful_refresh_at unset — the 'frozen cache' signal."""
+    with patch(f"{_PC}._read_quorum_bps", return_value=6666), \
+         patch(f"{_PC}._read_validator_count", side_effect=ConnectionError("boom")), \
+         patch(f"{_PC}._read_validators", return_value=[]), \
+         patch(f"{_PC}._read_chain_id", return_value=964), \
+         patch(f"{_PC}._read_block_number", return_value=8_000_000):
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+
+    assert cfg.last_successful_refresh_at is None
+    assert cfg.last_refresh_error is not None
+    assert "getValidatorCount" in cfg.last_refresh_error
+
+
+@pytest.mark.asyncio
+async def test_refresh_stamps_freshness_on_success():
+    cfg = ProtocolConfig(
+        quorum_bps=6666, rpc_url=_RPC, registry_address=_REGISTRY,
+        refresh_interval_seconds=0,
+    )
+    cfg.last_refresh_error = "stale-from-before"  # must clear on success
+
+    with patch(f"{_PC}._read_quorum_bps", return_value=6666), \
+         patch(f"{_PC}._read_validator_count", return_value=3), \
+         patch(f"{_PC}._read_validators", return_value=list(_VSET)), \
+         patch(f"{_PC}._read_block_number", return_value=8_111_111):
+        task = asyncio.create_task(cfg.refresh_loop())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert cfg.on_chain_validator_count == 3
+    assert cfg.last_refresh_block == 8_111_111
+    assert cfg.last_successful_refresh_at is not None
+    assert cfg.last_refresh_error is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_records_error_and_freezes_cache_on_failure():
+    """The prod TAO scenario: count read fails, so the cached count stays
+    frozen (e.g. at a stale 7) and the error is recorded — never silently
+    overwritten with a healthy-looking stamp."""
+    cfg = ProtocolConfig(
+        quorum_bps=6666, rpc_url=_RPC, registry_address=_REGISTRY,
+        refresh_interval_seconds=0, on_chain_validator_count=7,
+    )
+
+    with patch(f"{_PC}._read_quorum_bps", return_value=6666), \
+         patch(f"{_PC}._read_validator_count", side_effect=RuntimeError("rpc down")):
+        task = asyncio.create_task(cfg.refresh_loop())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert cfg.on_chain_validator_count == 7  # cached value preserved
+    assert cfg.last_refresh_error is not None
+    assert "getValidatorCount" in cfg.last_refresh_error
+    assert cfg.last_successful_refresh_at is None
