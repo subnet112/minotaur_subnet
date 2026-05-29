@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Sequence
 
@@ -196,6 +197,50 @@ class ProtocolConfig:
     # the order-consensus topology where ValidatorRegistry holds both.
     quorum_address: str = ""
 
+    # ── Observability: last on-chain read snapshot ───────────────────────
+    # Stamped at construction and on every successful refresh tick, and
+    # surfaced verbatim via ``observability_snapshot()`` under
+    # ``/health.champion_consensus.registry_view``. The point: a stale
+    # registry view (the cause of an impossible-looking quorum like
+    # ``5-of-5`` on a 6-validator network) is then DIRECTLY visible — the
+    # exact count + validator set + block height + refresh freshness the
+    # node is acting on — instead of being inferred backwards from
+    # ``quorum_required``. The validator-health workflow diffs these
+    # against chain truth to raise a ``stale_registry_view`` finding.
+    #
+    # chain_id: read once at construction (never changes for a given RPC).
+    chain_id: int = 0
+    # last_refresh_block: ``eth_blockNumber`` seen on the most recent read.
+    # A height that lags the chain head ⇒ the RPC node is out of sync and
+    # likely serving stale contract reads.
+    last_refresh_block: int = 0
+    # last_successful_refresh_at: wall-clock of the last FULLY-successful
+    # read (count + validators both fetched). Stays put when reads fail, so
+    # an old value ⇒ the refresh loop is wedged and the cached count/set are
+    # frozen. Mirrors the ``last_successful_emit`` weight-health pattern.
+    last_successful_refresh_at: float | None = None
+    # last_refresh_error: short string of the most recent refresh failure,
+    # cleared on the next success. None ⇒ last read was clean.
+    last_refresh_error: str | None = None
+
+    def observability_snapshot(self) -> dict:
+        """In-memory snapshot of the last on-chain registry read.
+
+        Pure attribute read — performs NO RPC, so it is safe to call on the
+        hot ``/health`` path. See the ``chain_id`` / ``last_refresh_*``
+        field docs above for why each value is surfaced.
+        """
+        return {
+            "on_chain_validator_count": self.on_chain_validator_count,
+            "on_chain_validators": sorted(a.lower() for a in self.on_chain_validators),
+            "quorum_bps": self.quorum_bps,
+            "registry_address": self.registry_address,
+            "chain_id": self.chain_id,
+            "rpc_block_number": self.last_refresh_block,
+            "last_successful_refresh": self.last_successful_refresh_at,
+            "last_refresh_error": self.last_refresh_error,
+        }
+
     @classmethod
     def from_validator_registry(
         cls,
@@ -244,6 +289,7 @@ class ProtocolConfig:
         # would use. Best-effort: if this read fails (e.g. older deployed
         # registry without ``getValidatorCount``), we record 0 and the
         # consensus manager falls back to its in-memory len(validators).
+        read_error: str | None = None
         try:
             on_chain_count = _read_validator_count(rpc_url, registry_address)
         except Exception as exc:
@@ -254,6 +300,7 @@ class ProtocolConfig:
                 registry_address, exc,
             )
             on_chain_count = 0
+            read_error = f"getValidatorCount: {exc}"
         # Also load the on-chain validator addresses. Used by the
         # approval-authorization check (see ``ProtocolConfig.on_chain_validators``).
         # Best-effort: same fallback semantics as the count above.
@@ -267,6 +314,21 @@ class ProtocolConfig:
                 registry_address, exc,
             )
             on_chain_addrs = []
+            read_error = f"getValidators: {exc}"
+        # Observability stamps (best-effort — never block construction).
+        # chain_id never changes for an RPC, so it's read only here.
+        try:
+            chain_id = _read_chain_id(rpc_url)
+        except Exception:
+            chain_id = 0
+        try:
+            block = _read_block_number(rpc_url)
+        except Exception:
+            block = 0
+        # Only mark "last successful refresh" when both registry reads
+        # actually landed — so a frozen cache is distinguishable from a
+        # fresh one downstream.
+        refreshed_at = time.time() if read_error is None else None
         if quorum_address and quorum_address != registry_address:
             logger.info(
                 "ProtocolConfig: loaded quorum_bps=%d (count=%d) from quorum source %s "
@@ -288,6 +350,10 @@ class ProtocolConfig:
             my_evm_address=my_evm_address,
             metagraph_provider=metagraph_provider,
             quorum_address=quorum_address,
+            chain_id=chain_id,
+            last_refresh_block=block,
+            last_successful_refresh_at=refreshed_at,
+            last_refresh_error=read_error,
         )
 
     async def refresh_loop(self) -> None:
@@ -352,6 +418,7 @@ class ProtocolConfig:
                 "(%s); keeping cached count=%d",
                 self.registry_address, exc, self.on_chain_validator_count,
             )
+            self.last_refresh_error = f"getValidatorCount: {exc}"
             return
         if new_count != self.on_chain_validator_count:
             logger.warning(
@@ -373,6 +440,7 @@ class ProtocolConfig:
                 "(%s); keeping cached %d addresses",
                 self.registry_address, exc, len(self.on_chain_validators),
             )
+            self.last_refresh_error = f"getValidators: {exc}"
             return
         # Detect set change for operator visibility (correlated with on-chain
         # ``updateValidators`` events).
@@ -385,6 +453,17 @@ class ProtocolConfig:
                 len(after - before), len(before - after), len(new_addrs),
             )
         self.on_chain_validators = list(new_addrs)
+
+        # Both registry reads landed — stamp the observability snapshot.
+        # block height is best-effort (its failure mustn't void an otherwise
+        # successful refresh); the timestamp + cleared error are the signal
+        # the health workflow keys off to tell a live view from a frozen one.
+        try:
+            self.last_refresh_block = _read_block_number(self.rpc_url)
+        except Exception as exc:
+            logger.debug("ProtocolConfig: eth_blockNumber read failed: %s", exc)
+        self.last_successful_refresh_at = time.time()
+        self.last_refresh_error = None
 
     async def _refresh_peers(self, session: aiohttp.ClientSession) -> None:
         assert self.metagraph_provider is not None
@@ -470,3 +549,21 @@ def _read_validators(rpc_url: str, registry_address: str) -> list[str]:
         abi=_VALIDATOR_REGISTRY_ABI,
     )
     return [str(a) for a in registry.functions.getValidators().call()]
+
+
+def _read_block_number(rpc_url: str) -> int:
+    """Latest block height seen by ``rpc_url`` (``eth_blockNumber``).
+
+    Observability only — a height that lags the chain head is the
+    signature of an out-of-sync RPC node, which can serve stale contract
+    reads (and thus a stale validator count/set) while still answering.
+    """
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    return int(w3.eth.block_number)
+
+
+def _read_chain_id(rpc_url: str) -> int:
+    """``eth_chainId`` for ``rpc_url`` — surfaced so operators can spot a
+    node pointed at the wrong chain's registry."""
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    return int(w3.eth.chain_id)

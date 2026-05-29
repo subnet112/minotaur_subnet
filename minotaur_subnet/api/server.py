@@ -281,17 +281,33 @@ def health() -> dict:
     champion_consensus = submissions.get_champion_consensus_manager()
     champion_peer_network = submissions.get_champion_peer_network()
     if champion_consensus is not None:
-        data["champion_consensus"] = {
+        cc = {
             "enabled": True,
             "validator_id": champion_consensus.validator_id,
             "quorum_required": champion_consensus.quorum_required,
             "validator_count": len(champion_consensus.validators),
             "peer_count": len(champion_peer_network.peers) if champion_peer_network is not None else 0,
+            # The discovered set this node's validator_count is built from
+            # (self + reachable+authorized peers). Surfaced so the health
+            # workflow can diff it against the on-chain set and name which
+            # validator dropped out of discovery — see registry_view below.
+            "discovered_validators": sorted(v.lower() for v in champion_consensus.validators),
             "internal_round_auth_configured": bool(
                 os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
                 or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
             ),
         }
+        # The exact on-chain registry view (count + validator set + block +
+        # refresh freshness) this node is acting on. Makes a stale view — the
+        # cause of an impossible-looking quorum like 5-of-5 on a 6-validator
+        # network — directly visible instead of inferred from quorum_required.
+        pc = getattr(champion_consensus, "protocol_config", None)
+        if pc is not None and hasattr(pc, "observability_snapshot"):
+            try:
+                cc["registry_view"] = pc.observability_snapshot()
+            except Exception:  # never let observability break /health
+                pass
+        data["champion_consensus"] = cc
     else:
         data["champion_consensus"] = {
             "enabled": False,
