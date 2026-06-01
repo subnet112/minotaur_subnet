@@ -16,15 +16,13 @@ The CLI flags are the same; only the `--validator-url` changes:
 | Target | URL | When to use |
 |---|---|---|
 | Local testnet | `http://localhost:8080` | After `make testnet-up`. Submissions auto-benchmark, fast iteration. |
-| Production | `<PRODUCTION_API_URL>` (see project announcement channel) | Real subnet 112 mining; emissions, real benchmarks. |
+| Production | `https://api.minotaursubnet.com` | Real subnet 112 mining; emissions, real benchmarks. |
 
 The rest of this guide uses `$VALIDATOR_URL` as a placeholder — set it to one of the above:
 
 ```bash
 export VALIDATOR_URL=http://localhost:8080            # local dev
-# For production, fetch the current API URL from the project announcement
-# channel (see project README) and export it:
-# export VALIDATOR_URL=<PRODUCTION_API_URL>
+# export VALIDATOR_URL=https://api.minotaursubnet.com  # production (subnet 112)
 ```
 
 See the [network reference](../operator/network-reference.md) for where to find the active production endpoint.
