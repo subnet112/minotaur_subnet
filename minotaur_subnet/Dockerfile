@@ -256,3 +256,18 @@ EXPOSE 8080 9100
 # in compose (the canonical validator stack does exactly this).
 ENTRYPOINT ["python"]
 CMD ["-m", "minotaur_subnet.api.server"]
+
+
+# ── testnet stage ──────────────────────────────────────────────────────────
+# Adds `forge` + the vendored contract libs that the local-testnet's app
+# compile/deploy path needs: DeployService.compile() runs `forge build` on
+# submitted app source, which requires forge and lib/{openzeppelin,uniswap,
+# forge-std}. The slim `final` stage deliberately drops both. This stage is
+# layered ON TOP of `final` and is selected only by the local-testnet compose
+# (`target: testnet`) — the prod image stays `final` and unaffected.
+FROM final AS testnet
+USER root
+COPY --from=builder /root/.foundry/bin/forge /usr/local/bin/forge
+RUN chmod 0755 /usr/local/bin/forge
+COPY --from=builder --chown=minotaur:minotaur /build/contracts/lib /home/minotaur/app/contracts/lib
+USER minotaur
