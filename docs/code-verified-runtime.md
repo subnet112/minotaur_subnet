@@ -58,7 +58,7 @@ Notes:
 
 - The CLI subcommands are `agent`, `submit`, `status` (no `run`, no `test`, no `submit-legacy`).
 - In local testnet, `/v1/submissions*` are served by the API service on `:8080`.
-- `submit` auto-detection currently expects `GET /v1/status`; if unavailable, pass `--epoch`.
+- `submit` discovers the active round via `GET /v1/solver/round` and signs `{repo_url}:{commit_hash}:{round_id}`; the epoch is read from the round (`--epoch` is an optional override). There is no `/v1/status` epoch fallback.
 
 ## API Server Surface (`/v1`)
 

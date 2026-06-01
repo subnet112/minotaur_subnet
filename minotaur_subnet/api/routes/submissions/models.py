@@ -24,8 +24,9 @@ class SubmitRequest(BaseModel):
     round_id: str | None = Field(
         default=None,
         description=(
-            "Current solver round ID. New clients should send this; older "
-            "clients may continue signing with epoch during migration."
+            "Solver round ID this submission targets (from GET /v1/solver/round). "
+            "When present it must match the current open round, else 409. "
+            "Signatures are always verified against the current open round."
         ),
         min_length=1,
     )
