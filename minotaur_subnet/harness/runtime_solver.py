@@ -16,6 +16,7 @@ import asyncio
 import atexit
 import logging
 import os
+import socket
 import subprocess
 import time
 from typing import Any
@@ -38,6 +39,21 @@ LIVE_SOLVER_LABEL_KEY = "minotaur.role"
 LIVE_SOLVER_LABEL_VALUE = "live-solver"
 LIVE_SOLVER_LABEL = f"{LIVE_SOLVER_LABEL_KEY}={LIVE_SOLVER_LABEL_VALUE}"
 
+# Per-launcher scope for the orphan reap. Multiple API instances (leader +
+# peers) can share one host docker.sock; reaping by role alone makes each
+# instance kill the OTHERS' in-use live-solver containers mid-INITIALIZE.
+# Tagging each container with the launching instance's hostname and reaping
+# only matching ones keeps siblings from stomping each other.
+LIVE_SOLVER_LAUNCHER_KEY = "minotaur.launcher"
+
+
+def _live_solver_launcher_id() -> str:
+    """Stable-per-instance launcher id (container hostname)."""
+    try:
+        return socket.gethostname() or "unknown"
+    except Exception:
+        return "unknown"
+
 
 def _reap_orphan_live_solvers() -> int:
     """Kill + remove any live-solver containers left over from prior runs.
@@ -48,7 +64,13 @@ def _reap_orphan_live_solvers() -> int:
     """
     try:
         result = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", f"label={LIVE_SOLVER_LABEL}"],
+            [
+                "docker", "ps", "-aq",
+                "--filter", f"label={LIVE_SOLVER_LABEL}",
+                # Only reap OUR OWN orphans — never a sibling instance's
+                # in-use live solver (see LIVE_SOLVER_LAUNCHER_KEY).
+                "--filter", f"label={LIVE_SOLVER_LAUNCHER_KEY}={_live_solver_launcher_id()}",
+            ],
             capture_output=True, text=True, timeout=10, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
@@ -189,7 +211,10 @@ class DockerRuntimeSolver:
                 image_ref,
                 live=True,
                 network=live_network or None,
-                labels={LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE},
+                labels={
+                    LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE,
+                    LIVE_SOLVER_LAUNCHER_KEY: _live_solver_launcher_id(),
+                },
             )
         finally:
             if saved_production is not None:
@@ -250,7 +275,10 @@ class DockerRuntimeSolver:
                 self._image_ref,
                 live=True,
                 network=live_network or None,
-                labels={LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE},
+                labels={
+                    LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE,
+                    LIVE_SOLVER_LAUNCHER_KEY: _live_solver_launcher_id(),
+                },
             )
         finally:
             if saved_production is not None:
