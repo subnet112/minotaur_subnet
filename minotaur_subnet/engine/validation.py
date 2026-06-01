@@ -163,9 +163,15 @@ def validate_solidity_code(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Auto-detect contract name
+    # Auto-detect contract name. Anchored to a line-start declaration and
+    # preferring an inheriting contract ("contract X is ...") so a NatSpec
+    # comment containing the word "contract" (e.g. "approve this contract to
+    # pull WETH") is not mistaken for the name (which produced "to").
     if not contract_name:
-        match = re.search(r"contract\s+(\w+)", solidity_code)
+        match = (
+            re.search(r"(?m)^\s*(?:abstract\s+)?contract\s+(\w+)\s+is\b", solidity_code)
+            or re.search(r"(?m)^\s*(?:abstract\s+)?contract\s+(\w+)", solidity_code)
+        )
         if match:
             contract_name = match.group(1)
         else:

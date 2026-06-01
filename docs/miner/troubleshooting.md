@@ -18,21 +18,17 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/submissions
 ```
 
-## Epoch auto-detection failure
+## No open solver round
 
-### Error: `Failed to fetch epoch from .../v1/status`
+### Error: `Cannot submit: solver round unavailable` / `Cannot submit: no open solver round`
 
-`submit` auto-detects epoch via `GET /v1/status`. If that endpoint is unavailable on your target, pass `--epoch` explicitly:
+`submit` discovers the active round via `GET /v1/solver/round` and requires one that is **open and accepting submissions** — there is no epoch fallback. Check the round:
 
 ```bash
-python -m minotaur_subnet.miner.main submit \
-  --repo-url <url> \
-  --commit-hash <hash> \
-  --hotkey <wallet> \
-  --epoch 0 \
-  --validator-url http://localhost:8080 \
-  --poll
+curl http://localhost:8080/v1/solver/round
 ```
+
+If there's no `round_id`, or `accepting_submissions` is `false`, wait for the next open round (on local testnet, ensure the API has opened one). `--epoch` is no longer required — the epoch is read from the round.
 
 ## Signature or hotkey issues (git submission)
 

@@ -1954,6 +1954,10 @@ def main() -> int:
             "trust": s.trust,
             "weight_source": s.weight_source,
             "weights_emitter_configured": s.weights_emitter_configured,
+            # Did the /health probe succeed this run? The auto-close logic
+            # uses this to gate /health-derived alert types — it won't close
+            # them on a probe miss (no positive evidence the condition cleared).
+            "health_reachable": s.health_reachable,
             "stale_weights": (
                 s.last_update_seconds_ago is not None
                 and s.last_update_seconds_ago > STALE_THRESHOLD_SECONDS

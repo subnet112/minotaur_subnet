@@ -158,7 +158,13 @@ async def test_create_reaps_orphans_and_labels_container():
         )
     # Reaper fires exactly once before the new container comes up.
     reap.assert_called_once()
-    # The container is labelled so the next boot's reaper can find it.
+    # The container is labelled so the next boot's reaper can find it —
+    # scoped to THIS instance's launcher id so sibling api instances don't
+    # reap each other's in-use live solvers.
+    from minotaur_subnet.harness.runtime_solver import _live_solver_launcher_id
     kwargs = start_docker.await_args.kwargs
-    assert kwargs["labels"] == {"minotaur.role": "live-solver"}
+    assert kwargs["labels"] == {
+        "minotaur.role": "live-solver",
+        "minotaur.launcher": _live_solver_launcher_id(),
+    }
     assert kwargs["live"] is True

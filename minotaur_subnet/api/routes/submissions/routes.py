@@ -518,14 +518,12 @@ def verify_hotkey_signature(
     hotkey: str,
     repo_url: str,
     commit_hash: str,
-    epoch: int | None,
     signature_b64: str,
-    round_id: str | None = None,
+    round_id: str,
 ) -> bool:
     """Verify that the signature was produced by the given hotkey.
 
-    Message format: "{repo_url}:{commit_hash}:{round_id}" when round ID is
-    supplied, else legacy "{repo_url}:{commit_hash}:{epoch}".
+    Message format: "{repo_url}:{commit_hash}:{round_id}".
     Uses bittensor Keypair.verify() for Ed25519 signature checks.
 
     Returns True if valid, False otherwise.
@@ -538,7 +536,6 @@ def verify_hotkey_signature(
             repo_url,
             commit_hash,
             round_id=round_id,
-            epoch=epoch,
         )
         signature_bytes = base64.b64decode(signature_b64)
         keypair = Keypair(ss58_address=hotkey)
@@ -552,15 +549,12 @@ def build_submission_message(
     repo_url: str,
     commit_hash: str,
     *,
-    round_id: str | None = None,
-    epoch: int | None = None,
+    round_id: str,
 ) -> str:
-    """Build the signed submission payload used by miners and validators."""
-    if round_id:
-        return f"{repo_url}:{commit_hash}:{round_id}"
-    if epoch is None:
-        raise ValueError("epoch is required when round_id is absent")
-    return f"{repo_url}:{commit_hash}:{epoch}"
+    """Build the signed submission payload: {repo_url}:{commit_hash}:{round_id}."""
+    if not round_id:
+        raise ValueError("round_id is required")
+    return f"{repo_url}:{commit_hash}:{round_id}"
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -658,13 +652,13 @@ async def create_submission(
     _validate_repo_url_policy(body.repo_url)
     _validate_commit_hash_format(body.commit_hash)
 
-    # Verify hotkey signature
+    # Verify hotkey signature against the authoritative open round (not the
+    # client-supplied round_id). round-based only — epoch signing is gone.
     if not verify_hotkey_signature(
         hotkey=body.hotkey,
         repo_url=body.repo_url,
         commit_hash=body.commit_hash,
-        epoch=body.epoch,
-        round_id=body.round_id,
+        round_id=current_round.round_id,
         signature_b64=body.signature,
     ):
         raise HTTPException(
