@@ -224,10 +224,11 @@ def health() -> dict:
     worker_running = ctx.benchmark_worker is not None and ctx.benchmark_worker._running
     loop_running = ctx.block_loop is not None and ctx.block_loop.running
     coordinator_running = ctx.solver_round_task is not None and not ctx.solver_round_task.done()
-    # MINOTAUR_IMAGE_SHA is baked at build time (see Dockerfile + the
-    # docker-publish.yml build-args). 7-char prefix matches GHCR's
-    # sha-XXXXXXX tag scheme; "dev" for local builds without --build-arg.
-    image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
+    # Build version: MINOTAUR_IMAGE_SHA (baked by CI/Dockerfile) for published
+    # images; falls back to the source checkout's git SHA for from-source /
+    # bare-metal operators (e.g. no-Docker validators); "dev" otherwise.
+    from minotaur_subnet.version import resolve_version
+    image_sha = resolve_version()
     # Live champion solver state — surfaces whether the Docker session
     # backing /v1/apps/*/quote and /v1/apps/*/orders is currently usable.
     # The session can die transparently on a per-command timeout (orchestrator
