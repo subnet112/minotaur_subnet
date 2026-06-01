@@ -43,6 +43,10 @@ class RejectionCode(str, Enum):
     ORDER_UNKNOWN = "ORDER_UNKNOWN"
     SCORE_BELOW_THRESHOLD = "SCORE_BELOW_THRESHOLD"
     ON_CHAIN_SCORE_BELOW_THRESHOLD = "ON_CHAIN_SCORE_BELOW_THRESHOLD"
+    # Locked protocol fee doesn't cover this follower's measured gas, or it
+    # falls outside the on-chain [min, max] clamp — signing would let the
+    # relayer submit at a loss / hit an on-chain revert.
+    FEE_NOT_CERTIFIED = "FEE_NOT_CERTIFIED"
     PLAN_HASH_MISMATCH = "PLAN_HASH_MISMATCH"
     SIMULATION_FAILED = "SIMULATION_FAILED"
     # Local Anvil unreachable/down/timed-out — distinct from SIMULATION_FAILED

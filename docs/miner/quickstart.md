@@ -16,15 +16,13 @@ The CLI flags are the same; only the `--validator-url` changes:
 | Target | URL | When to use |
 |---|---|---|
 | Local testnet | `http://localhost:8080` | After `make testnet-up`. Submissions auto-benchmark, fast iteration. |
-| Production | `<PRODUCTION_API_URL>` (see project announcement channel) | Real subnet 112 mining; emissions, real benchmarks. |
+| Production | `https://api.minotaursubnet.com` | Real subnet 112 mining; emissions, real benchmarks. |
 
 The rest of this guide uses `$VALIDATOR_URL` as a placeholder — set it to one of the above:
 
 ```bash
 export VALIDATOR_URL=http://localhost:8080            # local dev
-# For production, fetch the current API URL from the project announcement
-# channel (see project README) and export it:
-# export VALIDATOR_URL=<PRODUCTION_API_URL>
+# export VALIDATOR_URL=https://api.minotaursubnet.com  # production (subnet 112)
 ```
 
 See the [network reference](../operator/network-reference.md) for where to find the active production endpoint.
@@ -95,7 +93,7 @@ python -m minotaur_subnet.miner.main submit \
 Notes:
 
 - `--hotkey` is the bittensor **hotkey name** (matches `--wallet.hotkey` in `btcli`), not the wallet name. The signed submission is verified against the metagraph by the API.
-- `--epoch` is required in practice unless your target exposes `GET /v1/status` for auto-detection.
+- `--epoch` is optional — `submit` auto-detects it from the current open round (`GET /v1/solver/round`). The signed message is `{repo_url}:{commit_hash}:{round_id}`.
 - `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
 
 ## 6) Optional: direct source submission (local/dev)
@@ -147,6 +145,25 @@ Once `submit` returns, the API queues your solver for evaluation. The lifecycle 
 Wall-clock times depend on the live network's queue depth. On a quiet network, screening + benchmarking takes 1–3 minutes. During a benchmark spike (multiple submissions queued), it can stretch to 10+ minutes.
 
 Poll with `status` or watch the agent loop logs — both surface state transitions in real time.
+
+## Dry-run: score your solver before submitting to production
+
+There is **no endpoint to score a solver on the production validators without submitting** — running untrusted code on a validator only happens through the full sandboxed screening → benchmark flow. To iterate and get a score without touching production, run the **local testnet**, which executes the *same* screening + benchmark + scoring pipeline the production validator uses:
+
+```bash
+make testnet-up                                   # full stack on your machine
+export VALIDATOR_URL=http://localhost:8080        # your local validator/API
+python -m minotaur_subnet.miner.main submit \
+  --repo-url https://github.com/you/your-solver \
+  --commit-hash <sha> \
+  --hotkey <local-test-hotkey> \
+  --validator-url "$VALIDATOR_URL"
+# then poll status as above
+```
+
+The local testnet auto-registers a test miner and auto-benchmarks each submission — same screening stages, same benchmark worker, same scorecard — with no real emissions or stake, and without consuming a production round. Iterate freely here until your solver scores where you want.
+
+**Caveat — local scores are a strong predictor, not the exact production score.** A live production round also runs a hidden **shadow phase** (cases not in the public benchmark pack) to discourage overfitting. So a solver that scores well locally should score similarly in production, but the final on-validator score (including shadow cases) is only known once you submit for real. Don't tune to the public cases alone.
 
 ## Next steps
 

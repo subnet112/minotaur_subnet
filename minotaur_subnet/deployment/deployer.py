@@ -26,10 +26,23 @@ logger = logging.getLogger(__name__)
 
 
 def _detect_contract_name(solidity_source: str, fallback_name: str) -> str:
-    """Detect the primary Solidity contract name from source."""
-    match = re.search(r"\bcontract\s+(\w+)", solidity_source)
-    if match:
-        return match.group(1)
+    """Detect the primary Solidity contract name from source.
+
+    Anchored to a line-start declaration so a NatSpec comment that merely
+    contains the word "contract" (e.g. "approve this contract to pull WETH")
+    is not mistaken for the contract name. Prefers a contract that inherits
+    (``contract X is ...``) — the deployable App — over a bare declaration.
+    """
+    inheriting = re.search(
+        r"(?m)^\s*(?:abstract\s+)?contract\s+(\w+)\s+is\b", solidity_source,
+    )
+    if inheriting:
+        return inheriting.group(1)
+    decl = re.search(
+        r"(?m)^\s*(?:abstract\s+)?contract\s+(\w+)", solidity_source,
+    )
+    if decl:
+        return decl.group(1)
     return fallback_name.replace(" ", "").replace("-", "")
 
 

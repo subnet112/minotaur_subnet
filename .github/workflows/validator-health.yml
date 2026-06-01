@@ -240,20 +240,39 @@ jobs:
 
             // ── Auto-close cleared alerts ────────────────────────────
             //
-            // For each currently-open validator-health-alert issue, decide
-            // whether to close it. We close ONLY on positive evidence:
-            //   1. We successfully probed the validator this run
-            //      (its uid is in observed_uids)
-            //   2. The alert type that titled the issue is NOT currently
-            //      raised for that uid (stale_weights / low_trust = false)
+            // Close an open validator-health-alert issue ONLY on positive
+            // evidence the condition cleared:
+            //   1. The uid was observed this run (it's in observed_uids), AND
+            //   2. The alert's finding type is NOT currently raised for that
+            //      uid (it's absent from this run's findings), AND
+            //   3. For /health-derived types, the /health probe succeeded this
+            //      run (health_reachable) — chain-derived types (stale_weights,
+            //      low_trust) come from the metagraph and don't need /health.
             //
-            // If the uid is missing from observed_uids — almost always
-            // because the /identity probe failed from this runner — we
-            // leave the issue open. Closing on probe miss would create
-            // false "all clear" signals during flaky network windows.
-            const TITLE_RE = /\[validator-health\] (Stale weights|Low Yuma trust): .*\(uid=(\d+)\)/;
-            const TYPE_FROM_LABEL = { 'Stale weights': 'stale_weights', 'Low Yuma trust': 'low_trust' };
+            // A missing uid, or a failed /health probe for a /health-derived
+            // type, leaves the issue open — closing on a probe miss would emit
+            // a false "all clear" during flaky network windows.
+            //
+            // Generic over ALL finding types: titles are built as
+            // "[validator-health] {kind}: {who} (uid=N)" where {kind} is the
+            // human label for stale_weights/low_trust and the raw type name
+            // otherwise (see titleFor above). The old close logic only matched
+            // the two human labels, so every other alert type (no_emitter,
+            // phantom_leader, no_owner_hotkey, stale_registry_view, …) was
+            // opened but never auto-closed.
+            const KIND_TO_TYPE = { 'Stale weights': 'stale_weights', 'Low Yuma trust': 'low_trust' };
+            const CHAIN_DERIVED = new Set(['stale_weights', 'low_trust']);
+            const TITLE_RE = /^\[validator-health\] (.+?): .*\(uid=(\d+)\)\s*$/;
             const observed = payload.observed_uids || {};
+
+            // Types currently raised, per uid, from this run's findings.
+            const activeByUid = {};
+            for (const f of payload.findings) {
+              if (f.uid === undefined || f.uid === null) continue;
+              const k = String(f.uid);
+              if (!activeByUid[k]) activeByUid[k] = new Set();
+              activeByUid[k].add(f.type);
+            }
 
             const openAlerts = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
@@ -269,23 +288,33 @@ jobs:
                 core.info(`skipping #${issue.number} (title doesn't match known format): ${issue.title}`);
                 continue;
               }
-              const alertType = TYPE_FROM_LABEL[m[1]];
+              const alertType = KIND_TO_TYPE[m[1]] || m[1];
               const uid = m[2];
               const state = observed[uid];
 
               if (!state) {
-                core.info(`leaving #${issue.number} open — uid=${uid} not probed this run (no positive evidence)`);
+                core.info(`leaving #${issue.number} open — uid=${uid} not observed this run (no positive evidence)`);
                 continue;
               }
-              if (state[alertType]) {
-                // Still failing — handled above (comment added). Don't touch.
+              if ((activeByUid[uid] || new Set()).has(alertType)) {
+                // Still raised this run — re-comment handled above. Don't touch.
+                continue;
+              }
+              if (!CHAIN_DERIVED.has(alertType) && state.health_reachable === false) {
+                core.info(`leaving #${issue.number} open — uid=${uid} /health unreachable; can't confirm '${alertType}' cleared`);
                 continue;
               }
 
               // Positive evidence the condition has cleared.
-              const closingComment = alertType === 'stale_weights'
-                ? `✅ Auto-resolved as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()}). Validator at uid=${uid} set weights ${Math.floor((state.last_update_seconds_ago || 0) / 60)}m ago — below the ${Math.floor(payload.thresholds.stale_weights_seconds / 60)}m staleness threshold.`
-                : `✅ Auto-resolved as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()}). Validator at uid=${uid} now has Yuma trust ${state.trust?.toFixed(3) ?? '?'} — above the ${payload.thresholds.low_trust} threshold.`;
+              let detail;
+              if (alertType === 'stale_weights') {
+                detail = `set weights ${Math.floor((state.last_update_seconds_ago || 0) / 60)}m ago — below the ${Math.floor(payload.thresholds.stale_weights_seconds / 60)}m staleness threshold.`;
+              } else if (alertType === 'low_trust') {
+                detail = `now has Yuma trust ${state.trust?.toFixed(3) ?? '?'} — above the ${payload.thresholds.low_trust} threshold.`;
+              } else {
+                detail = `the \`${alertType}\` condition is no longer raised.`;
+              }
+              const closingComment = `✅ Auto-resolved as of ${new Date(payload.generated_at * 1000).toISOString()} (block ${payload.current_block.toLocaleString()}). Validator at uid=${uid}: ${detail}`;
 
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
