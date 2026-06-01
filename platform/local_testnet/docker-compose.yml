@@ -182,6 +182,11 @@ services:
     volumes:
       - testnet-config:/config
       - bittensor-wallets:/root/.bittensor/wallets
+      # WORKAROUND: repo-root .dockerignore excludes platform/local_testnet/
+      # AND contracts/script/, so Dockerfile.init's `COPY . /app` drops both
+      # init.py and the forge deploy script. Mount them back in.
+      - ./:/app/platform/local_testnet:ro
+      - ../../contracts/script:/app/contracts/script:ro
     networks:
       - minotaur-testnet
     depends_on:
@@ -200,6 +205,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; set +a; exec python /app/platform/local_testnet/seed.py"]
     environment:
@@ -218,6 +224,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_0_HOTKEY_SS58:-$${VALIDATOR_HOTKEY_SS58:-}}\"; set +a; exec python -m minotaur_subnet.api.server --port 8080"]
     ports:
@@ -262,6 +269,14 @@ services:
       SOLVER_ROUND_STORE_PATH: /data/solver_rounds.json
       ALLOW_FILE_REPO_URLS: "1"
       BENCHMARK_DOCKER_NETWORK: "local_testnet_minotaur-testnet"
+      # Genesis baseline solver image (built locally from the solver repo).
+      # Required for the benchmark worker to bootstrap a baseline champion and
+      # for the leader's DockerRuntimeSolver to serve quotes/plans.
+      GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
+      # The live (quote-serving) DockerRuntimeSolver defaults to --network=none,
+      # which blocks the RPC the solver needs to read pools → it exits during
+      # INITIALIZE. Attach it to the testnet network so it can reach the anvils.
+      LIVE_SOLVER_NETWORK: "local_testnet_minotaur-testnet"
       BENCHMARK_POLL_INTERVAL: "${BENCHMARK_POLL_INTERVAL:-5}"
       SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS: "${SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS:-2}"
       SOLVER_ROUND_OPEN_SECONDS: "${SOLVER_ROUND_OPEN_SECONDS:-600}"
@@ -295,6 +310,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - bittensor-wallets:/root/.bittensor/wallets:ro
       - "${LOCAL_TESTNET_SUBMISSION_HOST_ROOT:-/tmp/minotaur-testnet-submissions}:/solver-submissions:ro"
+    # The image runs as non-root (uid 1000); to use the mounted docker.sock
+    # and launch solver containers (benchmark + live DockerRuntimeSolver) it
+    # must belong to the host's docker group.
+    group_add:
+      - "${DOCKER_GID:-984}"
     networks:
       - minotaur-testnet
     healthcheck:
@@ -314,6 +334,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_1_HOTKEY_SS58:-}\"; set +a; exec python -m minotaur_subnet.api.server --port 8080"]
     ports:
@@ -353,6 +374,14 @@ services:
       SOLVER_ROUND_STORE_PATH: /data/solver_rounds.json
       ALLOW_FILE_REPO_URLS: "1"
       BENCHMARK_DOCKER_NETWORK: "local_testnet_minotaur-testnet"
+      # Genesis baseline solver image (built locally from the solver repo).
+      # Required for the benchmark worker to bootstrap a baseline champion and
+      # for the leader's DockerRuntimeSolver to serve quotes/plans.
+      GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
+      # The live (quote-serving) DockerRuntimeSolver defaults to --network=none,
+      # which blocks the RPC the solver needs to read pools → it exits during
+      # INITIALIZE. Attach it to the testnet network so it can reach the anvils.
+      LIVE_SOLVER_NETWORK: "local_testnet_minotaur-testnet"
       BENCHMARK_POLL_INTERVAL: "${BENCHMARK_POLL_INTERVAL:-5}"
       SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS: "${SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS:-2}"
       SOLVER_ROUND_OPEN_SECONDS: "${SOLVER_ROUND_OPEN_SECONDS:-600}"
@@ -370,6 +399,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - bittensor-wallets:/root/.bittensor/wallets:ro
       - "${LOCAL_TESTNET_SUBMISSION_HOST_ROOT:-/tmp/minotaur-testnet-submissions}:/solver-submissions:ro"
+    # The image runs as non-root (uid 1000); to use the mounted docker.sock
+    # and launch solver containers (benchmark + live DockerRuntimeSolver) it
+    # must belong to the host's docker group.
+    group_add:
+      - "${DOCKER_GID:-984}"
     networks:
       - minotaur-testnet
     healthcheck:
@@ -388,6 +422,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_2_HOTKEY_SS58:-}\"; set +a; exec python -m minotaur_subnet.api.server --port 8080"]
     ports:
@@ -427,6 +462,14 @@ services:
       SOLVER_ROUND_STORE_PATH: /data/solver_rounds.json
       ALLOW_FILE_REPO_URLS: "1"
       BENCHMARK_DOCKER_NETWORK: "local_testnet_minotaur-testnet"
+      # Genesis baseline solver image (built locally from the solver repo).
+      # Required for the benchmark worker to bootstrap a baseline champion and
+      # for the leader's DockerRuntimeSolver to serve quotes/plans.
+      GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
+      # The live (quote-serving) DockerRuntimeSolver defaults to --network=none,
+      # which blocks the RPC the solver needs to read pools → it exits during
+      # INITIALIZE. Attach it to the testnet network so it can reach the anvils.
+      LIVE_SOLVER_NETWORK: "local_testnet_minotaur-testnet"
       BENCHMARK_POLL_INTERVAL: "${BENCHMARK_POLL_INTERVAL:-5}"
       SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS: "${SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS:-2}"
       SOLVER_ROUND_OPEN_SECONDS: "${SOLVER_ROUND_OPEN_SECONDS:-600}"
@@ -444,6 +487,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - bittensor-wallets:/root/.bittensor/wallets:ro
       - "${LOCAL_TESTNET_SUBMISSION_HOST_ROOT:-/tmp/minotaur-testnet-submissions}:/solver-submissions:ro"
+    # The image runs as non-root (uid 1000); to use the mounted docker.sock
+    # and launch solver containers (benchmark + live DockerRuntimeSolver) it
+    # must belong to the host's docker group.
+    group_add:
+      - "${DOCKER_GID:-984}"
     networks:
       - minotaur-testnet
     healthcheck:
@@ -462,6 +510,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; set +a; exec python -m minotaur_subnet.relayer.main --port 8091"]
     ports:
@@ -489,6 +538,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_0_HOTKEY_SS58:-$${VALIDATOR_HOTKEY_SS58:-}}\"; set +a; exec python -m minotaur_subnet.validator.main --port 9100 --store-path /data/store.json"]
     ports:
@@ -531,6 +581,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_1_HOTKEY_SS58:-}\"; set +a; exec python -m minotaur_subnet.validator.main --port 9100 --store-path /data/store.json"]
     ports:
@@ -573,6 +624,7 @@ services:
     build:
       context: ../..
       dockerfile: minotaur_subnet/Dockerfile
+      target: testnet
     entrypoint: ["/bin/sh", "-c"]
     command: ["set -a && . /config/testnet.env 2>/dev/null; export VALIDATOR_HOTKEY_SS58=\"$${VALIDATOR_2_HOTKEY_SS58:-}\"; set +a; exec python -m minotaur_subnet.validator.main --port 9100 --store-path /data/store.json"]
     ports:

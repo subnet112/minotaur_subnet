@@ -133,6 +133,11 @@ class ForgeCompiler:
             '"../AppIntentBase.sol"': '"../AppIntentBase.sol"',
             '"../../AppIntentBase.sol"': '"../AppIntentBase.sol"',
             '"../interfaces/IAppIntentBase.sol"': '"../interfaces/IAppIntentBase.sol"',
+            # OSS apps (minotaur-apps repo) import AppIntentBase via the
+            # minotaur_contracts submodule path; map it onto this repo's
+            # contracts/src/AppIntentBase.sol so submitted app source compiles
+            # without the submodule layout.
+            '"minotaur_contracts/src/AppIntentBase.sol"': '"../AppIntentBase.sol"',
         }
         for old, new in replacements.items():
             source = source.replace(old, new)
