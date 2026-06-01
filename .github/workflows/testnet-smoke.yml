@@ -1,49 +1,95 @@
 name: Local Testnet Smoke
 
-# Manual-trigger only. The full local-testnet suite expects:
-#   - The `contracts/` tree (lives in subnet112/minotaur_contracts now)
-#   - An ALCHEMY_API_KEY repo secret for the mainnet/base fork RPCs
-#   - A multi-service docker-compose stack (anvil + subtensor + api +
-#     validators + relayer) that's better exercised in a dev rig than a
-#     hosted GitHub runner.
+# Full multi-service local-testnet stack (anvil ETH/Base/BT-EVM forks +
+# subtensor + api/validators/relayer) plus the tests/testnet/ suite. It is
+# heavy and needs the ALCHEMY_API_KEY secret for the fork RPCs, so it is
+# GATED rather than run on every PR:
 #
-# Run on demand from the Actions tab when you want a full-stack smoke
-# check; the daily schedule was removed so a missing ALCHEMY_API_KEY
-# secret stops generating red checkmarks on the repo home.
+#   - PRs: only when labelled `needs-testnet` (opt-in for risky changes —
+#     consensus / relayer / blockloop / fee / deployment / simulator).
+#   - Nightly on a schedule.
+#   - On demand via the Actions tab.
+#
+# When ALCHEMY_API_KEY is absent the job SKIPS cleanly (green, not red) so a
+# missing secret never spams the repo with failed checks (the reason the old
+# daily schedule was removed). The genesis solver image is built from the
+# reference solver repo so the stack has a champion to quote/score with.
+
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC nightly
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 jobs:
   local_testnet-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # PRs run only when explicitly opted in via the `needs-testnet` label;
+    # schedule/dispatch always run. (Secrets can't be referenced in job-level
+    # `if:`, so the secret check is a step guard below.)
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'needs-testnet')
     steps:
+      - name: Gate on ALCHEMY_API_KEY presence
+        id: guard
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+        run: |
+          if [ -z "$ALCHEMY_API_KEY" ]; then
+            echo "::notice::ALCHEMY_API_KEY not configured — skipping full-stack smoke (not a failure)."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.run == 'true'
         with:
           submodules: recursive
 
+      - name: Check out reference solver (for the genesis image)
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: subnet112/minotaur-solver
+          path: _solver
+
+      - name: Build genesis solver image
+        if: steps.guard.outputs.run == 'true'
+        run: docker build -t minotaur-genesis:ci _solver
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
         with:
           python-version: "3.12"
 
       - name: Create virtualenv and install dependencies
+        if: steps.guard.outputs.run == 'true'
         run: |
           python -m venv .venv
           ./.venv/bin/pip install --upgrade pip
           ./.venv/bin/pip install -r requirements.txt
 
-      - name: Prepare local testnet RPC config
+      - name: Prepare local testnet config
+        if: steps.guard.outputs.run == 'true'
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
         run: |
           cat > platform/local_testnet/.env <<EOF
           ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
           BASE_ALCHEMY_RPC_URL=https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+          GENESIS_SOLVER_IMAGE=minotaur-genesis:ci
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          MVP_DEMO_MODE=1
           EOF
-        env:
-          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
 
       - name: Run local testnet smoke suite
+        if: steps.guard.outputs.run == 'true'
         run: make test-testnet
 
       - name: Tear down local testnet
-        if: always()
+        if: always() && steps.guard.outputs.run == 'true'
         run: make testnet-down
