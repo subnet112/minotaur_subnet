@@ -27,6 +27,7 @@ Requires a running Anvil instance (local testnet or standalone).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -120,6 +121,13 @@ class AnvilSimulator:
         # 31337) where re-forking isn't possible — revert to baseline
         # instead. Also a recovery anchor if a per-simulation revert
         # fails. Tracked + refreshed inside _reset_fork.
+        # Serializes simulate() calls on this fork. Concurrent sims (e.g. the
+        # benchmark worker + a live quote hitting the same chain's simulator)
+        # interleave evm_snapshot/evm_revert IDs — Anvil consumes a snapshot on
+        # revert, so one sim's revert invalidates another's baseline → "baseline
+        # revert failed" / fork-poison false positives. One lock per fork makes
+        # the snapshot→execute→revert window atomic.
+        self._sim_lock = asyncio.Lock()
         self._baseline_snapshot_id: str | None = None
 
         # Per-process counter for the periodic baseline-alive probe.
@@ -156,7 +164,16 @@ class AnvilSimulator:
                     exc,
                 )
 
-    async def simulate(
+    async def simulate(self, *args: Any, **kwargs: Any) -> SimulationResult:
+        """Serialized entrypoint — see :meth:`_simulate_inner`.
+
+        Holds the per-fork lock for the whole snapshot→execute→revert window
+        so concurrent callers can't corrupt each other's snapshot state.
+        """
+        async with self._sim_lock:
+            return await self._simulate_inner(*args, **kwargs)
+
+    async def _simulate_inner(
         self,
         plan: ExecutionPlan,
         contract_address: str | None = None,
