@@ -170,7 +170,13 @@ class AnvilSimulator:
         Holds the per-fork lock for the whole snapshot→execute→revert window
         so concurrent callers can't corrupt each other's snapshot state.
         """
-        async with self._sim_lock:
+        # Lazy-init keeps objects built via __new__ (some tests / partial
+        # construction paths) working — they never ran __init__. Safe under
+        # asyncio: there's no await between the check and the assignment.
+        lock = getattr(self, "_sim_lock", None)
+        if lock is None:
+            lock = self._sim_lock = asyncio.Lock()
+        async with lock:
             return await self._simulate_inner(*args, **kwargs)
 
     async def _simulate_inner(
