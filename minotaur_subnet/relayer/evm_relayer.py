@@ -317,16 +317,41 @@ class EvmRelayer(RelayerBase):
                         if ix.value and str(ix.value) != "0"
                     )
 
+                    gas_limit = self._estimate_gas(w3, {
+                        "from": config.relayer_wallet,
+                        "to": app_address,
+                        "value": tx_value,
+                        "data": call_fn._encode_transaction_data(),
+                    })
+
+                    # Protocol-fee gas-price cap. Bound the bid so the relayer
+                    # can never pay more than the locked, validator-certified
+                    # fee covers: at gas_limit gas the total spend is <=
+                    # locked_fee. A post-certification gas spike above this
+                    # makes the tx pend rather than execute at a loss — the
+                    # relayer still submits (it cannot refuse a quorum-approved
+                    # order), it just doesn't overpay. On floor-dominated chains
+                    # (Base/BT EVM) the cap sits far above market so it never
+                    # binds; on gas-dominated chains it sits ~the quote-time
+                    # price.
+                    _locked_fee = int((getattr(order, "params", None) or {}).get("platform_fee_wei", 0) or 0)
+                    if _locked_fee > 0 and gas_limit > 0:
+                        from minotaur_subnet import fee_policy
+                        _cap = fee_policy.max_gas_price_wei(_locked_fee, gas_limit)
+                        if 0 < _cap < gas_price:
+                            logger.info(
+                                "[RELAYER] Capping gas price %d -> %d "
+                                "(fee %d / gas_limit %d) for order %s",
+                                gas_price, _cap, _locked_fee, gas_limit,
+                                getattr(order, "order_id", "?"),
+                            )
+                            gas_price = _cap
+
                     tx = call_fn.build_transaction({
                         "from": config.relayer_wallet,
                         "nonce": nonce,
                         "value": tx_value,
-                        "gas": self._estimate_gas(w3, {
-                            "from": config.relayer_wallet,
-                            "to": app_address,
-                            "value": tx_value,
-                            "data": call_fn._encode_transaction_data(),
-                        }),
+                        "gas": gas_limit,
                         "gasPrice": gas_price,
                         "chainId": chain_id,
                     })

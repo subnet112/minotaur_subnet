@@ -165,18 +165,14 @@ class OrderProcessor:
         if plan is None:
             return False
 
-        # Validate platform fee is within reasonable bounds
+        # Record the locked (user-signed) platform fee in plan metadata so it
+        # travels in the consensus proposal. The real loss-protection check —
+        # fee covers measured gas and lies within the on-chain clamp — runs
+        # after simulation below via fee_policy.certify_fee (the relayer cannot
+        # refuse a quorum-approved order, so the gate must be upstream).
         fee_in_params = int(order.params.get("platform_fee_wei", 0))
         if fee_in_params > 0:
-            # Include fee in plan metadata for validator consensus verification
             plan.metadata["platform_fee_wei"] = fee_in_params
-            # Sanity cap: fee shouldn't exceed ~0.1 ETH / 0.5 TAO
-            max_fee = 10**17  # 0.1 ETH
-            if fee_in_params > max_fee:
-                logger.warning(
-                    "[LOOP] Platform fee %d exceeds max %d for order %s",
-                    fee_in_params, max_fee, order.order_id,
-                )
 
         if (
             self.v3_flags.policy_assessment_enabled
@@ -323,6 +319,33 @@ class OrderProcessor:
             plan, order, contract_address, intent_order_dict,
             is_cross_chain, deployed_contract,
         )
+
+        # Protocol-fee certification — the never-lose-money gate, upstream of
+        # the relayer. Re-check the locked, user-signed fee against the gas we
+        # just measured: it must cover that gas and lie within the on-chain
+        # [min, max] clamp. Runs per processing pass, so one-shot orders are
+        # certified once and perpetual orders are re-certified every tick from
+        # that tick's own simulation — no perpetual-specific fee code.
+        if fee_in_params > 0:
+            from minotaur_subnet import fee_policy
+            _gas_price = fee_policy.current_gas_price_wei(order.chain_id)
+            _ok, _reason = fee_policy.certify_fee(
+                order.chain_id, fee_in_params,
+                getattr(simulation, "gas_used", 0) or 0, _gas_price,
+            )
+            if not _ok:
+                logger.warning(
+                    "[LOOP] Fee certification failed for order %s: %s",
+                    order.order_id, _reason,
+                )
+                self.orderbook.update_order(
+                    order.order_id,
+                    status=OrderStatus.REJECTED,
+                    error=f"Fee certification failed: {_reason}",
+                )
+                self.order_persistence.sync(order.order_id)
+                self.app_store.record_execution(order.app_id, 0.0, success=False)
+                return False
 
         # Score via JS engine
         score_result = await self.plan_scorer.score(
