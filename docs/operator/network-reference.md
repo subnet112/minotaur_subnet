@@ -24,10 +24,10 @@ btcli subnet register --netuid 112 --subtensor.network finney \
 
 | Item | Value |
 |---|---|
-| API endpoint | `<PRODUCTION_API_URL>` (see project announcement channel) |
+| API endpoint | `https://api.minotaursubnet.com` |
 | Frontend | `<PRODUCTION_FRONTEND_URL>` |
 
-Miners pointing the agent loop at production use `--validator-url <PRODUCTION_API_URL>` instead of `http://localhost:8080`. The current URL is published via the project announcement channel — check the [project README](../../README.md) for the active contact / status page. Don't hardcode a URL from a stale doc cache.
+Miners pointing the agent loop at production use `--validator-url https://api.minotaursubnet.com` instead of `http://localhost:8080`.
 
 ## Mainnet contract addresses
 
