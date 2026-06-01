@@ -24,12 +24,18 @@ class _FakeContextManager:
 
 class TestGitSubmit:
     @pytest.mark.asyncio
-    async def test_submit_solver_git_auto_epoch(self):
-        """submit_solver_git auto-detects epoch from /v1/status."""
-        # Mock status endpoint to return epoch=5
-        mock_status_resp = AsyncMock()
-        mock_status_resp.status = 200
-        mock_status_resp.json = AsyncMock(return_value={"epoch": 5})
+    async def test_submit_solver_git_round_based(self):
+        """submit_solver_git discovers the round from /v1/solver/round and signs
+        round-based — there is no /v1/status epoch fallback."""
+        # Mock /v1/solver/round: open + accepting, opened_epoch=5
+        mock_round_resp = AsyncMock()
+        mock_round_resp.status = 200
+        mock_round_resp.json = AsyncMock(return_value={
+            "round_id": "round-5-n1",
+            "status": "open",
+            "accepting_submissions": True,
+            "opened_epoch": 5,
+        })
 
         # Mock submission endpoint to return success
         mock_submit_resp = AsyncMock()
@@ -38,13 +44,14 @@ class TestGitSubmit:
             "submission_id": "sub_test123",
             "status": "queued",
             "status_url": "/v1/submissions/sub_test123/status",
+            "round_id": "round-5-n1",
             "epoch": 5,
         })
 
         captured_payload = {}
 
         def mock_get(url, **kwargs):
-            return _FakeContextManager(mock_status_resp)
+            return _FakeContextManager(mock_round_resp)
 
         def mock_post(url, json=None, **kwargs):
             if json:
@@ -74,6 +81,7 @@ class TestGitSubmit:
             )
 
         assert result.get("submission_id") == "sub_test123"
+        assert captured_payload.get("round_id") == "round-5-n1"
         assert captured_payload.get("epoch") == 5
         assert captured_payload.get("signature")  # Should be non-empty
 
