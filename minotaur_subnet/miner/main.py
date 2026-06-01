@@ -55,9 +55,9 @@ async def submit_solver_git(
 ) -> dict[str, Any]:
     """Submit a solver via git repo URL to the v1 submissions API.
 
-    Prefers GET {validator_url}/v1/solver/round and signs
-    "{repo_url}:{commit_hash}:{round_id}" when available. Falls back to the
-    legacy epoch-based signing flow for older servers.
+    Discovers the active round via GET {validator_url}/v1/solver/round and
+    signs "{repo_url}:{commit_hash}:{round_id}". Round-based submission is
+    required — there is no epoch-only fallback.
 
     Returns the API response dict (submission_id, status, status_url, epoch).
     """
@@ -66,47 +66,39 @@ async def submit_solver_git(
     resolved_round_id = round_id
     resolved_epoch = epoch
 
+    # Discover the active round. Round-based submission is required — the
+    # /v1/status epoch fallback was removed (no legacy clients to support).
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(
-                f"{base}/v1/solver/round",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    round_data = await resp.json()
-                    if round_data.get("round_id"):
-                        if not round_data.get("accepting_submissions", False):
-                            raise RuntimeError(
-                                "Solver submissions are currently closed "
-                                f"(round={round_data.get('round_id')}, "
-                                f"status={round_data.get('status')})"
-                            )
-                        resolved_round_id = resolved_round_id or round_data.get("round_id")
-                        if resolved_epoch is None:
-                            resolved_epoch = int(round_data.get("opened_epoch", 0))
-                        logger.info(
-                            "Auto-detected solver round: %s (epoch=%d)",
-                            resolved_round_id,
-                            resolved_epoch,
-                        )
-        except RuntimeError:
-            raise
-        except Exception:
-            logger.info("Round discovery unavailable; falling back to legacy epoch detection")
+        async with session.get(
+            f"{base}/v1/solver/round",
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"Cannot submit: solver round unavailable at "
+                    f"{base}/v1/solver/round (HTTP {resp.status})"
+                )
+            round_data = await resp.json()
 
-        if resolved_epoch is None:
-            async with session.get(
-                f"{base}/v1/status",
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"Failed to fetch round or epoch context from {base} "
-                        f"(solver/round HTTP unavailable, v1/status HTTP {resp.status})"
-                    )
-                status_data = await resp.json()
-                resolved_epoch = int(status_data.get("epoch", 0))
-            logger.info("Auto-detected epoch: %d", resolved_epoch)
+    discovered_round_id = round_data.get("round_id")
+    if not discovered_round_id:
+        raise RuntimeError(
+            f"Cannot submit: no open solver round at {base} "
+            f"(status={round_data.get('status')})"
+        )
+    if not round_data.get("accepting_submissions", False):
+        raise RuntimeError(
+            "Solver submissions are currently closed "
+            f"(round={discovered_round_id}, status={round_data.get('status')})"
+        )
+    resolved_round_id = resolved_round_id or discovered_round_id
+    if resolved_epoch is None:
+        resolved_epoch = int(round_data.get("opened_epoch", 0))
+    logger.info(
+        "Submitting to solver round %s (epoch=%d)",
+        resolved_round_id,
+        resolved_epoch,
+    )
 
     # Sign the message with bittensor wallet
     import base64
@@ -124,14 +116,13 @@ async def submit_solver_git(
         repo_url,
         commit_hash,
         round_id=resolved_round_id,
-        epoch=resolved_epoch,
     )
     signature_bytes = keypair.sign(message.encode("utf-8"))
     signature_b64 = base64.b64encode(signature_bytes).decode("ascii")
 
     logger.info(
         "Signed submission for round=%s epoch=%d (hotkey=%s)",
-        resolved_round_id or "legacy",
+        resolved_round_id,
         resolved_epoch,
         hotkey,
     )
@@ -195,15 +186,12 @@ def _build_submission_message(
     repo_url: str,
     commit_hash: str,
     *,
-    round_id: str | None = None,
-    epoch: int | None = None,
+    round_id: str,
 ) -> str:
-    """Build the signed payload for submission authentication."""
-    if round_id:
-        return f"{repo_url}:{commit_hash}:{round_id}"
-    if epoch is None:
-        raise ValueError("epoch is required when round_id is absent")
-    return f"{repo_url}:{commit_hash}:{epoch}"
+    """Build the signed submission payload: {repo_url}:{commit_hash}:{round_id}."""
+    if not round_id:
+        raise ValueError("round_id is required")
+    return f"{repo_url}:{commit_hash}:{round_id}"
 
 
 async def poll_submission_status(

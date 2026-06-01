@@ -53,17 +53,17 @@ python -m minotaur_subnet.miner.main submit \
 Defaults:
 
 - `--validator-url`: `http://localhost:9100`
-- `--epoch`: auto-detect attempted via `GET {validator_url}/v1/status`
+- `--epoch`: optional override; auto-detected from the open round (`GET {validator_url}/v1/solver/round`)
 - `--wallet-path`: `~/.bittensor/wallets` (or `BT_WALLET_PATH`)
 
 Important notes:
 
 - In local testnet/API flows, `--validator-url` is usually `http://localhost:8080` for `/v1/submissions*`.
-- If your target does not expose `/v1/status`, pass `--epoch` explicitly.
+- Submissions target the current open round; if none is open or it isn't accepting, `submit` errors clearly (there is no epoch fallback).
 - Request payload includes:
-  - `repo_url`, `commit_hash`, `epoch`
+  - `repo_url`, `commit_hash`, `round_id`, `epoch`
   - `hotkey` (SS58)
-  - `signature` over `{repo_url}:{commit_hash}:{epoch}`
+  - `signature` over `{repo_url}:{commit_hash}:{round_id}`
 
 ## `status`
 
