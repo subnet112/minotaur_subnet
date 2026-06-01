@@ -575,6 +575,26 @@ class ScoringEngine:
                 }
             print(f"[VALIDATOR] escrow verified for leg {_leg_index}: {_escrow_reason}", flush=True)
 
+        # Protocol-fee certification (follower side). Independently re-check the
+        # locked, user-signed fee against THIS follower's own measured gas
+        # before signing — the never-lose-money guarantee is per-validator, not
+        # just leader-side. A follower that can't certify the fee refuses to
+        # sign, so the leader can't reach quorum on a loss-making order.
+        _locked_fee = int(params.get("platform_fee_wei", 0) or 0)
+        if _locked_fee > 0 and simulation is not None:
+            from minotaur_subnet import fee_policy
+            _gas_price = fee_policy.current_gas_price_wei(chain_id)
+            _fee_ok, _fee_reason = fee_policy.certify_fee(
+                chain_id, _locked_fee,
+                getattr(simulation, "gas_used", 0) or 0, _gas_price,
+            )
+            if not _fee_ok:
+                return {
+                    "approved": False,
+                    "reason": f"Fee certification failed: {_fee_reason}",
+                    "reason_code": RejectionCode.FEE_NOT_CERTIFIED.value,
+                }
+
         # On-chain score gate for follower (CON-6, CON-7)
         if simulation is not None and simulation.on_chain_score is not None:
             app_def = self.store.get_app(app_id) if app_id else None

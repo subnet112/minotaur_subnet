@@ -11,19 +11,25 @@ GET  /v1/blockloop/status            → Block loop tick stats
 
 from __future__ import annotations
 
+import logging
 import os
+import time
+from collections import deque
+from threading import Lock
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from minotaur_subnet.api.routes.apps import (
+    _client_ip,
     _env_true,
     _require_admin,
     _require_admin_or_signed_miner,
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # Leader-mode detection (PR-2, audit H5): third-party follower validators
@@ -47,6 +53,36 @@ _orderbook = None
 _block_loop = None
 _app_store = None
 _js_engine = None
+
+# Quote-endpoint rate limit. Every quote now runs a real simulation to measure
+# gas (so the fee can be priced by us, not the miner), which means an
+# unauthenticated caller spamming quotes can exhaust the leader's simulation
+# capacity. Fixed-window per-IP limiter mirroring apps._debug_rate_limit; tune
+# via QUOTE_RATE_LIMIT_PER_MINUTE (default 30, 0 disables).
+_QUOTE_RATE_LIMIT_BUCKETS: dict[str, deque] = {}
+_QUOTE_RATE_LIMIT_LOCK = Lock()
+
+
+def _quote_rate_limit(request: Request) -> None:
+    per_minute = int(os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE", "30") or "30")
+    if per_minute <= 0:
+        return
+    now = time.monotonic()
+    window_start = now - 60.0
+    key = f"quote:{_client_ip(request)}"
+    with _QUOTE_RATE_LIMIT_LOCK:
+        bucket = _QUOTE_RATE_LIMIT_BUCKETS.setdefault(key, deque())
+        while bucket and bucket[0] < window_start:
+            bucket.popleft()
+        if len(bucket) >= per_minute:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Quote rate limit exceeded (>{per_minute}/min/IP). "
+                    "Retry shortly."
+                ),
+            )
+        bucket.append(now)
 
 
 def set_orderbook(orderbook: Any) -> None:
@@ -982,19 +1018,25 @@ async def dry_run_order(order_id: str, req: DryRunRequest) -> dict:
 
 
 @router.post("/apps/{app_id}/quote")
-async def get_quote(app_id: str, req: QuoteRequest) -> dict:
+async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     """Get an estimated quote for an intent without creating an order.
 
-    Calls the solver's quote() method for fast, pure-math quoting from
-    snapshot pool state. No simulation, no JS scoring, no order created.
+    Calls the solver's quote() for output/route estimation, then runs a real
+    simulation to measure gas and prices the protocol fee HERE (fee_policy) —
+    the binding fee is computed by the validator, not the miner-controlled
+    solver. No JS scoring, no order created.
 
     Returns:
         estimated_output: Best output amount the solver found (as string)
         suggested_min_output: estimated_output * (1 - slippage_bps/10000)
         route_summary: Human-readable description of the route
         gas_estimate: Estimated gas units
+        platform_fee_wei: Minotaur-computed protocol fee (locked when signed)
         valid_for_seconds: How long this quote is indicative (always 30)
     """
+    # Every quote runs a simulation below — rate-limit to bound that cost.
+    _quote_rate_limit(request)
+
     # ── Auto-resolve: token symbols → addresses ──
     req.params = _resolve_token_params(req.params, req.chain_id)
 
@@ -1094,6 +1136,77 @@ async def get_quote(app_id: str, req: QuoteRequest) -> dict:
             status_code=501,
             detail="Solver does not support quoting (legacy image — rebuild champion)",
         )
+
+    # ── Minotaur-controlled fee: measure gas via simulation, price it here ──
+    # The solver's quote() returns an advisory fee, but the BINDING fee is
+    # computed by us (fee_policy) from a REAL simulation's measured gas — so
+    # miners cannot influence the protocol fee (they cannot understate the gas
+    # of their own plan; the same plan is simulated and executed). The fee is a
+    # computational param the user locks at signing; the plan is NOT pinned.
+    # On any failure we fall back to the per-chain floor — never the solver's
+    # number — so the fee is always Minotaur-controlled.
+    import inspect as _inspect
+    from minotaur_subnet import fee_policy
+    if quote_result.estimated_output not in (None, "", "0"):  # route found (pre-filter)
+        _binding_gas_units = 0
+        try:
+            from minotaur_subnet.orderbook.orderbook import Order as _Order
+            _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
+            _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
+            _sim_runner = getattr(bl, "_simulation_runner", None)
+            _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
+            if _deployed and _has_sim:
+                _plan_state = IntentState(
+                    contract_address=_deployed,
+                    chain_id=req.chain_id,
+                    nonce=0,
+                    owner="0x000000000000000000000000000000000000dEaD",
+                    raw_params=req.params,
+                    control={"_intent_function": req.intent_function},
+                )
+                _plan_call = bl.solver.generate_plan(app_def, _plan_state)
+                _plan = await _plan_call if _inspect.isawaitable(_plan_call) else _plan_call
+                if _plan is not None and not _plan.metadata.get("cross_chain"):
+                    _prov_order = _Order(
+                        order_id="quote-sim",
+                        app_id=app_id,
+                        intent_function=req.intent_function,
+                        params=dict(req.params),
+                        submitted_by="0x000000000000000000000000000000000000dEaD",
+                        chain_id=req.chain_id,
+                    )
+                    # Plan-only sim (no intent_order) measures the swap gas;
+                    # we add the framework wrapper overhead (executeIntent,
+                    # proxy deploy, sig verify, fee settle) below.
+                    _sim = await _sim_runner.simulate(
+                        _plan, _prov_order, None, None, False, _deployed,
+                    )
+                    _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
+                    if _swap_gas > 0:
+                        _binding_gas_units = _swap_gas + fee_policy.framework_overhead_gas()
+        except Exception as exc:
+            logger.warning(
+                "Quote simulation failed for %s on chain %s, using floor fee: %s",
+                app_id, req.chain_id, exc,
+            )
+            _binding_gas_units = 0
+
+        _gas_price = fee_policy.current_gas_price_wei(req.chain_id)
+        _binding_fee = fee_policy.protocol_fee_wei(
+            req.chain_id, _binding_gas_units, _gas_price,
+        )
+        from minotaur_subnet.blockchain.tokens import (
+            WRAPPED_NATIVE_TOKEN, WRAPPED_NATIVE_SYMBOL,
+        )
+        quote_result.platform_fee_wei = str(_binding_fee)
+        quote_result.platform_fee_token = (
+            WRAPPED_NATIVE_TOKEN.get(req.chain_id) or quote_result.platform_fee_token or ""
+        )
+        quote_result.platform_fee_symbol = (
+            WRAPPED_NATIVE_SYMBOL.get(req.chain_id) or quote_result.platform_fee_symbol or ""
+        )
+        if _binding_gas_units > 0:
+            quote_result.gas_estimate = _binding_gas_units
 
     estimated_output_gross = quote_result.estimated_output
     # Track successful quote (zero output counts as failure)
