@@ -66,7 +66,11 @@ services:
       # after our snapshot/revert restores the underlying state.
       # anvil-base + anvil-btevm already carry this flag.
       - "--no-storage-caching"
-      - "--block-time=2"
+      # NOTE: no --block-time. The simulator force-mines every tx (evm_mine)
+      # and re-forks to the upstream head before each simulation, so interval
+      # mining is never used — it only burned CPU/RAM mining ~43k empty blocks
+      # /day per fork. Anvil's default auto-mine (one block per tx) is correct
+      # here. Validated on the subnet-team validator before this change.
     tmpfs:
       - /root:size=2g
       - /tmp:size=512m
@@ -93,7 +97,11 @@ services:
       - "--fork-url=${BASE_UPSTREAM_RPC_URL}"
       - "--chain-id=8453"
       - "--no-storage-caching"
-      - "--block-time=2"
+      # NOTE: no --block-time. The simulator force-mines every tx (evm_mine)
+      # and re-forks to the upstream head before each simulation, so interval
+      # mining is never used — it only burned CPU/RAM mining ~43k empty blocks
+      # /day per fork. Anvil's default auto-mine (one block per tx) is correct
+      # here. Validated on the subnet-team validator before this change.
     tmpfs:
       - /root:size=2g
       - /tmp:size=512m
@@ -123,7 +131,8 @@ services:
       - "--fork-retry-backoff=5000"
       - "--retries=10"
       - "--timeout=60000"
-      - "--block-time=2"
+      # NOTE: no --block-time — see anvil-eth above. Auto-mine (one block per
+      # tx) is correct here; interval mining was unused 24/7 CPU/RAM burn.
     tmpfs:
       - /root:size=2g
       - /tmp:size=512m
