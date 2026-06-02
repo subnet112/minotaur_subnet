@@ -742,8 +742,15 @@ def build_intent_params_hex_from_manifest(
 ) -> str | None:
     """ABI-encode intentParams using the app's manifest param schema.
 
-    Generic version of build_swap_intent_params_hex that works for any app.
-    Falls back to the swap-specific encoder if no manifest is available.
+    Generic, manifest-driven encoder that works for ANY app: it ABI-encodes
+    EVERY param the manifest declares, in order, using a type-default for any
+    value the caller didn't supply. Emitting the full fixed-width tuple (rather
+    than skipping missing fields) is what makes the on-chain abi.decode line up
+    — a skipped field would shift every later field and corrupt the decode.
+    Computational/quoted params (min_output, platform_fee_wei, quoted_output,
+    or whatever a given app declares) are populated upstream by the quote's
+    source:"quote" loop; here we just lay them out per the manifest. Returns
+    None only if no manifest/intent spec is available.
     """
     try:
         from eth_abi import encode as abi_encode
@@ -777,32 +784,50 @@ def build_intent_params_hex_from_manifest(
         if intent_spec is None:
             return None
 
-        # Build ABI types and values from the manifest params
+        # Build ABI types and values from the manifest params. Emit EVERY
+        # declared field in order, defaulting any value the caller omitted —
+        # fixed-layout abi.decode on-chain requires the full ordered tuple, so
+        # we must NOT skip missing fields (that would shift every later field).
+        ZERO_ADDR = "0x0000000000000000000000000000000000000000"
         abi_types = []
         abi_values = []
         for field in intent_spec.params:
-            val = params.get(field.name)
-            if val is None:
-                continue  # Skip missing optional params
             vtype = field.value_type
+            val = params.get(field.name)
+            # 'receiver' conventionally defaults to the order submitter.
+            if val is None and field.name == "receiver":
+                val = submitted_by
             abi_types.append(vtype)
             if vtype == "address":
-                abi_values.append(Web3.to_checksum_address(val))
+                abi_values.append(Web3.to_checksum_address(val) if val else ZERO_ADDR)
             elif vtype == "address[]":
-                # Array of addresses -- checksum each one
-                if isinstance(val, list):
-                    abi_values.append([Web3.to_checksum_address(a) for a in val])
-                else:
-                    abi_values.append([Web3.to_checksum_address(val)])
+                items = val if isinstance(val, list) else ([val] if val else [])
+                abi_values.append([Web3.to_checksum_address(a) for a in items])
             elif vtype.startswith("uint") or vtype.startswith("int"):
                 if "[]" in vtype:
-                    abi_values.append([int(v) for v in val] if isinstance(val, list) else [int(val)])
+                    items = val if isinstance(val, list) else ([val] if val is not None else [])
+                    abi_values.append([int(v) for v in items])
                 else:
-                    abi_values.append(int(val))
+                    abi_values.append(int(val) if val is not None else 0)
             elif vtype == "bool":
-                abi_values.append(bool(val))
+                abi_values.append(bool(val) if val is not None else False)
+            elif vtype == "bytes":  # dynamic bytes
+                if isinstance(val, (bytes, bytearray)):
+                    abi_values.append(bytes(val))
+                elif isinstance(val, str) and val:
+                    abi_values.append(bytes.fromhex(val.replace("0x", "")))
+                else:
+                    abi_values.append(b"")
+            elif vtype.startswith("bytes"):  # fixed bytesN (e.g. bytes32)
+                n = int(vtype[5:]) if vtype[5:].isdigit() else 32
+                if isinstance(val, (bytes, bytearray)):
+                    abi_values.append(bytes(val)[:n].ljust(n, b"\x00"))
+                elif isinstance(val, str) and val:
+                    abi_values.append(bytes.fromhex(val.replace("0x", "").ljust(n * 2, "0"))[:n])
+                else:
+                    abi_values.append(b"\x00" * n)
             else:
-                abi_values.append(val)
+                abi_values.append(val if val is not None else 0)
 
         if not abi_types:
             return None
