@@ -1159,11 +1159,12 @@ class AppIntentsValidator:
     async def _handle_health(self, request: web.Request) -> web.Response:
         loaded = self.engine.list_loaded_intents()
         ob_stats = self.orderbook.stats()
-        # MINOTAUR_IMAGE_SHA is baked at build time (docker/build-push-action
-        # build-args = ${{ github.sha }}). 7-char prefix matches GHCR's
-        # sha-XXXXXXX tag scheme so operators can pattern-match against
-        # :stable promotion history at a glance. "dev" for local builds.
-        image_sha = os.environ.get("MINOTAUR_IMAGE_SHA", "dev")[:7]
+        # Build version: MINOTAUR_IMAGE_SHA (baked by CI/Dockerfile) for
+        # published images; falls back to the source checkout's git SHA for
+        # from-source / bare-metal operators (e.g. no-Docker validators);
+        # "dev" otherwise. See minotaur_subnet/version.py.
+        from minotaur_subnet.version import resolve_version
+        image_sha = resolve_version()
         # last_emit: surface the most recent set_weights attempt so the
         # operator (and the subnet-team validator-health workflow) can tell
         # whether emission is silently failing inside the daemon. None when
