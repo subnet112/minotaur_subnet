@@ -49,13 +49,21 @@ def _chain_registry_env(chain_id: int) -> str:
 
 
 def _chain_rpc_env(chain_id: int) -> str:
+    # Live-chain reads (registry / validator set / score) must hit the LIVE
+    # chain, never the sim fork. Prefer the operator's *_UPSTREAM_RPC_URL — the
+    # live RPC they already supply for Anvil's --fork-url — then fall back to
+    # the plain RPC (direct-live or local-dev, where "live" IS the local node).
+    # No hardcoded URLs; if none is set the caller fails open with a WARN.
     if chain_id == 8453:
-        return os.environ.get("BASE_RPC_URL", "").strip()
+        return (os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("BASE_RPC_URL", "").strip())
     if chain_id == 1:
-        return (os.environ.get("ETH_RPC_URL", "").strip()
+        return (os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("ETH_RPC_URL", "").strip()
                 or os.environ.get("ANVIL_RPC_URL", "").strip())
     if chain_id == 964:
-        return (os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
+        return (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
                 or os.environ.get("BITTENSOR_EVM_FORK_RPC_URL", "").strip())
     return ""
 
