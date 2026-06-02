@@ -1250,9 +1250,15 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         pass
 
     # Build computed_params from manifest's quote-sourced param definitions
+    # Generic quote outputs an app's manifest can bind to via
+    # source:"quote" + quote_field. Apps choose which of these their
+    # computational/quoted params reference — nothing here is swap-specific.
     quote_values = {
-        "estimated_output": estimated_output,
+        "estimated_output": estimated_output,            # net (after protocol fee)
+        "estimated_output_gross": estimated_output_gross,
         "suggested_min_output": suggested_min_output,
+        "platform_fee_wei": quote_result.platform_fee_wei or "0",
+        "gas_estimate": str(quote_result.gas_estimate or 0),
     }
     computed_params: dict[str, str] = dict(quote_result.computed_params)
     manifest = None
