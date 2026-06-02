@@ -233,10 +233,17 @@ def build_swap_intent_params_hex(
     """ABI-encode DexAggregatorApp intentParams from order params.
 
     Returns hex string (no 0x prefix) or None if required fields are missing.
-    The encoding matches the DexAggregatorApp contract's abi.decode:
+    The encoding matches the DexAggregatorApp contract's abi.decode (12 fields):
         (address tokenIn, address tokenOut, uint256 amountIn,
          uint256 minAmountOut, address receiver,
-         uint256 permitDeadline, uint8 permitV, bytes32 permitR, bytes32 permitS)
+         uint256 permitDeadline, uint8 permitV, bytes32 permitR, bytes32 permitS,
+         uint256 platformFeeWei, uint256 quotedOutput, bool unwrapOutput)
+
+    Only the field LAYOUT is DexAggregator-specific (every app has its own
+    intentParams ABI). The VALUES of computational/quoted params —
+    min_output_amount, platform_fee_wei, quoted_output — arrive generically
+    via the manifest's source:"quote"/"system" declarations and the quote's
+    quote_values mapping; this encoder just reads them out of `params`.
     """
     input_token = params.get("input_token")
     output_token = params.get("output_token")
@@ -279,6 +286,11 @@ def build_swap_intent_params_hex(
         # Platform fee trailer
         platform_fee_wei = int(params.get("platform_fee_wei", 0))
 
+        # CoW-style app-fee reference: the net output we quoted the user,
+        # locked into the signed order. Validator-set (manifest source:"quote",
+        # quote_field:"estimated_output"), NOT user-chosen. 0 ⇒ no app fee.
+        quoted_output = int(params.get("quoted_output", 0) or 0)
+
         # Auto-unwrap: when the output token is ANY chain's wrapped native
         # (WETH on Ethereum/Base, WTAO on BT EVM), tell the contract to
         # unwrap → send native ETH/TAO to the receiver. This matches the
@@ -290,7 +302,7 @@ def build_swap_intent_params_hex(
 
         encoded = abi_encode(
             ["address", "address", "uint256", "uint256", "address",
-             "uint256", "uint8", "bytes32", "bytes32", "uint256", "bool"],
+             "uint256", "uint8", "bytes32", "bytes32", "uint256", "uint256", "bool"],
             [
                 Web3.to_checksum_address(input_token),
                 Web3.to_checksum_address(output_token),
@@ -302,6 +314,7 @@ def build_swap_intent_params_hex(
                 r_bytes,
                 s_bytes,
                 platform_fee_wei,
+                quoted_output,
                 unwrap_output,
             ],
         )
