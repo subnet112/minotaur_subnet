@@ -212,12 +212,17 @@ services:
       APP_REGISTRY_8453: "${APP_REGISTRY_8453}"
       APP_REGISTRY_964: "${APP_REGISTRY_964}"
 
-      # Anvil RPCs (internal docker hostnames)
+      # Sim-fork RPCs (internal anvil) — used ONLY for executeIntent simulation.
       ANVIL_RPC_URL: http://anvil-base:8546
-      BASE_RPC_URL: http://anvil-base:8546
       BASE_SIM_RPC_URL: http://anvil-base:8546
-      BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+      # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
+      # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app
+      # contract (or any live on-chain state) must be visible immediately, not
+      # only after the next anvil re-fork. Reuses the same upstreams Anvil forks.
+      BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      ETH_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
 
       # Upstream RPCs — used when Anvil restarts to re-fork at the
       # current head. Public BT EVM RPC is fine; ETH + Base need your
@@ -324,12 +329,17 @@ services:
       # and quorum from ChampionRegistry (both on chain 964).
       CHAMPION_CONSENSUS_CHAIN_ID: "964"
 
-      # Anvil RPCs (internal docker hostnames)
+      # Sim-fork RPCs (internal anvil) — used ONLY for executeIntent simulation.
       ANVIL_RPC_URL: http://anvil-base:8546
-      BASE_RPC_URL: http://anvil-base:8546
       BASE_SIM_RPC_URL: http://anvil-base:8546
-      BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+      # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
+      # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app
+      # contract (or any live on-chain state) must be visible immediately, not
+      # only after the next anvil re-fork. Reuses the same upstreams Anvil forks.
+      BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      ETH_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
 
       # Upstream RPCs for refork-time state
       ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
