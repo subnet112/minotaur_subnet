@@ -200,19 +200,64 @@ _FALLBACK_GAS_PRICE_WEI: dict[int, int] = {
 _GENERIC_FALLBACK_GAS_PRICE_WEI = 1_000_000_000
 
 
+def _live_gas_rpc_url(chain_id: int) -> str:
+    """RPC for the gas-price read — the operator's LIVE upstream, never the sim
+    fork. The leader's quote and every follower's fee certification MUST price
+    gas from the SAME live source: anvil reports a higher gas price than live
+    Base, so a follower reading the fork rejects the (correctly floor-priced)
+    fee as not-covering-gas (FEE_NOT_CERTIFIED). Mirrors the consensus caches.
+    Falls back to the plain chain RPC for local/dev where "live" IS the node.
+    """
+    if chain_id == 8453:
+        return (os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("BASE_RPC_URL", "").strip())
+    if chain_id == 1:
+        return (os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("ETHEREUM_RPC_URL", "").strip()
+                or os.environ.get("ETH_RPC_URL", "").strip()
+                or os.environ.get("ANVIL_RPC_URL", "").strip())
+    if chain_id == 964:
+        return (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
+                or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip())
+    return ""
+
+
+# Cache Web3 instances by RPC URL so the gas-price read doesn't reconnect each call.
+_GAS_W3_CACHE: dict = {}
+
+
+def _gas_w3(url: str):
+    w3 = _GAS_W3_CACHE.get(url)
+    if w3 is None:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(url))
+        _GAS_W3_CACHE[url] = w3
+    return w3
+
+
 def current_gas_price_wei(chain_id: int) -> int:
     """Live gas price for a chain, with a conservative per-chain fallback.
 
     Used by the quote (to price the fee) and by certification (to re-check
-    coverage). Queried daemon-side via web3 — never from solver code.
+    coverage). MUST read from the LIVE chain (operator's upstream), not the sim
+    fork — otherwise the leader (live) and followers (fork) price gas
+    differently and followers reject the fee (FEE_NOT_CERTIFIED). Queried
+    daemon-side via web3 — never from solver code.
     """
+    url = _live_gas_rpc_url(chain_id)
     try:
-        from minotaur_subnet.blockchain.chains import get_web3
-        w3 = get_web3(chain_id)
-        if w3 is not None:
-            price = int(w3.eth.gas_price)
+        if url:
+            price = int(_gas_w3(url).eth.gas_price)
             if price > 0:
                 return price
+        else:
+            # No upstream configured (local/dev) — fall back to the chain RPC.
+            from minotaur_subnet.blockchain.chains import get_web3
+            w3 = get_web3(chain_id)
+            if w3 is not None:
+                price = int(w3.eth.gas_price)
+                if price > 0:
+                    return price
     except Exception:
         pass
     return _FALLBACK_GAS_PRICE_WEI.get(chain_id, _GENERIC_FALLBACK_GAS_PRICE_WEI)
