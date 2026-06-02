@@ -20,6 +20,12 @@ class IntentFieldSpec:
     description: str = ""
     default: Any = None
     source: str = "user"
+    # Whether this param is part of the on-chain function SIGNATURE (and thus
+    # the intent selector). Computational/quoted params that are appended to
+    # intentParams but are NOT in the contract's `<intent>(...)` signature
+    # (e.g. platform fee, a quoted-output fee reference, an unwrap flag) set
+    # this False so the selector still matches the contract. Default True.
+    in_signature: bool = True
 
 
 @dataclass
@@ -114,6 +120,7 @@ def manifest_from_legacy_dict(
                             description=field_def.get("description", ""),
                             default=field_def.get("default"),
                             source=field_def.get("source", "user"),
+                            in_signature=field_def.get("in_signature", True),
                         )
                     )
                 else:
@@ -243,7 +250,7 @@ def canonical_intent_signature(
     param_types = [
         field.value_type
         for field in fn.params
-        if not field.name.startswith(skip_fields_with_prefixes)
+        if field.in_signature and not field.name.startswith(skip_fields_with_prefixes)
     ]
     return f"{intent_name}({','.join(param_types)})"
 
