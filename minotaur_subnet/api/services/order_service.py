@@ -233,11 +233,14 @@ def build_swap_intent_params_hex(
     """ABI-encode DexAggregatorApp intentParams from order params.
 
     Returns hex string (no 0x prefix) or None if required fields are missing.
-    The encoding matches the DexAggregatorApp contract's abi.decode (12 fields):
-        (address tokenIn, address tokenOut, uint256 amountIn,
-         uint256 minAmountOut, address receiver,
-         uint256 permitDeadline, uint8 permitV, bytes32 permitR, bytes32 permitS,
-         uint256 platformFeeWei, uint256 quotedOutput, bool unwrapOutput)
+    The encoding matches the DexAggregatorApp contract's abi.decode. The
+    trailing `quotedOutput` field is emitted ONLY when `params` carries it
+    (the quote populates it iff the deployed app's manifest declares it), so
+    this stays compatible across a rolling contract redeploy:
+        legacy (11 fields): (..., bytes32 permitS, uint256 platformFeeWei,
+                             bool unwrapOutput)
+        CoW    (12 fields): (..., bytes32 permitS, uint256 platformFeeWei,
+                             uint256 quotedOutput, bool unwrapOutput)
 
     Only the field LAYOUT is DexAggregator-specific (every app has its own
     intentParams ABI). The VALUES of computational/quoted params —
@@ -286,11 +289,6 @@ def build_swap_intent_params_hex(
         # Platform fee trailer
         platform_fee_wei = int(params.get("platform_fee_wei", 0))
 
-        # CoW-style app-fee reference: the net output we quoted the user,
-        # locked into the signed order. Validator-set (manifest source:"quote",
-        # quote_field:"estimated_output"), NOT user-chosen. 0 ⇒ no app fee.
-        quoted_output = int(params.get("quoted_output", 0) or 0)
-
         # Auto-unwrap: when the output token is ANY chain's wrapped native
         # (WETH on Ethereum/Base, WTAO on BT EVM), tell the contract to
         # unwrap → send native ETH/TAO to the receiver. This matches the
@@ -300,24 +298,36 @@ def build_swap_intent_params_hex(
         all_wnt = {v.lower() for v in WRAPPED_NATIVE_TOKEN.values()}
         unwrap_output = bool(output_token and output_token.lower() in all_wnt)
 
-        encoded = abi_encode(
-            ["address", "address", "uint256", "uint256", "address",
-             "uint256", "uint8", "bytes32", "bytes32", "uint256", "uint256", "bool"],
-            [
-                Web3.to_checksum_address(input_token),
-                Web3.to_checksum_address(output_token),
-                normalized["input_amount"],
-                normalized["min_output_amount"],
-                Web3.to_checksum_address(normalized["receiver"]),
-                permit_deadline,
-                permit_v,
-                r_bytes,
-                s_bytes,
-                platform_fee_wei,
-                quoted_output,
-                unwrap_output,
-            ],
-        )
+        # Rolling-deploy gate: emit the CoW-style `quotedOutput` field ONLY when
+        # the deployed app declares it. The quote populates `quoted_output` iff
+        # the live manifest has it (source:"quote", quote_field:"estimated_output").
+        # So the encoder follows whatever contract is currently deployed:
+        #   - legacy 11-field DexAggregator  → no quoted_output in params → 11 fields
+        #   - CoW 12-field DexAggregator      → quoted_output present       → 12 fields
+        # This decouples this daemon's rollout from the contract redeploy: a
+        # leader on the new image keeps signing orders the OLD contract accepts
+        # until the new contract + manifest are live, then switches automatically.
+        base_types = ["address", "address", "uint256", "uint256", "address",
+                      "uint256", "uint8", "bytes32", "bytes32", "uint256"]
+        base_vals = [
+            Web3.to_checksum_address(input_token),
+            Web3.to_checksum_address(output_token),
+            normalized["input_amount"],
+            normalized["min_output_amount"],
+            Web3.to_checksum_address(normalized["receiver"]),
+            permit_deadline,
+            permit_v,
+            r_bytes,
+            s_bytes,
+            platform_fee_wei,
+        ]
+        if params.get("quoted_output") not in (None, ""):
+            types = base_types + ["uint256", "bool"]
+            vals = base_vals + [int(params["quoted_output"] or 0), unwrap_output]
+        else:
+            types = base_types + ["bool"]
+            vals = base_vals + [unwrap_output]
+        encoded = abi_encode(types, vals)
         return encoded.hex()
     except Exception as exc:
         logger.warning("Failed to encode intent params: %s", exc)
