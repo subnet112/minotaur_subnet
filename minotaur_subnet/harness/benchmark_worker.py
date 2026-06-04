@@ -422,6 +422,7 @@ class BenchmarkWorker:
                 config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                fork_block=self._epoch_block_number,
             )
             return results
         finally:
@@ -446,6 +447,10 @@ class BenchmarkWorker:
         orch = SolverOrchestrator()
         session = await orch.start_docker(image_tag, rpc_overrides=rpc_overrides)
         try:
+            # NB: no fork_block here. Stage 3 replays a *past order* at its own
+            # historical block (via rpc_overrides on the solver), which is not the
+            # epoch block. Pinning the simulator fork for this path is a separate
+            # state-bundle task — see the Phase 4 plan ("Pin Stage 2 to the block").
             results = await run_benchmark(
                 session,
                 [(intent, state, snapshot)],
@@ -474,6 +479,7 @@ class BenchmarkWorker:
                 config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                fork_block=self._epoch_block_number,
             )
             return results
         finally:
