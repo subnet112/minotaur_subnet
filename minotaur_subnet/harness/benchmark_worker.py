@@ -156,6 +156,7 @@ class BenchmarkWorker:
         on_champion_adopted: Any = None,  # deprecated compatibility hook
         genesis_solver_image: str | None = None,  # Docker image for genesis benchmarking
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
+        require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -167,6 +168,7 @@ class BenchmarkWorker:
         self._on_champion_adopted = on_champion_adopted
         self._genesis_solver_image = genesis_solver_image or GENESIS_SOLVER_IMAGE or None
         self._simulator = simulator
+        self._require_real_sim = require_real_sim
         self._running = False
 
     def set_epoch_block(self, block_number: int) -> None:
@@ -423,6 +425,7 @@ class BenchmarkWorker:
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
+                require_real_sim=self._require_real_sim,
             )
             return results
         finally:
@@ -457,6 +460,7 @@ class BenchmarkWorker:
                 config=BenchmarkConfig(chain_ids=[state.chain_id]),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                require_real_sim=self._require_real_sim,
             )
             if results:
                 return results[0]
@@ -480,6 +484,7 @@ class BenchmarkWorker:
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
+                require_real_sim=self._require_real_sim,
             )
             return results
         finally:
