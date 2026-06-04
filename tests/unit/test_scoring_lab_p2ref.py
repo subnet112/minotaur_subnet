@@ -74,3 +74,19 @@ def test_p2ref_blocks_sandbag_with_gate():
                        max_sandbag=0.05)
     assert adopt is False
     assert any("sandbag" in r for r in rec.outputs["reasons"])
+
+
+def test_p2ref_rejects_onchain_output_regression_despite_higher_js():
+    # The V3-only case in miniature: higher JS (gas-inflated) but lower on-chain
+    # (delivers users less output) → REJECT. This is the showstopper-fix regression.
+    adopt, rec = _eval({"A": 0.50}, {"A": 0.60},
+                       champ_oc={"A": [5029]}, chal_oc={"A": [5017]})
+    assert adopt is False
+    assert any("on-chain output regresses" in r for r in rec.outputs["reasons"])
+    assert rec.outputs["per_app_diff"]["A"]["onchain"] == {"champion": 5029.0, "challenger": 5017.0}
+
+
+def test_p2ref_adopts_when_js_and_onchain_both_improve():
+    adopt, rec = _eval({"A": 0.50}, {"A": 0.60},
+                       champ_oc={"A": [5000]}, chal_oc={"A": [5100]})
+    assert adopt is True

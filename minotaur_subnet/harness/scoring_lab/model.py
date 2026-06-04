@@ -101,6 +101,11 @@ class LabConfig:
     per_app_min_score: float = 0.3
     max_app_regression: float = 0.10
     on_chain_floor: int | None = None          # BPS; used by the "p2" rule (and shown by both)
+    # p2ref on-chain output no-regression tolerance (BPS): a challenger may not deliver LESS
+    # output (lower scoreIntent BPS) than the champion by more than this, regardless of its JS
+    # score. The on-chain score is bit-exact same-host; 0 = strict. Guards against winning on
+    # the gas-inflated JS metric while giving users less.
+    onchain_regression_bps: float = 0.0
     # Phase 1 — quote-derived min: re-quote each case from the reference (champion) solver
     # at the sealed block instead of using the stale hardcoded manifest min.
     requote: bool = True

@@ -187,6 +187,13 @@ def _onchain_pass(scores: list[int | None], floor: int) -> tuple[bool, int | Non
     return all_pass, (min(present) if present else None), n_missing
 
 
+def _app_onchain_mean(scores: list[int | None]) -> float | None:
+    """Mean on-chain (scoreIntent BPS) over the present scenarios for an app — the unfakeable
+    output-quality signal used for the no-regression check (independent of the gas-weighted JS score)."""
+    present = [s for s in scores if s is not None]
+    return (sum(present) / len(present)) if present else None
+
+
 class AdoptRule:
     name = "?"
 
@@ -333,7 +340,22 @@ class P2RefAdoptRule(AdoptRule):
             surplus = ch - inc
             diffs[app] = {"champion": round(inc, 4), "challenger": round(ch, 4), "surplus": round(surplus, 4)}
             surpluses.append(surplus)
-            # (3) per-app no-regression
+            # (2b) on-chain OUTPUT no-regression — the unfakeable signal. A challenger that
+            #      delivers LESS output (lower scoreIntent BPS) cannot win on the gas-inflated
+            #      JS score. The JS discriminator can disagree with the on-chain anchor; here
+            #      the honest output metric vetoes a JS win that hurts users.
+            co = _app_onchain_mean(champ_oc.get(app, []))
+            cco = _app_onchain_mean(chal_oc.get(app, []))
+            if co is not None:
+                diffs[app]["onchain"] = {"champion": round(co, 1),
+                                         "challenger": (round(cco, 1) if cco is not None else None)}
+                if cco is None:
+                    adopt = False
+                    reasons.append(f"{app}: no on-chain score (champion {co:.0f})")
+                elif cco < co - cfg.onchain_regression_bps:
+                    adopt = False
+                    reasons.append(f"{app}: on-chain output regresses {co:.0f}->{cco:.0f} BPS")
+            # (3) per-app JS no-regression
             if inc > 0 and ch < inc * (1 - cfg.max_app_regression):
                 adopt = False
                 reasons.append(f"{app}: regress {inc:.3f}->{ch:.3f}")
