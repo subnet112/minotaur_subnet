@@ -44,7 +44,10 @@ def _print_adopt(rec) -> None:
             sp = "—" if d.get("surplus") is None else f"{d['surplus']:+.4f}"
             extra = d.get("extra_sandbag")
             qstr = f"   sandbag {extra:+.3f}" if extra is not None else ""
-            print(f"      {app:<10} {d['champion']:.4f} → {ch}   surplus {sp}{qstr}")
+            oc = d.get("onchain")
+            ocstr = (f"   on-chain {oc['champion']:.0f}→"
+                     f"{('%.0f' % oc['challenger']) if oc.get('challenger') is not None else '—'} BPS") if oc else ""
+            print(f"      {app:<10} JS {d['champion']:.4f} → {ch}   surplus {sp}{ocstr}{qstr}")
     flags = (rec.outputs or {}).get("flags")
     if flags:
         print("    flags: " + "; ".join(flags))
