@@ -83,6 +83,16 @@ class SolverProtocolError(Exception):
     """The solver returned an invalid response."""
 
 
+class RealSimulationUnavailable(RuntimeError):
+    """A real Anvil simulation was required but unavailable.
+
+    Raised by ``run_benchmark`` when ``require_real_sim`` is set and no
+    simulator was injected. Fail-closed: refuse to benchmark on the fabricated
+    mock, which reports a ~min*1.05 success and could be gamed into a passing
+    score. The benchmark worker loop logs this and retries; it never crashes
+    the process (``run_loop`` catches Exception)."""
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          SOLVER SESSION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -577,6 +587,7 @@ async def run_benchmark(
     score_fn: ScoreFn | None = None,
     simulator: Any | None = None,
     fork_block: int | None = None,
+    require_real_sim: bool = False,
 ) -> list[BenchmarkResult]:
     """Run a complete benchmark against a solver session.
 
@@ -599,6 +610,14 @@ async def run_benchmark(
             fork at upstream head — the existing live-head behavior. This is
             the keystone that makes a benchmark round reproducible across
             validators: all of them re-simulate at the same pinned block.
+        require_real_sim: Fail-closed switch (default ``False``). When ``True``,
+            the benchmark refuses to substitute the fabricated mock for a real
+            simulation: if no simulator is injected it raises
+            ``RealSimulationUnavailable``; if a real ``simulate()`` throws OR
+            returns a reverted (``success=False``) result, that scenario is
+            scored 0 — never laundered into a ~min*1.05 mock pass nor a
+            lenient-app-scorer pass on a plan that could not execute. Default
+            keeps today's silent mock fallback.
 
     Returns:
         List of BenchmarkResult, one per intent.
@@ -607,6 +626,16 @@ async def run_benchmark(
         config = BenchmarkConfig()
     if trigger_ground_truth is None:
         trigger_ground_truth = {}
+
+    # Fail-closed: when a real simulation is required but none was injected,
+    # refuse to run rather than score every scenario on the fabricated mock
+    # (which reports ~min*1.05 success and can be gamed). The worker loop logs
+    # this and retries each tick; it does not crash the process.
+    if require_real_sim and simulator is None:
+        raise RealSimulationUnavailable(
+            "require_real_sim is set but no simulator was injected — refusing "
+            "to benchmark on fabricated mock simulation data."
+        )
 
     results: list[BenchmarkResult] = []
 
@@ -681,6 +710,7 @@ async def run_benchmark(
                     # — they fabricate passing scores (~5% above minimum) and can
                     # be exploited to inflate benchmark results.
                     used_mock = False
+                    fail_closed_miss = False
                     if simulator is not None:
                         try:
                             token_balances = _build_token_balances(state)
@@ -707,37 +737,66 @@ async def run_benchmark(
                                 fork_block=fork_block,
                             )
                             print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
+                            if require_real_sim and not sim.success:
+                                # Fail-closed: a real simulation that REVERTED
+                                # (success=False) means the plan could not
+                                # execute. Don't hand it to the scorer — a lenient
+                                # app JS scorer doesn't hard-gate on success and
+                                # could still pass it. Score 0, exactly like a
+                                # genuine on-chain revert.
+                                logger.warning(
+                                    "Simulation reverted for %s and "
+                                    "require_real_sim is set; scoring 0: %s",
+                                    intent.app_id, sim.error,
+                                )
+                                br.error = f"real_sim_reverted: {sim.error}"
+                                fail_closed_miss = True
                         except Exception as sim_exc:
-                            logger.warning(
-                                "Anvil simulation failed for %s, falling back to mock: %s",
-                                intent.app_id, sim_exc,
-                            )
-                            sim = _build_benchmark_simulation(plan, state)
-                            used_mock = True
+                            if require_real_sim:
+                                # Fail-closed: do NOT fabricate a passing mock.
+                                # Leave the scenario at score 0 (the same outcome
+                                # as an on-chain revert) so a flaky Anvil can't be
+                                # laundered into a ~min*1.05 passing score.
+                                logger.warning(
+                                    "Anvil simulation failed for %s and "
+                                    "require_real_sim is set; scoring 0 (no mock "
+                                    "fallback): %s",
+                                    intent.app_id, sim_exc,
+                                )
+                                br.error = f"real_sim_unavailable: {sim_exc}"
+                                fail_closed_miss = True
+                            else:
+                                logger.warning(
+                                    "Anvil simulation failed for %s, falling back to mock: %s",
+                                    intent.app_id, sim_exc,
+                                )
+                                sim = _build_benchmark_simulation(plan, state)
+                                used_mock = True
                     else:
                         sim = _build_benchmark_simulation(plan, state)
                         used_mock = True
-                    br.mock_simulation = used_mock
-                    score_result = await score_fn(
-                        intent.app_id, plan, sim, state,
-                    )
-                    br.plan_score = score_result.score
-                    br.score_breakdown = score_result.breakdown
+                    if not fail_closed_miss:
+                        br.mock_simulation = used_mock
+                        score_result = await score_fn(
+                            intent.app_id, plan, sim, state,
+                        )
+                        br.plan_score = score_result.score
+                        br.score_breakdown = score_result.breakdown
 
-                    # Compute composite score for auto-triggered intents
-                    if is_auto and br.trigger_decision is not None:
-                        gt = trigger_ground_truth.get(intent.app_id)
-                        if gt is not None:
-                            trigger_correct = (br.trigger_decision == gt)
-                            br.trigger_score = 1.0 if trigger_correct else 0.0
-                            br.score = (
-                                config.auto_trigger_weight * br.trigger_score
-                                + config.plan_quality_weight * score_result.score
-                            )
+                        # Compute composite score for auto-triggered intents
+                        if is_auto and br.trigger_decision is not None:
+                            gt = trigger_ground_truth.get(intent.app_id)
+                            if gt is not None:
+                                trigger_correct = (br.trigger_decision == gt)
+                                br.trigger_score = 1.0 if trigger_correct else 0.0
+                                br.score = (
+                                    config.auto_trigger_weight * br.trigger_score
+                                    + config.plan_quality_weight * score_result.score
+                                )
+                            else:
+                                br.score = score_result.score
                         else:
                             br.score = score_result.score
-                    else:
-                        br.score = score_result.score
 
                 except Exception as exc:
                     logger.warning(

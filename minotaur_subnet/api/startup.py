@@ -559,11 +559,16 @@ async def initialize(ctx: ServerContext) -> dict:
 
         poll_interval = float(os.environ.get("BENCHMARK_POLL_INTERVAL", "30"))
         _genesis_solver_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip() or None
+        _require_real_sim = (
+            os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         ctx.benchmark_worker = BenchmarkWorker(
             submission_store=sub_store,
             app_store=ctx.store,
             round_store=round_store,
             genesis_solver_image=_genesis_solver_image,
+            require_real_sim=_require_real_sim,
         )
         ctx.benchmark_task = asyncio.create_task(
             ctx.benchmark_worker.run_loop(interval=poll_interval),
@@ -969,6 +974,19 @@ async def initialize(ctx: ServerContext) -> dict:
         if simulator is not None and ctx.benchmark_worker is not None:
             ctx.benchmark_worker._simulator = simulator
             logger.info("BenchmarkWorker using real Anvil simulation")
+        elif (
+            ctx.benchmark_worker is not None
+            and getattr(ctx.benchmark_worker, "_require_real_sim", False)
+        ):
+            # Fail-closed misconfiguration: the operator demanded real sims but
+            # none materialized. Surface it loudly at boot; the worker will also
+            # refuse (RealSimulationUnavailable) each tick rather than scoring
+            # solvers on the fabricated mock.
+            logger.error(
+                "BENCHMARK_REQUIRE_REAL_SIM is set but no Anvil simulator is "
+                "available — the benchmark worker will refuse to score "
+                "(fail-closed) until a simulator is configured."
+            )
 
         # Bridge tracker
         bridge_tracker = None

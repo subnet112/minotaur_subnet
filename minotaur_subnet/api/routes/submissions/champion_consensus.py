@@ -88,6 +88,7 @@ async def _reactive_benchmark_candidate(
     from minotaur_subnet.harness.orchestrator import (
         BenchmarkConfig,
         BenchmarkResult,
+        RealSimulationUnavailable,
         SolverOrchestrator,
         run_benchmark,
     )
@@ -159,7 +160,15 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:
             logger.warning("Reactive historical sampling failed: %s", exc)
 
-    # Run the Docker benchmark
+    # Run the Docker benchmark. Honor the same fail-closed switch as the leader
+    # (BENCHMARK_REQUIRE_REAL_SIM) so a follower never re-verifies a candidate on
+    # fabricated mock data while the leader fail-closes it — that asymmetry would
+    # silently diverge consensus.
+    import os
+    _require_real_sim = (
+        os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     orch = SolverOrchestrator()
     session = await orch.start_docker(image_tag)
     try:
@@ -171,7 +180,15 @@ async def _reactive_benchmark_candidate(
             ),
             score_fn=score_fn,
             simulator=simulator,
+            require_real_sim=_require_real_sim,
         )
+    except RealSimulationUnavailable:
+        logger.error(
+            "Reactive verify for %s requires a real simulator but none is "
+            "available — failing closed (verify=fail).",
+            candidate.submission_id,
+        )
+        return False, 0.0
     finally:
         await session.shutdown()
 
