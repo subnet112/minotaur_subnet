@@ -525,6 +525,23 @@ class AnvilSimulator:
                 except (ValueError, TypeError):
                     pass
 
+            # Capture the on-chain score via eth_call against the FUNDED pre-tx
+            # state. scoreIntent returns (uint256 score, bool valid), but the
+            # transaction below CONSUMES the funding (safeTransferFrom drains the
+            # input tokens), so reading the return value AFTER the tx reverts and
+            # yields None. eth_call doesn't persist state, so the tx still runs.
+            on_chain_score = None
+            try:
+                _score_call = {"from": relayer_addr, "to": target,
+                               "data": calldata, "gas": 2_000_000}
+                if tx_value > 0:
+                    _score_call["value"] = tx_value
+                _ret = self.w3.eth.call(_score_call)
+                _score_val, _valid = abi_decode(["uint256", "bool"], _ret)
+                on_chain_score = _score_val if _valid else None
+            except Exception as _score_exc:
+                logger.warning("scoreIntent on-chain score read failed: %s", _score_exc)
+
             # Send as a raw RPC call (bypasses Web3.py's signer middleware)
             tx_params = {
                 "from": relayer_addr,
@@ -560,20 +577,8 @@ class AnvilSimulator:
             all_transfers = self._parse_transfer_events(receipt)
             total_gas = receipt["gasUsed"]
 
-            # Decode return value for on-chain score
-            # scoreIntent returns (uint256 score, bool valid)
-            on_chain_score = None
-            try:
-                ret = self.w3.eth.call({
-                    "from": relayer_addr,
-                    "to": target,
-                    "data": calldata,
-                    "gas": 2_000_000,
-                })
-                score_val, valid = abi_decode(["uint256", "bool"], ret)
-                on_chain_score = score_val if valid else None
-            except Exception:
-                pass
+            # on_chain_score was captured pre-tx (above) — reading it here, after
+            # the tx drained the funding, would revert and yield None.
 
             price_impact = self._estimate_price_impact(all_transfers)
 
