@@ -576,6 +576,7 @@ async def run_benchmark(
     trigger_ground_truth: dict[str, bool] | None = None,
     score_fn: ScoreFn | None = None,
     simulator: Any | None = None,
+    fork_block: int | None = None,
 ) -> list[BenchmarkResult]:
     """Run a complete benchmark against a solver session.
 
@@ -592,6 +593,12 @@ async def run_benchmark(
         score_fn: Optional async callback to score plans. Signature:
             async (app_id, plan, simulation, state) -> ScoreResult.
             If None, plans are not scored (score stays 0.0).
+        fork_block: Optional historical block to pin the Anvil fork to for
+            every simulation in this run (forwarded to ``simulator.simulate``,
+            which resets the fork to that block). ``None`` (default) leaves the
+            fork at upstream head — the existing live-head behavior. This is
+            the keystone that makes a benchmark round reproducible across
+            validators: all of them re-simulate at the same pinned block.
 
     Returns:
         List of BenchmarkResult, one per intent.
@@ -697,6 +704,7 @@ async def run_benchmark(
                                 contract_address=state.contract_address if state else None,
                                 intent_order=intent_order,
                                 token_balances=token_balances,
+                                fork_block=fork_block,
                             )
                             print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
                         except Exception as sim_exc:
