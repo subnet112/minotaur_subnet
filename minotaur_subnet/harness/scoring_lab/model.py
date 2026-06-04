@@ -103,9 +103,12 @@ class LabConfig:
     on_chain_floor: int | None = None          # BPS; used by the "p2" rule (and shown by both)
     # p2ref on-chain output no-regression tolerance (BPS): a challenger may not deliver LESS
     # output (lower scoreIntent BPS) than the champion by more than this, regardless of its JS
-    # score. The on-chain score is bit-exact same-host; 0 = strict. Guards against winning on
-    # the gas-inflated JS metric while giving users less.
-    onchain_regression_bps: float = 0.0
+    # score. Guards against winning on the gas-inflated JS metric while giving users less.
+    # Set to 5 from the measured cross-version residual: on-chain is bit-exact same-host but
+    # jitters ~2 BPS across anvil versions (1.5.1 vs 1.6.0-nightly), so a strict 0 would be
+    # flaky cross-host. 5 absorbs that jitter (2.5x) while still catching real regressions
+    # (the V3-only candidate regressed ~10 BPS). Revisit once a true cross-MACHINE residual is known.
+    onchain_regression_bps: float = 5.0
     # Phase 1 — quote-derived min: re-quote each case from the reference (champion) solver
     # at the sealed block instead of using the stale hardcoded manifest min.
     requote: bool = True
