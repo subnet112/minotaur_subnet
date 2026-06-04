@@ -1045,28 +1045,32 @@ class BenchmarkWorker:
         return _StageScore(avg_score=avg, count=len(stage_results), success_count=successes)
 
     def _build_scorecard(self, results: list[BenchmarkResult]) -> BenchmarkScorecard:
-        """Build a per-app scorecard from benchmark results."""
-        # Group results by app_id
-        by_app: dict[str, list[BenchmarkResult]] = {}
-        for r in results:
-            app_id = r.intent_id or "unknown"
-            by_app.setdefault(app_id, []).append(r)
+        """Build a per-app scorecard from benchmark results.
 
-        app_scores: dict[str, float] = {}
+        app_scores is keyed by the BARE app_id so the adoption gate enforces
+        true per-app non-regression. intent_id has the form "<app_id>:<scenario>"
+        (app_ids never contain ':'), so the first ':'-segment is the app; the
+        full-label per-scenario breakdown is kept separately in scenario_scores.
+        """
+        # Group results by the bare app_id (strip the scenario suffix).
+        by_app: dict[str, list[BenchmarkResult]] = {}
         scenario_scores: dict[str, float] = {}
         failures = 0
+        for r in results:
+            intent_label = r.intent_id or "unknown"
+            app_id = intent_label.split(":")[0]
+            by_app.setdefault(app_id, []).append(r)
+            # Per-scenario breakdown stays at full-label granularity.
+            scenario_scores[intent_label] = r.score
+            if r.error is not None or r.plan is None or r.score <= 0:
+                failures += 1
 
+        app_scores: dict[str, float] = {}
         for app_id, app_results in by_app.items():
-            # Per-app: failures count in denominator
+            # Per-app average; failed/zero scenarios stay in the denominator
+            # (same anti-gaming dilution as _compute_stage_score).
             app_total = sum(r.score for r in app_results if r.score > 0)
             app_scores[app_id] = app_total / len(app_results) if app_results else 0.0
-
-            # Per-scenario
-            for r in app_results:
-                scenario_key = f"{app_id}:{r.intent_id}" if r.intent_id != app_id else app_id
-                scenario_scores[scenario_key] = r.score
-                if r.error is not None or r.plan is None or r.score <= 0:
-                    failures += 1
 
         global_score = self._compute_avg_score(results)
 

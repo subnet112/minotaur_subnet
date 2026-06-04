@@ -49,7 +49,10 @@ from minotaur_subnet.weight_policy import (
 
 logger = logging.getLogger(__name__)
 
-# Champion must beat the incumbent by this margin (5%) to be adopted.
+# Champion must beat the incumbent by this margin to be adopted.
+# 0.005 == 0.5% (NOT 5% — the prose used to say 5%). The value is left as-is on
+# purpose: raising it to a deliberate minimum-detectable-effect margin must wait
+# until scores are cross-validator comparable (sealed-round work, design doc P1).
 DETHRONE_MARGIN = 0.005
 
 
@@ -297,7 +300,7 @@ class EpochManager:
                     result["next_round_id"] = next_round.round_id
         else:
             logger.info(
-                "Challenger score %.4f does not beat champion %.4f by %.0f%% margin",
+                "Challenger score %.4f does not beat champion %.4f by %.3g%% margin",
                 new_champion_sub.benchmark_score or 0,
                 self._champion.benchmark_score,
                 self._dethrone_margin * 100,
@@ -909,11 +912,12 @@ class EpochManager:
         Enforces:
         1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
         2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-        3. Per-app non-regression (max 10% drop on any app)
-        4. Global improvement by dethrone margin (5%)
+        3. Per-app non-regression: no champion-covered app may be dropped, and
+           no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
+        4. Global improvement over the champion by the dethrone margin (default 0.5%)
         """
         challenger_score = challenger.benchmark_score or 0
-        champion_score = self._champion.benchmark_score
+        champion_score = self._champion.benchmark_score or 0
         min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
         per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
         max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
@@ -948,14 +952,27 @@ class EpochManager:
         if not self._champion.submission_id:
             return True
 
-        # 3. Per-app non-regression — no app can drop more than max_regression
+        # 3. Per-app non-regression. app_scores is keyed by bare app_id (see
+        #    BenchmarkWorker._build_scorecard), so this compares true per-app
+        #    quality, not per-scenario. A challenger may neither drop an app the
+        #    champion covers nor regress > MAX_APP_REGRESSION on any app it solves.
         if challenger_scorecard and incumbent_scorecard:
             inc_apps = incumbent_scorecard.get("app_scores", {})
             ch_apps = challenger_scorecard.get("app_scores", {})
             for app_id, inc_score in inc_apps.items():
+                ch_score = ch_apps.get(app_id)
+                # (a) Dropping a champion-covered app is a hard regression.
+                if ch_score is None:
+                    logger.info(
+                        "Challenger %s drops app %s that the champion covers",
+                        challenger.submission_id, app_id,
+                    )
+                    return False
+                # (b) A non-positive incumbent baseline gives no meaningful drop
+                #     threshold; the real per-app floor arrives with the on-chain
+                #     gate (design doc P2). Skip only the magnitude check here.
                 if inc_score <= 0:
                     continue
-                ch_score = ch_apps.get(app_id, 0)
                 if ch_score < inc_score * (1 - max_regression):
                     logger.info(
                         "Challenger %s regresses on %s: %.3f → %.3f (max drop %.0f%%)",
@@ -964,13 +981,16 @@ class EpochManager:
                     )
                     return False
 
-        # 4. Global improvement by dethrone margin
-        effective_champion_score = max(champion_score, min_score)
-        required = effective_champion_score * (1 + self._dethrone_margin)
-        if challenger_score <= effective_champion_score:
+        # 4. Global improvement over the champion's actual (freshly
+        #    re-benchmarked) score by the dethrone margin. The absolute
+        #    MIN_CHAMPION_SCORE floor is already enforced in step 1, so the
+        #    baseline must NOT be floored at min_score here — flooring only
+        #    over-protects a degraded (sub-floor) champion (design doc, §a #6).
+        required = champion_score * (1 + self._dethrone_margin)
+        if challenger_score <= champion_score:
             logger.info(
                 "Challenger %s score %.3f not better than incumbent %.3f",
-                challenger.submission_id, challenger_score, effective_champion_score,
+                challenger.submission_id, challenger_score, champion_score,
             )
             return False
         if challenger_score < required:

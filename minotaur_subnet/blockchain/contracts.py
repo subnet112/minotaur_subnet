@@ -734,31 +734,3 @@ class ContractManager:
             "canExecute()",
         )
         return (result[0], result[1])
-
-    # -------------------------------------------------------------------
-    # Convenience: on-chain score
-    # -------------------------------------------------------------------
-
-    async def get_on_chain_score(
-        self,
-        contract_address: str,
-        plan: ExecutionPlan,
-        chain_id: int,
-    ) -> tuple[int, bool, str]:
-        """
-        Call the on-chain ``score()`` function.
-
-        Returns ``(score_bps, valid, reason)``.
-        """
-        w3 = get_web3(chain_id)
-        checksum = Web3.to_checksum_address(contract_address)
-        contract = w3.eth.contract(address=checksum, abi=APP_INTENT_BASE_ABI)
-
-        plan_tuple = _plan_to_solidity(plan)
-
-        result = await _retry_rpc(
-            lambda: contract.functions.score(plan_tuple).call(),
-            "score()",
-        )
-        # result is a tuple matching ScoreResult struct: (score, valid, reason)
-        return (result[0], result[1], result[2])
