@@ -10,8 +10,8 @@ so the solver and the simulator both see identical state — the determinism the
 champion contest needs. Pass an explicit fork_block to replay a historical block.
 
 External deps: a live Base RPC (``--base-rpc`` / $BASE_ALCHEMY_RPC_URL) to fork from,
-anvil on PATH, and the genesis solver source at $MINOTAUR_SOLVER_OSS
-(default ~/git/minotaur-solver-oss).
+anvil on PATH, and the genesis solver source at $MINOTAUR_SOLVER_OSS (your
+minotaur-solver-oss checkout).
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from .model import LabConfig, Scenario, StageRecord
 from .pipeline import compare, run_solver
 from .stages import _ms, build_state
 
-SOLVER_OSS = os.environ.get("MINOTAUR_SOLVER_OSS") or os.path.expanduser("~/git/minotaur-solver-oss")
+SOLVER_OSS = os.environ.get("MINOTAUR_SOLVER_OSS", "")  # set to your minotaur-solver-oss checkout
 SUBNET_ROOT = str(Path(minotaur_subnet.__file__).resolve().parents[1])
 GENESIS_SOLVER_PY = os.path.join(SOLVER_OSS, "solver.py")
 EXAMPLE_CANDIDATE = str(Path(__file__).with_name("example_candidate.py"))

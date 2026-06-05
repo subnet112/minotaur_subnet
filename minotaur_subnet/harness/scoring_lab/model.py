@@ -12,13 +12,14 @@ from typing import Any
 
 from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
-# The real DexAggregator scorer lives in the apps-oss repo (not in this repo).
-DEFAULT_DEX_SCORER = os.environ.get("MINOTAUR_DEX_SCORER") or os.path.expanduser(
-    "~/git/minotaur-apps-oss/contracts/scoring/dex_aggregator_scoring.js"
+# The DexAggregator scorer JS lives in the apps repo (not in this repo). Point
+# MINOTAUR_DEX_SCORER at your checkout's contracts/scoring/dex_aggregator_scoring.js.
+DEFAULT_DEX_SCORER = os.environ.get("MINOTAUR_DEX_SCORER", "")
+# The DexAggregator contract to fork against. Pass --contract / set
+# MINOTAUR_DEX_CONTRACT; the zero-address default is a placeholder.
+DEFAULT_DEX_CONTRACT = os.environ.get(
+    "MINOTAUR_DEX_CONTRACT", "0x0000000000000000000000000000000000000000"
 )
-# Live Base DexAggregator (CoW-fee contract, app_da6c96b84c60), read from the prod
-# store 2026-06-04. Override via --contract / LabConfig.contract_address.
-DEFAULT_DEX_CONTRACT = "0xAc1C555Fad90b26461a6b4EafCCD5e1FbA93cB07"
 DEFAULT_GENESIS_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "minotaur-genesis:fee-test")
 
 
