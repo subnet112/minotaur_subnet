@@ -676,8 +676,13 @@ class EpochManager:
             old_score = self._champion.benchmark_score
             self._champion.benchmark_score = fresh_score
 
-            # Also update the submission store so the score persists
-            if self._sub_store and fresh_score != old_score:
+            # Persist the refreshed score + details. Also persist when the stored
+            # scorecard predates the on-chain plumbing (no app_onchain) so the
+            # on-chain-ranked rule has the champion's per-app on-chain means even
+            # when the JS score is unchanged — otherwise p2oc would reject a
+            # legitimate challenger for lack of a champion baseline.
+            _stored = self._get_incumbent_scorecard() or {}
+            if self._sub_store and (fresh_score != old_score or not _stored.get("app_onchain")):
                 self._sub_store.set_benchmark_result(
                     incumbent_sub.submission_id,
                     score=fresh_score,
