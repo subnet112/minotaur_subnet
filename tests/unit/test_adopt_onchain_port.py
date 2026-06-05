@@ -159,3 +159,32 @@ def test_p2oc_js_catastrophic_regression_veto():
 def test_p2oc_adopts_genesis_when_no_champion():
     mgr = _mgr(champ_id="")  # no champion yet
     assert mgr._should_adopt_onchain(_chal()) is True
+
+
+# ── shadow-determinism (observe-only) ────────────────────────────────────────
+
+def _shadow_mgr():
+    mgr = _mgr()
+    _cards(mgr, _card({"A": 0.6}, {"A": [5000]}), _card({"A": 0.7}, {"A": [5100]}))
+    return mgr
+
+
+def test_shadow_off_by_default_not_invoked(monkeypatch):
+    monkeypatch.delenv("SHADOW_DETERMINISM", raising=False)
+    mgr = _shadow_mgr()
+    mgr._log_shadow_determinism = lambda *a: (_ for _ in ()).throw(AssertionError("shadow ran"))
+    assert mgr._should_adopt(_chal(0.7)) is True  # current rule adopts; shadow NOT invoked
+
+
+def test_shadow_on_logs_without_changing_decision(monkeypatch):
+    monkeypatch.setenv("SHADOW_DETERMINISM", "1")
+    calls = []
+    mgr = _shadow_mgr()
+    mgr._log_shadow_determinism = lambda *a: calls.append(a)
+    assert mgr._should_adopt(_chal(0.7)) is True  # live decision UNCHANGED
+    assert len(calls) == 1                          # but the shadow WAS invoked
+
+
+def test_shadow_log_never_raises_on_empty_cards():
+    mgr = _mgr()
+    mgr._log_shadow_determinism(_chal(), {}, {})  # observe-only must not raise

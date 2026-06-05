@@ -185,6 +185,24 @@ class BenchmarkWorker:
         """
         self._epoch_block_number = block_number
 
+    def _apply_epoch_block_pin(self) -> None:
+        """Pin the benchmark fork to BENCHMARK_EPOCH_BLOCK when set (call-time read so
+        operators can flip without restart). Unset/invalid -> no pin (live head). The
+        block threads through run_benchmark -> simulate as fork_block, so every sim this
+        round runs at the same Base block -> on-chain scores reproduce across validators."""
+        raw = os.environ.get("BENCHMARK_EPOCH_BLOCK", "").strip()
+        if not raw:
+            return
+        try:
+            block = int(raw)
+        except ValueError:
+            logger.warning("BENCHMARK_EPOCH_BLOCK=%r is not an int; ignoring", raw)
+            return
+        if block != self._epoch_block_number:
+            self.set_epoch_block(block)
+            logger.info("[fork-pin] benchmark pinned to Base block %d (BENCHMARK_EPOCH_BLOCK)",
+                        block)
+
     async def run_loop(self, interval: float = 30.0) -> None:
         """Continuously poll for and process BENCHMARKING submissions.
 
@@ -223,6 +241,13 @@ class BenchmarkWorker:
 
         Returns the number of submissions processed.
         """
+        # Deterministic fork-pin: when BENCHMARK_EPOCH_BLOCK is set, pin this round's
+        # benchmark simulations to that Base block so on-chain scores are reproducible
+        # across validators (the cross-machine determinism keystone). Default unset ->
+        # live head (current behavior unchanged). Operators set the SAME value fleet-wide
+        # for comparability; an automatic per-round shared block (leader-pinned via the
+        # round state) is the production follow-up.
+        self._apply_epoch_block_pin()
         replay_round = self._current_replay_round()
         benchmarking = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
         if replay_round is not None:

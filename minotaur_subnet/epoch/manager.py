@@ -977,6 +977,13 @@ class EpochManager:
         challenger_scorecard = self._get_scorecard(challenger)
         incumbent_scorecard = self._get_incumbent_scorecard()
 
+        # SHADOW (observe-only): while the live decision uses the current rule below,
+        # log what the on-chain-ranked rule WOULD decide + the on-chain surplus, so the
+        # fleet can compare these determinism-critical signals across machines WITHOUT
+        # affecting any actual adoption. Default off. Never raises into the live path.
+        if os.environ.get("SHADOW_DETERMINISM", "").strip().lower() in ("1", "true", "yes", "on"):
+            self._log_shadow_determinism(challenger, challenger_scorecard, incumbent_scorecard)
+
         # 2. Per-app minimum — every app must be above floor
         if challenger_scorecard:
             for app_id, app_score in challenger_scorecard.get("app_scores", {}).items():
@@ -1101,6 +1108,45 @@ class EpochManager:
         logger.info("p2oc ADOPT %s: net on-chain surplus %+.1f BPS",
                     challenger.submission_id, net_bps)
         return True
+
+    def _log_shadow_determinism(self, challenger: Submission, chal_card, champ_card) -> None:
+        """Observe-only shadow of the on-chain-ranked decision (SHADOW_DETERMINISM).
+
+        Logs, per challenger, the on-chain-ranked (p2oc) verdict + the net on-chain
+        output surplus + the per-app champion/challenger on-chain means — the exact
+        determinism-critical signals. Operators across the fleet can compare these
+        (same challenger + same pinned block -> same numbers, or consensus would split
+        if enabled). Has NO effect on the live adoption decision and never raises into
+        it. For the numbers to be comparable across validators they must benchmark at
+        the SAME pinned block (the fork-pin keystone); on the prod lead alone it still
+        surfaces p2oc's behavior on real challengers.
+        """
+        try:
+            chal_card = chal_card or {}
+            champ_card = champ_card or {}
+            champ_apps = champ_card.get("app_scores", {})
+            champ_oc = champ_card.get("app_onchain", {})
+            chal_oc = chal_card.get("app_onchain", {})
+            surpluses: list[float] = []
+            per_app: dict[str, float] = {}
+            for app in champ_apps:
+                co = _app_onchain_mean(champ_oc.get(app, []))
+                cco = _app_onchain_mean(chal_oc.get(app, []))
+                if co is not None and cco is not None:
+                    per_app[app] = round(cco - co, 1)
+                    surpluses.append(cco - co)
+            net_bps = (sum(surpluses) / len(surpluses)) if surpluses else 0.0
+            would_adopt = self._should_adopt_onchain(challenger)
+            logger.info(
+                "[shadow-determinism] challenger=%s p2oc_verdict=%s net_onchain_bps=%+.1f "
+                "per_app_surplus=%s champion_onchain=%s challenger_onchain=%s",
+                challenger.submission_id, "ADOPT" if would_adopt else "REJECT", net_bps,
+                per_app,
+                {a: _app_onchain_mean(v) for a, v in champ_oc.items()},
+                {a: _app_onchain_mean(v) for a, v in chal_oc.items()},
+            )
+        except Exception as exc:  # observe-only — must never break the live decision
+            logger.warning("[shadow-determinism] failed (ignored): %s", exc)
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
         """Extract the scorecard from a submission's benchmark details."""
