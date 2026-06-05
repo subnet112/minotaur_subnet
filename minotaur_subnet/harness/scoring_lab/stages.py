@@ -397,4 +397,103 @@ class P2RefAdoptRule(AdoptRule):
         return adopt, rec
 
 
-ADOPT_RULES = {"current": CurrentAdoptRule, "p2": P2AdoptRule, "p2ref": P2RefAdoptRule}
+class P2OcAdoptRule(AdoptRule):
+    """On-chain co-ranked adoption — fixes the p2ref ranking gap.
+
+    p2ref RANKS the dethrone on the JS surplus (gas-polluted) and uses on-chain only as a
+    veto. That rejects in BOTH directions when a candidate trades output for gas: a
+    gas-gaming challenger that delivers LESS output is vetoed (good), but a genuine
+    MORE-output challenger that costs more gas has a negative JS surplus and is ALSO rejected
+    (bad — users pay zero gas). p2oc RANKS the decision on the unfakeable on-chain OUTPUT
+    surplus (Δ scoreIntent BPS) instead, keeping the same vetoes. Output is the signal that
+    should rank; gas can neither manufacture nor block a win. Ports to:
+    epoch/manager.py:_should_adopt (on-chain-ranked target).
+
+    scoreIntent == 5000*(output/min) in [5000,10000], so Δbps/10000 is ~half the fractional
+    output gain; dethrone_margin (0.005) => +50 BPS => ~+1% output above min to dethrone —
+    well above the ~2-5 BPS cross-host reproducibility noise.
+    """
+
+    name = "p2oc"
+
+    def evaluate(self, champ_card, chal_card, champ_oc, chal_oc, cfg, champ_qa=None, chal_qa=None) -> tuple[bool, StageRecord]:
+        t0 = time.monotonic()
+        floor = cfg.on_chain_floor
+        champ_apps = champ_card.app_scores
+        chal_apps = chal_card.app_scores
+        reasons: list[str] = []
+        flags: list[str] = []
+        diffs: dict[str, Any] = {}
+        oc_surpluses: list[float] = []          # BPS — the RANKING signal
+        adopt = True
+
+        for app, inc in champ_apps.items():
+            ch = chal_apps.get(app)
+            # (1) on-chain admission floor on every champion-covered app
+            if floor is not None:
+                all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app, []), floor)
+                if not all_pass:
+                    adopt = False
+                    reasons.append(f"{app}: on-chain floor fail (min={min_bps} missing={n_missing})")
+            # (2) coverage — dropping a champion-covered app is a hard regression
+            if ch is None:
+                adopt = False
+                reasons.append(f"{app}: dropped")
+                diffs[app] = {"js": {"champion": round(inc, 4), "challenger": None}}
+                continue
+            diffs[app] = {"js": {"champion": round(inc, 4), "challenger": round(ch, 4),
+                                 "surplus": round(ch - inc, 4)}}
+            # on-chain OUTPUT surplus — the unfakeable, gas-blind RANKING signal
+            co = _app_onchain_mean(champ_oc.get(app, []))
+            cco = _app_onchain_mean(chal_oc.get(app, []))
+            if co is not None and cco is not None:
+                oc_surpluses.append(cco - co)
+                diffs[app]["onchain"] = {"champion": round(co, 1), "challenger": round(cco, 1),
+                                         "surplus_bps": round(cco - co, 1)}
+            elif co is not None and cco is None:
+                adopt = False
+                reasons.append(f"{app}: no on-chain score (champion {co:.0f})")
+                diffs[app]["onchain"] = {"champion": round(co, 1), "challenger": None}
+            # (3) per-app JS no-CATASTROPHIC-regression guard (a gas blow-up safety net only)
+            if inc > 0 and ch < inc * (1 - cfg.max_app_regression):
+                adopt = False
+                reasons.append(f"{app}: JS regress {inc:.3f}->{ch:.3f}")
+            # (4) sandbag guard (CoW fee = share of gained-quoted)
+            if chal_qa is not None:
+                cq = (chal_qa.get(app) or {}).get("mean_err")
+                pq = (champ_qa.get(app) or {}).get("mean_err") if champ_qa else None
+                if cq is not None:
+                    diffs[app]["quote_err"] = round(cq, 4)
+                    if pq is not None:
+                        extra = cq - pq
+                        diffs[app]["extra_sandbag"] = round(extra, 4)
+                        if cfg.max_extra_sandbag is not None and extra > cfg.max_extra_sandbag:
+                            adopt = False
+                            reasons.append(f"{app}: sandbags quote +{extra:.3f} > {cfg.max_extra_sandbag:g} vs champion")
+                        elif extra > 0.02:
+                            flags.append(f"{app}: under-quotes +{extra:.3f} vs champion")
+
+        # (5) net gain RANKED ON ON-CHAIN OUTPUT: mean per-app BPS surplus / 10000 beats the margin
+        net_bps = sum(oc_surpluses) / len(oc_surpluses) if oc_surpluses else 0.0
+        net = net_bps / 10000.0
+        if net <= cfg.dethrone_margin:
+            adopt = False
+            reasons.append(f"net on-chain surplus {net_bps:+.1f} BPS ({net:+.4f}) <= margin {cfg.dethrone_margin:g}")
+
+        rec = StageRecord(
+            stage="adopt", scenario="(all)", ok=True,
+            summary=(f"rule=p2oc -> {'ADOPT' if adopt else 'REJECT'} (net on-chain {net_bps:+.1f} BPS)"
+                     + ("" if adopt else f" :: {'; '.join(reasons)}")
+                     + (f"  [flags: {'; '.join(flags)}]" if flags else "")),
+            inputs={"on_chain_floor": floor, "margin": cfg.dethrone_margin,
+                    "max_app_regression": cfg.max_app_regression, "max_extra_sandbag": cfg.max_extra_sandbag},
+            outputs={"adopt": adopt, "net_onchain_bps": round(net_bps, 2), "net_surplus": round(net, 6),
+                     "per_app_diff": diffs, "reasons": reasons, "flags": flags},
+            meta={"ports_to": "epoch/manager.py:_should_adopt (on-chain-ranked target)",
+                  "note": "decision RANKS on on-chain output surplus; JS kept only as a no-blowup guard"},
+            duration_ms=_ms(t0),
+        )
+        return adopt, rec
+
+
+ADOPT_RULES = {"current": CurrentAdoptRule, "p2": P2AdoptRule, "p2ref": P2RefAdoptRule, "p2oc": P2OcAdoptRule}
