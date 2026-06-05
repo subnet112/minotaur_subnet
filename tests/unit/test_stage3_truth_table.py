@@ -20,8 +20,9 @@ def _run(coro):
 
 
 def test_stage3_disabled_env_helper(monkeypatch):
+    # The gate is now OPT-IN: default (unset) is DISABLED.
     monkeypatch.delenv("STAGE3_DISABLED", raising=False)
-    assert _stage3_disabled() is False
+    assert _stage3_disabled() is True
 
     monkeypatch.setenv("STAGE3_DISABLED", "1")
     assert _stage3_disabled() is True
@@ -59,7 +60,7 @@ async def test_disabled_env_returns_true_without_any_other_work(monkeypatch):
 @pytest.mark.asyncio
 async def test_no_candidates_returns_true(monkeypatch):
     """Row: enabled + no regression candidates → True (nothing to test)."""
-    monkeypatch.delenv("STAGE3_DISABLED", raising=False)
+    monkeypatch.setenv("STAGE3_DISABLED", "0")  # gate is opt-in now — enable it
     mgr = _make_manager_with_disabled_flag()
 
     # Provide the collaborators needed to reach candidate extraction.
@@ -82,7 +83,7 @@ async def test_no_candidates_returns_true(monkeypatch):
 @pytest.mark.asyncio
 async def test_candidates_plus_missing_archive_fails_closed(monkeypatch):
     """Row: enabled + candidates + archive missing → False."""
-    monkeypatch.delenv("STAGE3_DISABLED", raising=False)
+    monkeypatch.setenv("STAGE3_DISABLED", "0")  # gate is opt-in now — enable it
 
     # Build a more realistic mock: candidate extraction sees a failed
     # historical order, archive RPC says no for that chain.
