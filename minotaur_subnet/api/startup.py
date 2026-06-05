@@ -1555,6 +1555,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 block_loop=ctx.block_loop,
                 benchmark_worker=ctx.benchmark_worker,
                 submission_store=sub_store,
+                app_store=ctx.store,  # Stage-3 gate order lookups
                 round_store=round_store,
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,

@@ -91,13 +91,16 @@ async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
 
 
 def _stage3_disabled() -> bool:
-    """Whether Stage 3 regression testing is opt-out-disabled.
+    """Whether the Stage 3 historical-regression gate is disabled.
 
-    Read at call time so operators can flip without restarting. Dev-only
-    escape hatch — leaving this on in production would let a champion with
-    regressions through the gate.
+    Read at call time so operators can flip without restarting. The gate is now
+    OPT-IN: it defaults to DISABLED because it FAIL-CLOSES when a referenced chain
+    has no archive RPC, and it was accidentally dead for a long time (the
+    per_intent key bug), so reviving it on-by-default could suddenly block
+    adoptions on a leader that has order history but no archive RPC. Enable it
+    deliberately with ``STAGE3_DISABLED=0`` once archive RPCs are configured.
     """
-    return os.environ.get("STAGE3_DISABLED", "0").strip().lower() in (
+    return os.environ.get("STAGE3_DISABLED", "1").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -140,6 +143,7 @@ class EpochManager:
         block_loop: Any = None,
         benchmark_worker: Any = None,
         submission_store: SubmissionStore | None = None,
+        app_store: Any = None,
         orchestrator: Any = None,
         round_store: RoundStore | None = None,
         runtime_builder: Any = None,
@@ -152,6 +156,10 @@ class EpochManager:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
         self._sub_store = submission_store
+        # App/order store for the Stage-3 historical-regression gate (order lookups).
+        # Was referenced but never assigned — defaults None so the gate degrades to
+        # "no candidates -> pass" rather than AttributeError when unwired.
+        self._app_store = app_store
         self._orchestrator = orchestrator
         self._round_store = round_store
         self._runtime_builder = runtime_builder
@@ -740,9 +748,12 @@ class EpochManager:
             logger.info("[stage3] skipped: challenger has no image_tag")
             return True
 
-        # Find regression candidates from challenger's benchmark details
+        # Find regression candidates from challenger's benchmark details.
+        # NB: the per-scenario list is stored under "per_intent" (see
+        # benchmark_worker._results_to_details); reading "results" here always
+        # yielded [] — the gate was silently dead. Fixed to "per_intent".
         details = getattr(challenger, "benchmark_details", None) or {}
-        results = details.get("results") or []
+        results = details.get("per_intent") or details.get("results") or []
         candidates: list[dict] = []
         for r in results:
             intent_id = r.get("intent_id", "")
