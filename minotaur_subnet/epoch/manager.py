@@ -49,8 +49,27 @@ from minotaur_subnet.weight_policy import (
 
 logger = logging.getLogger(__name__)
 
-# Champion must beat the incumbent by this margin (5%) to be adopted.
+# Champion must beat the incumbent by this margin to be adopted.
+# 0.005 == 0.5% (NOT 5% — the prose used to say 5%). The value is left as-is on
+# purpose: raising it to a deliberate minimum-detectable-effect margin must wait
+# until scores are cross-validator comparable (sealed-round work, design doc P1).
 DETHRONE_MARGIN = 0.005
+
+
+def _onchain_pass(scores: list, floor: int) -> tuple[bool, "int | None", int]:
+    """all_pass, min_bps, n_missing — a champion-covered app must clear the floor on
+    every scenario (ported from scoring_lab/stages.py)."""
+    present = [s for s in scores if s is not None]
+    n_missing = sum(1 for s in scores if s is None)
+    all_pass = n_missing == 0 and all(s >= floor for s in present)
+    return all_pass, (min(present) if present else None), n_missing
+
+
+def _app_onchain_mean(scores: list) -> "float | None":
+    """Mean on-chain scoreIntent BPS over present scenarios for an app — the unfakeable
+    output-quality signal, independent of the gas-weighted JS score."""
+    present = [s for s in scores if s is not None]
+    return (sum(present) / len(present)) if present else None
 
 
 async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
@@ -72,13 +91,16 @@ async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
 
 
 def _stage3_disabled() -> bool:
-    """Whether Stage 3 regression testing is opt-out-disabled.
+    """Whether the Stage 3 historical-regression gate is disabled.
 
-    Read at call time so operators can flip without restarting. Dev-only
-    escape hatch — leaving this on in production would let a champion with
-    regressions through the gate.
+    Read at call time so operators can flip without restarting. The gate is now
+    OPT-IN: it defaults to DISABLED because it FAIL-CLOSES when a referenced chain
+    has no archive RPC, and it was accidentally dead for a long time (the
+    per_intent key bug), so reviving it on-by-default could suddenly block
+    adoptions on a leader that has order history but no archive RPC. Enable it
+    deliberately with ``STAGE3_DISABLED=0`` once archive RPCs are configured.
     """
-    return os.environ.get("STAGE3_DISABLED", "0").strip().lower() in (
+    return os.environ.get("STAGE3_DISABLED", "1").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -121,6 +143,7 @@ class EpochManager:
         block_loop: Any = None,
         benchmark_worker: Any = None,
         submission_store: SubmissionStore | None = None,
+        app_store: Any = None,
         orchestrator: Any = None,
         round_store: RoundStore | None = None,
         runtime_builder: Any = None,
@@ -133,6 +156,10 @@ class EpochManager:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
         self._sub_store = submission_store
+        # App/order store for the Stage-3 historical-regression gate (order lookups).
+        # Was referenced but never assigned — defaults None so the gate degrades to
+        # "no candidates -> pass" rather than AttributeError when unwired.
+        self._app_store = app_store
         self._orchestrator = orchestrator
         self._round_store = round_store
         self._runtime_builder = runtime_builder
@@ -297,7 +324,7 @@ class EpochManager:
                     result["next_round_id"] = next_round.round_id
         else:
             logger.info(
-                "Challenger score %.4f does not beat champion %.4f by %.0f%% margin",
+                "Challenger score %.4f does not beat champion %.4f by %.3g%% margin",
                 new_champion_sub.benchmark_score or 0,
                 self._champion.benchmark_score,
                 self._dethrone_margin * 100,
@@ -657,8 +684,13 @@ class EpochManager:
             old_score = self._champion.benchmark_score
             self._champion.benchmark_score = fresh_score
 
-            # Also update the submission store so the score persists
-            if self._sub_store and fresh_score != old_score:
+            # Persist the refreshed score + details. Also persist when the stored
+            # scorecard predates the on-chain plumbing (no app_onchain) so the
+            # on-chain-ranked rule has the champion's per-app on-chain means even
+            # when the JS score is unchanged — otherwise p2oc would reject a
+            # legitimate challenger for lack of a champion baseline.
+            _stored = self._get_incumbent_scorecard() or {}
+            if self._sub_store and (fresh_score != old_score or not _stored.get("app_onchain")):
                 self._sub_store.set_benchmark_result(
                     incumbent_sub.submission_id,
                     score=fresh_score,
@@ -716,9 +748,12 @@ class EpochManager:
             logger.info("[stage3] skipped: challenger has no image_tag")
             return True
 
-        # Find regression candidates from challenger's benchmark details
+        # Find regression candidates from challenger's benchmark details.
+        # NB: the per-scenario list is stored under "per_intent" (see
+        # benchmark_worker._results_to_details); reading "results" here always
+        # yielded [] — the gate was silently dead. Fixed to "per_intent".
         details = getattr(challenger, "benchmark_details", None) or {}
-        results = details.get("results") or []
+        results = details.get("per_intent") or details.get("results") or []
         candidates: list[dict] = []
         for r in results:
             intent_id = r.get("intent_id", "")
@@ -909,11 +944,12 @@ class EpochManager:
         Enforces:
         1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
         2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-        3. Per-app non-regression (max 10% drop on any app)
-        4. Global improvement by dethrone margin (5%)
+        3. Per-app non-regression: no champion-covered app may be dropped, and
+           no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
+        4. Global improvement over the champion by the dethrone margin (default 0.5%)
         """
         challenger_score = challenger.benchmark_score or 0
-        champion_score = self._champion.benchmark_score
+        champion_score = self._champion.benchmark_score or 0
         min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
         per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
         max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
@@ -929,6 +965,13 @@ class EpochManager:
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
             return False
+
+        # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
+        # JS logic below, byte-for-byte unchanged. ADOPT_RULE=p2oc ranks the dethrone on
+        # the unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score.
+        # MUST NOT be enabled live until the cross-machine determinism gate passes.
+        if os.environ.get("ADOPT_RULE", "current").strip().lower() == "p2oc":
+            return self._should_adopt_onchain(challenger)
 
         # Extract scorecards from benchmark details
         challenger_scorecard = self._get_scorecard(challenger)
@@ -948,14 +991,27 @@ class EpochManager:
         if not self._champion.submission_id:
             return True
 
-        # 3. Per-app non-regression — no app can drop more than max_regression
+        # 3. Per-app non-regression. app_scores is keyed by bare app_id (see
+        #    BenchmarkWorker._build_scorecard), so this compares true per-app
+        #    quality, not per-scenario. A challenger may neither drop an app the
+        #    champion covers nor regress > MAX_APP_REGRESSION on any app it solves.
         if challenger_scorecard and incumbent_scorecard:
             inc_apps = incumbent_scorecard.get("app_scores", {})
             ch_apps = challenger_scorecard.get("app_scores", {})
             for app_id, inc_score in inc_apps.items():
+                ch_score = ch_apps.get(app_id)
+                # (a) Dropping a champion-covered app is a hard regression.
+                if ch_score is None:
+                    logger.info(
+                        "Challenger %s drops app %s that the champion covers",
+                        challenger.submission_id, app_id,
+                    )
+                    return False
+                # (b) A non-positive incumbent baseline gives no meaningful drop
+                #     threshold; the real per-app floor arrives with the on-chain
+                #     gate (design doc P2). Skip only the magnitude check here.
                 if inc_score <= 0:
                     continue
-                ch_score = ch_apps.get(app_id, 0)
                 if ch_score < inc_score * (1 - max_regression):
                     logger.info(
                         "Challenger %s regresses on %s: %.3f → %.3f (max drop %.0f%%)",
@@ -964,13 +1020,16 @@ class EpochManager:
                     )
                     return False
 
-        # 4. Global improvement by dethrone margin
-        effective_champion_score = max(champion_score, min_score)
-        required = effective_champion_score * (1 + self._dethrone_margin)
-        if challenger_score <= effective_champion_score:
+        # 4. Global improvement over the champion's actual (freshly
+        #    re-benchmarked) score by the dethrone margin. The absolute
+        #    MIN_CHAMPION_SCORE floor is already enforced in step 1, so the
+        #    baseline must NOT be floored at min_score here — flooring only
+        #    over-protects a degraded (sub-floor) champion (design doc, §a #6).
+        required = champion_score * (1 + self._dethrone_margin)
+        if challenger_score <= champion_score:
             logger.info(
                 "Challenger %s score %.3f not better than incumbent %.3f",
-                challenger.submission_id, challenger_score, effective_champion_score,
+                challenger.submission_id, challenger_score, champion_score,
             )
             return False
         if challenger_score < required:
@@ -979,6 +1038,68 @@ class EpochManager:
                 challenger.submission_id, challenger_score, required,
             )
             return False
+        return True
+
+    def _should_adopt_onchain(self, challenger: Submission) -> bool:
+        """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — port of the lab's
+        P2OcAdoptRule. Ranks the dethrone on the unfakeable on-chain OUTPUT surplus
+        (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the gas-polluted JS
+        score, so a more-output-but-more-gas challenger (which the JS path rejects) is
+        adoptable, while a gas-gaming challenger that delivers less is not. Keeps the
+        vetoes: on-chain admission floor (ONCHAIN_FLOOR_BPS), app-coverage drop, and a
+        JS no-catastrophic-regression guard (MAX_APP_REGRESSION). The shared preamble in
+        _should_adopt (global-min + same-submission) already ran. Requires the
+        on-chain plumbing (BenchmarkResult.on_chain_score -> scorecard.app_onchain).
+        """
+        if not self._champion.submission_id:
+            return True  # no champion yet (genesis)
+
+        champ_card = self._get_incumbent_scorecard() or {}
+        chal_card = self._get_scorecard(challenger) or {}
+        champ_apps = champ_card.get("app_scores", {})
+        chal_apps = chal_card.get("app_scores", {})
+        champ_oc = champ_card.get("app_onchain", {})
+        chal_oc = chal_card.get("app_onchain", {})
+        max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
+        floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
+        floor = int(floor_env) if floor_env else None
+
+        oc_surpluses: list[float] = []
+        for app, inc in champ_apps.items():
+            ch = chal_apps.get(app)
+            # (veto 1) on-chain admission floor on the challenger's every scenario
+            if floor is not None:
+                all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app, []), floor)
+                if not all_pass:
+                    logger.info("p2oc reject %s: on-chain floor fail (min=%s missing=%d)",
+                                app, min_bps, n_missing)
+                    return False
+            # (veto 2) dropping a champion-covered app is a hard regression
+            if ch is None:
+                logger.info("p2oc reject %s: dropped by challenger", app)
+                return False
+            # rank input: on-chain output surplus (only when both means are present)
+            co = _app_onchain_mean(champ_oc.get(app, []))
+            cco = _app_onchain_mean(chal_oc.get(app, []))
+            if co is not None and cco is not None:
+                oc_surpluses.append(cco - co)
+            elif co is not None and cco is None:
+                logger.info("p2oc reject %s: challenger produced no on-chain score", app)
+                return False
+            # (veto 3) JS no-CATASTROPHIC-regression — a gas-blowup safety net only
+            if inc > 0 and ch < inc * (1 - max_regression):
+                logger.info("p2oc reject %s: JS regress %.3f->%.3f", app, inc, ch)
+                return False
+
+        # rank: mean per-app on-chain BPS surplus / 10000 must beat the dethrone margin
+        net_bps = sum(oc_surpluses) / len(oc_surpluses) if oc_surpluses else 0.0
+        net = net_bps / 10000.0
+        if net <= self._dethrone_margin:
+            logger.info("p2oc reject %s: net on-chain surplus %+.1f BPS <= margin %.4f",
+                        challenger.submission_id, net_bps, self._dethrone_margin)
+            return False
+        logger.info("p2oc ADOPT %s: net on-chain surplus %+.1f BPS",
+                    challenger.submission_id, net_bps)
         return True
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
