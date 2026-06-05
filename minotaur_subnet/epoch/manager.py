@@ -56,6 +56,22 @@ logger = logging.getLogger(__name__)
 DETHRONE_MARGIN = 0.005
 
 
+def _onchain_pass(scores: list, floor: int) -> tuple[bool, "int | None", int]:
+    """all_pass, min_bps, n_missing — a champion-covered app must clear the floor on
+    every scenario (ported from scoring_lab/stages.py)."""
+    present = [s for s in scores if s is not None]
+    n_missing = sum(1 for s in scores if s is None)
+    all_pass = n_missing == 0 and all(s >= floor for s in present)
+    return all_pass, (min(present) if present else None), n_missing
+
+
+def _app_onchain_mean(scores: list) -> "float | None":
+    """Mean on-chain scoreIntent BPS over present scenarios for an app — the unfakeable
+    output-quality signal, independent of the gas-weighted JS score."""
+    present = [s for s in scores if s is not None]
+    return (sum(present) / len(present)) if present else None
+
+
 async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
     """Return the local sha256 image_id for *image_tag*, or None on error.
 
@@ -934,6 +950,13 @@ class EpochManager:
         if challenger.submission_id == self._champion.submission_id:
             return False
 
+        # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
+        # JS logic below, byte-for-byte unchanged. ADOPT_RULE=p2oc ranks the dethrone on
+        # the unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score.
+        # MUST NOT be enabled live until the cross-machine determinism gate passes.
+        if os.environ.get("ADOPT_RULE", "current").strip().lower() == "p2oc":
+            return self._should_adopt_onchain(challenger)
+
         # Extract scorecards from benchmark details
         challenger_scorecard = self._get_scorecard(challenger)
         incumbent_scorecard = self._get_incumbent_scorecard()
@@ -999,6 +1022,68 @@ class EpochManager:
                 challenger.submission_id, challenger_score, required,
             )
             return False
+        return True
+
+    def _should_adopt_onchain(self, challenger: Submission) -> bool:
+        """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — port of the lab's
+        P2OcAdoptRule. Ranks the dethrone on the unfakeable on-chain OUTPUT surplus
+        (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the gas-polluted JS
+        score, so a more-output-but-more-gas challenger (which the JS path rejects) is
+        adoptable, while a gas-gaming challenger that delivers less is not. Keeps the
+        vetoes: on-chain admission floor (ONCHAIN_FLOOR_BPS), app-coverage drop, and a
+        JS no-catastrophic-regression guard (MAX_APP_REGRESSION). The shared preamble in
+        _should_adopt (global-min + same-submission) already ran. Requires the
+        on-chain plumbing (BenchmarkResult.on_chain_score -> scorecard.app_onchain).
+        """
+        if not self._champion.submission_id:
+            return True  # no champion yet (genesis)
+
+        champ_card = self._get_incumbent_scorecard() or {}
+        chal_card = self._get_scorecard(challenger) or {}
+        champ_apps = champ_card.get("app_scores", {})
+        chal_apps = chal_card.get("app_scores", {})
+        champ_oc = champ_card.get("app_onchain", {})
+        chal_oc = chal_card.get("app_onchain", {})
+        max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
+        floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
+        floor = int(floor_env) if floor_env else None
+
+        oc_surpluses: list[float] = []
+        for app, inc in champ_apps.items():
+            ch = chal_apps.get(app)
+            # (veto 1) on-chain admission floor on the challenger's every scenario
+            if floor is not None:
+                all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app, []), floor)
+                if not all_pass:
+                    logger.info("p2oc reject %s: on-chain floor fail (min=%s missing=%d)",
+                                app, min_bps, n_missing)
+                    return False
+            # (veto 2) dropping a champion-covered app is a hard regression
+            if ch is None:
+                logger.info("p2oc reject %s: dropped by challenger", app)
+                return False
+            # rank input: on-chain output surplus (only when both means are present)
+            co = _app_onchain_mean(champ_oc.get(app, []))
+            cco = _app_onchain_mean(chal_oc.get(app, []))
+            if co is not None and cco is not None:
+                oc_surpluses.append(cco - co)
+            elif co is not None and cco is None:
+                logger.info("p2oc reject %s: challenger produced no on-chain score", app)
+                return False
+            # (veto 3) JS no-CATASTROPHIC-regression — a gas-blowup safety net only
+            if inc > 0 and ch < inc * (1 - max_regression):
+                logger.info("p2oc reject %s: JS regress %.3f->%.3f", app, inc, ch)
+                return False
+
+        # rank: mean per-app on-chain BPS surplus / 10000 must beat the dethrone margin
+        net_bps = sum(oc_surpluses) / len(oc_surpluses) if oc_surpluses else 0.0
+        net = net_bps / 10000.0
+        if net <= self._dethrone_margin:
+            logger.info("p2oc reject %s: net on-chain surplus %+.1f BPS <= margin %.4f",
+                        challenger.submission_id, net_bps, self._dethrone_margin)
+            return False
+        logger.info("p2oc ADOPT %s: net on-chain surplus %+.1f BPS",
+                    challenger.submission_id, net_bps)
         return True
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
