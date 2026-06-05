@@ -83,6 +83,10 @@ class BenchmarkScorecard:
     """
     global_score: float = 0.0
     app_scores: dict[str, float] = field(default_factory=dict)
+    # Per-app on-chain scoreIntent BPS (one list entry per scenario; None when the
+    # sim didn't yield a score). The unfakeable output signal the on-chain-ranked
+    # adoption rule (ADOPT_RULE=p2oc) ranks on. Populated only when a real sim runs.
+    app_onchain: dict[str, list[int | None]] = field(default_factory=dict)
     scenario_scores: dict[str, float] = field(default_factory=dict)
     failures: int = 0
     total: int = 0
@@ -101,6 +105,7 @@ class BenchmarkScorecard:
         return {
             "global_score": self.global_score,
             "app_scores": dict(self.app_scores),
+            "app_onchain": {k: list(v) for k, v in self.app_onchain.items()},
             "scenario_scores": dict(self.scenario_scores),
             "failures": self.failures,
             "total": self.total,
@@ -116,6 +121,7 @@ class BenchmarkScorecard:
         return cls(
             global_score=data.get("global_score", 0.0),
             app_scores=data.get("app_scores", {}),
+            app_onchain=data.get("app_onchain", {}),
             scenario_scores=data.get("scenario_scores", {}),
             failures=data.get("failures", 0),
             total=data.get("total", 0),
@@ -1077,11 +1083,14 @@ class BenchmarkWorker:
                 failures += 1
 
         app_scores: dict[str, float] = {}
+        app_onchain: dict[str, list[int | None]] = {}
         for app_id, app_results in by_app.items():
             # Per-app average; failed/zero scenarios stay in the denominator
             # (same anti-gaming dilution as _compute_stage_score).
             app_total = sum(r.score for r in app_results if r.score > 0)
             app_scores[app_id] = app_total / len(app_results) if app_results else 0.0
+            # Per-app on-chain scoreIntent BPS (one per scenario; None if no sim score).
+            app_onchain[app_id] = [getattr(r, "on_chain_score", None) for r in app_results]
 
         global_score = self._compute_avg_score(results)
 
@@ -1090,6 +1099,7 @@ class BenchmarkWorker:
         return BenchmarkScorecard(
             global_score=global_score,
             app_scores=app_scores,
+            app_onchain=app_onchain,
             scenario_scores=scenario_scores,
             failures=failures,
             total=len(results),

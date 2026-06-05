@@ -111,6 +111,7 @@ class BenchmarkResult:
     elapsed_ms: int = 0
     error: str | None = None
     mock_simulation: bool = False  # True when scored with fabricated simulation data
+    on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
 
 
 # Type alias for the scoring callback
@@ -777,6 +778,9 @@ async def run_benchmark(
                         used_mock = True
                     if not fail_closed_miss:
                         br.mock_simulation = used_mock
+                        # Capture the unfakeable on-chain scoreIntent BPS (was dropped
+                        # here). Used by the opt-in on-chain-ranked adoption rule.
+                        br.on_chain_score = getattr(sim, "on_chain_score", None)
                         score_result = await score_fn(
                             intent.app_id, plan, sim, state,
                         )
