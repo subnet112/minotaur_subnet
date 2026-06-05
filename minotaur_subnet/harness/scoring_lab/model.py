@@ -15,11 +15,11 @@ from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 # The DexAggregator scorer JS lives in the apps repo (not in this repo). Point
 # MINOTAUR_DEX_SCORER at your checkout's contracts/scoring/dex_aggregator_scoring.js.
 DEFAULT_DEX_SCORER = os.environ.get("MINOTAUR_DEX_SCORER", "")
-# The DexAggregator contract to fork against. Pass --contract / set
-# MINOTAUR_DEX_CONTRACT; the zero-address default is a placeholder.
-DEFAULT_DEX_CONTRACT = os.environ.get(
-    "MINOTAUR_DEX_CONTRACT", "0x0000000000000000000000000000000000000000"
-)
+# App contract addresses are NOT hardcoded — they're resolved from the on-chain
+# AppRegistry by app_id (see registry.py), exactly like production resolves
+# app_id -> contractAddr. ZERO_ADDR is only a fake-backend placeholder (the fake
+# sim never touches a real contract).
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 DEFAULT_GENESIS_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "minotaur-genesis:fee-test")
 
 
@@ -35,7 +35,7 @@ class Scenario:
     app_id: str = "dex"                 # scorecard grouping key == engine scorer key
     chain_id: int = 8453
     receiver: str = "0x0000000000000000000000000000000000000001"
-    contract_address: str = DEFAULT_DEX_CONTRACT
+    contract_address: str = ZERO_ADDR   # fork mode overwrites this from the AppRegistry
     intent_function: str = "swap"
     stage: str = "synthetic"            # "synthetic" (Stage 1, 0.4) | "historical" (Stage 2, 0.6)
     quoted_output: str | None = None    # CoW-fee reference (12th intent param), defaults to min
@@ -93,7 +93,13 @@ class LabConfig:
     base_upstream_rpc: str | None = None       # live Base RPC the anvil forks from
     anvil_rpc: str | None = None               # local anvil RPC (lab starts one if None)
     fork_block: int | None = None              # pin a block (sealed) vs None (live head)
-    contract_address: str = DEFAULT_DEX_CONTRACT
+    # App contract resolution: the lab reads app_id -> contractAddr from the on-chain
+    # AppRegistry (like production), never a hardcoded address. Supply the registry via
+    # app_registry / $APP_REGISTRY_{chain_id} and the app via registry_app_id; or pass an
+    # explicit contract_address to override (it is verified as registered).
+    app_registry: str | None = None            # AppRegistry address (else $APP_REGISTRY_{chain})
+    registry_app_id: str | None = None         # the on-chain bytes32 appId to resolve
+    contract_address: str = ""                 # resolved from the registry in fork mode
     genesis_image: str = DEFAULT_GENESIS_IMAGE
     # adoption-gate knobs (mirror the real env vars in epoch/manager.py)
     adopt_rule: str = "current"                # "current" | "p2"
