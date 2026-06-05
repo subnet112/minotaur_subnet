@@ -31,6 +31,7 @@ def sample_historical_orders(
     chain_ids: list[int] | None = None,
     n_per_chain: int = 10,
     exclude_statuses: set[str] | None = None,
+    records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical FILLED orders for Stage 2.
 
@@ -44,6 +45,10 @@ def sample_historical_orders(
         n_per_chain: Target sample size per chain (may be smaller if
             insufficient historical orders).
         exclude_statuses: Order statuses to exclude (default: only include 'filled').
+        records: Pre-built candidate orders (e.g. a chain-derived corpus, plan
+            Phase 5b). When provided, they are the source instead of
+            app_store.list_orders() — same filter/sample/PII logic. None (default)
+            keeps the local-store path byte-for-byte.
 
     Returns:
         List of order dicts, PII-stripped. May be empty if no history exists.
@@ -53,11 +58,14 @@ def sample_historical_orders(
     else:
         include_statuses = None  # include all except excluded
 
-    try:
-        all_orders = app_store.list_orders()
-    except Exception as exc:
-        logger.warning("Failed to list orders for Stage 2 sampling: %s", exc)
-        return []
+    if records is not None:
+        all_orders = records
+    else:
+        try:
+            all_orders = app_store.list_orders()
+        except Exception as exc:
+            logger.warning("Failed to list orders for Stage 2 sampling: %s", exc)
+            return []
 
     # Filter: only orders with a block_number (can be replayed) and the right status
     candidates = []

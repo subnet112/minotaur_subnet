@@ -750,10 +750,34 @@ class BenchmarkWorker:
             except ValueError:
                 n_per_chain = 10
 
+        # Stage-2 corpus source. Default: the local order store. Opt-in
+        # (BENCHMARK_CHAIN_CORPUS): rebuild it from chain (plan Phase 5b) so a
+        # freshly-promoted leader with an empty store still has a corpus. The
+        # chain-derived records carry the SAME dict shape, so the deterministic
+        # sample below is unchanged. MUST NOT be enabled live until the
+        # cross-machine corpus-determinism gate passes.
+        chain_records: list[dict[str, Any]] | None = None
+        from minotaur_subnet.harness.chain_corpus import chain_corpus_enabled
+        if chain_corpus_enabled():
+            from minotaur_subnet.harness.chain_corpus import build_chain_corpus
+            chain_ids = {
+                d.chain_id
+                for app in self._app_store.list_apps()
+                for d in self._app_store.get_deployments(app.app_id).values()
+            } or {8453}
+            chain_records = []
+            for cid in sorted(chain_ids):
+                try:
+                    chain_records.extend(build_chain_corpus(
+                        self._app_store, self._js_engine, cid))
+                except Exception as exc:
+                    logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
+
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
+            records=chain_records,
         )
         if not sampled:
             return []
