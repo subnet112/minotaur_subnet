@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import make_engine
-from .model import DEFAULT_DEX_CONTRACT, DEFAULT_DEX_SCORER, DEFAULT_GENESIS_IMAGE, Fill, LabConfig, Scenario
+from .model import DEFAULT_DEX_SCORER, DEFAULT_GENESIS_IMAGE, Fill, LabConfig, Scenario
 from .pipeline import FakeBackend, SolverResult, compare, run_solver
 
 
@@ -156,7 +156,9 @@ def _cfg_from_args(a: argparse.Namespace) -> LabConfig:
         base_upstream_rpc=getattr(a, "base_rpc", None) or os.environ.get("BASE_ALCHEMY_RPC_URL"),
         anvil_rpc=getattr(a, "anvil_rpc", None),
         fork_block=getattr(a, "fork_block", None),
-        contract_address=getattr(a, "contract", DEFAULT_DEX_CONTRACT),
+        contract_address=getattr(a, "contract", "") or "",
+        app_registry=getattr(a, "app_registry", None),
+        registry_app_id=getattr(a, "app_id", None),
         genesis_image=getattr(a, "genesis_image", DEFAULT_GENESIS_IMAGE),
         requote=getattr(a, "requote", True),
         slippage_bps=getattr(a, "slippage_bps", 50),
@@ -184,7 +186,9 @@ def main() -> None:
     pr.add_argument("--base-rpc", default=None)
     pr.add_argument("--anvil-rpc", default=None)
     pr.add_argument("--fork-block", type=int, default=None)
-    pr.add_argument("--contract", default=DEFAULT_DEX_CONTRACT)
+    pr.add_argument("--contract", default="", help="explicit app contract (else resolved from AppRegistry)")
+    pr.add_argument("--app-registry", default=None, help="AppRegistry address (else $APP_REGISTRY_<chain>)")
+    pr.add_argument("--app-id", default=None, help="on-chain bytes32 appId to resolve via AppRegistry")
     pr.add_argument("--json", dest="json_out", default=None)
 
     pb = sub.add_parser("bench", help="real fork: genesis vs candidate solver")
@@ -192,7 +196,9 @@ def main() -> None:
     pb.add_argument("--base-rpc", default=None, help="live Base RPC to fork (default: $BASE_ALCHEMY_RPC_URL)")
     pb.add_argument("--anvil-rpc", default=None, help="existing anvil RPC (else the lab starts one)")
     pb.add_argument("--fork-block", type=int, default=None, help="pin a block (sealed) vs live head")
-    pb.add_argument("--contract", default=DEFAULT_DEX_CONTRACT)
+    pb.add_argument("--contract", default="", help="explicit app contract (else resolved from AppRegistry)")
+    pb.add_argument("--app-registry", default=None, help="AppRegistry address (else $APP_REGISTRY_<chain>)")
+    pb.add_argument("--app-id", default=None, help="on-chain bytes32 appId to resolve via AppRegistry")
     pb.add_argument("--genesis-image", default=DEFAULT_GENESIS_IMAGE)
     pb.add_argument("--candidate", default=None, help="path to a candidate solver.py (else the example candidate)")
     pb.add_argument("--rule", choices=["current", "p2", "p2ref", "p2oc"], default="current")

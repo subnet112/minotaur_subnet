@@ -24,7 +24,6 @@ from pathlib import Path
 from minotaur_subnet.engine.js_engine import JsExecutionEngine
 
 from .model import (
-    DEFAULT_DEX_CONTRACT,
     DEFAULT_DEX_SCORER,
     DEFAULT_GENESIS_IMAGE,
     Fill,
@@ -32,6 +31,7 @@ from .model import (
     RunTrace,
     Scenario,
     StageRecord,
+    ZERO_ADDR,
 )
 from .pipeline import FakeBackend, SolverResult, compare, run_solver
 from .report import build_report, compute_report_hash, diff_reports, scorer_digest
@@ -52,7 +52,7 @@ __all__ = [
     "FakeBackend", "run_solver", "compare", "ScoreJsStage", "aggregate", "build_state",
     "ADOPT_RULES", "PORT_MAP", "make_engine",
     "build_report", "diff_reports", "compute_report_hash", "scorer_digest",
-    "DEFAULT_DEX_SCORER", "DEFAULT_DEX_CONTRACT", "DEFAULT_GENESIS_IMAGE",
+    "DEFAULT_DEX_SCORER", "DEFAULT_GENESIS_IMAGE", "ZERO_ADDR",
 ]
 
 

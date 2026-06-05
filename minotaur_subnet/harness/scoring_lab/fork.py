@@ -271,8 +271,23 @@ async def run_bench(
     cfg.fork_block = block
 
     try:
+        # Resolve the app contract from the on-chain AppRegistry (never hardcoded) —
+        # the same source production resolves app_id -> contractAddr from.
+        needs_resolve = (not cfg.contract_address) or (
+            cfg.contract_address.startswith("0x") and int(cfg.contract_address, 16) == 0)
+        if needs_resolve:
+            reg = cfg.app_registry or os.environ.get(f"APP_REGISTRY_{chain_id}", "").strip()
+            if not reg or not cfg.registry_app_id:
+                raise SystemExit(
+                    f"no app contract: resolve from the AppRegistry by passing --app-id <bytes32> "
+                    f"plus $APP_REGISTRY_{chain_id} / --app-registry, or pass --contract explicitly")
+            from web3 import Web3
+            from .registry import resolve_contract
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            cfg.contract_address = resolve_contract(w3, reg, cfg.registry_app_id)
+            print(f"[registry] {cfg.registry_app_id} -> {cfg.contract_address} (AppRegistry {reg})")
         relayer = verify_contract(rpc_url, cfg.contract_address)
-        print(f"[fork] DexAggregator {cfg.contract_address} OK"
+        print(f"[fork] app {cfg.contract_address} OK"
               + (f" (relayer {relayer})" if relayer else " (code present)"))
 
         # 2. simulator (pinned -> no upstream resets)
