@@ -13,7 +13,6 @@ from minotaur_subnet.harness.chain_corpus import (
     chain_corpus_enabled,
     decode_intent_params_hex,
     _function_for_selector,
-    _resolve_app_id_from_contract,
 )
 from minotaur_subnet.harness.order_sampler import sample_historical_orders
 from minotaur_subnet.v3.manifest import (
@@ -71,15 +70,6 @@ def test_function_for_selector_maps_back():
     sel = compute_selector_from_manifest(m, "swap")
     assert _function_for_selector(m, sel) == "swap"
     assert _function_for_selector(m, "0xdeadbeef") is None
-
-
-def test_resolve_app_id_from_contract():
-    dep = types.SimpleNamespace(contract_address="0x" + "cd" * 20, chain_id=8453)
-    app = types.SimpleNamespace(app_id="app_x")
-    store = types.SimpleNamespace(list_apps=lambda: [app], get_deployment=lambda _a: dep)
-    # case-insensitive match
-    assert _resolve_app_id_from_contract(store, "0x" + "CD" * 20) == "app_x"
-    assert _resolve_app_id_from_contract(store, "0x" + "ee" * 20) is None
 
 
 def test_sample_records_path_is_deterministic_and_store_free():

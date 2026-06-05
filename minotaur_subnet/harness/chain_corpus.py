@@ -55,6 +55,9 @@ def decode_intent_params_hex(manifest: Any, intent_function: str,
         elif vt == "bool":
             out[field.name] = bool(v)
         elif vt == "bytes" or vt.startswith("bytes"):
+            # NB: fixed bytesN is not a clean round-trip — the encoder right-pads to N
+            # bytes, so a short input comes back padded. No current app uses bytesN
+            # intent params; revisit (track the declared width) if one does.
             out[field.name] = "0x" + (bytes(v).hex() if isinstance(v, (bytes, bytearray)) else "")
         else:
             out[field.name] = v
@@ -74,23 +77,6 @@ def _function_for_selector(manifest: Any, selector_hex: str) -> str | None:
                 continue
         if sel == target:
             return fn.name
-    return None
-
-
-def _resolve_app_id_from_contract(app_store: Any, contract_address: str) -> str | None:
-    """Map a deployed contract address back to the store's string app_id by scanning
-    deployments. Returns None (order dropped + logged) if not found — canonical_order
-    emits a contract ADDRESS as app_id, but Stage-2 keys apps by the store app_id."""
-    if app_store is None or not contract_address:
-        return None
-    target = contract_address.lower()
-    for app in app_store.list_apps():
-        try:
-            dep = app_store.get_deployment(app.app_id)
-        except Exception:
-            dep = None
-        if dep and (getattr(dep, "contract_address", "") or "").lower() == target:
-            return app.app_id
     return None
 
 
@@ -132,9 +118,13 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
 
     records: list[dict] = []
     for app in app_store.list_apps():
-        dep = app_store.get_deployment(app.app_id) if app_store else None
+        # The deployment for THIS chain specifically (multi-chain apps deploy per chain).
+        try:
+            dep = app_store.get_deployments(app.app_id).get(chain_id)
+        except Exception:
+            dep = None
         contract = getattr(dep, "contract_address", None) if dep else None
-        if not contract or getattr(dep, "chain_id", chain_id) != chain_id:
+        if not contract:
             continue
         manifest = _get_manifest(app_store, js_engine, app.app_id)
         if manifest is None:
@@ -146,13 +136,18 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
             logger.warning("chain corpus: recover failed for %s: %s", contract, exc)
             continue
         for rec in recovered:
-            fn = _function_for_selector(manifest, rec.get("intent_selector", ""))
-            if fn is None:
+            # Isolate per-order failures: one malformed order must not abort the whole
+            # chain's corpus (that would silently collapse Stage 2 to Stage-1-only).
+            try:
+                fn = _function_for_selector(manifest, rec.get("intent_selector", ""))
+                params = decode_intent_params_hex(manifest, fn, rec.get("intent_params_hex", "")) if fn else {}
+            except Exception as exc:
+                logger.warning("chain corpus: decode failed for order %s: %s; dropped",
+                               rec.get("order_id"), exc)
                 continue
-            params = decode_intent_params_hex(manifest, fn, rec.get("intent_params_hex", ""))
-            if not params:
-                logger.warning("chain corpus: decode failed for order %s; dropped",
-                               rec.get("order_id"))
+            if not fn or not params:
+                logger.warning("chain corpus: unresolved order %s (fn=%s); dropped",
+                               rec.get("order_id"), fn)
                 continue
             rec["app_id"] = app.app_id              # remap contract address -> store id
             rec["params"] = params
