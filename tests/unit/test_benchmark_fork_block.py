@@ -94,3 +94,33 @@ def test_default_fork_block_is_none_preserving_live_head():
     results, sim = _run(fork_block=None)
     assert len(results) == 1
     assert sim.fork_blocks == [None]
+
+
+# ── BENCHMARK_EPOCH_BLOCK pin (deterministic fork-pin, opt-in) ────────────────
+
+def _bare_worker():
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+    w = BenchmarkWorker.__new__(BenchmarkWorker)
+    w._epoch_block_number = None
+    return w
+
+
+def test_epoch_block_pin_set_from_env(monkeypatch):
+    monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
+    w = _bare_worker()
+    w._apply_epoch_block_pin()
+    assert w._epoch_block_number == 46904887
+
+
+def test_epoch_block_pin_unset_stays_none(monkeypatch):
+    monkeypatch.delenv("BENCHMARK_EPOCH_BLOCK", raising=False)
+    w = _bare_worker()
+    w._apply_epoch_block_pin()
+    assert w._epoch_block_number is None  # default = live head, unchanged
+
+
+def test_epoch_block_pin_invalid_ignored(monkeypatch):
+    monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "not-an-int")
+    w = _bare_worker()
+    w._apply_epoch_block_pin()
+    assert w._epoch_block_number is None
