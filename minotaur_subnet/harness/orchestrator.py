@@ -70,6 +70,18 @@ from minotaur_subnet.harness.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how long ``kill()`` waits to reap the killed process.
+# After SIGKILL the process is gone regardless; we only wait to clean up
+# the zombie. In a container whose asyncio child-watcher can stall (we have
+# observed unreaped zombie children piling up under a long-lived api PID 1),
+# an UNBOUNDED ``proc.wait()`` here never returns — and because ``kill()``
+# runs while the DockerRuntimeSolver holds its per-runtime ``asyncio.Lock``
+# (every quote/plan serializes on it), a single stalled reap deadlocks the
+# entire live-solver path: every subsequent quote hangs forever while the
+# event loop otherwise stays healthy. Bounding the wait guarantees the lock
+# is always released; the worst case is a lingering zombie, not an outage.
+_KILL_REAP_TIMEOUT = 5.0
+
 
 class SolverTimeoutError(Exception):
     """A solver command exceeded its timeout."""
@@ -288,9 +300,17 @@ class SolverSession:
         self._closed = True
         try:
             self._proc.kill()
-            await self._proc.wait()
+            # Bounded reap — never block the caller (and the runtime lock it
+            # may hold) forever if child-reaping stalls. See _KILL_REAP_TIMEOUT.
+            await asyncio.wait_for(self._proc.wait(), timeout=_KILL_REAP_TIMEOUT)
         except ProcessLookupError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] proc.wait() did not return %ss after SIGKILL; "
+                "abandoning reap (zombie may linger, but the lock is freed)",
+                self._label, _KILL_REAP_TIMEOUT,
+            )
         logger.info("[%s] Process terminated", self._label)
 
     @property
