@@ -41,9 +41,17 @@ _CHECKS: tuple[_Check, ...] = (
     _Check("ValidatorRegistry (Ethereum)", "VALIDATOR_REGISTRY_1", 1),
     _Check("ValidatorRegistry (BT EVM)", "VALIDATOR_REGISTRY_964", 964),
     _Check("ChampionRegistry (BT EVM)", "CHAMPION_REGISTRY_964", 964),
-    _Check("AppIntentBase (Base)", "APP_INTENT_BASE_8453", 8453),
-    _Check("AppIntentBase (Ethereum)", "APP_INTENT_BASE_1", 1),
-    _Check("AppIntentBase (BT EVM)", "APP_INTENT_BASE_964", 964),
+    # AppRegistry is the source of truth for per-app contract resolution:
+    # consensus/app_registry_cache.py gates every order against
+    # APP_REGISTRY_{chain}, and apps are resolved per-order from the
+    # AppIntentStore deployment record. We verify the registry, NOT a
+    # single app contract — there is no global "AppIntentBase" address
+    # anymore. The old APP_INTENT_BASE_<chain> checks pinned one app,
+    # could not detect a retired-but-still-deployed address (a stale
+    # value still has bytecode, so the check passed), and were never
+    # consulted on the execution path.
+    _Check("AppRegistry (Base)", "APP_REGISTRY_8453", 8453),
+    _Check("AppRegistry (BT EVM)", "APP_REGISTRY_964", 964),
 )
 
 

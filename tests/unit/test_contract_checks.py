@@ -23,7 +23,7 @@ def test_all_unset_returns_empty_and_does_not_call_rpc(monkeypatch):
     for var in (
         "VALIDATOR_REGISTRY_8453", "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
         "CHAMPION_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -38,7 +38,7 @@ def test_configured_address_with_code_passes(monkeypatch):
     for var in (
         "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
         "CHAMPION_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -56,7 +56,7 @@ def test_empty_bytecode_raises(monkeypatch):
     monkeypatch.setenv("BITTENSOR_EVM_RPC_URL", "http://stub")
     for var in (
         "VALIDATOR_REGISTRY_8453", "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -77,7 +77,7 @@ def test_invalid_address_raises(monkeypatch):
     for var in (
         "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
         "CHAMPION_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -95,7 +95,7 @@ def test_missing_rpc_for_configured_address(monkeypatch):
     monkeypatch.delenv("BITTENSOR_EVM_FORK_RPC_URL", raising=False)
     for var in (
         "VALIDATOR_REGISTRY_8453", "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -112,7 +112,7 @@ def test_rpc_error_reported_not_swallowed(monkeypatch):
     monkeypatch.setenv("BITTENSOR_EVM_RPC_URL", "http://stub")
     for var in (
         "VALIDATOR_REGISTRY_8453", "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -135,7 +135,7 @@ def test_multiple_errors_all_reported(monkeypatch):
     monkeypatch.setenv("BASE_RPC_URL", "http://stub")
     for var in (
         "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
-        "APP_INTENT_BASE_8453", "APP_INTENT_BASE_1", "APP_INTENT_BASE_964",
+        "APP_REGISTRY_8453", "APP_REGISTRY_964",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -149,3 +149,26 @@ def test_multiple_errors_all_reported(monkeypatch):
         msg = str(exc.value)
         assert "ChampionRegistry" in msg
         assert "ValidatorRegistry" in msg
+
+
+def test_app_registry_checked_not_pinned_app_intent_base(monkeypatch):
+    # The startup check verifies the AppRegistry (the source of truth for
+    # per-app contract resolution), NOT a pinned single-app AppIntentBase
+    # address. A stale APP_INTENT_BASE_<chain> must have no effect.
+    monkeypatch.setenv("APP_REGISTRY_8453", "0x" + "66" * 20)
+    monkeypatch.setenv("BASE_RPC_URL", "http://stub")
+    monkeypatch.setenv("APP_INTENT_BASE_8453", "0x" + "de" * 20)  # stale/ignored
+    for var in (
+        "VALIDATOR_REGISTRY_8453", "VALIDATOR_REGISTRY_1", "VALIDATOR_REGISTRY_964",
+        "CHAMPION_REGISTRY_964", "APP_REGISTRY_964",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    with patch("web3.Web3") as W3:
+        W3.is_address.return_value = True
+        W3.to_checksum_address = lambda a: a
+        W3.return_value = _w3_with_code(b"\x60\x80")
+
+        verified = verify_required_contracts()
+        # Only the AppRegistry is verified; the pinned app address is never read.
+        assert verified == ["AppRegistry (Base) @ 0x" + "66" * 20]
