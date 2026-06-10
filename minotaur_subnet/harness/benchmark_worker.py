@@ -83,6 +83,10 @@ class BenchmarkScorecard:
     """
     global_score: float = 0.0
     app_scores: dict[str, float] = field(default_factory=dict)
+    # Per-app on-chain scoreIntent BPS (one list entry per scenario; None when the
+    # sim didn't yield a score). The unfakeable output signal the on-chain-ranked
+    # adoption rule (ADOPT_RULE=p2oc) ranks on. Populated only when a real sim runs.
+    app_onchain: dict[str, list[int | None]] = field(default_factory=dict)
     scenario_scores: dict[str, float] = field(default_factory=dict)
     failures: int = 0
     total: int = 0
@@ -101,6 +105,7 @@ class BenchmarkScorecard:
         return {
             "global_score": self.global_score,
             "app_scores": dict(self.app_scores),
+            "app_onchain": {k: list(v) for k, v in self.app_onchain.items()},
             "scenario_scores": dict(self.scenario_scores),
             "failures": self.failures,
             "total": self.total,
@@ -116,6 +121,7 @@ class BenchmarkScorecard:
         return cls(
             global_score=data.get("global_score", 0.0),
             app_scores=data.get("app_scores", {}),
+            app_onchain=data.get("app_onchain", {}),
             scenario_scores=data.get("scenario_scores", {}),
             failures=data.get("failures", 0),
             total=data.get("total", 0),
@@ -156,6 +162,7 @@ class BenchmarkWorker:
         on_champion_adopted: Any = None,  # deprecated compatibility hook
         genesis_solver_image: str | None = None,  # Docker image for genesis benchmarking
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
+        require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -167,6 +174,7 @@ class BenchmarkWorker:
         self._on_champion_adopted = on_champion_adopted
         self._genesis_solver_image = genesis_solver_image or GENESIS_SOLVER_IMAGE or None
         self._simulator = simulator
+        self._require_real_sim = require_real_sim
         self._running = False
 
     def set_epoch_block(self, block_number: int) -> None:
@@ -176,6 +184,24 @@ class BenchmarkWorker:
         a specific block for deterministic benchmarking.
         """
         self._epoch_block_number = block_number
+
+    def _apply_epoch_block_pin(self) -> None:
+        """Pin the benchmark fork to BENCHMARK_EPOCH_BLOCK when set (call-time read so
+        operators can flip without restart). Unset/invalid -> no pin (live head). The
+        block threads through run_benchmark -> simulate as fork_block, so every sim this
+        round runs at the same Base block -> on-chain scores reproduce across validators."""
+        raw = os.environ.get("BENCHMARK_EPOCH_BLOCK", "").strip()
+        if not raw:
+            return
+        try:
+            block = int(raw)
+        except ValueError:
+            logger.warning("BENCHMARK_EPOCH_BLOCK=%r is not an int; ignoring", raw)
+            return
+        if block != self._epoch_block_number:
+            self.set_epoch_block(block)
+            logger.info("[fork-pin] benchmark pinned to Base block %d (BENCHMARK_EPOCH_BLOCK)",
+                        block)
 
     async def run_loop(self, interval: float = 30.0) -> None:
         """Continuously poll for and process BENCHMARKING submissions.
@@ -215,6 +241,13 @@ class BenchmarkWorker:
 
         Returns the number of submissions processed.
         """
+        # Deterministic fork-pin: when BENCHMARK_EPOCH_BLOCK is set, pin this round's
+        # benchmark simulations to that Base block so on-chain scores are reproducible
+        # across validators (the cross-machine determinism keystone). Default unset ->
+        # live head (current behavior unchanged). Operators set the SAME value fleet-wide
+        # for comparability; an automatic per-round shared block (leader-pinned via the
+        # round state) is the production follow-up.
+        self._apply_epoch_block_pin()
         replay_round = self._current_replay_round()
         benchmarking = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
         if replay_round is not None:
@@ -422,6 +455,8 @@ class BenchmarkWorker:
                 config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                fork_block=self._epoch_block_number,
+                require_real_sim=self._require_real_sim,
             )
             return results
         finally:
@@ -446,12 +481,17 @@ class BenchmarkWorker:
         orch = SolverOrchestrator()
         session = await orch.start_docker(image_tag, rpc_overrides=rpc_overrides)
         try:
+            # NB: no fork_block here. Stage 3 replays a *past order* at its own
+            # historical block (via rpc_overrides on the solver), which is not the
+            # epoch block. Pinning the simulator fork for this path is a separate
+            # state-bundle task — see the Phase 4 plan ("Pin Stage 2 to the block").
             results = await run_benchmark(
                 session,
                 [(intent, state, snapshot)],
                 config=BenchmarkConfig(chain_ids=[state.chain_id]),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                require_real_sim=self._require_real_sim,
             )
             if results:
                 return results[0]
@@ -474,6 +514,8 @@ class BenchmarkWorker:
                 config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
                 score_fn=score_fn,
                 simulator=self._simulator,
+                fork_block=self._epoch_block_number,
+                require_real_sim=self._require_real_sim,
             )
             return results
         finally:
@@ -733,10 +775,34 @@ class BenchmarkWorker:
             except ValueError:
                 n_per_chain = 10
 
+        # Stage-2 corpus source. Default: the local order store. Opt-in
+        # (BENCHMARK_CHAIN_CORPUS): rebuild it from chain (plan Phase 5b) so a
+        # freshly-promoted leader with an empty store still has a corpus. The
+        # chain-derived records carry the SAME dict shape, so the deterministic
+        # sample below is unchanged. MUST NOT be enabled live until the
+        # cross-machine corpus-determinism gate passes.
+        chain_records: list[dict[str, Any]] | None = None
+        from minotaur_subnet.harness.chain_corpus import chain_corpus_enabled
+        if chain_corpus_enabled():
+            from minotaur_subnet.harness.chain_corpus import build_chain_corpus
+            chain_ids = {
+                d.chain_id
+                for app in self._app_store.list_apps()
+                for d in self._app_store.get_deployments(app.app_id).values()
+            } or {8453}
+            chain_records = []
+            for cid in sorted(chain_ids):
+                try:
+                    chain_records.extend(build_chain_corpus(
+                        self._app_store, self._js_engine, cid))
+                except Exception as exc:
+                    logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
+
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
+            records=chain_records,
         )
         if not sampled:
             return []
@@ -1045,28 +1111,35 @@ class BenchmarkWorker:
         return _StageScore(avg_score=avg, count=len(stage_results), success_count=successes)
 
     def _build_scorecard(self, results: list[BenchmarkResult]) -> BenchmarkScorecard:
-        """Build a per-app scorecard from benchmark results."""
-        # Group results by app_id
-        by_app: dict[str, list[BenchmarkResult]] = {}
-        for r in results:
-            app_id = r.intent_id or "unknown"
-            by_app.setdefault(app_id, []).append(r)
+        """Build a per-app scorecard from benchmark results.
 
-        app_scores: dict[str, float] = {}
+        app_scores is keyed by the BARE app_id so the adoption gate enforces
+        true per-app non-regression. intent_id has the form "<app_id>:<scenario>"
+        (app_ids never contain ':'), so the first ':'-segment is the app; the
+        full-label per-scenario breakdown is kept separately in scenario_scores.
+        """
+        # Group results by the bare app_id (strip the scenario suffix).
+        by_app: dict[str, list[BenchmarkResult]] = {}
         scenario_scores: dict[str, float] = {}
         failures = 0
+        for r in results:
+            intent_label = r.intent_id or "unknown"
+            app_id = intent_label.split(":")[0]
+            by_app.setdefault(app_id, []).append(r)
+            # Per-scenario breakdown stays at full-label granularity.
+            scenario_scores[intent_label] = r.score
+            if r.error is not None or r.plan is None or r.score <= 0:
+                failures += 1
 
+        app_scores: dict[str, float] = {}
+        app_onchain: dict[str, list[int | None]] = {}
         for app_id, app_results in by_app.items():
-            # Per-app: failures count in denominator
+            # Per-app average; failed/zero scenarios stay in the denominator
+            # (same anti-gaming dilution as _compute_stage_score).
             app_total = sum(r.score for r in app_results if r.score > 0)
             app_scores[app_id] = app_total / len(app_results) if app_results else 0.0
-
-            # Per-scenario
-            for r in app_results:
-                scenario_key = f"{app_id}:{r.intent_id}" if r.intent_id != app_id else app_id
-                scenario_scores[scenario_key] = r.score
-                if r.error is not None or r.plan is None or r.score <= 0:
-                    failures += 1
+            # Per-app on-chain scoreIntent BPS (one per scenario; None if no sim score).
+            app_onchain[app_id] = [getattr(r, "on_chain_score", None) for r in app_results]
 
         global_score = self._compute_avg_score(results)
 
@@ -1075,6 +1148,7 @@ class BenchmarkWorker:
         return BenchmarkScorecard(
             global_score=global_score,
             app_scores=app_scores,
+            app_onchain=app_onchain,
             scenario_scores=scenario_scores,
             failures=failures,
             total=len(results),
