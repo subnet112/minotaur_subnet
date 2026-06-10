@@ -370,6 +370,13 @@ services:
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
 
+      # Determinism pins — leave UNSET for normal operation (live head).
+      # When the subnet team coordinates a cross-validator determinism
+      # round, every validator sets the SAME block so the reactive
+      # benchmark scores identical inputs (fork + Stage-2 corpus cutoff):
+      # BENCHMARK_EPOCH_BLOCK: "<base block>"      # pins fork AND corpus
+      # BENCHMARK_CORPUS_TO_BLOCK: "<base block>"  # corpus-only override
+
       # Admin gate — REQUIRED on third-party validators. Without it, the
       # default `RELAYER_URL` above + the wrapper-sig the api adds from
       # `VALIDATOR_PRIVATE_KEY` means any anonymous internet caller can
