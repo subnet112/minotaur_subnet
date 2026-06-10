@@ -205,6 +205,11 @@ class RoundState:
     benchmark_pack_hash: str | None = None
     committee_block: int | None = None
     committee_hash: str | None = None
+    # Canonical per-chain benchmark fork pins for the round ({chain_id: block}),
+    # derived from the round anchor. Default None = legacy/live-head. Folded into
+    # benchmark_pack_hash when ROUND_ANCHORED_PIN is enabled. See
+    # consensus/round_anchor.py.
+    fork_pins: dict[int, int] | None = None
     quorum_required: int | None = None
     decision_deadline_epoch: int | None = None
     finalist_submission_id: str | None = None
@@ -239,6 +244,10 @@ class RoundState:
             "benchmark_pack_hash": self.benchmark_pack_hash,
             "committee_block": self.committee_block,
             "committee_hash": self.committee_hash,
+            "fork_pins": (
+                {str(k): int(v) for k, v in self.fork_pins.items()}
+                if self.fork_pins else None
+            ),
             "quorum_required": self.quorum_required,
             "decision_deadline_epoch": self.decision_deadline_epoch,
             "finalist_submission_id": self.finalist_submission_id,
@@ -265,6 +274,10 @@ class RoundState:
             benchmark_pack_hash=raw.get("benchmark_pack_hash"),
             committee_block=raw.get("committee_block"),
             committee_hash=raw.get("committee_hash"),
+            fork_pins=(
+                {int(k): int(v) for k, v in raw["fork_pins"].items()}
+                if raw.get("fork_pins") else None
+            ),
             quorum_required=raw.get("quorum_required"),
             decision_deadline_epoch=raw.get("decision_deadline_epoch"),
             finalist_submission_id=raw.get("finalist_submission_id"),
