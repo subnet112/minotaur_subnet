@@ -138,6 +138,104 @@ def _resolve_native_bittensor_target() -> str:
     )
 
 
+def _round_anchor_chains() -> list[int]:
+    """Benchmark chains to pin, from ROUND_ANCHOR_CHAINS (default Base only).
+
+    Fleet-consistent config like epoch_seconds — every validator must use the
+    same set or pack hashes diverge (which is the intended fail-loud signal).
+    """
+    raw = os.environ.get("ROUND_ANCHOR_CHAINS", "8453").strip()
+    chains: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            chains.append(int(part))
+        except ValueError:
+            logger.warning("ROUND_ANCHOR_CHAINS: ignoring non-int chain %r", part)
+    return chains or [8453]
+
+
+def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
+    """Canonical per-chain fork pins for the round's epoch anchor, or None.
+
+    Anchor timestamp = ``anchor_epoch * epoch_seconds`` (deterministic, no chain
+    read). Reads each chain's LIVE upstream RPC (never the sim fork) via
+    ``_chain_rpc_env`` — the same source chain_corpus uses. All determinism lives
+    in the pure ``consensus.round_anchor``; this is only the live adapter. Returns
+    None (defer / live-head) on any unavailability — never a guess.
+    """
+    from minotaur_subnet.epoch.clock import SolverRoundEpochClock
+    from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
+    from minotaur_subnet.consensus.round_anchor import (
+        ForkPinUnavailable,
+        derive_fork_pins,
+        epoch_anchor_ts,
+    )
+
+    epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
+    anchor_ts = epoch_anchor_ts(anchor_epoch, epoch_seconds)
+    chains = _round_anchor_chains()
+    try:
+        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
+    except ValueError:
+        confirmations = 12
+
+    from web3 import Web3
+
+    w3_cache: dict[int, object] = {}
+
+    def _w3(chain_id: int):
+        if chain_id not in w3_cache:
+            rpc = _chain_rpc_env(chain_id)
+            if not rpc:
+                raise ForkPinUnavailable(
+                    f"no live RPC for chain {chain_id} (set *_UPSTREAM_RPC_URL)"
+                )
+            w3_cache[chain_id] = Web3(Web3.HTTPProvider(rpc))
+        return w3_cache[chain_id]
+
+    try:
+        return derive_fork_pins(
+            anchor_ts,
+            chains,
+            head_of=lambda c: int(_w3(c).eth.block_number),
+            block_timestamp_of=lambda c, b: int(_w3(c).eth.get_block(b)["timestamp"]),
+            confirmations=confirmations,
+        )
+    except ForkPinUnavailable as exc:
+        logger.info("fork-pins: deferring for epoch %s: %s", anchor_epoch, exc)
+        return None
+    except Exception as exc:
+        logger.warning("fork-pins: derivation failed for epoch %s: %s", anchor_epoch, exc)
+        return None
+
+
+def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
+    """Leader-side: derive + store the round's canonical fork pins (gated).
+
+    Called before the leader builds ``benchmark_pack_hash`` so the pins enter the
+    hash. Default-off and best-effort: with the gate off, or on any derivation
+    failure, ``fork_pins`` stays unset → the pack hash is unchanged and the
+    benchmark runs at live head (inert). Followers derive their own independently
+    (P3); divergence surfaces as PACK_HASH_MISMATCH, never a silent mis-score.
+    """
+    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+        return
+    pins = _derive_round_fork_pins(anchor_epoch)
+    if not pins:
+        return
+    try:
+        from minotaur_subnet.api.routes import submissions
+        submissions.get_round_store().set_round_fork_pins(round_id, pins)
+        logger.info(
+            "fork-pins: round %s pinned %s (anchor epoch %s)", round_id, pins, anchor_epoch,
+        )
+    except Exception as exc:
+        logger.warning("fork-pins: store failed for round %s: %s", round_id, exc)
+
+
 def _round_anchored_pin_segment(round_id: str) -> str:
     """Canonical per-chain fork pins for the round, serialized for the pack hash.
 
@@ -1903,6 +2001,9 @@ async def initialize(ctx: ServerContext) -> dict:
                     int(current.opened_epoch),
                     _current_solver_round_epoch(ctx),
                 )
+                # Round-anchored fork pins (gated, default-off). Populate BEFORE
+                # the pack hash below so the canonical pins are folded into it.
+                _maybe_populate_round_fork_pins(current.round_id, close_epoch)
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
                 closed = submissions._close_solver_round_state(

@@ -432,6 +432,24 @@ class RoundStore:
         self._persist()
         return copy.deepcopy(state)
 
+    def set_round_fork_pins(
+        self, round_id: str, pins: dict[int, int] | None,
+    ) -> RoundState:
+        """Store the round's canonical per-chain benchmark fork pins.
+
+        Set by the leader (and, independently, each follower) before the
+        benchmark_pack_hash is computed, so the pins enter the hash. ``None`` or
+        empty clears them (legacy / live-head behavior).
+        """
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.fork_pins = {int(k): int(v) for k, v in pins.items()} if pins else None
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
     def certify_round(
         self,
         round_id: str,
