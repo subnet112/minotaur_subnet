@@ -919,10 +919,26 @@ def list_orders(
     reader-sig only unlocks the orders it actually owns.
     """
     ob = _require_orderbook()
-    orders = ob.list_orders(app_id=app_id, status=status)
-    out = []
-    for o in orders:
+    # The durable store is the source of truth for which orders exist — it
+    # survives restarts, whereas the in-memory OrderBook only holds the live
+    # working set (and on restart only OPEN orders are reloaded). Source the
+    # list from the store, then overlay the OrderBook for the freshest
+    # in-flight state. Mirrors the store fallback in get_order(). Without
+    # this, terminal orders (filled/rejected) vanish from the list after a
+    # restart even though they are persisted.
+    merged: dict[str, dict] = {}
+    if _app_store is not None and hasattr(_app_store, "list_orders"):
+        for d in _app_store.list_orders(app_id=app_id, status=status):
+            oid = d.get("order_id")
+            if oid:
+                merged[oid] = d
+    for o in ob.list_orders(app_id=app_id, status=status):
         d = o.to_dict()
+        oid = d.get("order_id")
+        if oid:
+            merged[oid] = d
+    out = []
+    for d in merged.values():
         submitted_by = (d.get("submitted_by", "") or "")
         if not _verify_reader_sig(submitted_by, d.get("order_id", ""), x_reader_sig or ""):
             d = _strip_user_signature(d)
