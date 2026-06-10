@@ -138,6 +138,12 @@ async def _reactive_benchmark_candidate(
         simulator=simulator,
     )
 
+    # Input parity with the leader: honor the same BENCHMARK_EPOCH_BLOCK fork-pin
+    # the leader applies in run_once(). Without this a follower re-verifies at its
+    # OWN live fork head while the leader scored at the pinned block — exactly the
+    # divergence the ±15% band papers over. Unset env -> no pin (live head).
+    worker._apply_epoch_block_pin()
+
     intents = worker._load_benchmark_intents()
     if not intents:
         logger.warning("No active intents for reactive benchmark")
@@ -181,6 +187,7 @@ async def _reactive_benchmark_candidate(
             score_fn=score_fn,
             simulator=simulator,
             require_real_sim=_require_real_sim,
+            fork_block=worker._epoch_block_number,
         )
     except RealSimulationUnavailable:
         logger.error(
@@ -199,6 +206,25 @@ async def _reactive_benchmark_candidate(
         "Reactive benchmark for %s: local_score=%.4f leader_score=%.4f",
         candidate.submission_id, local_score, leader_score,
     )
+
+    # Determinism-comparable signals: the JS local_score alone can't be diffed
+    # against the leader's on-chain-ranked (p2oc / SHADOW_DETERMINISM) numbers.
+    # Log the per-app on-chain scoreIntent means so operators can grep-compare
+    # leader vs follower for the same candidate + pinned block across the fleet.
+    try:
+        card = worker._build_scorecard(results)
+        oc_means: dict[str, float | None] = {}
+        for app, scores in card.app_onchain.items():
+            present = [s for s in scores if s is not None]
+            oc_means[app] = round(sum(present) / len(present), 1) if present else None
+        logger.info(
+            "[reactive-determinism] candidate=%s round=%s fork_block=%s "
+            "local_score=%.4f app_onchain_means=%s",
+            candidate.submission_id, round_id, worker._epoch_block_number,
+            local_score, oc_means,
+        )
+    except Exception as exc:  # observe-only — must never break verification
+        logger.warning("[reactive-determinism] logging failed (ignored): %s", exc)
 
     if leader_score <= 0:
         # Leader claims zero — accept if we also scored zero

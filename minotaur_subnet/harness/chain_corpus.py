@@ -99,6 +99,32 @@ def _get_manifest(app_store: Any, js_engine: Any, app_id: str) -> Any:
     return None
 
 
+def _corpus_to_block(w3: Any, confirmations: int) -> int:
+    """Confirmed-scan cutoff, pinnable for cross-validator corpus parity.
+
+    The default (live ``head - confirmations``) is computed from each node's OWN
+    RPC at call time, so two validators scanning minutes apart get different
+    ranges -> different corpora -> different Stage-2 samples despite the shared
+    round_id seed. Pinning fixes that: ``BENCHMARK_CORPUS_TO_BLOCK`` wins, else
+    ``BENCHMARK_EPOCH_BLOCK`` (the round's fork-pin — one knob pins both the fork
+    AND the corpus), else live head. Env read at call time so operators can flip
+    without restart. Single-chain scope: like BENCHMARK_EPOCH_BLOCK itself, a
+    pinned value is a block number on THE benchmark chain (Base today).
+    """
+    for var in ("BENCHMARK_CORPUS_TO_BLOCK", "BENCHMARK_EPOCH_BLOCK"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            pinned = int(raw)
+        except ValueError:
+            logger.warning("chain corpus: %s=%r is not an int; ignoring", var, raw)
+            continue
+        logger.info("chain corpus: to_block pinned to %d (%s)", pinned, var)
+        return pinned
+    return max(0, w3.eth.block_number - int(confirmations))
+
+
 def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
                        confirmations: int = 1, from_block: int = 0) -> list[dict]:
     """Build chain-derived filled-order records (sample_historical_orders shape) for a
@@ -114,7 +140,7 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
         return []
     from web3 import Web3
     w3 = Web3(Web3.HTTPProvider(rpc))
-    to_block = max(0, w3.eth.block_number - int(confirmations))
+    to_block = _corpus_to_block(w3, confirmations)
 
     records: list[dict] = []
     for app in app_store.list_apps():
