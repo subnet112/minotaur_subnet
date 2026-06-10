@@ -12,6 +12,7 @@ from minotaur_subnet.api.services.app_service import build_intent_params_hex_fro
 from minotaur_subnet.harness.chain_corpus import (
     chain_corpus_enabled,
     decode_intent_params_hex,
+    _corpus_to_block,
     _function_for_selector,
 )
 from minotaur_subnet.harness.order_sampler import sample_historical_orders
@@ -101,3 +102,37 @@ def test_chain_corpus_gate_default_off(monkeypatch):
     assert chain_corpus_enabled() is False
     monkeypatch.setenv("BENCHMARK_CHAIN_CORPUS", "1")
     assert chain_corpus_enabled() is True
+
+
+# ── to_block pin (cross-validator corpus parity) ──────────────────────────────
+# The live cutoff is head-derived per node, so two validators scanning minutes
+# apart build different corpora despite the shared round_id seed. The pin makes
+# the scan range an explicit shared input.
+
+_W3 = types.SimpleNamespace(eth=types.SimpleNamespace(block_number=1000))
+
+
+def test_corpus_to_block_defaults_to_live_head(monkeypatch):
+    monkeypatch.delenv("BENCHMARK_CORPUS_TO_BLOCK", raising=False)
+    monkeypatch.delenv("BENCHMARK_EPOCH_BLOCK", raising=False)
+    assert _corpus_to_block(_W3, 1) == 999  # head - confirmations, unchanged
+
+
+def test_corpus_to_block_falls_back_to_epoch_pin(monkeypatch):
+    # One knob pins both the fork AND the corpus: the round's fork-pin is the
+    # default cutoff when no explicit corpus pin is set.
+    monkeypatch.delenv("BENCHMARK_CORPUS_TO_BLOCK", raising=False)
+    monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
+    assert _corpus_to_block(_W3, 1) == 46904887
+
+
+def test_corpus_to_block_explicit_pin_wins(monkeypatch):
+    monkeypatch.setenv("BENCHMARK_CORPUS_TO_BLOCK", "46900000")
+    monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
+    assert _corpus_to_block(_W3, 1) == 46900000
+
+
+def test_corpus_to_block_invalid_pin_ignored(monkeypatch):
+    monkeypatch.setenv("BENCHMARK_CORPUS_TO_BLOCK", "not-an-int")
+    monkeypatch.delenv("BENCHMARK_EPOCH_BLOCK", raising=False)
+    assert _corpus_to_block(_W3, 1) == 999  # falls through to live head
