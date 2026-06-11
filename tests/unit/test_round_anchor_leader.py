@@ -36,7 +36,7 @@ def _fake_web3(*, head: int, t0: int, spacing: int):
             self.eth = _Eth()
 
         @staticmethod
-        def HTTPProvider(url):
+        def HTTPProvider(url, **kwargs):
             return ("http", url)
 
     return _W3
