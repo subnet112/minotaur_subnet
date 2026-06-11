@@ -13,9 +13,23 @@ import pytest
 from minotaur_subnet.consensus.round_anchor import (
     ForkPinUnavailable,
     derive_fork_pins,
+    epoch_anchor_ts,
     find_pin_block,
     serialize_fork_pins,
 )
+
+
+# ── epoch_anchor_ts ───────────────────────────────────────────────────────────
+
+
+def test_epoch_anchor_ts_is_epoch_times_seconds():
+    assert epoch_anchor_ts(100, 60) == 6000
+    assert epoch_anchor_ts(0, 60) == 0
+
+
+def test_epoch_anchor_ts_rejects_nonpositive_seconds():
+    with pytest.raises(ValueError):
+        epoch_anchor_ts(100, 0)
 
 
 class _Chain:

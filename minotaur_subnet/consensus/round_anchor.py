@@ -25,6 +25,21 @@ BlockTimestampFn = Callable[[int, int], int]  # (chain_id, block) -> unix timest
 LoFn = Callable[[int], int]                 # chain_id -> earliest searchable block
 
 
+def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:
+    """Deterministic anchor timestamp for a (time-based) solver-round epoch.
+
+    Mirrors ``SolverRoundEpochClock`` time mode, where epoch ``E`` spans
+    ``[E*epoch_seconds, (E+1)*epoch_seconds)`` — so the epoch boundary timestamp
+    is ``E * epoch_seconds``. Every validator computes it identically from the
+    shared ``epoch_seconds`` config (already fleet-consistent, since round ids
+    derive from it), with no chain read. This is the anchor fed to
+    :func:`derive_fork_pins`.
+    """
+    if epoch_seconds <= 0:
+        raise ValueError("epoch_seconds must be > 0")
+    return int(epoch) * int(epoch_seconds)
+
+
 class ForkPinUnavailable(Exception):
     """The pin cannot yet be derived deterministically for a chain.
 
