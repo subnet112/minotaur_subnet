@@ -3,8 +3,8 @@
 Provides a stable, monotonic epoch source for the API-side solver round
 coordinator. The clock prefers native subnet epoch indices derived from
 metagraph/subtensor tempo data when available, otherwise it falls back to
-``SOLVER_ROUND_EPOCH_BLOCKS`` or wall-clock epochs derived from
-``SOLVER_ROUND_EPOCH_SECONDS``.
+``SOLVER_ROUND_EPOCH_BLOCKS`` or wall-clock epochs derived from the fixed
+``EPOCH_SECONDS`` protocol constant.
 """
 
 from __future__ import annotations
@@ -13,6 +13,18 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+# Consensus-critical protocol constant — NOT operator-configurable.
+#
+# The round-anchored fork pin derives its anchor timestamp as
+# ``anchor_epoch * EPOCH_SECONDS`` (see consensus.round_anchor), and the round
+# coordinator buckets wall-clock time into epochs of this width. Every
+# validator MUST use the identical value or the per-round benchmark pack hashes
+# diverge → PACK_HASH_MISMATCH. This was previously the ``SOLVER_ROUND_EPOCH_SECONDS``
+# env var, but that was a debug/test knob: letting operators pick it silently
+# breaks fleet consensus parity. Fixed at 60s and removed from config
+# (2026-06-11). Tests may still override via the constructor.
+EPOCH_SECONDS = 60
 
 
 def _parse_positive_int(raw: str | None, *, default: int | None) -> int | None:
@@ -33,7 +45,7 @@ def _parse_positive_int(raw: str | None, *, default: int | None) -> int | None:
 class SolverRoundEpochClock:
     """Resolve the current solver-round epoch from blocks or wall-clock time."""
 
-    epoch_seconds: int = 60
+    epoch_seconds: int = EPOCH_SECONDS
     epoch_blocks: int | None = None
 
     @classmethod
@@ -41,17 +53,18 @@ class SolverRoundEpochClock:
         cls,
         env: Mapping[str, str] | None = None,
     ) -> "SolverRoundEpochClock":
-        """Build an epoch clock from environment variables."""
+        """Build an epoch clock from environment variables.
+
+        ``epoch_seconds`` is intentionally NOT read from the environment: it is
+        the fixed ``EPOCH_SECONDS`` protocol constant (consensus-critical, see
+        above). Only the block-mode override remains operator-tunable.
+        """
         environ = env or os.environ
-        epoch_seconds = _parse_positive_int(
-            environ.get("SOLVER_ROUND_EPOCH_SECONDS"),
-            default=60,
-        ) or 60
         epoch_blocks = _parse_positive_int(
             environ.get("SOLVER_ROUND_EPOCH_BLOCKS"),
             default=None,
         )
-        return cls(epoch_seconds=epoch_seconds, epoch_blocks=epoch_blocks)
+        return cls(epoch_seconds=EPOCH_SECONDS, epoch_blocks=epoch_blocks)
 
     def uses_block_mode(self, *, block_number: int | None = None) -> bool:
         """Return whether the clock can derive epochs from the chain block."""
