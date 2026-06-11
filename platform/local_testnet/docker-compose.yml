@@ -300,7 +300,6 @@ services:
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
-      SOLVER_ROUND_EPOCH_SECONDS: "${SOLVER_ROUND_EPOCH_SECONDS:-60}"
       # Fee model (skeleton): set FEE_ENABLED=1 to require fee accounting
       FEE_ENABLED: "${FEE_ENABLED:-0}"
       DEFAULT_FEE_WEI: "${DEFAULT_FEE_WEI:-10000000000000000}"
@@ -392,7 +391,6 @@ services:
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
-      SOLVER_ROUND_EPOCH_SECONDS: "${SOLVER_ROUND_EPOCH_SECONDS:-60}"
     volumes:
       - testnet-config:/config:ro
       - store-data:/data
@@ -480,7 +478,6 @@ services:
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
-      SOLVER_ROUND_EPOCH_SECONDS: "${SOLVER_ROUND_EPOCH_SECONDS:-60}"
     volumes:
       - testnet-config:/config:ro
       - store-data:/data
