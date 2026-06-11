@@ -138,11 +138,28 @@ async def _reactive_benchmark_candidate(
         simulator=simulator,
     )
 
-    # Input parity with the leader: honor the same BENCHMARK_EPOCH_BLOCK fork-pin
-    # the leader applies in run_once(). Without this a follower re-verifies at its
-    # OWN live fork head while the leader scored at the pinned block — exactly the
-    # divergence the ±15% band papers over. Unset env -> no pin (live head).
-    worker._apply_epoch_block_pin()
+    # Input parity with the leader. Prefer the ROUND-ANCHORED pin: the follower
+    # derives the SAME canonical fork block from the round's anchor (Option b —
+    # no trust in the leader's number) and re-verifies at it, so on-chain scores
+    # reproduce. Falls back to the BENCHMARK_EPOCH_BLOCK env path when the gate is
+    # off (unset env -> live head, unchanged). Without parity a follower would
+    # re-verify at its own live head — exactly the divergence the band papers over.
+    _round_pin = None
+    if round_id:
+        try:
+            from minotaur_subnet.api.startup import (
+                _resolve_round_fork_pins,
+                _round_anchor_chains,
+            )
+            _pins = _resolve_round_fork_pins(round_id)
+            if _pins:
+                _round_pin = _pins.get(_round_anchor_chains()[0])
+        except Exception as exc:
+            logger.warning("fork-pins: follower resolve failed for %s: %s", round_id, exc)
+    if _round_pin is not None:
+        worker.set_epoch_block(int(_round_pin))
+    else:
+        worker._apply_epoch_block_pin()
 
     intents = worker._load_benchmark_intents()
     if not intents:
