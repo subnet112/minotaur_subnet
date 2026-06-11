@@ -634,6 +634,24 @@ class AppIntentStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def count_orders_by_status(self, app_id: str | None = None) -> dict[str, int]:
+        """Return a ``{status: count}`` map over all persisted orders.
+
+        Durable counterpart to ``IntentOrderBook.stats()`` — counts every
+        persisted order (not just the live in-memory working set), so the
+        ``orderbook_stats`` "total" stays consistent with ``list_orders``
+        across restarts.
+        """
+        query = "SELECT status, COUNT(*) AS n FROM orders"
+        params: list[Any] = []
+        if app_id:
+            query += " WHERE app_id=?"
+            params.append(app_id)
+        query += " GROUP BY status"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return {(r["status"] if r["status"] is not None else "unknown"): int(r["n"]) for r in rows}
+
     # ── native bittensor permissions / executions ────────────────────────
 
     def save_native_permission(self, permission: NativeBittensorPermission) -> None:
