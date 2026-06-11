@@ -153,6 +153,8 @@ def _deployment_from_dict(d: dict[str, Any]) -> DeploymentResult:
         js_code_hash=d.get("js_code_hash", ""),
         chain_id=d.get("chain_id", 1),
         error=d.get("error"),
+        tx_hash=d.get("tx_hash"),
+        abi=d.get("abi"),
     )
 
 
