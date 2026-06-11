@@ -37,6 +37,14 @@ class ServerContext:
     block_loop: Any = None
     block_loop_task: Any = None
 
+    # ── round-anchor parity probe (observability) ────────────────────────
+    # Latest snapshot of the canonical fork pins THIS node derives for the
+    # current epoch anchor, refreshed by a background task and surfaced on
+    # /health. Lets the fleet's pin parity be diffed by polling /health —
+    # no log access, no operator action, decoupled from the champion path.
+    round_anchor_parity: dict = field(default_factory=dict)
+    round_anchor_task: Any = None
+
     # ── champion-consensus ProtocolConfig ────────────────────────────────
     # Created at startup pointed at BT EVM ValidatorRegistry (for the
     # validator set) + ChampionRegistry (for the quorum threshold). The
