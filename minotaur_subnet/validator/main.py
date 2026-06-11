@@ -963,7 +963,13 @@ class AppIntentsValidator:
         while True:
             await asyncio.sleep(15)
             try:
-                self.store._load()  # re-read from disk
+                # The SQLite-backed AppIntentStore (PR #157) reads live from the
+                # DB on every query — there is no in-memory cache to reload, and
+                # the old JSON-era `store._load()` was removed in that migration.
+                # `list_apps()` below already reflects apps written in by the
+                # app-sync loop, so the rescan picks up new deployments directly.
+                # (Calling the removed `_load()` here raised AttributeError every
+                # 15s on all validators after the SQLite migration.)
                 loaded_ids = set(self.engine.list_loaded_intents())
                 for app_def in self.store.list_apps():
                     if app_def.app_id in loaded_ids:
