@@ -138,6 +138,31 @@ def _resolve_native_bittensor_target() -> str:
     )
 
 
+def _round_anchored_pin_segment(round_id: str) -> str:
+    """Canonical per-chain fork pins for the round, serialized for the pack hash.
+
+    Returns ``""`` — leaving ``benchmark_pack_hash`` byte-for-byte unchanged —
+    unless ``ROUND_ANCHORED_PIN`` is enabled AND the round carries derived pins.
+    With the gate off this is a no-op, so the rollout is safe on a mixed-version
+    fleet. When enabled, a node missing the pins computes a different pack hash
+    and the existing pre-flight check rejects it (fail-loud) — which is the point:
+    determinism divergence must surface, not be papered over.
+    """
+    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+        return ""
+    try:
+        from minotaur_subnet.api.routes import submissions
+        round_state = submissions.get_round_store().get_round(round_id)
+    except Exception as exc:
+        logger.warning("pack_hash: fork-pin round lookup failed: %s", exc)
+        return ""
+    pins = getattr(round_state, "fork_pins", None) if round_state else None
+    if not pins:
+        return ""
+    from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
+    return serialize_fork_pins(pins)
+
+
 def _build_solver_round_benchmark_pack_hash(
     ctx: ServerContext,
     round_id: str,
@@ -218,6 +243,11 @@ def _build_solver_round_benchmark_pack_hash(
             "require_asymmetric_provenance": _env_true("REQUIRE_ASYMMETRIC_PROVENANCE", default=False),
         },
     }
+    # Bind the round-anchored fork pins into the pack hash (gated, default-off).
+    # Added only when present so the default hash is byte-for-byte unchanged.
+    pin_segment = _round_anchored_pin_segment(round_id)
+    if pin_segment:
+        payload["fork_pins"] = pin_segment
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "0x" + hashlib.sha256(encoded).hexdigest()
 
