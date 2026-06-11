@@ -236,25 +236,54 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
         logger.warning("fork-pins: store failed for round %s: %s", round_id, exc)
 
 
+def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
+    """Resolve the round's canonical fork pins, deriving + caching if absent.
+
+    Gated by ``ROUND_ANCHORED_PIN``. Returns ``RoundState.fork_pins`` when already
+    set (leader populated at close, or a prior resolve); otherwise derives them
+    independently from the round's ``close_epoch`` anchor and caches them. Returns
+    None (defer / live head) when the gate is off, the round is unknown or not yet
+    closed, or derivation defers.
+
+    This is what gives followers Option-b parity: each validator derives the same
+    pin from the same anchor, with no trust in a leader-asserted number.
+    """
+    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+        return None
+    try:
+        from minotaur_subnet.api.routes import submissions
+        store = submissions.get_round_store()
+        round_state = store.get_round(round_id)
+    except Exception as exc:
+        logger.warning("fork-pins: round lookup failed for %s: %s", round_id, exc)
+        return None
+    if round_state is None:
+        return None
+    cached = getattr(round_state, "fork_pins", None)
+    if cached:
+        return cached
+    close_epoch = getattr(round_state, "close_epoch", None)
+    if close_epoch is None:
+        return None  # not closed yet -> no anchor
+    pins = _derive_round_fork_pins(int(close_epoch))
+    if pins:
+        try:
+            store.set_round_fork_pins(round_id, pins)  # cache for reuse
+        except Exception as exc:
+            logger.warning("fork-pins: cache store failed for %s: %s", round_id, exc)
+    return pins
+
+
 def _round_anchored_pin_segment(round_id: str) -> str:
     """Canonical per-chain fork pins for the round, serialized for the pack hash.
 
     Returns ``""`` — leaving ``benchmark_pack_hash`` byte-for-byte unchanged —
-    unless ``ROUND_ANCHORED_PIN`` is enabled AND the round carries derived pins.
-    With the gate off this is a no-op, so the rollout is safe on a mixed-version
-    fleet. When enabled, a node missing the pins computes a different pack hash
-    and the existing pre-flight check rejects it (fail-loud) — which is the point:
-    determinism divergence must surface, not be papered over.
+    unless ``ROUND_ANCHORED_PIN`` is on and pins resolve. The resolver derives
+    them if absent, so a *follower* computing its pre-flight pack hash gets the
+    same pins the leader did (independently); divergence surfaces as
+    PACK_HASH_MISMATCH (fail-loud) rather than a silent mis-score.
     """
-    if not _env_true("ROUND_ANCHORED_PIN", default=False):
-        return ""
-    try:
-        from minotaur_subnet.api.routes import submissions
-        round_state = submissions.get_round_store().get_round(round_id)
-    except Exception as exc:
-        logger.warning("pack_hash: fork-pin round lookup failed: %s", exc)
-        return ""
-    pins = getattr(round_state, "fork_pins", None) if round_state else None
+    pins = _resolve_round_fork_pins(round_id)
     if not pins:
         return ""
     from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
