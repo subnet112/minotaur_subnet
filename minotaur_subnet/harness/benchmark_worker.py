@@ -163,6 +163,7 @@ class BenchmarkWorker:
         genesis_solver_image: str | None = None,  # Docker image for genesis benchmarking
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
+        pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -175,6 +176,10 @@ class BenchmarkWorker:
         self._genesis_solver_image = genesis_solver_image or GENESIS_SOLVER_IMAGE or None
         self._simulator = simulator
         self._require_real_sim = require_real_sim
+        # Injected by the API layer (keeps the harness free of API imports):
+        # round_id -> the round-anchored benchmark-chain fork block, or None.
+        self._pin_resolver = pin_resolver
+        self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
 
     def set_epoch_block(self, block_number: int) -> None:
@@ -186,12 +191,24 @@ class BenchmarkWorker:
         self._epoch_block_number = block_number
 
     def _apply_epoch_block_pin(self) -> None:
-        """Pin the benchmark fork to BENCHMARK_EPOCH_BLOCK when set (call-time read so
-        operators can flip without restart). Unset/invalid -> no pin (live head). The
-        block threads through run_benchmark -> simulate as fork_block, so every sim this
-        round runs at the same Base block -> on-chain scores reproduce across validators."""
+        """DEV/TEST-ONLY manual fork pin via BENCHMARK_EPOCH_BLOCK.
+
+        Production pins the fork automatically and per-round via the round-anchored
+        derivation (ROUND_ANCHORED_PIN). When that gate is on this env override is
+        IGNORED — a stale value must not silently divert a deferred round to an old
+        block. Unset/invalid -> no pin (live head). Call-time read so dev can flip
+        without restart; threads through run_benchmark -> simulate as fork_block."""
         raw = os.environ.get("BENCHMARK_EPOCH_BLOCK", "").strip()
         if not raw:
+            return
+        if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+            if not self._warned_env_pin_ignored:
+                logger.warning(
+                    "[fork-pin] BENCHMARK_EPOCH_BLOCK=%r ignored — ROUND_ANCHORED_PIN is on "
+                    "(round-anchored derivation is authoritative). BENCHMARK_EPOCH_BLOCK is a "
+                    "dev/test-only override; unset it in production.", raw,
+                )
+                self._warned_env_pin_ignored = True
             return
         try:
             block = int(raw)
@@ -202,6 +219,26 @@ class BenchmarkWorker:
             self.set_epoch_block(block)
             logger.info("[fork-pin] benchmark pinned to Base block %d (BENCHMARK_EPOCH_BLOCK)",
                         block)
+
+    def _apply_round_anchored_pin(self, round_id: str | None) -> None:
+        """Override the fork pin with the round-anchored block (Option b).
+
+        Uses the injected resolver (round_id -> canonical benchmark-chain block).
+        Authoritative over the env fallback, so call AFTER _apply_epoch_block_pin.
+        No-op without a resolver / round_id / pin (gate off or deferred -> the
+        env/live-head value stands). Never raises into the benchmark.
+        """
+        if self._pin_resolver is None or not round_id:
+            return
+        try:
+            pin = self._pin_resolver(round_id)
+        except Exception as exc:
+            logger.warning("[fork-pin] round-anchored resolve failed: %s", exc)
+            return
+        if pin is not None and int(pin) != self._epoch_block_number:
+            self.set_epoch_block(int(pin))
+            logger.info("[fork-pin] benchmark pinned to Base block %d (round-anchored, %s)",
+                        int(pin), round_id)
 
     async def run_loop(self, interval: float = 30.0) -> None:
         """Continuously poll for and process BENCHMARKING submissions.
@@ -249,6 +286,18 @@ class BenchmarkWorker:
         # round state) is the production follow-up.
         self._apply_epoch_block_pin()
         replay_round = self._current_replay_round()
+        # Round-anchored pin (authoritative over the env fallback above): the round
+        # being benchmarked carries / derives a canonical fork block; pin to it so
+        # the leader's scores reproduce on followers. None when the gate is off /
+        # round not closed / deferred -> env/live-head unchanged.
+        _pin_round_id: str | None = None
+        if replay_round is not None:
+            _pin_round_id = replay_round.round_id
+        elif self._round_store is not None:
+            _cur = self._round_store.get_current_round()
+            if _cur is not None:
+                _pin_round_id = _cur.round_id
+        self._apply_round_anchored_pin(_pin_round_id)
         benchmarking = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
         if replay_round is not None:
             benchmarking = [
@@ -794,7 +843,12 @@ class BenchmarkWorker:
             for cid in sorted(chain_ids):
                 try:
                     chain_records.extend(build_chain_corpus(
-                        self._app_store, self._js_engine, cid))
+                        self._app_store, self._js_engine, cid,
+                        # Pin the corpus cutoff to the SAME block the benchmark forks
+                        # at (round-anchored) so the Stage-2 sample matches across
+                        # validators. Only the benchmark chain has the scalar pin;
+                        # other chains fall back to env/live head.
+                        to_block=(self._epoch_block_number if cid == 8453 else None)))
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 

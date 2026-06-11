@@ -99,12 +99,50 @@ def _get_manifest(app_store: Any, js_engine: Any, app_id: str) -> Any:
     return None
 
 
+def _corpus_to_block(w3: Any, confirmations: int, *, to_block: int | None = None) -> int:
+    """Confirmed-scan cutoff, pinnable for cross-validator corpus parity.
+
+    An explicit ``to_block`` (the round-anchored fork pin, passed by the benchmark
+    worker) wins — the production path: the corpus cutoff is the SAME block the
+    benchmark forks at, derived canonically per round. Absent that, the legacy env
+    knobs apply (``BENCHMARK_CORPUS_TO_BLOCK`` then ``BENCHMARK_EPOCH_BLOCK``), then
+    live ``head - confirmations``. The live default is each node's OWN RPC at call
+    time, so two validators scanning minutes apart get different ranges ->
+    different corpora despite the shared round_id seed; the pin removes that.
+    Single-chain scope: a pinned value is a block number on THE benchmark chain.
+    """
+    if to_block is not None:
+        return int(to_block)
+    # Round-anchored derivation is authoritative in production: when its gate is
+    # on, the explicit to_block above is the production path and the env knobs
+    # below are dev/test-only -> skip them (a deferred/None pin falls to live head,
+    # not a stale env block).
+    if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        return max(0, w3.eth.block_number - int(confirmations))
+    for var in ("BENCHMARK_CORPUS_TO_BLOCK", "BENCHMARK_EPOCH_BLOCK"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            pinned = int(raw)
+        except ValueError:
+            logger.warning("chain corpus: %s=%r is not an int; ignoring", var, raw)
+            continue
+        logger.info("chain corpus: to_block pinned to %d (%s)", pinned, var)
+        return pinned
+    return max(0, w3.eth.block_number - int(confirmations))
+
+
 def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
-                       confirmations: int = 1, from_block: int = 0) -> list[dict]:
+                       confirmations: int = 1, from_block: int = 0,
+                       to_block: int | None = None) -> list[dict]:
     """Build chain-derived filled-order records (sample_historical_orders shape) for a
     chain: scan IntentExecuted per registered app contract, decode params, remap the
     contract address to the store app_id. Fail-closed (empty + WARN) if no live RPC —
     never scans a sim fork. Reorg-safe via a confirmed-block cutoff.
+
+    ``to_block`` (optional) pins the scan cutoff to the round-anchored fork pin for
+    cross-validator parity; None falls back to the env/live-head cutoff.
     """
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
     rpc = _chain_rpc_env(chain_id)
@@ -114,7 +152,7 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
         return []
     from web3 import Web3
     w3 = Web3(Web3.HTTPProvider(rpc))
-    to_block = max(0, w3.eth.block_number - int(confirmations))
+    to_block = _corpus_to_block(w3, confirmations, to_block=to_block)
 
     records: list[dict] = []
     for app in app_store.list_apps():
