@@ -71,3 +71,8 @@ contracts/foundry.lock
 
 # Runtime wallet data — encrypted but should never enter the repo
 minotaur_subnet/blockchain/data/
+
+# SQLite store (runtime data — never commit)
+minotaur_subnet/store/data/*.db
+minotaur_subnet/store/data/*.db-wal
+minotaur_subnet/store/data/*.db-shm
