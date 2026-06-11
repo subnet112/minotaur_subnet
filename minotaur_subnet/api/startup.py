@@ -157,6 +157,14 @@ def _round_anchor_chains() -> list[int]:
     return chains or [8453]
 
 
+def _round_anchor_rpc_timeout() -> float:
+    """Per-request timeout (seconds) for fork-pin RPC reads. Default 10s."""
+    try:
+        return max(1.0, float(os.environ.get("ROUND_ANCHOR_RPC_TIMEOUT", "10")))
+    except ValueError:
+        return 10.0
+
+
 def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     """Canonical per-chain fork pins for the round's epoch anchor, or None.
 
@@ -186,6 +194,8 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
 
     w3_cache: dict[int, object] = {}
 
+    timeout_s = _round_anchor_rpc_timeout()
+
     def _w3(chain_id: int):
         if chain_id not in w3_cache:
             rpc = _chain_rpc_env(chain_id)
@@ -193,7 +203,13 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
                 raise ForkPinUnavailable(
                     f"no live RPC for chain {chain_id} (set *_UPSTREAM_RPC_URL)"
                 )
-            w3_cache[chain_id] = Web3(Web3.HTTPProvider(rpc))
+            # Bounded per-request timeout: this runs synchronously, and on the
+            # leader the same event loop also drives the order-execution
+            # BlockLoop. An unbounded HTTP read on a stuck RPC would block the
+            # loop (and stall order proposing); the timeout caps the worst case.
+            w3_cache[chain_id] = Web3(
+                Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s})
+            )
         return w3_cache[chain_id]
 
     try:
@@ -376,6 +392,104 @@ def _maybe_shadow_log_round_fork_pins(
             "[round-anchor-shadow] logging failed for round %s (ignored): %s",
             round_id, exc,
         )
+
+
+def _round_anchor_parity_enabled() -> bool:
+    """Whether the /health parity probe runs. Default-ON (opt-out)."""
+    return _env_true("ROUND_ANCHOR_PARITY", default=True)
+
+
+def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
+    """Derive the current-epoch fork pins and package a /health-ready snapshot.
+
+    Pure observability: the result is NEVER stored on a round nor bound into a
+    pack hash. Runs in a worker thread (see :func:`_round_anchor_parity_loop`)
+    so its synchronous RPC reads never touch the event loop. ``status`` is
+    ``ok`` (pins derived), ``deferred`` (anchor not yet confirmation-bracketed
+    or no RPC), and the caller maps timeouts/errors to their own statuses.
+    """
+    from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
+
+    chains = _round_anchor_chains()
+    try:
+        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
+    except ValueError:
+        confirmations = 12
+    pins = _derive_round_fork_pins(anchor_epoch)
+    if pins:
+        pin_map = {str(chain): int(block) for chain, block in sorted(pins.items())}
+        pin_segment = serialize_fork_pins(pins)
+        status = "ok"
+    else:
+        pin_map = {}
+        pin_segment = ""
+        status = "deferred"
+    return {
+        "status": status,
+        "anchor_epoch": int(anchor_epoch),
+        "chains": chains,
+        "confirmations": confirmations,
+        "pins": pin_map,
+        "pin_segment": pin_segment,
+        "gate_enabled": _env_true("ROUND_ANCHORED_PIN", default=False),
+        "derived_at": int(time.time()),
+    }
+
+
+async def _round_anchor_parity_loop(ctx: "ServerContext") -> None:
+    """Background probe keeping ``ctx.round_anchor_parity`` fresh for /health.
+
+    Every validator (leader and follower) independently derives the canonical
+    fork pin for the current epoch anchor and publishes it on /health, so fleet
+    pin parity can be confirmed by polling /health — no log access, no operator
+    action, and decoupled from the (possibly dormant) champion-consensus path.
+
+    Safety: derivation runs in a thread with a bounded RPC timeout, so it can
+    never block the event loop or the order-execution BlockLoop sharing it. The
+    pin for an anchor epoch is immutable once confirmed, so we re-derive only
+    when the epoch advances (keeps RPC load to ~one derivation per epoch).
+    """
+    from minotaur_subnet.epoch.clock import SolverRoundEpochClock
+
+    try:
+        refresh = max(5.0, float(os.environ.get("ROUND_ANCHOR_PARITY_INTERVAL", "60")))
+    except ValueError:
+        refresh = 60.0
+    overall_timeout = max(refresh, _round_anchor_rpc_timeout() * 4)
+    loop = asyncio.get_running_loop()
+    while True:
+        anchor_epoch: int | None = None
+        try:
+            epoch_seconds = max(1, int(SolverRoundEpochClock.from_env().epoch_seconds))
+            # One epoch back → the anchor is comfortably confirmation-bracketed
+            # (the current epoch's boundary is ~now and would usually defer).
+            anchor_epoch = max(int(time.time()) // epoch_seconds - 1, 0)
+            prev = ctx.round_anchor_parity or {}
+            already_good = (
+                prev.get("anchor_epoch") == anchor_epoch and prev.get("status") == "ok"
+            )
+            if not already_good:
+                snapshot = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, _compute_round_anchor_parity_snapshot, anchor_epoch
+                    ),
+                    timeout=overall_timeout,
+                )
+                ctx.round_anchor_parity = snapshot
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            ctx.round_anchor_parity = {
+                "status": "timeout",
+                "anchor_epoch": anchor_epoch,
+                "derived_at": int(time.time()),
+            }
+            logger.warning(
+                "[round-anchor-parity] derivation timed out for epoch %s", anchor_epoch
+            )
+        except Exception as exc:
+            logger.warning("[round-anchor-parity] probe iteration failed: %s", exc)
+        await asyncio.sleep(refresh)
 
 
 def _build_solver_round_benchmark_pack_hash(
@@ -2336,6 +2450,14 @@ async def initialize(ctx: ServerContext) -> dict:
             tick_interval, score_threshold,
         )
 
+    # Round-anchor parity probe — runs on every validator (leader + follower),
+    # independent of the solver-round coordinator, so /health always carries
+    # this node's derived pin for fleet parity diffing. Default-on; opt out with
+    # ROUND_ANCHOR_PARITY=0.
+    if _round_anchor_parity_enabled():
+        ctx.round_anchor_task = asyncio.create_task(_round_anchor_parity_loop(ctx))
+        logger.info("[round-anchor-parity] /health probe started")
+
     # CloudWatch metrics publisher (Phase 5.4). No-op unless
     # CLOUDWATCH_METRICS_ENABLED=1 and boto3 is installed.
     from minotaur_subnet.api.metrics import publish_loop as _metrics_publish_loop
@@ -2397,6 +2519,13 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Benchmark worker stopped")
+    if ctx.round_anchor_task is not None:
+        ctx.round_anchor_task.cancel()
+        try:
+            await ctx.round_anchor_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Round-anchor parity probe stopped")
     if ctx.solver_round_task is not None:
         ctx.solver_round_task.cancel()
         try:

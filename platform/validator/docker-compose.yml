@@ -376,6 +376,15 @@ services:
       # the round's epoch anchor — no manual per-round block coordination.
       # ROUND_ANCHORED_PIN: "0"   # default off; flip to 1 fleet-wide to enable
       #
+      # Pre-flight parity check (default-ON, observe-only): a background probe
+      # derives this node's fork pin for the current epoch anchor and publishes
+      # it on GET /health under "round_anchor" (pins, anchor_epoch, status). The
+      # subnet team polls every validator's /health and diffs the pin per epoch
+      # to confirm the WHOLE fleet derives an identical block BEFORE flipping
+      # ROUND_ANCHORED_PIN — no log scraping, no action needed from you. It never
+      # changes consensus and runs with a bounded RPC timeout. Opt out (not
+      # recommended) with ROUND_ANCHOR_PARITY: "0".
+      #
       # SHADOW (recommended before flipping the gate): set ROUND_ANCHOR_SHADOW: "1"
       # fleet-wide while ROUND_ANCHORED_PIN stays "0". Each validator then derives
       # and LOGS the pin it would use (and the would-be benchmark_pack_hash) with
