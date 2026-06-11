@@ -347,6 +347,13 @@ def health() -> dict:
             }
     except Exception:
         logger.warning("Failed to load solver round for /health", exc_info=True)
+    # Round-anchor parity probe: this node's independently-derived fork pin for
+    # the current epoch anchor. Poll across the fleet and diff ``pins`` grouped
+    # by ``anchor_epoch`` to confirm every validator derives the identical pin
+    # before flipping ROUND_ANCHORED_PIN. Observe-only; absent until the probe's
+    # first derivation completes (or if ROUND_ANCHOR_PARITY=0).
+    if ctx.round_anchor_parity:
+        data["round_anchor"] = dict(ctx.round_anchor_parity)
     return data
 
 
