@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import unittest
 
-from minotaur_subnet.epoch.clock import SolverRoundEpochClock
+from minotaur_subnet.epoch.clock import EPOCH_SECONDS, SolverRoundEpochClock
 
 
 class TestSolverRoundEpochClock(unittest.TestCase):
+    def test_from_env_ignores_discontinued_epoch_seconds_var(self):
+        # SOLVER_ROUND_EPOCH_SECONDS was a debug/test knob and is consensus
+        # critical; from_env must never honor it — every validator uses the
+        # fixed EPOCH_SECONDS protocol constant.
+        clock = SolverRoundEpochClock.from_env(
+            env={"SOLVER_ROUND_EPOCH_SECONDS": "120"}
+        )
+        self.assertEqual(clock.epoch_seconds, EPOCH_SECONDS)
+        self.assertEqual(clock.epoch_seconds, 60)
+
+    def test_from_env_still_honors_block_fallback(self):
+        clock = SolverRoundEpochClock.from_env(
+            env={"SOLVER_ROUND_EPOCH_BLOCKS": "360"}
+        )
+        self.assertEqual(clock.epoch_blocks, 360)
+        self.assertEqual(clock.epoch_seconds, EPOCH_SECONDS)
+
     def test_time_mode_uses_unix_epoch_buckets(self):
         clock = SolverRoundEpochClock(epoch_seconds=60)
         self.assertEqual(clock.current_epoch(now=0), 0)

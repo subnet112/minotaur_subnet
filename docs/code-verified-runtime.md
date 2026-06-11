@@ -209,7 +209,7 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 - `ENABLE_SOLVER_ROUND_COORDINATOR` (default `true` when the benchmark worker is enabled) — drives the closed-round solver lifecycle on the API server.
 - `SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS` (default `5`) — how often the API server polls durable round state to resume explicitly closed rounds.
 - `SOLVER_ROUND_OPEN_SECONDS` (default `300`) — how long the elected leader leaves a solver round `OPEN` before it auto-closes intake and freezes the replay cohort.
-- `SOLVER_ROUND_EPOCH_SECONDS` (default `60`) — wall-clock fallback epoch size used for `close_epoch` / `decision_deadline_epoch` / `effective_epoch` only when native chain tempo and explicit block-based fallback are both unavailable.
+- Wall-clock epoch size is the fixed `EPOCH_SECONDS` protocol constant (`60`, in `minotaur_subnet/epoch/clock.py`) — used for `close_epoch` / `decision_deadline_epoch` / `effective_epoch` when native chain tempo and explicit block-based fallback are both unavailable. It is **consensus-critical and not operator-configurable**: the round-anchored fork pin anchors on `anchor_epoch * EPOCH_SECONDS`, so a divergent value causes `PACK_HASH_MISMATCH`. (Was the `SOLVER_ROUND_EPOCH_SECONDS` env var; removed 2026-06-11.)
 - `SOLVER_ROUND_EPOCH_BLOCKS` (unset by default) — optional block-based fallback epoch size; used only when native chain tempo is unavailable from metagraph/subtensor state.
 - `SUBMISSIONS_ACCEPTING` (default `true`) — global kill switch for new submissions.
 - `SUBMISSIONS_API_KEY` (unset by default) — if set, requires header `x-submission-api-key` on submission create endpoints.
@@ -268,7 +268,7 @@ ALLOW_SUBPROCESS_BENCHMARK=0
 ENABLE_SOLVER_ROUND_COORDINATOR=1
 SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS=5
 SOLVER_ROUND_OPEN_SECONDS=300
-SOLVER_ROUND_EPOCH_SECONDS=60
+# Wall-clock epoch width is a fixed protocol constant (60s) — not configurable.
 # Optional block-based epoch clock instead of wall-clock epochs:
 # SOLVER_ROUND_EPOCH_BLOCKS=360
 SUBTENSOR_URL=ws://127.0.0.1:9944
