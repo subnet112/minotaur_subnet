@@ -1386,8 +1386,19 @@ def get_bridge_status(order_id: str) -> dict:
 def blockloop_status() -> dict:
     """Get block loop tick statistics."""
     if _block_loop is None:
-        return {"running": False, "message": "Block loop not initialized"}
-    return _block_loop.status()
+        result = {"running": False, "message": "Block loop not initialized"}
+    else:
+        result = _block_loop.status()
+    # `orderbook_stats` from the block loop counts only the in-memory OrderBook
+    # working set, so the "total" undercounts historical orders after a restart
+    # (and disagrees with the now-durable /orders list). Source it from the
+    # store instead. Defensive: a store hiccup must never 500 the status probe.
+    if _app_store is not None and hasattr(_app_store, "count_orders_by_status"):
+        try:
+            result["orderbook_stats"] = _app_store.count_orders_by_status()
+        except Exception:
+            pass
+    return result
 
 
 class PrepareOrderRequest(BaseModel):
