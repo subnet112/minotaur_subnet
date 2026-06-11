@@ -305,9 +305,84 @@ def _round_anchored_pin_segment(round_id: str) -> str:
     return serialize_fork_pins(pins)
 
 
+def _maybe_shadow_log_round_fork_pins(
+    ctx: "ServerContext",
+    round_id: str,
+    *,
+    role: str,
+    anchor_epoch: int | None = None,
+) -> None:
+    """Shadow phase (spec §6 step 2): derive + log the round-anchored fork pins
+    and the ``benchmark_pack_hash`` they *would* produce, with **zero consensus
+    effect**.
+
+    Enabled by ``ROUND_ANCHOR_SHADOW`` (default-off) and only active while the
+    real gate ``ROUND_ANCHORED_PIN`` is OFF — when the gate is on the live path
+    already derives, binds and logs the pins, so shadow would be redundant. This
+    closes the rollout gap where, with the gate off, ``_derive_round_fork_pins``
+    is never called, so operators have no way to confirm every validator computes
+    the identical pin *before* flipping the gate.
+
+    Strictly observational and best-effort:
+
+    * never stores ``RoundState.fork_pins`` (so the real pack hash is unchanged),
+    * never feeds the worker or corpus,
+    * derives via the same live adapter (:func:`_derive_round_fork_pins`) every
+      node uses, so ``[round-anchor-shadow]`` lines can be diffed across the
+      fleet to prove pin parity,
+    * swallows every error — a shadow log must never perturb the round.
+
+    ``anchor_epoch`` is the round's close epoch when the caller already has it
+    (leader at close). When ``None`` (follower path) it is resolved from the
+    round store, mirroring :func:`_resolve_round_fork_pins`.
+    """
+    if not _env_true("ROUND_ANCHOR_SHADOW", default=False):
+        return
+    if _env_true("ROUND_ANCHORED_PIN", default=False):
+        return  # live path already derives/binds/logs — shadow is redundant
+    try:
+        if anchor_epoch is None:
+            from minotaur_subnet.api.routes import submissions
+            round_state = submissions.get_round_store().get_round(round_id)
+            anchor_epoch = (
+                getattr(round_state, "close_epoch", None)
+                if round_state is not None
+                else None
+            )
+        if anchor_epoch is None:
+            return  # round not closed yet → no anchor to derive from
+        pins = _derive_round_fork_pins(int(anchor_epoch))
+        if not pins:
+            logger.info(
+                "[round-anchor-shadow] role=%s round=%s anchor_epoch=%s pins=deferred "
+                "(unavailable/derivation-skipped)",
+                role, round_id, anchor_epoch,
+            )
+            return
+        from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
+        pin_segment = serialize_fork_pins(pins)
+        actual_pack_hash = _build_solver_round_benchmark_pack_hash(ctx, round_id)
+        would_be_pack_hash = _build_solver_round_benchmark_pack_hash(
+            ctx, round_id, shadow_pin_segment=pin_segment
+        )
+        logger.info(
+            "[round-anchor-shadow] role=%s round=%s anchor_epoch=%s pins=%s "
+            "pin_segment=%s actual_pack_hash=%s would_be_pack_hash=%s",
+            role, round_id, anchor_epoch, pins, pin_segment,
+            actual_pack_hash, would_be_pack_hash,
+        )
+    except Exception as exc:  # observe-only — must never break the round
+        logger.warning(
+            "[round-anchor-shadow] logging failed for round %s (ignored): %s",
+            round_id, exc,
+        )
+
+
 def _build_solver_round_benchmark_pack_hash(
     ctx: ServerContext,
     round_id: str,
+    *,
+    shadow_pin_segment: str | None = None,
 ) -> str:
     """Build a deterministic benchmark-pack hash covering:
     1. Round metadata (app list, submissions, policy)
@@ -387,7 +462,15 @@ def _build_solver_round_benchmark_pack_hash(
     }
     # Bind the round-anchored fork pins into the pack hash (gated, default-off).
     # Added only when present so the default hash is byte-for-byte unchanged.
-    pin_segment = _round_anchored_pin_segment(round_id)
+    #
+    # ``shadow_pin_segment`` lets the shadow logger
+    # (:func:`_maybe_shadow_log_round_fork_pins`) compute the *would-be* hash for
+    # an explicit segment WITHOUT activating the gate. Real call sites never pass
+    # it, so production behavior is unchanged.
+    if shadow_pin_segment is not None:
+        pin_segment = shadow_pin_segment
+    else:
+        pin_segment = _round_anchored_pin_segment(round_id)
     if pin_segment:
         payload["fork_pins"] = pin_segment
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2049,6 +2132,12 @@ async def initialize(ctx: ServerContext) -> dict:
                 # Round-anchored fork pins (gated, default-off). Populate BEFORE
                 # the pack hash below so the canonical pins are folded into it.
                 _maybe_populate_round_fork_pins(current.round_id, close_epoch)
+                # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off,
+                # still derive + log the pins the leader WOULD pin, so fleet pin
+                # parity can be verified before enabling. No consensus effect.
+                _maybe_shadow_log_round_fork_pins(
+                    ctx, current.round_id, role="leader", anchor_epoch=close_epoch,
+                )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
                 closed = submissions._close_solver_round_state(

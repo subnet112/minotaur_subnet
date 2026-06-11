@@ -376,6 +376,17 @@ services:
       # the round's epoch anchor — no manual per-round block coordination.
       # ROUND_ANCHORED_PIN: "0"   # default off; flip to 1 fleet-wide to enable
       #
+      # SHADOW (recommended before flipping the gate): set ROUND_ANCHOR_SHADOW: "1"
+      # fleet-wide while ROUND_ANCHORED_PIN stays "0". Each validator then derives
+      # and LOGS the pin it would use (and the would-be benchmark_pack_hash) with
+      # ZERO consensus effect — nothing is bound, stored, or scored. Diff the
+      # `[round-anchor-shadow]` log lines across the fleet for the same round:
+      # identical `pin_segment`/`would_be_pack_hash` everywhere ⇒ safe to enable.
+      # Divergence here is exactly the silent mis-score the gate would have caused,
+      # surfaced harmlessly. ROUND_ANCHOR_SHADOW is a no-op once ROUND_ANCHORED_PIN
+      # is on (the live path already derives + logs + binds).
+      # ROUND_ANCHOR_SHADOW: "0"  # default off; flip to 1 to observe before enabling
+      #
       # The env pins below are DEV/TEST-ONLY manual overrides and are IGNORED
       # when ROUND_ANCHORED_PIN is on (do not set them in production):
       # BENCHMARK_EPOCH_BLOCK: "<base block>"      # dev/test only

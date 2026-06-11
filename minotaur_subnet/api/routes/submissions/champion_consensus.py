@@ -243,6 +243,17 @@ async def _reactive_benchmark_candidate(
     except Exception as exc:  # observe-only — must never break verification
         logger.warning("[reactive-determinism] logging failed (ignored): %s", exc)
 
+    # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off, derive + log
+    # the fork pins this follower WOULD use, so operators can diff the leader's
+    # and every follower's '[round-anchor-shadow]' lines to confirm fleet-wide pin
+    # parity before flipping ROUND_ANCHORED_PIN. Observe-only, no consensus effect.
+    if round_id:
+        try:
+            from minotaur_subnet.api.startup import _maybe_shadow_log_round_fork_pins
+            _maybe_shadow_log_round_fork_pins(ctx, round_id, role="follower")
+        except Exception as exc:  # observe-only — must never break verification
+            logger.warning("[round-anchor-shadow] follower logging failed (ignored): %s", exc)
+
     if leader_score <= 0:
         # Leader claims zero — accept if we also scored zero
         return local_score <= 0, local_score
