@@ -370,12 +370,16 @@ services:
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
 
-      # Determinism pins — leave UNSET for normal operation (live head).
-      # When the subnet team coordinates a cross-validator determinism
-      # round, every validator sets the SAME block so the reactive
-      # benchmark scores identical inputs (fork + Stage-2 corpus cutoff):
-      # BENCHMARK_EPOCH_BLOCK: "<base block>"      # pins fork AND corpus
-      # BENCHMARK_CORPUS_TO_BLOCK: "<base block>"  # corpus-only override
+      # Determinism — the production mechanism is AUTOMATIC and per-round.
+      # Set ROUND_ANCHORED_PIN: "1" fleet-wide (coordinated) and every
+      # validator independently derives the SAME canonical fork block from
+      # the round's epoch anchor — no manual per-round block coordination.
+      # ROUND_ANCHORED_PIN: "0"   # default off; flip to 1 fleet-wide to enable
+      #
+      # The env pins below are DEV/TEST-ONLY manual overrides and are IGNORED
+      # when ROUND_ANCHORED_PIN is on (do not set them in production):
+      # BENCHMARK_EPOCH_BLOCK: "<base block>"      # dev/test only
+      # BENCHMARK_CORPUS_TO_BLOCK: "<base block>"  # dev/test only
 
       # Admin gate — REQUIRED on third-party validators. Without it, the
       # default `RELAYER_URL` above + the wrapper-sig the api adds from
