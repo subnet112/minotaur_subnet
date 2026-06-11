@@ -190,7 +190,6 @@ Most runtime behavior is controlled via environment variables.
 | `VALIDATOR_REGISTRY_ADDRESS` | On-chain `ValidatorRegistry` holding the canonical `quorumBps`. Order-consensus daemons read it at startup and refresh once per epoch. See [Quorum management](docs/operator/quorum-management.md) for changing the value. |
 | `CHAMPION_QUORUM_BPS` | Quorum for champion-certification consensus (separate from order consensus; ChampionRegistry on BT EVM holds its own value to mirror) |
 | `SOLVER_ROUND_INTERNAL_API_KEY` | Shared secret for validator-to-validator round control (`x-solver-round-internal-key`) |
-| `SOLVER_ROUND_EPOCH_SECONDS` | Wall-clock fallback solver-round epoch size used only when native tempo is unavailable |
 | `SOLVER_ROUND_EPOCH_BLOCKS` | Optional block-based fallback solver-round epoch size when native tempo is unavailable |
 | `FORCE_LEADER` | Overrides follower mode in local testing |
 
@@ -234,7 +233,8 @@ ALLOW_SUBPROCESS_BENCHMARK=0
 ENABLE_SOLVER_ROUND_COORDINATOR=1
 SOLVER_ROUND_COORDINATOR_INTERVAL_SECONDS=5
 SOLVER_ROUND_OPEN_SECONDS=300
-SOLVER_ROUND_EPOCH_SECONDS=60
+# Wall-clock epoch width is a fixed protocol constant (60s, EPOCH_SECONDS in
+# minotaur_subnet/epoch/clock.py) — consensus-critical, not operator-configurable.
 # Optional block-based epoch clock instead of wall-clock epochs:
 # SOLVER_ROUND_EPOCH_BLOCKS=360
 SUBTENSOR_URL=ws://127.0.0.1:9944
