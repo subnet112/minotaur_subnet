@@ -111,11 +111,6 @@ KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
         "name": "Rizzo (Insured)",
         "url": None,
     },
-    "0xbe93685473ce8fb096997394ea11f7ede92a0ae9": {
-        "hotkey": "5G66U8yjZJygrr8E2JGaR3PkY7UQzMtJdq9ZU2U7UQUsn112",
-        "name": "General Tensor (RoundTable21)",
-        "url": None,
-    },
     "0x8f0bac1081661e193c21028dd1dd1002cd962d9a": {
         "hotkey": "5HBMtn1FvqANpG8d9comQpF1gTZWr1fu9aTd8qKQMUdbbAyo",
         "name": "TAO.com",
