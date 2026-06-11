@@ -274,6 +274,21 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     return pins
 
 
+def _leader_fork_pin_resolver(round_id: str) -> int | None:
+    """Benchmark-chain fork block for the leader's run_once, or None.
+
+    Thin adapter over `_resolve_round_fork_pins` for injection into the
+    BenchmarkWorker (keeps the harness worker free of any API-layer import).
+    Returns the pin for the primary benchmark chain; None when the gate is off or
+    unresolved. The leader and every follower derive the same value from the same
+    anchor — that is the parity.
+    """
+    pins = _resolve_round_fork_pins(round_id)
+    if not pins:
+        return None
+    return pins.get(_round_anchor_chains()[0])
+
+
 def _round_anchored_pin_segment(round_id: str) -> str:
     """Canonical per-chain fork pins for the round, serialized for the pack hash.
 
@@ -726,6 +741,7 @@ async def initialize(ctx: ServerContext) -> dict:
             round_store=round_store,
             genesis_solver_image=_genesis_solver_image,
             require_real_sim=_require_real_sim,
+            pin_resolver=_leader_fork_pin_resolver,
         )
         ctx.benchmark_task = asyncio.create_task(
             ctx.benchmark_worker.run_loop(interval=poll_interval),
