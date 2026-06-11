@@ -113,6 +113,12 @@ def _corpus_to_block(w3: Any, confirmations: int, *, to_block: int | None = None
     """
     if to_block is not None:
         return int(to_block)
+    # Round-anchored derivation is authoritative in production: when its gate is
+    # on, the explicit to_block above is the production path and the env knobs
+    # below are dev/test-only -> skip them (a deferred/None pin falls to live head,
+    # not a stale env block).
+    if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        return max(0, w3.eth.block_number - int(confirmations))
     for var in ("BENCHMARK_CORPUS_TO_BLOCK", "BENCHMARK_EPOCH_BLOCK"):
         raw = os.environ.get(var, "").strip()
         if not raw:

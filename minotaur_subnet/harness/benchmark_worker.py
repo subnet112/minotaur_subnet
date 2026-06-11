@@ -179,6 +179,7 @@ class BenchmarkWorker:
         # Injected by the API layer (keeps the harness free of API imports):
         # round_id -> the round-anchored benchmark-chain fork block, or None.
         self._pin_resolver = pin_resolver
+        self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
 
     def set_epoch_block(self, block_number: int) -> None:
@@ -190,12 +191,24 @@ class BenchmarkWorker:
         self._epoch_block_number = block_number
 
     def _apply_epoch_block_pin(self) -> None:
-        """Pin the benchmark fork to BENCHMARK_EPOCH_BLOCK when set (call-time read so
-        operators can flip without restart). Unset/invalid -> no pin (live head). The
-        block threads through run_benchmark -> simulate as fork_block, so every sim this
-        round runs at the same Base block -> on-chain scores reproduce across validators."""
+        """DEV/TEST-ONLY manual fork pin via BENCHMARK_EPOCH_BLOCK.
+
+        Production pins the fork automatically and per-round via the round-anchored
+        derivation (ROUND_ANCHORED_PIN). When that gate is on this env override is
+        IGNORED — a stale value must not silently divert a deferred round to an old
+        block. Unset/invalid -> no pin (live head). Call-time read so dev can flip
+        without restart; threads through run_benchmark -> simulate as fork_block."""
         raw = os.environ.get("BENCHMARK_EPOCH_BLOCK", "").strip()
         if not raw:
+            return
+        if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+            if not self._warned_env_pin_ignored:
+                logger.warning(
+                    "[fork-pin] BENCHMARK_EPOCH_BLOCK=%r ignored — ROUND_ANCHORED_PIN is on "
+                    "(round-anchored derivation is authoritative). BENCHMARK_EPOCH_BLOCK is a "
+                    "dev/test-only override; unset it in production.", raw,
+                )
+                self._warned_env_pin_ignored = True
             return
         try:
             block = int(raw)
