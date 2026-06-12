@@ -56,6 +56,22 @@ logger = logging.getLogger(__name__)
 DETHRONE_MARGIN = 0.005
 
 
+def _adoption_disabled() -> bool:
+    """Safety gate: when ``DISABLE_CHAMPION_ADOPTION`` is set, submissions are
+    scored normally (benchmark + scorecard + feedback report all run) but NO
+    challenger is ever adopted as champion — the champion solver and the on-chain
+    emission target stay put.
+
+    Lets us run the real scoring pipeline on a live validator (e.g. to exercise
+    the miner feedback report) without a test submission accidentally winning the
+    champion slot and redirecting emissions. Default off (normal adoption). Read
+    at call time so it can be flipped without a restart.
+    """
+    return os.environ.get("DISABLE_CHAMPION_ADOPTION", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _onchain_pass(scores: list, floor: int) -> tuple[bool, "int | None", int]:
     """all_pass, min_bps, n_missing — a champion-covered app must clear the floor on
     every scenario (ported from scoring_lab/stages.py)."""
@@ -948,6 +964,13 @@ class EpochManager:
            no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
         4. Global improvement over the champion by the dethrone margin (default 0.5%)
         """
+        if _adoption_disabled():
+            logger.warning(
+                "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — %s scored but NOT "
+                "adopted; champion unchanged. Unset the flag to resume adoption.",
+                getattr(challenger, "submission_id", "?"),
+            )
+            return False
         challenger_score = challenger.benchmark_score or 0
         champion_score = self._champion.benchmark_score or 0
         min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
@@ -1178,6 +1201,15 @@ class EpochManager:
         session directly. If neither is configured, updates champion metadata
         only (solver stays the same).
         """
+        # Belt-and-suspenders: even if some path reached activation, never swap
+        # the live champion while adoption is disabled.
+        if _adoption_disabled():
+            logger.warning(
+                "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — refusing hot-swap to "
+                "%s; live champion solver unchanged.",
+                getattr(submission, "submission_id", "?"),
+            )
+            return
         new_runtime = None
 
         if self._runtime_builder is not None:
