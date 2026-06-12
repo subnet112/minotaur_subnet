@@ -622,15 +622,26 @@ async def _enrich_state_with_quote(
     apply, or quoting fails (the scenario then scores 0 as it does today —
     never a crash).
     """
-    if getattr(intent, "intent_type", "") != "swap":
-        return state
-
     raw = state.raw_params_view()
-    # Already quoted (e.g. a real/historical order) — leave as-is.
-    if raw.get("quoted_output") not in (None, ""):
-        return state
-
     intent_function = state.control_view().get("_intent_function", "swap")
+
+    # Manifest-driven gate (NOT intent.intent_type — that field is empty for
+    # the live DexAggregator app, so keying on it makes this a no-op on prod).
+    # Enrich iff the manifest declares source:"quote" params for this function
+    # that aren't already populated. Real/historical orders carry their quote
+    # values, so they're skipped; synthetic scenarios don't, so they're filled.
+    from minotaur_subnet.api.services.app_service import source_quote_param_names
+    quote_param_names = source_quote_param_names(
+        getattr(intent, "manifest", None), intent_function,
+    )
+    if not quote_param_names:
+        return state  # nothing sourced from a quote → leave as-is
+    # `quoted_output` is the canonical "was this quoted" marker: synthetic
+    # scenarios never carry it (they only set static input/output/min_output),
+    # while real/historical orders always do. (min_output_amount can't be the
+    # marker — scenarios set it statically.)
+    if raw.get("quoted_output") not in (None, ""):
+        return state  # already quoted (real/historical order) — leave as-is
 
     quote_params = reference_params
     if not quote_params:

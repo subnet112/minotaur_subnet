@@ -1083,6 +1083,7 @@ class BenchmarkWorker:
 
         from minotaur_subnet.api.services.app_service import (
             map_quote_result_to_params,
+            source_quote_param_names,
         )
 
         reference: dict[str, dict[str, str]] = {}
@@ -1100,7 +1101,9 @@ class BenchmarkWorker:
                 {"chain_ids": list({s.chain_id for _, s, _ in intents} or {1})}
             )
             for intent, state, snapshot in intents:
-                if getattr(intent, "intent_type", "") != "swap":
+                intent_function = state.control_view().get("_intent_function", "swap")
+                # Same manifest-driven gate as run_benchmark's enrichment.
+                if not source_quote_param_names(intent.manifest, intent_function):
                     continue
                 if state.raw_params_view().get("quoted_output") not in (None, ""):
                     continue
@@ -1109,7 +1112,6 @@ class BenchmarkWorker:
                     f"{intent.app_id}:{scenario_name}"
                     if scenario_name else intent.app_id
                 )
-                intent_function = state.control_view().get("_intent_function", "swap")
                 try:
                     quote_result = await session.quote(intent, state, snapshot)
                 except Exception as exc:
