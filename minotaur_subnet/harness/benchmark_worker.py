@@ -1226,6 +1226,7 @@ class BenchmarkWorker:
                     "score": r.score,
                     "plan_score": r.plan_score,
                     "trigger_score": r.trigger_score,
+                    "on_chain_score": getattr(r, "on_chain_score", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
                     "has_plan": r.plan is not None,
