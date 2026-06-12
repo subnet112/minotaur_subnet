@@ -354,7 +354,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         worker = BenchmarkWorker(store, use_docker=True)
 
         # Mock the actual benchmarking to avoid Docker
-        async def mock_benchmark_submission(image_tag, intents, score_fn):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="test",
                 plan=_make_plan("test"),
@@ -389,7 +389,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         worker = BenchmarkWorker(store, use_docker=True, round_store=round_store)
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             raise AssertionError("benchmark should not run while round is open")
 
         worker._benchmark_submission = mock_benchmark_submission
@@ -465,7 +465,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         worker = BenchmarkWorker(store)
         scores = {sub1.submission_id: 0.65, sub2.submission_id: 0.85}
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             # Determine which submission this is
             for sid, score in scores.items():
                 sub = store.get(sid)
@@ -545,7 +545,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         worker = BenchmarkWorker(store)
 
-        async def mock_benchmark(image_tag, intents, score_fn):
+        async def mock_benchmark(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.99)]
 
         worker._benchmark_submission = mock_benchmark
@@ -575,7 +575,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         worker = BenchmarkWorker(store, on_champion_adopted=on_adopted)
 
-        async def mock_benchmark(image_tag, intents, score_fn):
+        async def mock_benchmark(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.85)]
 
         worker._benchmark_submission = mock_benchmark
@@ -731,7 +731,7 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         worker = BenchmarkWorker(store)
 
         # Mock _benchmark_solver_path to avoid real subprocess
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             self.assertEqual(solver_path, "/tmp/fake_solver.py")
             return [BenchmarkResult(
                 intent_id="test", plan=_make_plan(), score=0.7, plan_score=0.7,
@@ -762,11 +762,11 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         worker = BenchmarkWorker(store)
         path_used = []
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             path_used.append(solver_path)
             return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.5)]
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             self.fail("Docker benchmark should not be called when solver_path exists")
 
         worker._benchmark_solver_path = mock_benchmark_solver_path
@@ -822,7 +822,7 @@ class TestGenesisBootstrap(unittest.TestCase):
         )
 
         # Mock the actual benchmarking
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
             )]
@@ -859,7 +859,7 @@ class TestGenesisBootstrap(unittest.TestCase):
             baseline_solver_path="/tmp/fake_baseline.py",
         )
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
             )]
@@ -921,7 +921,7 @@ class TestGenesisBootstrap(unittest.TestCase):
             baseline_solver_path="/tmp/fake_baseline.py",
         )
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
             )]
@@ -992,7 +992,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             self.assertEqual(image_tag, "solver-champ:screening")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
@@ -1045,7 +1045,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             self.assertEqual(solver_path, "/tmp/fake_baseline.py")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
@@ -1096,7 +1096,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn):
+        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
             self.assertEqual(solver_path, "/tmp/fake_baseline.py")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(

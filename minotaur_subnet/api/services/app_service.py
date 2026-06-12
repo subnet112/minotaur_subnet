@@ -837,3 +837,68 @@ def build_intent_params_hex_from_manifest(
     except Exception as exc:
         logger.warning("Failed to encode manifest intent params: %s", exc)
         return None
+
+
+def map_quote_result_to_params(
+    quote_result: Any,
+    manifest_dict: dict[str, Any] | None,
+    intent_function: str,
+    slippage_bps: int = 50,
+) -> dict[str, str]:
+    """Map a solver QuoteResult onto an app's source:"quote" intent params.
+
+    This is the ONE place the quote → param mapping lives. The live
+    ``get_quote`` endpoint (api/routes/orders.py) and the benchmark
+    quote-at-benchmark path both depend on the same contract: for the
+    manifest's ``intent_function``, every param whose definition has
+    ``source == "quote"`` is set to ``quote_values[param_def["quote_field"]]``.
+
+    Args:
+        quote_result: A ``QuoteResult`` (or any object exposing
+            ``estimated_output``, ``platform_fee_wei``, ``gas_estimate``).
+        manifest_dict: The app's manifest in legacy-dict form (as returned by
+            ``JsExecutionEngine.get_manifest``). May be ``None``.
+        intent_function: The intent function name to resolve params for.
+        slippage_bps: Slippage applied to derive ``suggested_min_output`` from
+            ``estimated_output`` (default 50 = 0.5%).
+
+    Returns:
+        A dict of ``{param_name: value}`` for ONLY the source:"quote" params
+        the manifest declares for ``intent_function``. Empty dict if there's no
+        manifest, no matching function, or no quote params.
+    """
+    if quote_result is None or not manifest_dict:
+        return {}
+
+    estimated_output = str(getattr(quote_result, "estimated_output", "0") or "0")
+    suggested_min_output = "0"
+    try:
+        est_int = int(estimated_output)
+        if est_int > 0:
+            bps = max(0, min(int(slippage_bps), 10000))
+            suggested_min_output = str(est_int * (10000 - bps) // 10000)
+    except (ValueError, TypeError):
+        pass
+
+    # Mirror the quote_values dict the live get_quote endpoint binds against.
+    quote_values = {
+        "estimated_output": estimated_output,
+        "estimated_output_gross": estimated_output,
+        "suggested_min_output": suggested_min_output,
+        "platform_fee_wei": str(getattr(quote_result, "platform_fee_wei", "0") or "0"),
+        "gas_estimate": str(getattr(quote_result, "gas_estimate", 0) or 0),
+    }
+
+    mapped: dict[str, str] = {}
+    for fn_def in manifest_dict.get("intent_functions", []) or []:
+        if fn_def.get("name") != intent_function:
+            continue
+        for param_name, param_def in (fn_def.get("params", {}) or {}).items():
+            if not isinstance(param_def, dict):
+                continue
+            if param_def.get("source") == "quote":
+                qf = param_def.get("quote_field", "")
+                if qf and qf in quote_values:
+                    mapped[param_name] = quote_values[qf]
+        break
+    return mapped
