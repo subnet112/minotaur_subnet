@@ -902,3 +902,26 @@ def map_quote_result_to_params(
                     mapped[param_name] = quote_values[qf]
         break
     return mapped
+
+
+def source_quote_param_names(
+    manifest_dict: dict[str, Any] | None,
+    intent_function: str,
+) -> set[str]:
+    """Names of the params an app sources from a quote for ``intent_function``.
+
+    The one gate used to decide whether a benchmark scenario needs
+    quote-at-benchmark enrichment. Keyed off the manifest (NOT
+    ``AppIntentDefinition.intent_type``, which is empty for the live
+    DexAggregator app — keying on it makes enrichment a silent no-op).
+    """
+    if not manifest_dict:
+        return set()
+    for fn_def in manifest_dict.get("intent_functions", []) or []:
+        if fn_def.get("name") != intent_function:
+            continue
+        return {
+            n for n, pdef in (fn_def.get("params", {}) or {}).items()
+            if isinstance(pdef, dict) and pdef.get("source") == "quote"
+        }
+    return set()

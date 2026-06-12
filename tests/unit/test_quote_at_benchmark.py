@@ -101,7 +101,9 @@ def _swap_intent() -> AppIntentDefinition:
         app_id="dex",
         name="Dex",
         version="1.0.0",
-        intent_type="swap",
+        # Empty on purpose — mirrors the LIVE DexAggregator app (intent_type='').
+        # Enrichment must NOT depend on this field; it's manifest-driven.
+        intent_type="",
         js_code="//hidden",
         manifest=_swap_manifest(),
         config=AppIntentConfig(
