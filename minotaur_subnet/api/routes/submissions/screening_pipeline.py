@@ -10,11 +10,24 @@ Handles:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import os
 import shutil
+import tarfile
 import tempfile
 from urllib.parse import urlparse
+
+# Ephemeral sandbox used to fetch untrusted miner repos. The clone runs in a
+# short-lived, hardened container (read-only rootfs, all caps dropped, no new
+# privileges, pid/mem caps) instead of in the long-lived validator process, and
+# the result is streamed back as a tar over stdout — so the validator image
+# needs no git and never executes repo content during the fetch.
+DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
+# Hard cap on the clone tarball (compressed stream + uncompressed total) to
+# bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
+MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 
 from minotaur_subnet.harness.submission_store import SubmissionStatus
 from minotaur_subnet.harness.provenance import create_signed_provenance
@@ -118,11 +131,171 @@ def _cleanup_temp_file(path: str | None) -> None:
         logger.warning("Failed to remove temporary helper file: %s", path)
 
 
+def _resolve_clone_basic_auth(repo_url: str) -> str | None:
+    """Return base64(user:pass) for a private https clone, honoring the host
+    allowlist; None when creds are absent/partial or the host isn't allowed.
+
+    Mirrors the policy in ``_build_git_process_env`` so the sandboxed clone path
+    enforces the same private-repo credential scoping.
+    """
+    username = os.environ.get("SUBMISSION_GIT_CLONE_USERNAME", "").strip()
+    password = os.environ.get("SUBMISSION_GIT_CLONE_PASSWORD", "").strip()
+    if not username or not password:
+        return None
+    allowed_hosts = _parse_host_allowlist(
+        os.environ.get("SUBMISSION_GIT_CLONE_ALLOWED_HOSTS", "")
+    )
+    if not allowed_hosts:
+        logger.warning(
+            "Ignoring private repo clone credentials because "
+            "SUBMISSION_GIT_CLONE_ALLOWED_HOSTS is unset"
+        )
+        return None
+    if (urlparse(repo_url).hostname or "").lower() not in allowed_hosts:
+        return None
+    return base64.b64encode(f"{username}:{password}".encode()).decode()
+
+
+def _safe_extract_tar(data: bytes, dest: str) -> bool:
+    """Extract a clone tarball (from the sandbox's stdout) into ``dest`` with
+    traversal/symlink/size guards. Returns True on success."""
+    if not data:
+        logger.warning("Clone sandbox produced an empty archive")
+        return False
+    if len(data) > MAX_CLONE_TAR_BYTES:
+        logger.warning("Clone archive too large: %d bytes", len(data))
+        return False
+    os.makedirs(dest, exist_ok=True)
+    dest_real = os.path.realpath(dest)
+    prefix = dest_real + os.sep
+    total = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+            members = tf.getmembers()
+            for m in members:
+                target = os.path.realpath(os.path.join(dest_real, m.name))
+                if target != dest_real and not target.startswith(prefix):
+                    logger.warning("Clone archive path traversal blocked: %s", m.name)
+                    return False
+                if m.issym() or m.islnk():
+                    link_base = os.path.dirname(target)
+                    link_target = os.path.realpath(os.path.join(link_base, m.linkname))
+                    if link_target != dest_real and not link_target.startswith(prefix):
+                        logger.warning("Clone archive unsafe link blocked: %s", m.name)
+                        return False
+                total += max(0, m.size)
+                if total > MAX_CLONE_TAR_BYTES:
+                    logger.warning("Clone archive uncompressed size exceeds cap")
+                    return False
+            # Validated; extract with the stdlib data filter as defense in depth.
+            try:
+                tf.extractall(dest_real, filter="data")
+            except TypeError:  # Python < 3.12 has no extraction filter kwarg
+                tf.extractall(dest_real)
+        return True
+    except Exception as exc:  # noqa: BLE001 — any tar error => clone failed
+        logger.warning("Clone archive extraction failed: %s", exc)
+        return False
+
+
+async def _clone_repo_sandboxed(repo_url: str, commit_hash: str, dest: str) -> bool:
+    """Fetch a miner repo at ``commit_hash`` inside an ephemeral, hardened
+    container and extract the result into ``dest``.
+
+    The container gets network egress (to reach the git host) but is otherwise
+    locked down: read-only rootfs with tmpfs scratch, all caps dropped, no new
+    privileges, and pid/cpu/memory caps. Only a tar of the checked-out tree is
+    streamed back over stdout; nothing from the repo executes here.
+    """
+    image = os.environ.get("SUBMISSION_CLONE_IMAGE", "").strip() or DEFAULT_CLONE_IMAGE
+    network = os.environ.get("SUBMISSION_CLONE_NETWORK", "").strip() or "bridge"
+    basic_auth = _resolve_clone_basic_auth(repo_url)
+
+    # git/tar progress -> stderr so stdout carries only the tarball. Repo URL and
+    # commit arrive via env (referenced as "$REPO_URL"/"$COMMIT") so a hostile
+    # value can't break out of the argv. Auth (when present) is sent as an
+    # http.extraHeader from $GIT_BASIC_AUTH, never on the command line.
+    hdr = '-c "http.extraHeader=Authorization: Basic $GIT_BASIC_AUTH" ' if basic_auth else ""
+    script = (
+        "set -e; export HOME=/tmp; "
+        f'git {hdr}clone --no-checkout "$REPO_URL" /clone >&2; '
+        f'git {hdr}-C /clone fetch origin "+refs/heads/*:refs/remotes/origin/*" >&2; '
+        'git -C /clone checkout "$COMMIT" >&2; '
+        "tar -C /clone -cf - ."
+    )
+    cmd = [
+        "docker", "run", "--rm",
+        # The alpine/git image's ENTRYPOINT is `git`; override to a shell so the
+        # clone+fetch+checkout+tar script runs (and stays image-agnostic).
+        "--entrypoint", "sh",
+        "--network", network,
+        "--read-only",
+        "--tmpfs", "/clone:rw,exec,nosuid,size=512m",
+        "--tmpfs", "/tmp:rw,exec,nosuid,size=64m",
+        "--cap-drop=ALL",
+        "--security-opt", "no-new-privileges",
+        "--pids-limit=256",
+        "--memory=2g",
+        "--cpus=2",
+        "-e", "GIT_TERMINAL_PROMPT=0",
+        "-e", "REPO_URL",
+        "-e", "COMMIT",
+    ]
+    if basic_auth:
+        cmd += ["-e", "GIT_BASIC_AUTH"]
+    cmd += [image, "-c", script]
+
+    run_env = os.environ.copy()
+    run_env["REPO_URL"] = repo_url
+    run_env["COMMIT"] = commit_hash
+    if basic_auth:
+        run_env["GIT_BASIC_AUTH"] = basic_auth
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=run_env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
+    except asyncio.TimeoutError:
+        logger.warning("Clone sandbox timed out for %s", repo_url)
+        return False
+    except FileNotFoundError:
+        logger.error("docker CLI not found; cannot run clone sandbox")
+        return False
+
+    if proc.returncode != 0:
+        logger.warning(
+            "Clone sandbox failed (rc=%s): %s",
+            proc.returncode,
+            stderr.decode("utf-8", errors="replace")[:300],
+        )
+        return False
+    return _safe_extract_tar(stdout, dest)
+
+
 async def _clone_repo(repo_url: str, commit_hash: str, dest: str) -> bool:
     """Clone a git repo at a specific commit.
 
+    http(s) repos (the production path) are fetched in an ephemeral hardened
+    container (``_clone_repo_sandboxed``) so the validator process never runs
+    git on untrusted input. ``file://`` repos — only used by the bind-mounted
+    local-testnet stack — keep the in-process clone, which understands the
+    host-foreign-ownership trust dance.
+
     Returns True on success, False on failure.
     """
+    scheme = (urlparse(repo_url).scheme or "").lower()
+    if scheme in ("http", "https"):
+        return await _clone_repo_sandboxed(repo_url, commit_hash, dest)
+    return await _clone_repo_in_process(repo_url, commit_hash, dest)
+
+
+async def _clone_repo_in_process(repo_url: str, commit_hash: str, dest: str) -> bool:
+    """Clone directly in the validator process (used for local-testnet
+    ``file://`` repos). Requires git on PATH."""
     git_env, askpass_path = _build_git_process_env(repo_url)
     try:
         # Clone the repo. Miners push to branches (miner/{id}), so the

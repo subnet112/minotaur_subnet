@@ -3,6 +3,10 @@
 
 # Core SDK deps
 eth-abi>=4.0.0
+# keccak backend for eth_hash.auto (used by the baseline solver to compute the
+# swap function selector). Without an explicit backend, the sandbox raises
+# "None of these hashing backends are installed: ['pycryptodome', 'pysha3']".
+eth-hash[pycryptodome]>=0.5.0
 
 # Common ML/data libraries (miners can add more in their requirements.txt)
 numpy>=1.26.0
