@@ -372,6 +372,12 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
+        # Champion quote pre-pass: anchor each scenario's on-chain quote params
+        # (CoW quoted_output etc.) to the champion solver so every challenger is
+        # graded against the same reference output. Falls back to per-submission
+        # self-quoting when no champion is available (still fixes the revert).
+        reference_quotes = await self._build_reference_quotes(intents)
+
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
             # Skip already-scored submissions (may appear in BENCHMARKING
@@ -403,6 +409,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_solver_path(
                         sub.solver_path, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     avg_score = self._compute_avg_score(results)
                     details = self._results_to_details(results)
@@ -433,6 +440,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_submission(
                         sub.image_tag, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
@@ -484,6 +492,7 @@ class BenchmarkWorker:
         image_tag: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against one submission's Docker image."""
         orch = SolverOrchestrator()
@@ -506,6 +515,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -553,6 +563,7 @@ class BenchmarkWorker:
         solver_path: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against a local solver file (subprocess mode)."""
         orch = SolverOrchestrator()
@@ -565,6 +576,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -1014,6 +1026,112 @@ class BenchmarkWorker:
         self._rank_scored_submissions([sub])
 
         return 1
+
+    def _resolve_champion_image(self) -> str | None:
+        """Resolve the Docker image tag of the current champion (or genesis).
+
+        Mirrors the champion resolution in
+        ``_maybe_bootstrap_solving_apps_with_champion``: prefer an explicit
+        champion, fall back to a SCORED/ADOPTED genesis submission, and map a
+        genesis hotkey with no image to the configured genesis solver image.
+        Returns ``None`` when no usable champion image is available.
+        """
+        champion = self._sub_store.get_champion()
+        if champion is None:
+            genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+            if genesis is not None and genesis.status in (
+                SubmissionStatus.SCORED,
+                SubmissionStatus.ADOPTED,
+            ):
+                champion = genesis
+        if champion is None:
+            return None
+        image_tag = champion.image_tag
+        if (
+            image_tag is None
+            and champion.hotkey == GENESIS_HOTKEY
+            and self._genesis_solver_image
+        ):
+            image_tag = self._genesis_solver_image
+        return image_tag
+
+    async def _build_reference_quotes(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+    ) -> dict[str, dict[str, str]]:
+        """Quote every scenario with the CHAMPION solver as the reference.
+
+        Runs a short champion pre-pass before benchmarking submissions: start a
+        champion Docker session, ask it to quote each scenario, map the result
+        via the shared ``map_quote_result_to_params`` helper, and key the output
+        by the same per-scenario label ``run_benchmark`` uses (``app_id`` or
+        ``app_id:scenario_name``). This anchors the on-chain ``quoted_output``
+        (the CoW fee reference) to the champion so every challenger is graded
+        against the same reference output — the champion→challenger fallback the
+        product owner specified.
+
+        Returns ``{}`` (every scenario self-quotes, which still fixes the
+        revert) when no champion image is available, Docker is disabled, or the
+        champion session can't be started.
+        """
+        if not self._use_docker:
+            return {}
+        image_tag = self._resolve_champion_image()
+        if image_tag is None:
+            logger.info("Reference-quote pre-pass skipped: no champion image")
+            return {}
+
+        from minotaur_subnet.api.services.app_service import (
+            map_quote_result_to_params,
+        )
+
+        reference: dict[str, dict[str, str]] = {}
+        orch = SolverOrchestrator()
+        try:
+            session = await orch.start_docker(image_tag)
+        except Exception as exc:
+            logger.warning(
+                "Reference-quote pre-pass: failed to start champion session "
+                "(%s); scenarios will self-quote", exc,
+            )
+            return {}
+        try:
+            await session.initialize(
+                {"chain_ids": list({s.chain_id for _, s, _ in intents} or {1})}
+            )
+            for intent, state, snapshot in intents:
+                if getattr(intent, "intent_type", "") != "swap":
+                    continue
+                if state.raw_params_view().get("quoted_output") not in (None, ""):
+                    continue
+                scenario_name = state.control_view().get("_scenario_name", "")
+                label = (
+                    f"{intent.app_id}:{scenario_name}"
+                    if scenario_name else intent.app_id
+                )
+                intent_function = state.control_view().get("_intent_function", "swap")
+                try:
+                    quote_result = await session.quote(intent, state, snapshot)
+                except Exception as exc:
+                    logger.warning(
+                        "Reference-quote pre-pass: champion quote failed for "
+                        "%s (%s); scenario will self-quote", label, exc,
+                    )
+                    continue
+                if quote_result is None:
+                    continue
+                mapped = map_quote_result_to_params(
+                    quote_result, intent.manifest, intent_function,
+                )
+                if mapped:
+                    reference[label] = mapped
+            logger.info(
+                "Reference-quote pre-pass: built %d champion reference quotes",
+                len(reference),
+            )
+        finally:
+            await session.shutdown()
+        return reference
 
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.
