@@ -7,6 +7,10 @@ eth-abi>=4.0.0
 # swap function selector). Without an explicit backend, the sandbox raises
 # "None of these hashing backends are installed: ['pycryptodome', 'pysha3']".
 eth-hash[pycryptodome]>=0.5.0
+# web3 — the reference baseline solver uses it for RPC pool discovery / quoting.
+# Must live here because the screening build runs `docker build --network=none`,
+# so a miner Dockerfile cannot `pip install web3` itself (no PyPI access).
+web3>=6.15.0
 
 # Common ML/data libraries (miners can add more in their requirements.txt)
 numpy>=1.26.0
