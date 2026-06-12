@@ -1048,6 +1048,35 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     if sub is None:
         raise HTTPException(status_code=404, detail="Submission not found")
     d = sub.status_dict()
+    # Feedback report (P1): cheap read+shape of the already-persisted benchmark
+    # detail + aggregate-vs-champion. Best-effort — never break /status on it.
+    try:
+        from .report import build_submission_report
+        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+
+        champion_score: float | None = None
+        champ = get_round_store().get_active_champion()
+        if champ is not None and champ.submission_id:
+            champ_sub = store.get(champ.submission_id)
+            champion_score = champ_sub.benchmark_score if champ_sub is not None else None
+
+        threshold = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
+        reason = d.get("rejection_reason")
+        if not reason and sub.round_id:
+            rs = get_round_store().get_round(sub.round_id)
+            if rs is not None and getattr(rs, "abort_reason", None):
+                reason = rs.abort_reason
+
+        d["report"] = build_submission_report(
+            sub,
+            champion_score=champion_score,
+            threshold=threshold,
+            dethrone_margin=DETHRONE_MARGIN,
+            reason=reason,
+        )
+    except Exception as exc:
+        logger.warning("submission report build failed for %s: %s", submission_id, exc)
+        d["report"] = None
     return StatusResponse(**d)
 
 
