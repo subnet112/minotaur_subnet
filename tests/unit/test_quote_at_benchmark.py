@@ -207,7 +207,9 @@ def test_run_benchmark_enriches_from_reference_quote():
     assert sess.quote_calls == 0, "reference present → must NOT self-quote"
     scored = sess.scored_states[0]
     assert scored["quoted_output"] == "999"
-    assert scored["min_output_amount"] == "990", "quote value must win over scenario"
+    # min_output_amount stays the scenario's loose floor (NOT the quote's), so a
+    # worse-but-functional challenger still executes and is graded on-chain.
+    assert scored["min_output_amount"] == "1", "scenario min_output must be kept"
     # The intent_order built for simulation carries the enriched params.
     assert captured["intent_order"] is not None
 
@@ -224,7 +226,8 @@ def test_run_benchmark_falls_back_to_self_quote():
     assert sess.quote_calls == 1, "absent reference → must self-quote"
     scored = sess.scored_states[0]
     assert scored["quoted_output"] == "2000000"
-    assert scored["min_output_amount"] == str(2000000 * 9950 // 10000)
+    # min_output stays the scenario's loose floor (kept, not the quote's tight one).
+    assert scored["min_output_amount"] == "1"
     assert scored["platform_fee_wei"] == "50"
 
 

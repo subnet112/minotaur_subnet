@@ -673,8 +673,17 @@ async def _enrich_state_with_quote(
         return state
 
     # Quote VALUES win over the scenario's params for the source:"quote"
-    # fields (merge order matters — scenario first, quote second).
+    # fields (merge order matters — scenario first, quote second)...
     new_raw = {**raw, **quote_params}
+    # ...EXCEPT min_output_amount: for benchmark SCORING we keep the scenario's
+    # loose floor. The champion-quote-derived suggested_min_output is a tight
+    # slippage floor (estimated*0.995) that reverts a worse-but-functional
+    # challenger with "Too little received" → scores 0, destroying ranking
+    # granularity. We still anchor quoted_output (the CoW surplus reference) to
+    # the quote; min_output stays loose so every solver executes and is graded
+    # by its actual on-chain output.
+    if raw.get("min_output_amount") not in (None, ""):
+        new_raw["min_output_amount"] = raw["min_output_amount"]
     return IntentState(
         contract_address=state.contract_address,
         chain_id=state.chain_id,
