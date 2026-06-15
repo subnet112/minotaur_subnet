@@ -92,7 +92,10 @@ async def _reactive_benchmark_candidate(
         SolverOrchestrator,
         run_benchmark,
     )
-    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+    from minotaur_subnet.harness.benchmark_worker import (
+        BenchmarkWorker,
+        _challenger_quorum_mode,
+    )
 
     image_tag = candidate.image_tag
     if not image_tag:
@@ -131,11 +134,21 @@ async def _reactive_benchmark_candidate(
     from minotaur_subnet.api.routes import apps as _apps_module
     simulator = getattr(_apps_module, "_simulator", None)
 
+    # This follower's stable identity seeds its OWN diverse Stage-2 subset under
+    # CHALLENGER_QUORUM_MODE, so it independently tests a different slice than the
+    # leader. Best-effort: None falls back to the shared round_id-only draw.
+    try:
+        from minotaur_subnet.api.startup import _resolve_solver_round_hotkey
+        _my_identity = _resolve_solver_round_hotkey()
+    except Exception:
+        _my_identity = None
+
     worker = BenchmarkWorker(
         submission_store=get_store(),  # SubmissionStore (needed by constructor)
         app_store=app_store,
         use_docker=True,
         simulator=simulator,
+        validator_identity=_my_identity,
     )
 
     # Input parity with the leader. Prefer the ROUND-ANCHORED pin: the follower
@@ -169,8 +182,10 @@ async def _reactive_benchmark_candidate(
     score_fn = await worker._build_score_fn(intents)
     intents = worker._enrich_intents_with_manifests(intents)
 
-    # Stage 2: historical scenarios deterministic from round_id.
-    # Peers must sample the same set as the leader or scores will diverge.
+    # Stage 2 historical scenarios. Legacy (flag off): seeded by round_id alone so
+    # peers sample the SAME set as the leader (reproducibility check). Under
+    # CHALLENGER_QUORUM_MODE the worker's identity seeds a DIFFERENT, diverse subset
+    # per validator — intended, so each casts an independent verdict over its own slice.
     if round_id:
         try:
             historical = worker._load_historical_scenarios(round_id)
@@ -218,6 +233,17 @@ async def _reactive_benchmark_candidate(
 
     # Compute average score (same logic as BenchmarkWorker._compute_avg_score)
     local_score = worker._compute_avg_score(results)
+
+    # CHALLENGER_QUORUM_MODE: cast an INDEPENDENT adopt vote rather than reproducing
+    # the leader's number. Benchmark the CURRENT champion on this follower's own
+    # (diverse) intents and apply the SAME adoption rule the leader uses. The vote
+    # is this validator's own judgement; quorum of YES votes -> adopt.
+    if _challenger_quorum_mode():
+        return await _independent_adopt_vote(
+            worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
+            chal_results=results, chal_score=local_score, candidate=candidate,
+            round_id=round_id,
+        )
 
     logger.info(
         "Reactive benchmark for %s: local_score=%.4f leader_score=%.4f",
@@ -268,6 +294,104 @@ async def _reactive_benchmark_candidate(
             tolerance_pct * 100,
         )
     return verified, local_score
+
+
+async def _independent_adopt_vote(
+    *,
+    worker: Any,
+    intents: list,
+    score_fn: Any,
+    simulator: Any,
+    chal_results: list,
+    chal_score: float,
+    candidate: Any,
+    round_id: str | None,
+) -> tuple[bool, float]:
+    """This follower's INDEPENDENT adopt vote (CHALLENGER_QUORUM_MODE).
+
+    Benchmarks the CURRENT champion on the SAME (this follower's diverse) intents
+    and applies the shared ``evaluate_adoption`` rule — so the vote reflects this
+    validator's own judgement over its own slice of orders, not reproduction of the
+    leader's number. Returns ``(adopt, chal_score)``.
+
+    Conservative on uncertainty: if the champion image can't be resolved, or its
+    benchmark needs a real simulator and none is available, vote REJECT rather than
+    risk adopting an unverified challenger.
+    """
+    import os
+
+    from minotaur_subnet.harness.orchestrator import (
+        BenchmarkConfig,
+        RealSimulationUnavailable,
+        SolverOrchestrator,
+        run_benchmark,
+    )
+    from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
+    from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+
+    chal_card = worker._build_scorecard(chal_results).to_dict()
+    champ_image = worker._resolve_champion_image()
+    if not champ_image:
+        logger.warning(
+            "[independent-vote] candidate=%s: cannot resolve current champion image "
+            "— voting REJECT (cannot verify improvement)",
+            candidate.submission_id,
+        )
+        return False, chal_score
+
+    _require_real_sim = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    orch = SolverOrchestrator()
+    champ_session = await orch.start_docker(champ_image)
+    try:
+        champ_results = await run_benchmark(
+            champ_session,
+            intents,
+            config=BenchmarkConfig(
+                chain_ids=list({s.chain_id for _, s, _ in intents} or {1}),
+            ),
+            score_fn=score_fn,
+            simulator=simulator,
+            require_real_sim=_require_real_sim,
+            fork_block=worker._epoch_block_number,
+        )
+    except RealSimulationUnavailable:
+        logger.error(
+            "[independent-vote] candidate=%s: champion benchmark needs a real sim "
+            "but none available — voting REJECT",
+            candidate.submission_id,
+        )
+        return False, chal_score
+    finally:
+        await champ_session.shutdown()
+
+    champ_score = worker._compute_avg_score(champ_results)
+    champ_card = worker._build_scorecard(champ_results).to_dict()
+    # Use the SAME margin source the leader's EpochManager uses (the DETHRONE_MARGIN
+    # constant — see routes.py EpochManager construction) so leader and follower
+    # apply an identical bar; do not diverge via a follower-only env override.
+    margin = DETHRONE_MARGIN
+    adopt, reason = evaluate_adoption(
+        challenger_score=chal_score,
+        champion_score=champ_score,
+        challenger_scorecard=chal_card,
+        champion_scorecard=champ_card,
+        dethrone_margin=margin,
+        has_champion=True,
+    )
+    logger.info(
+        "[independent-vote] candidate=%s round=%s vote=%s chal_score=%.4f "
+        "champ_score=%.4f fork_block=%s: %s",
+        candidate.submission_id,
+        round_id,
+        "ADOPT" if adopt else "REJECT",
+        chal_score,
+        champ_score,
+        worker._epoch_block_number,
+        reason,
+    )
+    return adopt, chal_score
 
 
 async def _maybe_prepare_round_for_certification(
