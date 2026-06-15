@@ -62,13 +62,18 @@ def test_snapshot_ok_with_pins(monkeypatch):
     monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
-    ) as derive:
+    ) as derive, patch(
+        "minotaur_subnet.api.startup._fetch_pin_block_hashes",
+        return_value={"964": "0xaaa", "8453": "0xbbb"},
+    ):
         snap = startup._compute_round_anchor_parity_snapshot(14_843_049)
     derive.assert_called_once_with(14_843_049)
     assert snap["status"] == "ok"
     assert snap["anchor_epoch"] == 14_843_049
     # Pins are string-keyed (JSON-friendly) and sorted by chain id.
     assert snap["pins"] == {"964": 5_012_345, "8453": 47_188_506}
+    # Per-chain block hash at the pin — the no-flag fleet determinism probe.
+    assert snap["pin_hashes"] == {"964": "0xaaa", "8453": "0xbbb"}
     assert snap["pin_segment"] == "964:5012345|8453:47188506"
     assert snap["gate_enabled"] is False
     assert isinstance(snap["derived_at"], int)
@@ -91,7 +96,69 @@ def test_snapshot_deferred_when_no_pins(monkeypatch):
         snap = startup._compute_round_anchor_parity_snapshot(42)
     assert snap["status"] == "deferred"
     assert snap["pins"] == {}
+    assert snap["pin_hashes"] == {}
     assert snap["pin_segment"] == ""
+
+
+# ── pin block-hash probe (fleet determinism signal, no corpus flag) ─────────
+
+
+class _FakeEth:
+    def __init__(self, block_hash):
+        self._h = block_hash
+
+    def get_block(self, block):
+        return {"hash": self._h}
+
+
+def _fake_web3(block_hash):
+    class _FakeW3:
+        def __init__(self, *a, **k):
+            self.eth = _FakeEth(block_hash)
+
+        @staticmethod
+        def HTTPProvider(*a, **k):
+            return None
+
+    return _FakeW3
+
+
+def test_fetch_pin_block_hashes_per_chain(monkeypatch):
+    monkeypatch.setattr(
+        "minotaur_subnet.consensus.app_registry_cache._chain_rpc_env",
+        lambda c: "http://rpc",
+    )
+    # HexBytes-like (.hex()) is preferred; bytes.hex() works too.
+    monkeypatch.setattr("web3.Web3", _fake_web3(bytes.fromhex("ab" * 32)))
+    out = startup._fetch_pin_block_hashes({8453: 47_188_506})
+    assert out == {"8453": "ab" * 32}
+
+
+def test_fetch_pin_block_hashes_empty_without_rpc(monkeypatch):
+    monkeypatch.setattr(
+        "minotaur_subnet.consensus.app_registry_cache._chain_rpc_env",
+        lambda c: None,
+    )
+    assert startup._fetch_pin_block_hashes({8453: 1, 964: 2}) == {}
+
+
+def test_fetch_pin_block_hashes_swallows_rpc_errors(monkeypatch):
+    monkeypatch.setattr(
+        "minotaur_subnet.consensus.app_registry_cache._chain_rpc_env",
+        lambda c: "http://rpc",
+    )
+
+    class _BoomW3:
+        def __init__(self, *a, **k):
+            raise RuntimeError("rpc down")
+
+        @staticmethod
+        def HTTPProvider(*a, **k):
+            return None
+
+    monkeypatch.setattr("web3.Web3", _BoomW3)
+    # A probe must never break /health — failures are omitted, not raised.
+    assert startup._fetch_pin_block_hashes({8453: 1}) == {}
 
 
 # ── background loop ─────────────────────────────────────────────────────────
