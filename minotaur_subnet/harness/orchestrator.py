@@ -600,6 +600,93 @@ class BenchmarkConfig:
     plan_quality_weight: float = 0.6
 
 
+async def _enrich_state_with_quote(
+    session: "SolverSession",
+    intent: AppIntentDefinition,
+    state: IntentState,
+    snapshot: MarketSnapshot,
+    reference_params: dict[str, str] | None,
+) -> IntentState:
+    """Populate a swap scenario's source:"quote" params from a real quote.
+
+    Synthetic benchmark scenarios never run a quote, so their on-chain
+    intentParams omit the CoW ``quoted_output`` field — the deployed
+    12-field DexAggregator scoreIntent then reverts. This mirrors the live
+    get_quote path: obtain a quote (a provided reference, else the solver's
+    own), map it via the shared ``map_quote_result_to_params`` helper, and
+    rebuild the IntentState with those quote VALUES winning over the
+    scenario's params.
+
+    Returns the original ``state`` unchanged when: it isn't a swap intent,
+    the params already carry ``quoted_output``, no manifest/quote params
+    apply, or quoting fails (the scenario then scores 0 as it does today —
+    never a crash).
+    """
+    raw = state.raw_params_view()
+    intent_function = state.control_view().get("_intent_function", "swap")
+
+    # Manifest-driven gate (NOT intent.intent_type — that field is empty for
+    # the live DexAggregator app, so keying on it makes this a no-op on prod).
+    # Enrich iff the manifest declares source:"quote" params for this function
+    # that aren't already populated. Real/historical orders carry their quote
+    # values, so they're skipped; synthetic scenarios don't, so they're filled.
+    from minotaur_subnet.api.services.app_service import source_quote_param_names
+    quote_param_names = source_quote_param_names(
+        getattr(intent, "manifest", None), intent_function,
+    )
+    if not quote_param_names:
+        return state  # nothing sourced from a quote → leave as-is
+    # `quoted_output` is the canonical "was this quoted" marker: synthetic
+    # scenarios never carry it (they only set static input/output/min_output),
+    # while real/historical orders always do. (min_output_amount can't be the
+    # marker — scenarios set it statically.)
+    if raw.get("quoted_output") not in (None, ""):
+        return state  # already quoted (real/historical order) — leave as-is
+
+    quote_params = reference_params
+    if not quote_params:
+        # Fallback: self-quote via the solver session, mapped through the
+        # one shared helper so there is no second quote implementation.
+        try:
+            quote_result = await session.quote(intent, state, snapshot)
+        except Exception as exc:  # noqa: BLE001 — defensive, never crash a run
+            logger.warning(
+                "quote-at-benchmark: self-quote failed for %s (%s); "
+                "scenario will score on the legacy layout",
+                intent.app_id, exc,
+            )
+            return state
+        if quote_result is None:
+            logger.warning(
+                "quote-at-benchmark: self-quote returned None for %s; "
+                "scenario will score on the legacy layout", intent.app_id,
+            )
+            return state
+        from minotaur_subnet.api.services.app_service import (
+            map_quote_result_to_params,
+        )
+        quote_params = map_quote_result_to_params(
+            quote_result, intent.manifest, intent_function,
+        )
+
+    if not quote_params:
+        return state
+
+    # Quote VALUES win over the scenario's params for the source:"quote"
+    # fields (merge order matters — scenario first, quote second).
+    new_raw = {**raw, **quote_params}
+    return IntentState(
+        contract_address=state.contract_address,
+        chain_id=state.chain_id,
+        nonce=state.nonce,
+        owner=state.owner,
+        raw_params=new_raw,
+        control=state.control_view(),
+        context_version=state.context_version,
+        policy_tier=state.policy_tier,
+    )
+
+
 async def run_benchmark(
     session: SolverSession,
     intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -609,6 +696,7 @@ async def run_benchmark(
     simulator: Any | None = None,
     fork_block: int | None = None,
     require_real_sim: bool = False,
+    reference_quotes: dict[str, dict[str, str]] | None = None,
 ) -> list[BenchmarkResult]:
     """Run a complete benchmark against a solver session.
 
@@ -639,6 +727,16 @@ async def run_benchmark(
             scored 0 — never laundered into a ~min*1.05 mock pass nor a
             lenient-app-scorer pass on a plan that could not execute. Default
             keeps today's silent mock fallback.
+        reference_quotes: Optional pre-computed quote params keyed by a stable
+            per-scenario key (the intent's intent_id label). Each value is the
+            ``map_quote_result_to_params`` output for that scenario (the CoW
+            ``quoted_output`` and friends). Synthetic benchmark scenarios carry
+            no quote, so without this the on-chain encoder emits the legacy
+            layout and the deployed CoW scoreIntent reverts. When a scenario's
+            swap params lack ``quoted_output``, the reference quote is applied;
+            absent a reference, the solver session is asked for its own quote
+            as a fallback. ``None``/``{}`` = always self-quote (still fixes the
+            revert; the reference path just makes the quote champion-anchored).
 
     Returns:
         List of BenchmarkResult, one per intent.
@@ -647,6 +745,8 @@ async def run_benchmark(
         config = BenchmarkConfig()
     if trigger_ground_truth is None:
         trigger_ground_truth = {}
+    if reference_quotes is None:
+        reference_quotes = {}
 
     # Fail-closed: when a real simulation is required but none was injected,
     # refuse to run rather than score every scenario on the fabricated mock
@@ -705,6 +805,16 @@ async def run_benchmark(
         scenario_name = state.control_view().get("_scenario_name", "")
         intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
         br = BenchmarkResult(intent_id=intent_label)
+
+        # Quote-at-benchmark: synthetic scenarios never ran a quote, so their
+        # on-chain intentParams omit the CoW `quoted_output` field and the
+        # deployed scoreIntent reverts. Populate the source:"quote" params from
+        # a REAL quote — exactly like the live get_quote path — so downstream
+        # _build_benchmark_intent_order emits the full (CoW) layout.
+        state = await _enrich_state_with_quote(
+            session, intent, state, snapshot,
+            reference_quotes.get(intent_label),
+        )
 
         try:
             from minotaur_subnet.shared.types import TriggerType
