@@ -381,7 +381,7 @@ async def _independent_adopt_vote(
         has_champion=True,
     )
     logger.info(
-        "[independent-vote] candidate=%s round=%s vote=%s chal_score=%.4f "
+        "[independent-vote] role=follower candidate=%s round=%s vote=%s chal_score=%.4f "
         "champ_score=%.4f fork_block=%s: %s",
         candidate.submission_id,
         round_id,

@@ -157,6 +157,7 @@ class EpochManager:
         weight_decay: float = 0.6,
         owner_hotkey: str | None = None,
         on_champion_adopted: Any = None,
+        vote_recorder: Any = None,
     ) -> None:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
@@ -173,6 +174,9 @@ class EpochManager:
         self._weight_decay = weight_decay
         self._owner_hotkey = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
         self._on_champion_adopted = on_champion_adopted
+        # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
+        # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
+        self._vote_recorder = vote_recorder
 
         self._champion = ChampionInfo()
         self._current_session: Any = None  # SolverSession
@@ -952,6 +956,46 @@ class EpochManager:
         )
         return True
 
+    def _record_would_be_vote(self, challenger: Submission) -> None:
+        """Publish this leader's INDEPENDENT would-be adopt vote (CHALLENGER_QUORUM_MODE).
+
+        Computed via the shared rule and recorded REGARDLESS of
+        DISABLE_CHAMPION_ADOPTION, so the fleet quorum can be observed with adoption
+        OFF. Best-effort and side-effect-free — never affects the live decision.
+        """
+        if os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return
+        try:
+            challenger_score = challenger.benchmark_score or 0
+            champion_score = self._champion.benchmark_score or 0
+            adopt, reason = evaluate_adoption(
+                challenger_score=challenger_score,
+                champion_score=champion_score,
+                challenger_scorecard=self._get_scorecard(challenger),
+                champion_scorecard=self._get_incumbent_scorecard(),
+                dethrone_margin=self._dethrone_margin,
+                has_champion=bool(self._champion.submission_id),
+            )
+            vote = {
+                "candidate_id": getattr(challenger, "submission_id", None),
+                "role": "leader",
+                "vote": "ADOPT" if adopt else "REJECT",
+                "chal_score": round(float(challenger_score), 4),
+                "champ_score": round(float(champion_score), 4),
+                "reason": reason,
+            }
+            logger.info(
+                "[independent-vote] role=leader candidate=%s vote=%s chal_score=%.4f "
+                "champ_score=%.4f: %s",
+                vote["candidate_id"], vote["vote"], challenger_score, champion_score, reason,
+            )
+            if self._vote_recorder is not None:
+                self._vote_recorder(vote)
+        except Exception as exc:  # observe-only — must never break adoption
+            logger.warning("[independent-vote] leader vote record failed (ignored): %s", exc)
+
     def _should_adopt(self, challenger: Submission) -> bool:
         """Check if the challenger should replace the current champion.
 
@@ -962,6 +1006,10 @@ class EpochManager:
            no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
         4. Global improvement over the champion by the dethrone margin (default 0.5%)
         """
+        # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
+        # BEFORE the disable gate so the shadow tally sees it with adoption off.
+        self._record_would_be_vote(challenger)
+
         if _adoption_disabled():
             logger.warning(
                 "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — %s scored but NOT "
