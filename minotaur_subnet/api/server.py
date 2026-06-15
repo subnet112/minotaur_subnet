@@ -293,6 +293,19 @@ def health() -> dict:
             # workflow can diff it against the on-chain set and name which
             # validator dropped out of discovery — see registry_view below.
             "discovered_validators": sorted(v.lower() for v in champion_consensus.validators),
+            # Resolved peer endpoints (validator_id + axon URL) from the SAME
+            # dynamic discovery the consensus loops already use (metagraph ∩
+            # on-chain ValidatorRegistry, /identity-verified). Surfaced so
+            # fleet-wide tooling (e.g. the determinism-parity sweep) can reach
+            # every peer from one seed node without re-walking the metagraph.
+            "peer_endpoints": (
+                [
+                    {"validator_id": p.validator_id, "url": p.url}
+                    for p in champion_peer_network.peers
+                ]
+                if champion_peer_network is not None
+                else []
+            ),
             "internal_round_auth_configured": bool(
                 os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
                 or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
