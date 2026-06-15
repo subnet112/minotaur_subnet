@@ -635,8 +635,10 @@ class EpochManager:
         it was computed under different conditions. Re-benchmarking
         ensures challenger vs incumbent comparisons are fair.
 
-        If the incumbent has no Docker image (genesis/builtin), or the
-        benchmark worker is unavailable, the score is left unchanged.
+        The genesis champion (no submission image) is re-benchmarked via the
+        configured genesis solver image so the bar stays current on each round's
+        pack (issue #177). The score is left unchanged only when no benchmark
+        worker — or no genesis image — is available.
         """
         if not self._champion.submission_id:
             return
@@ -652,8 +654,15 @@ class EpochManager:
 
         image_tag = incumbent_sub.image_tag
         if not image_tag:
-            # Builtin/genesis — no Docker image to benchmark
-            return
+            # Genesis/builtin champion: no submission image. Re-benchmark it via
+            # the configured genesis solver image so the champion BAR is current
+            # on THIS round's pack — otherwise the stale stored score makes the
+            # contest uncontestable (issue #177). _resolve_champion_image returns
+            # the genesis image for a genesis champion, else None.
+            if callable(getattr(self._benchmark_worker, "_resolve_champion_image", None)):
+                image_tag = self._benchmark_worker._resolve_champion_image()
+            if not image_tag:
+                return  # no genesis image configured → leave the stored score
 
         logger.info(
             "Re-benchmarking incumbent %s (%s) with current scenarios",
