@@ -144,6 +144,23 @@ def _allow_subprocess_benchmark() -> bool:
     """
     return False
 
+
+def _challenger_quorum_mode() -> bool:
+    """Whether the diverse-subset / independent-vote challenger-validation model is on.
+
+    Default OFF — the legacy shared (round_id-only) subset draw and the follower
+    reproducibility check are unchanged until this is explicitly enabled for the
+    quorum-validation rollout. When ON, each validator draws its own diverse
+    Stage-2 subset (seeded by its identity) so adoption is decided by a quorum of
+    independent verdicts rather than reproduction of the leader's number.
+    """
+    import os
+
+    return os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 class BenchmarkWorker:
     """Processes BENCHMARKING submissions by scoring them against active intents.
 
@@ -164,6 +181,7 @@ class BenchmarkWorker:
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
+        validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -179,6 +197,9 @@ class BenchmarkWorker:
         # Injected by the API layer (keeps the harness free of API imports):
         # round_id -> the round-anchored benchmark-chain fork block, or None.
         self._pin_resolver = pin_resolver
+        # Stable per-validator id (hotkey ss58); seeds this validator's diverse
+        # Stage-2 subset when CHALLENGER_QUORUM_MODE is on (else None = shared draw).
+        self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
 
@@ -854,11 +875,16 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
+        # Diverse-subset model: seed the draw with this validator's identity so it
+        # tests a DIFFERENT slice of real orders than its peers (broader regression
+        # coverage). Default (model off / no identity) -> shared round_id-only draw.
+        _seed = self._validator_identity if _challenger_quorum_mode() else None
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
             records=chain_records,
+            validator_seed=_seed,
         )
         if not sampled:
             return []
