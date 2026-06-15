@@ -372,7 +372,9 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
-        # Benchmark each submission (route by solver_path or image_tag)
+        # Benchmark each submission (route by solver_path or image_tag).
+        # Each solver self-quotes its scenarios inside run_benchmark (the score
+        # is the unfakeable on-chain output), so no champion pre-pass is needed.
         for sub in benchmarking:
             # Skip already-scored submissions (may appear in BENCHMARKING
             # from a previous pass that scored then persisted)
@@ -1015,6 +1017,34 @@ class BenchmarkWorker:
 
         return 1
 
+    def _resolve_champion_image(self) -> str | None:
+        """Resolve the Docker image tag of the current champion (or genesis).
+
+        Mirrors the champion resolution in
+        ``_maybe_bootstrap_solving_apps_with_champion``: prefer an explicit
+        champion, fall back to a SCORED/ADOPTED genesis submission, and map a
+        genesis hotkey with no image to the configured genesis solver image.
+        Returns ``None`` when no usable champion image is available.
+        """
+        champion = self._sub_store.get_champion()
+        if champion is None:
+            genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+            if genesis is not None and genesis.status in (
+                SubmissionStatus.SCORED,
+                SubmissionStatus.ADOPTED,
+            ):
+                champion = genesis
+        if champion is None:
+            return None
+        image_tag = champion.image_tag
+        if (
+            image_tag is None
+            and champion.hotkey == GENESIS_HOTKEY
+            and self._genesis_solver_image
+        ):
+            image_tag = self._genesis_solver_image
+        return image_tag
+
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.
 
@@ -1226,6 +1256,7 @@ class BenchmarkWorker:
                     "score": r.score,
                     "plan_score": r.plan_score,
                     "trigger_score": r.trigger_score,
+                    "on_chain_score": getattr(r, "on_chain_score", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
                     "has_plan": r.plan is not None,

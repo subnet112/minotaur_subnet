@@ -61,6 +61,9 @@ class StatusResponse(BaseModel):
     benchmark_score: float | None = None
     benchmark_rank: int | None = None
     rejection_reason: str | None = None
+    # Feedback report (P1): per-case scores + aggregate-vs-champion + worst cases.
+    # Present once benchmarked (or screening-rejected); None while in-flight.
+    report: dict[str, Any] | None = None
 
 
 class SourceSubmitRequest(BaseModel):

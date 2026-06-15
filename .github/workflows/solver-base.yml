@@ -6,6 +6,7 @@ on:
     paths:
       - "minotaur_subnet/docker/Dockerfile.solver-base"
       - "minotaur_subnet/docker/build-solver-base.sh"
+      - "minotaur_subnet/docker/requirements.solver-base.txt"
       - "minotaur_subnet/sdk/**"
       - "minotaur_subnet/harness/runner.py"
   workflow_dispatch:
