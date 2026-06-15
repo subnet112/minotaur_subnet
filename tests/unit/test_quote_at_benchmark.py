@@ -166,7 +166,7 @@ class _FakeSession:
         return None
 
 
-def _run(session, reference_quotes):
+def _run(session):
     intent, state, snapshot = _swap_intent(), _swap_state(), _make_snapshot()
     plan = ExecutionPlan(intent_id=intent.app_id, interactions=[], deadline=0, nonce=0)
 
@@ -190,51 +190,37 @@ def _run(session, reference_quotes):
             config=BenchmarkConfig(chain_ids=[1]),
             score_fn=score_fn,
             simulator=_Sim(),
-            reference_quotes=reference_quotes,
         )
 
     results = asyncio.run(_go())
     return results, session, captured
 
 
-def test_run_benchmark_enriches_from_reference_quote():
-    # Reference quote provided → no self-quote call, params enriched.
-    session = _FakeSession(self_quote=None)
-    ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
-    results, sess, captured = _run(session, ref)
-
-    assert len(results) == 1
-    assert sess.quote_calls == 0, "reference present → must NOT self-quote"
-    scored = sess.scored_states[0]
-    assert scored["quoted_output"] == "999"
-    # min_output_amount stays the scenario's loose floor (NOT the quote's), so a
-    # worse-but-functional challenger still executes and is graded on-chain.
-    assert scored["min_output_amount"] == "1", "scenario min_output must be kept"
-    # The intent_order built for simulation carries the enriched params.
-    assert captured["intent_order"] is not None
-
-
-def test_run_benchmark_falls_back_to_self_quote():
-    # No reference → self-quote via the session, mapped through the helper.
+def test_run_benchmark_self_quotes_synthetic_scenario():
+    # Synthetic scenario (no quoted_output) → the solver SELF-quotes; quoted_output
+    # comes from its own quote and min_output is the LOOSE benchmark floor
+    # (estimate * (1 - 50%)), so the solver executes and is graded on-chain.
     self_quote = QuoteResult(
         estimated_output="2000000", platform_fee_wei="50", gas_estimate=1
     )
     session = _FakeSession(self_quote=self_quote)
-    results, sess, _ = _run(session, reference_quotes={})
+    results, sess, captured = _run(session)
 
     assert len(results) == 1
-    assert sess.quote_calls == 1, "absent reference → must self-quote"
+    assert sess.quote_calls == 1, "synthetic scenario → must self-quote"
     scored = sess.scored_states[0]
     assert scored["quoted_output"] == "2000000"
-    # min_output stays the scenario's loose floor (kept, not the quote's tight one).
-    assert scored["min_output_amount"] == "1"
+    # Loose execution-gate min = estimate * (10000 - 5000)//10000 = 50%.
+    assert scored["min_output_amount"] == str(2000000 * 5000 // 10000)
     assert scored["platform_fee_wei"] == "50"
+    # The intent_order built for simulation carries the enriched params.
+    assert captured["intent_order"] is not None
 
 
 def test_run_benchmark_no_crash_when_self_quote_returns_none():
     # Defensive: quote unavailable → score on the legacy layout, no crash.
     session = _FakeSession(self_quote=None)
-    results, sess, _ = _run(session, reference_quotes={})
+    results, sess, _ = _run(session)
 
     assert len(results) == 1
     assert sess.quote_calls == 1
@@ -262,7 +248,6 @@ def test_run_benchmark_skips_quote_when_already_quoted():
             [(intent, state, snapshot)],
             config=BenchmarkConfig(chain_ids=[1]),
             score_fn=score_fn,
-            reference_quotes={},
         )
 
     asyncio.run(_go())
