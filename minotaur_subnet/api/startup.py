@@ -399,6 +399,40 @@ def _round_anchor_parity_enabled() -> bool:
     return _env_true("ROUND_ANCHOR_PARITY", default=True)
 
 
+def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
+    """Block hash at each pinned block, per chain — the fleet determinism probe.
+
+    Two validators that derive the same pin AND read the same block hash are
+    forking byte-identical chain state, so their on-chain sims are deterministic;
+    a hash mismatch means their upstream RPCs disagree (reorg / archive
+    inconsistency) and ``ADOPT_RULE=p2oc`` must NOT be flipped. Unlike the pack
+    hash, this needs no corpus flag, so it is comparable across the fleet by
+    polling /health alone. One ``eth_getBlockByNumber`` per chain against the
+    same live upstream RPC the pin derivation uses, bounded timeout, best-effort
+    (a missing/failed hash is omitted, never raises — a probe must not break
+    /health).
+    """
+    from web3 import Web3
+    from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
+
+    timeout_s = _round_anchor_rpc_timeout()
+    out: dict[str, str] = {}
+    for chain_id, block in sorted(pins.items()):
+        try:
+            rpc = _chain_rpc_env(int(chain_id))
+            if not rpc:
+                continue
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s}))
+            block_hash = w3.eth.get_block(int(block)).get("hash")
+            if block_hash is not None:
+                out[str(chain_id)] = (
+                    block_hash.hex() if hasattr(block_hash, "hex") else str(block_hash)
+                )
+        except Exception:  # best-effort — never break the /health probe
+            continue
+    return out
+
+
 def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
     """Derive the current-epoch fork pins and package a /health-ready snapshot.
 
@@ -419,10 +453,12 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
     if pins:
         pin_map = {str(chain): int(block) for chain, block in sorted(pins.items())}
         pin_segment = serialize_fork_pins(pins)
+        pin_hashes = _fetch_pin_block_hashes(pins)
         status = "ok"
     else:
         pin_map = {}
         pin_segment = ""
+        pin_hashes = {}
         status = "deferred"
     return {
         "status": status,
@@ -430,6 +466,7 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
         "chains": chains,
         "confirmations": confirmations,
         "pins": pin_map,
+        "pin_hashes": pin_hashes,
         "pin_segment": pin_segment,
         "gate_enabled": _env_true("ROUND_ANCHORED_PIN", default=False),
         "derived_at": int(time.time()),
