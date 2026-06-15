@@ -32,15 +32,22 @@ def sample_historical_orders(
     n_per_chain: int = 10,
     exclude_statuses: set[str] | None = None,
     records: list[dict[str, Any]] | None = None,
+    validator_seed: str | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical FILLED orders for Stage 2.
 
-    Uses round_id as RNG seed so all validators produce the same sample
-    without needing to broadcast the selection.
+    Seed = ``round_id`` alone (``validator_seed=None``, the default) → every
+    validator draws the SAME subset (legacy determinism). When ``validator_seed``
+    is supplied (e.g. the validator's hotkey/evm), it is mixed into the seed so
+    each validator draws a DIFFERENT subset — distributed cross-validation: a
+    challenger must beat the champion across the *union* of everyone's subsets,
+    which broadens regression coverage and resists overfitting to one fixed set.
+    The draw stays deterministic *per validator* (reproducible from
+    round_id+identity), so no selection broadcast is needed either way.
 
     Args:
         app_store: AppIntentStore with list_orders().
-        round_id: The current round identifier (determines sample).
+        round_id: The current round identifier (part of the sample seed).
         chain_ids: Only include orders from these chains. None = all chains.
         n_per_chain: Target sample size per chain (may be smaller if
             insufficient historical orders).
@@ -49,6 +56,7 @@ def sample_historical_orders(
             Phase 5b). When provided, they are the source instead of
             app_store.list_orders() — same filter/sample/PII logic. None (default)
             keeps the local-store path byte-for-byte.
+        validator_seed: Per-validator seed component (None = shared/legacy draw).
 
     Returns:
         List of order dicts, PII-stripped. May be empty if no history exists.
@@ -84,9 +92,14 @@ def sample_historical_orders(
     if not candidates:
         return []
 
-    # Deterministic RNG from round_id
+    # Deterministic RNG seed: round_id alone (shared draw) or round_id+identity
+    # (per-validator diverse draw). Mixing the identity in shifts which orders
+    # this validator tests without making the draw non-deterministic.
+    seed_material = (
+        round_id if validator_seed is None else f"{round_id}:{validator_seed}"
+    )
     seed = int.from_bytes(
-        hashlib.sha256(round_id.encode("utf-8")).digest()[:8], "big"
+        hashlib.sha256(seed_material.encode("utf-8")).digest()[:8], "big"
     )
     rng = random.Random(seed)
 

@@ -57,6 +57,39 @@ class TestDeterminism:
         assert ids1 != ids2
 
 
+class TestDiverseSubsets:
+    """Per-validator seed: each validator draws a different subset (cross-validation)."""
+
+    def test_none_seed_matches_legacy_round_only_draw(self):
+        # Backward compat: validator_seed=None must be byte-for-byte the old draw.
+        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
+        store = _FakeAppStore(orders)
+        legacy = sample_historical_orders(store, "round-123", n_per_chain=10)
+        explicit_none = sample_historical_orders(
+            store, "round-123", n_per_chain=10, validator_seed=None
+        )
+        assert [o["order_id"] for o in legacy] == [o["order_id"] for o in explicit_none]
+
+    def test_same_validator_seed_is_deterministic(self):
+        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
+        store = _FakeAppStore(orders)
+        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
+        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
+        assert [o["order_id"] for o in a] == [o["order_id"] for o in b]
+
+    def test_different_validators_draw_different_subsets(self):
+        # Same round, different validator identities → different (diverse) subsets.
+        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
+        store = _FakeAppStore(orders)
+        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
+        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALB")
+        ids_a = set(o["order_id"] for o in a)
+        ids_b = set(o["order_id"] for o in b)
+        assert ids_a != ids_b
+        # ...but each is still a valid full-size draw from the same pool.
+        assert len(ids_a) == 10 and len(ids_b) == 10
+
+
 class TestFiltering:
     def test_excludes_non_filled_orders(self):
         orders = [
