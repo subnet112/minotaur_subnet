@@ -391,6 +391,20 @@ async def _independent_adopt_vote(
         worker._epoch_block_number,
         reason,
     )
+    # Publish for the fleet shadow tally (/health independent_vote). Best-effort.
+    try:
+        from minotaur_subnet.api.server_context import ctx
+        ctx.last_independent_vote = {
+            "candidate_id": candidate.submission_id,
+            "role": "follower",
+            "vote": "ADOPT" if adopt else "REJECT",
+            "chal_score": round(float(chal_score), 4),
+            "champ_score": round(float(champ_score), 4),
+            "round_id": round_id,
+            "reason": reason,
+        }
+    except Exception:  # observe-only — must never break verification
+        pass
     return adopt, chal_score
 
 
