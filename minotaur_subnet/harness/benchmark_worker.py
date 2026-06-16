@@ -299,6 +299,14 @@ class BenchmarkWorker:
 
         Returns the number of submissions processed.
         """
+        # Startup-race guard: the run_loop is started right after construction, but
+        # startup wires the real simulator a bit LATER (ctx.benchmark_worker._simulator).
+        # A docker benchmark that runs before the simulator is attached falls to the
+        # mock path -> on_chain null -> the genesis scores 0 -> REJECTED and is never
+        # retried. Defer until the simulator is wired so the first benchmark is real.
+        if self._use_docker and self._simulator is None:
+            logger.info("[benchmark] real simulator not yet wired — deferring run_once")
+            return 0
         # Deterministic fork-pin: when BENCHMARK_EPOCH_BLOCK is set, pin this round's
         # benchmark simulations to that Base block so on-chain scores are reproducible
         # across validators (the cross-machine determinism keystone). Default unset ->
@@ -1070,6 +1078,115 @@ class BenchmarkWorker:
         ):
             image_tag = self._genesis_solver_image
         return image_tag
+
+    async def run_shadow_vote(self, challenger_image: str) -> dict[str, Any]:
+        """Observe-only per-validator shadow adopt-vote (challenger-quorum demo).
+
+        Benchmarks a DESIGNATED reference champion (``SHADOW_CHAMPION_IMAGE``, or
+        the real champion if unset) and ``challenger_image`` on THIS validator's
+        own diverse Stage-2 subset, then applies the shared ``evaluate_adoption``
+        rule. Returns + publishes this validator's vote.
+
+        NEVER touches the real champion, adoption, or weights — it is a pure
+        shadow computation so the fleet can demonstrate the challenger-quorum
+        decision (good->adopt / bad->reject by majority) without needing an
+        organic champion to exist on-chain. Each validator scores its own slice
+        of orders, so disagreement on a regressing challenger is the feature.
+        """
+        import os
+        from minotaur_subnet.harness.orchestrator import (
+            BenchmarkConfig,
+            RealSimulationUnavailable,
+            SolverOrchestrator,
+            run_benchmark,
+        )
+        from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
+        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+
+        champ_image = (
+            os.environ.get("SHADOW_CHAMPION_IMAGE", "").strip()
+            or self._resolve_champion_image()
+        )
+        if not champ_image:
+            return {"error": "no shadow champion (set SHADOW_CHAMPION_IMAGE)"}
+        if not challenger_image:
+            return {"error": "challenger_image required"}
+
+        # Same benchmark set run_once uses: Stage-1 synthetic + Stage-2 diverse
+        # (per-validator seed when CHALLENGER_QUORUM_MODE is on).
+        intents = self._load_benchmark_intents()
+        if not intents:
+            return {"error": "no active intents"}
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+        round_id = None
+        if self._round_store is not None:
+            cur = self._round_store.get_current_round()
+            if cur is not None:
+                round_id = cur.round_id
+                try:
+                    hist = self._load_historical_scenarios(cur.round_id)
+                    if hist:
+                        intents.extend(hist)
+                except Exception as exc:
+                    logger.warning("[shadow-vote] historical load failed: %s", exc)
+
+        _require_real_sim = os.environ.get(
+            "BENCHMARK_REQUIRE_REAL_SIM", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
+
+        async def _bench(image: str) -> list[BenchmarkResult]:
+            orch = SolverOrchestrator()
+            sess = await orch.start_docker(image)
+            try:
+                return await run_benchmark(
+                    sess, intents, config=cfg, score_fn=score_fn,
+                    simulator=self._simulator, require_real_sim=_require_real_sim,
+                    fork_block=self._epoch_block_number,
+                )
+            finally:
+                await sess.shutdown()
+
+        try:
+            champ_results = await _bench(champ_image)
+            chal_results = await _bench(challenger_image)
+        except RealSimulationUnavailable:
+            return {"error": "real simulator unavailable"}
+
+        champ_score = self._compute_avg_score(champ_results)
+        chal_score = self._compute_avg_score(chal_results)
+        adopt, reason = evaluate_adoption(
+            challenger_score=chal_score,
+            champion_score=champ_score,
+            challenger_scorecard=self._build_scorecard(chal_results).to_dict(),
+            champion_scorecard=self._build_scorecard(champ_results).to_dict(),
+            dethrone_margin=DETHRONE_MARGIN,
+            has_champion=True,
+        )
+        vote = {
+            "candidate_id": challenger_image,
+            "role": "shadow",
+            "vote": "ADOPT" if adopt else "REJECT",
+            "chal_score": round(float(chal_score), 4),
+            "champ_score": round(float(champ_score), 4),
+            "champion_image": champ_image,
+            "validator_seed": self._validator_identity,
+            "round_id": round_id,
+            "reason": reason,
+        }
+        logger.info(
+            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s "
+            "champ_score=%.4f chal_score=%.4f: %s",
+            self._validator_identity, champ_image, challenger_image,
+            vote["vote"], champ_score, chal_score, reason,
+        )
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_independent_vote = dict(vote)
+        except Exception:  # observe-only — must never break
+            pass
+        return vote
 
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.
