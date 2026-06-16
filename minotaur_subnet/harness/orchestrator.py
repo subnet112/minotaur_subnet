@@ -600,6 +600,26 @@ class BenchmarkConfig:
     plan_quality_weight: float = 0.6
 
 
+# Sentinel a reference-quote pre-pass writes into ``reference_quotes[label]``
+# when the CHAMPION solver FAILED to quote that scenario. ``run_benchmark``
+# detects it and surfaces an explicit error + scores 0 instead of silently
+# self-quoting (which would fabricate a non-comparable pass and mask the
+# champion-reference failure). Cannot collide with real mapped quote params —
+# those are keyed by manifest param names, never this dunder key.
+REFERENCE_QUOTE_FAILED_SENTINEL = "__reference_quote_failed__"
+
+# Slippage applied to a BENCHMARK scenario's quote-derived min_output_amount.
+# Deliberately generous (50%): scoring is anchored on quotedOutput (the full
+# quote), NOT on min, so the min is purely the execution slippage guard here.
+# A loose floor lets any solver that produces a real swap EXECUTE and be graded
+# continuously on output-vs-quote, instead of reverting (and scoring 0) the
+# moment it lands a few % under a tight floor. This does NOT re-introduce the
+# old on-chain saturation — that bug existed only because the score was anchored
+# on min; decoupled, a loose min is safe. Live user orders keep their own tight
+# slippage tolerance (this constant is benchmark-only).
+BENCHMARK_MIN_SLIPPAGE_BPS = 5000
+
+
 async def _enrich_state_with_quote(
     session: "SolverSession",
     intent: AppIntentDefinition,
@@ -650,16 +670,17 @@ async def _enrich_state_with_quote(
         try:
             quote_result = await session.quote(intent, state, snapshot)
         except Exception as exc:  # noqa: BLE001 — defensive, never crash a run
-            logger.warning(
-                "quote-at-benchmark: self-quote failed for %s (%s); "
-                "scenario will score on the legacy layout",
-                intent.app_id, exc,
+            logger.error(
+                "[quote-FAILED] self-quote raised for %s (%s); scenario keeps "
+                "the legacy (un-quoted) layout and will revert/score 0 — a real "
+                "failure, not a silent pass", intent.app_id, exc,
             )
             return state
         if quote_result is None:
-            logger.warning(
-                "quote-at-benchmark: self-quote returned None for %s; "
-                "scenario will score on the legacy layout", intent.app_id,
+            logger.error(
+                "[quote-FAILED] self-quote returned None for %s; scenario keeps "
+                "the legacy (un-quoted) layout and will revert/score 0 — a real "
+                "failure, not a silent pass", intent.app_id,
             )
             return state
         from minotaur_subnet.api.services.app_service import (
@@ -667,24 +688,22 @@ async def _enrich_state_with_quote(
         )
         quote_params = map_quote_result_to_params(
             quote_result, intent.manifest, intent_function,
-            slippage_bps=100,  # 1% benchmark floor (PR #188)
+            slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
         )
 
     if not quote_params:
         return state
 
-    # Quote VALUES win over the scenario's params for the source:"quote"
-    # fields (merge order matters — scenario first, quote second)...
+    # Quote VALUES win over the scenario's params for ALL source:"quote" fields,
+    # INCLUDING min_output_amount. Scoring is anchored on quotedOutput (the full
+    # quote), so the min is purely the execution slippage guard — we let it track
+    # the quote (quote × (1 − benchmark slippage)) rather than pinning the
+    # scenario's stale STATIC floor. A static floor goes stale: a min set when
+    # WETH was ~$2000 sits ABOVE a $1777 market and reverts EVERY solver with
+    # "Too little received" (the WETH→USDC bug). A quote-relative loose floor
+    # never goes stale and never spuriously reverts, while quoted_output keeps
+    # the score (and CoW fee) honest.
     new_raw = {**raw, **quote_params}
-    # ...EXCEPT min_output_amount: for benchmark SCORING we keep the scenario's
-    # loose floor. The champion-quote-derived suggested_min_output is a tight
-    # slippage floor (estimated*0.995) that reverts a worse-but-functional
-    # challenger with "Too little received" → scores 0, destroying ranking
-    # granularity. We still anchor quoted_output (the CoW surplus reference) to
-    # the quote; min_output stays loose so every solver executes and is graded
-    # by its actual on-chain output.
-    if raw.get("min_output_amount") not in (None, ""):
-        new_raw["min_output_amount"] = raw["min_output_amount"]
     return IntentState(
         contract_address=state.contract_address,
         chain_id=state.chain_id,
@@ -816,14 +835,35 @@ async def run_benchmark(
         intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
         br = BenchmarkResult(intent_id=intent_label)
 
+        # De-mask champion-reference-quote failures. If the reference pre-pass
+        # marked this scenario as one the CHAMPION could not quote, do NOT fall
+        # through to a self-quote — that would fabricate a non-comparable pass
+        # (the solver clears its own bar) and silently hide that the common
+        # reference bar is missing. Score 0 with an explicit error instead. This
+        # is symmetric across champion + challenger (both graded on the same
+        # reference set), so it never biases the comparison.
+        _ref = reference_quotes.get(intent_label)
+        if _ref and _ref.get(REFERENCE_QUOTE_FAILED_SENTINEL):
+            br.error = (
+                "champion_reference_quote_failed: scenario not scored "
+                "(refusing to self-quote a non-comparable pass)"
+            )
+            logger.error(
+                "[reference-quote-FAILED] %s: champion could not quote this "
+                "scenario; scoring 0 rather than silently self-quoting",
+                intent_label,
+            )
+            br.elapsed_ms = int((time.monotonic() - start) * 1000)
+            results.append(br)
+            continue
+
         # Quote-at-benchmark: synthetic scenarios never ran a quote, so their
         # on-chain intentParams omit the CoW `quoted_output` field and the
         # deployed scoreIntent reverts. Populate the source:"quote" params from
         # a REAL quote — exactly like the live get_quote path — so downstream
         # _build_benchmark_intent_order emits the full (CoW) layout.
         state = await _enrich_state_with_quote(
-            session, intent, state, snapshot,
-            reference_quotes.get(intent_label),
+            session, intent, state, snapshot, _ref,
         )
 
         try:
