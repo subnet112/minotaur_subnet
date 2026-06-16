@@ -401,9 +401,13 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
-        # Benchmark each submission (route by solver_path or image_tag).
-        # Each solver self-quotes its scenarios inside run_benchmark (the score
-        # is the unfakeable on-chain output), so no champion pre-pass is needed.
+        # Champion quote pre-pass: anchor each scenario's on-chain quote params
+        # (CoW quoted_output etc.) to the champion solver so every challenger is
+        # graded against the same reference output. Falls back to per-submission
+        # self-quoting when no champion is available (still fixes the revert).
+        reference_quotes = await self._build_reference_quotes(intents)
+
+        # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
             # Skip already-scored submissions (may appear in BENCHMARKING
             # from a previous pass that scored then persisted)
@@ -434,6 +438,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_solver_path(
                         sub.solver_path, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     avg_score = self._compute_avg_score(results)
                     details = self._results_to_details(results)
@@ -464,6 +469,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_submission(
                         sub.image_tag, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
@@ -515,6 +521,7 @@ class BenchmarkWorker:
         image_tag: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against one submission's Docker image."""
         orch = SolverOrchestrator()
@@ -537,6 +544,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -584,6 +592,7 @@ class BenchmarkWorker:
         solver_path: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against a local solver file (subprocess mode)."""
         orch = SolverOrchestrator()
@@ -596,6 +605,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -1136,6 +1146,13 @@ class BenchmarkWorker:
         ).strip().lower() in ("1", "true", "yes", "on")
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
+        # Champion-anchored bar: grade BOTH the reference champion and the
+        # challenger against the SHADOW champion's OWN quote (one shared floor,
+        # ~0.5% slippage), with the champion->challenger self-quote fallback when
+        # the champion can't quote a scenario. Without this both would self-quote
+        # and tie — the saturation the product owner flagged.
+        reference_quotes = await self._build_reference_quotes(intents, image_tag=champ_image)
+
         async def _bench(image: str) -> list[BenchmarkResult]:
             orch = SolverOrchestrator()
             sess = await orch.start_docker(image)
@@ -1144,6 +1161,7 @@ class BenchmarkWorker:
                     sess, intents, config=cfg, score_fn=score_fn,
                     simulator=self._simulator, require_real_sim=_require_real_sim,
                     fork_block=self._epoch_block_number,
+                    reference_quotes=reference_quotes,
                 )
             finally:
                 await sess.shutdown()
@@ -1187,6 +1205,89 @@ class BenchmarkWorker:
         except Exception:  # observe-only — must never break
             pass
         return vote
+    async def _build_reference_quotes(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        *,
+        image_tag: str | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Quote every scenario with the CHAMPION solver as the reference.
+
+        Runs a short champion pre-pass before benchmarking submissions: start a
+        champion Docker session, ask it to quote each scenario, map the result
+        via the shared ``map_quote_result_to_params`` helper, and key the output
+        by the same per-scenario label ``run_benchmark`` uses (``app_id`` or
+        ``app_id:scenario_name``). This anchors the on-chain ``quoted_output``
+        (the CoW fee reference) to the champion so every challenger is graded
+        against the same reference output — the champion→challenger fallback the
+        product owner specified.
+
+        Returns ``{}`` (every scenario self-quotes, which still fixes the
+        revert) when no champion image is available, Docker is disabled, or the
+        champion session can't be started.
+        """
+        if not self._use_docker:
+            return {}
+        if image_tag is None:
+            image_tag = self._resolve_champion_image()
+        if image_tag is None:
+            logger.info("Reference-quote pre-pass skipped: no champion image")
+            return {}
+
+        from minotaur_subnet.api.services.app_service import (
+            map_quote_result_to_params,
+            source_quote_param_names,
+        )
+
+        reference: dict[str, dict[str, str]] = {}
+        orch = SolverOrchestrator()
+        try:
+            session = await orch.start_docker(image_tag)
+        except Exception as exc:
+            logger.warning(
+                "Reference-quote pre-pass: failed to start champion session "
+                "(%s); scenarios will self-quote", exc,
+            )
+            return {}
+        try:
+            await session.initialize(
+                {"chain_ids": list({s.chain_id for _, s, _ in intents} or {1})}
+            )
+            for intent, state, snapshot in intents:
+                intent_function = state.control_view().get("_intent_function", "swap")
+                # Same manifest-driven gate as run_benchmark's enrichment.
+                if not source_quote_param_names(intent.manifest, intent_function):
+                    continue
+                if state.raw_params_view().get("quoted_output") not in (None, ""):
+                    continue
+                scenario_name = state.control_view().get("_scenario_name", "")
+                label = (
+                    f"{intent.app_id}:{scenario_name}"
+                    if scenario_name else intent.app_id
+                )
+                try:
+                    quote_result = await session.quote(intent, state, snapshot)
+                except Exception as exc:
+                    logger.warning(
+                        "Reference-quote pre-pass: champion quote failed for "
+                        "%s (%s); scenario will self-quote", label, exc,
+                    )
+                    continue
+                if quote_result is None:
+                    continue
+                mapped = map_quote_result_to_params(
+                    quote_result, intent.manifest, intent_function,
+                    slippage_bps=100,  # 1% benchmark floor (PR #188)
+                )
+                if mapped:
+                    reference[label] = mapped
+            logger.info(
+                "Reference-quote pre-pass: built %d champion reference quotes",
+                len(reference),
+            )
+        finally:
+            await session.shutdown()
+        return reference
 
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.
