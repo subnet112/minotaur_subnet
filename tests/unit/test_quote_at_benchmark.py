@@ -14,7 +14,11 @@ These tests cover:
 import asyncio
 
 from minotaur_subnet.api.services.app_service import map_quote_result_to_params
-from minotaur_subnet.harness.orchestrator import BenchmarkConfig, run_benchmark
+from minotaur_subnet.harness.orchestrator import (
+    REFERENCE_QUOTE_FAILED_SENTINEL,
+    BenchmarkConfig,
+    run_benchmark,
+)
 from minotaur_subnet.shared.types import (
     AppIntentConfig,
     AppIntentDefinition,
@@ -207,9 +211,10 @@ def test_run_benchmark_enriches_from_reference_quote():
     assert sess.quote_calls == 0, "reference present → must NOT self-quote"
     scored = sess.scored_states[0]
     assert scored["quoted_output"] == "999"
-    # min_output_amount stays the scenario's loose floor (NOT the quote's), so a
-    # worse-but-functional challenger still executes and is graded on-chain.
-    assert scored["min_output_amount"] == "1", "scenario min_output must be kept"
+    # min_output_amount now tracks the QUOTE (the reference's quote-derived min),
+    # NOT the scenario's stale static floor — scoring is anchored on
+    # quoted_output, so the min is just the (quote-relative) execution guard.
+    assert scored["min_output_amount"] == "990", "quote-derived min must win"
     # The intent_order built for simulation carries the enriched params.
     assert captured["intent_order"] is not None
 
@@ -226,8 +231,10 @@ def test_run_benchmark_falls_back_to_self_quote():
     assert sess.quote_calls == 1, "absent reference → must self-quote"
     scored = sess.scored_states[0]
     assert scored["quoted_output"] == "2000000"
-    # min_output stays the scenario's loose floor (kept, not the quote's tight one).
-    assert scored["min_output_amount"] == "1"
+    # min_output is the quote-derived loose floor: estimated * (1 - 50%) =
+    # 2000000 * 0.5 = 1000000 (BENCHMARK_MIN_SLIPPAGE_BPS), NOT the scenario's
+    # static "1". Scoring anchors on quoted_output, so this is just the guard.
+    assert scored["min_output_amount"] == "1000000"
     assert scored["platform_fee_wei"] == "50"
 
 
@@ -242,6 +249,25 @@ def test_run_benchmark_no_crash_when_self_quote_returns_none():
     # Unenriched: still no quoted_output (scenario would revert on-chain, but
     # the benchmark itself does not crash).
     assert "quoted_output" not in scored
+
+
+def test_run_benchmark_surfaces_champion_reference_failure_no_self_quote():
+    # De-mask: when the champion pre-pass marked this scenario as one it could
+    # NOT quote, run_benchmark must surface an explicit error + score 0 and must
+    # NOT silently self-quote (which would fabricate a non-comparable pass).
+    # A self_quote IS available — the test proves it is deliberately not used.
+    self_quote = QuoteResult(
+        estimated_output="2000000", platform_fee_wei="50", gas_estimate=1
+    )
+    session = _FakeSession(self_quote=self_quote)
+    ref = {"dex:small_swap": {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}}
+    results, sess, _ = _run(session, ref)
+
+    assert len(results) == 1
+    assert results[0].score == 0.0
+    assert results[0].error and "champion_reference_quote_failed" in results[0].error
+    assert sess.quote_calls == 0, "reference FAILED → must NOT self-quote"
+    assert sess.scored_states == [], "failed reference → scorer must not run"
 
 
 def test_run_benchmark_skips_quote_when_already_quoted():
