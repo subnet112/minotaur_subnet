@@ -1,6 +1,7 @@
-"""Shadow-champion adopt-vote — observe-only per-validator vote against a
-DESIGNATED reference champion (SHADOW_CHAMPION_IMAGE), so the fleet can
-demonstrate the challenger-quorum decision without an organic on-chain champion.
+"""Shadow adopt-vote — observe-only per-validator vote against the REAL reference
+champion (the adopted champion, or the official genesis when none is adopted —
+resolved from the store, never an injectable env), so the fleet can demonstrate
+the challenger-quorum decision without an organic on-chain champion.
 
 Exercises the orchestration glue in ``BenchmarkWorker.run_shadow_vote``: benchmark
 the reference champion + the challenger, apply the shared ``evaluate_adoption`` rule,
@@ -53,10 +54,12 @@ class _FakeCard:
         return {"app_scores": {"dex": self._s}, "app_onchain": {}}
 
 
-def _make_worker(monkeypatch, scores):
+def _make_worker(monkeypatch, scores, champion="champ:ref"):
     w = bw_mod.BenchmarkWorker(
         submission_store=_FakeSubStore(), use_docker=False, validator_identity="val-1",
     )
+    # The reference is the store-resolved champion (or genesis), NOT an env.
+    monkeypatch.setattr(w, "_resolve_champion_image", lambda: champion)
     monkeypatch.setattr(w, "_load_benchmark_intents", lambda **k: [(object(), _FakeState(), object())])
 
     async def _sf(intents):
@@ -76,7 +79,6 @@ def _make_worker(monkeypatch, scores):
 
 
 def test_better_challenger_votes_adopt(monkeypatch):
-    monkeypatch.setenv("SHADOW_CHAMPION_IMAGE", "champ:ref")
     w = _make_worker(monkeypatch, {"champ:ref": 0.70, "chal:good": 0.90})
     vote = asyncio.run(w.run_shadow_vote("chal:good"))
     assert vote["vote"] == "ADOPT", vote
@@ -86,7 +88,6 @@ def test_better_challenger_votes_adopt(monkeypatch):
 
 
 def test_worse_challenger_votes_reject(monkeypatch):
-    monkeypatch.setenv("SHADOW_CHAMPION_IMAGE", "champ:ref")
     w = _make_worker(monkeypatch, {"champ:ref": 0.70, "chal:bad": 0.50})
     vote = asyncio.run(w.run_shadow_vote("chal:bad"))
     assert vote["vote"] == "REJECT", vote
@@ -94,14 +95,12 @@ def test_worse_challenger_votes_reject(monkeypatch):
 
 def test_tie_challenger_votes_reject(monkeypatch):
     # No improvement above the dethrone margin -> REJECT (don't churn the champion).
-    monkeypatch.setenv("SHADOW_CHAMPION_IMAGE", "champ:ref")
     w = _make_worker(monkeypatch, {"champ:ref": 0.80, "chal:tie": 0.80})
     vote = asyncio.run(w.run_shadow_vote("chal:tie"))
     assert vote["vote"] == "REJECT", vote
 
 
 def test_no_champion_fails_safe(monkeypatch):
-    monkeypatch.delenv("SHADOW_CHAMPION_IMAGE", raising=False)
-    w = _make_worker(monkeypatch, {})
+    w = _make_worker(monkeypatch, {}, champion=None)
     vote = asyncio.run(w.run_shadow_vote("chal:good"))
     assert "error" in vote and "champion" in vote["error"].lower()
