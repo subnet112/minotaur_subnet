@@ -99,8 +99,7 @@ The context object has a simulation field:
   context.simulation = {
     success: bool,
     gasUsed (or gas_used): number,
-    tokenTransfers (or token_transfers): [{token, from_addr, to_addr, amount}],
-    priceImpact (or price_impact): number (percentage, e.g. 0.15 = 0.15%)
+    tokenTransfers (or token_transfers): [{token, from_addr, to_addr, amount}]
   }
 
 Use this pattern to get simulation data:
