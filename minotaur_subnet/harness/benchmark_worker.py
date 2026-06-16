@@ -1277,6 +1277,7 @@ class BenchmarkWorker:
                     continue
                 mapped = map_quote_result_to_params(
                     quote_result, intent.manifest, intent_function,
+                    slippage_bps=100,  # 1% benchmark floor (PR #188)
                 )
                 if mapped:
                     reference[label] = mapped

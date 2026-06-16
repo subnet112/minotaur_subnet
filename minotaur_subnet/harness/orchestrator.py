@@ -667,6 +667,7 @@ async def _enrich_state_with_quote(
         )
         quote_params = map_quote_result_to_params(
             quote_result, intent.manifest, intent_function,
+            slippage_bps=100,  # 1% benchmark floor (PR #188)
         )
 
     if not quote_params:
