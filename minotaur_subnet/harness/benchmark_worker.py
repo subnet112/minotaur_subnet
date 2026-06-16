@@ -1092,16 +1092,19 @@ class BenchmarkWorker:
     async def run_shadow_vote(self, challenger_image: str) -> dict[str, Any]:
         """Observe-only per-validator shadow adopt-vote (challenger-quorum demo).
 
-        Benchmarks a DESIGNATED reference champion (``SHADOW_CHAMPION_IMAGE``, or
-        the real champion if unset) and ``challenger_image`` on THIS validator's
-        own diverse Stage-2 subset, then applies the shared ``evaluate_adoption``
-        rule. Returns + publishes this validator's vote.
+        Benchmarks the REAL reference champion — the adopted champion, or the
+        official genesis solver when none is adopted (``_resolve_champion_image``,
+        the same store-backed resolution scoring uses) — and ``challenger_image``
+        on THIS validator's own diverse Stage-2 subset, then applies the shared
+        ``evaluate_adoption`` rule. Returns + publishes this validator's vote.
+
+        The reference is resolved from the store, NOT an injectable env, so a
+        miner can't point the vote at a weak/own reference to look better.
 
         NEVER touches the real champion, adoption, or weights — it is a pure
         shadow computation so the fleet can demonstrate the challenger-quorum
-        decision (good->adopt / bad->reject by majority) without needing an
-        organic champion to exist on-chain. Each validator scores its own slice
-        of orders, so disagreement on a regressing challenger is the feature.
+        decision (good->adopt / bad->reject by majority). Each validator scores
+        its own slice of orders, so disagreement on a regression is the feature.
         """
         import os
         from minotaur_subnet.harness.orchestrator import (
@@ -1113,12 +1116,9 @@ class BenchmarkWorker:
         from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
         from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
-        champ_image = (
-            os.environ.get("SHADOW_CHAMPION_IMAGE", "").strip()
-            or self._resolve_champion_image()
-        )
+        champ_image = self._resolve_champion_image()
         if not champ_image:
-            return {"error": "no shadow champion (set SHADOW_CHAMPION_IMAGE)"}
+            return {"error": "no champion/genesis reference available"}
         if not challenger_image:
             return {"error": "challenger_image required"}
 

@@ -33,8 +33,9 @@ class ShadowVoteRequest(BaseModel):
 async def shadow_vote(body: ShadowVoteRequest) -> dict[str, Any]:
     """Trigger this validator's OBSERVE-ONLY shadow adopt-vote.
 
-    Benchmarks a designated reference champion (``SHADOW_CHAMPION_IMAGE``) and the
-    given challenger on this validator's own diverse Stage-2 subset, applies the
+    Benchmarks the current champion (or the official genesis solver when none is
+    adopted — the same store-backed resolution scoring uses, never an injectable
+    env) and the given challenger on this validator's own diverse Stage-2 subset, applies the
     shared adoption rule, and returns this validator's vote. Never adopts, never
     touches the real champion or weights — it lets the fleet demonstrate the
     challenger-quorum decision (good->adopt / bad->reject by majority) without an
