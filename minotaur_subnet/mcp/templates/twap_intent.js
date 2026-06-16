@@ -84,13 +84,7 @@ async function validate(plan, state, context) {
     return { valid: false, reason: "No output token received" };
   }
 
-  // 5. Warnings
-  const warnings = [];
-  if (simulation.price_impact && simulation.price_impact > 0.5) {
-    warnings.push(`High price impact: ${simulation.price_impact.toFixed(2)}%`);
-  }
-
-  return { valid: true, warnings: warnings.length > 0 ? warnings : undefined };
+  return { valid: true };
 }
 
 // --- score ------------------------------------------------------------------

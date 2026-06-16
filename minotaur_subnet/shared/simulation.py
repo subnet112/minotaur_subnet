@@ -47,7 +47,6 @@ def build_mock_simulation(
         success=True,
         gas_used=gas_used,
         token_transfers=transfers,
-        price_impact=0.003,
     )
 
 
