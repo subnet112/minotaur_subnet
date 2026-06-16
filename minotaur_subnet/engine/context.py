@@ -98,9 +98,6 @@ def _simulation_to_dict(sim: SimulationResult) -> dict[str, Any]:
         result["approval_changes"] = sim.approval_changes
     else:
         result["approval_changes"] = []
-    if sim.price_impact is not None:
-        result["price_impact"] = sim.price_impact
-        result["priceImpact"] = sim.price_impact
     return result
 
 

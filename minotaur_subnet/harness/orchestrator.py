@@ -1148,7 +1148,6 @@ def _build_benchmark_simulation(
         gas_used=gas_used,
         token_transfers=transfers,
         state_changes=[],
-        price_impact=0.02,
     )
 
 

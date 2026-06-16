@@ -50,7 +50,6 @@ class Fill:
 
     output_amount: str | None = None    # delivered output (wei str); None = nothing delivered
     gas_used: int = 150_000
-    price_impact: float = 0.0
     success: bool = True
     on_chain_score: int | None = None   # BPS 0..10000 (informational in current contest)
     quoted_output: str | None = None    # the solver's OWN quote estimate (for quote-accuracy grading)
@@ -66,7 +65,6 @@ class Fill:
         return cls(
             output_amount=out,
             gas_used=int(spec.get("gas_used", 150_000)),
-            price_impact=float(spec.get("price_impact", 0.0)),
             success=bool(spec.get("success", True)),
             on_chain_score=spec.get("on_chain_score"),
             quoted_output=q,

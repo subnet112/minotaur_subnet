@@ -345,14 +345,11 @@ class AnvilSimulator:
                 "delta": str(eth_delta),
             })
 
-            price_impact = self._estimate_price_impact(all_transfers)
-
             return SimulationResult(
                 success=True,
                 gas_used=total_gas,
                 token_transfers=all_transfers,
                 state_changes=state_changes,
-                price_impact=price_impact,
             )
 
         except Exception as exc:
@@ -580,8 +577,6 @@ class AnvilSimulator:
             # on_chain_score was captured pre-tx (above) — reading it here, after
             # the tx drained the funding, would revert and yield None.
 
-            price_impact = self._estimate_price_impact(all_transfers)
-
             logger.info(
                 "scoreIntent simulation: gas=%d transfers=%d on_chain_score=%s",
                 total_gas, len(all_transfers), on_chain_score,
@@ -591,7 +586,6 @@ class AnvilSimulator:
                 success=True,
                 gas_used=total_gas,
                 token_transfers=all_transfers,
-                price_impact=price_impact,
                 on_chain_score=on_chain_score,
             )
 
@@ -1302,15 +1296,6 @@ class AnvilSimulator:
         except Exception as exc:
             logger.debug("scoreIntent call failed: %s", exc)
             return None
-
-    def _estimate_price_impact(
-        self, transfers: list[TokenTransfer]
-    ) -> float:
-        """Estimate price impact from token transfers (rough heuristic)."""
-        if len(transfers) < 2:
-            return 0.0
-        # For MVP: return a small default impact
-        return 0.003
 
     def is_connected(self) -> bool:
         """Check if the Anvil instance is reachable."""

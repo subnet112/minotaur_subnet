@@ -5,9 +5,8 @@
  * code; they only receive the final numeric score (black-box optimisation).
  *
  * Scoring breakdown (0 - 1.0):
- *   - Output amount vs quote:  up to 0.50  (core value)
+ *   - Output amount vs quote:  up to 0.70  (core value)
  *   - Gas efficiency:          up to 0.20
- *   - Price impact:            up to 0.20
  *   - Route simplicity bonus:  up to 0.10
  */
 
@@ -67,14 +66,7 @@ async function validate(plan, state, context) {
     };
   }
 
-  // 4. Warnings
-  const warnings = [];
-  const priceImpact = simulation.priceImpact || simulation.price_impact;
-  if (priceImpact && priceImpact > 1.0) {
-    warnings.push(`High price impact: ${priceImpact.toFixed(2)}%`);
-  }
-
-  return { valid: true, warnings: warnings.length > 0 ? warnings : undefined };
+  return { valid: true };
 }
 
 // ─── score ───────────────────────────────────────────────────────────────────
@@ -103,9 +95,8 @@ async function score(plan, state, context) {
   const breakdown = {};
 
   // ── Scoring weights ─────────────────────────────────────────────────
-  const W_OUTPUT = 0.50;
+  const W_OUTPUT = 0.70;
   const W_GAS = 0.20;
-  const W_IMPACT = 0.20;
   const W_ROUTE = 0.10;
 
   // ── Component 1: Output amount (up to W_OUTPUT) ──────────────────────
@@ -145,21 +136,7 @@ async function score(plan, state, context) {
     breakdown.gasEfficiency = gasScore;
   }
 
-  // ── Component 3: Price impact (up to W_IMPACT) ───────────────────────
-  const priceImpact = simulation.priceImpact !== undefined ? simulation.priceImpact
-    : simulation.price_impact;
-  if (priceImpact !== undefined && priceImpact !== null) {
-    // Lower price impact is better
-    const impactScore = linearScore(1.0 - priceImpact, 0, 1) * W_IMPACT;
-    finalScore += impactScore;
-    breakdown.priceImpact = impactScore;
-  } else {
-    // No price impact data: assume moderate
-    finalScore += W_IMPACT * 0.5;
-    breakdown.priceImpact = W_IMPACT * 0.5;
-  }
-
-  // ── Component 4: Route simplicity (up to W_ROUTE) ────────────────────
+  // ── Component 3: Route simplicity (up to W_ROUTE) ────────────────────
   const numHops = plan.interactions.length;
   if (numHops <= 1) {
     finalScore += W_ROUTE;
@@ -180,7 +157,6 @@ async function score(plan, state, context) {
       simulatedOutput: totalOutput.toString(),
       minOutput: minOutput.toString(),
       gasUsed,
-      priceImpact: priceImpact,
       hops: numHops,
     },
   };
