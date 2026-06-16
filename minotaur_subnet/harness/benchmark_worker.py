@@ -42,6 +42,8 @@ from minotaur_subnet.harness.orchestrator import (
     SolverTimeoutError,
     SolverCrashedError,
     run_benchmark,
+    REFERENCE_QUOTE_FAILED_SENTINEL,
+    BENCHMARK_MIN_SLIPPAGE_BPS,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
@@ -1225,6 +1227,13 @@ class BenchmarkWorker:
         Returns ``{}`` (every scenario self-quotes, which still fixes the
         revert) when no champion image is available, Docker is disabled, or the
         champion session can't be started.
+
+        Per-scenario: when the champion session is up but FAILS to quote a
+        specific scenario (raises or returns ``None``), that scenario's entry is
+        set to the ``REFERENCE_QUOTE_FAILED_SENTINEL`` marker instead of being
+        omitted. ``run_benchmark`` detects the marker and scores the scenario 0
+        with an explicit error rather than silently self-quoting it — surfacing
+        the failure instead of masking it behind a non-comparable self-quote.
         """
         if not self._use_docker:
             return {}
@@ -1240,6 +1249,7 @@ class BenchmarkWorker:
         )
 
         reference: dict[str, dict[str, str]] = {}
+        failed: set[str] = set()
         orch = SolverOrchestrator()
         try:
             session = await orch.start_docker(image_tag)
@@ -1268,23 +1278,44 @@ class BenchmarkWorker:
                 try:
                     quote_result = await session.quote(intent, state, snapshot)
                 except Exception as exc:
-                    logger.warning(
-                        "Reference-quote pre-pass: champion quote failed for "
-                        "%s (%s); scenario will self-quote", label, exc,
+                    # Surface, don't mask: a champion that can't quote a scenario
+                    # is a real failure (broken solver, bad scenario, RPC issue).
+                    # Mark it so run_benchmark scores 0 with an explicit error
+                    # instead of silently self-quoting a non-comparable pass.
+                    logger.error(
+                        "[reference-quote-FAILED] champion quote raised for %s "
+                        "(%s); scenario will score 0, NOT self-quote", label, exc,
                     )
+                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
+                    failed.add(label)
                     continue
                 if quote_result is None:
+                    logger.error(
+                        "[reference-quote-FAILED] champion quote returned None "
+                        "for %s; scenario will score 0, NOT self-quote", label,
+                    )
+                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
+                    failed.add(label)
                     continue
                 mapped = map_quote_result_to_params(
                     quote_result, intent.manifest, intent_function,
-                    slippage_bps=100,  # 1% benchmark floor (PR #188)
+                    slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
                 )
                 if mapped:
                     reference[label] = mapped
-            logger.info(
-                "Reference-quote pre-pass: built %d champion reference quotes",
-                len(reference),
-            )
+            built = len(reference) - len(failed)
+            if failed:
+                logger.error(
+                    "Reference-quote pre-pass: built %d champion reference "
+                    "quotes; %d scenario(s) FAILED to quote (scored 0, not "
+                    "self-quoted): %s",
+                    built, len(failed), sorted(failed),
+                )
+            else:
+                logger.info(
+                    "Reference-quote pre-pass: built %d champion reference quotes",
+                    built,
+                )
         finally:
             await session.shutdown()
         return reference
