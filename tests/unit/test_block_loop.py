@@ -624,6 +624,79 @@ class TestDualScoring:
         # Should process normally (only JS gate)
         assert result.orders_processed == 1
 
+    @pytest.mark.asyncio
+    async def test_dual_scoring_fail_closed_on_none_when_flag_set(
+        self, temp_store, app_def, monkeypatch,
+    ):
+        """ONCHAIN_SCORE_FAIL_CLOSED=1: a None on-chain score (contract present)
+        must REJECT instead of riding on the JS score alone."""
+        monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "1")
+        app_def.config.score_threshold = 0.3
+        temp_store.save_app(app_def)
+        temp_store.save_deployment(DeploymentResult(
+            app_id="test_app", status=AppStatus.ACTIVE,
+            contract_address="0x" + "ab" * 20,
+        ))
+        ob = IntentOrderBook()
+        mock_sim = AsyncMock()
+        mock_sim.simulate = AsyncMock(return_value=SimulationResult(
+            success=True, gas_used=100000, on_chain_score=None,  # contract didn't bless it
+        ))
+        loop = BlockLoop(
+            orderbook=ob, app_store=temp_store, relayer=MockRelayer(),
+            simulator=mock_sim, score_threshold=0.3,
+        )
+        ob.submit(
+            app_id="test_app", intent_function="execute",
+            params={"input_token": "WETH", "output_token": "USDC", "input_amount": "1000"},
+            submitted_by="0xuser",
+        )
+        result = await loop.tick()
+        assert result.orders_rejected == 1
+        rejected = ob.list_orders(status="rejected")
+        assert "On-chain score unavailable" in (rejected[0].error or "")
+
+    @pytest.mark.asyncio
+    async def test_dual_scoring_fail_open_on_none_when_flag_unset(
+        self, temp_store, app_def, monkeypatch,
+    ):
+        """Default (flag unset): a None on-chain score must NOT reject — legacy
+        skip-on-None preserved (order rides on the JS gate)."""
+        monkeypatch.delenv("ONCHAIN_SCORE_FAIL_CLOSED", raising=False)
+        app_def.config.score_threshold = 0.3
+        temp_store.save_app(app_def)
+        temp_store.save_deployment(DeploymentResult(
+            app_id="test_app", status=AppStatus.ACTIVE,
+            contract_address="0x" + "ab" * 20,
+        ))
+        ob = IntentOrderBook()
+        mock_sim = AsyncMock()
+        mock_sim.simulate = AsyncMock(return_value=SimulationResult(
+            success=True, gas_used=100000, on_chain_score=None,
+        ))
+        loop = BlockLoop(
+            orderbook=ob, app_store=temp_store, relayer=MockRelayer(),
+            simulator=mock_sim, score_threshold=0.3,
+        )
+        ob.submit(
+            app_id="test_app", intent_function="execute",
+            params={"input_token": "WETH", "output_token": "USDC", "input_amount": "1000"},
+            submitted_by="0xuser",
+        )
+        result = await loop.tick()
+        assert result.orders_approved == 1
+
+
+def test_onchain_score_fail_closed_flag(monkeypatch):
+    """The shared dual-scoring fail-closed flag: default off, on when set."""
+    from minotaur_subnet.shared.simulation import onchain_score_fail_closed
+    monkeypatch.delenv("ONCHAIN_SCORE_FAIL_CLOSED", raising=False)
+    assert onchain_score_fail_closed() is False
+    monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "1")
+    assert onchain_score_fail_closed() is True
+    monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "off")
+    assert onchain_score_fail_closed() is False
+
 
 class TestPerAppScoreThreshold:
     """Tests for per-app JS score threshold (SCR-7)."""

@@ -157,6 +157,11 @@ class CertifyRoundRequest(BaseModel):
     effective_epoch: int = Field(..., ge=0)
     quorum_required: int = Field(0, ge=0)
     approvals: list[ChampionApprovalPayload] = Field(default_factory=list)
+    # Operator override for the public certify endpoint: certify a candidate
+    # that is NOT the round's rule-selected finalist (and not genesis/builtin).
+    # Audited (logged loudly). Default off so the public endpoint can't silently
+    # bypass the adoption rule.
+    force: bool = False
 
 
 class ActivateRoundRequest(BaseModel):
