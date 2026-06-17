@@ -5,9 +5,8 @@ scenarios. Sampling is deterministic from the round_id — all validators
 derive the same sample without needing to broadcast the selection.
 
 Stage 2 replays these orders' parameters against the current benchmark
-fork (weekly-pinned Anvil). Stage 3 replays the subset where the
-challenger failed against a fresh Anvil pinned to each order's original
-execution block.
+fork (weekly-pinned Anvil), and the resulting per-app scores feed the
+adoption rule's per-app non-regression floor.
 """
 
 from __future__ import annotations
