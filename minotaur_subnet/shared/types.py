@@ -455,7 +455,6 @@ class SimulationResult:
     token_transfers: list[TokenTransfer] = field(default_factory=list)
     state_changes: list[dict[str, Any]] = field(default_factory=list)
     approval_changes: list[dict[str, Any]] = field(default_factory=list)
-    price_impact: float | None = None
     on_chain_score: int | None = None    # BPS (0-10000) from contract scoreIntent()
     leg_results: dict[int, Any] | None = None       # leg_id -> per-leg sim result dict
     bridge_estimate: dict[str, Any] | None = None    # bridge quote data for cross-chain

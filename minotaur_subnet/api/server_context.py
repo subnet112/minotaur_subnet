@@ -45,6 +45,11 @@ class ServerContext:
     round_anchor_parity: dict = field(default_factory=dict)
     round_anchor_task: Any = None
 
+    # ── independent adopt vote (CHALLENGER_QUORUM_MODE observability) ─────
+    # This validator's latest independent ADOPT/REJECT vote on a candidate,
+    # published on /health for the fleet shadow tally (poll, group by candidate).
+    last_independent_vote: dict = field(default_factory=dict)
+
     # ── champion-consensus ProtocolConfig ────────────────────────────────
     # Created at startup pointed at BT EVM ValidatorRegistry (for the
     # validator set) + ChampionRegistry (for the quorum threshold). The

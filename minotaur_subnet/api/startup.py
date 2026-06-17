@@ -976,6 +976,7 @@ async def initialize(ctx: ServerContext) -> dict:
             genesis_solver_image=_genesis_solver_image,
             require_real_sim=_require_real_sim,
             pin_resolver=_leader_fork_pin_resolver,
+            validator_identity=_resolve_solver_round_hotkey(),
         )
         ctx.benchmark_task = asyncio.create_task(
             ctx.benchmark_worker.run_loop(interval=poll_interval),
@@ -1966,6 +1967,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 round_store=round_store,
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,
+                vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
 
