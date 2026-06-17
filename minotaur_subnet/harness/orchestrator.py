@@ -835,27 +835,26 @@ async def run_benchmark(
         intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
         br = BenchmarkResult(intent_id=intent_label)
 
-        # De-mask champion-reference-quote failures. If the reference pre-pass
-        # marked this scenario as one the CHAMPION could not quote, do NOT fall
-        # through to a self-quote — that would fabricate a non-comparable pass
-        # (the solver clears its own bar) and silently hide that the common
-        # reference bar is missing. Score 0 with an explicit error instead. This
-        # is symmetric across champion + challenger (both graded on the same
-        # reference set), so it never biases the comparison.
+        # Champion BLIND SPOT. The reference pre-pass marked this scenario as one
+        # the CHAMPION could not quote (surfaced/logged there — the anti-masking
+        # guarantee). We do NOT zero it: instead each solver SELF-QUOTES, so a
+        # challenger that CAN quote + execute this order reveals a real capability
+        # the champion lacks. The self-quote still requires a real on-chain
+        # execution to score, so it can't fabricate capability — and the champion
+        # self-quotes the same way (it fails → scores 0), so the champion's 0 is
+        # the floor and any real execution here is unambiguous progress. On an
+        # order the champion can't process at all, any progress is good progress.
+        # (Under-quoting can inflate the MAGNITUDE of that progress, not its
+        # existence; capping the per-blind-spot contribution is a future guard for
+        # when champion ADOPTION is live, not for observe-only progress reveal.)
         _ref = reference_quotes.get(intent_label)
         if _ref and _ref.get(REFERENCE_QUOTE_FAILED_SENTINEL):
-            br.error = (
-                "champion_reference_quote_failed: scenario not scored "
-                "(refusing to self-quote a non-comparable pass)"
-            )
-            logger.error(
-                "[reference-quote-FAILED] %s: champion could not quote this "
-                "scenario; scoring 0 rather than silently self-quoting",
+            logger.warning(
+                "[champion-blind-spot] %s: champion could not quote; this solver "
+                "self-quotes to reveal capability (champion scores 0 here)",
                 intent_label,
             )
-            br.elapsed_ms = int((time.monotonic() - start) * 1000)
-            results.append(br)
-            continue
+            _ref = None  # fall through to the self-quote path below
 
         # Quote-at-benchmark: synthetic scenarios never ran a quote, so their
         # on-chain intentParams omit the CoW `quoted_output` field and the
