@@ -25,6 +25,7 @@ from minotaur_subnet.blockloop.utils import (
     _resolve_effective_policy_tier,
     _plan_assessment_to_dict,
 )
+from minotaur_subnet.shared.simulation import onchain_score_fail_closed
 from minotaur_subnet.blockloop.plan_generation import PlanGenerator
 from minotaur_subnet.blockloop.simulation import SimulationRunner
 from minotaur_subnet.blockloop.scoring import PlanScorer
@@ -378,23 +379,36 @@ class OrderProcessor:
             return False
 
         # On-chain score gate — dual scoring (SCR-5, SCR-6, VAL-10)
-        if simulation.on_chain_score is not None:
-            on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
+        on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
+        oc_score = simulation.on_chain_score
+        if oc_score is not None:
+            self.orderbook.update_order(order.order_id, on_chain_score=oc_score)
+        # Fail-closed (opt-in): a deployed contract must yield a passing on-chain
+        # score. None means scoreIntent returned valid=False (plan breaks an
+        # on-chain invariant) or was unreadable — the contract did NOT bless the
+        # plan, so don't relay it on the JS score alone. Leader + follower share
+        # onchain_score_fail_closed() so they gate identically.
+        if contract_address and oc_score is None and onchain_score_fail_closed():
             self.orderbook.update_order(
-                order.order_id, on_chain_score=simulation.on_chain_score,
+                order.order_id,
+                status=OrderStatus.REJECTED,
+                error="On-chain score unavailable — contract returned invalid or unreadable (dual-scoring fail-closed)",
             )
-            if simulation.on_chain_score < on_chain_threshold:
-                self.orderbook.update_order(
-                    order.order_id,
-                    status=OrderStatus.REJECTED,
-                    error=(
-                        f"On-chain score {simulation.on_chain_score} BPS "
-                        f"< threshold {on_chain_threshold}"
-                    ),
-                )
-                self.order_persistence.sync(order.order_id)
-                self.app_store.record_execution(order.app_id, score, success=False)
-                return False
+            self.order_persistence.sync(order.order_id)
+            self.app_store.record_execution(order.app_id, score, success=False)
+            return False
+        if oc_score is not None and oc_score < on_chain_threshold:
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.REJECTED,
+                error=(
+                    f"On-chain score {oc_score} BPS "
+                    f"< threshold {on_chain_threshold}"
+                ),
+            )
+            self.order_persistence.sync(order.order_id)
+            self.app_store.record_execution(order.app_id, score, success=False)
+            return False
 
         # Phase 2: Consensus (with optional peer broadcast)
         consensus_result = None
