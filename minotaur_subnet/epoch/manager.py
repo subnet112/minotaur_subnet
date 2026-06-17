@@ -54,11 +54,16 @@ from minotaur_subnet.weight_policy import (
 
 logger = logging.getLogger(__name__)
 
-# Champion must beat the incumbent by this margin to be adopted.
-# 0.005 == 0.5% (NOT 5% — the prose used to say 5%). The value is left as-is on
-# purpose: raising it to a deliberate minimum-detectable-effect margin must wait
-# until scores are cross-validator comparable (sealed-round work, design doc P1).
-DETHRONE_MARGIN = 0.005
+# Champion must beat the incumbent by this margin to be adopted. THE SINGLE
+# SOURCE of the dethrone margin: every consumer imports DETHRONE_MARGIN from here
+# (the manager passes it to adopt_rule; champion_consensus, benchmark_worker, and
+# scoring_lab import it directly), so changing it here moves the bar everywhere —
+# leader and followers stay on an identical rule.
+# 0.05 == 5%: a deliberate minimum-detectable-effect margin that sits well above
+# the observed run-to-run benchmark noise (~1% same-code spread measured on the
+# prod-shadow vote), so champions don't churn on noise. (Was 0.005 / 0.5% — which
+# the prose had mislabeled "5%".)
+DETHRONE_MARGIN = 0.05
 
 
 def _adoption_disabled() -> bool:
@@ -1146,6 +1151,8 @@ class EpochManager:
         epoch: int,
         *,
         round_id: str | None = None,
+        force: bool = False,
+        capture_previous: bool = True,
     ) -> None:
         """Load the winning submission and swap it into the block loop.
 
@@ -1153,10 +1160,17 @@ class EpochManager:
         for BlockLoop. Otherwise, if orchestrator is available, starts a Docker
         session directly. If neither is configured, updates champion metadata
         only (solver stays the same).
+
+        ``force`` bypasses the DISABLE_CHAMPION_ADOPTION gate — used only by the
+        emergency revert path (rolling back to an already-vetted prior champion
+        is always safe). ``capture_previous`` records the displaced champion as
+        the rollback target; the revert path sets it False (an undo isn't a new
+        adoption and must not overwrite its own target).
         """
         # Belt-and-suspenders: even if some path reached activation, never swap
-        # the live champion while adoption is disabled.
-        if _adoption_disabled():
+        # the live champion while adoption is disabled — unless this is a forced
+        # revert to a previously-vetted champion.
+        if _adoption_disabled() and not force:
             logger.warning(
                 "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — refusing hot-swap to "
                 "%s; live champion solver unchanged.",
@@ -1236,6 +1250,13 @@ class EpochManager:
         if self._sub_store is not None:
             self._sub_store.adopt(submission.submission_id)
         if self._round_store is not None:
+            # Record the champion we're displacing as the one-step rollback
+            # target — but only on a genuine change (not a restore / re-adopt of
+            # the same submission), and not when this swap is itself a revert.
+            if capture_previous:
+                outgoing = self._round_store.get_active_champion()
+                if outgoing.submission_id and outgoing.submission_id != submission.submission_id:
+                    self._round_store.set_previous_champion(outgoing)
             self._round_store.set_active_champion(
                 ChampionSnapshot(
                     submission_id=submission.submission_id,
@@ -1253,6 +1274,74 @@ class EpochManager:
         # Hot-swap in block loop
         if self._block_loop and new_runtime is not None:
             self._block_loop.set_solver(new_runtime)
+
+    async def revert_to_previous_champion(
+        self,
+        *,
+        epoch: int | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Emergency rollback: swap the live champion back to the PREVIOUS one.
+
+        A one-step undo of the most recent adoption — restores the champion that
+        was active immediately before the current one (NOT genesis). Intended as
+        a kill switch when a freshly-adopted champion misbehaves: set
+        ``DISABLE_CHAMPION_ADOPTION=1`` first to stop it being re-adopted, then
+        revert. The swap is forced (bypasses the adoption gate — reverting to an
+        already-vetted prior champion is always safe) and skips the
+        dethrone-margin / scoring path entirely.
+
+        Updates the live block-loop solver and the active-champion snapshot, so
+        the next weight emission routes to the restored champion. Leaves the
+        rollback target unchanged (reverting again is a no-op).
+
+        Raises ``ValueError`` if there is no previous champion recorded, it's
+        already active, or its submission can't be resolved from the store.
+        """
+        if self._round_store is None:
+            raise ValueError("revert unavailable: no round store configured")
+        previous = self._round_store.get_previous_champion()
+        if not previous.submission_id:
+            raise ValueError("no previous champion recorded to revert to")
+        if previous.submission_id == self._champion.submission_id:
+            raise ValueError(
+                f"previous champion {previous.submission_id} is already active "
+                "— nothing to revert"
+            )
+        submission = (
+            self._sub_store.get(previous.submission_id)
+            if self._sub_store is not None
+            else None
+        )
+        if submission is None:
+            raise ValueError(
+                f"previous champion submission {previous.submission_id} not found in store"
+            )
+
+        from_submission_id = self._champion.submission_id
+        target_epoch = epoch if epoch is not None else self._current_epoch
+        logger.warning(
+            "[revert] rolling champion back %s -> %s (epoch=%d): %s",
+            from_submission_id or "<none>",
+            previous.submission_id,
+            target_epoch,
+            reason or "manual revert",
+        )
+        await self._hot_swap(
+            submission,
+            target_epoch,
+            round_id=previous.activated_round_id,
+            force=True,
+            capture_previous=False,
+        )
+        return {
+            "reverted": True,
+            "from_submission_id": from_submission_id,
+            "to_submission_id": previous.submission_id,
+            "to_image_tag": submission.image_tag,
+            "epoch": target_epoch,
+            "reason": reason or "manual revert",
+        }
 
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
