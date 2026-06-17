@@ -251,11 +251,13 @@ def test_run_benchmark_no_crash_when_self_quote_returns_none():
     assert "quoted_output" not in scored
 
 
-def test_run_benchmark_surfaces_champion_reference_failure_no_self_quote():
-    # De-mask: when the champion pre-pass marked this scenario as one it could
-    # NOT quote, run_benchmark must surface an explicit error + score 0 and must
-    # NOT silently self-quote (which would fabricate a non-comparable pass).
-    # A self_quote IS available — the test proves it is deliberately not used.
+def test_run_benchmark_self_quotes_on_champion_blind_spot():
+    # Champion BLIND SPOT: the pre-pass marked this scenario as one the champion
+    # could not quote. run_benchmark must NOT zero it — instead the solver
+    # SELF-QUOTES, so a challenger that CAN quote + execute the order reveals a
+    # capability the champion lacks (the champion self-quote-fails -> 0, so any
+    # real execution here is genuine progress). The self-quote still requires a
+    # real execution, so it can't fabricate capability.
     self_quote = QuoteResult(
         estimated_output="2000000", platform_fee_wei="50", gas_estimate=1
     )
@@ -264,10 +266,9 @@ def test_run_benchmark_surfaces_champion_reference_failure_no_self_quote():
     results, sess, _ = _run(session, ref)
 
     assert len(results) == 1
-    assert results[0].score == 0.0
-    assert results[0].error and "champion_reference_quote_failed" in results[0].error
-    assert sess.quote_calls == 0, "reference FAILED → must NOT self-quote"
-    assert sess.scored_states == [], "failed reference → scorer must not run"
+    assert sess.quote_calls == 1, "blind spot -> solver self-quotes to reveal capability"
+    scored = sess.scored_states[0]
+    assert scored["quoted_output"] == "2000000", "self-quote anchors the score"
 
 
 def test_run_benchmark_skips_quote_when_already_quoted():
