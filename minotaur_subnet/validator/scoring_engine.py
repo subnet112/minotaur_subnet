@@ -24,7 +24,7 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
     TokenTransfer,
 )
-from minotaur_subnet.shared.simulation import build_mock_simulation
+from minotaur_subnet.shared.simulation import build_mock_simulation, onchain_score_fail_closed
 
 if TYPE_CHECKING:
     from minotaur_subnet.consensus import ConsensusManager
@@ -595,19 +595,31 @@ class ScoringEngine:
                     "reason_code": RejectionCode.FEE_NOT_CERTIFIED.value,
                 }
 
-        # On-chain score gate for follower (CON-6, CON-7)
-        if simulation is not None and simulation.on_chain_score is not None:
+        # On-chain score gate for follower (CON-6, CON-7) — must mirror the
+        # leader's order_processor gate so leader and follower agree.
+        if simulation is not None:
             app_def = self.store.get_app(app_id) if app_id else None
             threshold = (
                 app_def.config.on_chain_threshold
                 if app_def and app_def.config
                 else 5000
             )
-            if simulation.on_chain_score < threshold:
+            oc_score = simulation.on_chain_score
+            # Fail-closed (opt-in): a deployed contract must yield a passing
+            # on-chain score. None = scoreIntent returned valid=False / unreadable
+            # → the contract didn't bless the plan, so don't sign it on the JS
+            # score alone.
+            if contract_address and oc_score is None and onchain_score_fail_closed():
+                return {
+                    "approved": False,
+                    "reason": "On-chain score unavailable — contract returned invalid or unreadable (dual-scoring fail-closed)",
+                    "reason_code": RejectionCode.ON_CHAIN_SCORE_BELOW_THRESHOLD.value,
+                }
+            if oc_score is not None and oc_score < threshold:
                 return {
                     "approved": False,
                     "reason": (
-                        f"On-chain score {simulation.on_chain_score} BPS "
+                        f"On-chain score {oc_score} BPS "
                         f"below threshold {threshold}"
                     ),
                     "reason_code": RejectionCode.ON_CHAIN_SCORE_BELOW_THRESHOLD.value,
