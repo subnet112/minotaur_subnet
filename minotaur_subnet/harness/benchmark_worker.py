@@ -552,43 +552,6 @@ class BenchmarkWorker:
         finally:
             await session.shutdown()
 
-    async def _benchmark_one_scenario_with_rpc(
-        self,
-        image_tag: str,
-        intent: "AppIntentDefinition",
-        state: "IntentState",
-        snapshot: "MarketSnapshot",
-        score_fn: Any,
-        rpc_overrides: dict[int, str],
-    ) -> "BenchmarkResult":
-        """Run a single scenario through a Docker solver pointed at an
-        override RPC. Used by Stage 3 regression gate to replay one order
-        against a historical-block Anvil fork.
-
-        Returns a BenchmarkResult with the score (0 if the solver could
-        not produce a valid plan or simulation reverted).
-        """
-        orch = SolverOrchestrator()
-        session = await orch.start_docker(image_tag, rpc_overrides=rpc_overrides)
-        try:
-            # NB: no fork_block here. Stage 3 replays a *past order* at its own
-            # historical block (via rpc_overrides on the solver), which is not the
-            # epoch block. Pinning the simulator fork for this path is a separate
-            # state-bundle task — see the Phase 4 plan ("Pin Stage 2 to the block").
-            results = await run_benchmark(
-                session,
-                [(intent, state, snapshot)],
-                config=BenchmarkConfig(chain_ids=[state.chain_id]),
-                score_fn=score_fn,
-                simulator=self._simulator,
-                require_real_sim=self._require_real_sim,
-            )
-            if results:
-                return results[0]
-            return BenchmarkResult(intent_id=intent.app_id, score=0.0, error="no_result")
-        finally:
-            await session.shutdown()
-
     async def _benchmark_solver_path(
         self,
         solver_path: str,

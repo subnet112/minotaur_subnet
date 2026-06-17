@@ -100,21 +100,6 @@ async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
     return stdout.decode("utf-8", errors="replace").strip() or None
 
 
-def _stage3_disabled() -> bool:
-    """Whether the Stage 3 historical-regression gate is disabled.
-
-    Read at call time so operators can flip without restarting. The gate is now
-    OPT-IN: it defaults to DISABLED because it FAIL-CLOSES when a referenced chain
-    has no archive RPC, and it was accidentally dead for a long time (the
-    per_intent key bug), so reviving it on-by-default could suddenly block
-    adoptions on a leader that has order history but no archive RPC. Enable it
-    deliberately with ``STAGE3_DISABLED=0`` once archive RPCs are configured.
-    """
-    return os.environ.get("STAGE3_DISABLED", "1").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-
-
 @dataclass
 class ChampionInfo:
     """Metadata about the currently active solver champion."""
@@ -167,9 +152,7 @@ class EpochManager:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
         self._sub_store = submission_store
-        # App/order store for the Stage-3 historical-regression gate (order lookups).
-        # Was referenced but never assigned — defaults None so the gate degrades to
-        # "no candidates -> pass" rather than AttributeError when unwired.
+        # App/order store injected for app/order lookups (optional; may be None).
         self._app_store = app_store
         self._orchestrator = orchestrator
         self._round_store = round_store
@@ -289,23 +272,6 @@ class EpochManager:
         # Step 3: Re-score incumbent with current scenarios, then check margin
         await self._refresh_incumbent_score()
         if self._should_adopt(new_champion_sub):
-            # Stage 3: regression gate — block adoption if challenger fails
-            # scenarios where the incumbent still succeeds
-            if not await self._passes_regression_gate(new_champion_sub, scope_round_id):
-                logger.warning(
-                    "Challenger %s blocked by Stage 3 regression gate",
-                    new_champion_sub.submission_id,
-                )
-                next_round = self._complete_round(
-                    current_round,
-                    epoch,
-                    activated=False,
-                    abort_reason="regression_detected",
-                )
-                if next_round is not None:
-                    result["next_round_id"] = next_round.round_id
-                self._epoch_history.append(result)
-                return result
             try:
                 await self._hot_swap(new_champion_sub, epoch, round_id=scope_round_id)
                 result["champion_changed"] = True
@@ -436,25 +402,6 @@ class EpochManager:
             )
             result["status_after"] = RoundStatus.ABORTED.value
             result["abort_reason"] = "dethrone_margin_not_met"
-            if next_round is not None:
-                result["next_round_id"] = next_round.round_id
-            return result
-
-        # Stage 3: regression gate — block if challenger fails scenarios
-        # that the incumbent still handles correctly at the original block.
-        if not await self._passes_regression_gate(finalist, round_id):
-            logger.warning(
-                "Challenger %s blocked by Stage 3 regression gate (round %s)",
-                finalist.submission_id, round_id,
-            )
-            next_round = self._complete_round(
-                round_state,
-                epoch,
-                activated=False,
-                abort_reason="regression_detected",
-            )
-            result["status_after"] = RoundStatus.ABORTED.value
-            result["abort_reason"] = "regression_detected"
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
@@ -730,236 +677,6 @@ class EpochManager:
                 self._champion.submission_id, self._champion.benchmark_score,
                 exc_info=True,
             )
-
-    async def _passes_regression_gate(
-        self,
-        challenger: Submission,
-        round_id: str | None,
-    ) -> bool:
-        """Stage 3 regression gate. Returns True to allow adoption.
-
-        Truth table (explicit so the audit doesn't have to re-derive it):
-
-          | candidates | archive ok | STAGE3_DISABLED | result | why |
-          |------------+------------+-----------------+--------+-----|
-          | -          | -          | 1               | True   | explicit skip |
-          | 0          | -          | 0               | True   | nothing to regress |
-          | >0         | yes        | 0               | T/F    | run the test |
-          | >0         | no         | 0               | False  | fail-closed on missing archive |
-
-        "archive ok" means every chain the candidates reference has an
-        archive RPC configured. We check all of them up front so we don't
-        waste work on one candidate only to fail on the next.
-        """
-        if _stage3_disabled():
-            logger.info("[stage3] disabled by STAGE3_DISABLED env — returning True")
-            return True
-
-        if not self._benchmark_worker:
-            # No benchmark worker → can't replay, fail-closed
-            return False
-        if not self._sub_store:
-            return False
-
-        incumbent_sub = self._sub_store.get(self._champion.submission_id) if self._champion.submission_id else None
-        if incumbent_sub is None or not incumbent_sub.image_tag:
-            # No incumbent to compare against → genesis case, skip
-            logger.info("[stage3] skipped: no incumbent Docker image available")
-            return True
-
-        if not challenger.image_tag:
-            logger.info("[stage3] skipped: challenger has no image_tag")
-            return True
-
-        # Find regression candidates from challenger's benchmark details.
-        # NB: the per-scenario list is stored under "per_intent" (see
-        # benchmark_worker._results_to_details); reading "results" here always
-        # yielded [] — the gate was silently dead. Fixed to "per_intent".
-        details = getattr(challenger, "benchmark_details", None) or {}
-        results = details.get("per_intent") or details.get("results") or []
-        candidates: list[dict] = []
-        for r in results:
-            intent_id = r.get("intent_id", "")
-            score = r.get("score", 0)
-            error = r.get("error")
-            # Only historical scenarios where challenger failed
-            if ":hist:" not in intent_id:
-                continue
-            if score > 0:
-                continue
-            # Extract order_id from intent_id format "app_xxx:hist:ord_yyy"
-            parts = intent_id.split(":hist:")
-            if len(parts) != 2:
-                continue
-            order_id = parts[1]
-            if self._app_store is None:
-                continue
-            order = self._app_store.get_order(order_id) if callable(
-                getattr(self._app_store, "get_order", None)
-            ) else None
-            if order is None:
-                continue
-            block_number = order.get("block_number")
-            chain_id = order.get("chain_id")
-            if block_number is None or chain_id is None:
-                continue
-            candidates.append({
-                "order_id": order_id,
-                "chain_id": chain_id,
-                "block_number": block_number,
-                "params": order.get("params", {}),
-                "app_id": order.get("app_id"),
-            })
-
-        if not candidates:
-            logger.info("Stage 3: no regression candidates (no failed historical orders)")
-            return True
-
-        max_checks = int(os.environ.get("STAGE3_MAX_REGRESSION_CHECKS", "5"))
-        candidates = candidates[:max_checks]
-
-        logger.info(
-            "[stage3] checking %d potential regression(s) for challenger %s",
-            len(candidates), challenger.submission_id,
-        )
-
-        from minotaur_subnet.harness.historical_fork import (
-            historical_anvil,
-            archive_rpc_available,
-            HistoricalForkError,
-        )
-
-        # Pre-flight: every chain the candidates reference must have an
-        # archive RPC. Checked up front so we fail-closed in one shot
-        # rather than mid-loop after partial work. Truth-table row:
-        #   enabled + missing-archive + have-candidates → False.
-        missing_chains = sorted({
-            cand["chain_id"] for cand in candidates
-            if not archive_rpc_available(cand["chain_id"])
-        })
-        if missing_chains:
-            logger.warning(
-                "[stage3] fail-closed: archive RPC missing for chain(s) %s "
-                "(set STAGE3_DISABLED=1 to skip this gate in dev only)",
-                missing_chains,
-            )
-            return False
-
-        # Build a score function once (reused across all candidates)
-        from minotaur_subnet.shared.types import IntentState
-        from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-
-        try:
-            # Use an empty intent list to initialize the JS engine,
-            # then we'll pass per-candidate intents to the scenario runner.
-            _proto_intents = self._benchmark_worker._load_benchmark_intents()
-            if not _proto_intents:
-                logger.info("[stage3] no active intents to build score_fn; skipping")
-                return True
-            score_fn = await self._benchmark_worker._build_score_fn(_proto_intents)
-        except Exception:
-            logger.warning("[stage3] failed to build score_fn — failing closed", exc_info=True)
-            return False
-
-        # Index app definitions for fast lookup
-        apps_by_id = {app.app_id: app for app in (self._app_store.list_apps() if self._app_store else [])}
-
-        regressions_detected = 0
-        for cand in candidates:
-            chain_id = cand["chain_id"]
-
-            app_def = apps_by_id.get(cand["app_id"])
-            if app_def is None:
-                logger.debug("Stage 3: app %s not found for order %s, skipping", cand["app_id"], cand["order_id"])
-                continue
-
-            deployment = self._app_store.get_deployment(cand["app_id"]) if self._app_store else None
-            contract_address = deployment.contract_address if deployment else ""
-
-            state = IntentState(
-                contract_address=contract_address,
-                chain_id=chain_id,
-                nonce=0,
-                owner="",
-                raw_params=dict(cand["params"] or {}),
-                control={
-                    "_intent_function": cand.get("intent_function", "swap"),
-                    "_scenario_name": f"regression:{cand['order_id']}",
-                    "_stage": "regression",
-                },
-            )
-            snapshot = build_synthetic_snapshot(chain_id)
-
-            try:
-                async with historical_anvil(chain_id, cand["block_number"]) as fork_rpc:
-                    overrides = {chain_id: fork_rpc}
-                    # Run challenger first
-                    challenger_result = await self._benchmark_worker._benchmark_one_scenario_with_rpc(
-                        image_tag=challenger.image_tag,
-                        intent=app_def,
-                        state=state,
-                        snapshot=snapshot,
-                        score_fn=score_fn,
-                        rpc_overrides=overrides,
-                    )
-                    # Only run incumbent if challenger failed — saves one
-                    # Docker startup per successful candidate
-                    if challenger_result.score > 0:
-                        logger.info(
-                            "Stage 3 PASS: challenger succeeded on %s (score=%.3f)",
-                            cand["order_id"], challenger_result.score,
-                        )
-                        continue
-
-                    incumbent_result = await self._benchmark_worker._benchmark_one_scenario_with_rpc(
-                        image_tag=incumbent_sub.image_tag,
-                        intent=app_def,
-                        state=state,
-                        snapshot=snapshot,
-                        score_fn=score_fn,
-                        rpc_overrides=overrides,
-                    )
-
-                    if incumbent_result.score > 0:
-                        regressions_detected += 1
-                        logger.warning(
-                            "Stage 3 REGRESSION: order=%s block=%d — "
-                            "incumbent score=%.3f, challenger score=%.3f (FAIL)",
-                            cand["order_id"], cand["block_number"],
-                            incumbent_result.score, challenger_result.score,
-                        )
-                    else:
-                        logger.info(
-                            "Stage 3 NEUTRAL: order=%s — both solvers failed "
-                            "(not a regression, likely market drift)",
-                            cand["order_id"],
-                        )
-            except HistoricalForkError as exc:
-                logger.warning(
-                    "Stage 3 fork failed for order %s: %s — failing closed",
-                    cand["order_id"], exc,
-                )
-                return False
-            except Exception:
-                logger.warning(
-                    "Stage 3 unexpected error for order %s — failing closed",
-                    cand["order_id"],
-                    exc_info=True,
-                )
-                return False
-
-        if regressions_detected > 0:
-            logger.warning(
-                "Stage 3: %d regression(s) detected — adoption blocked",
-                regressions_detected,
-            )
-            return False
-
-        logger.info(
-            "Stage 3: %d candidate(s) tested, no regressions",
-            len(candidates),
-        )
-        return True
 
     def _record_would_be_vote(self, challenger: Submission) -> None:
         """Publish this leader's INDEPENDENT would-be adopt vote (CHALLENGER_QUORUM_MODE).
