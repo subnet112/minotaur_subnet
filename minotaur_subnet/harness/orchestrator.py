@@ -716,6 +716,37 @@ async def _enrich_state_with_quote(
     )
 
 
+# Per-chain benchmark RPC sources, in priority order: sandbox-specific
+# BENCHMARK_ANVIL_RPC_* IPs (reachable on BENCHMARK_DOCKER_NETWORK) first, then
+# the standard env vars. Shared by run_benchmark AND the champion reference
+# pre-pass so BOTH score against the SAME live chain state.
+_BENCHMARK_RPC_SOURCES: dict[int, tuple[str, ...]] = {
+    1:     ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
+    31337: ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
+    8453:  ("BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL"),
+    964:   ("BENCHMARK_ANVIL_RPC_BTEVM", "BITTENSOR_EVM_SIM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
+}
+
+
+def build_rpc_url_map(chain_ids) -> dict[int, str]:
+    """Resolve per-chain RPC URLs from the environment for benchmarking.
+
+    Returns ``{chain_id: url}`` only for chains with a resolved RPC. A chain
+    ABSENT from the result has NO live RPC — and a solver run without it would
+    silently fall back to an incomplete on-chain snapshot (missing pools →
+    false "No route" → corrupt scores). Callers MUST treat a missing chain as a
+    loud failure, never a silent degradation.
+    """
+    rpc_map: dict[int, str] = {}
+    for cid in chain_ids:
+        for env_name in _BENCHMARK_RPC_SOURCES.get(cid, ("ANVIL_RPC_URL",)):
+            url = os.environ.get(env_name, "").strip()
+            if url:
+                rpc_map[cid] = url
+                break
+    return rpc_map
+
+
 async def run_benchmark(
     session: SolverSession,
     intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -794,23 +825,21 @@ async def run_benchmark(
         "chain_ids": config.chain_ids,
         "timeout_per_plan_ms": config.timeout_per_plan_ms,
     }
-    # Build per-chain RPC URL map. Prefer sandbox-specific IPs (BENCHMARK_ANVIL_RPC_*)
-    # when a benchmark network is configured, falling back to the standard env vars.
-    _bench_net = os.environ.get("BENCHMARK_DOCKER_NETWORK", "").strip()
-    rpc_map: dict[int, str] = {}
-    _rpc_sources = {
-        1:     ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        31337: ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        8453:  ("BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL"),
-        964:   ("BENCHMARK_ANVIL_RPC_BTEVM", "BITTENSOR_EVM_SIM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
-    }
-    for cid in config.chain_ids:
-        sources = _rpc_sources.get(cid, ("ANVIL_RPC_URL",))
-        for env_name in sources:
-            url = os.environ.get(env_name, "").strip()
-            if url:
-                rpc_map[cid] = url
-                break
+    # Resolve live RPC for every chain we're about to benchmark. Without it the
+    # solver silently falls back to an incomplete on-chain snapshot (missing
+    # pools → false "No route" → corrupt scores) — so when real simulation is
+    # required, FAIL LOUD rather than score on degraded data.
+    rpc_map = build_rpc_url_map(config.chain_ids)
+    missing_rpc = [c for c in config.chain_ids if c not in rpc_map]
+    if missing_rpc:
+        msg = (
+            f"No benchmark RPC resolved for chain(s) {missing_rpc} — the solver "
+            f"would fall back to an incomplete snapshot (degraded scoring). Set "
+            f"BENCHMARK_ANVIL_RPC_* / *_SIM_RPC_URL / *_RPC_URL for these chains."
+        )
+        if require_real_sim:
+            raise RealSimulationUnavailable(msg)
+        logger.error("[benchmark] %s", msg)
     if rpc_map:
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)

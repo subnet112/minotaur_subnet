@@ -295,3 +295,37 @@ def test_run_benchmark_skips_quote_when_already_quoted():
     asyncio.run(_go())
     assert session.quote_calls == 0, "already quoted → must NOT re-quote"
     assert session.scored_states[0]["quoted_output"] == "12345"
+
+
+def test_run_benchmark_fails_loud_without_rpc_when_real_sim_required(monkeypatch):
+    # Fail loud, not silent: require_real_sim + no live RPC for the benchmark
+    # chain → REFUSE. Without RPC the solver falls back to an incomplete on-chain
+    # snapshot (missing pools → false "No route" → corrupt scores); we must not
+    # silently degrade benchmarking.
+    import pytest
+    from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
+
+    for v in ("ANVIL_RPC_URL", "BENCHMARK_ANVIL_RPC_ETH"):
+        monkeypatch.delenv(v, raising=False)
+    intent, state, snapshot = _swap_intent(), _swap_state(), _make_snapshot()
+    session = _FakeSession(self_quote=None)
+
+    class _Sim:
+        async def simulate(self, plan, **kwargs):
+            return SimulationResult(success=True, gas_used=1)
+
+    async def score_fn(app_id, p, simulation, st):
+        return ScoreResult(score=0.5)
+
+    async def _go():
+        return await run_benchmark(
+            session,
+            [(intent, state, snapshot)],
+            config=BenchmarkConfig(chain_ids=[1]),
+            score_fn=score_fn,
+            simulator=_Sim(),
+            require_real_sim=True,
+        )
+
+    with pytest.raises(RealSimulationUnavailable):
+        asyncio.run(_go())
