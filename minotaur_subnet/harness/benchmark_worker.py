@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -204,6 +205,12 @@ class BenchmarkWorker:
         self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
+        # app_id -> sha256(js_code)[:16] currently loaded in this worker's
+        # engine. Lets _build_score_fn hot-reload a developer's PUT /scoring on
+        # the next benchmark run instead of caching the first-seen JS forever
+        # (the shared BlockLoop engine already hot-reloads this way; this worker
+        # keeps its own engine, so it needs the same hash-diff).
+        self._loaded_js_hashes: dict[str, str] = {}
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.
@@ -629,17 +636,31 @@ class BenchmarkWorker:
             engine = JsExecutionEngine(timeout_ms=10000)
             self._js_engine = engine  # Save for _enrich_intents_with_manifests()
 
-        # Load JS scoring code for each intent
+        # Load (or hot-reload) JS scoring code for each intent. Mirror the
+        # BlockLoop's hash-diff reload (blockloop/loop.py): reload when the
+        # js_code hash changes so a developer's PUT /scoring is picked up on the
+        # next benchmark run WITHOUT an api restart. (Previously this loaded
+        # "only if not already loaded", so this worker's engine cached the
+        # first-seen JS for the process lifetime.)
         for intent_def, _, _ in intents:
-            if intent_def.app_id not in engine.list_loaded_intents():
-                js_code = intent_def.js_code
-                if not js_code or len(js_code.strip()) < 20:
-                    logger.warning(
-                        "App %s has no JS scoring code, skipping",
-                        intent_def.app_id,
-                    )
-                    continue
-                await engine.load_intent(intent_def.app_id, js_code)
+            js_code = intent_def.js_code
+            if not js_code or len(js_code.strip()) < 20:
+                logger.warning(
+                    "App %s has no JS scoring code, skipping",
+                    intent_def.app_id,
+                )
+                continue
+            js_hash = hashlib.sha256(js_code.encode()).hexdigest()[:16]
+            if self._loaded_js_hashes.get(intent_def.app_id) == js_hash:
+                continue  # already loaded at this exact version
+            await engine.load_intent(intent_def.app_id, js_code)
+            old = self._loaded_js_hashes.get(intent_def.app_id)
+            self._loaded_js_hashes[intent_def.app_id] = js_hash
+            if old is not None:
+                logger.info(
+                    "[benchmark] hot-reloaded JS for app %s (hash %s -> %s)",
+                    intent_def.app_id, old, js_hash,
+                )
 
         async def score_fn(
             app_id: str,
