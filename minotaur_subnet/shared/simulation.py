@@ -7,6 +7,7 @@ circular imports and gives every consumer a single, canonical location.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from minotaur_subnet.shared.types import (
@@ -14,6 +15,25 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
     TokenTransfer,
 )
+
+
+def onchain_score_fail_closed() -> bool:
+    """Whether the dual-scoring on-chain gate should FAIL CLOSED on a missing score.
+
+    Dual scoring requires BOTH the JS score AND the on-chain ``scoreIntent``
+    value to clear threshold. When a contract is present the on-chain score is
+    EXPECTED; ``simulation.on_chain_score is None`` means the contract returned
+    ``valid=False`` (the plan violates an on-chain invariant) or the score
+    couldn't be read — either way the contract did NOT bless the plan. With this
+    flag on, the gate REJECTS instead of silently riding on the JS score alone.
+
+    Read at call time and DEFAULT OFF (preserves the legacy skip-on-None) so it
+    can be enabled deliberately and observed, then turned on fleet-wide — leader
+    and follower must agree, so flip it everywhere together.
+    """
+    return os.environ.get("ONCHAIN_SCORE_FAIL_CLOSED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def build_mock_simulation(

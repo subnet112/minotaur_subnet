@@ -715,6 +715,37 @@ async def certify_solver_round(
 ) -> SolverRoundResponse:
     """Persist a champion certificate for a replay-qualified finalist."""
     _require_submission_api_key(request)
+    # Close the explicit-certify bypass: this public (operator) endpoint must not
+    # silently certify an ARBITRARY candidate that never won the round's adoption
+    # rule. Allow only the round's rule-selected finalist, a genesis/builtin
+    # bootstrap candidate, or an explicit audited force override. (The automated
+    # coordinator, genesis bootstrap, and peer-sync call the internal functions
+    # directly and never hit this endpoint, so they're unaffected.)
+    if body.candidate_submission_id:
+        _rs = get_round_store().get_round(body.round_id)
+        _is_finalist = _rs is not None and _rs.finalist_submission_id == body.candidate_submission_id
+        _cand = get_store().get(body.candidate_submission_id)
+        _is_genesis = _cand is not None and (
+            _cand.hotkey == "__genesis__"
+            or (_cand.repo_url or "").startswith("builtin://")
+        )
+        if not (_is_finalist or _is_genesis or body.force):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Candidate {body.candidate_submission_id} is not the round's "
+                    f"finalist (={_rs.finalist_submission_id if _rs else None}) and is "
+                    "not a genesis/builtin candidate; it never passed the adoption "
+                    "rule. Pass force=true to override deliberately."
+                ),
+            )
+        if body.force and not (_is_finalist or _is_genesis):
+            logger.warning(
+                "[certify-override] FORCE certify of non-finalist candidate %s for "
+                "round %s (finalist=%s) — operator override, bypassing the adoption rule",
+                body.candidate_submission_id, body.round_id,
+                _rs.finalist_submission_id if _rs else None,
+            )
     certified = await _certify_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/certify",
