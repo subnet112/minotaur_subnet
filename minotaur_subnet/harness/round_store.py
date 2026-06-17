@@ -299,6 +299,11 @@ class RoundStore:
         self._rounds: dict[str, RoundState] = {}
         self._current_round_id: str | None = None
         self._active_champion = ChampionSnapshot()
+        # The champion that was active immediately BEFORE the current one — the
+        # one-step-undo target for an emergency revert (see
+        # EpochManager.revert_to_previous_champion). Persisted so the rollback
+        # target survives a restart.
+        self._previous_champion = ChampionSnapshot()
 
         if persist_path and persist_path.exists():
             self._load()
@@ -335,6 +340,18 @@ class RoundStore:
             current.sync_incumbent(champion)
         self._persist()
         return self.get_active_champion()
+
+    def get_previous_champion(self) -> ChampionSnapshot:
+        """The champion active immediately before the current one (rollback target)."""
+        self._maybe_reload()
+        return copy.deepcopy(self._previous_champion)
+
+    def set_previous_champion(self, champion: ChampionSnapshot) -> ChampionSnapshot:
+        """Record the rollback target — the champion being displaced by an adoption."""
+        self._maybe_reload()
+        self._previous_champion = copy.deepcopy(champion)
+        self._persist()
+        return self.get_previous_champion()
 
     def ensure_open_round(
         self,
@@ -540,6 +557,7 @@ class RoundStore:
             data = {
                 "current_round_id": self._current_round_id,
                 "active_champion": self._active_champion.to_dict(),
+                "previous_champion": self._previous_champion.to_dict(),
                 "rounds": {
                     round_id: state.to_dict()
                     for round_id, state in self._rounds.items()
@@ -556,6 +574,7 @@ class RoundStore:
             data = json.loads(self._persist_path.read_text())
             current_round_id = data.get("current_round_id")
             active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))
+            previous_champion = ChampionSnapshot.from_dict(data.get("previous_champion"))
             rounds_raw = data.get("rounds", {}) or {}
             rounds: dict[str, RoundState] = {}
             for round_id, raw in rounds_raw.items():
@@ -566,6 +585,7 @@ class RoundStore:
                 current_round_id = None
             self._current_round_id = current_round_id
             self._active_champion = active_champion
+            self._previous_champion = previous_champion
             self._rounds = rounds
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
             logger.info(

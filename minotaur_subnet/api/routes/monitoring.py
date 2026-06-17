@@ -51,3 +51,31 @@ async def shadow_vote(body: ShadowVoteRequest) -> dict[str, Any]:
     if worker is None:
         raise HTTPException(status_code=503, detail="benchmark worker unavailable")
     return await worker.run_shadow_vote(body.challenger_image)
+
+
+class RevertChampionRequest(BaseModel):
+    reason: str = ""
+
+
+@router.post("/admin/revert-champion", dependencies=[Depends(_require_admin)])
+async def revert_champion(body: RevertChampionRequest) -> dict[str, Any]:
+    """Emergency rollback: revert the live champion to the PREVIOUS one.
+
+    A one-step undo of the most recent adoption (NOT genesis). Forces the swap
+    past the ``DISABLE_CHAMPION_ADOPTION`` gate — reverting to an already-vetted
+    prior champion is always safe — and re-routes the next weight emission to it.
+    Pair with ``DISABLE_CHAMPION_ADOPTION=1`` to stop the bad champion being
+    re-adopted, then revert. Admin-gated.
+
+    Returns 409 if there is no previous champion to revert to (or it's already
+    active / unresolvable).
+    """
+    from minotaur_subnet.api.routes.submissions.state import get_epoch_manager
+
+    manager = get_epoch_manager()
+    if manager is None:
+        raise HTTPException(status_code=503, detail="epoch manager unavailable")
+    try:
+        return await manager.revert_to_previous_champion(reason=body.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
