@@ -108,7 +108,7 @@ def fake_solve_simulate(
     sim = SimulationResult(
         success=fill.success, gas_used=fill.gas_used,
         error=None if fill.success else "scoreIntent reverted (fake)",
-        token_transfers=transfers, price_impact=fill.price_impact,
+        token_transfers=transfers,
         on_chain_score=fill.on_chain_score,
     )
     sim_rec = StageRecord(
@@ -116,7 +116,7 @@ def fake_solve_simulate(
         summary=(f"output={fill.output_amount} gas={fill.gas_used} "
                  f"on_chain={fill.on_chain_score}" if sim.success else "revert"),
         inputs={"fill": {"output_amount": fill.output_amount, "gas_used": fill.gas_used,
-                         "price_impact": fill.price_impact, "success": fill.success}},
+                         "success": fill.success}},
         outputs={"success": sim.success, "gas_used": sim.gas_used,
                  "transfers": len(transfers), "on_chain_score": sim.on_chain_score},
         meta={"backend": "fake (no fork)"}, duration_ms=_ms(t1),

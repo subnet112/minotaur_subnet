@@ -345,14 +345,11 @@ class AnvilSimulator:
                 "delta": str(eth_delta),
             })
 
-            price_impact = self._estimate_price_impact(all_transfers)
-
             return SimulationResult(
                 success=True,
                 gas_used=total_gas,
                 token_transfers=all_transfers,
                 state_changes=state_changes,
-                price_impact=price_impact,
             )
 
         except Exception as exc:
@@ -440,6 +437,10 @@ class AnvilSimulator:
                     # Re-impersonate relayer — _set_erc20_allowance may have
                     # stopped impersonating if submitted_by == relayer
                     self._impersonate(relayer_addr)
+
+            # Fund the app's fee paymaster so APP-mode protocol-fee settlement
+            # can pull WETH (see _fund_app_paymaster). No-op for non-fee apps.
+            self._fund_app_paymaster(target, relayer_addr)
 
             # Build scoreIntent calldata
             sig = "scoreIntent((bytes32,address,bytes4,bytes,address,uint256,uint256,uint256,bool,uint256,uint256),((address,uint256,bytes)[],uint256,uint256,bytes))"
@@ -580,8 +581,6 @@ class AnvilSimulator:
             # on_chain_score was captured pre-tx (above) — reading it here, after
             # the tx drained the funding, would revert and yield None.
 
-            price_impact = self._estimate_price_impact(all_transfers)
-
             logger.info(
                 "scoreIntent simulation: gas=%d transfers=%d on_chain_score=%s",
                 total_gas, len(all_transfers), on_chain_score,
@@ -591,7 +590,6 @@ class AnvilSimulator:
                 success=True,
                 gas_used=total_gas,
                 token_transfers=all_transfers,
-                price_impact=price_impact,
                 on_chain_score=on_chain_score,
             )
 
@@ -938,6 +936,54 @@ class AnvilSimulator:
                 self._stop_impersonating(owner)
             except Exception:
                 pass
+
+    def _fund_app_paymaster(self, target: str, relayer_addr: str) -> None:
+        """Fund + approve the app's fee paymaster's wrapped-native float.
+
+        In ``FeeMode.APP`` the protocol fee is settled in WETH — taken from the
+        swap output when ``tokenOut == WETH``, otherwise pulled from the
+        ``appPaymaster`` via
+        ``IERC20(WETH).safeTransferFrom(appPaymaster, platformFeeCollector, fee)``.
+        On a fresh fork the paymaster has no WETH, and even if its real balance
+        is inherited its allowance is granted to the LIVE app, not this
+        fork-deployed instance — so every ``tokenOut != WETH`` scenario reverts
+        with empty data (WETH9's message-less ``require``) at the fee step,
+        scoring 0 regardless of solver quality and starving the benchmark
+        signal. Mirror the user-input funding for the paymaster.
+
+        No-op for apps without an ``appPaymaster`` (USER-mode / non-fee apps):
+        the view reverts -> ``None`` -> skipped.
+        """
+        paymaster = self._read_view_address(target, b"appPaymaster()")
+        weth = self._read_view_address(target, b"wrappedNativeToken()")
+        if not (paymaster and weth and int(paymaster, 16) and int(weth, 16)):
+            return
+        self._deal_erc20(weth, paymaster, 100 * 10**18)
+        self._set_erc20_allowance(weth, paymaster, target, 2**256 - 1)
+        # _set_erc20_allowance stops impersonating the paymaster; the
+        # scoreIntent tx is sent from the relayer.
+        self._impersonate(relayer_addr)
+
+    def _read_view_address(self, target: str, signature: bytes) -> str | None:
+        """eth_call a no-arg view returning an address; None if it reverts.
+
+        Used to read app config (e.g. ``appPaymaster()``,
+        ``wrappedNativeToken()``) off a deployed contract for benchmark
+        funding. Returns None when the function is absent (the call reverts)
+        so callers can treat it as "not applicable".
+        """
+        from eth_hash.auto import keccak
+
+        try:
+            result = self.w3.eth.call({
+                "to": Web3.to_checksum_address(target),
+                "data": "0x" + keccak(signature)[:4].hex(),
+            })
+        except Exception:
+            return None
+        if not result or len(result) < 32:
+            return None
+        return Web3.to_checksum_address("0x" + result[-20:].hex())
 
     def _erc20_balance(self, token: str, holder: str) -> int:
         """Read ERC-20 balanceOf via eth_call. Returns 0 on any error."""
@@ -1302,15 +1348,6 @@ class AnvilSimulator:
         except Exception as exc:
             logger.debug("scoreIntent call failed: %s", exc)
             return None
-
-    def _estimate_price_impact(
-        self, transfers: list[TokenTransfer]
-    ) -> float:
-        """Estimate price impact from token transfers (rough heuristic)."""
-        if len(transfers) < 2:
-            return 0.0
-        # For MVP: return a small default impact
-        return 0.003
 
     def is_connected(self) -> bool:
         """Check if the Anvil instance is reachable."""

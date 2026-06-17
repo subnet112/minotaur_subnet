@@ -42,6 +42,8 @@ from minotaur_subnet.harness.orchestrator import (
     SolverTimeoutError,
     SolverCrashedError,
     run_benchmark,
+    REFERENCE_QUOTE_FAILED_SENTINEL,
+    BENCHMARK_MIN_SLIPPAGE_BPS,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
@@ -144,6 +146,23 @@ def _allow_subprocess_benchmark() -> bool:
     """
     return False
 
+
+def _challenger_quorum_mode() -> bool:
+    """Whether the diverse-subset / independent-vote challenger-validation model is on.
+
+    Default OFF — the legacy shared (round_id-only) subset draw and the follower
+    reproducibility check are unchanged until this is explicitly enabled for the
+    quorum-validation rollout. When ON, each validator draws its own diverse
+    Stage-2 subset (seeded by its identity) so adoption is decided by a quorum of
+    independent verdicts rather than reproduction of the leader's number.
+    """
+    import os
+
+    return os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 class BenchmarkWorker:
     """Processes BENCHMARKING submissions by scoring them against active intents.
 
@@ -164,6 +183,7 @@ class BenchmarkWorker:
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
+        validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -179,6 +199,9 @@ class BenchmarkWorker:
         # Injected by the API layer (keeps the harness free of API imports):
         # round_id -> the round-anchored benchmark-chain fork block, or None.
         self._pin_resolver = pin_resolver
+        # Stable per-validator id (hotkey ss58); seeds this validator's diverse
+        # Stage-2 subset when CHALLENGER_QUORUM_MODE is on (else None = shared draw).
+        self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
 
@@ -278,6 +301,14 @@ class BenchmarkWorker:
 
         Returns the number of submissions processed.
         """
+        # Startup-race guard: the run_loop is started right after construction, but
+        # startup wires the real simulator a bit LATER (ctx.benchmark_worker._simulator).
+        # A docker benchmark that runs before the simulator is attached falls to the
+        # mock path -> on_chain null -> the genesis scores 0 -> REJECTED and is never
+        # retried. Defer until the simulator is wired so the first benchmark is real.
+        if self._use_docker and self._simulator is None:
+            logger.info("[benchmark] real simulator not yet wired — deferring run_once")
+            return 0
         # Deterministic fork-pin: when BENCHMARK_EPOCH_BLOCK is set, pin this round's
         # benchmark simulations to that Base block so on-chain scores are reproducible
         # across validators (the cross-machine determinism keystone). Default unset ->
@@ -372,9 +403,13 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
-        # Benchmark each submission (route by solver_path or image_tag).
-        # Each solver self-quotes its scenarios inside run_benchmark (the score
-        # is the unfakeable on-chain output), so no champion pre-pass is needed.
+        # Champion quote pre-pass: anchor each scenario's on-chain quote params
+        # (CoW quoted_output etc.) to the champion solver so every challenger is
+        # graded against the same reference output. Falls back to per-submission
+        # self-quoting when no champion is available (still fixes the revert).
+        reference_quotes = await self._build_reference_quotes(intents)
+
+        # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
             # Skip already-scored submissions (may appear in BENCHMARKING
             # from a previous pass that scored then persisted)
@@ -405,6 +440,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_solver_path(
                         sub.solver_path, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     avg_score = self._compute_avg_score(results)
                     details = self._results_to_details(results)
@@ -435,6 +471,7 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_submission(
                         sub.image_tag, intents, score_fn,
+                        reference_quotes=reference_quotes,
                     )
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
@@ -486,6 +523,7 @@ class BenchmarkWorker:
         image_tag: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against one submission's Docker image."""
         orch = SolverOrchestrator()
@@ -508,6 +546,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -555,6 +594,7 @@ class BenchmarkWorker:
         solver_path: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against a local solver file (subprocess mode)."""
         orch = SolverOrchestrator()
@@ -567,6 +607,7 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
+                reference_quotes=reference_quotes,
             )
             return results
         finally:
@@ -854,11 +895,16 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
+        # Diverse-subset model: seed the draw with this validator's identity so it
+        # tests a DIFFERENT slice of real orders than its peers (broader regression
+        # coverage). Default (model off / no identity) -> shared round_id-only draw.
+        _seed = self._validator_identity if _challenger_quorum_mode() else None
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
             records=chain_records,
+            validator_seed=_seed,
         )
         if not sampled:
             return []
@@ -1044,6 +1090,235 @@ class BenchmarkWorker:
         ):
             image_tag = self._genesis_solver_image
         return image_tag
+
+    async def run_shadow_vote(self, challenger_image: str) -> dict[str, Any]:
+        """Observe-only per-validator shadow adopt-vote (challenger-quorum demo).
+
+        Benchmarks the REAL reference champion — the adopted champion, or the
+        official genesis solver when none is adopted (``_resolve_champion_image``,
+        the same store-backed resolution scoring uses) — and ``challenger_image``
+        on THIS validator's own diverse Stage-2 subset, then applies the shared
+        ``evaluate_adoption`` rule. Returns + publishes this validator's vote.
+
+        The reference is resolved from the store, NOT an injectable env, so a
+        miner can't point the vote at a weak/own reference to look better.
+
+        NEVER touches the real champion, adoption, or weights — it is a pure
+        shadow computation so the fleet can demonstrate the challenger-quorum
+        decision (good->adopt / bad->reject by majority). Each validator scores
+        its own slice of orders, so disagreement on a regression is the feature.
+        """
+        import os
+        from minotaur_subnet.harness.orchestrator import (
+            BenchmarkConfig,
+            RealSimulationUnavailable,
+            SolverOrchestrator,
+            run_benchmark,
+        )
+        from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
+        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+
+        champ_image = self._resolve_champion_image()
+        if not champ_image:
+            return {"error": "no champion/genesis reference available"}
+        if not challenger_image:
+            return {"error": "challenger_image required"}
+
+        # Same benchmark set run_once uses: Stage-1 synthetic + Stage-2 diverse
+        # (per-validator seed when CHALLENGER_QUORUM_MODE is on).
+        intents = self._load_benchmark_intents()
+        if not intents:
+            return {"error": "no active intents"}
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+        round_id = None
+        if self._round_store is not None:
+            cur = self._round_store.get_current_round()
+            if cur is not None:
+                round_id = cur.round_id
+                try:
+                    hist = self._load_historical_scenarios(cur.round_id)
+                    if hist:
+                        intents.extend(hist)
+                except Exception as exc:
+                    logger.warning("[shadow-vote] historical load failed: %s", exc)
+
+        _require_real_sim = os.environ.get(
+            "BENCHMARK_REQUIRE_REAL_SIM", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+        cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
+
+        # Champion-anchored bar: grade BOTH the reference champion and the
+        # challenger against the SHADOW champion's OWN quote (one shared floor,
+        # ~0.5% slippage), with the champion->challenger self-quote fallback when
+        # the champion can't quote a scenario. Without this both would self-quote
+        # and tie — the saturation the product owner flagged.
+        reference_quotes = await self._build_reference_quotes(intents, image_tag=champ_image)
+
+        async def _bench(image: str) -> list[BenchmarkResult]:
+            orch = SolverOrchestrator()
+            sess = await orch.start_docker(image)
+            try:
+                return await run_benchmark(
+                    sess, intents, config=cfg, score_fn=score_fn,
+                    simulator=self._simulator, require_real_sim=_require_real_sim,
+                    fork_block=self._epoch_block_number,
+                    reference_quotes=reference_quotes,
+                )
+            finally:
+                await sess.shutdown()
+
+        try:
+            champ_results = await _bench(champ_image)
+            chal_results = await _bench(challenger_image)
+        except RealSimulationUnavailable:
+            return {"error": "real simulator unavailable"}
+
+        champ_score = self._compute_avg_score(champ_results)
+        chal_score = self._compute_avg_score(chal_results)
+        adopt, reason = evaluate_adoption(
+            challenger_score=chal_score,
+            champion_score=champ_score,
+            challenger_scorecard=self._build_scorecard(chal_results).to_dict(),
+            champion_scorecard=self._build_scorecard(champ_results).to_dict(),
+            dethrone_margin=DETHRONE_MARGIN,
+            has_champion=True,
+        )
+        vote = {
+            "candidate_id": challenger_image,
+            "role": "shadow",
+            "vote": "ADOPT" if adopt else "REJECT",
+            "chal_score": round(float(chal_score), 4),
+            "champ_score": round(float(champ_score), 4),
+            "champion_image": champ_image,
+            "validator_seed": self._validator_identity,
+            "round_id": round_id,
+            "reason": reason,
+        }
+        logger.info(
+            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s "
+            "champ_score=%.4f chal_score=%.4f: %s",
+            self._validator_identity, champ_image, challenger_image,
+            vote["vote"], champ_score, chal_score, reason,
+        )
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_independent_vote = dict(vote)
+        except Exception:  # observe-only — must never break
+            pass
+        return vote
+    async def _build_reference_quotes(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        *,
+        image_tag: str | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Quote every scenario with the CHAMPION solver as the reference.
+
+        Runs a short champion pre-pass before benchmarking submissions: start a
+        champion Docker session, ask it to quote each scenario, map the result
+        via the shared ``map_quote_result_to_params`` helper, and key the output
+        by the same per-scenario label ``run_benchmark`` uses (``app_id`` or
+        ``app_id:scenario_name``). This anchors the on-chain ``quoted_output``
+        (the CoW fee reference) to the champion so every challenger is graded
+        against the same reference output — the champion→challenger fallback the
+        product owner specified.
+
+        Returns ``{}`` (every scenario self-quotes, which still fixes the
+        revert) when no champion image is available, Docker is disabled, or the
+        champion session can't be started.
+
+        Per-scenario: when the champion session is up but FAILS to quote a
+        specific scenario (raises or returns ``None``), that scenario's entry is
+        set to the ``REFERENCE_QUOTE_FAILED_SENTINEL`` marker instead of being
+        omitted. ``run_benchmark`` detects the marker and scores the scenario 0
+        with an explicit error rather than silently self-quoting it — surfacing
+        the failure instead of masking it behind a non-comparable self-quote.
+        """
+        if not self._use_docker:
+            return {}
+        if image_tag is None:
+            image_tag = self._resolve_champion_image()
+        if image_tag is None:
+            logger.info("Reference-quote pre-pass skipped: no champion image")
+            return {}
+
+        from minotaur_subnet.api.services.app_service import (
+            map_quote_result_to_params,
+            source_quote_param_names,
+        )
+
+        reference: dict[str, dict[str, str]] = {}
+        failed: set[str] = set()
+        orch = SolverOrchestrator()
+        try:
+            session = await orch.start_docker(image_tag)
+        except Exception as exc:
+            logger.warning(
+                "Reference-quote pre-pass: failed to start champion session "
+                "(%s); scenarios will self-quote", exc,
+            )
+            return {}
+        try:
+            await session.initialize(
+                {"chain_ids": list({s.chain_id for _, s, _ in intents} or {1})}
+            )
+            for intent, state, snapshot in intents:
+                intent_function = state.control_view().get("_intent_function", "swap")
+                # Same manifest-driven gate as run_benchmark's enrichment.
+                if not source_quote_param_names(intent.manifest, intent_function):
+                    continue
+                if state.raw_params_view().get("quoted_output") not in (None, ""):
+                    continue
+                scenario_name = state.control_view().get("_scenario_name", "")
+                label = (
+                    f"{intent.app_id}:{scenario_name}"
+                    if scenario_name else intent.app_id
+                )
+                try:
+                    quote_result = await session.quote(intent, state, snapshot)
+                except Exception as exc:
+                    # Surface, don't mask: a champion that can't quote a scenario
+                    # is a real failure (broken solver, bad scenario, RPC issue).
+                    # Mark it so run_benchmark scores 0 with an explicit error
+                    # instead of silently self-quoting a non-comparable pass.
+                    logger.error(
+                        "[reference-quote-FAILED] champion quote raised for %s "
+                        "(%s); scenario will score 0, NOT self-quote", label, exc,
+                    )
+                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
+                    failed.add(label)
+                    continue
+                if quote_result is None:
+                    logger.error(
+                        "[reference-quote-FAILED] champion quote returned None "
+                        "for %s; scenario will score 0, NOT self-quote", label,
+                    )
+                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
+                    failed.add(label)
+                    continue
+                mapped = map_quote_result_to_params(
+                    quote_result, intent.manifest, intent_function,
+                    slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
+                )
+                if mapped:
+                    reference[label] = mapped
+            built = len(reference) - len(failed)
+            if failed:
+                logger.error(
+                    "Reference-quote pre-pass: built %d champion reference "
+                    "quotes; %d scenario(s) FAILED to quote (scored 0, not "
+                    "self-quoted): %s",
+                    built, len(failed), sorted(failed),
+                )
+            else:
+                logger.info(
+                    "Reference-quote pre-pass: built %d champion reference quotes",
+                    built,
+                )
+        finally:
+            await session.shutdown()
+        return reference
 
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.

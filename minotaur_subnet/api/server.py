@@ -367,6 +367,8 @@ def health() -> dict:
     # first derivation completes (or if ROUND_ANCHOR_PARITY=0).
     if ctx.round_anchor_parity:
         data["round_anchor"] = dict(ctx.round_anchor_parity)
+    if ctx.last_independent_vote:
+        data["independent_vote"] = dict(ctx.last_independent_vote)
     return data
 
 
