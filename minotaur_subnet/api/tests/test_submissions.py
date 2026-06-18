@@ -486,7 +486,7 @@ class TestSubmissionAPI(unittest.TestCase):
         # operator-override env for the duration of these tests.
         os.environ["SUBMISSIONS_ALLOW_UNREGISTERED"] = "1"
         os.environ.pop("SUBMISSIONS_API_KEY", None)
-        os.environ.pop("SOLVER_ROUND_INTERNAL_API_KEY", None)
+        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
         os.environ.pop("SOLVER_ROUND_EPOCH_SECONDS", None)
         os.environ.pop("SOLVER_ROUND_EPOCH_BLOCKS", None)
         os.environ.pop("ALLOW_INSECURE_REPO_URLS", None)
@@ -578,7 +578,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "benchmark_pack_hash": "pack-43",
             "committee_hash": "committee-43",
             "quorum_required": 2,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -604,7 +604,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "benchmark_pack_hash": "pack-43",
             "committee_hash": "committee-43",
             "quorum_required": 2,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         peer_network.broadcast_json.assert_awaited_once()
@@ -648,7 +648,7 @@ class TestSubmissionAPI(unittest.TestCase):
                     "signature": "sig",
                 },
             ],
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -656,6 +656,14 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertEqual(data["certificate_candidate_submission_id"], sub.submission_id)
         self.assertEqual(data["certificate_quorum_required"], 1)
         self.assertEqual(data["certificate_approvals"], 1)
+
+    def test_certify_solver_round_requires_internal_key(self):
+        # Public operator certify route must reject when no internal key header is sent.
+        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
+        resp = self.client.post("/v1/solver/round/certify", json={
+            "round_id": "round-x", "effective_epoch": 1,
+        })
+        self.assertEqual(resp.status_code, 401)
 
     def test_certify_solver_round_endpoint_rejects_after_deadline(self):
         from minotaur_subnet.api.routes import submissions as sub_mod
@@ -695,7 +703,7 @@ class TestSubmissionAPI(unittest.TestCase):
                     "signature": "sig",
                 },
             ],
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 409)
         self.assertIn("exceeded certification deadline", resp.json()["detail"])
@@ -765,7 +773,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "round_id": current.round_id,
             "candidate_submission_id": sub.submission_id,
             "effective_epoch": 44,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -827,7 +835,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "effective_epoch": 44,
             "close_epoch": 43,
             "quorum_required": 1,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -876,7 +884,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "close_epoch": 43,
             "quorum_required": 1,
             "decision_deadline_epoch": 43,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -950,7 +958,7 @@ class TestSubmissionAPI(unittest.TestCase):
         resp = self.client.post("/v1/solver/round/abort", json={
             "round_id": current.round_id,
             "reason": "operator_abort",
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -1010,7 +1018,7 @@ class TestSubmissionAPI(unittest.TestCase):
         resp = self.client.post("/v1/solver/round/activate", json={
             "round_id": current.round_id,
             "activation_epoch": 44,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
