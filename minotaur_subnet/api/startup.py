@@ -820,7 +820,6 @@ async def initialize(ctx: ServerContext) -> dict:
 
     from minotaur_subnet.api.routes import (
         apps,
-        chains,
         orders,
         submissions,
     )
@@ -1313,27 +1312,6 @@ async def initialize(ctx: ServerContext) -> dict:
                     "Genesis solver initialized via Docker (%s, chains=%s)",
                     _genesis_image, list(rpc_urls.keys()),
                 )
-
-                # Background pre-warm for token discovery. A cold call can
-                # take 60-120 s on Base (17 seed tokens × 4 fee tiers ≈ 600
-                # factory.getPool RPC roundtrips). Doing it here populates
-                # the DockerRuntimeSolver's TTL cache so the frontend's
-                # first /v1/chains/{id}/tokens call returns instantly.
-                async def _prewarm_tokens(_solver, _chain_ids):
-                    for cid in _chain_ids:
-                        try:
-                            t0 = time.monotonic()
-                            tokens = await _solver.supported_tokens(cid)
-                            logger.info(
-                                "Token discovery pre-warm chain %d: %d tokens in %.1fs",
-                                cid, len(tokens), time.monotonic() - t0,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Token discovery pre-warm failed for chain %d: %s",
-                                cid, exc,
-                            )
-                asyncio.create_task(_prewarm_tokens(solver, list(rpc_urls.keys())))
             except Exception as exc:
                 logger.warning("Genesis Docker solver unavailable: %s", exc)
         else:
@@ -1654,35 +1632,6 @@ async def initialize(ctx: ServerContext) -> dict:
         if order_peer_network is not None:
             ctx.block_loop.set_peer_network(order_peer_network)
         orders.set_block_loop(ctx.block_loop)
-        chains.set_block_loop(ctx.block_loop)
-
-        # Token cache warm-up. DockerRuntimeSolver.supported_tokens is an
-        # async coroutine; sync solvers expose it as a regular function.
-        # Route each appropriately — previously we unconditionally wrapped
-        # in asyncio.to_thread which produced an unawaited coroutine and
-        # an ``object of type 'coroutine' has no len()'' warning.
-        #
-        # Note: this is redundant with the genesis-solver _prewarm_tokens
-        # task earlier, which already warms the DockerRuntimeSolver cache.
-        # Kept for sync-solver support and as a defensive re-warm.
-        if ctx.block_loop.solver and hasattr(ctx.block_loop.solver, "supported_tokens"):
-            _supported_tokens = ctx.block_loop.solver.supported_tokens
-            _is_async = asyncio.iscoroutinefunction(_supported_tokens)
-
-            async def _warm_token_cache() -> None:
-                for cid in chain_ids:
-                    try:
-                        if _is_async:
-                            tokens = await _supported_tokens(cid)
-                        else:
-                            tokens = await asyncio.to_thread(_supported_tokens, cid)
-                        logger.info(
-                            "Token cache warmed for chain %d: %d tokens",
-                            cid, len(tokens),
-                        )
-                    except Exception as exc:
-                        logger.warning("Token cache warm failed for chain %d: %s", cid, exc)
-            asyncio.create_task(_warm_token_cache())
 
         # ── solver round coordinator ─────────────────────────────────────
         # Champion consensus init is DECOUPLED from the benchmark worker.

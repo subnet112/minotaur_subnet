@@ -97,7 +97,10 @@ def test_no_simulator_raises_when_required():
         _run(simulator=None, require_real_sim=True)
 
 
-def test_sim_throw_scores_zero_when_required_no_mock():
+def test_sim_throw_scores_zero_when_required_no_mock(monkeypatch):
+    # A real simulator IS injected; an RPC must be present so run_benchmark's RPC
+    # precondition passes and we exercise the THROW path (not the no-RPC raise).
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
     results, calls = _run(simulator=_ThrowingSimulator(), require_real_sim=True)
     assert len(results) == 1
     r = results[0]
@@ -107,9 +110,11 @@ def test_sim_throw_scores_zero_when_required_no_mock():
     assert calls["score_fn"] == 0, "the scorer must not run on absent sim data"
 
 
-def test_sim_revert_scores_zero_when_required():
+def test_sim_revert_scores_zero_when_required(monkeypatch):
     # success=False (a real revert) must be fail-closed to 0, not handed to a
     # possibly-lenient scorer — closes the gap the adversarial review found.
+    # RPC present so the precondition passes and we reach the revert path.
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
     results, calls = _run(simulator=_RevertingSimulator(), require_real_sim=True)
     r = results[0]
     assert r.score == 0.0
