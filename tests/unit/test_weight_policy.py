@@ -2,12 +2,14 @@
 
 from unittest.mock import MagicMock
 
+import minotaur_subnet.weight_policy as weight_policy
 from minotaur_subnet.weight_policy import (
     CHAMPION_MINER_WEIGHT_FRACTION,
     GENESIS_HOTKEY,
     apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     lookup_subnet_owner_from_chain,
+    resolve_subnet_owner_hotkey,
 )
 from minotaur_subnet.validator.main import ChampionWeights
 
@@ -159,6 +161,38 @@ def test_lookup_subnet_owner_from_chain_empty_on_error():
     owner = lookup_subnet_owner_from_chain(sub, 112)
 
     assert owner == ""
+
+
+def test_resolve_subnet_owner_chain_primary(monkeypatch):
+    """The chain is authoritative: when the on-chain lookup returns a value it
+    wins, even if the env owner is also set."""
+    monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "5Genv")
+    monkeypatch.setattr(
+        weight_policy, "lookup_subnet_owner_from_chain", lambda sub, nuid: "5Gchain"
+    )
+    sub = MagicMock()
+    assert resolve_subnet_owner_hotkey(sub, 112) == "5Gchain"
+
+
+def test_resolve_subnet_owner_falls_back_to_env(monkeypatch):
+    """When the chain lookup returns '', fall back to the env owner."""
+    monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "5Genv")
+    monkeypatch.setattr(
+        weight_policy, "lookup_subnet_owner_from_chain", lambda sub, nuid: ""
+    )
+    sub = MagicMock()
+    assert resolve_subnet_owner_hotkey(sub, 112) == "5Genv"
+
+
+def test_resolve_subnet_owner_env_only_without_subtensor(monkeypatch):
+    """With no subtensor/netuid wired, resolve straight from env."""
+    monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "5Genv")
+    monkeypatch.setattr(
+        weight_policy,
+        "lookup_subnet_owner_from_chain",
+        lambda sub, nuid: (_ for _ in ()).throw(AssertionError("should not query chain")),
+    )
+    assert resolve_subnet_owner_hotkey(None, None) == "5Genv"
 
 
 def test_maybe_emit_recovers_after_owner_hotkey_set_late(monkeypatch):

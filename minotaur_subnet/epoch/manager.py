@@ -162,6 +162,10 @@ class EpochManager:
         self._weights_emitter = weights_emitter
         self._weight_decay = weight_decay
         self._owner_hotkey = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+        # Chain-primary owner resolution: a wired chain source (MetagraphSync with
+        # resolve_subnet_owner()) takes precedence over the env/constructor owner.
+        self._owner_chain_source: Any = None
+        self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
@@ -1054,6 +1058,28 @@ class EpochManager:
             "reason": reason or "manual revert",
         }
 
+    def set_owner_chain_source(self, source: Any) -> None:
+        """Wire a chain source (a MetagraphSync with resolve_subnet_owner()) so the
+        burn-target owner is resolved CHAIN-PRIMARY instead of env-only."""
+        self._owner_chain_source = source
+
+    def _resolve_owner_hotkey(self) -> str:
+        if self._resolved_owner:
+            return self._resolved_owner
+        owner = ""
+        src = self._owner_chain_source
+        if src is not None and hasattr(src, "resolve_subnet_owner"):
+            try:
+                owner = src.resolve_subnet_owner()
+            except Exception as exc:
+                logger.warning("Owner chain resolution failed (%s); using env owner", exc)
+                owner = ""
+        if not owner:
+            owner = self._owner_hotkey  # env/constructor fallback
+        if owner:
+            self._resolved_owner = owner  # cache a real value
+        return owner
+
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
 
@@ -1071,7 +1097,7 @@ class EpochManager:
         if not is_real_miner_hotkey(self._champion.hotkey):
             return build_bootstrap_or_champion_weights(
                 self._champion.hotkey,
-                owner_hotkey=self._owner_hotkey,
+                owner_hotkey=self._resolve_owner_hotkey(),
             )
 
         # Gather champion-eligible submissions from this epoch
@@ -1103,7 +1129,7 @@ class EpochManager:
         if total > 0:
             normalized = {k: v / total for k, v in raw_weights.items()}
             return apply_champion_burn_ramp(
-                normalized, owner_hotkey=self._owner_hotkey,
+                normalized, owner_hotkey=self._resolve_owner_hotkey(),
             )
         return raw_weights
 

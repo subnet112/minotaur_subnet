@@ -50,6 +50,22 @@ def lookup_subnet_owner_from_chain(subtensor: Any, netuid: int) -> str:
         return ""
 
 
+def resolve_subnet_owner_hotkey(subtensor: Any = None, netuid: int | None = None) -> str:
+    """Resolve the subnet owner hotkey. The CHAIN is authoritative (public on-chain
+    data, identical for every validator); the env (SUBNET_OWNER_HOTKEY / OWNER_HOTKEY)
+    is only a fallback for environments where the chain isn't queryable (e.g. a local
+    testnet without the storage set)."""
+    if subtensor is not None and netuid is not None:
+        try:
+            chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Subnet owner chain lookup failed (%s); falling back to env", exc)
+            chain_owner = ""
+        if chain_owner:
+            return chain_owner
+    return get_subnet_owner_hotkey()
+
+
 def is_real_miner_hotkey(hotkey: str | None) -> bool:
     """Return whether a hotkey belongs to a real miner-backed champion."""
     value = (hotkey or "").strip()
