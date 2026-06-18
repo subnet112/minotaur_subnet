@@ -278,3 +278,58 @@ class TestMetagraphSync:
             my_uid=1, my_role="follower",
         )
         assert ms.is_leader is False
+
+
+# ── Locked-leader constants are env-overridable ─────────────────────────────
+
+_PROD_LOCKED_LEADER_HOTKEY = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
+_PROD_LOCKED_LEADER_EVM = "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D"
+
+
+class TestLockedLeaderEnvOverride:
+    """LOCKED_LEADER_* are module-load constants read from env with the prod
+    values as defaults. Tested via importlib.reload under monkeypatched env."""
+
+    def test_unset_env_defaults_to_prod_values(self):
+        # The currently-imported module reflects an unset-env load (conftest /
+        # test env does not set these) → must equal the hardcoded prod values.
+        assert (
+            metagraph_sync_module.LOCKED_LEADER_HOTKEY
+            == _PROD_LOCKED_LEADER_HOTKEY
+        )
+        assert (
+            metagraph_sync_module.LOCKED_LEADER_EVM_ADDRESS
+            == _PROD_LOCKED_LEADER_EVM
+        )
+
+    def test_env_override_applied_on_module_load(self, monkeypatch):
+        import importlib
+
+        monkeypatch.setenv("LOCKED_LEADER_HOTKEY", "5Hcustomhotkey")
+        monkeypatch.setenv("LOCKED_LEADER_EVM_ADDRESS", "0xCustomLeaderAddr")
+        try:
+            importlib.reload(metagraph_sync_module)
+            assert metagraph_sync_module.LOCKED_LEADER_HOTKEY == "5Hcustomhotkey"
+            assert (
+                metagraph_sync_module.LOCKED_LEADER_EVM_ADDRESS
+                == "0xCustomLeaderAddr"
+            )
+        finally:
+            # Restore the default-env module state for other tests.
+            monkeypatch.delenv("LOCKED_LEADER_HOTKEY", raising=False)
+            monkeypatch.delenv("LOCKED_LEADER_EVM_ADDRESS", raising=False)
+            importlib.reload(metagraph_sync_module)
+
+    def test_explicit_empty_env_clears_the_lock(self, monkeypatch):
+        import importlib
+
+        monkeypatch.setenv("LOCKED_LEADER_HOTKEY", "")
+        monkeypatch.setenv("LOCKED_LEADER_EVM_ADDRESS", "")
+        try:
+            importlib.reload(metagraph_sync_module)
+            assert metagraph_sync_module.LOCKED_LEADER_HOTKEY == ""
+            assert metagraph_sync_module.LOCKED_LEADER_EVM_ADDRESS == ""
+        finally:
+            monkeypatch.delenv("LOCKED_LEADER_HOTKEY", raising=False)
+            monkeypatch.delenv("LOCKED_LEADER_EVM_ADDRESS", raising=False)
+            importlib.reload(metagraph_sync_module)

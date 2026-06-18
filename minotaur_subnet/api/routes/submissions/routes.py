@@ -233,25 +233,19 @@ def _champion_proposal_rate_limit_check(
 def _verify_champion_proposal_signature(body: Any) -> str | None:
     """Verify the leader's EIP-712 signature over the canonical proposal.
 
-    Default ON as of PR-2 (audit C2): opt-OUT via
-    ``CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=0`` for emergency
-    incident handling only. Previously defaulted to off, which meant the
-    shared API key was the only thing standing between any leaked-key
-    holder and forging "the leader said adopt this champion" claims.
-    Mirrors the compose default flipped in PR-1.
+    ALWAYS required: this signature is the sole cross-validator auth for the
+    champion-consensus proposal route now that the shared internal API key
+    gate has been removed. The previous
+    ``CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=0`` bypass is gone — there
+    is no opt-out, otherwise any caller could forge "the leader said adopt
+    this champion" claims.
 
-    When on, requires ``proposer`` and ``proposer_signature`` to be
-    present and verifies the signature covers the canonical JSON of the
-    proposal payload with the signature field stripped.
+    Requires ``proposer`` and ``proposer_signature`` to be present and
+    verifies the signature covers the canonical JSON of the proposal payload
+    with the signature field stripped.
 
     Returns an error string on failure, or None on pass.
     """
-    require = os.environ.get(
-        "CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1",
-    ).strip().lower() in ("1", "true", "yes", "on")
-    if not require:
-        return None
-
     signer_declared = (getattr(body, "proposer", "") or "").strip()
     sig_hex = (getattr(body, "proposer_signature", "") or "").strip()
     if not signer_declared or not sig_hex:
@@ -699,7 +693,7 @@ async def close_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Explicitly close the current solver round for replay evaluation."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     closed = _close_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/close",
@@ -714,7 +708,7 @@ async def certify_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a champion certificate for a replay-qualified finalist."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     # Close the explicit-certify bypass: this public (operator) endpoint must not
     # silently certify an ARBITRARY candidate that never won the round's adoption
     # rule. Allow only the round's rule-selected finalist, a genesis/builtin
@@ -793,12 +787,10 @@ async def solver_round_consensus_proposal(
     request: Request,
 ) -> dict[str, Any]:
     """Receive a champion certification proposal from the current round leader."""
-    _require_internal_round_api_key(request)
-
-    # Additional EIP-712 signature check (opt-in via
-    # CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=1). The shared API key is
-    # broadcast, so it alone can't prove the caller is an actual registered
-    # validator. Signing the canonical payload with a validator key does.
+    # EIP-712 signature check is the sole cross-validator auth for this route.
+    # The shared internal API key gate was removed: peers reached over the
+    # metagraph don't hold it, and signing the canonical payload with the
+    # leader validator key already proves the caller is the round leader.
     from minotaur_subnet.consensus.dissent import RejectionCode
     auth_err = _verify_champion_proposal_signature(body)
     if auth_err:
@@ -1017,7 +1009,7 @@ async def activate_solver_round(
     request: Request,
 ) -> dict[str, Any]:
     """Activate a previously certified round at an explicit epoch."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     try:
         result = await _activate_solver_round_state(body)
     except KeyError as exc:
@@ -1037,7 +1029,7 @@ async def abort_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Abort a solver round without activating a challenger."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     aborted = _abort_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/abort",
