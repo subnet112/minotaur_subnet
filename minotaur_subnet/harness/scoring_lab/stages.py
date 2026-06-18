@@ -210,8 +210,7 @@ class CurrentAdoptRule(AdoptRule):
         t0 = time.monotonic()
         # Drive the floors via env (as the real gate reads them) + margin via the ctor field.
         prev = {k: os.environ.get(k) for k in
-                ("MIN_CHAMPION_SCORE", "PER_APP_MIN_SCORE", "MAX_APP_REGRESSION")}
-        os.environ["MIN_CHAMPION_SCORE"] = str(cfg.min_champion_score)
+                ("PER_APP_MIN_SCORE", "MAX_APP_REGRESSION")}
         os.environ["PER_APP_MIN_SCORE"] = str(cfg.per_app_min_score)
         os.environ["MAX_APP_REGRESSION"] = str(cfg.max_app_regression)
         try:

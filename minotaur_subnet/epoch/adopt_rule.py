@@ -10,7 +10,6 @@ adoption-disabled / same-submission / shadow preamble (those stay in
 ``EpochManager`` because they touch instance state / logging side effects). It
 reads the same environment knobs at call time:
 
-    MIN_CHAMPION_SCORE   (default 0.5)  global score floor
     PER_APP_MIN_SCORE    (default 0.3)  per-app score floor (current rule)
     MAX_APP_REGRESSION   (default 0.10) per-app non-regression / catastrophe veto
     ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (p2oc rule)
@@ -56,10 +55,23 @@ def _evaluate_onchain(
     (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the gas-polluted JS
     score, so a more-output-but-more-gas challenger (which the JS path rejects) is
     adoptable, while a gas-gaming challenger that delivers less is not. Keeps the
-    vetoes: on-chain admission floor (ONCHAIN_FLOOR_BPS), app-coverage drop, and a
-    JS no-catastrophic-regression guard (MAX_APP_REGRESSION). The shared preamble in
-    ``_should_adopt`` (global-min + same-submission) already ran.
+    vetoes: per-app sanity floor (PER_APP_MIN_SCORE), on-chain admission floor
+    (ONCHAIN_FLOOR_BPS), app-coverage drop, and a JS no-catastrophic-regression
+    guard (MAX_APP_REGRESSION). The same-submission short-circuit in
+    ``_should_adopt`` already ran (the absolute global-min floor was removed —
+    adoption is governed by the dethrone margin + the per-app floor, not an
+    absolute global number).
     """
+    # Per-app sanity floor — applies to the genesis (no-champion) case too, so a
+    # garbage first champion can't self-adopt under p2oc (mirrors the current rule).
+    per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
+    for app_id, app_score in (challenger_scorecard or {}).get("app_scores", {}).items():
+        if app_score < per_app_min:
+            return False, (
+                f"Challenger app {app_id} score {app_score:.3f} below "
+                f"per-app minimum {per_app_min:.3f}"
+            )
+
     if not has_champion:
         return True, "p2oc adopt: no champion yet (genesis)"  # no champion yet (genesis)
 
@@ -122,30 +134,29 @@ def evaluate_adoption(
 
     Mirrors ``EpochManager._should_adopt``'s rule body EXACTLY — everything
     AFTER the adoption-disabled / same-submission / shadow preamble (those stay
-    in ``EpochManager``). Reads the same env knobs (``MIN_CHAMPION_SCORE``,
-    ``PER_APP_MIN_SCORE``, ``MAX_APP_REGRESSION``, ``ONCHAIN_FLOOR_BPS``,
-    ``ADOPT_RULE``). Dispatches ``ADOPT_RULE=p2oc`` to the on-chain-surplus
-    variant internally.
+    in ``EpochManager``). Reads the same env knobs (``PER_APP_MIN_SCORE``,
+    ``MAX_APP_REGRESSION``, ``ONCHAIN_FLOOR_BPS``, ``ADOPT_RULE``). Dispatches
+    ``ADOPT_RULE=p2oc`` to the on-chain-surplus variant internally.
 
     Enforces (default "current" rule):
-    1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
-    2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-    3. Per-app non-regression: no champion-covered app may be dropped, and
+    1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — the absolute sanity floor.
+    2. Per-app non-regression: no champion-covered app may be dropped, and
        no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-    4. Global improvement over the champion by the dethrone margin (default 0.5%)
+    3. Global improvement over the champion by the dethrone margin (default 5%)
+
+    There is intentionally NO absolute global-score floor: the global JS score is
+    a RELATIVE measure (anchored on the champion reference, ~0.5 == "matches the
+    reference"), so an absolute floor on it is meaningless and was mis-calibrated
+    above the achievable ceiling — it blocked every adoption. The meaningful
+    absolute floor lives per-order in the on-chain ``scoreIntent`` gate
+    (``on_chain_threshold``: "the user got at least their minimum outcome"), which
+    is a separate, per-execution check — not an adoption criterion.
 
     ``has_champion`` is True iff there is a current champion submission_id
     (i.e. ``bool(self._champion.submission_id)``).
     """
-    min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
     per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
     max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
-
-    # 1. Global minimum
-    if challenger_score < min_score:
-        return False, (
-            f"Challenger global score {challenger_score:.3f} below minimum {min_score:.3f}"
-        )
 
     # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
     # JS logic below, byte-for-byte unchanged. ADOPT_RULE=p2oc ranks the dethrone on
@@ -195,11 +206,11 @@ def evaluate_adoption(
                     f"(max drop {max_regression * 100:.0f}%)"
                 )
 
-    # 4. Global improvement over the champion's actual (freshly
-    #    re-benchmarked) score by the dethrone margin. The absolute
-    #    MIN_CHAMPION_SCORE floor is already enforced in step 1, so the
-    #    baseline must NOT be floored at min_score here — flooring only
-    #    over-protects a degraded (sub-floor) champion (design doc, §a #6).
+    # 3. Global improvement over the champion's actual (freshly re-benchmarked)
+    #    score by the dethrone margin. This is the operative gate: the challenger
+    #    must beat the current champion by the margin — the champion score is the
+    #    moving baseline (NOT floored), so a genuinely-better challenger adopts
+    #    even when both sit below any absolute number.
     required = champion_score * (1 + dethrone_margin)
     if challenger_score <= champion_score:
         return False, (
