@@ -47,6 +47,7 @@ from minotaur_subnet.harness.round_store import (
     RoundStore,
 )
 from minotaur_subnet.weight_policy import (
+    apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
     is_real_miner_hotkey,
@@ -161,6 +162,10 @@ class EpochManager:
         self._weights_emitter = weights_emitter
         self._weight_decay = weight_decay
         self._owner_hotkey = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+        # Chain-primary owner resolution: a wired chain source (MetagraphSync with
+        # resolve_subnet_owner()) takes precedence over the env/constructor owner.
+        self._owner_chain_source: Any = None
+        self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
@@ -1053,6 +1058,28 @@ class EpochManager:
             "reason": reason or "manual revert",
         }
 
+    def set_owner_chain_source(self, source: Any) -> None:
+        """Wire a chain source (a MetagraphSync with resolve_subnet_owner()) so the
+        burn-target owner is resolved CHAIN-PRIMARY instead of env-only."""
+        self._owner_chain_source = source
+
+    def _resolve_owner_hotkey(self) -> str:
+        if self._resolved_owner:
+            return self._resolved_owner
+        owner = ""
+        src = self._owner_chain_source
+        if src is not None and hasattr(src, "resolve_subnet_owner"):
+            try:
+                owner = src.resolve_subnet_owner()
+            except Exception as exc:
+                logger.warning("Owner chain resolution failed (%s); using env owner", exc)
+                owner = ""
+        if not owner:
+            owner = self._owner_hotkey  # env/constructor fallback
+        if owner:
+            self._resolved_owner = owner  # cache a real value
+        return owner
+
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
 
@@ -1070,7 +1097,7 @@ class EpochManager:
         if not is_real_miner_hotkey(self._champion.hotkey):
             return build_bootstrap_or_champion_weights(
                 self._champion.hotkey,
-                owner_hotkey=self._owner_hotkey,
+                owner_hotkey=self._resolve_owner_hotkey(),
             )
 
         # Gather champion-eligible submissions from this epoch
@@ -1093,10 +1120,17 @@ class EpochManager:
             weight = self._weight_decay ** rank  # rank 0 = champion
             raw_weights[sub.hotkey] = weight
 
-        # Normalize to sum=1
+        # Normalize to sum=1, then apply the champion burn ramp so the miners
+        # collectively receive only CHAMPION_MINER_WEIGHT_FRACTION (0.05) and the
+        # rest burns to the owner — the same conservative cap the daemon's
+        # burn-fallback builder applies, so a freshly-adopted champion's share is
+        # bounded however its weights were built.
         total = sum(raw_weights.values())
         if total > 0:
-            return {k: v / total for k, v in raw_weights.items()}
+            normalized = {k: v / total for k, v in raw_weights.items()}
+            return apply_champion_burn_ramp(
+                normalized, owner_hotkey=self._resolve_owner_hotkey(),
+            )
         return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
