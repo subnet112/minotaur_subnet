@@ -30,7 +30,17 @@ from mcp.server.fastmcp import FastMCP
 _API_BASE = os.environ.get("MINOTAUR_API_URL", "http://localhost:8080")
 _API_V1 = f"{_API_BASE}/v1"
 
-_client = httpx.Client(base_url=_API_V1, timeout=30.0)
+# Operator round-control routes are fail-closed (require the internal key); send
+# it as a default header when configured so the MCP operator tools keep working.
+_internal_round_key = (
+    os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
+    or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
+)
+_client = httpx.Client(
+    base_url=_API_V1,
+    timeout=30.0,
+    headers={"x-solver-round-internal-key": _internal_round_key} if _internal_round_key else None,
+)
 
 server = FastMCP(
     name="minotaur-app-intents",
