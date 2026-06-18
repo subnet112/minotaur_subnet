@@ -1091,7 +1091,12 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
             champ_sub = store.get(champ.submission_id)
             champion_score = champ_sub.benchmark_score if champ_sub is not None else None
 
-        threshold = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
+        # The report's absolute "too low" floor is the surviving per-app sanity
+        # floor (PER_APP_MIN_SCORE) — the absolute GLOBAL floor was purged. The
+        # dethrone bar (champion*(1+margin)) is computed inside the report as
+        # score_to_beat, which drives the "scored but didn't dethrone" outcome;
+        # keeping threshold distinct from it keeps both outcomes reachable.
+        threshold = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
         reason = d.get("rejection_reason")
         if not reason and sub.round_id:
             rs = get_round_store().get_round(sub.round_id)

@@ -721,12 +721,16 @@ class EpochManager:
     def _should_adopt(self, challenger: Submission) -> bool:
         """Check if the challenger should replace the current champion.
 
-        Enforces:
-        1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
-        2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-        3. Per-app non-regression: no champion-covered app may be dropped, and
+        Enforces (via the shared ``evaluate_adoption`` rule):
+        1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — absolute sanity floor.
+        2. Per-app non-regression: no champion-covered app may be dropped, and
            no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-        4. Global improvement over the champion by the dethrone margin (default 0.5%)
+        3. Global improvement over the champion by the dethrone margin (default 5%)
+
+        There is no absolute global-score floor — the global JS score is relative
+        to the champion reference, so the dethrone margin (beat the champion) is
+        the operative gate. The "user got their minimum outcome" 0.5 lives in the
+        separate per-order on-chain ``scoreIntent`` gate, not adoption.
         """
         # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
         # BEFORE the disable gate so the shadow tally sees it with adoption off.
@@ -742,16 +746,6 @@ class EpochManager:
 
         challenger_score = challenger.benchmark_score or 0
         champion_score = self._champion.benchmark_score or 0
-
-        # 1. Global minimum — preserved here so the same-submission short-circuit and
-        #    the p2oc dispatch run in the original order (matches legacy behavior).
-        min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
-        if challenger_score < min_score:
-            logger.info(
-                "Challenger %s global score %.3f below minimum %.3f",
-                challenger.submission_id, challenger_score, min_score,
-            )
-            return False
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
@@ -775,8 +769,7 @@ class EpochManager:
             self._log_shadow_determinism(challenger, challenger_scorecard, incumbent_scorecard)
 
         # Delegate the rule body to the pure, shared decision function so the leader
-        # and followers make the identical decision. (global-min is re-checked inside
-        # but already enforced above — same threshold, idempotent.)
+        # and followers make the identical decision.
         adopt, reason = evaluate_adoption(
             challenger_score=challenger_score,
             champion_score=champion_score,
@@ -794,8 +787,8 @@ class EpochManager:
         ``adopt_rule._evaluate_onchain``. Ranks the dethrone on the unfakeable on-chain
         OUTPUT surplus (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the
         gas-polluted JS score. Kept as a method so direct callers (e.g.
-        ``_log_shadow_determinism``) and existing tests keep working; the shared
-        preamble in ``_should_adopt`` (global-min + same-submission) already ran.
+        ``_log_shadow_determinism``) and existing tests keep working; the
+        same-submission short-circuit in ``_should_adopt`` already ran.
         """
         adopt, reason = _evaluate_onchain(
             challenger_scorecard=self._get_scorecard(challenger),

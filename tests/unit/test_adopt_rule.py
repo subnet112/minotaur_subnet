@@ -27,17 +27,20 @@ def _card(js: dict, oc: dict | None = None) -> dict:
 # ── default "current" JS rule ────────────────────────────────────────────────
 
 
-def test_global_min_reject():
+def test_no_absolute_global_floor():
+    # The absolute MIN_CHAMPION_SCORE floor was purged: a challenger BELOW any
+    # absolute number still ADOPTS when it beats the champion by the dethrone
+    # margin (and meets the per-app floor + non-regression). The global JS score
+    # is relative to the champion reference, so only the margin governs.
     adopt, reason = evaluate_adoption(
-        challenger_score=0.4,  # below default MIN_CHAMPION_SCORE=0.5
-        champion_score=0.6,
-        challenger_scorecard=_card({"A": 0.4}),
-        champion_scorecard=_card({"A": 0.6}),
-        dethrone_margin=0.005,
+        challenger_score=0.40,  # well below the old 0.5 floor
+        champion_score=0.30,    # but beats the champion by >> the margin
+        challenger_scorecard=_card({"A": 0.40}),
+        champion_scorecard=_card({"A": 0.30}),
+        dethrone_margin=0.05,
         has_champion=True,
     )
-    assert adopt is False
-    assert "below minimum" in reason
+    assert adopt is True
 
 
 def test_per_app_min_reject(monkeypatch):
@@ -201,19 +204,21 @@ def test_p2oc_reject_on_floor_fail(monkeypatch):
     assert "on-chain floor fail" in reason
 
 
-def test_p2oc_global_min_still_enforced(monkeypatch):
-    # Global min is checked before the p2oc dispatch inside evaluate_adoption.
+def test_p2oc_no_absolute_global_floor(monkeypatch):
+    # The global-score floor was purged, so a sub-floor challenger reaches the
+    # p2oc dispatch and is judged by p2oc's own rule (here it rejects on JS
+    # regression) — NOT blocked by an absolute floor.
     monkeypatch.setenv("ADOPT_RULE", "p2oc")
     adopt, reason = evaluate_adoption(
-        challenger_score=0.4,  # below MIN_CHAMPION_SCORE=0.5
+        challenger_score=0.4,
         champion_score=0.5,
         challenger_scorecard=_card({"A": 0.4}, {"A": [9000]}),
         champion_scorecard=_card({"A": 0.5}, {"A": [5000]}),
-        dethrone_margin=0.005,
+        dethrone_margin=0.05,
         has_champion=True,
     )
     assert adopt is False
-    assert "below minimum" in reason
+    assert "p2oc" in reason
 
 
 def test_p2oc_genesis_adopt(monkeypatch):
@@ -228,6 +233,23 @@ def test_p2oc_genesis_adopt(monkeypatch):
     )
     assert adopt is True
     assert "genesis" in reason
+
+
+def test_p2oc_genesis_rejects_below_per_app_floor(monkeypatch):
+    # Purging the absolute global floor must NOT open the p2oc genesis path: the
+    # per-app sanity floor now also guards it, so a garbage first champion can't
+    # self-adopt under ADOPT_RULE=p2oc (matches the default rule).
+    monkeypatch.setenv("ADOPT_RULE", "p2oc")
+    adopt, reason = evaluate_adoption(
+        challenger_score=0.05,
+        champion_score=0.0,
+        challenger_scorecard=_card({"A": 0.05}, {"A": [100]}),  # below per-app 0.3
+        champion_scorecard=None,
+        dethrone_margin=0.05,
+        has_champion=False,
+    )
+    assert adopt is False
+    assert "per-app minimum" in reason
 
 
 # ── moved module helpers ─────────────────────────────────────────────────────
