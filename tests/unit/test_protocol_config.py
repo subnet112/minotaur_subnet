@@ -29,7 +29,7 @@ def test_from_validator_registry_reads_chain():
         "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
         return_value=6666,
     ) as mock_read:
-        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
         assert cfg.quorum_bps == 6666
         assert cfg.rpc_url == _RPC
         assert cfg.registry_address == _REGISTRY
@@ -41,7 +41,7 @@ def test_override_skips_chain_read():
     with patch(
         "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
     ) as mock_read:
-        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
         assert cfg.quorum_bps == 7500
         mock_read.assert_not_called()
 
@@ -52,7 +52,7 @@ def test_override_garbage_falls_back_to_chain():
         "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
         return_value=6666,
     ):
-        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
         assert cfg.quorum_bps == 6666  # fell through
 
 
@@ -64,7 +64,27 @@ def test_chain_failure_propagates_at_startup():
         side_effect=ConnectionError("RPC down"),
     ):
         with pytest.raises(ConnectionError):
+            ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
+
+
+def test_quorum_address_required_no_silent_fallback():
+    """quorum_address is REQUIRED — there must be no silent fallback to
+    registry_address. The champion path uses a distinct ChampionRegistry as
+    its quorum source, so silently defaulting to registry_address would read
+    the quorum from the wrong contract / chain. Every caller must be explicit.
+    """
+    # Empty string (the previous default) now raises before any RPC happens.
+    with patch(
+        "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
+    ) as mock_read:
+        with pytest.raises(ValueError, match="explicit quorum_address"):
             ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        mock_read.assert_not_called()
+    # None is equally rejected.
+    with pytest.raises(ValueError, match="explicit quorum_address"):
+        ProtocolConfig.from_validator_registry(
+            _RPC, _REGISTRY, quorum_address=None,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio
@@ -165,7 +185,7 @@ def test_observability_snapshot_stamped_at_construction():
          patch(f"{_PC}._read_validators", return_value=list(_VSET)), \
          patch(f"{_PC}._read_chain_id", return_value=964), \
          patch(f"{_PC}._read_block_number", return_value=8_000_000):
-        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
 
     assert cfg.chain_id == 964
     assert cfg.last_refresh_block == 8_000_000
@@ -190,7 +210,7 @@ def test_observability_records_error_on_failed_read():
          patch(f"{_PC}._read_validators", return_value=[]), \
          patch(f"{_PC}._read_chain_id", return_value=964), \
          patch(f"{_PC}._read_block_number", return_value=8_000_000):
-        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY)
+        cfg = ProtocolConfig.from_validator_registry(_RPC, _REGISTRY, quorum_address=_REGISTRY)
 
     assert cfg.last_successful_refresh_at is None
     assert cfg.last_refresh_error is not None
