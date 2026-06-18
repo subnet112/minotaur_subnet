@@ -47,11 +47,18 @@ def test_sig_verify_on_by_default(monkeypatch):
     assert "Missing proposer" in err
 
 
-def test_sig_verify_opt_out_via_env(monkeypatch):
-    """Operators can still bypass with =0 for emergency incident handling."""
+def test_sig_verify_env_opt_out_now_ignored(monkeypatch):
+    """The CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS=0 bypass is removed.
+
+    The EIP-712 signature is now the sole cross-validator auth (the shared
+    internal API key gate was dropped from this route), so an unsigned
+    proposal must STILL be rejected even with the legacy opt-out env set.
+    """
     monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "0")
-    body = _make_body()
-    assert _verify_champion_proposal_signature(body) is None
+    body = _make_body()  # empty proposer/signature
+    err = _verify_champion_proposal_signature(body)
+    assert err is not None
+    assert "Missing proposer" in err
 
 
 def test_sig_verify_on_rejects_missing(monkeypatch):

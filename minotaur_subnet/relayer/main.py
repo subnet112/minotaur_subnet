@@ -146,6 +146,10 @@ class RelayerService:
         self.protocol_config = ProtocolConfig.from_validator_registry(
             rpc_url=primary.rpc_url,
             registry_address=primary.validator_registry_address,
+            # The relayer's quorum source IS the primary chain's
+            # ValidatorRegistry — pass it explicitly (no silent fallback
+            # inside from_validator_registry).
+            quorum_address=primary.validator_registry_address,
         )
         # SignatureCollector removed in H3 audit fix; sig collection happens
         # at the api leader, the relayer only verifies pre-formed quorum

@@ -105,6 +105,62 @@ def _make_plan(intent_id: str = "test-swap"):
         nonce=0,
     )
 
+class _RecordingEngine:
+    """Minimal JsExecutionEngine stand-in that records load_intent calls."""
+
+    def __init__(self):
+        self.loaded: dict[str, str] = {}
+        self.load_calls: list[tuple[str, str]] = []
+
+    async def load_intent(self, app_id: str, js_code: str) -> None:
+        self.loaded[app_id] = js_code
+        self.load_calls.append((app_id, js_code))
+
+    def list_loaded_intents(self):
+        return list(self.loaded.keys())
+
+    def get_manifest(self, app_id: str):
+        return {}
+
+    async def score(self, app_id, plan, simulation, state):
+        return ScoreResult(score=0.5)
+
+
+def _intent_with_js(app_id: str, js_code: str):
+    return AppIntentDefinition(
+        app_id=app_id, name="Hot", version="1.0.0", intent_type="swap",
+        js_code=js_code,
+        config=AppIntentConfig(supported_chains=[1],
+                               trigger_type=TriggerType.USER_TRIGGERED),
+    )
+
+
+class TestBenchmarkEngineHotReload(unittest.TestCase):
+    """The benchmark worker keeps its OWN engine, so it must hot-reload on a
+    js_code change (like the BlockLoop) — otherwise a developer's PUT /scoring
+    is ignored until an api restart."""
+
+    def test_build_score_fn_hot_reloads_on_js_change(self):
+        eng = _RecordingEngine()
+        worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
+        snap, state = _make_snapshot(), _make_state()
+        v1 = "function score(p,s,c){return {score:0.1};} // version one padding"
+        v2 = "function score(p,s,c){return {score:0.9};} // version two padding"
+
+        asyncio.run(worker._build_score_fn([(_intent_with_js("hot", v1), state, snap)]))
+        self.assertEqual(eng.loaded["hot"], v1)
+        self.assertEqual(len(eng.load_calls), 1)
+
+        # Same JS → must NOT reload.
+        asyncio.run(worker._build_score_fn([(_intent_with_js("hot", v1), state, snap)]))
+        self.assertEqual(len(eng.load_calls), 1, "unchanged js must not reload")
+
+        # Changed JS → must hot-reload to the new version.
+        asyncio.run(worker._build_score_fn([(_intent_with_js("hot", v2), state, snap)]))
+        self.assertEqual(len(eng.load_calls), 2, "changed js must hot-reload")
+        self.assertEqual(eng.loaded["hot"], v2)
+
+
 class TestBuildBenchmarkSimulation(unittest.TestCase):
     """Tests for _build_benchmark_simulation helper."""
 

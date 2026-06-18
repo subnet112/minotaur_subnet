@@ -486,7 +486,7 @@ class TestSubmissionAPI(unittest.TestCase):
         # operator-override env for the duration of these tests.
         os.environ["SUBMISSIONS_ALLOW_UNREGISTERED"] = "1"
         os.environ.pop("SUBMISSIONS_API_KEY", None)
-        os.environ.pop("SOLVER_ROUND_INTERNAL_API_KEY", None)
+        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
         os.environ.pop("SOLVER_ROUND_EPOCH_SECONDS", None)
         os.environ.pop("SOLVER_ROUND_EPOCH_BLOCKS", None)
         os.environ.pop("ALLOW_INSECURE_REPO_URLS", None)
@@ -505,6 +505,15 @@ class TestSubmissionAPI(unittest.TestCase):
         sub_mod.set_champion_consensus_manager(None)
         sub_mod.set_champion_peer_network(None)
         sub_mod.set_solver_round_epoch_provider(None)
+
+        # Reset the global champion-proposal rate-limiter between tests. It is
+        # module-level state keyed by (signer-or-client-IP, round_id); without
+        # this clear, a second unsigned POST from the shared TestClient IP is
+        # rate-limited before reaching the round-state logic under test.
+        from minotaur_subnet.api.routes.submissions.routes import (
+            _CHAMPION_PROPOSAL_LAST_SEEN,
+        )
+        _CHAMPION_PROPOSAL_LAST_SEEN.clear()
 
         # Mock signature verification to always pass (unless testing sig failure)
         self._sig_patcher = patch(
@@ -578,7 +587,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "benchmark_pack_hash": "pack-43",
             "committee_hash": "committee-43",
             "quorum_required": 2,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -604,7 +613,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "benchmark_pack_hash": "pack-43",
             "committee_hash": "committee-43",
             "quorum_required": 2,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         peer_network.broadcast_json.assert_awaited_once()
@@ -648,7 +657,7 @@ class TestSubmissionAPI(unittest.TestCase):
                     "signature": "sig",
                 },
             ],
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -656,6 +665,14 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertEqual(data["certificate_candidate_submission_id"], sub.submission_id)
         self.assertEqual(data["certificate_quorum_required"], 1)
         self.assertEqual(data["certificate_approvals"], 1)
+
+    def test_certify_solver_round_requires_internal_key(self):
+        # Public operator certify route must reject when no internal key header is sent.
+        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
+        resp = self.client.post("/v1/solver/round/certify", json={
+            "round_id": "round-x", "effective_epoch": 1,
+        })
+        self.assertEqual(resp.status_code, 401)
 
     def test_certify_solver_round_endpoint_rejects_after_deadline(self):
         from minotaur_subnet.api.routes import submissions as sub_mod
@@ -695,7 +712,7 @@ class TestSubmissionAPI(unittest.TestCase):
                     "signature": "sig",
                 },
             ],
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 409)
         self.assertIn("exceeded certification deadline", resp.json()["detail"])
@@ -765,7 +782,7 @@ class TestSubmissionAPI(unittest.TestCase):
             "round_id": current.round_id,
             "candidate_submission_id": sub.submission_id,
             "effective_epoch": 44,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -818,16 +835,35 @@ class TestSubmissionAPI(unittest.TestCase):
         consensus_manager.sign_approval.return_value = approval
         sub_mod.set_champion_consensus_manager(consensus_manager)
 
-        resp = self.client.post("/v1/solver/round/consensus/proposal", json={
-            "round_id": current.round_id,
-            "candidate_submission_id": sub.submission_id,
-            "candidate_image_id": sub.image_id,
-            "committee_hash": "committee-43",
-            "benchmark_pack_hash": "pack-43",
-            "effective_epoch": 44,
-            "close_epoch": 43,
-            "quorum_required": 1,
-        })
+        # The EIP-712 signature is now the sole cross-validator auth for this
+        # route (the internal-key gate was removed). This test POSTs an
+        # unsigned body and stays focused on the round-state -> sign path, so
+        # stub the signature check to pass. The pack-hash pre-flight and the
+        # reactive Docker benchmark are independent downstream gates exercised
+        # elsewhere; stub them so we reach sign_approval.
+        with patch(
+            "minotaur_subnet.api.routes.submissions.routes."
+            "_verify_champion_proposal_signature",
+            return_value=None,
+        ), patch(
+            "minotaur_subnet.api.startup."
+            "_build_solver_round_benchmark_pack_hash",
+            return_value="pack-43",
+        ), patch(
+            "minotaur_subnet.api.routes.submissions.routes."
+            "_reactive_benchmark_candidate",
+            new=AsyncMock(return_value=(True, 0.91)),
+        ):
+            resp = self.client.post("/v1/solver/round/consensus/proposal", json={
+                "round_id": current.round_id,
+                "candidate_submission_id": sub.submission_id,
+                "candidate_image_id": sub.image_id,
+                "committee_hash": "committee-43",
+                "benchmark_pack_hash": "pack-43",
+                "effective_epoch": 44,
+                "close_epoch": 43,
+                "quorum_required": 1,
+            })
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -866,32 +902,29 @@ class TestSubmissionAPI(unittest.TestCase):
         sub_mod.set_champion_consensus_manager(consensus_manager)
         sub_mod.set_solver_round_epoch_provider(lambda: 44)
 
-        resp = self.client.post("/v1/solver/round/consensus/proposal", json={
-            "round_id": current.round_id,
-            "candidate_submission_id": sub.submission_id,
-            "candidate_image_id": sub.image_id,
-            "committee_hash": "committee-43",
-            "benchmark_pack_hash": "pack-43",
-            "effective_epoch": 44,
-            "close_epoch": 43,
-            "quorum_required": 1,
-            "decision_deadline_epoch": 43,
-        })
+        # Unsigned body — stub the signature check (now the sole auth) so the
+        # test stays focused on the deadline-rejection round-state logic.
+        with patch(
+            "minotaur_subnet.api.routes.submissions.routes."
+            "_verify_champion_proposal_signature",
+            return_value=None,
+        ):
+            resp = self.client.post("/v1/solver/round/consensus/proposal", json={
+                "round_id": current.round_id,
+                "candidate_submission_id": sub.submission_id,
+                "candidate_image_id": sub.image_id,
+                "committee_hash": "committee-43",
+                "benchmark_pack_hash": "pack-43",
+                "effective_epoch": 44,
+                "close_epoch": 43,
+                "quorum_required": 1,
+                "decision_deadline_epoch": 43,
+            })
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertFalse(data["approved"])
         self.assertIn("exceeded certification deadline", data["reason"])
-
-    def test_solver_round_consensus_proposal_requires_internal_key_when_configured(self):
-        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
-        resp = self.client.post("/v1/solver/round/consensus/proposal", json={
-            "round_id": "round-e42-n1",
-            "candidate_submission_id": "sub_123",
-            "candidate_image_id": "sha256:" + "a" * 64,
-            "effective_epoch": 42,
-        })
-        self.assertEqual(resp.status_code, 401)
 
     def test_internal_close_solver_round_endpoint_uses_internal_key(self):
         os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
@@ -950,7 +983,7 @@ class TestSubmissionAPI(unittest.TestCase):
         resp = self.client.post("/v1/solver/round/abort", json={
             "round_id": current.round_id,
             "reason": "operator_abort",
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -1010,7 +1043,7 @@ class TestSubmissionAPI(unittest.TestCase):
         resp = self.client.post("/v1/solver/round/activate", json={
             "round_id": current.round_id,
             "activation_epoch": 44,
-        })
+        }, headers={"x-solver-round-internal-key": "internal-secret"})
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()

@@ -30,7 +30,17 @@ from mcp.server.fastmcp import FastMCP
 _API_BASE = os.environ.get("MINOTAUR_API_URL", "http://localhost:8080")
 _API_V1 = f"{_API_BASE}/v1"
 
-_client = httpx.Client(base_url=_API_V1, timeout=30.0)
+# Operator round-control routes are fail-closed (require the internal key); send
+# it as a default header when configured so the MCP operator tools keep working.
+_internal_round_key = (
+    os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
+    or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
+)
+_client = httpx.Client(
+    base_url=_API_V1,
+    timeout=30.0,
+    headers={"x-solver-round-internal-key": _internal_round_key} if _internal_round_key else None,
+)
 
 server = FastMCP(
     name="minotaur-app-intents",
@@ -881,26 +891,6 @@ def execute_bittensor_stake(
         body["hotkey"] = hotkey
     return _post("/native-bittensor/stake", body)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                       CHAIN TOKEN DISCOVERY
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@server.tool(
-    name="get_chain_tokens",
-    description=(
-        "List tokens available on a chain as discovered by the active solver. "
-        "Returns token addresses, symbols, decimals, and pool count."
-    ),
-)
-def get_chain_tokens(chain_id: int) -> dict:
-    """List tokens available on a chain.
-
-    Args:
-        chain_id: The chain ID to list tokens for.
-    """
-    return _get(f"/chains/{chain_id}/tokens")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

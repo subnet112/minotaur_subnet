@@ -195,11 +195,29 @@ class EvmRelayer(RelayerBase):
                 chain_id=chain_id,
             )
 
+        # App address must come from the order's deployment record (passed as
+        # contract_address by every caller). config.app_intent_base_address is
+        # a programmatic-only fallback for tests/emulation; in production it is
+        # always "" because the APP_INTENT_BASE_{chain} env is no longer read
+        # (a stale static env silently executed against a dead contract after
+        # an app redeploy — see chain_config.get_supported_chains). Fail loud
+        # rather than route to a static address.
         app_address = contract_address or config.app_intent_base_address
         if not app_address:
+            order_id = getattr(order, "order_id", "?")
+            logger.error(
+                "submit_plan: no app contract address for order=%s on chain=%s "
+                "— order carried no app_address and the static env fallback has "
+                "been removed; refusing to submit",
+                order_id, chain_id,
+            )
             return SubmitResult(
                 success=False,
-                error=f"No AppIntentBase deployed on chain {chain_id}",
+                error=(
+                    f"No app contract address for order {order_id} on chain "
+                    f"{chain_id} (order carried no app_address; static "
+                    f"APP_INTENT_BASE env fallback removed)"
+                ),
                 chain_id=chain_id,
             )
 

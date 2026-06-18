@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -205,6 +206,12 @@ class BenchmarkWorker:
         self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
+        # app_id -> sha256(js_code)[:16] currently loaded in this worker's
+        # engine. Lets _build_score_fn hot-reload a developer's PUT /scoring on
+        # the next benchmark run instead of caching the first-seen JS forever
+        # (the shared BlockLoop engine already hot-reloads this way; this worker
+        # keeps its own engine, so it needs the same hash-diff).
+        self._loaded_js_hashes: dict[str, str] = {}
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.
@@ -553,43 +560,6 @@ class BenchmarkWorker:
         finally:
             await session.shutdown()
 
-    async def _benchmark_one_scenario_with_rpc(
-        self,
-        image_tag: str,
-        intent: "AppIntentDefinition",
-        state: "IntentState",
-        snapshot: "MarketSnapshot",
-        score_fn: Any,
-        rpc_overrides: dict[int, str],
-    ) -> "BenchmarkResult":
-        """Run a single scenario through a Docker solver pointed at an
-        override RPC. Used by Stage 3 regression gate to replay one order
-        against a historical-block Anvil fork.
-
-        Returns a BenchmarkResult with the score (0 if the solver could
-        not produce a valid plan or simulation reverted).
-        """
-        orch = SolverOrchestrator()
-        session = await orch.start_docker(image_tag, rpc_overrides=rpc_overrides)
-        try:
-            # NB: no fork_block here. Stage 3 replays a *past order* at its own
-            # historical block (via rpc_overrides on the solver), which is not the
-            # epoch block. Pinning the simulator fork for this path is a separate
-            # state-bundle task — see the Phase 4 plan ("Pin Stage 2 to the block").
-            results = await run_benchmark(
-                session,
-                [(intent, state, snapshot)],
-                config=BenchmarkConfig(chain_ids=[state.chain_id]),
-                score_fn=score_fn,
-                simulator=self._simulator,
-                require_real_sim=self._require_real_sim,
-            )
-            if results:
-                return results[0]
-            return BenchmarkResult(intent_id=intent.app_id, score=0.0, error="no_result")
-        finally:
-            await session.shutdown()
-
     async def _benchmark_solver_path(
         self,
         solver_path: str,
@@ -630,17 +600,31 @@ class BenchmarkWorker:
             engine = JsExecutionEngine(timeout_ms=10000)
             self._js_engine = engine  # Save for _enrich_intents_with_manifests()
 
-        # Load JS scoring code for each intent
+        # Load (or hot-reload) JS scoring code for each intent. Mirror the
+        # BlockLoop's hash-diff reload (blockloop/loop.py): reload when the
+        # js_code hash changes so a developer's PUT /scoring is picked up on the
+        # next benchmark run WITHOUT an api restart. (Previously this loaded
+        # "only if not already loaded", so this worker's engine cached the
+        # first-seen JS for the process lifetime.)
         for intent_def, _, _ in intents:
-            if intent_def.app_id not in engine.list_loaded_intents():
-                js_code = intent_def.js_code
-                if not js_code or len(js_code.strip()) < 20:
-                    logger.warning(
-                        "App %s has no JS scoring code, skipping",
-                        intent_def.app_id,
-                    )
-                    continue
-                await engine.load_intent(intent_def.app_id, js_code)
+            js_code = intent_def.js_code
+            if not js_code or len(js_code.strip()) < 20:
+                logger.warning(
+                    "App %s has no JS scoring code, skipping",
+                    intent_def.app_id,
+                )
+                continue
+            js_hash = hashlib.sha256(js_code.encode()).hexdigest()[:16]
+            if self._loaded_js_hashes.get(intent_def.app_id) == js_hash:
+                continue  # already loaded at this exact version
+            await engine.load_intent(intent_def.app_id, js_code)
+            old = self._loaded_js_hashes.get(intent_def.app_id)
+            self._loaded_js_hashes[intent_def.app_id] = js_hash
+            if old is not None:
+                logger.info(
+                    "[benchmark] hot-reloaded JS for app %s (hash %s -> %s)",
+                    intent_def.app_id, old, js_hash,
+                )
 
         async def score_fn(
             app_id: str,
@@ -1109,11 +1093,11 @@ class BenchmarkWorker:
         decision (good->adopt / bad->reject by majority). Each validator scores
         its own slice of orders, so disagreement on a regression is the feature.
         """
-        import os
         from minotaur_subnet.harness.orchestrator import (
             BenchmarkConfig,
             RealSimulationUnavailable,
             SolverOrchestrator,
+            require_real_sim_default,
             run_benchmark,
         )
         from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
@@ -1144,9 +1128,7 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("[shadow-vote] historical load failed: %s", exc)
 
-        _require_real_sim = os.environ.get(
-            "BENCHMARK_REQUIRE_REAL_SIM", "",
-        ).strip().lower() in ("1", "true", "yes", "on")
+        _require_real_sim = require_real_sim_default()
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
         # Champion-anchored bar: grade BOTH the reference champion and the

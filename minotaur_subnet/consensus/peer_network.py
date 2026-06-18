@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 
@@ -63,6 +63,7 @@ class ValidatorPeerNetwork:
         protocol_config: Any = None,
         timeout: float = 10.0,
         default_headers: dict[str, str] | None = None,
+        peer_url_transform: Callable[[str], str] | None = None,
     ) -> None:
         self.validator_id = validator_id
         self.private_key = private_key
@@ -78,6 +79,7 @@ class ValidatorPeerNetwork:
         self.protocol_config = protocol_config
         self.timeout = timeout
         self._default_headers = dict(default_headers or {})
+        self._peer_url_transform = peer_url_transform
         self._session: aiohttp.ClientSession | None = None
 
     def set_peers(self, peers: list[PeerEndpoint]) -> None:
@@ -133,8 +135,13 @@ class ValidatorPeerNetwork:
                 if key == me_lower or key in seen:
                     continue
                 seen.add(key)
+                url = (
+                    self._peer_url_transform(p.axon_url)
+                    if self._peer_url_transform is not None
+                    else p.axon_url
+                )
                 result.append(
-                    PeerEndpoint(validator_id=p.evm_address, url=p.axon_url)
+                    PeerEndpoint(validator_id=p.evm_address, url=url)
                 )
 
         return result
