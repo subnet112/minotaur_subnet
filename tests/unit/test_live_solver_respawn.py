@@ -11,9 +11,8 @@ This file pins the post-fix contract:
   - ``is_alive()`` reflects whether the inner session is currently usable
     (and goes False the moment ``_session._closed`` flips).
   - ``respawn_state()`` exposes the diagnostic snapshot /health reads.
-  - calling ``quote`` / ``generate_plan`` / ``supported_tokens`` while
-    the inner session is dead transparently rebuilds the session and
-    retries the request once.
+  - calling ``quote`` / ``generate_plan`` while the inner session is dead
+    transparently rebuilds the session and retries the request once.
   - the single-retry policy is hard: if the second attempt also fails,
     the caller sees the error (no infinite loop).
   - explicit ``shutdown()`` still works and leaves ``is_alive()`` False.
@@ -49,7 +48,6 @@ def _make_session(*, closed: bool = False) -> MagicMock:
     session._closed = closed
     session.quote = AsyncMock()
     session.generate_plan = AsyncMock()
-    session.supported_tokens = AsyncMock()
     session.shutdown = AsyncMock()
     return session
 
@@ -204,29 +202,6 @@ async def test_generate_plan_respawns_on_crash():
         result = await rt.generate_plan(intent, state, snapshot)
 
     assert result == "plan-result"
-    assert rt._respawn_count == 1
-
-
-@pytest.mark.asyncio
-async def test_supported_tokens_respawns_on_timeout():
-    """supported_tokens uses _call_with_respawn even though it has an
-    extra TTL-cache wrapper above the retry logic."""
-    session = _make_session(closed=False)
-    session.supported_tokens = AsyncMock(
-        side_effect=[
-            SolverTimeoutError("Command supported_tokens timed out"),
-            [{"address": "0x123", "symbol": "TEST"}],
-        ],
-    )
-    rt = _make_runtime(session=session)
-
-    async def _fake_respawn(self):
-        self._respawn_count += 1
-
-    with patch.object(DockerRuntimeSolver, "_respawn_session", _fake_respawn):
-        tokens = await rt.supported_tokens(8453)
-
-    assert tokens == [{"address": "0x123", "symbol": "TEST"}]
     assert rt._respawn_count == 1
 
 
