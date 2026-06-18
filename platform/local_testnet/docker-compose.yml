@@ -298,6 +298,13 @@ services:
       # on-chain ChampionRegistry.quorumBps() value here.
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_0:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
+      # Champion-consensus peer set (api cluster, port 8080). Only the leader
+      # broadcasts proposals, so only the leader api needs this pin.
+      CHAMPION_CONSENSUS_PEERS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8@http://api-peer-1:8080,0x90F79bf6EB2c4f870365E785982E1f101E93b906@http://api-peer-2:8080"
+      # Disable the prod leader-lock for the testnet so the local leader/peers
+      # accept each other's EIP-712-signed proposals (any registered validator).
+      LOCKED_LEADER_EVM_ADDRESS: ""
+      LOCKED_LEADER_HOTKEY: ""
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
       # Fee model (skeleton): set FEE_ENABLED=1 to require fee accounting
@@ -389,6 +396,10 @@ services:
       CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_1:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
+      # Disable the prod leader-lock so this peer accepts the leader's
+      # EIP-712-signed champion proposals (any registered validator).
+      LOCKED_LEADER_EVM_ADDRESS: ""
+      LOCKED_LEADER_HOTKEY: ""
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
     volumes:
@@ -476,6 +487,10 @@ services:
       CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"
       VALIDATOR_PRIVATE_KEY: "${VALIDATOR_KEY_2:-0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6}"
       CHAMPION_QUORUM_BPS: "${API_CLUSTER_QUORUM_BPS:-6666}"
+      # Disable the prod leader-lock so this peer accepts the leader's
+      # EIP-712-signed champion proposals (any registered validator).
+      LOCKED_LEADER_EVM_ADDRESS: ""
+      LOCKED_LEADER_HOTKEY: ""
       CHAIN_ID: "31337"
       SOLVER_ROUND_INTERNAL_API_KEY: "${SOLVER_ROUND_INTERNAL_API_KEY:-minotaur-internal-round-secret}"
     volumes:
