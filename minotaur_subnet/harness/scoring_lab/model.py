@@ -102,7 +102,6 @@ class LabConfig:
     # adoption-gate knobs (mirror the real env vars in epoch/manager.py)
     adopt_rule: str = "current"                # "current" | "p2"
     dethrone_margin: float = DETHRONE_MARGIN
-    min_champion_score: float = 0.5
     per_app_min_score: float = 0.3
     max_app_regression: float = 0.10
     on_chain_floor: int | None = None          # BPS; used by the "p2" rule (and shown by both)
