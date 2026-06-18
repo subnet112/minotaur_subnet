@@ -1571,6 +1571,10 @@ def main() -> None:
         protocol_config = ProtocolConfig.from_validator_registry(
             rpc_url=consensus_rpc,
             registry_address=registry_address,
+            # The order daemon's quorum source IS its own ValidatorRegistry —
+            # pass it explicitly (no silent fallback inside
+            # from_validator_registry).
+            quorum_address=registry_address,
         )
 
     leader_api_url = (
