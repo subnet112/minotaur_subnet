@@ -85,8 +85,22 @@ def apply_champion_burn_ramp(
     Returns ``miner_weights`` unchanged when there are no miners, the owner can't
     be resolved (nothing to burn to), or the owner is already among the miners.
     """
+    if not miner_weights:
+        return miner_weights
     owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
-    if not miner_weights or not owner or owner in miner_weights:
+    if not owner:
+        # Fail LOUD: with no resolvable owner we cannot burn, so the miners would
+        # receive the FULL emission instead of the intended 0.05 — the exact thing
+        # this ramp exists to prevent. Surface it so an operator sets the owner.
+        logger.warning(
+            "Champion burn ramp SKIPPED: no subnet owner resolved (set "
+            "SUBNET_OWNER_HOTKEY / OWNER_HOTKEY on the leader, or wire a chain "
+            "fallback) — %d miner(s) would receive the FULL emission share "
+            "instead of %.0f%%.",
+            len(miner_weights), CHAMPION_MINER_WEIGHT_FRACTION * 100,
+        )
+        return miner_weights
+    if owner in miner_weights:
         return miner_weights
     ramped = {hk: w * CHAMPION_MINER_WEIGHT_FRACTION for hk, w in miner_weights.items()}
     ramped[owner] = 1.0 - CHAMPION_MINER_WEIGHT_FRACTION
