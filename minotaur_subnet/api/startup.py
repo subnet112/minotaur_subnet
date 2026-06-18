@@ -1990,6 +1990,18 @@ async def initialize(ctx: ServerContext) -> dict:
                     initial_state = await ctx.solver_round_metagraph_sync.sync_once()
                     ctx.solver_round_role = initial_state.my_role
 
+                    # Wire the metagraph sync as the EpochManager's chain source so
+                    # the burn-target subnet owner is resolved CHAIN-PRIMARY (public
+                    # on-chain data) instead of env-only. Without this the leader's
+                    # ramp silently no-ops on prod (no SUBNET_OWNER_HOTKEY set).
+                    if (
+                        ctx.epoch_manager is not None
+                        and ctx.solver_round_metagraph_sync is not None
+                    ):
+                        ctx.epoch_manager.set_owner_chain_source(
+                            ctx.solver_round_metagraph_sync
+                        )
+
                     # Restore logging — instantiating MetagraphSync above
                     # imports bittensor, which clears all root logging
                     # handlers, sets the root logger to WARNING, and sets
