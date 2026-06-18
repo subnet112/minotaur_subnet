@@ -44,7 +44,6 @@ class Command(str, Enum):
     RESTORE_STATE = "restore_state"
     METADATA = "metadata"
     QUOTE = "quote"
-    SUPPORTED_TOKENS = "supported_tokens"
     SHUTDOWN = "shutdown"
 
 
@@ -63,12 +62,6 @@ TIMEOUTS: dict[str, float] = {
     Command.RESTORE_STATE: 30.0,
     Command.METADATA: 5.0,
     Command.QUOTE: 5.0,
-    # Token discovery does O(N²) factory.getPool() calls across seed
-    # tokens + per-token symbol/decimals enrichment. On Base (17 seed
-    # tokens × 4 fee tiers × 2 calls per pair ≈ 600 RPC calls) a cold
-    # cache takes 60-120 s. Solver-side results cached 5 min so this
-    # only pays once per run.
-    Command.SUPPORTED_TOKENS: 180.0,
     Command.SHUTDOWN: 5.0,
 }
 
@@ -236,14 +229,6 @@ def make_quote_request(
             "state": _to_dict(state),
             "snapshot": _to_dict(snapshot),
         },
-    )
-
-
-def make_supported_tokens_request(chain_id: int) -> HarnessRequest:
-    """Build a supported_tokens command."""
-    return HarnessRequest(
-        command=Command.SUPPORTED_TOKENS,
-        params={"chain_id": chain_id},
     )
 
 

@@ -110,9 +110,13 @@ class TestGetSupportedChains(unittest.TestCase):
         "ETHEREUM_RPC_URL": "http://eth.example.com",
         "APP_INTENT_BASE_1": "0xContract",
     }, clear=True)
-    def test_app_intent_base_address(self):
+    def test_app_intent_base_env_not_read(self):
+        # The APP_INTENT_BASE_{chain} env is intentionally NOT read: a stale
+        # static address silently routes execution to a dead contract after an
+        # app redeploy. The app address must come per-order from the deployment
+        # record. The field stays at its "" default even when the env is set.
         chains = get_supported_chains()
-        self.assertEqual(chains[1].app_intent_base_address, "0xContract")
+        self.assertEqual(chains[1].app_intent_base_address, "")
 
     @patch.dict("os.environ", {
         "ETHEREUM_RPC_URL": "http://eth.example.com",
@@ -338,7 +342,10 @@ class TestEvmRelayer(unittest.TestCase):
             relayer.submit_plan(order, None, 0.5)
         )
         self.assertFalse(result.success)
-        self.assertIn("No AppIntentBase", result.error)
+        # Fails loud when no per-order app address is supplied (no static
+        # env fallback). Error names the order and the missing address.
+        self.assertIn("No app contract address", result.error)
+        self.assertIn("order_1", result.error)
 
     @patch("minotaur_subnet.blockchain.chains.get_web3")
     @patch("minotaur_subnet.relayer.evm_relayer.encode_intent_order")
