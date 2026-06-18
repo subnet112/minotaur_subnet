@@ -37,6 +37,23 @@ def _is_real_chain_url(url: str) -> bool:
     return not any(kw in lower for kw in ("anvil", "localhost", "127.0.0.1", "0.0.0.0"))
 
 
+def _champion_axon_to_api_url(axon_url: str) -> str:
+    """Swap a discovered validator axon (:9100 daemon) to its co-located api port
+    for champion-consensus broadcasts. Prod runs api and daemon on the same host."""
+    import urllib.parse
+    try:
+        port = int(os.environ.get("CHAMPION_CONSENSUS_PEER_PORT", "8080"))
+        parts = urllib.parse.urlsplit(axon_url)
+        host = parts.hostname or ""
+        netloc = f"{host}:{port}"
+        if parts.username:
+            netloc = f"{parts.username}@{netloc}"
+        return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        logger.warning("champion peer url transform failed for %s; using original", axon_url)
+        return axon_url
+
+
 def _looks_like_mainnet_bittensor_target(target: str) -> bool:
     """Return whether a target string appears to reference Bittensor mainnet."""
     raw = (target or "").strip().lower()
@@ -1823,6 +1840,11 @@ async def initialize(ctx: ServerContext) -> dict:
                         peers=champion_peer_endpoints if champion_peer_endpoints else None,
                         protocol_config=champion_protocol_config,
                         timeout=champion_consensus_timeout,
+                        # Discovered axons point at the :9100 daemon, which
+                        # doesn't serve the champion-consensus routes. Retarget
+                        # them to each validator's co-located api port (:8080).
+                        # Pinned (_peers_override) peers are left verbatim.
+                        peer_url_transform=_champion_axon_to_api_url,
                         default_headers=(
                             {
                                 "x-solver-round-internal-key": internal_round_api_key,
