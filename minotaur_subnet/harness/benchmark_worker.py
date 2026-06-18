@@ -1071,11 +1071,11 @@ class BenchmarkWorker:
         decision (good->adopt / bad->reject by majority). Each validator scores
         its own slice of orders, so disagreement on a regression is the feature.
         """
-        import os
         from minotaur_subnet.harness.orchestrator import (
             BenchmarkConfig,
             RealSimulationUnavailable,
             SolverOrchestrator,
+            require_real_sim_default,
             run_benchmark,
         )
         from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
@@ -1106,9 +1106,7 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("[shadow-vote] historical load failed: %s", exc)
 
-        _require_real_sim = os.environ.get(
-            "BENCHMARK_REQUIRE_REAL_SIM", "",
-        ).strip().lower() in ("1", "true", "yes", "on")
+        _require_real_sim = require_real_sim_default()
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
         # Champion-anchored bar: grade BOTH the reference champion and the

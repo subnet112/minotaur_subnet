@@ -105,6 +105,20 @@ class RealSimulationUnavailable(RuntimeError):
     the process (``run_loop`` catches Exception)."""
 
 
+def require_real_sim_default() -> bool:
+    """Whether the benchmark must use a REAL simulator (fail closed on no-sim / mock).
+    Default ON for prod/consensus so a champion can't be adopted on fabricated scores;
+    OFF only under LOCAL_TESTNET=1 (testnet configs may run with no Anvil simulator).
+    Consensus-relevant: must be uniform across validators."""
+    if os.environ.get("LOCAL_TESTNET", "").strip() == "1":
+        v = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+        return v in ("1", "true", "yes", "on")  # testnet defaults OFF
+    v = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+    if v == "":
+        v = "1"  # prod/consensus defaults ON (empty env -> ON, not just absent env)
+    return v in ("1", "true", "yes", "on")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          SOLVER SESSION
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -90,6 +90,7 @@ async def _reactive_benchmark_candidate(
         BenchmarkResult,
         RealSimulationUnavailable,
         SolverOrchestrator,
+        require_real_sim_default,
         run_benchmark,
     )
     from minotaur_subnet.harness.benchmark_worker import (
@@ -148,6 +149,7 @@ async def _reactive_benchmark_candidate(
         app_store=app_store,
         use_docker=True,
         simulator=simulator,
+        require_real_sim=require_real_sim_default(),
         validator_identity=_my_identity,
     )
 
@@ -202,11 +204,7 @@ async def _reactive_benchmark_candidate(
     # (BENCHMARK_REQUIRE_REAL_SIM) so a follower never re-verifies a candidate on
     # fabricated mock data while the leader fail-closes it — that asymmetry would
     # silently diverge consensus.
-    import os
-    _require_real_sim = (
-        os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
-        in ("1", "true", "yes", "on")
-    )
+    _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
     session = await orch.start_docker(image_tag)
     try:
@@ -318,12 +316,11 @@ async def _independent_adopt_vote(
     benchmark needs a real simulator and none is available, vote REJECT rather than
     risk adopting an unverified challenger.
     """
-    import os
-
     from minotaur_subnet.harness.orchestrator import (
         BenchmarkConfig,
         RealSimulationUnavailable,
         SolverOrchestrator,
+        require_real_sim_default,
         run_benchmark,
     )
     from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
@@ -339,9 +336,7 @@ async def _independent_adopt_vote(
         )
         return False, chal_score
 
-    _require_real_sim = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
     champ_session = await orch.start_docker(champ_image)
     try:
