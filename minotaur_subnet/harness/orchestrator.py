@@ -63,7 +63,6 @@ from minotaur_subnet.harness.protocol import (
     make_metadata_request,
     make_shutdown_request,
     make_quote_request,
-    make_supported_tokens_request,
     parse_plan_response,
     parse_quote_response,
 )
@@ -103,6 +102,20 @@ class RealSimulationUnavailable(RuntimeError):
     mock, which reports a ~min*1.05 success and could be gamed into a passing
     score. The benchmark worker loop logs this and retries; it never crashes
     the process (``run_loop`` catches Exception)."""
+
+
+def require_real_sim_default() -> bool:
+    """Whether the benchmark must use a REAL simulator (fail closed on no-sim / mock).
+    Default ON for prod/consensus so a champion can't be adopted on fabricated scores;
+    OFF only under LOCAL_TESTNET=1 (testnet configs may run with no Anvil simulator).
+    Consensus-relevant: must be uniform across validators."""
+    if os.environ.get("LOCAL_TESTNET", "").strip() == "1":
+        v = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+        return v in ("1", "true", "yes", "on")  # testnet defaults OFF
+    v = os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
+    if v == "":
+        v = "1"  # prod/consensus defaults ON (empty env -> ON, not just absent env)
+    return v in ("1", "true", "yes", "on")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -211,20 +224,6 @@ class SolverSession:
             )
             return None
         return parse_quote_response(resp)
-
-    async def supported_tokens(self, chain_id: int) -> list[dict[str, Any]]:
-        """Send supported_tokens and return the list of discovered tokens."""
-        resp = await self._send(make_supported_tokens_request(chain_id))
-        if not resp.success:
-            logger.warning(
-                "[%s] supported_tokens failed for chain %d: %s",
-                self._label, chain_id, resp.error,
-            )
-            return []
-        result = resp.result
-        if not isinstance(result, list):
-            return []
-        return result
 
     async def check_trigger(
         self,

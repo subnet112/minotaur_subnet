@@ -47,6 +47,7 @@ from minotaur_subnet.harness.round_store import (
     RoundStore,
 )
 from minotaur_subnet.weight_policy import (
+    apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
     is_real_miner_hotkey,
@@ -54,11 +55,16 @@ from minotaur_subnet.weight_policy import (
 
 logger = logging.getLogger(__name__)
 
-# Champion must beat the incumbent by this margin to be adopted.
-# 0.005 == 0.5% (NOT 5% — the prose used to say 5%). The value is left as-is on
-# purpose: raising it to a deliberate minimum-detectable-effect margin must wait
-# until scores are cross-validator comparable (sealed-round work, design doc P1).
-DETHRONE_MARGIN = 0.005
+# Champion must beat the incumbent by this margin to be adopted. THE SINGLE
+# SOURCE of the dethrone margin: every consumer imports DETHRONE_MARGIN from here
+# (the manager passes it to adopt_rule; champion_consensus, benchmark_worker, and
+# scoring_lab import it directly), so changing it here moves the bar everywhere —
+# leader and followers stay on an identical rule.
+# 0.05 == 5%: a deliberate minimum-detectable-effect margin that sits well above
+# the observed run-to-run benchmark noise (~1% same-code spread measured on the
+# prod-shadow vote), so champions don't churn on noise. (Was 0.005 / 0.5% — which
+# the prose had mislabeled "5%".)
+DETHRONE_MARGIN = 0.05
 
 
 def _adoption_disabled() -> bool:
@@ -93,21 +99,6 @@ async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
     if proc.returncode != 0:
         return None
     return stdout.decode("utf-8", errors="replace").strip() or None
-
-
-def _stage3_disabled() -> bool:
-    """Whether the Stage 3 historical-regression gate is disabled.
-
-    Read at call time so operators can flip without restarting. The gate is now
-    OPT-IN: it defaults to DISABLED because it FAIL-CLOSES when a referenced chain
-    has no archive RPC, and it was accidentally dead for a long time (the
-    per_intent key bug), so reviving it on-by-default could suddenly block
-    adoptions on a leader that has order history but no archive RPC. Enable it
-    deliberately with ``STAGE3_DISABLED=0`` once archive RPCs are configured.
-    """
-    return os.environ.get("STAGE3_DISABLED", "1").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
 
 
 @dataclass
@@ -162,9 +153,7 @@ class EpochManager:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
         self._sub_store = submission_store
-        # App/order store for the Stage-3 historical-regression gate (order lookups).
-        # Was referenced but never assigned — defaults None so the gate degrades to
-        # "no candidates -> pass" rather than AttributeError when unwired.
+        # App/order store injected for app/order lookups (optional; may be None).
         self._app_store = app_store
         self._orchestrator = orchestrator
         self._round_store = round_store
@@ -173,6 +162,10 @@ class EpochManager:
         self._weights_emitter = weights_emitter
         self._weight_decay = weight_decay
         self._owner_hotkey = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+        # Chain-primary owner resolution: a wired chain source (MetagraphSync with
+        # resolve_subnet_owner()) takes precedence over the env/constructor owner.
+        self._owner_chain_source: Any = None
+        self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
@@ -284,23 +277,6 @@ class EpochManager:
         # Step 3: Re-score incumbent with current scenarios, then check margin
         await self._refresh_incumbent_score()
         if self._should_adopt(new_champion_sub):
-            # Stage 3: regression gate — block adoption if challenger fails
-            # scenarios where the incumbent still succeeds
-            if not await self._passes_regression_gate(new_champion_sub, scope_round_id):
-                logger.warning(
-                    "Challenger %s blocked by Stage 3 regression gate",
-                    new_champion_sub.submission_id,
-                )
-                next_round = self._complete_round(
-                    current_round,
-                    epoch,
-                    activated=False,
-                    abort_reason="regression_detected",
-                )
-                if next_round is not None:
-                    result["next_round_id"] = next_round.round_id
-                self._epoch_history.append(result)
-                return result
             try:
                 await self._hot_swap(new_champion_sub, epoch, round_id=scope_round_id)
                 result["champion_changed"] = True
@@ -431,25 +407,6 @@ class EpochManager:
             )
             result["status_after"] = RoundStatus.ABORTED.value
             result["abort_reason"] = "dethrone_margin_not_met"
-            if next_round is not None:
-                result["next_round_id"] = next_round.round_id
-            return result
-
-        # Stage 3: regression gate — block if challenger fails scenarios
-        # that the incumbent still handles correctly at the original block.
-        if not await self._passes_regression_gate(finalist, round_id):
-            logger.warning(
-                "Challenger %s blocked by Stage 3 regression gate (round %s)",
-                finalist.submission_id, round_id,
-            )
-            next_round = self._complete_round(
-                round_state,
-                epoch,
-                activated=False,
-                abort_reason="regression_detected",
-            )
-            result["status_after"] = RoundStatus.ABORTED.value
-            result["abort_reason"] = "regression_detected"
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
@@ -726,236 +683,6 @@ class EpochManager:
                 exc_info=True,
             )
 
-    async def _passes_regression_gate(
-        self,
-        challenger: Submission,
-        round_id: str | None,
-    ) -> bool:
-        """Stage 3 regression gate. Returns True to allow adoption.
-
-        Truth table (explicit so the audit doesn't have to re-derive it):
-
-          | candidates | archive ok | STAGE3_DISABLED | result | why |
-          |------------+------------+-----------------+--------+-----|
-          | -          | -          | 1               | True   | explicit skip |
-          | 0          | -          | 0               | True   | nothing to regress |
-          | >0         | yes        | 0               | T/F    | run the test |
-          | >0         | no         | 0               | False  | fail-closed on missing archive |
-
-        "archive ok" means every chain the candidates reference has an
-        archive RPC configured. We check all of them up front so we don't
-        waste work on one candidate only to fail on the next.
-        """
-        if _stage3_disabled():
-            logger.info("[stage3] disabled by STAGE3_DISABLED env — returning True")
-            return True
-
-        if not self._benchmark_worker:
-            # No benchmark worker → can't replay, fail-closed
-            return False
-        if not self._sub_store:
-            return False
-
-        incumbent_sub = self._sub_store.get(self._champion.submission_id) if self._champion.submission_id else None
-        if incumbent_sub is None or not incumbent_sub.image_tag:
-            # No incumbent to compare against → genesis case, skip
-            logger.info("[stage3] skipped: no incumbent Docker image available")
-            return True
-
-        if not challenger.image_tag:
-            logger.info("[stage3] skipped: challenger has no image_tag")
-            return True
-
-        # Find regression candidates from challenger's benchmark details.
-        # NB: the per-scenario list is stored under "per_intent" (see
-        # benchmark_worker._results_to_details); reading "results" here always
-        # yielded [] — the gate was silently dead. Fixed to "per_intent".
-        details = getattr(challenger, "benchmark_details", None) or {}
-        results = details.get("per_intent") or details.get("results") or []
-        candidates: list[dict] = []
-        for r in results:
-            intent_id = r.get("intent_id", "")
-            score = r.get("score", 0)
-            error = r.get("error")
-            # Only historical scenarios where challenger failed
-            if ":hist:" not in intent_id:
-                continue
-            if score > 0:
-                continue
-            # Extract order_id from intent_id format "app_xxx:hist:ord_yyy"
-            parts = intent_id.split(":hist:")
-            if len(parts) != 2:
-                continue
-            order_id = parts[1]
-            if self._app_store is None:
-                continue
-            order = self._app_store.get_order(order_id) if callable(
-                getattr(self._app_store, "get_order", None)
-            ) else None
-            if order is None:
-                continue
-            block_number = order.get("block_number")
-            chain_id = order.get("chain_id")
-            if block_number is None or chain_id is None:
-                continue
-            candidates.append({
-                "order_id": order_id,
-                "chain_id": chain_id,
-                "block_number": block_number,
-                "params": order.get("params", {}),
-                "app_id": order.get("app_id"),
-            })
-
-        if not candidates:
-            logger.info("Stage 3: no regression candidates (no failed historical orders)")
-            return True
-
-        max_checks = int(os.environ.get("STAGE3_MAX_REGRESSION_CHECKS", "5"))
-        candidates = candidates[:max_checks]
-
-        logger.info(
-            "[stage3] checking %d potential regression(s) for challenger %s",
-            len(candidates), challenger.submission_id,
-        )
-
-        from minotaur_subnet.harness.historical_fork import (
-            historical_anvil,
-            archive_rpc_available,
-            HistoricalForkError,
-        )
-
-        # Pre-flight: every chain the candidates reference must have an
-        # archive RPC. Checked up front so we fail-closed in one shot
-        # rather than mid-loop after partial work. Truth-table row:
-        #   enabled + missing-archive + have-candidates → False.
-        missing_chains = sorted({
-            cand["chain_id"] for cand in candidates
-            if not archive_rpc_available(cand["chain_id"])
-        })
-        if missing_chains:
-            logger.warning(
-                "[stage3] fail-closed: archive RPC missing for chain(s) %s "
-                "(set STAGE3_DISABLED=1 to skip this gate in dev only)",
-                missing_chains,
-            )
-            return False
-
-        # Build a score function once (reused across all candidates)
-        from minotaur_subnet.shared.types import IntentState
-        from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-
-        try:
-            # Use an empty intent list to initialize the JS engine,
-            # then we'll pass per-candidate intents to the scenario runner.
-            _proto_intents = self._benchmark_worker._load_benchmark_intents()
-            if not _proto_intents:
-                logger.info("[stage3] no active intents to build score_fn; skipping")
-                return True
-            score_fn = await self._benchmark_worker._build_score_fn(_proto_intents)
-        except Exception:
-            logger.warning("[stage3] failed to build score_fn — failing closed", exc_info=True)
-            return False
-
-        # Index app definitions for fast lookup
-        apps_by_id = {app.app_id: app for app in (self._app_store.list_apps() if self._app_store else [])}
-
-        regressions_detected = 0
-        for cand in candidates:
-            chain_id = cand["chain_id"]
-
-            app_def = apps_by_id.get(cand["app_id"])
-            if app_def is None:
-                logger.debug("Stage 3: app %s not found for order %s, skipping", cand["app_id"], cand["order_id"])
-                continue
-
-            deployment = self._app_store.get_deployment(cand["app_id"]) if self._app_store else None
-            contract_address = deployment.contract_address if deployment else ""
-
-            state = IntentState(
-                contract_address=contract_address,
-                chain_id=chain_id,
-                nonce=0,
-                owner="",
-                raw_params=dict(cand["params"] or {}),
-                control={
-                    "_intent_function": cand.get("intent_function", "swap"),
-                    "_scenario_name": f"regression:{cand['order_id']}",
-                    "_stage": "regression",
-                },
-            )
-            snapshot = build_synthetic_snapshot(chain_id)
-
-            try:
-                async with historical_anvil(chain_id, cand["block_number"]) as fork_rpc:
-                    overrides = {chain_id: fork_rpc}
-                    # Run challenger first
-                    challenger_result = await self._benchmark_worker._benchmark_one_scenario_with_rpc(
-                        image_tag=challenger.image_tag,
-                        intent=app_def,
-                        state=state,
-                        snapshot=snapshot,
-                        score_fn=score_fn,
-                        rpc_overrides=overrides,
-                    )
-                    # Only run incumbent if challenger failed — saves one
-                    # Docker startup per successful candidate
-                    if challenger_result.score > 0:
-                        logger.info(
-                            "Stage 3 PASS: challenger succeeded on %s (score=%.3f)",
-                            cand["order_id"], challenger_result.score,
-                        )
-                        continue
-
-                    incumbent_result = await self._benchmark_worker._benchmark_one_scenario_with_rpc(
-                        image_tag=incumbent_sub.image_tag,
-                        intent=app_def,
-                        state=state,
-                        snapshot=snapshot,
-                        score_fn=score_fn,
-                        rpc_overrides=overrides,
-                    )
-
-                    if incumbent_result.score > 0:
-                        regressions_detected += 1
-                        logger.warning(
-                            "Stage 3 REGRESSION: order=%s block=%d — "
-                            "incumbent score=%.3f, challenger score=%.3f (FAIL)",
-                            cand["order_id"], cand["block_number"],
-                            incumbent_result.score, challenger_result.score,
-                        )
-                    else:
-                        logger.info(
-                            "Stage 3 NEUTRAL: order=%s — both solvers failed "
-                            "(not a regression, likely market drift)",
-                            cand["order_id"],
-                        )
-            except HistoricalForkError as exc:
-                logger.warning(
-                    "Stage 3 fork failed for order %s: %s — failing closed",
-                    cand["order_id"], exc,
-                )
-                return False
-            except Exception:
-                logger.warning(
-                    "Stage 3 unexpected error for order %s — failing closed",
-                    cand["order_id"],
-                    exc_info=True,
-                )
-                return False
-
-        if regressions_detected > 0:
-            logger.warning(
-                "Stage 3: %d regression(s) detected — adoption blocked",
-                regressions_detected,
-            )
-            return False
-
-        logger.info(
-            "Stage 3: %d candidate(s) tested, no regressions",
-            len(candidates),
-        )
-        return True
-
     def _record_would_be_vote(self, challenger: Submission) -> None:
         """Publish this leader's INDEPENDENT would-be adopt vote (CHALLENGER_QUORUM_MODE).
 
@@ -999,12 +726,16 @@ class EpochManager:
     def _should_adopt(self, challenger: Submission) -> bool:
         """Check if the challenger should replace the current champion.
 
-        Enforces:
-        1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
-        2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-        3. Per-app non-regression: no champion-covered app may be dropped, and
+        Enforces (via the shared ``evaluate_adoption`` rule):
+        1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — absolute sanity floor.
+        2. Per-app non-regression: no champion-covered app may be dropped, and
            no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-        4. Global improvement over the champion by the dethrone margin (default 0.5%)
+        3. Global improvement over the champion by the dethrone margin (default 5%)
+
+        There is no absolute global-score floor — the global JS score is relative
+        to the champion reference, so the dethrone margin (beat the champion) is
+        the operative gate. The "user got their minimum outcome" 0.5 lives in the
+        separate per-order on-chain ``scoreIntent`` gate, not adoption.
         """
         # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
         # BEFORE the disable gate so the shadow tally sees it with adoption off.
@@ -1020,16 +751,6 @@ class EpochManager:
 
         challenger_score = challenger.benchmark_score or 0
         champion_score = self._champion.benchmark_score or 0
-
-        # 1. Global minimum — preserved here so the same-submission short-circuit and
-        #    the p2oc dispatch run in the original order (matches legacy behavior).
-        min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
-        if challenger_score < min_score:
-            logger.info(
-                "Challenger %s global score %.3f below minimum %.3f",
-                challenger.submission_id, challenger_score, min_score,
-            )
-            return False
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
@@ -1053,8 +774,7 @@ class EpochManager:
             self._log_shadow_determinism(challenger, challenger_scorecard, incumbent_scorecard)
 
         # Delegate the rule body to the pure, shared decision function so the leader
-        # and followers make the identical decision. (global-min is re-checked inside
-        # but already enforced above — same threshold, idempotent.)
+        # and followers make the identical decision.
         adopt, reason = evaluate_adoption(
             challenger_score=challenger_score,
             champion_score=champion_score,
@@ -1072,8 +792,8 @@ class EpochManager:
         ``adopt_rule._evaluate_onchain``. Ranks the dethrone on the unfakeable on-chain
         OUTPUT surplus (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the
         gas-polluted JS score. Kept as a method so direct callers (e.g.
-        ``_log_shadow_determinism``) and existing tests keep working; the shared
-        preamble in ``_should_adopt`` (global-min + same-submission) already ran.
+        ``_log_shadow_determinism``) and existing tests keep working; the
+        same-submission short-circuit in ``_should_adopt`` already ran.
         """
         adopt, reason = _evaluate_onchain(
             challenger_scorecard=self._get_scorecard(challenger),
@@ -1146,6 +866,8 @@ class EpochManager:
         epoch: int,
         *,
         round_id: str | None = None,
+        force: bool = False,
+        capture_previous: bool = True,
     ) -> None:
         """Load the winning submission and swap it into the block loop.
 
@@ -1153,10 +875,17 @@ class EpochManager:
         for BlockLoop. Otherwise, if orchestrator is available, starts a Docker
         session directly. If neither is configured, updates champion metadata
         only (solver stays the same).
+
+        ``force`` bypasses the DISABLE_CHAMPION_ADOPTION gate — used only by the
+        emergency revert path (rolling back to an already-vetted prior champion
+        is always safe). ``capture_previous`` records the displaced champion as
+        the rollback target; the revert path sets it False (an undo isn't a new
+        adoption and must not overwrite its own target).
         """
         # Belt-and-suspenders: even if some path reached activation, never swap
-        # the live champion while adoption is disabled.
-        if _adoption_disabled():
+        # the live champion while adoption is disabled — unless this is a forced
+        # revert to a previously-vetted champion.
+        if _adoption_disabled() and not force:
             logger.warning(
                 "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — refusing hot-swap to "
                 "%s; live champion solver unchanged.",
@@ -1236,6 +965,13 @@ class EpochManager:
         if self._sub_store is not None:
             self._sub_store.adopt(submission.submission_id)
         if self._round_store is not None:
+            # Record the champion we're displacing as the one-step rollback
+            # target — but only on a genuine change (not a restore / re-adopt of
+            # the same submission), and not when this swap is itself a revert.
+            if capture_previous:
+                outgoing = self._round_store.get_active_champion()
+                if outgoing.submission_id and outgoing.submission_id != submission.submission_id:
+                    self._round_store.set_previous_champion(outgoing)
             self._round_store.set_active_champion(
                 ChampionSnapshot(
                     submission_id=submission.submission_id,
@@ -1254,6 +990,96 @@ class EpochManager:
         if self._block_loop and new_runtime is not None:
             self._block_loop.set_solver(new_runtime)
 
+    async def revert_to_previous_champion(
+        self,
+        *,
+        epoch: int | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Emergency rollback: swap the live champion back to the PREVIOUS one.
+
+        A one-step undo of the most recent adoption — restores the champion that
+        was active immediately before the current one (NOT genesis). Intended as
+        a kill switch when a freshly-adopted champion misbehaves: set
+        ``DISABLE_CHAMPION_ADOPTION=1`` first to stop it being re-adopted, then
+        revert. The swap is forced (bypasses the adoption gate — reverting to an
+        already-vetted prior champion is always safe) and skips the
+        dethrone-margin / scoring path entirely.
+
+        Updates the live block-loop solver and the active-champion snapshot, so
+        the next weight emission routes to the restored champion. Leaves the
+        rollback target unchanged (reverting again is a no-op).
+
+        Raises ``ValueError`` if there is no previous champion recorded, it's
+        already active, or its submission can't be resolved from the store.
+        """
+        if self._round_store is None:
+            raise ValueError("revert unavailable: no round store configured")
+        previous = self._round_store.get_previous_champion()
+        if not previous.submission_id:
+            raise ValueError("no previous champion recorded to revert to")
+        if previous.submission_id == self._champion.submission_id:
+            raise ValueError(
+                f"previous champion {previous.submission_id} is already active "
+                "— nothing to revert"
+            )
+        submission = (
+            self._sub_store.get(previous.submission_id)
+            if self._sub_store is not None
+            else None
+        )
+        if submission is None:
+            raise ValueError(
+                f"previous champion submission {previous.submission_id} not found in store"
+            )
+
+        from_submission_id = self._champion.submission_id
+        target_epoch = epoch if epoch is not None else self._current_epoch
+        logger.warning(
+            "[revert] rolling champion back %s -> %s (epoch=%d): %s",
+            from_submission_id or "<none>",
+            previous.submission_id,
+            target_epoch,
+            reason or "manual revert",
+        )
+        await self._hot_swap(
+            submission,
+            target_epoch,
+            round_id=previous.activated_round_id,
+            force=True,
+            capture_previous=False,
+        )
+        return {
+            "reverted": True,
+            "from_submission_id": from_submission_id,
+            "to_submission_id": previous.submission_id,
+            "to_image_tag": submission.image_tag,
+            "epoch": target_epoch,
+            "reason": reason or "manual revert",
+        }
+
+    def set_owner_chain_source(self, source: Any) -> None:
+        """Wire a chain source (a MetagraphSync with resolve_subnet_owner()) so the
+        burn-target owner is resolved CHAIN-PRIMARY instead of env-only."""
+        self._owner_chain_source = source
+
+    def _resolve_owner_hotkey(self) -> str:
+        if self._resolved_owner:
+            return self._resolved_owner
+        owner = ""
+        src = self._owner_chain_source
+        if src is not None and hasattr(src, "resolve_subnet_owner"):
+            try:
+                owner = src.resolve_subnet_owner()
+            except Exception as exc:
+                logger.warning("Owner chain resolution failed (%s); using env owner", exc)
+                owner = ""
+        if not owner:
+            owner = self._owner_hotkey  # env/constructor fallback
+        if owner:
+            self._resolved_owner = owner  # cache a real value
+        return owner
+
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
 
@@ -1271,7 +1097,7 @@ class EpochManager:
         if not is_real_miner_hotkey(self._champion.hotkey):
             return build_bootstrap_or_champion_weights(
                 self._champion.hotkey,
-                owner_hotkey=self._owner_hotkey,
+                owner_hotkey=self._resolve_owner_hotkey(),
             )
 
         # Gather champion-eligible submissions from this epoch
@@ -1294,10 +1120,17 @@ class EpochManager:
             weight = self._weight_decay ** rank  # rank 0 = champion
             raw_weights[sub.hotkey] = weight
 
-        # Normalize to sum=1
+        # Normalize to sum=1, then apply the champion burn ramp so the miners
+        # collectively receive only CHAMPION_MINER_WEIGHT_FRACTION (0.05) and the
+        # rest burns to the owner — the same conservative cap the daemon's
+        # burn-fallback builder applies, so a freshly-adopted champion's share is
+        # bounded however its weights were built.
         total = sum(raw_weights.values())
         if total > 0:
-            return {k: v / total for k, v in raw_weights.items()}
+            normalized = {k: v / total for k, v in raw_weights.items()}
+            return apply_champion_burn_ramp(
+                normalized, owner_hotkey=self._resolve_owner_hotkey(),
+            )
         return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:

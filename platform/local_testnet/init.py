@@ -449,6 +449,9 @@ def write_config(addresses: dict[str, str], bt_ok: bool) -> None:
     # BT EVM validator registry + app contract
     if "REGISTRY_ADDRESS_BTEVM" in addresses:
         lines.append(f"VALIDATOR_REGISTRY_964={addresses['REGISTRY_ADDRESS_BTEVM']}")
+    if "CHAMPION_REGISTRY_ADDRESS_BTEVM" in addresses:
+        lines.append(f"CHAMPION_REGISTRY_964={addresses['CHAMPION_REGISTRY_ADDRESS_BTEVM']}")
+        lines.append("CHAMPION_CONSENSUS_CHAIN_ID=964")
     if "DEX_AGGREGATOR_ADDRESS_BTEVM" in addresses:
         lines.append(f"APP_INTENT_BASE_964={addresses['DEX_AGGREGATOR_ADDRESS_BTEVM']}")
 

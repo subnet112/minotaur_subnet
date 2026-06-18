@@ -179,15 +179,6 @@ class SolverRunner:
         result = self.solver.quote(intent, state, snapshot)
         return asdict(result) if result is not None else {}
 
-    def _handle_supported_tokens(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        chain_id = int(params["chain_id"])
-        # Optional on the solver — return empty list if not implemented so
-        # the host can surface a clean 501 instead of a hard failure.
-        fn = getattr(self.solver, "supported_tokens", None)
-        if fn is None:
-            return []
-        return list(fn(chain_id) or [])
-
     def _handle_shutdown(self, params: dict[str, Any]) -> None:
         self._running = False
         return None
@@ -199,7 +190,6 @@ class SolverRunner:
         Command.GENERATE_PLAN: _handle_generate_plan,
         Command.CHECK_TRIGGER: _handle_check_trigger,
         Command.QUOTE: _handle_quote,
-        Command.SUPPORTED_TOKENS: _handle_supported_tokens,
         Command.ON_BENCHMARK_START: _handle_on_benchmark_start,
         Command.ON_BENCHMARK_END: _handle_on_benchmark_end,
         Command.SERIALIZE_STATE: _handle_serialize_state,

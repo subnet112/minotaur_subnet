@@ -10,14 +10,24 @@ adoption-disabled / same-submission / shadow preamble (those stay in
 ``EpochManager`` because they touch instance state / logging side effects). It
 reads the same environment knobs at call time:
 
-    MIN_CHAMPION_SCORE   (default 0.5)  global score floor
     PER_APP_MIN_SCORE    (default 0.3)  per-app score floor (current rule)
     MAX_APP_REGRESSION   (default 0.10) per-app non-regression / catastrophe veto
-    ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (p2oc rule)
+    ONCHAIN_MAX_REGRESSION (default MAX_APP_REGRESSION, else 0.10)
+                                         on-chain HARD-VETO non-regression band
+    ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (both rules)
     ADOPT_RULE           (current|p2oc) dispatch between the two rules
 
 It returns ``(adopt, reason)`` where ``reason`` is a human-readable string in
 every branch (for logging by the caller).
+
+The current (default) rule keeps the JS score as the RANKING signal but adds an
+unfakeable on-chain HARD VETO (``_evaluate_onchain_gate``): a challenger whose
+benchmark plans revert / run on a fabricated mock (on-chain score None) or
+regress vs the champion's on-chain ``scoreIntent`` cannot be adopted on JS score
+alone. The veto runs only when there IS a champion (after the genesis early
+return) and only in the current branch (p2oc has its own on-chain ranking). It
+is symmetric across leader + followers because they all route through this one
+pure function.
 """
 
 from __future__ import annotations
@@ -44,6 +54,47 @@ def _app_onchain_mean(scores: list) -> "float | None":
     return (sum(present) / len(present)) if present else None
 
 
+def _evaluate_onchain_gate(
+    *,
+    challenger_scorecard: dict | None,
+    champion_scorecard: dict | None,
+    onchain_regression: float,
+    floor: "int | None",
+) -> tuple[bool, "str | None"]:
+    """On-chain HARD GATE for the current rule: for every app where the CHAMPION
+    produced a present (non-None) on-chain mean, the challenger must also produce a
+    valid on-chain score that doesn't regress beyond ``onchain_regression``. Apps
+    with no on-chain signal for the champion are skipped (not every app swaps). This
+    is a VETO, not a re-ranking — JS still ranks. None AND 0 both fail (None = no
+    valid execution; 0 = below the champion's by the no-regression band)."""
+    champ_card = champion_scorecard or {}
+    chal_card = challenger_scorecard or {}
+    champ_oc = champ_card.get("app_onchain", {})
+    chal_oc = chal_card.get("app_onchain", {})
+    for app_id in champ_card.get("app_scores", {}).keys():
+        champ_mean = _app_onchain_mean(champ_oc.get(app_id, []))
+        if champ_mean is None:
+            continue  # champion has no on-chain signal for this app -> not gated
+        cco = _app_onchain_mean(chal_oc.get(app_id, []))
+        if cco is None:
+            return False, f"Challenger produced no valid on-chain score for {app_id} (champion did)"
+        # partial-revert guard: champion all-present but challenger has any missing scenario
+        _, _, champ_missing = _onchain_pass(champ_oc.get(app_id, []), 0)
+        _, _, chal_missing = _onchain_pass(chal_oc.get(app_id, []), 0)
+        if champ_missing == 0 and chal_missing > 0:
+            return False, f"Partial on-chain revert on {app_id} (champion fully executed)"
+        if champ_mean > 0 and cco < champ_mean * (1 - onchain_regression):
+            return False, (
+                f"Challenger on-chain regresses on {app_id}: "
+                f"{champ_mean:.0f} -> {cco:.0f} BPS (max drop {onchain_regression*100:.0f}%)"
+            )
+        if floor is not None:
+            all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app_id, []), floor)
+            if not all_pass:
+                return False, f"Challenger on-chain floor fail on {app_id} (min={min_bps} missing={n_missing})"
+    return True, None
+
+
 def _evaluate_onchain(
     *,
     challenger_scorecard: dict | None,
@@ -56,10 +107,23 @@ def _evaluate_onchain(
     (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the gas-polluted JS
     score, so a more-output-but-more-gas challenger (which the JS path rejects) is
     adoptable, while a gas-gaming challenger that delivers less is not. Keeps the
-    vetoes: on-chain admission floor (ONCHAIN_FLOOR_BPS), app-coverage drop, and a
-    JS no-catastrophic-regression guard (MAX_APP_REGRESSION). The shared preamble in
-    ``_should_adopt`` (global-min + same-submission) already ran.
+    vetoes: per-app sanity floor (PER_APP_MIN_SCORE), on-chain admission floor
+    (ONCHAIN_FLOOR_BPS), app-coverage drop, and a JS no-catastrophic-regression
+    guard (MAX_APP_REGRESSION). The same-submission short-circuit in
+    ``_should_adopt`` already ran (the absolute global-min floor was removed —
+    adoption is governed by the dethrone margin + the per-app floor, not an
+    absolute global number).
     """
+    # Per-app sanity floor — applies to the genesis (no-champion) case too, so a
+    # garbage first champion can't self-adopt under p2oc (mirrors the current rule).
+    per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
+    for app_id, app_score in (challenger_scorecard or {}).get("app_scores", {}).items():
+        if app_score < per_app_min:
+            return False, (
+                f"Challenger app {app_id} score {app_score:.3f} below "
+                f"per-app minimum {per_app_min:.3f}"
+            )
+
     if not has_champion:
         return True, "p2oc adopt: no champion yet (genesis)"  # no champion yet (genesis)
 
@@ -122,30 +186,35 @@ def evaluate_adoption(
 
     Mirrors ``EpochManager._should_adopt``'s rule body EXACTLY — everything
     AFTER the adoption-disabled / same-submission / shadow preamble (those stay
-    in ``EpochManager``). Reads the same env knobs (``MIN_CHAMPION_SCORE``,
-    ``PER_APP_MIN_SCORE``, ``MAX_APP_REGRESSION``, ``ONCHAIN_FLOOR_BPS``,
-    ``ADOPT_RULE``). Dispatches ``ADOPT_RULE=p2oc`` to the on-chain-surplus
-    variant internally.
+    in ``EpochManager``). Reads the same env knobs (``PER_APP_MIN_SCORE``,
+    ``MAX_APP_REGRESSION``, ``ONCHAIN_FLOOR_BPS``, ``ADOPT_RULE``). Dispatches
+    ``ADOPT_RULE=p2oc`` to the on-chain-surplus variant internally.
 
     Enforces (default "current" rule):
-    1. Global minimum score (MIN_CHAMPION_SCORE, default 0.5)
-    2. Per-app minimum (PER_APP_MIN_SCORE, default 0.3)
-    3. Per-app non-regression: no champion-covered app may be dropped, and
+    1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — the absolute sanity floor.
+    2. Per-app non-regression: no champion-covered app may be dropped, and
        no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-    4. Global improvement over the champion by the dethrone margin (default 0.5%)
+    3. On-chain HARD VETO: for every app the champion scores on-chain, the
+       challenger's plans must validly EXECUTE on-chain (not revert / mock ->
+       None) and not regress beyond ONCHAIN_MAX_REGRESSION. A mock-simulation
+       scorecard is rejected outright. JS still ranks; this only vetoes. Runs
+       only with a champion (after the genesis early return) and only in this
+       (non-p2oc) branch, so it is symmetric across leader + followers.
+    4. Global improvement over the champion by the dethrone margin (default 5%)
+
+    There is intentionally NO absolute global-score floor: the global JS score is
+    a RELATIVE measure (anchored on the champion reference, ~0.5 == "matches the
+    reference"), so an absolute floor on it is meaningless and was mis-calibrated
+    above the achievable ceiling — it blocked every adoption. The meaningful
+    absolute floor lives per-order in the on-chain ``scoreIntent`` gate
+    (``on_chain_threshold``: "the user got at least their minimum outcome"), which
+    is a separate, per-execution check — not an adoption criterion.
 
     ``has_champion`` is True iff there is a current champion submission_id
     (i.e. ``bool(self._champion.submission_id)``).
     """
-    min_score = float(os.environ.get("MIN_CHAMPION_SCORE", "0.5"))
     per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
     max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
-
-    # 1. Global minimum
-    if challenger_score < min_score:
-        return False, (
-            f"Challenger global score {challenger_score:.3f} below minimum {min_score:.3f}"
-        )
 
     # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
     # JS logic below, byte-for-byte unchanged. ADOPT_RULE=p2oc ranks the dethrone on
@@ -158,6 +227,14 @@ def evaluate_adoption(
             dethrone_margin=dethrone_margin,
             has_champion=has_champion,
         )
+
+    # Belt-and-suspenders: a challenger benchmarked on the fabricated mock
+    # simulator (require_real_sim off + no Anvil) has unfakeable on-chain scores
+    # that mean nothing — refuse it outright in the current rule. run_benchmark
+    # already fails closed when require_real_sim is set; this catches the case
+    # where a mock slipped through and the scorecard recorded it.
+    if (challenger_scorecard or {}).get("mock_simulation_count", 0) > 0:
+        return False, "Challenger benchmarked on a fabricated mock simulation"
 
     # 2. Per-app minimum — every app must be above floor
     if challenger_scorecard:
@@ -195,11 +272,28 @@ def evaluate_adoption(
                     f"(max drop {max_regression * 100:.0f}%)"
                 )
 
-    # 4. Global improvement over the champion's actual (freshly
-    #    re-benchmarked) score by the dethrone margin. The absolute
-    #    MIN_CHAMPION_SCORE floor is already enforced in step 1, so the
-    #    baseline must NOT be floored at min_score here — flooring only
-    #    over-protects a degraded (sub-floor) champion (design doc, §a #6).
+    # On-chain HARD GATE: the challenger's plans must validly EXECUTE on-chain (not
+    # revert / mock) and not regress vs the champion, for apps the champion scores
+    # on-chain. Keeps JS as the ranking signal; this only vetoes.
+    onchain_regression = float(
+        os.environ.get("ONCHAIN_MAX_REGRESSION", os.environ.get("MAX_APP_REGRESSION", "0.10"))
+    )
+    _floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
+    onchain_floor = int(_floor_env) if _floor_env else None
+    oc_ok, oc_reason = _evaluate_onchain_gate(
+        challenger_scorecard=challenger_scorecard,
+        champion_scorecard=champion_scorecard,
+        onchain_regression=onchain_regression,
+        floor=onchain_floor,
+    )
+    if not oc_ok:
+        return False, oc_reason
+
+    # 3. Global improvement over the champion's actual (freshly re-benchmarked)
+    #    score by the dethrone margin. This is the operative gate: the challenger
+    #    must beat the current champion by the margin — the champion score is the
+    #    moving baseline (NOT floored), so a genuinely-better challenger adopts
+    #    even when both sit below any absolute number.
     required = champion_score * (1 + dethrone_margin)
     if challenger_score <= champion_score:
         return False, (
