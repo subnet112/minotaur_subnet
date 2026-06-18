@@ -693,7 +693,7 @@ async def close_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Explicitly close the current solver round for replay evaluation."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     closed = _close_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/close",
@@ -708,7 +708,7 @@ async def certify_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a champion certificate for a replay-qualified finalist."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     # Close the explicit-certify bypass: this public (operator) endpoint must not
     # silently certify an ARBITRARY candidate that never won the round's adoption
     # rule. Allow only the round's rule-selected finalist, a genesis/builtin
@@ -1009,7 +1009,7 @@ async def activate_solver_round(
     request: Request,
 ) -> dict[str, Any]:
     """Activate a previously certified round at an explicit epoch."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     try:
         result = await _activate_solver_round_state(body)
     except KeyError as exc:
@@ -1029,7 +1029,7 @@ async def abort_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Abort a solver round without activating a challenger."""
-    _require_submission_api_key(request)
+    _require_internal_round_api_key(request)
     aborted = _abort_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/abort",

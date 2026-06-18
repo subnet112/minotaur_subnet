@@ -22,7 +22,7 @@ class _Req:  # minimal stand-in for fastapi Request (auth is monkeypatched off)
 
 
 async def _call(monkeypatch, *, candidate, finalist, subs, force=False):
-    monkeypatch.setattr(R, "_require_submission_api_key", lambda req: None)
+    monkeypatch.setattr(R, "_require_internal_round_api_key", lambda req: None)
     monkeypatch.setattr(
         R, "get_round_store",
         lambda: SimpleNamespace(
