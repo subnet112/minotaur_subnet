@@ -339,6 +339,11 @@ services:
     ports:
       - "${HOST_API_PEER_1_PORT:-8081}:8080"
     environment:
+      # Follower reactive-benchmark / independent-vote runs here too, so it must
+      # see the SAME real-sim default as the leader `api` (orchestrator
+      # require_real_sim_default keys off LOCAL_TESTNET — keep it symmetric).
+      LOCAL_TESTNET: "1"
+
       ANVIL_RPC_URL: http://anvil:8545
       BASE_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
@@ -426,6 +431,11 @@ services:
     ports:
       - "${HOST_API_PEER_2_PORT:-8082}:8080"
     environment:
+      # Follower reactive-benchmark / independent-vote runs here too, so it must
+      # see the SAME real-sim default as the leader `api` (orchestrator
+      # require_real_sim_default keys off LOCAL_TESTNET — keep it symmetric).
+      LOCAL_TESTNET: "1"
+
       ANVIL_RPC_URL: http://anvil:8545
       BASE_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_RPC_URL: http://anvil-btevm:8547
