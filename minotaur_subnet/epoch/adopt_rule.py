@@ -12,11 +12,22 @@ reads the same environment knobs at call time:
 
     PER_APP_MIN_SCORE    (default 0.3)  per-app score floor (current rule)
     MAX_APP_REGRESSION   (default 0.10) per-app non-regression / catastrophe veto
-    ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (p2oc rule)
+    ONCHAIN_MAX_REGRESSION (default MAX_APP_REGRESSION, else 0.10)
+                                         on-chain HARD-VETO non-regression band
+    ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (both rules)
     ADOPT_RULE           (current|p2oc) dispatch between the two rules
 
 It returns ``(adopt, reason)`` where ``reason`` is a human-readable string in
 every branch (for logging by the caller).
+
+The current (default) rule keeps the JS score as the RANKING signal but adds an
+unfakeable on-chain HARD VETO (``_evaluate_onchain_gate``): a challenger whose
+benchmark plans revert / run on a fabricated mock (on-chain score None) or
+regress vs the champion's on-chain ``scoreIntent`` cannot be adopted on JS score
+alone. The veto runs only when there IS a champion (after the genesis early
+return) and only in the current branch (p2oc has its own on-chain ranking). It
+is symmetric across leader + followers because they all route through this one
+pure function.
 """
 
 from __future__ import annotations
@@ -41,6 +52,47 @@ def _app_onchain_mean(scores: list) -> "float | None":
     output-quality signal, independent of the gas-weighted JS score."""
     present = [s for s in scores if s is not None]
     return (sum(present) / len(present)) if present else None
+
+
+def _evaluate_onchain_gate(
+    *,
+    challenger_scorecard: dict | None,
+    champion_scorecard: dict | None,
+    onchain_regression: float,
+    floor: "int | None",
+) -> tuple[bool, "str | None"]:
+    """On-chain HARD GATE for the current rule: for every app where the CHAMPION
+    produced a present (non-None) on-chain mean, the challenger must also produce a
+    valid on-chain score that doesn't regress beyond ``onchain_regression``. Apps
+    with no on-chain signal for the champion are skipped (not every app swaps). This
+    is a VETO, not a re-ranking — JS still ranks. None AND 0 both fail (None = no
+    valid execution; 0 = below the champion's by the no-regression band)."""
+    champ_card = champion_scorecard or {}
+    chal_card = challenger_scorecard or {}
+    champ_oc = champ_card.get("app_onchain", {})
+    chal_oc = chal_card.get("app_onchain", {})
+    for app_id in champ_card.get("app_scores", {}).keys():
+        champ_mean = _app_onchain_mean(champ_oc.get(app_id, []))
+        if champ_mean is None:
+            continue  # champion has no on-chain signal for this app -> not gated
+        cco = _app_onchain_mean(chal_oc.get(app_id, []))
+        if cco is None:
+            return False, f"Challenger produced no valid on-chain score for {app_id} (champion did)"
+        # partial-revert guard: champion all-present but challenger has any missing scenario
+        _, _, champ_missing = _onchain_pass(champ_oc.get(app_id, []), 0)
+        _, _, chal_missing = _onchain_pass(chal_oc.get(app_id, []), 0)
+        if champ_missing == 0 and chal_missing > 0:
+            return False, f"Partial on-chain revert on {app_id} (champion fully executed)"
+        if champ_mean > 0 and cco < champ_mean * (1 - onchain_regression):
+            return False, (
+                f"Challenger on-chain regresses on {app_id}: "
+                f"{champ_mean:.0f} -> {cco:.0f} BPS (max drop {onchain_regression*100:.0f}%)"
+            )
+        if floor is not None:
+            all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app_id, []), floor)
+            if not all_pass:
+                return False, f"Challenger on-chain floor fail on {app_id} (min={min_bps} missing={n_missing})"
+    return True, None
 
 
 def _evaluate_onchain(
@@ -142,7 +194,13 @@ def evaluate_adoption(
     1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — the absolute sanity floor.
     2. Per-app non-regression: no champion-covered app may be dropped, and
        no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-    3. Global improvement over the champion by the dethrone margin (default 5%)
+    3. On-chain HARD VETO: for every app the champion scores on-chain, the
+       challenger's plans must validly EXECUTE on-chain (not revert / mock ->
+       None) and not regress beyond ONCHAIN_MAX_REGRESSION. A mock-simulation
+       scorecard is rejected outright. JS still ranks; this only vetoes. Runs
+       only with a champion (after the genesis early return) and only in this
+       (non-p2oc) branch, so it is symmetric across leader + followers.
+    4. Global improvement over the champion by the dethrone margin (default 5%)
 
     There is intentionally NO absolute global-score floor: the global JS score is
     a RELATIVE measure (anchored on the champion reference, ~0.5 == "matches the
@@ -169,6 +227,14 @@ def evaluate_adoption(
             dethrone_margin=dethrone_margin,
             has_champion=has_champion,
         )
+
+    # Belt-and-suspenders: a challenger benchmarked on the fabricated mock
+    # simulator (require_real_sim off + no Anvil) has unfakeable on-chain scores
+    # that mean nothing — refuse it outright in the current rule. run_benchmark
+    # already fails closed when require_real_sim is set; this catches the case
+    # where a mock slipped through and the scorecard recorded it.
+    if (challenger_scorecard or {}).get("mock_simulation_count", 0) > 0:
+        return False, "Challenger benchmarked on a fabricated mock simulation"
 
     # 2. Per-app minimum — every app must be above floor
     if challenger_scorecard:
@@ -205,6 +271,23 @@ def evaluate_adoption(
                     f"Challenger regresses on {app_id}: {inc_score:.3f} -> {ch_score:.3f} "
                     f"(max drop {max_regression * 100:.0f}%)"
                 )
+
+    # On-chain HARD GATE: the challenger's plans must validly EXECUTE on-chain (not
+    # revert / mock) and not regress vs the champion, for apps the champion scores
+    # on-chain. Keeps JS as the ranking signal; this only vetoes.
+    onchain_regression = float(
+        os.environ.get("ONCHAIN_MAX_REGRESSION", os.environ.get("MAX_APP_REGRESSION", "0.10"))
+    )
+    _floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
+    onchain_floor = int(_floor_env) if _floor_env else None
+    oc_ok, oc_reason = _evaluate_onchain_gate(
+        challenger_scorecard=challenger_scorecard,
+        champion_scorecard=champion_scorecard,
+        onchain_regression=onchain_regression,
+        floor=onchain_floor,
+    )
+    if not oc_ok:
+        return False, oc_reason
 
     # 3. Global improvement over the champion's actual (freshly re-benchmarked)
     #    score by the dethrone margin. This is the operative gate: the challenger
