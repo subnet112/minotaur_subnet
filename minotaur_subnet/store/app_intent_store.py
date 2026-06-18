@@ -322,6 +322,9 @@ class AppIntentStore:
                     execution_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS token_lists(
+                    chain_id INTEGER PRIMARY KEY, updated_at REAL NOT NULL,
+                    data TEXT NOT NULL);
                 """
             )
 
@@ -841,3 +844,35 @@ class AppIntentStore:
             "last_quote_at": qs.get("last_quote_at", 0.0),
             "recent_errors": qs.get("recent_errors", []),
         }
+
+    # ── Solver token lists (per chain) ──────────────────────────────────────
+    # Persisted so the public token-list endpoint serves instantly across
+    # restarts/champion swaps while a background task refreshes it off the
+    # request path (token discovery is a slow on-chain scan; see TokenListCache).
+
+    def save_token_list(
+        self, chain_id: int, tokens: list[dict[str, Any]], updated_at: float | None = None,
+    ) -> None:
+        """Upsert the solver's supported-token list for a chain."""
+        ts = time.time() if updated_at is None else float(updated_at)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO token_lists(chain_id, updated_at, data) VALUES(?, ?, ?) "
+                "ON CONFLICT(chain_id) DO UPDATE SET "
+                "updated_at=excluded.updated_at, data=excluded.data",
+                (int(chain_id), ts, json.dumps(list(tokens or []))),
+            )
+
+    def get_token_list(self, chain_id: int) -> tuple[float, list[dict[str, Any]]] | None:
+        """Return (updated_at, tokens) for a chain, or None if never cached."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT updated_at, data FROM token_lists WHERE chain_id=?",
+                (int(chain_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return float(row["updated_at"]), json.loads(row["data"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None

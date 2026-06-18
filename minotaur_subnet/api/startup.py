@@ -848,6 +848,8 @@ async def initialize(ctx: ServerContext) -> dict:
     ctx.solver_round_metagraph_task = None
     ctx.solver_round_role_task = None
     ctx.solver_round_role = "standalone"
+    ctx.token_cache = None
+    ctx.token_cache_task = None
     ctx.solver_round_epoch_clock = SolverRoundEpochClock.from_env()
     submissions.set_solver_round_epoch_provider(
         lambda: _current_solver_round_epoch(ctx),
@@ -1636,34 +1638,26 @@ async def initialize(ctx: ServerContext) -> dict:
             ctx.block_loop.set_peer_network(order_peer_network)
         orders.set_block_loop(ctx.block_loop)
         chains.set_block_loop(ctx.block_loop)
+        # Let the token-list endpoint serve from the persisted cache.
+        chains.set_store(ctx.store)
 
-        # Token cache warm-up. DockerRuntimeSolver.supported_tokens is an
-        # async coroutine; sync solvers expose it as a regular function.
-        # Route each appropriately — previously we unconditionally wrapped
-        # in asyncio.to_thread which produced an unawaited coroutine and
-        # an ``object of type 'coroutine' has no len()'' warning.
-        #
-        # Note: this is redundant with the genesis-solver _prewarm_tokens
-        # task earlier, which already warms the DockerRuntimeSolver cache.
-        # Kept for sync-solver support and as a defensive re-warm.
+        # Persistent, background-refreshed token-list cache. Token discovery is
+        # a slow on-chain scan (factory pool enumeration + per-token symbol/
+        # decimals RPC, ~minute cold), so we keep it OFF the request path: this
+        # task refreshes per chain on a timer and persists to the store, and the
+        # /v1/chains/{id}/tokens endpoint serves the last persisted list
+        # instantly (survives api restarts + champion swaps). Replaces the old
+        # one-shot in-memory warm-up, which went stale after its 5-min TTL and
+        # forced a cold recompute on the next user reload.
         if ctx.block_loop.solver and hasattr(ctx.block_loop.solver, "supported_tokens"):
-            _supported_tokens = ctx.block_loop.solver.supported_tokens
-            _is_async = asyncio.iscoroutinefunction(_supported_tokens)
-
-            async def _warm_token_cache() -> None:
-                for cid in chain_ids:
-                    try:
-                        if _is_async:
-                            tokens = await _supported_tokens(cid)
-                        else:
-                            tokens = await asyncio.to_thread(_supported_tokens, cid)
-                        logger.info(
-                            "Token cache warmed for chain %d: %d tokens",
-                            cid, len(tokens),
-                        )
-                    except Exception as exc:
-                        logger.warning("Token cache warm failed for chain %d: %s", cid, exc)
-            asyncio.create_task(_warm_token_cache())
+            from minotaur_subnet.api.token_cache import TokenListCache
+            _token_refresh = float(
+                os.environ.get("TOKEN_LIST_REFRESH_SECONDS", "300") or "300"
+            )
+            ctx.token_cache = TokenListCache(
+                ctx.store, ctx.block_loop, chain_ids, refresh_interval=_token_refresh,
+            )
+            ctx.token_cache_task = asyncio.create_task(ctx.token_cache.start())
 
         # ── solver round coordinator ─────────────────────────────────────
         # Champion consensus init is DECOUPLED from the benchmark worker.
@@ -2548,6 +2542,15 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
                     await maybe_awaitable
             except Exception:
                 logger.warning("Solver shutdown during API teardown failed", exc_info=True)
+
+    if getattr(ctx, "token_cache", None) is not None:
+        await ctx.token_cache.stop()
+    if getattr(ctx, "token_cache_task", None) is not None:
+        ctx.token_cache_task.cancel()
+        try:
+            await ctx.token_cache_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     if ctx.benchmark_worker is not None:
         ctx.benchmark_worker.stop()
