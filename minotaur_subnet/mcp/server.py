@@ -882,26 +882,6 @@ def execute_bittensor_stake(
     return _post("/native-bittensor/stake", body)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#                       CHAIN TOKEN DISCOVERY
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@server.tool(
-    name="get_chain_tokens",
-    description=(
-        "List tokens available on a chain as discovered by the active solver. "
-        "Returns token addresses, symbols, decimals, and pool count."
-    ),
-)
-def get_chain_tokens(chain_id: int) -> dict:
-    """List tokens available on a chain.
-
-    Args:
-        chain_id: The chain ID to list tokens for.
-    """
-    return _get(f"/chains/{chain_id}/tokens")
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                             ENTRY POINT
