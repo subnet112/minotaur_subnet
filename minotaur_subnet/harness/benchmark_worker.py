@@ -45,6 +45,7 @@ from minotaur_subnet.harness.orchestrator import (
     run_benchmark,
     REFERENCE_QUOTE_FAILED_SENTINEL,
     BENCHMARK_MIN_SLIPPAGE_BPS,
+    build_rpc_url_map,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
@@ -1242,9 +1243,25 @@ class BenchmarkWorker:
             )
             return {}
         try:
-            await session.initialize(
-                {"chain_ids": list({s.chain_id for _, s, _ in intents} or {1})}
-            )
+            chain_ids = list({s.chain_id for _, s, _ in intents} or {1})
+            rpc_map = build_rpc_url_map(chain_ids)
+            missing_rpc = [c for c in chain_ids if c not in rpc_map]
+            if missing_rpc:
+                # Fail loud, not silent: without a live RPC the champion quotes
+                # against an INCOMPLETE snapshot (missing pools → false "No route"
+                # → false blind spots → corrupt reference quotes that EVERY
+                # challenger is then graded against). Refuse rather than build the
+                # network's scoring bar on degraded data.
+                raise RuntimeError(
+                    f"Reference-quote pre-pass: no benchmark RPC for chain(s) "
+                    f"{missing_rpc} — refusing to build champion reference quotes "
+                    f"on snapshot fallback (incomplete pools). Set "
+                    f"BENCHMARK_ANVIL_RPC_* / *_SIM_RPC_URL / *_RPC_URL."
+                )
+            await session.initialize({
+                "chain_ids": chain_ids,
+                "rpc_urls": {str(k): v for k, v in rpc_map.items()},
+            })
             for intent, state, snapshot in intents:
                 intent_function = state.control_view().get("_intent_function", "swap")
                 # Same manifest-driven gate as run_benchmark's enrichment.
