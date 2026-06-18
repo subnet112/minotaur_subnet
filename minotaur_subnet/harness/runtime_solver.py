@@ -123,11 +123,6 @@ class DockerRuntimeSolver:
         self._metadata = metadata
         self._lock = asyncio.Lock()
         self._closed = False
-        # Per-chain cache for supported_tokens so the token list endpoint
-        # doesn't round-trip through the Docker pipe on every frontend
-        # refresh. TTL matches the solver-side cache (5 min).
-        self._token_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
-        self._token_cache_ttl = 300.0
         # Best-effort cleanup on ungraceful shutdown (sys.exit, SIGTERM
         # caught by the Python runtime). SIGKILL will bypass this — the
         # next api boot reaps orphans via _reap_orphan_live_solvers().
@@ -430,32 +425,6 @@ class DockerRuntimeSolver:
             "quote",
             lambda: self._session.quote(intent, state, snapshot),
         )
-
-    async def supported_tokens(self, chain_id: int) -> list[dict[str, Any]]:
-        """Forward token discovery to the solver session with a small TTL cache.
-
-        Frontend hits `/v1/chains/{chain_id}/tokens` on every wallet tab
-        open, so caching here avoids waking the solver for every refresh.
-        An empty list (no discovery yet) is NOT cached — we want the first
-        successful discovery to displace it.
-
-        Crash-resilient via the same respawn-and-retry path as quote/generate_plan.
-        """
-        if self._closed:
-            raise RuntimeError("Champion runtime solver is closed")
-
-        now = time.time()
-        cached = self._token_cache.get(chain_id)
-        if cached and cached[1] and now - cached[0] < self._token_cache_ttl:
-            return cached[1]
-
-        tokens = await self._call_with_respawn(
-            "supported_tokens",
-            lambda: self._session.supported_tokens(chain_id),
-        )
-        if tokens:
-            self._token_cache[chain_id] = (now, tokens)
-        return tokens
 
     def metadata(self) -> SolverMetadata:
         """Return cached metadata for BlockLoop logging."""

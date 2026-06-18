@@ -63,7 +63,6 @@ from minotaur_subnet.harness.protocol import (
     make_metadata_request,
     make_shutdown_request,
     make_quote_request,
-    make_supported_tokens_request,
     parse_plan_response,
     parse_quote_response,
 )
@@ -225,20 +224,6 @@ class SolverSession:
             )
             return None
         return parse_quote_response(resp)
-
-    async def supported_tokens(self, chain_id: int) -> list[dict[str, Any]]:
-        """Send supported_tokens and return the list of discovered tokens."""
-        resp = await self._send(make_supported_tokens_request(chain_id))
-        if not resp.success:
-            logger.warning(
-                "[%s] supported_tokens failed for chain %d: %s",
-                self._label, chain_id, resp.error,
-            )
-            return []
-        result = resp.result
-        if not isinstance(result, list):
-            return []
-        return result
 
     async def check_trigger(
         self,
