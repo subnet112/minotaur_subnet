@@ -982,10 +982,8 @@ async def initialize(ctx: ServerContext) -> dict:
 
         poll_interval = float(os.environ.get("BENCHMARK_POLL_INTERVAL", "30"))
         _genesis_solver_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip() or None
-        _require_real_sim = (
-            os.environ.get("BENCHMARK_REQUIRE_REAL_SIM", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        from minotaur_subnet.harness.orchestrator import require_real_sim_default
+        _require_real_sim = require_real_sim_default()
         ctx.benchmark_worker = BenchmarkWorker(
             submission_store=sub_store,
             app_store=ctx.store,
