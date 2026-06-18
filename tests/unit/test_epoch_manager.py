@@ -922,6 +922,75 @@ class TestWeightEmission:
         assert result["champion_changed"] is True  # Champion still adopted
 
 
+# ── Owner Resolution (chain-primary) Tests ───────────────────────────────────
+
+
+class TestEpochManagerOwnerResolution:
+    """The burn-target subnet owner is resolved CHAIN-PRIMARY when a chain source
+    is wired, with the env/constructor owner only as a fallback."""
+
+    def test_chain_source_is_primary_and_cached(self):
+        """A wired chain source's resolve_subnet_owner() wins over the env owner,
+        and the resolved value is cached (no repeat chain queries)."""
+        source = MagicMock()
+        source.resolve_subnet_owner = MagicMock(return_value="5Gchain")
+
+        mgr = EpochManager(owner_hotkey="5Genv")
+        mgr.set_owner_chain_source(source)
+
+        assert mgr._resolve_owner_hotkey() == "5Gchain"  # chain-primary
+        # Cached: a second call must not re-query the chain
+        assert mgr._resolve_owner_hotkey() == "5Gchain"
+        source.resolve_subnet_owner.assert_called_once()
+
+    def test_falls_back_to_env_without_source(self, monkeypatch):
+        """With no chain source wired, resolve to the env/constructor owner."""
+        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+        mgr = EpochManager(owner_hotkey="5Genv")
+        assert mgr._resolve_owner_hotkey() == "5Genv"
+
+    def test_falls_back_to_env_when_chain_empty(self):
+        """When the chain source returns '', fall back to the env owner (a real
+        resolved value, so it's cached)."""
+        source = MagicMock()
+        source.resolve_subnet_owner = MagicMock(return_value="")
+
+        mgr = EpochManager(owner_hotkey="5Genv")
+        mgr.set_owner_chain_source(source)
+
+        assert mgr._resolve_owner_hotkey() == "5Genv"
+        assert mgr._resolved_owner == "5Genv"  # real fallback value cached
+
+    def test_empty_not_cached_when_no_owner_anywhere(self, monkeypatch):
+        """When neither chain nor env yields an owner, '' is returned and NOT
+        cached — so a later chain/env value can still win."""
+        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+        source = MagicMock()
+        source.resolve_subnet_owner = MagicMock(return_value="")
+
+        mgr = EpochManager(owner_hotkey="")
+        mgr.set_owner_chain_source(source)
+
+        assert mgr._resolve_owner_hotkey() == ""
+        assert mgr._resolved_owner == ""  # empty not cached
+
+        # A later chain value now wins (no stale empty cached)
+        source.resolve_subnet_owner = MagicMock(return_value="5Gchain")
+        assert mgr._resolve_owner_hotkey() == "5Gchain"
+
+    def test_chain_failure_falls_back_to_env(self):
+        """A raising chain source must not crash — fall back to the env owner."""
+        source = MagicMock()
+        source.resolve_subnet_owner = MagicMock(side_effect=RuntimeError("rpc down"))
+
+        mgr = EpochManager(owner_hotkey="5Genv")
+        mgr.set_owner_chain_source(source)
+
+        assert mgr._resolve_owner_hotkey() == "5Genv"
+
+
 # ── Benchmark Snapshot Wiring Tests ──────────────────────────────────────────
 
 

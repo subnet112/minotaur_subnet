@@ -469,26 +469,29 @@ class AppIntentsValidator:
                     if name.startswith("minotaur_subnet"):
                         logging.getLogger(name).setLevel(logging.NOTSET)
 
-                # Resolve owner_hotkey from chain if env didn't provide one.
-                # Subnet owner is public on-chain data; making it an env
-                # requirement was a misconfig hazard that silently broke
-                # weight emission for third-party operators on canonical
-                # compose (they had no SUBNET_OWNER_HOTKEY set and their
-                # daemon emitted {} → silent dead loop every epoch).
-                if not self.weights.owner_hotkey:
-                    from minotaur_subnet.weight_policy import lookup_subnet_owner_from_chain
-                    chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
-                    if chain_owner:
-                        self.weights.owner_hotkey = chain_owner
-                        logger.info(
-                            "Resolved subnet %d owner hotkey from chain: %s…",
-                            netuid, chain_owner[:16],
-                        )
-                    else:
-                        logger.warning(
-                            "No SUBNET_OWNER_HOTKEY env AND chain lookup failed; "
-                            "weight emission will be empty until either resolves",
-                        )
+                # Resolve owner_hotkey CHAIN-PRIMARY (env only as fallback).
+                # The subnet owner is public on-chain data — authoritative and
+                # identical for every validator — so the chain is queried FIRST
+                # and overrides the env value when present. Requiring the env was
+                # a misconfig hazard that silently broke weight emission for
+                # third-party operators on canonical compose (they had no
+                # SUBNET_OWNER_HOTKEY set and their daemon emitted {} → silent
+                # dead loop every epoch). The env stays only as a fallback for
+                # environments where the chain isn't queryable (e.g. a local
+                # testnet without the storage set).
+                from minotaur_subnet.weight_policy import lookup_subnet_owner_from_chain
+                chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
+                if chain_owner:
+                    self.weights.owner_hotkey = chain_owner
+                    logger.info(
+                        "Resolved subnet %d owner hotkey from chain: %s…",
+                        netuid, chain_owner[:16],
+                    )
+                elif not self.weights.owner_hotkey:
+                    logger.warning(
+                        "No SUBNET_OWNER_HOTKEY env AND chain lookup failed; "
+                        "weight emission will be empty until either resolves",
+                    )
 
                 if wallet_name and hotkey_name:
                     try:

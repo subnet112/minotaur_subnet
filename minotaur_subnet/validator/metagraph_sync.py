@@ -358,6 +358,16 @@ class MetagraphSync:
         """Whether this validator is the current leader."""
         return self._state is not None and self._state.my_role == "leader"
 
+    def resolve_subnet_owner(self) -> str:
+        """Chain-primary subnet-owner hotkey (env fallback), reusing this sync's
+        subtensor connection."""
+        from minotaur_subnet.weight_policy import resolve_subnet_owner_hotkey
+        try:
+            subtensor = self._get_subtensor()
+        except Exception:
+            subtensor = None
+        return resolve_subnet_owner_hotkey(subtensor, self.netuid)
+
     def _get_subtensor(self, force_reconnect: bool = False) -> Any:
         """Lazily create or reconnect a Subtensor client."""
         if self._subtensor is None or force_reconnect:
