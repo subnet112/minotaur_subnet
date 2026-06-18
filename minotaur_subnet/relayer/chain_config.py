@@ -34,7 +34,17 @@ def get_supported_chains() -> dict[int, ChainDeployment]:
     Env vars:
         ETHEREUM_RPC_URL, BASE_RPC_URL, ARBITRUM_RPC_URL, OPTIMISM_RPC_URL
         RELAYER_WALLET_{CHAIN_ID}  — relayer wallet address per chain
-        APP_INTENT_BASE_{CHAIN_ID} — deployed AppIntentBase address
+
+    NOTE: the app contract address is intentionally NOT read from an
+    ``APP_INTENT_BASE_{CHAIN_ID}`` env. A static per-chain address silently
+    routes execution to a stale/dead contract after an app redeploy (the
+    address changes, the env does not — this caused a live prod outage where
+    every order reverted against the old contract). The app address is sourced
+    per-order from the deployment record and passed explicitly to
+    ``submit_plan`` by every caller; the relayer fails loud when it is missing
+    instead of falling back to a static address. ``app_intent_base_address``
+    remains a programmatic field (set directly by tests/emulation), never
+    env-backed.
     """
     chains: dict[int, ChainDeployment] = {}
 
@@ -56,9 +66,8 @@ def get_supported_chains() -> dict[int, ChainDeployment]:
             chain_id=chain_id,
             name=name,
             rpc_url=rpc_url,
-            app_intent_base_address=os.environ.get(
-                f"APP_INTENT_BASE_{chain_id}", "",
-            ),
+            # app_intent_base_address is deliberately left at its "" default:
+            # the per-order deployment address is authoritative (see docstring).
             validator_registry_address=os.environ.get(
                 f"VALIDATOR_REGISTRY_{chain_id}", "",
             ),
