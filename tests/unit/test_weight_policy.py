@@ -3,7 +3,9 @@
 from unittest.mock import MagicMock
 
 from minotaur_subnet.weight_policy import (
+    CHAMPION_MINER_WEIGHT_FRACTION,
     GENESIS_HOTKEY,
+    apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     lookup_subnet_owner_from_chain,
 )
@@ -24,11 +26,61 @@ def test_build_weights_burns_to_owner_for_genesis():
     ) == {"5Gowner": 1.0}
 
 
-def test_build_weights_routes_to_real_champion():
+def test_build_weights_ramps_champion_with_owner_burn():
+    # Once a real miner champion exists: 0.05 to the champion, 0.95 burned to owner.
     assert build_bootstrap_or_champion_weights(
         "5Gminer",
         owner_hotkey="5Gowner",
+    ) == {"5Gowner": 0.95, "5Gminer": 0.05}
+
+
+def test_build_weights_full_to_champion_when_owner_unresolvable(monkeypatch):
+    # No resolvable owner anywhere -> can't burn -> route fully to the champion.
+    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    assert build_bootstrap_or_champion_weights(
+        "5Gminer",
+        owner_hotkey=None,
     ) == {"5Gminer": 1.0}
+
+
+def test_build_weights_full_to_champion_when_champion_is_owner():
+    # Champion IS the owner -> no point splitting to itself; 100%.
+    assert build_bootstrap_or_champion_weights(
+        "5Gowner",
+        owner_hotkey="5Gowner",
+    ) == {"5Gowner": 1.0}
+
+
+def test_champion_ramp_split_sums_to_one():
+    w = build_bootstrap_or_champion_weights("5Gminer", owner_hotkey="5Gowner")
+    assert abs(sum(w.values()) - 1.0) < 1e-9
+    assert w["5Gminer"] == CHAMPION_MINER_WEIGHT_FRACTION
+
+
+def test_apply_burn_ramp_caps_miners_preserves_ratios():
+    # A ranked multi-miner distribution: miners collectively get 0.05, owner 0.95,
+    # and the relative split AMONG miners is preserved.
+    ramped = apply_champion_burn_ramp(
+        {"m1": 0.6, "m2": 0.3, "m3": 0.1}, owner_hotkey="5Gowner"
+    )
+    assert abs(sum(ramped.values()) - 1.0) < 1e-9
+    assert ramped["5Gowner"] == 0.95
+    assert abs((ramped["m1"] + ramped["m2"] + ramped["m3"]) - 0.05) < 1e-9
+    assert abs(ramped["m1"] / ramped["m2"] - 2.0) < 1e-9  # 0.6/0.3 preserved
+
+
+def test_apply_burn_ramp_noop_without_owner(monkeypatch):
+    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    assert apply_champion_burn_ramp({"m1": 1.0}, owner_hotkey=None) == {"m1": 1.0}
+
+
+def test_apply_burn_ramp_noop_when_owner_is_a_miner():
+    # Owner already in the distribution -> can't both earn and burn to itself.
+    assert apply_champion_burn_ramp(
+        {"5Gowner": 0.7, "m1": 0.3}, owner_hotkey="5Gowner"
+    ) == {"5Gowner": 0.7, "m1": 0.3}
 
 
 def test_champion_weights_uses_owner_burn_before_real_champion():
@@ -36,7 +88,7 @@ def test_champion_weights_uses_owner_burn_before_real_champion():
 
     assert tracker.maybe_emit(None) == {"5Gowner": 1.0}
     assert tracker.get_weights(GENESIS_HOTKEY) == {"5Gowner": 1.0}
-    assert tracker.get_weights("5Gminer") == {"5Gminer": 1.0}
+    assert tracker.get_weights("5Gminer") == {"5Gowner": 0.95, "5Gminer": 0.05}
 
 
 def test_seed_epoch_clock_stale_emits_on_next_tick():

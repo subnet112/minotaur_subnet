@@ -56,17 +56,64 @@ def is_real_miner_hotkey(hotkey: str | None) -> bool:
     return bool(value) and value != GENESIS_HOTKEY
 
 
+# Share of emission weight a real miner champion receives; the remainder burns
+# to the subnet owner. 0.05 means a 95% burn — a conservative ramp so a freshly-
+# adopted (or bad) champion earns only a bounded share until proven.
+#
+# This is a HARDCODED CONSTANT, deliberately NOT an env knob: the weight split is
+# consensus-relevant and must be IDENTICAL across every validator, or different
+# operators (esp. third parties) would emit divergent weight vectors. Baking it
+# into the image makes a change propagate uniformly via redeploy/Watchtower;
+# changing it means a code edit + release, by design.
+CHAMPION_MINER_WEIGHT_FRACTION = 0.05
+
+
+def apply_champion_burn_ramp(
+    miner_weights: dict[str, float],
+    *,
+    owner_hotkey: str | None = None,
+) -> dict[str, float]:
+    """Scale a (normalized) miner weight distribution so the miners collectively
+    receive ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05) of emission and the
+    remainder (0.95) burns to the subnet owner — the conservative champion ramp.
+
+    The relative split *among* miners is preserved; only their aggregate share is
+    capped. Used by BOTH champion-weight paths (the daemon burn-fallback builder
+    below and the leader's ranked path in ``epoch/manager.py``) so the 95% burn
+    applies however the distribution was built.
+
+    Returns ``miner_weights`` unchanged when there are no miners, the owner can't
+    be resolved (nothing to burn to), or the owner is already among the miners.
+    """
+    owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+    if not miner_weights or not owner or owner in miner_weights:
+        return miner_weights
+    ramped = {hk: w * CHAMPION_MINER_WEIGHT_FRACTION for hk, w in miner_weights.items()}
+    ramped[owner] = 1.0 - CHAMPION_MINER_WEIGHT_FRACTION
+    return ramped
+
+
 def build_bootstrap_or_champion_weights(
     champion_hotkey: str | None,
     *,
     owner_hotkey: str | None = None,
 ) -> dict[str, float]:
-    """Return 100% burn-to-owner before miner champion, else 100% to champion."""
+    """Bootstrap / ramp weight emission (single-champion / daemon burn-fallback path).
+
+    - No real miner champion (``None`` / genesis): 100% burn to the subnet owner.
+    - Real miner champion: the conservative ramp via ``apply_champion_burn_ramp``
+      — the champion gets ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05) and 0.95 burns
+      to the owner (falling back to 100%-to-champion only if the owner can't be
+      resolved or the champion IS the owner).
+    """
+    owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+
     if is_real_miner_hotkey(champion_hotkey):
         assert champion_hotkey is not None
-        return {champion_hotkey.strip(): 1.0}
+        return apply_champion_burn_ramp(
+            {champion_hotkey.strip(): 1.0}, owner_hotkey=owner_hotkey,
+        )
 
-    owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
     if owner:
         return {owner: 1.0}
     return {}

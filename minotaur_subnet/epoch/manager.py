@@ -47,6 +47,7 @@ from minotaur_subnet.harness.round_store import (
     RoundStore,
 )
 from minotaur_subnet.weight_policy import (
+    apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
     is_real_miner_hotkey,
@@ -1093,10 +1094,17 @@ class EpochManager:
             weight = self._weight_decay ** rank  # rank 0 = champion
             raw_weights[sub.hotkey] = weight
 
-        # Normalize to sum=1
+        # Normalize to sum=1, then apply the champion burn ramp so the miners
+        # collectively receive only CHAMPION_MINER_WEIGHT_FRACTION (0.05) and the
+        # rest burns to the owner — the same conservative cap the daemon's
+        # burn-fallback builder applies, so a freshly-adopted champion's share is
+        # bounded however its weights were built.
         total = sum(raw_weights.values())
         if total > 0:
-            return {k: v / total for k, v in raw_weights.items()}
+            normalized = {k: v / total for k, v in raw_weights.items()}
+            return apply_champion_burn_ramp(
+                normalized, owner_hotkey=self._owner_hotkey,
+            )
         return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
