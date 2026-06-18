@@ -264,8 +264,23 @@ class ProtocolConfig:
         Raises if the override is unset AND the RPC call fails. Failing fast
         at startup is the right behaviour: a misconfigured registry address or
         unreachable RPC should be loud, not silently fall back to a default.
+
+        ``quorum_address`` is REQUIRED and must be passed explicitly by every
+        caller — it names the registry whose ``quorumBps()`` defines the
+        quorum threshold. There is no silent fallback to ``registry_address``:
+        for order consensus the two happen to be the same ValidatorRegistry,
+        but the champion path uses a distinct ChampionRegistry, and silently
+        defaulting to the wrong contract would target the wrong chain/registry
+        without any error. Callers must be explicit so the misconfiguration is
+        loud, not silent.
         """
-        quorum_source = quorum_address or registry_address
+        if not quorum_address:
+            raise ValueError(
+                "from_validator_registry requires an explicit quorum_address "
+                "(the registry whose quorumBps() defines the quorum); callers must "
+                "pass it — no silent fallback to registry_address."
+            )
+        quorum_source = quorum_address
         override = _read_override()
         if override is not None:
             logger.warning(
