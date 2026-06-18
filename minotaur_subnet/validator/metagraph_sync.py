@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,8 +42,14 @@ logger = logging.getLogger(__name__)
 # only one breaks consensus (election would point one way, sig-check the
 # other). Both values are public information already published in the
 # on-chain ValidatorRegistry / metagraph.
-LOCKED_LEADER_HOTKEY = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
-LOCKED_LEADER_EVM_ADDRESS = "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D"
+LOCKED_LEADER_HOTKEY = os.environ.get("LOCKED_LEADER_HOTKEY", "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt")
+LOCKED_LEADER_EVM_ADDRESS = os.environ.get("LOCKED_LEADER_EVM_ADDRESS", "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D")
+
+if not LOCKED_LEADER_EVM_ADDRESS:
+    logger.warning(
+        "LOCKED_LEADER_EVM_ADDRESS is empty — leader lock CLEARED "
+        "(stake-based election + any-validator proposer acceptance)."
+    )
 
 
 def _extract_int(value: Any) -> int | None:
