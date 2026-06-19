@@ -65,6 +65,7 @@ class Submission:
     # Set after screening passes
     image_tag: str | None = None
     image_id: str | None = None          # Immutable local image identifier (sha256:...)
+    image_digest: str | None = None      # Global GHCR manifest ref <repo>@sha256:<64hex> (content-addressed transport)
     provenance: dict[str, Any] | None = None
     solver_path: str | None = None  # Local path to solver .py (source submissions)
     solver_name: str | None = None
@@ -96,6 +97,7 @@ class Submission:
             "screening": self.screening,
             "image_tag": self.image_tag,
             "image_id": self.image_id,
+            "image_digest": self.image_digest,
             "provenance": self.provenance,
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
@@ -115,6 +117,7 @@ class Submission:
             "screening": self.screening,
             "image_tag": self.image_tag,
             "image_id": self.image_id,
+            "image_digest": self.image_digest,
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
@@ -298,6 +301,16 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    def set_image_digest(self, submission_id: str, image_digest: str) -> None:
+        """Set the global GHCR manifest ref (<repo>@sha256:<64hex>) after push."""
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.image_digest = image_digest
+        sub.updated_at = time.time()
+        self._persist()
+
     def set_provenance(
         self,
         submission_id: str,
@@ -469,6 +482,7 @@ class SubmissionStore:
                     screening=d.get("screening", {}),
                     image_tag=d.get("image_tag"),
                     image_id=d.get("image_id"),
+                    image_digest=d.get("image_digest"),
                     provenance=d.get("provenance"),
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
