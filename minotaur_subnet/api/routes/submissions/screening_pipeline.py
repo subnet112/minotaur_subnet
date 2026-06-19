@@ -388,6 +388,57 @@ async def _resolve_image_id(image_tag: str) -> str | None:
     return image_id
 
 
+async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
+    """Retag the locally-built screening image to the candidate repo, push it
+    (single-arch — the local build is already single-arch), and return the
+    resolved ``<repo>@sha256:<digest>`` manifest ref.
+
+    This is the content-addressed transport step: it distributes the leader's
+    sandbox-built image so every follower can pull byte-identical bytes by digest
+    (no per-host rebuild → no ``{{.Id}}`` divergence). Best-effort: returns
+    ``None`` on any docker/registry failure (the leader can still benchmark its
+    local build; only fleet distribution is affected). Only the leader runs this,
+    gated by ``leader_pushes_digests()`` at the call site, so it is inert until a
+    ``CANDIDATE_IMAGE_REPO`` is configured.
+    """
+    from minotaur_subnet.harness.image_transport import candidate_repo, is_digest_ref
+
+    repo = candidate_repo()
+    ref = f"{repo}:pr-{pr_number}"
+
+    async def _docker(*args: str, timeout: float) -> tuple[int, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return (proc.returncode or 0), out.decode("utf-8", errors="replace")
+        except asyncio.TimeoutError:
+            return 124, "timed out"
+        except FileNotFoundError:
+            return 127, "docker not found"
+
+    rc, msg = await _docker("tag", image_tag, ref, timeout=30)
+    if rc != 0:
+        logger.warning("Candidate retag %s -> %s failed: %s", image_tag, ref, msg[:200])
+        return None
+    rc, msg = await _docker("push", ref, timeout=600)
+    if rc != 0:
+        logger.warning("Candidate push %s failed: %s", ref, msg[:300])
+        return None
+    # RepoDigests is populated by the registry after a successful push.
+    rc, msg = await _docker(
+        "image", "inspect", ref, "--format", "{{index .RepoDigests 0}}", timeout=30,
+    )
+    digest_ref = msg.strip()
+    if rc != 0 or not is_digest_ref(digest_ref):
+        logger.warning("Could not resolve RepoDigest for %s (rc=%s): %s", ref, rc, msg[:200])
+        return None
+    return digest_ref
+
+
 async def _run_screening_pipeline(submission_id: str) -> None:
     """Clone repo and run the 3-stage screening pipeline.
 
@@ -452,6 +503,23 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             )
             return
         store.set_image_id(submission_id, image_id)
+
+        # Content-addressed transport (leader-only, inert until CANDIDATE_IMAGE_REPO
+        # is set): push the built image to the candidate repo and persist its GHCR
+        # manifest digest so followers pull byte-identical bytes by digest. The
+        # local build above is what the leader benchmarks; this just distributes it.
+        from minotaur_subnet.harness.image_transport import leader_pushes_digests
+        if leader_pushes_digests() and sub.pr_number:
+            digest_ref = await _push_candidate_image(image_tag, sub.pr_number)
+            if digest_ref:
+                store.set_image_digest(submission_id, digest_ref)
+                logger.info("Candidate image pushed for %s: %s", submission_id, digest_ref)
+            else:
+                logger.warning(
+                    "Candidate push failed for %s; image_digest unset (followers "
+                    "cannot pull-by-digest until this succeeds).", submission_id,
+                )
+
         require_signed_provenance = _env_true("REQUIRE_SIGNED_PROVENANCE", default=False)
         require_asymmetric_provenance = _env_true("REQUIRE_ASYMMETRIC_PROVENANCE", default=False)
         signing_key = os.environ.get("SUBMISSION_PROVENANCE_HMAC_KEY", "").strip()
