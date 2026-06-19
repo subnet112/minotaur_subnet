@@ -51,6 +51,7 @@ class Submission:
     epoch: int
     hotkey: str
     round_id: str = ""
+    pr_number: int | None = None         # Solver-repo PR number (PR-based submission)
     status: SubmissionStatus = SubmissionStatus.QUEUED
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -91,6 +92,7 @@ class Submission:
             "epoch": self.epoch,
             "hotkey": self.hotkey,
             "round_id": self.round_id,
+            "pr_number": self.pr_number,
             "status": self.status.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -114,6 +116,7 @@ class Submission:
             "submission_id": self.submission_id,
             "status": self.status.value,
             "round_id": self.round_id,
+            "pr_number": self.pr_number,
             "screening": self.screening,
             "image_tag": self.image_tag,
             "image_id": self.image_id,
@@ -147,6 +150,7 @@ class SubmissionStore:
         epoch: int,
         hotkey: str,
         round_id: str | None = None,
+        pr_number: int | None = None,
     ) -> Submission:
         """Create a new submission. Raises ValueError for duplicates."""
         self._maybe_reload()
@@ -168,6 +172,7 @@ class SubmissionStore:
             epoch=epoch,
             hotkey=hotkey,
             round_id=resolved_round_id,
+            pr_number=pr_number,
             created_at=now,
             updated_at=now,
         )
@@ -476,6 +481,7 @@ class SubmissionStore:
                     epoch=d["epoch"],
                     hotkey=d["hotkey"],
                     round_id=round_id,
+                    pr_number=d.get("pr_number"),
                     status=SubmissionStatus(d["status"]),
                     created_at=d.get("created_at", 0),
                     updated_at=d.get("updated_at", 0),

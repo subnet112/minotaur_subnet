@@ -510,14 +510,14 @@ def _validate_commit_hash_format(commit_hash: str) -> None:
 
 def verify_hotkey_signature(
     hotkey: str,
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     signature_b64: str,
     round_id: str,
 ) -> bool:
     """Verify that the signature was produced by the given hotkey.
 
-    Message format: "{repo_url}:{commit_hash}:{round_id}".
+    Message format: "{pr_number}:{head_sha}:{round_id}".
     Uses bittensor Keypair.verify() for Ed25519 signature checks.
 
     Returns True if valid, False otherwise.
@@ -527,8 +527,8 @@ def verify_hotkey_signature(
         from bittensor import Keypair
 
         message = build_submission_message(
-            repo_url,
-            commit_hash,
+            pr_number,
+            head_sha,
             round_id=round_id,
         )
         signature_bytes = base64.b64decode(signature_b64)
@@ -540,15 +540,15 @@ def verify_hotkey_signature(
 
 
 def build_submission_message(
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     *,
     round_id: str,
 ) -> str:
-    """Build the signed submission payload: {repo_url}:{commit_hash}:{round_id}."""
+    """Build the signed submission payload: {pr_number}:{head_sha}:{round_id}."""
     if not round_id:
         raise ValueError("round_id is required")
-    return f"{repo_url}:{commit_hash}:{round_id}"
+    return f"{pr_number}:{head_sha}:{round_id}"
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -643,15 +643,32 @@ async def create_submission(
         requested_round_id=body.round_id,
     )
 
-    _validate_repo_url_policy(body.repo_url)
-    _validate_commit_hash_format(body.commit_hash)
+    # Resolve the PR (host fixed to the canonical solver repo) -> fork clone_url +
+    # the live head SHA, and reject if the live head != the miner-signed head_sha
+    # (force-push / TOCTOU guard). The miner signs the exact commit it built.
+    from minotaur_subnet.api.routes.submissions.github_pr import (
+        PRResolutionError,
+        resolve_pr,
+    )
+    try:
+        pr = resolve_pr(body.pr_number)
+    except PRResolutionError as exc:
+        raise HTTPException(status_code=400, detail=f"PR resolution failed: {exc}")
+    if pr["head_sha"].lower() != body.head_sha.strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"PR #{body.pr_number} live head {pr['head_sha']} != signed head "
+                f"{body.head_sha} (force-push after signing?)"
+            ),
+        )
 
-    # Verify hotkey signature against the authoritative open round (not the
-    # client-supplied round_id). round-based only — epoch signing is gone.
+    # Verify hotkey signature over (pr_number, head_sha, round) against the
+    # authoritative open round (not the client-supplied round_id).
     if not verify_hotkey_signature(
         hotkey=body.hotkey,
-        repo_url=body.repo_url,
-        commit_hash=body.commit_hash,
+        pr_number=body.pr_number,
+        head_sha=body.head_sha,
         round_id=current_round.round_id,
         signature_b64=body.signature,
     ):
@@ -660,14 +677,16 @@ async def create_submission(
             detail="Invalid hotkey signature",
         )
 
-    # Check for duplicate submission
+    # Check for duplicate submission. Store the RESOLVED fork clone_url + head SHA
+    # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).
     try:
         sub = store.create(
-            repo_url=body.repo_url,
-            commit_hash=body.commit_hash,
+            repo_url=pr["clone_url"],
+            commit_hash=pr["head_sha"],
             epoch=body.epoch,
             hotkey=body.hotkey,
             round_id=current_round.round_id,
+            pr_number=body.pr_number,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
