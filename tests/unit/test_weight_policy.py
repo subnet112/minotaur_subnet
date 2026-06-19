@@ -78,11 +78,27 @@ def test_apply_burn_ramp_noop_without_owner(monkeypatch):
     assert apply_champion_burn_ramp({"m1": 1.0}, owner_hotkey=None) == {"m1": 1.0}
 
 
-def test_apply_burn_ramp_noop_when_owner_is_a_miner():
-    # Owner already in the distribution -> can't both earn and burn to itself.
-    assert apply_champion_burn_ramp(
+def test_apply_burn_ramp_drops_owner_and_still_burns():
+    # Footgun fix: the owner appearing in the miner set must NOT skip the burn.
+    # The owner is the burn target, not a miner — it is dropped, the remaining
+    # miner re-normalized, and the 0.95 burn still applies.
+    ramped = apply_champion_burn_ramp(
         {"5Gowner": 0.7, "m1": 0.3}, owner_hotkey="5Gowner"
-    ) == {"5Gowner": 0.7, "m1": 0.3}
+    )
+    assert ramped == {"5Gowner": 0.95, "m1": 0.05}
+
+
+def test_apply_burn_ramp_owner_among_many_miners_burn_not_skipped():
+    # The actual footgun: an owner submission landing among MULTIPLE ranked miners
+    # must not disable the 0.95 burn for everyone. Owner dropped; the remaining
+    # miners share 0.05 with their relative ratio preserved.
+    ramped = apply_champion_burn_ramp(
+        {"5Gowner": 0.5, "m1": 0.3, "m2": 0.2}, owner_hotkey="5Gowner"
+    )
+    assert abs(sum(ramped.values()) - 1.0) < 1e-9
+    assert ramped["5Gowner"] == 0.95
+    assert abs((ramped["m1"] + ramped["m2"]) - 0.05) < 1e-9
+    assert abs(ramped["m1"] / ramped["m2"] - 1.5) < 1e-9  # 0.3/0.2 preserved
 
 
 def test_champion_weights_uses_owner_burn_before_real_champion():
