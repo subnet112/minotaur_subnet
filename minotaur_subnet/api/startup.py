@@ -31,6 +31,69 @@ def _env_true(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+async def _restore_persisted_champion_solver(
+    *, round_store, sub_store, block_loop, build_live_solver, allow_hot_swap,
+):
+    """Rebuild the live solver from the persisted active champion at boot.
+
+    Restart-drift fix: the boot solver is built only from ``GENESIS_SOLVER_IMAGE``,
+    so without this a restart silently reverts the live solver to genesis and an
+    already-adopted champion stops running its certified bytecode until the next
+    adoption/rebake. We rebuild through the SAME ``build_live_solver`` +
+    ``block_loop.set_solver`` path the runtime hot-swap uses (the sha256 ``image_id``
+    is verified inside ``DockerRuntimeSolver``). This is continuity of an
+    already-vetted champion, so it is independent of ``DISABLE_CHAMPION_ADOPTION``
+    (which only blocks *new* adoptions) but gated by ``ALLOW_CHAMPION_HOT_SWAP`` for
+    parity with the runtime swap.
+
+    Returns the restored solver (already set on ``block_loop``) or ``None`` when
+    there is no champion to restore, hot-swap is disabled, or the rebuild fails —
+    in which case the caller keeps the genesis solver.
+    """
+    if not allow_hot_swap:
+        return None
+    try:
+        active = round_store.get_active_champion()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Champion boot-restore: get_active_champion failed (%s)", exc)
+        return None
+    sub_id = (getattr(active, "submission_id", "") or "").strip()
+    if not sub_id:
+        return None  # no champion adopted -> keep the genesis solver (current behavior)
+    submission = None
+    try:
+        submission = sub_store.get(sub_id)
+    except Exception:  # pragma: no cover - defensive
+        submission = None
+    # The ChampionSnapshot itself carries hotkey + image_id + submission_id, so it
+    # is a safe fallback when the submission row has been pruned from the store.
+    submission = submission or active
+    epoch = int(getattr(active, "activated_epoch", 0) or 0)
+    try:
+        solver = await build_live_solver(submission, epoch)
+    except Exception as exc:
+        logger.warning(
+            "Champion boot-restore: rebuild of %s failed (%s); staying on genesis.",
+            sub_id, exc,
+        )
+        return None
+    if solver is None:
+        logger.warning(
+            "Champion boot-restore: %s could not be rebuilt (image unavailable or "
+            "hot-swap disabled); staying on the genesis solver.",
+            sub_id,
+        )
+        return None
+    if block_loop is not None:
+        block_loop.set_solver(solver)
+    logger.info(
+        "Restored persisted champion solver at boot: %s (image_id=%s, epoch=%d) "
+        "— restart-drift avoided.",
+        sub_id, (getattr(submission, "image_id", "") or "")[:20], epoch,
+    )
+    return solver
+
+
 def _is_real_chain_url(url: str) -> bool:
     """Return True if *url* points to a real chain (not Anvil/localhost)."""
     lower = url.lower()
@@ -1945,6 +2008,19 @@ async def initialize(ctx: ServerContext) -> dict:
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
+
+            # Restart-drift fix: restore the persisted active champion onto the
+            # block loop BEFORE it starts (below), so a restart boots straight on
+            # the adopted champion instead of silently reverting to the genesis
+            # image. No-op today — no champion is adopted while
+            # DISABLE_CHAMPION_ADOPTION=1, so get_active_champion() is empty.
+            await _restore_persisted_champion_solver(
+                round_store=round_store,
+                sub_store=sub_store,
+                block_loop=ctx.block_loop,
+                build_live_solver=_build_live_solver,
+                allow_hot_swap=allow_champion_hot_swap,
+            )
 
             solver_round_hotkey = _resolve_solver_round_hotkey()
             solver_round_force_leader = _env_true("FORCE_LEADER", default=False)
