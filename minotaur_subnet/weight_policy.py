@@ -98,8 +98,12 @@ def apply_champion_burn_ramp(
     below and the leader's ranked path in ``epoch/manager.py``) so the 95% burn
     applies however the distribution was built.
 
-    Returns ``miner_weights`` unchanged when there are no miners, the owner can't
-    be resolved (nothing to burn to), or the owner is already among the miners.
+    Returns ``miner_weights`` unchanged only when there are no miners or the owner
+    can't be resolved (nothing to burn to). The owner is *dropped* from the miner
+    set before ramping — it is the burn target, never a competing miner — and the
+    remaining miners are re-normalized so they still collectively receive exactly
+    ``CHAMPION_MINER_WEIGHT_FRACTION`` (a stray owner submission must not skip the
+    burn for the whole set).
     """
     if not miner_weights:
         return miner_weights
@@ -116,9 +120,21 @@ def apply_champion_burn_ramp(
             len(miner_weights), CHAMPION_MINER_WEIGHT_FRACTION * 100,
         )
         return miner_weights
-    if owner in miner_weights:
-        return miner_weights
-    ramped = {hk: w * CHAMPION_MINER_WEIGHT_FRACTION for hk, w in miner_weights.items()}
+    # Drop the owner from the miner set BEFORE ramping. The owner is the burn
+    # target, not a candidate miner; leaving it in made the old `owner in
+    # miner_weights` guard skip the ramp entirely, so the whole set kept summing
+    # to 1.0 (no 0.95 burn) — one stray owner submission disabling the burn for
+    # everyone. Re-normalize the remaining miners to preserve their relative split.
+    miners = {hk: w for hk, w in miner_weights.items() if hk != owner}
+    if not miners:
+        # The owner was the only "miner" (champion IS the owner) -> 100% to owner.
+        return {owner: 1.0}
+    total = sum(miners.values())
+    if total <= 0:
+        return {owner: 1.0}
+    ramped = {
+        hk: (w / total) * CHAMPION_MINER_WEIGHT_FRACTION for hk, w in miners.items()
+    }
     ramped[owner] = 1.0 - CHAMPION_MINER_WEIGHT_FRACTION
     return ramped
 
