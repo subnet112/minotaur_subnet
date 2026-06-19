@@ -1,24 +1,25 @@
-"""Content-addressed champion image transport (P1).
+"""Content-addressed champion image transport.
 
-Single source of truth for the ``CHAMPION_IMAGE_TRANSPORT`` feature flag and the
-small pure helpers that translate between the three image-reference shapes:
+The champion image is identified, certified, and run by its GHCR **manifest
+digest** so every validator pulls byte-identical bytes — this is the only champion
+identity (the old per-host ``{{.Id}}`` identity + local-sha256 compare is retired).
+
+There is deliberately **no per-validator mode env**: that would split the fleet
+because third-party validators never update their envs. Instead the behavior is
+**proposal-driven** — a follower branches on the *shape* of the ``candidate_image_id``
+the leader proposed (``is_digest_ref`` → pull-by-digest + verify; else legacy),
+which ships uniformly to everyone as code. Only the **leader** decides to build,
+push, and propose a digest, gated on ``CANDIDATE_IMAGE_REPO`` being configured on
+that one node (leader-local, not a consensus toggle).
+
+Three reference shapes this module translates between:
 
   - local image id:   ``sha256:<64hex>``         (docker ``{{.Id}}``, per-host, NOT portable)
   - bare digest:      ``<64hex>``                (on-chain ``candidateImageId`` encoding)
   - pullable ref:     ``<repo>@sha256:<64hex>``  (GHCR manifest digest, portable)
 
-Modes (env ``CHAMPION_IMAGE_TRANSPORT``):
-  - ``local`` (default): today's behavior — build locally, identify by ``{{.Id}}``,
-    no registry push/pull. Fully inert.
-  - ``digest``: build once, push to the candidate repo, certify/run by the GHCR
-    manifest digest so every validator pulls byte-identical bytes.
-
-``CHAMPION_IMAGE_TRANSPORT_STRICT`` (default off) controls degradation in
-``digest`` mode: off → log loud and fall back to local semantics on registry
-failure; on → fail the operation (used on testnet to prove the path works).
-
-Nothing here reads or runs Docker — these are pure functions so the flag and the
-ref parsing are auditable in isolation. Callers branch on ``digest_mode()``.
+Nothing here reads or runs Docker — these are pure functions so the ref parsing
+is auditable in isolation.
 """
 
 from __future__ import annotations
@@ -37,24 +38,23 @@ def _env(name: str) -> str:
     return (os.environ.get(name) or "").strip()
 
 
-def transport_mode() -> str:
-    """Champion image transport mode: ``"local"`` (default) or ``"digest"``."""
-    return "digest" if _env("CHAMPION_IMAGE_TRANSPORT").lower() == "digest" else "local"
-
-
-def digest_mode() -> bool:
-    """True when content-addressed (digest) transport is enabled."""
-    return transport_mode() == "digest"
-
-
-def transport_strict() -> bool:
-    """True when digest-mode failures must fail loudly instead of falling back."""
-    return _env("CHAMPION_IMAGE_TRANSPORT_STRICT").lower() in ("1", "true", "yes", "on")
-
-
 def candidate_repo() -> str:
-    """GHCR repo candidate images are pushed to / pulled from in digest mode."""
+    """GHCR repo the LEADER pushes candidate images to (leader-local config).
+
+    Followers never read this — they pull the full ``<repo>@sha256:D`` ref carried
+    in the champion proposal, so the repo travels with the digest.
+    """
     return _env("CANDIDATE_IMAGE_REPO") or DEFAULT_CANDIDATE_REPO
+
+
+def leader_pushes_digests() -> bool:
+    """True when THIS node is configured to build+push candidate images.
+
+    Leader-local capability gate (not a fleet-wide consensus toggle): the leader
+    proposes digests when it has a candidate repo configured; everything else is
+    driven by the shape of what gets proposed.
+    """
+    return bool(_env("CANDIDATE_IMAGE_REPO"))
 
 
 def bare_hex(ref: str | None) -> str | None:

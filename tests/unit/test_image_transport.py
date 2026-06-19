@@ -7,28 +7,12 @@ HEX = "a" * 64
 REF = f"{REPO}@sha256:{HEX}"
 
 
-def test_mode_defaults_local(monkeypatch):
-    monkeypatch.delenv("CHAMPION_IMAGE_TRANSPORT", raising=False)
-    assert it.transport_mode() == "local"
-    assert it.digest_mode() is False
-
-
-def test_mode_digest(monkeypatch):
-    monkeypatch.setenv("CHAMPION_IMAGE_TRANSPORT", "digest")
-    assert it.transport_mode() == "digest"
-    assert it.digest_mode() is True
-
-
-def test_mode_unknown_value_is_local(monkeypatch):
-    monkeypatch.setenv("CHAMPION_IMAGE_TRANSPORT", "garbage")
-    assert it.transport_mode() == "local"  # only "digest" enables it; everything else inert
-
-
-def test_strict_default_off(monkeypatch):
-    monkeypatch.delenv("CHAMPION_IMAGE_TRANSPORT_STRICT", raising=False)
-    assert it.transport_strict() is False
-    monkeypatch.setenv("CHAMPION_IMAGE_TRANSPORT_STRICT", "1")
-    assert it.transport_strict() is True
+def test_leader_pushes_digests_keys_off_candidate_repo(monkeypatch):
+    # Leader-local capability gate — NOT a per-validator consensus mode env.
+    monkeypatch.delenv("CANDIDATE_IMAGE_REPO", raising=False)
+    assert it.leader_pushes_digests() is False          # unset -> leader does not push
+    monkeypatch.setenv("CANDIDATE_IMAGE_REPO", "ghcr.io/x/y")
+    assert it.leader_pushes_digests() is True           # explicit opt-in
 
 
 def test_candidate_repo_default_and_override(monkeypatch):
