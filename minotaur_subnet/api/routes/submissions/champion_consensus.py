@@ -523,7 +523,19 @@ def _build_champion_proposal_for_round(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Certified submission not found")
 
-    resolved_image_id = candidate_image_id or candidate.image_id or round_state.finalist_image_id
+    # Content-addressed (digest mode): when the candidate has a pushed GHCR manifest
+    # digest, carry its BARE 64-hex so on-chain candidateImageId == D and followers
+    # reconstruct <repo>@sha256:D to pull. Falls back to the local {{.Id}} image_id
+    # (legacy) when no digest was pushed. Peers receive the leader's resolved value
+    # via candidate_image_id, so the whole quorum signs the same D.
+    from minotaur_subnet.harness.image_transport import bare_hex
+    _candidate_digest = bare_hex(getattr(candidate, "image_digest", None))
+    resolved_image_id = (
+        candidate_image_id
+        or _candidate_digest
+        or candidate.image_id
+        or round_state.finalist_image_id
+    )
     if not resolved_image_id:
         # Genesis/subprocess submissions don't have Docker image_ids.
         # Use a placeholder so they can still be certified as bootstrap champions.
