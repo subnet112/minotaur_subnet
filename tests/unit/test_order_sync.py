@@ -13,16 +13,14 @@ def _run(coro):
 def _sync(*, is_follower=True, leader_url="http://leader:8080", orders=None, app_store=None):
     captured = {}
 
-    async def fake_get(url, api_key):
+    async def fake_get(url):
         captured["url"] = url
-        captured["api_key"] = api_key
         return orders if orders is not None else []
 
     s = OrderSync(
         app_store=app_store if app_store is not None else MagicMock(),
         leader_api_url=lambda: leader_url,
         is_follower=lambda: is_follower,
-        internal_api_key=lambda: "secret-key",
         http_get=fake_get,
     )
     return s, captured
@@ -37,9 +35,8 @@ def test_follower_pulls_and_upserts():
     # upserted both (including the rejected one — the #228 point)
     saved = [c.args[0]["order_id"] for c in store.save_order.call_args_list]
     assert saved == ["a", "b"]
-    # hit the leader's internal endpoint with the internal key
-    assert cap["url"] == "http://leader:8080/v1/internal/orders"
-    assert cap["api_key"] == "secret-key"
+    # hit the leader's PUBLIC order book (no auth — anyone can read it)
+    assert cap["url"] == "http://leader:8080/v1/orders"
 
 
 def test_leader_does_not_sync():
@@ -77,6 +74,6 @@ def test_continues_past_save_error():
 def test_no_app_store_noops():
     s = OrderSync(
         app_store=None, leader_api_url=lambda: "http://x", is_follower=lambda: True,
-        internal_api_key=lambda: "k", http_get=lambda u, k: asyncio.sleep(0, result=[]),
+        http_get=lambda u: asyncio.sleep(0, result=[]),
     )
     assert _run(s.sync_once()) == 0
