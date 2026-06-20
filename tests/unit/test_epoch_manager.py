@@ -226,10 +226,12 @@ class TestEpochManager:
         block_loop = _make_mock_block_loop()
         worker = _make_mock_benchmark_worker()
 
+        rejected = []
         mgr = EpochManager(
             block_loop=block_loop,
             benchmark_worker=worker,
             submission_store=store,
+            on_champion_rejected=lambda sub, reason: rejected.append((sub.submission_id, reason)),
         )
 
         # First epoch: adopt old champion
@@ -240,6 +242,23 @@ class TestEpochManager:
         result = await mgr.on_epoch_boundary(epoch=2)
         assert result["champion_changed"] is False
         assert mgr.champion.submission_id == "sub_old"
+        # The rejected challenger gets its PR-mirror callback fired (no pr_number on
+        # this fixture -> _notify_champion_rejected guards, so it does NOT fire here).
+        assert rejected == []  # fixture submissions have no pr_number
+
+        # With a pr_number, the reject callback fires for the losing challenger.
+        new_sub.pr_number = 42
+        store2 = _make_store_with_subs(old_sub, new_sub)
+        rejected2 = []
+        mgr2 = EpochManager(
+            block_loop=_make_mock_block_loop(),
+            benchmark_worker=_make_mock_benchmark_worker(),
+            submission_store=store2,
+            on_champion_rejected=lambda sub, reason: rejected2.append(sub.submission_id),
+        )
+        await mgr2.on_epoch_boundary(epoch=1)
+        await mgr2.on_epoch_boundary(epoch=2)
+        assert "sub_new" in rejected2
 
     @pytest.mark.asyncio
     async def test_challenger_beats_margin(self):

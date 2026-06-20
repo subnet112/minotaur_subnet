@@ -289,6 +289,115 @@ def _github_api_headers() -> dict[str, str]:
     return headers
 
 
+# ── PR lifecycle (the PR-based submission fold) ──────────────────────────────
+# The miner opens the PR; the leader MIRRORS the off-chain quorum's decision onto
+# it — a scoring-report comment + merge on ADOPT (the cert-gated Action merges), or
+# a comment + close + candidate-image GC on REJECT. These are thin GitHub/GHCR API
+# wrappers; they no-op without SOLVER_REPO_URL / a token, so they are inert on a
+# node that isn't the configured leader.
+
+def _github_api_request(method: str, url: str, payload: dict | None = None) -> tuple[int, dict | None]:
+    """Issue a GitHub API request. Returns (status, json|None); never raises."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=_github_api_headers(), method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — fixed github host
+            body = resp.read().decode("utf-8")
+            return resp.status, (json.loads(body) if body else None)
+    except urllib.error.HTTPError as exc:
+        logger.warning("GitHub %s %s -> %s: %s", method, url, exc.code, exc.reason)
+        return exc.code, None
+    except Exception as exc:  # network / json
+        logger.warning("GitHub %s %s failed: %s", method, url, exc)
+        return 0, None
+
+
+def comment_on_pr(pr_number: int, body: str) -> bool:
+    """Post a comment on a solver-repo PR (used for the scoring report)."""
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None or not pr_number:
+        return False
+    owner, repo = owner_repo
+    status, _ = _github_api_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        {"body": body},
+    )
+    return status in (200, 201)
+
+
+def close_pr(pr_number: int) -> bool:
+    """Close a solver-repo PR (the REJECT path — no certificate was emitted)."""
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None or not pr_number:
+        return False
+    owner, repo = owner_repo
+    status, _ = _github_api_request(
+        "PATCH",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        {"state": "closed"},
+    )
+    return status == 200
+
+
+def delete_candidate_image(pr_number: int) -> bool:
+    """GC a rejected candidate's ``pr-<N>`` image tag from GHCR.
+
+    Finds the org container-package version whose tags include ``pr-<N>`` and
+    deletes it. Best-effort (needs ``delete:packages``); never raises. The
+    org/package are derived from ``CANDIDATE_IMAGE_REPO`` (``ghcr.io/ORG/PKG``).
+    """
+    from minotaur_subnet.harness.image_transport import candidate_repo
+
+    repo_ref = candidate_repo()  # ghcr.io/ORG/PKG
+    parts = repo_ref.split("/")
+    if len(parts) < 3:
+        return False
+    org, package = parts[1], "/".join(parts[2:])
+    tag = f"pr-{pr_number}"
+    status, versions = _github_api_request(
+        "GET",
+        f"https://api.github.com/orgs/{org}/packages/container/{package}/versions?per_page=100",
+    )
+    if status != 200 or not isinstance(versions, list):
+        return False
+    for v in versions:
+        tags = (((v or {}).get("metadata") or {}).get("container") or {}).get("tags") or []
+        if tag in tags:
+            vid = v.get("id")
+            del_status, _ = _github_api_request(
+                "DELETE",
+                f"https://api.github.com/orgs/{org}/packages/container/{package}/versions/{vid}",
+            )
+            return del_status in (200, 204)
+    return False  # no matching tag (already pruned / never pushed)
+
+
+def on_champion_rejected_pr(submission: Any, reason: str, report_md: str | None = None) -> bool:
+    """REJECT path: comment the reason/report on the miner's PR, close it, and GC
+    the candidate image. Mirrors the off-chain quorum's reject decision onto the
+    PR. Usable while adoption is frozen — pure miner feedback, no chain writes."""
+    pr_number = getattr(submission, "pr_number", None)
+    if not pr_number:
+        logger.info(
+            "Champion reject for %s has no pr_number — skipping PR close",
+            getattr(submission, "submission_id", "?"),
+        )
+        return False
+    body = report_md or f"### ❌ Submission rejected\n\n{reason}"
+    commented = comment_on_pr(pr_number, body)
+    closed = close_pr(pr_number)
+    gced = delete_candidate_image(pr_number)
+    logger.info(
+        "Champion reject PR#%s: comment=%s close=%s gc=%s",
+        pr_number, commented, closed, gced,
+    )
+    return closed
+
+
 def _parse_github_owner_repo() -> tuple[str, str] | None:
     """Extract owner/repo from SOLVER_REPO_URL."""
     url = os.environ.get("SOLVER_REPO_URL", "").strip()
@@ -513,6 +622,18 @@ def on_champion_adopted_pr(
             )
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
+
+    # Mirror the ADOPT decision onto the miner's own PR (the fold): post the
+    # success report so the miner sees it; the cert-gated Action merges the PR.
+    _pr_number = getattr(submission, "pr_number", None)
+    if _pr_number:
+        comment_on_pr(
+            _pr_number,
+            f"### ✅ Adopted as champion\n\n"
+            f"- round: `{round_id}`\n- submission: `{submission_id}`\n"
+            f"- on-chain attest tx: `{tx_hash or 'pending'}`\n\n"
+            f"The cert-gated merge will land this PR.",
+        )
 
     # Step 2: Create GitHub PR
     pr_url = create_champion_pr(submission, round_id, tx_hash, certificate)
