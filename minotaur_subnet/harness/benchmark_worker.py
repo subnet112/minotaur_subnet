@@ -186,7 +186,9 @@ class BenchmarkWorker:
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
         validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
+        validator_set_provider: Any = None,  # Callable[[], list[str]] -> current validator IDs (partition)
     ) -> None:
+        self._validator_set_provider = validator_set_provider
         self._sub_store = submission_store
         self._app_store = app_store
         self._js_engine = js_engine
@@ -212,6 +214,14 @@ class BenchmarkWorker:
         # (the shared BlockLoop engine already hot-reloads this way; this worker
         # keeps its own engine, so it needs the same hash-diff).
         self._loaded_js_hashes: dict[str, str] = {}
+
+    def set_validator_set_provider(self, provider: Any) -> None:
+        """Wire the current-validator-set resolver (for the coverage partition).
+
+        Set after construction because the validator set / consensus peers are
+        resolved later in startup than the benchmark worker is built.
+        """
+        self._validator_set_provider = provider
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.
@@ -880,16 +890,37 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
-        # Diverse-subset model: seed the draw with this validator's identity so it
-        # tests a DIFFERENT slice of real orders than its peers (broader regression
-        # coverage). Default (model off / no identity) -> shared round_id-only draw.
-        _seed = self._validator_identity if _challenger_quorum_mode() else None
+        # Coverage-partition model: each validator benchmarks a DISJOINT slice of
+        # the order corpus (partitioned by hash % V over the current validator set)
+        # so the fleet collectively covers as many distinct orders as possible —
+        # more validators -> more coverage. Falls back to the per-validator diverse
+        # seed (overlapping subsets) when the validator set can't be resolved, and
+        # to the shared round_id-only draw when the quorum model is off.
+        _seed = None
+        _v_index = None
+        _v_count = None
+        if _challenger_quorum_mode():
+            _vset = []
+            if self._validator_set_provider is not None:
+                try:
+                    _vset = sorted({str(v) for v in (self._validator_set_provider() or []) if v})
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("Validator-set resolve for partition failed: %s", exc)
+                    _vset = []
+            _me = self._validator_identity
+            if _vset and _me in _vset:
+                _v_index = _vset.index(_me)
+                _v_count = len(_vset)
+            else:
+                _seed = _me  # fall back to the diverse-subset draw
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
             records=chain_records,
             validator_seed=_seed,
+            validator_index=_v_index,
+            validator_count=_v_count,
         )
         if not sampled:
             return []

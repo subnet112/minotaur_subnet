@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from minotaur_subnet.harness.order_sampler import sample_historical_orders
+from minotaur_subnet.harness.order_sampler import (
+    _order_partition,
+    sample_historical_orders,
+)
 
 
 class _FakeAppStore:
@@ -88,6 +91,74 @@ class TestDiverseSubsets:
         assert ids_a != ids_b
         # ...but each is still a valid full-size draw from the same pool.
         assert len(ids_a) == 10 and len(ids_b) == 10
+
+
+class TestPartition:
+    """Partition mode: validators split the corpus into DISJOINT slices for max coverage."""
+
+    def test_partition_is_deterministic_and_in_range(self):
+        # Same (order, round, V) → same assignment everywhere; always in [0, V).
+        for i in range(100):
+            a = _order_partition(f"ord_{i}", "round-1", 5)
+            b = _order_partition(f"ord_{i}", "round-1", 5)
+            assert a == b
+            assert 0 <= a < 5
+
+    def test_partition_reshuffles_each_round(self):
+        # The same order lands in different validators across rounds (coverage rotates).
+        same = all(
+            _order_partition(f"ord_{i}", "round-1", 5)
+            == _order_partition(f"ord_{i}", "round-2", 5)
+            for i in range(200)
+        )
+        assert not same
+
+    def test_slices_are_disjoint_and_cover_the_pool(self):
+        # Every order goes to exactly one validator; the union is the full pool.
+        orders = [_make_order(f"ord_{i:03d}") for i in range(60)]
+        store = _FakeAppStore(orders)
+        V = 5
+        slices = [
+            sample_historical_orders(
+                store, "round-1", n_per_chain=100,  # large n → keep whole slice
+                validator_index=idx, validator_count=V,
+            )
+            for idx in range(V)
+        ]
+        id_sets = [set(o["order_id"] for o in s) for s in slices]
+        # Disjoint: no order appears in two validators' slices.
+        for i in range(V):
+            for j in range(i + 1, V):
+                assert id_sets[i].isdisjoint(id_sets[j])
+        # Complete: the union is every order in the pool.
+        union = set().union(*id_sets)
+        assert union == {f"ord_{i:03d}" for i in range(60)}
+
+    def test_coverage_scales_with_validator_count(self):
+        # With n_per_chain cap, fleet covers min(total, V*n) distinct orders.
+        orders = [_make_order(f"ord_{i:03d}") for i in range(100)]
+        store = _FakeAppStore(orders)
+        V, n = 5, 4
+        union = set()
+        for idx in range(V):
+            s = sample_historical_orders(
+                store, "round-1", n_per_chain=n,
+                validator_index=idx, validator_count=V,
+            )
+            assert len(s) <= n  # each validator stays within its load budget
+            union |= {o["order_id"] for o in s}
+        # Fleet coverage = V*n distinct orders (well under the 100 available).
+        assert len(union) == V * n
+
+    def test_partition_disabled_when_count_none(self):
+        # Without (index, count) it's the legacy shared draw — no partition filter.
+        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
+        store = _FakeAppStore(orders)
+        legacy = sample_historical_orders(store, "round-1", n_per_chain=10)
+        no_part = sample_historical_orders(
+            store, "round-1", n_per_chain=10, validator_index=None, validator_count=None
+        )
+        assert [o["order_id"] for o in legacy] == [o["order_id"] for o in no_part]
 
 
 class TestFiltering:
