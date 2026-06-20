@@ -1370,10 +1370,46 @@ class EpochManager:
                 abort_reason or "round_aborted",
             )
 
+        # #227: reap submissions still BENCHMARKING for this now-terminal round.
+        # The benchmark worker only processes the current-open or replay round, so
+        # once this round leaves CLOSED/REPLAYING they would be stranded in
+        # BENCHMARKING forever with no signal (e.g. non-finalist challengers when
+        # the round activates on the first finalist). Fail them with a clear reason
+        # and fire the reject callback so the miner knows to resubmit.
+        self._reap_orphaned_benchmarking(round_state.round_id)
+
         return self._round_store.open_next_round(
             opened_epoch=epoch,
             incumbent=self._get_incumbent_snapshot(),
         )
+
+    def _reap_orphaned_benchmarking(self, round_id: str) -> None:
+        """Reject submissions left BENCHMARKING after their round terminated (#227)."""
+        if self._sub_store is None or not round_id:
+            return
+        try:
+            subs = self._sub_store.list_by_round(round_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Reaper: list_by_round(%s) failed: %s", round_id, exc)
+            return
+        for sub in subs:
+            if sub.status != SubmissionStatus.BENCHMARKING:
+                continue
+            try:
+                self._sub_store.reject(
+                    sub.submission_id,
+                    "benchmark_window_elapsed: round closed before scoring — "
+                    "resubmit to a fresh open round",
+                )
+                self._notify_champion_rejected(
+                    sub, "benchmark window elapsed before scoring",
+                )
+                logger.info(
+                    "Reaped orphaned BENCHMARKING submission %s (round %s terminal)",
+                    sub.submission_id, round_id,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Reaper: failed to reject %s: %s", sub.submission_id, exc)
 
     def _get_incumbent_snapshot(self) -> ChampionSnapshot | None:
         """Return the best available active champion snapshot for round sync."""
