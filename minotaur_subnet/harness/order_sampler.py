@@ -19,6 +19,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _order_partition(order_id: str, round_id: str, validator_count: int) -> int:
+    """Deterministically assign an order to one of ``validator_count`` validators.
+
+    ``hash(order_id + round_id) % V`` — stable across all validators (so the
+    partition is verifiable, not leader-chosen) and re-shuffles each round so
+    coverage rotates over time.
+    """
+    h = hashlib.sha256(f"{order_id}:{round_id}".encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big") % validator_count
+
+
 # Fields to strip for privacy when exposing sampled orders to solvers.
 # The solver only needs the trade parameters, not who submitted it.
 _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
@@ -32,6 +43,8 @@ def sample_historical_orders(
     exclude_statuses: set[str] | None = None,
     records: list[dict[str, Any]] | None = None,
     validator_seed: str | None = None,
+    validator_index: int | None = None,
+    validator_count: int | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical TERMINAL-DEMAND orders for Stage 2.
 
@@ -113,6 +126,19 @@ def sample_historical_orders(
         if chain_ids is not None and order.get("chain_id") not in chain_ids:
             continue
         candidates.append(order)
+
+    # PARTITION mode (max coverage): when (validator_index, validator_count) are
+    # given, each validator keeps a DISJOINT slice — order assigned to validator
+    # ``hash(order_id+round_id) % V``. With V validators each benchmarking up to
+    # n_per_chain, the fleet covers min(total, V*n_per_chain) DISTINCT orders
+    # (filled or failed) instead of overlapping random subsets — more validators →
+    # more coverage. Each validator's slice is deterministic + verifiable, so no
+    # single party picks who benchmarks what.
+    if validator_index is not None and validator_count and validator_count > 0:
+        candidates = [
+            o for o in candidates
+            if _order_partition(o.get("order_id", ""), round_id, validator_count) == validator_index
+        ]
 
     if not candidates:
         return []

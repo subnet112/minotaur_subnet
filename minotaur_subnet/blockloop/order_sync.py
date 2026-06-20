@@ -30,14 +30,12 @@ class OrderSync:
         app_store: Any,
         leader_api_url: Callable[[], str | None],
         is_follower: Callable[[], bool],
-        internal_api_key: Callable[[], str],
         interval: float = 30.0,
-        http_get: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
+        http_get: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None,
     ) -> None:
         self._app_store = app_store
         self._leader_api_url = leader_api_url      # () -> current leader's API base, or None
         self._is_follower = is_follower            # () -> True only when this node is a follower
-        self._internal_api_key = internal_api_key  # () -> shared internal round key
         self._interval = interval
         self._http_get = http_get or self._default_http_get
 
@@ -60,7 +58,9 @@ class OrderSync:
         url = (self._leader_api_url() or "").rstrip("/")
         if not url:
             return 0
-        orders = await self._http_get(f"{url}/v1/internal/orders", self._internal_api_key())
+        # The order book is PUBLIC (no auth) — /v1/orders already strips
+        # user_signature. Followers pull it to build their benchmark corpus.
+        orders = await self._http_get(f"{url}/v1/orders")
         if not orders:
             return 0
         n = 0
@@ -78,13 +78,10 @@ class OrderSync:
         return n
 
     @staticmethod
-    async def _default_http_get(url: str, api_key: str) -> list[dict[str, Any]]:
+    async def _default_http_get(url: str) -> list[dict[str, Any]]:
         import aiohttp
-        headers = {"x-solver-round-internal-key": api_key} if api_key else {}
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
                     logger.warning("Order sync: leader %s returned HTTP %s", url, resp.status)
                     return []

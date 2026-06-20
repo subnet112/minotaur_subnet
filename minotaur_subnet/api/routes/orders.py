@@ -903,31 +903,6 @@ def get_order(
     return d
 
 
-@router.get("/internal/orders")
-def internal_list_orders(request: Request) -> dict:
-    """Leader's full order set for follower order-sync (#228 cross-validator corpus).
-
-    The leader is the only node that persists orders — including the FAILED ones
-    (rejected/expired) that never reach the chain. Followers pull this to build a
-    representative Stage-2 benchmark corpus (the diverse-subset adoption vote).
-    Authenticated with the internal round key. ``user_signature`` is stripped — the
-    benchmark needs the trade params, not the signature, and replicating sigs
-    across validators is an unnecessary surface.
-    """
-    from minotaur_subnet.api.routes.submissions.routes import (
-        _require_internal_round_api_key,
-    )
-    _require_internal_round_api_key(request)
-    if _app_store is None:
-        raise HTTPException(status_code=503, detail="App store not configured")
-    orders = []
-    for o in _app_store.list_orders():
-        o = dict(o)
-        o.pop("user_signature", None)
-        orders.append(o)
-    return {"orders": orders}
-
-
 @router.get("/orders")
 def list_orders(
     app_id: str | None = None,
