@@ -83,6 +83,17 @@ def is_digest_ref(s: str | None) -> bool:
     return bool(s and _REPO_DIGEST.match(s.strip()))
 
 
+def is_bare_digest(s: str | None) -> bool:
+    """True if *s* is exactly a bare 64-hex digest (no ``sha256:`` prefix, no repo).
+
+    This is how a follower distinguishes a content-addressed proposal from a
+    legacy one: the leader sets ``candidate_image_id`` to the bare 64-hex ``D`` in
+    digest mode, but to ``sha256:<64hex>`` (local ``{{.Id}}``, 70 chars) or
+    ``builtin:<x>`` otherwise — only the bare form means "pull ``<repo>@sha256:D``".
+    """
+    return bool(s and _HEX64.match(s.strip().lower()))
+
+
 def parse_repo_digest(s: str | None) -> tuple[str, str] | None:
     """Split ``<repo>@sha256:<64hex>`` into ``(repo, bare_hex)``; else ``None``."""
     if not s:

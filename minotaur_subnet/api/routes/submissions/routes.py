@@ -956,13 +956,23 @@ async def solver_round_consensus_proposal(
         _candidate.commit_hash == "builtin"
         or (_candidate.repo_url or "").startswith("builtin://")
     )
-    if not is_builtin and _candidate.image_tag:
+    # Benchmark when we have something to run: a locally-built image_tag (legacy)
+    # OR a content-addressed digest to pull (digest mode — the follower need not
+    # have built it locally). Without this, a digest-mode follower with no local
+    # image_tag would SKIP verification and sign blind.
+    from minotaur_subnet.harness.image_transport import is_bare_digest
+    _proposed_image = body.candidate_image_id or proposal.candidate_image_id
+    _can_benchmark = bool(_candidate.image_tag) or is_bare_digest(_proposed_image)
+    if not is_builtin and _can_benchmark:
         try:
             verified, local_score = await _reactive_benchmark_candidate(
                 candidate=_candidate,
                 leader_score=round_state.finalist_score or 0.0,
                 tolerance_pct=0.15,
                 round_id=round_state.round_id,
+                # The leader-signed candidate_image_id: a bare 64-hex digest D in
+                # content-addressed mode (pull <repo>@sha256:D), else legacy {{.Id}}.
+                candidate_image_id=body.candidate_image_id or proposal.candidate_image_id,
             )
             if not verified:
                 return {
