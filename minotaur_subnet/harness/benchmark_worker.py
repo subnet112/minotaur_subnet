@@ -187,8 +187,10 @@ class BenchmarkWorker:
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
         validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
         validator_set_provider: Any = None,  # Callable[[], list[str]] -> current validator IDs (partition)
+        validator_self_id_provider: Any = None,  # Callable[[], str] -> this node's id in the SET's space
     ) -> None:
         self._validator_set_provider = validator_set_provider
+        self._validator_self_id_provider = validator_self_id_provider
         self._sub_store = submission_store
         self._app_store = app_store
         self._js_engine = js_engine
@@ -222,6 +224,54 @@ class BenchmarkWorker:
         resolved later in startup than the benchmark worker is built.
         """
         self._validator_set_provider = provider
+
+    def set_validator_self_id_provider(self, provider: Any) -> None:
+        """Wire this node's own id resolver, in the SAME space as the set.
+
+        The partition matches this node against the validator set, so the self id
+        must be the EVM address (``manager.validator_id``), NOT the SS58 hotkey
+        used for the diverse-subset seed — otherwise ``me in set`` is always False
+        and the partition silently falls back to the (overlapping) diverse draw.
+        """
+        self._validator_self_id_provider = provider
+
+    def _resolve_stage2_partition(self) -> tuple[str | None, int | None, int | None]:
+        """Resolve this validator's Stage-2 corpus selection mode.
+
+        Returns ``(validator_seed, validator_index, validator_count)``:
+          - PARTITION (None, idx, count): quorum mode on AND this node's self id
+            resolves into the current validator set -> disjoint coverage slice.
+          - DIVERSE (hotkey, None, None): quorum mode on but the set/self-id can't
+            be resolved -> per-validator overlapping draw (graceful fallback).
+          - SHARED (None, None, None): quorum mode off -> round-only shared draw.
+
+        The self id and the set MUST be in the same space (EVM address). The
+        diverse-fallback seed uses the SS58 hotkey, which only needs to be stable.
+        """
+        if not _challenger_quorum_mode():
+            return None, None, None
+        _vset: list[str] = []
+        if self._validator_set_provider is not None:
+            try:
+                _vset = sorted({str(v) for v in (self._validator_set_provider() or []) if v})
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Validator-set resolve for partition failed: %s", exc)
+                _vset = []
+        _me: str | None = None
+        if self._validator_self_id_provider is not None:
+            try:
+                _raw = self._validator_self_id_provider()
+                _me = str(_raw) if _raw else None
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Self-id resolve for partition failed: %s", exc)
+                _me = None
+        if _vset and _me and _me in _vset:
+            idx = _vset.index(_me)
+            logger.info(
+                "Stage-2 partition: validator %d of %d (coverage slice)", idx, len(_vset)
+            )
+            return None, idx, len(_vset)
+        return self._validator_identity, None, None  # diverse-subset fallback
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.
@@ -890,29 +940,7 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
-        # Coverage-partition model: each validator benchmarks a DISJOINT slice of
-        # the order corpus (partitioned by hash % V over the current validator set)
-        # so the fleet collectively covers as many distinct orders as possible —
-        # more validators -> more coverage. Falls back to the per-validator diverse
-        # seed (overlapping subsets) when the validator set can't be resolved, and
-        # to the shared round_id-only draw when the quorum model is off.
-        _seed = None
-        _v_index = None
-        _v_count = None
-        if _challenger_quorum_mode():
-            _vset = []
-            if self._validator_set_provider is not None:
-                try:
-                    _vset = sorted({str(v) for v in (self._validator_set_provider() or []) if v})
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.warning("Validator-set resolve for partition failed: %s", exc)
-                    _vset = []
-            _me = self._validator_identity
-            if _vset and _me in _vset:
-                _v_index = _vset.index(_me)
-                _v_count = len(_vset)
-            else:
-                _seed = _me  # fall back to the diverse-subset draw
+        _seed, _v_index, _v_count = self._resolve_stage2_partition()
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
