@@ -32,6 +32,25 @@ _GAS_ESTIMATE_MULTIPLIER = float(os.environ.get("RELAYER_GAS_ESTIMATE_MULTIPLIER
 _MIN_BALANCE_WEI = int(os.environ.get("RELAYER_MIN_BALANCE_WEI", str(10**16)))  # 0.01 ETH
 
 
+def canonicalize_user_signature(sig: bytes) -> bytes:
+    """Normalize a 65-byte ECDSA signature's recovery byte ``v`` to 27/28.
+
+    The on-chain ``EIP712Verifier.verifyUserSignature`` uses OpenZeppelin's strict
+    ``ECDSA.recover``, which accepts ``v`` only as 27/28 and reverts
+    ``ECDSAInvalidSignature()`` (0xf645eedf) otherwise — it does NOT normalize the
+    0/1 form that viem/ethers low-level paths, several hardware wallets, and
+    WalletConnect bridges emit. So a legitimate non-MetaMask EOA order passes
+    off-chain screening/scoring/quorum (eth_account tolerates 0/1) and then reverts
+    at settlement, silently dropping the user and debiting a blameless miner
+    (issue #229). Normalizing here, in the relayer, rescues those users WITHOUT a
+    contract redeploy (the live app is immutable). Non-65-byte sigs (empty =
+    skip-check, or already-canonical) are returned unchanged.
+    """
+    if len(sig) == 65 and sig[64] in (0, 1):
+        return sig[:64] + bytes([sig[64] + 27])
+    return sig
+
+
 class NonceManager:
     """Thread-safe local nonce tracking per (chain_id, wallet).
 
@@ -297,7 +316,11 @@ class EvmRelayer(RelayerBase):
             if has_leg_index:
                 user_sig = b""  # empty = skip sig check in executeLeg
             elif user_sig_hex:
-                user_sig = bytes.fromhex(user_sig_hex.replace("0x", ""))
+                # Normalize v 0/1 -> 27/28 so non-MetaMask EOA sigs don't revert
+                # the immutable on-chain verifier (issue #229).
+                user_sig = canonicalize_user_signature(
+                    bytes.fromhex(user_sig_hex.replace("0x", "")),
+                )
             else:
                 user_sig = b"\x00" * 65
 
