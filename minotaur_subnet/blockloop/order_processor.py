@@ -161,9 +161,14 @@ class OrderProcessor:
             state.typed_context = build_typed_context(app, order.intent_function, state)
             state.context_version = "v3"
 
-        # Generate plan — if no solver is available, skip (order stays open)
+        # Generate plan. None = the solver produced no plan: a deliberate no-route,
+        # a crash, a >30s timeout, or any unhandled exception (all collapsed to None
+        # by PlanGenerator). Don't leave the order silently stranded in ASSIGNED
+        # until it EXPIREs with no signal (#225) and — for perpetuals — don't forfeit
+        # all remaining executions on one unsolvable cycle (#226).
         plan = await self.plan_generator.generate(app, state, snapshot)
         if plan is None:
+            self._handle_no_plan(order)
             return False
 
         # Record the locked (user-signed) platform fee in plan metadata so it
@@ -593,6 +598,42 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    def _handle_no_plan(self, order: Any) -> None:
+        """Resolve an order whose solver produced no plan (#225/#226).
+
+        Perpetual orders (still under max_executions) are requeued to OPEN to be
+        retried on a later cycle — the champion solver hot-swaps over the order's
+        lifetime, so a future champion may solve it; ``last_filled_at=now`` reuses
+        the existing cooldown gate for per-cycle backoff and the execution slot is
+        NOT consumed. One-shot orders (and exhausted perpetuals) are terminal:
+        ``REJECTED`` with a clear reason + ``record_execution(success=False)`` for
+        miner accountability — matching the bad-plan path, instead of a silent
+        ASSIGNED→EXPIRED with no signal.
+        """
+        if order.perpetual and order.execution_count < order.max_executions:
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.OPEN,
+                last_filled_at=time.time(),
+            )
+            self.order_persistence.sync(order.order_id)
+            logger.info(
+                "Perpetual order %s: no plan this cycle — requeued OPEN for retry",
+                order.order_id,
+            )
+        else:
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.REJECTED,
+                error="solver produced no plan",
+            )
+            self.order_persistence.sync(order.order_id)
+            self.app_store.record_execution(order.app_id, 0.0, success=False)
+            logger.info(
+                "Order %s: solver produced no plan — REJECTED + miner debited",
+                order.order_id,
+            )
 
     async def _refresh_perpetual_nonce(self, order: "Order") -> None:
         """Fetch the user's current on-chain nonce and update the order params.

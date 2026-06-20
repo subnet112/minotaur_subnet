@@ -35,6 +35,18 @@ def sample_historical_orders(
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical FILLED orders for Stage 2.
 
+    SURVIVORSHIP BIAS (issue #228 — intentional, documented): by default the
+    corpus is FILLED orders only. Expired / rejected / unsolved demand is dropped
+    (wrong status, and no ``block_number`` to re-fork against). The reason is
+    replay determinism — a filled order has a known on-chain ``block_number`` to
+    reconstruct fork state from; a never-executed order has no such anchor, so it
+    cannot be trivially replayed. CONSEQUENCE: challengers are only ever graded on
+    demand the champion ALREADY fills, so there is NO benchmark pressure to solve
+    the order types the champion currently FAILS. Rewarding "challenger filled
+    where the champion could not" (and reconstructing replayable fork-state for
+    never-executed orders) is a deliberate design change tied to the same milestone
+    that flips ``DISABLE_CHAMPION_ADOPTION=0`` — not a silent default.
+
     Seed = ``round_id`` alone (``validator_seed=None``, the default) → every
     validator draws the SAME subset (legacy determinism). When ``validator_seed``
     is supplied (e.g. the validator's hotkey/evm), it is mixed into the seed so
@@ -61,6 +73,9 @@ def sample_historical_orders(
         List of order dicts, PII-stripped. May be empty if no history exists.
     """
     if exclude_statuses is None:
+        # Default = filled-only (survivorship bias, #228): see the docstring —
+        # failed/unsolved demand exerts no benchmark pressure. Deliberate for
+        # replay determinism; revisit when adoption is enabled.
         include_statuses = {"filled"}
     else:
         include_statuses = None  # include all except excluded
