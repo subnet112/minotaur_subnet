@@ -33,19 +33,21 @@ def sample_historical_orders(
     records: list[dict[str, Any]] | None = None,
     validator_seed: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Deterministically sample historical FILLED orders for Stage 2.
+    """Deterministically sample historical TERMINAL-DEMAND orders for Stage 2.
 
-    SURVIVORSHIP BIAS (issue #228 — intentional, documented): by default the
-    corpus is FILLED orders only. Expired / rejected / unsolved demand is dropped
-    (wrong status, and no ``block_number`` to re-fork against). The reason is
-    replay determinism — a filled order has a known on-chain ``block_number`` to
-    reconstruct fork state from; a never-executed order has no such anchor, so it
-    cannot be trivially replayed. CONSEQUENCE: challengers are only ever graded on
-    demand the champion ALREADY fills, so there is NO benchmark pressure to solve
-    the order types the champion currently FAILS. Rewarding "challenger filled
-    where the champion could not" (and reconstructing replayable fork-state for
-    never-executed orders) is a deliberate design change tied to the same milestone
-    that flips ``DISABLE_CHAMPION_ADOPTION=0`` — not a silent default.
+    The corpus is terminal real demand — ``filled`` orders (the champion solved)
+    PLUS ``rejected``/``expired`` orders (the champion FAILED). Previously it was
+    filled-only, which was survivorship-biased: challengers were graded only on
+    demand the champion already fills, so there was no benchmark pressure to solve
+    what it fails (#228). Now a challenger that produces a valid fill where the
+    champion could not earns credit through the normal score — the failed order is
+    a scenario the champion scores ~0 on.
+
+    This is sound because Stage-2 replay forks at the BENCHMARK pin
+    (``self._epoch_block_number`` — the round-anchor / ``BENCHMARK_EPOCH_BLOCK``, or
+    live head by default), NEVER the order's own block. So an unfilled order (no
+    fill block) replays against current state exactly like a filled one — no
+    per-order fork anchor is needed, and the draw stays deterministic per the seed.
 
     Seed = ``round_id`` alone (``validator_seed=None``, the default) → every
     validator draws the SAME subset (legacy determinism). When ``validator_seed``
@@ -62,7 +64,9 @@ def sample_historical_orders(
         chain_ids: Only include orders from these chains. None = all chains.
         n_per_chain: Target sample size per chain (may be smaller if
             insufficient historical orders).
-        exclude_statuses: Order statuses to exclude (default: only include 'filled').
+        exclude_statuses: Order statuses to exclude. Default (None) = include the
+            terminal-demand set {filled, rejected, expired}; pass a set to instead
+            include all statuses except those given.
         records: Pre-built candidate orders (e.g. a chain-derived corpus, plan
             Phase 5b). When provided, they are the source instead of
             app_store.list_orders() — same filter/sample/PII logic. None (default)
@@ -73,10 +77,14 @@ def sample_historical_orders(
         List of order dicts, PII-stripped. May be empty if no history exists.
     """
     if exclude_statuses is None:
-        # Default = filled-only (survivorship bias, #228): see the docstring —
-        # failed/unsolved demand exerts no benchmark pressure. Deliberate for
-        # replay determinism; revisit when adoption is enabled.
-        include_statuses = {"filled"}
+        # Terminal demand: orders the network actually had to solve. Includes the
+        # champion's FAILURES (rejected/expired), not just its successes (filled),
+        # so a challenger gets benchmark credit for filling demand the champion
+        # could not (#228). Safe because the benchmark forks at the round/live-head
+        # pin, NOT the order's block — see the block_number note below — so unfilled
+        # orders replay against current state exactly like filled ones. Excludes
+        # in-flight (open/assigned) and user-cancelled orders (not solver signal).
+        include_statuses = {"filled", "rejected", "expired"}
     else:
         include_statuses = None  # include all except excluded
 
@@ -89,15 +97,18 @@ def sample_historical_orders(
             logger.warning("Failed to list orders for Stage 2 sampling: %s", exc)
             return []
 
-    # Filter: only orders with a block_number (can be replayed) and the right status
+    # Filter by status + chain. NOTE: we do NOT require a block_number. The
+    # benchmark forks at self._epoch_block_number (the round/env pin, or live head
+    # by default) — never the order's own block — so an order without a fill block
+    # (rejected/expired demand) replays against current state just like a filled
+    # one. Requiring block_number here was the survivorship-bias source (#228), not
+    # a replay necessity.
     candidates = []
     for order in all_orders:
         status = order.get("status", "").lower()
         if include_statuses is not None and status not in include_statuses:
             continue
         if exclude_statuses is not None and status in exclude_statuses:
-            continue
-        if order.get("block_number") is None:
             continue
         if chain_ids is not None and order.get("chain_id") not in chain_ids:
             continue

@@ -91,26 +91,31 @@ class TestDiverseSubsets:
 
 
 class TestFiltering:
-    def test_excludes_non_filled_orders(self):
+    def test_includes_terminal_demand_excludes_inflight(self):
+        # #228: terminal demand (filled + the champion's failures rejected/expired)
+        # is sampled; in-flight (open) and user-cancelled are not — not solver signal.
         orders = [
             _make_order("ord_filled", status="filled"),
             _make_order("ord_rejected", status="rejected"),
+            _make_order("ord_expired", status="expired"),
             _make_order("ord_open", status="open"),
+            _make_order("ord_cancelled", status="cancelled"),
         ]
         store = _FakeAppStore(orders)
         sample = sample_historical_orders(store, "round-1", n_per_chain=10)
-        assert len(sample) == 1
-        assert sample[0]["order_id"] == "ord_filled"
+        assert {o["order_id"] for o in sample} == {"ord_filled", "ord_rejected", "ord_expired"}
 
-    def test_excludes_orders_without_block_number(self):
+    def test_includes_unfilled_orders_without_block_number(self):
+        # #228: block_number is NOT required — the benchmark forks at the round/
+        # live-head pin, not the order's block, so unfilled demand (no fill block)
+        # replays against current state just like a filled order.
         orders = [
-            _make_order("ord_with_block", block_number=28000000),
-            _make_order("ord_no_block", block_number=None),
+            _make_order("ord_filled", status="filled", block_number=28000000),
+            _make_order("ord_rejected_noblock", status="rejected", block_number=None),
         ]
         store = _FakeAppStore(orders)
         sample = sample_historical_orders(store, "round-1", n_per_chain=10)
-        assert len(sample) == 1
-        assert sample[0]["order_id"] == "ord_with_block"
+        assert {o["order_id"] for o in sample} == {"ord_filled", "ord_rejected_noblock"}
 
     def test_filters_by_chain_ids(self):
         orders = [
