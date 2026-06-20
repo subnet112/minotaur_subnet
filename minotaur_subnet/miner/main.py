@@ -8,10 +8,10 @@ Subcommands:
         --validator-url http://localhost:8080 \\
         --anvil-rpc-url http://localhost:8545
 
-    # Submit a solver via git repo URL
+    # Submit a solver PR (open a PR on subnet112/minotaur-solver first)
     python -m minotaur_subnet.miner.main submit \\
-        --repo-url https://github.com/miner/solver \\
-        --commit-hash abc123 --hotkey my-wallet
+        --pr-number 123 \\
+        --head-sha <40-char-sha> --hotkey my-wallet
 
     # Check submission status
     python -m minotaur_subnet.miner.main status --submission-id sub_xxx
@@ -45,19 +45,19 @@ logger = logging.getLogger("minotaur_subnet.miner")
 
 
 async def submit_solver_git(
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     hotkey: str,
     wallet_path: str | None = None,
     validator_url: str = "http://localhost:9100",
     round_id: str | None = None,
     epoch: int | None = None,
 ) -> dict[str, Any]:
-    """Submit a solver via git repo URL to the v1 submissions API.
+    """Submit a solver PR to the v1 submissions API (the PR-based fold).
 
     Discovers the active round via GET {validator_url}/v1/solver/round and
-    signs "{repo_url}:{commit_hash}:{round_id}". Round-based submission is
-    required — there is no epoch-only fallback.
+    signs "{pr_number}:{head_sha}:{round_id}". The leader resolves the PR number
+    to the fork clone_url + head SHA and rejects if the live head != head_sha.
 
     Returns the API response dict (submission_id, status, status_url, epoch).
     """
@@ -113,8 +113,8 @@ async def submit_solver_git(
     keypair = wallet.get_hotkey()
 
     message = _build_submission_message(
-        repo_url,
-        commit_hash,
+        pr_number,
+        head_sha,
         round_id=resolved_round_id,
     )
     signature_bytes = keypair.sign(message.encode("utf-8"))
@@ -129,8 +129,8 @@ async def submit_solver_git(
 
     # POST to v1/submissions
     payload = {
-        "repo_url": repo_url,
-        "commit_hash": commit_hash,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
         "round_id": resolved_round_id,
         "epoch": resolved_epoch,
         "hotkey": keypair.ss58_address,
@@ -183,15 +183,15 @@ async def get_solver_round(
 
 
 def _build_submission_message(
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     *,
     round_id: str,
 ) -> str:
-    """Build the signed submission payload: {repo_url}:{commit_hash}:{round_id}."""
+    """Build the signed submission payload: {pr_number}:{head_sha}:{round_id}."""
     if not round_id:
         raise ValueError("round_id is required")
-    return f"{repo_url}:{commit_hash}:{round_id}"
+    return f"{pr_number}:{head_sha}:{round_id}"
 
 
 async def poll_submission_status(
@@ -295,13 +295,14 @@ def main() -> None:
         help="Anvil RPC URL for on-chain queries (optional)",
     )
 
-    # submit (git-based)
-    submit_parser = subparsers.add_parser("submit", help="Submit solver via git repo URL")
+    # submit (PR-based)
+    submit_parser = subparsers.add_parser("submit", help="Submit a solver PR")
     submit_parser.add_argument(
-        "--repo-url", required=True, help="Public git repo URL (HTTPS)",
+        "--pr-number", required=True, type=int,
+        help="PR number on the canonical solver repo (subnet112/minotaur-solver)",
     )
     submit_parser.add_argument(
-        "--commit-hash", required=True, help="Git commit hash to pin",
+        "--head-sha", required=True, help="Full 40-char PR head commit SHA",
     )
     submit_parser.add_argument(
         "--hotkey", required=True, help="Bittensor wallet name (hotkey)",
@@ -390,8 +391,8 @@ def main() -> None:
 
     elif args.command == "submit":
         result = asyncio.run(submit_solver_git(
-            repo_url=args.repo_url,
-            commit_hash=args.commit_hash,
+            pr_number=args.pr_number,
+            head_sha=args.head_sha,
             hotkey=args.hotkey,
             wallet_path=args.wallet_path,
             validator_url=args.validator_url,
