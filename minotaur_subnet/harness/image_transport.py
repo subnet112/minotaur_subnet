@@ -31,7 +31,14 @@ import re
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _REPO_DIGEST = re.compile(r"^(?P<repo>.+)@sha256:(?P<hex>[0-9a-f]{64})$")
 
-DEFAULT_CANDIDATE_REPO = "ghcr.io/subnet112/minotaur-solver-candidates"
+# Candidate images are pushed as `pr-<N>` tags on the SAME package the champion
+# is served from. Decided 2026-06-20: we control the leader for >=1yr, so the
+# per-package `packages:write` token (GHCR scopes write per-package, not per-tag)
+# is acceptable, and sharing the package makes promote nearly free — the certified
+# digest D is already in this package, so no cross-package manifest copy is needed.
+# Override via CANDIDATE_IMAGE_REPO to use a separate namespace later if the leader
+# role moves to a third party.
+DEFAULT_CANDIDATE_REPO = "ghcr.io/subnet112/minotaur-solver"
 
 
 def _env(name: str) -> str:
@@ -39,10 +46,13 @@ def _env(name: str) -> str:
 
 
 def candidate_repo() -> str:
-    """GHCR repo the LEADER pushes candidate images to (leader-local config).
+    """GHCR repo the LEADER pushes candidate ``pr-<N>`` images to (leader-local).
 
-    Followers never read this — they pull the full ``<repo>@sha256:D`` ref carried
-    in the champion proposal, so the repo travels with the digest.
+    Defaults to the champion package (``minotaur-solver``) — the certified digest D
+    is then already in the package the champion is served from, so promotion is just
+    the on-chain cert pointing at ``<repo>@sha256:D`` (no manifest copy). Followers
+    don't read this — they pull the full ``<repo>@sha256:D`` ref carried in the
+    champion proposal, so the repo travels with the digest.
     """
     return _env("CANDIDATE_IMAGE_REPO") or DEFAULT_CANDIDATE_REPO
 
