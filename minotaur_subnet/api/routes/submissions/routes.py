@@ -46,7 +46,6 @@ from .models import (
     SubmitResponse,
 )
 from .state import (
-    _COMMIT_HASH_RE,
     _rate_limit_buckets,
     _rate_limit_lock,
     get_champion_consensus_manager,
@@ -410,99 +409,11 @@ def _enforce_rate_limit(request: Request, principal: str) -> None:
         bucket.append(now)
 
 
-def _validate_repo_url_policy(repo_url: str) -> None:
-    """Validate repo URL format and host policy.
-
-    Hardened against URL tricks that would otherwise let a miner clone from
-    an unapproved host while passing the hostname check:
-      - @-userinfo (``https://github.com@attacker.com/x``) is rejected.
-      - IP-literal hostnames (``https://192.168.1.1/x``, ``https://[::1]/x``)
-        are rejected.
-      - Fragments / queries that embed another URL are not parsed — urlparse
-        already strips those, so they can't shadow the real host.
-    """
-    parsed = urlparse(repo_url)
-    if parsed.scheme == "file":
-        if not _env_true("ALLOW_FILE_REPO_URLS", default=False):
-            raise HTTPException(
-                status_code=400,
-                detail="repo_url must be an HTTP(S) URL unless ALLOW_FILE_REPO_URLS=1 enables file:// URLs",
-            )
-        if not parsed.path.startswith("/"):
-            raise HTTPException(
-                status_code=400,
-                detail="file repo_url must use an absolute path",
-            )
-        return
-    if parsed.scheme not in ("https", "http"):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must be an HTTP(S) URL",
-        )
-    if parsed.scheme == "http" and not _env_true("ALLOW_INSECURE_REPO_URLS", default=False):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must use HTTPS unless ALLOW_INSECURE_REPO_URLS=1",
-        )
-    if not parsed.netloc:
-        raise HTTPException(status_code=400, detail="repo_url must include a hostname")
-
-    # No userinfo is allowed — `git@github.com:x/y.git` SSH form isn't our
-    # use case (we require http/https), so any `@` in netloc means someone
-    # is trying to shadow the hostname.
-    if "@" in parsed.netloc:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "repo_url must not contain userinfo (credentials belong in "
-                "SUBMISSION_GIT_CLONE_* env vars, not in the URL)"
-            ),
-        )
-
-    host = (parsed.hostname or "").lower()
-    if not host:
-        raise HTTPException(status_code=400, detail="repo_url must include a hostname")
-
-    # Reject IP literals: IPv4 dotted quad, IPv6 in brackets (urlparse strips
-    # the brackets for .hostname but preserves the colons), and numeric-only
-    # hostnames. We require a DNS name the allowlist is meaningful against.
-    if _looks_like_ip_literal(host):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must use a DNS hostname, not an IP address",
-        )
-
-    allowed_hosts_raw = os.environ.get("SUBMISSION_ALLOWED_REPO_HOSTS", "").strip()
-    if not allowed_hosts_raw:
-        return
-    allowed_hosts = {h.strip().lower() for h in allowed_hosts_raw.split(",") if h.strip()}
-    if host not in allowed_hosts:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"repo_url host '{host}' is not allowed by policy. "
-                f"Allowed: {sorted(allowed_hosts)}"
-            ),
-        )
-
-
-def _looks_like_ip_literal(host: str) -> bool:
-    """True if *host* parses as an IPv4 or IPv6 literal."""
-    import ipaddress
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
-
-
-def _validate_commit_hash_format(commit_hash: str) -> None:
-    """Ensure commit hash is hex and bounded."""
-    if not _COMMIT_HASH_RE.fullmatch(commit_hash):
-        raise HTTPException(
-            status_code=400,
-            detail="commit_hash must be a 7-64 char hexadecimal git hash",
-        )
+# NOTE: the old repo_url/commit_hash submission validators (host allowlist, SSRF
+# hardening, commit-hash format) were removed with the PR-based submission cutover.
+# A submission now references a PR number on the canonical solver repo, so the host
+# is FIXED (no arbitrary repo_url) and the head SHA comes from GitHub — the SSRF
+# surface is gone structurally. PR resolution + validation lives in github_pr.py.
 
 
 # ── Signature verification ──────────────────────────────────────────────────
