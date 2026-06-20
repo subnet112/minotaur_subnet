@@ -2097,6 +2097,45 @@ async def initialize(ctx: ServerContext) -> dict:
                     return True
                 return ctx.solver_round_metagraph_sync.is_leader
 
+            # Order-book sync (#228): each FOLLOWER pulls the leader's full order set
+            # — including the FAILED orders (rejected/expired) that never reach the
+            # chain and are broadcast nowhere — so it can build a representative
+            # Stage-2 benchmark corpus for the diverse-subset adoption vote. No-ops
+            # on the leader (the source); idempotent upsert is self-healing.
+            def _resolve_leader_api_url() -> str | None:
+                _sync = ctx.solver_round_metagraph_sync
+                if _sync is None or _sync.state is None or _sync.state.leader is None:
+                    return None
+                _leader = _sync.state.leader
+                # Reuse the champion peer network's resolved :8080 endpoints (the
+                # CHAMPION_CONSENSUS_PEERS pin on the testnet + the axon->api
+                # transform on prod), matching the leader by evm validator_id.
+                _net = submissions.get_champion_peer_network()
+                if _net is not None:
+                    for _peer in _net.peers:
+                        if (_peer.validator_id or "").lower() == (_leader.evm_address or "").lower():
+                            return _peer.url
+                return _champion_axon_to_api_url(_leader.axon_url) or None
+
+            try:
+                from minotaur_subnet.blockloop.order_sync import OrderSync
+                _order_sync = OrderSync(
+                    app_store=ctx.store,
+                    leader_api_url=_resolve_leader_api_url,
+                    is_follower=(
+                        lambda: ctx.solver_round_metagraph_sync is not None
+                        and not _is_solver_round_leader()
+                    ),
+                    internal_api_key=lambda: (
+                        os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
+                        or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
+                    ),
+                )
+                ctx.order_sync_task = asyncio.create_task(_order_sync.run_loop())
+                logger.info("Order-book sync loop started (followers pull the leader's orders)")
+            except Exception:
+                logger.warning("Order-book sync not started", exc_info=True)
+
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
                 network = submissions.get_champion_peer_network()
