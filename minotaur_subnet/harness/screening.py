@@ -472,9 +472,21 @@ async def run_stage_3(
         )
 
     try:
-        # Initialize
+        # Initialize. Pass rpc_urls (resolved from the benchmark RPC env, the same
+        # way the benchmark worker does) so a solver that reads its chain RPC from
+        # the init params — not just the env — can build a Web3 for chain 1 and
+        # actually generate a plan. Without this, Stage 3 fails such solvers with
+        # "no Web3 available for chain 1" even though the build + init succeeded.
+        from minotaur_subnet.harness.orchestrator import build_rpc_url_map
+        _init_config: dict[str, Any] = {
+            "chain_ids": [1],
+            "timeout_per_plan_ms": int(plan_timeout * 1000),
+        }
+        _rpc_map = build_rpc_url_map([1])
+        if _rpc_map:
+            _init_config["rpc_urls"] = {str(k): v for k, v in _rpc_map.items()}
         await asyncio.wait_for(
-            session.initialize({"chain_ids": [1], "timeout_per_plan_ms": int(plan_timeout * 1000)}),
+            session.initialize(_init_config),
             timeout=60,
         )
 
