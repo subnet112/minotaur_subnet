@@ -135,9 +135,10 @@ class TestOrderRoutes(unittest.TestCase):
         self.assertEqual(data["count"], 2)
         self.assertEqual(len(data["orders"]), 2)
 
-    def test_internal_orders_requires_key_and_strips_sig(self):
-        # #228 follower order-sync endpoint. Returns the full order set (incl.
-        # failed) for authenticated peers, with user_signature stripped.
+    def test_public_orders_serves_failed_and_strips_sig(self):
+        # The order book is PUBLIC (no auth) — followers pull /v1/orders to build
+        # their benchmark corpus, so it must include FAILED orders (rejected/expired,
+        # which never reach the chain) and strip user_signature.
         from unittest.mock import MagicMock
         store = MagicMock()
         store.list_orders.return_value = [
@@ -145,21 +146,16 @@ class TestOrderRoutes(unittest.TestCase):
             {"order_id": "b", "status": "rejected", "user_signature": "0xalso"},
         ]
         orders_module.set_app_store(store)
-        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "k"
         try:
-            # No key -> 401
-            self.assertEqual(self.client.get("/v1/internal/orders").status_code, 401)
-            # With key -> 200, both orders (incl. the rejected one), sig stripped
-            resp = self.client.get(
-                "/v1/internal/orders", headers={"x-solver-round-internal-key": "k"}
-            )
+            # No auth required, returns both orders (incl. the rejected one), sig stripped
+            resp = self.client.get("/v1/orders")
             self.assertEqual(resp.status_code, 200)
             orders = resp.json()["orders"]
             self.assertEqual({o["order_id"] for o in orders}, {"a", "b"})
-            self.assertTrue(all("user_signature" not in o for o in orders))
+            # signature blanked (not leaked) for every entry
+            self.assertTrue(all(not o.get("user_signature") for o in orders))
         finally:
             orders_module.set_app_store(None)
-            os.environ.pop("SOLVER_ROUND_INTERNAL_API_KEY", None)
 
     def test_list_orders_filter_by_app(self):
         self._submit(app_id="app-1", submitted_by="0xA")

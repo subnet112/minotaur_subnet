@@ -2126,10 +2126,6 @@ async def initialize(ctx: ServerContext) -> dict:
                         lambda: ctx.solver_round_metagraph_sync is not None
                         and not _is_solver_round_leader()
                     ),
-                    internal_api_key=lambda: (
-                        os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
-                        or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
-                    ),
                 )
                 ctx.order_sync_task = asyncio.create_task(_order_sync.run_loop())
                 logger.info("Order-book sync loop started (followers pull the leader's orders)")
@@ -2158,6 +2154,22 @@ async def initialize(ctx: ServerContext) -> dict:
                     if validators:
                         return validators
                 return []
+
+            def _solver_round_self_id() -> str | None:
+                # This node's id in the SAME space as _solver_round_validator_set
+                # (the consensus manager's EVM validator_id), so the partition can
+                # match `me in set`. The benchmark worker's validator_identity is
+                # the SS58 hotkey (diverse seed), which is the wrong space here.
+                manager = submissions.get_champion_consensus_manager()
+                return manager.validator_id if manager is not None else None
+
+            # Wire the validator-set + self-id resolvers into the benchmark worker
+            # so it can partition the order corpus for coverage (each validator a
+            # disjoint slice). Done here because the consensus peers resolve later
+            # than the worker is built.
+            if ctx.benchmark_worker is not None:
+                ctx.benchmark_worker.set_validator_set_provider(_solver_round_validator_set)
+                ctx.benchmark_worker.set_validator_self_id_provider(_solver_round_self_id)
 
             async def _broadcast_round_sync(
                 path: str,
