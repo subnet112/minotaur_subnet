@@ -428,13 +428,29 @@ async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
     if rc != 0:
         logger.warning("Candidate push %s failed: %s", ref, msg[:300])
         return None
-    # RepoDigests is populated by the registry after a successful push.
+    # RepoDigests is populated by the registry after a successful push. An image
+    # built FROM a base carries MULTIPLE RepoDigests (the base repo + ours), so we
+    # must pick the entry for the repo we just pushed to — NOT index 0, which can
+    # be the base/source repo's digest (caught on a real registry: index 0 was a
+    # stale source repo, giving the wrong digest entirely).
+    import json as _json
     rc, msg = await _docker(
-        "image", "inspect", ref, "--format", "{{index .RepoDigests 0}}", timeout=30,
+        "image", "inspect", ref, "--format", "{{json .RepoDigests}}", timeout=30,
     )
-    digest_ref = msg.strip()
-    if rc != 0 or not is_digest_ref(digest_ref):
-        logger.warning("Could not resolve RepoDigest for %s (rc=%s): %s", ref, rc, msg[:200])
+    if rc != 0:
+        logger.warning("Could not inspect RepoDigests for %s (rc=%s): %s", ref, rc, msg[:200])
+        return None
+    try:
+        repo_digests = _json.loads(msg.strip() or "[]")
+    except ValueError:
+        logger.warning("Malformed RepoDigests for %s: %s", ref, msg[:200])
+        return None
+    prefix = f"{repo}@sha256:"
+    digest_ref = next((d for d in repo_digests if isinstance(d, str) and d.startswith(prefix)), None)
+    if not digest_ref or not is_digest_ref(digest_ref):
+        logger.warning(
+            "No RepoDigest matching %s after push (got %s)", prefix, repo_digests,
+        )
         return None
     return digest_ref
 

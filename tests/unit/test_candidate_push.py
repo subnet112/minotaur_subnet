@@ -33,14 +33,17 @@ def _patch_docker(procs):
 
 def test_push_candidate_success(monkeypatch):
     monkeypatch.setenv("CANDIDATE_IMAGE_REPO", REPO)
+    # inspect returns a JSON array of RepoDigests; an image built FROM a base has
+    # MULTIPLE entries — the code must pick the one for OUR repo, not index 0.
+    repo_digests = f'["busybox@sha256:{"b" * 64}", "{DIGEST}"]'
     procs = [
         _FakeProc(0),                              # docker tag
         _FakeProc(0, b"pushed"),                   # docker push
-        _FakeProc(0, (DIGEST + "\n").encode()),    # docker image inspect RepoDigests
+        _FakeProc(0, (repo_digests + "\n").encode()),  # docker image inspect {{json .RepoDigests}}
     ]
     with _patch_docker(procs) as m:
         out = _run(_push_candidate_image("solver-abc123:screening", 7))
-    assert out == DIGEST
+    assert out == DIGEST                           # picked OUR repo's digest, not index 0
     # First docker call retags the local image to <repo>:pr-<N>.
     tag_args = m.call_args_list[0].args
     assert tag_args[:3] == ("docker", "tag", "solver-abc123:screening")
@@ -64,8 +67,16 @@ def test_push_candidate_push_failure_returns_none(monkeypatch):
 
 def test_push_candidate_bad_digest_returns_none(monkeypatch):
     monkeypatch.setenv("CANDIDATE_IMAGE_REPO", REPO)
-    # tag ok, push ok, but inspect returns a non-digest string -> None (don't trust it)
-    procs = [_FakeProc(0), _FakeProc(0), _FakeProc(0, b"not-a-digest\n")]
+    # tag ok, push ok, but inspect has NO entry for our repo -> None (don't trust it).
+    procs = [_FakeProc(0), _FakeProc(0), _FakeProc(0, f'["busybox@sha256:{"c"*64}"]\n'.encode())]
+    with _patch_docker(procs):
+        out = _run(_push_candidate_image("solver-abc:screening", 7))
+    assert out is None
+
+
+def test_push_candidate_malformed_inspect_returns_none(monkeypatch):
+    monkeypatch.setenv("CANDIDATE_IMAGE_REPO", REPO)
+    procs = [_FakeProc(0), _FakeProc(0), _FakeProc(0, b"not-json\n")]
     with _patch_docker(procs):
         out = _run(_push_candidate_image("solver-abc:screening", 7))
     assert out is None
