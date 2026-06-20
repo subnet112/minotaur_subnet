@@ -148,6 +148,7 @@ class EpochManager:
         weight_decay: float = 0.6,
         owner_hotkey: str | None = None,
         on_champion_adopted: Any = None,
+        on_champion_rejected: Any = None,
         vote_recorder: Any = None,
     ) -> None:
         self._block_loop = block_loop
@@ -167,6 +168,7 @@ class EpochManager:
         self._owner_chain_source: Any = None
         self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
+        self._on_champion_rejected = on_champion_rejected
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
         self._vote_recorder = vote_recorder
@@ -314,6 +316,7 @@ class EpochManager:
                 self._champion.benchmark_score,
                 self._dethrone_margin * 100,
             )
+            self._notify_champion_rejected(new_champion_sub, "did not beat the champion")
             next_round = self._complete_round(
                 current_round,
                 epoch,
@@ -405,6 +408,8 @@ class EpochManager:
                 activated=False,
                 abort_reason="dethrone_margin_not_met",
             )
+            # Mirror the reject onto the challenger's PR (comment + close + GC).
+            self._notify_champion_rejected(finalist, "did not beat the champion")
             result["status_after"] = RoundStatus.ABORTED.value
             result["abort_reason"] = "dethrone_margin_not_met"
             if next_round is not None:
@@ -494,6 +499,19 @@ class EpochManager:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
 
         return result
+
+    def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
+        """Best-effort fire the reject callback (PR comment + close + GC). Sync —
+        called from the round-evaluation path; the callback itself is sync GitHub
+        API. No-op without a callback / a PR-based submission."""
+        if self._on_champion_rejected is None:
+            return
+        if not getattr(submission, "pr_number", None):
+            return
+        try:
+            self._on_champion_rejected(submission, reason)
+        except Exception as exc:
+            logger.warning("on_champion_rejected callback failed: %s", exc)
 
     def get_champion(self) -> dict[str, Any]:
         """Return metadata about the current champion solver."""

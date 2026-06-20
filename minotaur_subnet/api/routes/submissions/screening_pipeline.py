@@ -623,3 +623,19 @@ async def _run_screening_pipeline(submission_id: str) -> None:
     finally:
         if repo_dir and os.path.exists(repo_dir):
             shutil.rmtree(repo_dir, ignore_errors=True)
+        # PR-fold feedback: if screening REJECTED a PR-based submission, mirror it
+        # onto the miner's PR (comment the reason + close + GC the candidate image).
+        # Pure feedback — usable while adoption is frozen, no chain writes. Best-
+        # effort + leader-only (no-op without SOLVER_REPO_URL).
+        try:
+            final = store.get(submission_id)
+            if (
+                final is not None
+                and final.status == SubmissionStatus.REJECTED
+                and getattr(final, "pr_number", None)
+            ):
+                from minotaur_subnet.relayer.solver_repo import on_champion_rejected_pr
+                reason = final.rejection_reason or "Screening rejected"
+                on_champion_rejected_pr(final, f"### ❌ Screening rejected\n\n{reason}")
+        except Exception as exc:  # never let feedback break screening
+            logger.warning("Screening reject-feedback failed for %s: %s", submission_id, exc)

@@ -1934,9 +1934,14 @@ async def initialize(ctx: ServerContext) -> dict:
                 return new_solver
 
             _champion_merge_fn = None
+            _champion_reject_fn = None
             if os.environ.get("SOLVER_REPO_URL", "").strip() or os.environ.get("SOLVER_REPO_PATH", "").strip():
-                from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+                from minotaur_subnet.relayer.solver_repo import (
+                    on_champion_adopted_pr,
+                    on_champion_rejected_pr,
+                )
                 _champion_merge_fn = on_champion_adopted_pr
+                _champion_reject_fn = on_champion_rejected_pr
                 logger.info(
                     "Champion adoption: on-chain attestation + GitHub PR (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
@@ -1951,6 +1956,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 round_store=round_store,
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,
+                on_champion_rejected=_champion_reject_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
