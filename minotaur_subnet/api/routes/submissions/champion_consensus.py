@@ -61,11 +61,43 @@ async def _resolve_local_image_id(image_tag: str) -> str | None:
     return stdout.decode("utf-8", errors="replace").strip() or None
 
 
+async def _pull_image_by_digest(digest_ref: str) -> bool:
+    """Pull a ``<repo>@sha256:D`` image. Returns True on success.
+
+    Pulling BY DIGEST is self-verifying: the Docker daemon refuses a manifest
+    whose computed digest != D, so a successful pull guarantees the follower runs
+    byte-identical bytes to what the leader built and signed — this is what makes
+    cross-host content-addressed benchmarking sound (no ``{{.Id}}`` divergence).
+    """
+    import asyncio as _asyncio
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "docker", "pull", digest_ref,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        out, _ = await _asyncio.wait_for(proc.communicate(), timeout=600)
+    except _asyncio.TimeoutError:
+        logger.warning("docker pull timed out for %s", digest_ref)
+        return False
+    except FileNotFoundError:
+        logger.warning("docker not found while pulling %s", digest_ref)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "docker pull %s failed: %s",
+            digest_ref, out.decode("utf-8", errors="replace")[:300],
+        )
+        return False
+    return True
+
+
 async def _reactive_benchmark_candidate(
     candidate: Any,
     leader_score: float,
     tolerance_pct: float = 0.15,
     round_id: str | None = None,
+    candidate_image_id: str | None = None,
 ) -> tuple[bool, float]:
     """Independently benchmark a champion candidate to verify the leader's score.
 
@@ -98,34 +130,70 @@ async def _reactive_benchmark_candidate(
         _challenger_quorum_mode,
     )
 
-    image_tag = candidate.image_tag
-    if not image_tag:
-        logger.warning(
-            "Candidate %s has no image_tag — cannot benchmark reactively",
-            candidate.submission_id,
-        )
-        return False, 0.0
+    # Resolve the image this follower will run. Two modes, decided by the SHAPE of
+    # the leader-proposed candidate_image_id (which the whole quorum signed):
+    #
+    #   digest mode  (bare 64-hex D): reconstruct <candidate_repo>@sha256:D and
+    #     `docker pull` it. Pull-by-digest is self-verifying — the daemon rejects a
+    #     manifest whose digest != D — so the follower runs byte-identical bytes to
+    #     what the leader built. This REPLACES the broken cross-host {{.Id}} compare
+    #     (two hosts that rebuild from source get different {{.Id}}s → false reject).
+    #
+    #   legacy mode  (sha256:<id> / builtin / unset): keep the local {{.Id}} compare
+    #     against the leader's image_id — the candidate must already be built locally.
+    from minotaur_subnet.harness.image_transport import (
+        candidate_repo,
+        is_bare_digest,
+        make_digest_ref,
+    )
 
-    # Before burning CPU, make sure the image tag on this peer resolves to
-    # the same sha256 image_id the leader built. Tags are local refs; two
-    # hosts can end up with different bytecode under the same tag.
-    expected_image_id = (candidate.image_id or "").strip()
-    if expected_image_id:
-        local_image_id = await _resolve_local_image_id(image_tag)
-        if local_image_id is None:
+    if is_bare_digest(candidate_image_id):
+        run_image = make_digest_ref(candidate_repo(), candidate_image_id)
+        if not run_image:
             logger.warning(
-                "Reactive benchmark: cannot resolve local image_id for %s — "
-                "refusing to benchmark",
-                image_tag,
+                "Reactive benchmark: cannot build digest ref for %s (D=%s) — refusing",
+                candidate.submission_id, candidate_image_id,
             )
             return False, 0.0
-        if local_image_id.lower() != expected_image_id.lower():
+        if not await _pull_image_by_digest(run_image):
             logger.warning(
-                "Reactive benchmark image_id mismatch for %s: local=%s expected=%s "
-                "— refusing to benchmark",
-                candidate.submission_id, local_image_id, expected_image_id,
+                "Reactive benchmark: pull-by-digest failed for %s (%s) — refusing to sign",
+                candidate.submission_id, run_image,
             )
             return False, 0.0
+        logger.info(
+            "Reactive benchmark: pulled content-addressed candidate %s (%s)",
+            candidate.submission_id, run_image,
+        )
+    else:
+        run_image = candidate.image_tag
+        if not run_image:
+            logger.warning(
+                "Candidate %s has no image_tag — cannot benchmark reactively",
+                candidate.submission_id,
+            )
+            return False, 0.0
+
+        # Before burning CPU, make sure the image tag on this peer resolves to
+        # the same sha256 image_id the leader built. Tags are local refs; two
+        # hosts can end up with different bytecode under the same tag.
+        expected_image_id = (candidate.image_id or "").strip()
+        if expected_image_id:
+            local_image_id = await _resolve_local_image_id(run_image)
+            if local_image_id is None:
+                logger.warning(
+                    "Reactive benchmark: cannot resolve local image_id for %s — "
+                    "refusing to benchmark",
+                    run_image,
+                )
+                return False, 0.0
+            if local_image_id.lower() != expected_image_id.lower():
+                logger.warning(
+                    "Reactive benchmark image_id mismatch for %s: local=%s expected=%s "
+                    "— refusing to benchmark",
+                    candidate.submission_id, local_image_id, expected_image_id,
+                )
+                return False, 0.0
 
     # Build a temporary BenchmarkWorker to reuse intent loading and scoring
     app_store = ctx.store
@@ -206,7 +274,7 @@ async def _reactive_benchmark_candidate(
     # silently diverge consensus.
     _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
-    session = await orch.start_docker(image_tag)
+    session = await orch.start_docker(run_image)
     try:
         results = await run_benchmark(
             session,
@@ -523,7 +591,19 @@ def _build_champion_proposal_for_round(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Certified submission not found")
 
-    resolved_image_id = candidate_image_id or candidate.image_id or round_state.finalist_image_id
+    # Content-addressed (digest mode): when the candidate has a pushed GHCR manifest
+    # digest, carry its BARE 64-hex so on-chain candidateImageId == D and followers
+    # reconstruct <repo>@sha256:D to pull. Falls back to the local {{.Id}} image_id
+    # (legacy) when no digest was pushed. Peers receive the leader's resolved value
+    # via candidate_image_id, so the whole quorum signs the same D.
+    from minotaur_subnet.harness.image_transport import bare_hex
+    _candidate_digest = bare_hex(getattr(candidate, "image_digest", None))
+    resolved_image_id = (
+        candidate_image_id
+        or _candidate_digest
+        or candidate.image_id
+        or round_state.finalist_image_id
+    )
     if not resolved_image_id:
         # Genesis/subprocess submissions don't have Docker image_ids.
         # Use a placeholder so they can still be certified as bootstrap champions.

@@ -46,7 +46,6 @@ from .models import (
     SubmitResponse,
 )
 from .state import (
-    _COMMIT_HASH_RE,
     _rate_limit_buckets,
     _rate_limit_lock,
     get_champion_consensus_manager,
@@ -410,99 +409,11 @@ def _enforce_rate_limit(request: Request, principal: str) -> None:
         bucket.append(now)
 
 
-def _validate_repo_url_policy(repo_url: str) -> None:
-    """Validate repo URL format and host policy.
-
-    Hardened against URL tricks that would otherwise let a miner clone from
-    an unapproved host while passing the hostname check:
-      - @-userinfo (``https://github.com@attacker.com/x``) is rejected.
-      - IP-literal hostnames (``https://192.168.1.1/x``, ``https://[::1]/x``)
-        are rejected.
-      - Fragments / queries that embed another URL are not parsed — urlparse
-        already strips those, so they can't shadow the real host.
-    """
-    parsed = urlparse(repo_url)
-    if parsed.scheme == "file":
-        if not _env_true("ALLOW_FILE_REPO_URLS", default=False):
-            raise HTTPException(
-                status_code=400,
-                detail="repo_url must be an HTTP(S) URL unless ALLOW_FILE_REPO_URLS=1 enables file:// URLs",
-            )
-        if not parsed.path.startswith("/"):
-            raise HTTPException(
-                status_code=400,
-                detail="file repo_url must use an absolute path",
-            )
-        return
-    if parsed.scheme not in ("https", "http"):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must be an HTTP(S) URL",
-        )
-    if parsed.scheme == "http" and not _env_true("ALLOW_INSECURE_REPO_URLS", default=False):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must use HTTPS unless ALLOW_INSECURE_REPO_URLS=1",
-        )
-    if not parsed.netloc:
-        raise HTTPException(status_code=400, detail="repo_url must include a hostname")
-
-    # No userinfo is allowed — `git@github.com:x/y.git` SSH form isn't our
-    # use case (we require http/https), so any `@` in netloc means someone
-    # is trying to shadow the hostname.
-    if "@" in parsed.netloc:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "repo_url must not contain userinfo (credentials belong in "
-                "SUBMISSION_GIT_CLONE_* env vars, not in the URL)"
-            ),
-        )
-
-    host = (parsed.hostname or "").lower()
-    if not host:
-        raise HTTPException(status_code=400, detail="repo_url must include a hostname")
-
-    # Reject IP literals: IPv4 dotted quad, IPv6 in brackets (urlparse strips
-    # the brackets for .hostname but preserves the colons), and numeric-only
-    # hostnames. We require a DNS name the allowlist is meaningful against.
-    if _looks_like_ip_literal(host):
-        raise HTTPException(
-            status_code=400,
-            detail="repo_url must use a DNS hostname, not an IP address",
-        )
-
-    allowed_hosts_raw = os.environ.get("SUBMISSION_ALLOWED_REPO_HOSTS", "").strip()
-    if not allowed_hosts_raw:
-        return
-    allowed_hosts = {h.strip().lower() for h in allowed_hosts_raw.split(",") if h.strip()}
-    if host not in allowed_hosts:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"repo_url host '{host}' is not allowed by policy. "
-                f"Allowed: {sorted(allowed_hosts)}"
-            ),
-        )
-
-
-def _looks_like_ip_literal(host: str) -> bool:
-    """True if *host* parses as an IPv4 or IPv6 literal."""
-    import ipaddress
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
-
-
-def _validate_commit_hash_format(commit_hash: str) -> None:
-    """Ensure commit hash is hex and bounded."""
-    if not _COMMIT_HASH_RE.fullmatch(commit_hash):
-        raise HTTPException(
-            status_code=400,
-            detail="commit_hash must be a 7-64 char hexadecimal git hash",
-        )
+# NOTE: the old repo_url/commit_hash submission validators (host allowlist, SSRF
+# hardening, commit-hash format) were removed with the PR-based submission cutover.
+# A submission now references a PR number on the canonical solver repo, so the host
+# is FIXED (no arbitrary repo_url) and the head SHA comes from GitHub — the SSRF
+# surface is gone structurally. PR resolution + validation lives in github_pr.py.
 
 
 # ── Signature verification ──────────────────────────────────────────────────
@@ -510,14 +421,14 @@ def _validate_commit_hash_format(commit_hash: str) -> None:
 
 def verify_hotkey_signature(
     hotkey: str,
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     signature_b64: str,
     round_id: str,
 ) -> bool:
     """Verify that the signature was produced by the given hotkey.
 
-    Message format: "{repo_url}:{commit_hash}:{round_id}".
+    Message format: "{pr_number}:{head_sha}:{round_id}".
     Uses bittensor Keypair.verify() for Ed25519 signature checks.
 
     Returns True if valid, False otherwise.
@@ -527,8 +438,8 @@ def verify_hotkey_signature(
         from bittensor import Keypair
 
         message = build_submission_message(
-            repo_url,
-            commit_hash,
+            pr_number,
+            head_sha,
             round_id=round_id,
         )
         signature_bytes = base64.b64decode(signature_b64)
@@ -540,15 +451,15 @@ def verify_hotkey_signature(
 
 
 def build_submission_message(
-    repo_url: str,
-    commit_hash: str,
+    pr_number: int,
+    head_sha: str,
     *,
     round_id: str,
 ) -> str:
-    """Build the signed submission payload: {repo_url}:{commit_hash}:{round_id}."""
+    """Build the signed submission payload: {pr_number}:{head_sha}:{round_id}."""
     if not round_id:
         raise ValueError("round_id is required")
-    return f"{repo_url}:{commit_hash}:{round_id}"
+    return f"{pr_number}:{head_sha}:{round_id}"
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -643,15 +554,32 @@ async def create_submission(
         requested_round_id=body.round_id,
     )
 
-    _validate_repo_url_policy(body.repo_url)
-    _validate_commit_hash_format(body.commit_hash)
+    # Resolve the PR (host fixed to the canonical solver repo) -> fork clone_url +
+    # the live head SHA, and reject if the live head != the miner-signed head_sha
+    # (force-push / TOCTOU guard). The miner signs the exact commit it built.
+    from minotaur_subnet.api.routes.submissions.github_pr import (
+        PRResolutionError,
+        resolve_pr,
+    )
+    try:
+        pr = resolve_pr(body.pr_number)
+    except PRResolutionError as exc:
+        raise HTTPException(status_code=400, detail=f"PR resolution failed: {exc}")
+    if pr["head_sha"].lower() != body.head_sha.strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"PR #{body.pr_number} live head {pr['head_sha']} != signed head "
+                f"{body.head_sha} (force-push after signing?)"
+            ),
+        )
 
-    # Verify hotkey signature against the authoritative open round (not the
-    # client-supplied round_id). round-based only — epoch signing is gone.
+    # Verify hotkey signature over (pr_number, head_sha, round) against the
+    # authoritative open round (not the client-supplied round_id).
     if not verify_hotkey_signature(
         hotkey=body.hotkey,
-        repo_url=body.repo_url,
-        commit_hash=body.commit_hash,
+        pr_number=body.pr_number,
+        head_sha=body.head_sha,
         round_id=current_round.round_id,
         signature_b64=body.signature,
     ):
@@ -660,14 +588,16 @@ async def create_submission(
             detail="Invalid hotkey signature",
         )
 
-    # Check for duplicate submission
+    # Check for duplicate submission. Store the RESOLVED fork clone_url + head SHA
+    # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).
     try:
         sub = store.create(
-            repo_url=body.repo_url,
-            commit_hash=body.commit_hash,
+            repo_url=pr["clone_url"],
+            commit_hash=pr["head_sha"],
             epoch=body.epoch,
             hotkey=body.hotkey,
             round_id=current_round.round_id,
+            pr_number=body.pr_number,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -937,13 +867,23 @@ async def solver_round_consensus_proposal(
         _candidate.commit_hash == "builtin"
         or (_candidate.repo_url or "").startswith("builtin://")
     )
-    if not is_builtin and _candidate.image_tag:
+    # Benchmark when we have something to run: a locally-built image_tag (legacy)
+    # OR a content-addressed digest to pull (digest mode — the follower need not
+    # have built it locally). Without this, a digest-mode follower with no local
+    # image_tag would SKIP verification and sign blind.
+    from minotaur_subnet.harness.image_transport import is_bare_digest
+    _proposed_image = body.candidate_image_id or proposal.candidate_image_id
+    _can_benchmark = bool(_candidate.image_tag) or is_bare_digest(_proposed_image)
+    if not is_builtin and _can_benchmark:
         try:
             verified, local_score = await _reactive_benchmark_candidate(
                 candidate=_candidate,
                 leader_score=round_state.finalist_score or 0.0,
                 tolerance_pct=0.15,
                 round_id=round_state.round_id,
+                # The leader-signed candidate_image_id: a bare 64-hex digest D in
+                # content-addressed mode (pull <repo>@sha256:D), else legacy {{.Id}}.
+                candidate_image_id=body.candidate_image_id or proposal.candidate_image_id,
             )
             if not verified:
                 return {

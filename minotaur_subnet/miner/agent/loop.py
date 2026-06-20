@@ -32,6 +32,56 @@ from minotaur_subnet.sdk.strategy import Strategy
 logger = logging.getLogger(__name__)
 
 
+def _open_or_get_pr(
+    upstream: str, head_owner: str, branch: str, token: str, *, head_sha: str = "",
+) -> int | None:
+    """Open (or find the existing open) PR for ``head_owner:branch`` against
+    ``upstream``'s default branch, returning the PR number.
+
+    The PR-based submission fold: the miner forks the canonical solver repo, pushes
+    a branch, and opens a PR; the PR number + head SHA are what it signs and submits.
+    Idempotent — GitHub returns 422 if a PR already exists for the head, in which
+    case we look it up. Returns None on failure (no token / API error).
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    if not token or not upstream or not head_owner or not branch:
+        return None
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Authorization": f"Bearer {token}",
+    }
+    head = f"{head_owner}:{branch}"
+    base_api = f"https://api.github.com/repos/{upstream}"
+
+    def _req(method: str, path: str, payload: dict | None = None):
+        data = _json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(base_api + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 fixed host
+                body = resp.read().decode("utf-8")
+                return resp.status, (_json.loads(body) if body else None)
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except Exception:
+            return 0, None
+
+    title = f"Champion submission: {head_owner}/{branch}"
+    body = f"Automated Minotaur solver submission.\nhead_sha: `{head_sha}`"
+    status, data = _req("POST", "/pulls", {"title": title, "head": head, "base": "main", "body": body})
+    if status == 201 and data:
+        return int(data["number"])
+    # 422 = a PR already exists for this head -> find it.
+    status, data = _req("GET", f"/pulls?head={head}&state=open")
+    if status == 200 and isinstance(data, list) and data:
+        return int(data[0]["number"])
+    logger.warning("Could not open/find PR for %s on %s (status=%s)", head, upstream, status)
+    return None
+
+
 async def submit_solver_via_git(
     source: str,
     validator_url: str,
@@ -183,24 +233,45 @@ async def submit_solver_via_git(
     except Exception:
         pass
 
-    # Sign the submission
+    # PR-based submission (the fold): open/find the PR for this branch on the
+    # canonical solver repo; the PR number + head SHA are the submission identity.
+    upstream = os.environ.get("SOLVER_UPSTREAM_REPO", "subnet112/minotaur-solver").strip()
+    head_owner = os.environ.get("MINER_GITHUB_USER", "").strip()
+    gh_token = (os.environ.get("MINER_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    head_sha = commit_hash  # the pushed HEAD — the exact commit we sign + that gets built
+    pr_number = None
+    _env_pr = os.environ.get("MINER_PR_NUMBER", "").strip()
+    if _env_pr.isdigit():
+        pr_number = int(_env_pr)  # operator supplied a pre-opened PR
+    elif gh_token and head_owner:
+        pr_number = _open_or_get_pr(upstream, head_owner, branch_name, gh_token, head_sha=head_sha)
+    if not pr_number:
+        return {
+            "accepted": False,
+            "error": (
+                "Could not resolve a PR for this submission. Set MINER_PR_NUMBER, or "
+                "MINER_GITHUB_USER + MINER_GITHUB_TOKEN so the miner can open one."
+            ),
+        }
+
+    # Sign the submission: {pr_number}:{head_sha}:{round_id}
     hotkey = miner_id
     signature = ""
     try:
         from bittensor_wallet import Keypair
         keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
-        message = f"{repo_url}:{commit_hash}:{round_id}"
+        message = f"{pr_number}:{head_sha}:{round_id}"
         signature = base64.b64encode(keypair.sign(message.encode())).decode("ascii")
         hotkey = keypair.ss58_address
     except ImportError:
         pass
 
-    # Submit via production git path
+    # Submit via the PR path
     try:
         url = f"{validator_url.rstrip('/')}/v1/submissions"
         payload = {
-            "repo_url": repo_url,
-            "commit_hash": commit_hash,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
             "epoch": epoch,
             "round_id": round_id,
             "hotkey": hotkey,

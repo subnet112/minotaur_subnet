@@ -1891,19 +1891,28 @@ async def initialize(ctx: ServerContext) -> dict:
                     logger.warning("Genesis champion activated but baseline solver unavailable")
                     return None
 
-                image_ref = (submission.image_id or "").strip()
-                if not image_ref.startswith("sha256:"):
-                    logger.warning(
-                        "Champion %s missing immutable image_id; refusing hot-swap",
-                        submission.submission_id,
-                    )
-                    return None
+                # Content-addressed: prefer the portable <repo>@sha256:D digest ref
+                # (pullable on any host — start_docker pre-pulls it) over the local
+                # {{.Id}} image_id (only present where the image was built). This is
+                # what lets a follower / fresh node / restart run the certified bytes.
+                from minotaur_subnet.harness.image_transport import is_digest_ref
+                _digest = (getattr(submission, "image_digest", None) or "").strip()
+                if is_digest_ref(_digest):
+                    image_ref = _digest
+                else:
+                    image_ref = (submission.image_id or "").strip()
+                    if not image_ref.startswith("sha256:"):
+                        logger.warning(
+                            "Champion %s missing immutable image_id/digest; refusing hot-swap",
+                            submission.submission_id,
+                        )
+                        return None
 
                 from minotaur_subnet.harness.runtime_solver import DockerRuntimeSolver
 
                 logger.info(
-                    "Starting champion runtime from image_id %s",
-                    image_ref[:20],
+                    "Starting champion runtime from image_ref %s",
+                    image_ref[:24],
                 )
                 new_solver = await asyncio.wait_for(
                     DockerRuntimeSolver.create(
@@ -1925,9 +1934,14 @@ async def initialize(ctx: ServerContext) -> dict:
                 return new_solver
 
             _champion_merge_fn = None
+            _champion_reject_fn = None
             if os.environ.get("SOLVER_REPO_URL", "").strip() or os.environ.get("SOLVER_REPO_PATH", "").strip():
-                from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+                from minotaur_subnet.relayer.solver_repo import (
+                    on_champion_adopted_pr,
+                    on_champion_rejected_pr,
+                )
                 _champion_merge_fn = on_champion_adopted_pr
+                _champion_reject_fn = on_champion_rejected_pr
                 logger.info(
                     "Champion adoption: on-chain attestation + GitHub PR (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
@@ -1942,6 +1956,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 round_store=round_store,
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,
+                on_champion_rejected=_champion_reject_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
