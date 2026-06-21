@@ -381,10 +381,14 @@ async def _independent_adopt_vote(
     from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
     chal_card = worker._build_scorecard(chal_results).to_dict()
-    # has_champion mirrors the leader EXACTLY: bool(self._champion.submission_id),
-    # i.e. whether a champion SUBMISSION (or scored/adopted genesis) exists —
-    # independent of whether its image resolves.
-    has_champion = worker._resolve_champion_submission() is not None
+    # has_champion mirrors the leader EXACTLY: the leader's
+    # bool(self._champion.submission_id) where self._champion comes from
+    # _restore_active_champion_submission (ADOPTED champion or active-champion
+    # snapshot). A SCORED-but-never-ADOPTED genesis is NOT an incumbent on EITHER
+    # side — that is true bootstrap. _resolve_incumbent_submission() replicates the
+    # leader's resolution precisely (NOT _resolve_champion_image, which falls back
+    # to a scored genesis just to pick an image to run).
+    has_champion = worker._resolve_incumbent_submission() is not None
     champ_image = worker._resolve_champion_image()
 
     if not has_champion:

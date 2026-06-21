@@ -38,7 +38,7 @@ class _Worker:
         # so the existing has-champion tests are unaffected.
         self._champ_sub = champ_sub
 
-    def _resolve_champion_submission(self):
+    def _resolve_incumbent_submission(self):
         return self._champ_sub
 
     def _resolve_champion_image(self):
@@ -163,3 +163,42 @@ def test_bootstrap_rejects_first_champion_below_floor(monkeypatch):
     )
     adopt, _ = _vote(w, 0.1, monkeypatch)
     assert adopt is False
+
+
+# ── has_champion PARITY with the leader (the genesis-as-incumbent regression) ──
+# The leader's _restore_active_champion_submission counts ONLY an ADOPTED champion
+# or the active-champion snapshot — NOT a SCORED-but-never-ADOPTED genesis. The
+# follower MUST resolve has_champion identically, or the first adoption deadlocks
+# fleet-wide (leader has_champion=False adopts a floor-clearer; followers counting
+# genesis as incumbent demand the dethrone margin -> 0 quorum).
+
+def _bench_worker(*, adopted=None, snapshot_sid=None, snapshot_sub=None, scored_genesis=None):
+    from unittest.mock import MagicMock
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+    sub = MagicMock()
+    sub.get_champion.return_value = adopted
+    sub.get_by_hotkey_epoch.return_value = scored_genesis  # present but must NOT count
+    sub.get.return_value = snapshot_sub
+    rs = MagicMock()
+    rs.get_active_champion.return_value = SimpleNamespace(submission_id=snapshot_sid)
+    return BenchmarkWorker(submission_store=sub, round_store=rs)
+
+
+def test_incumbent_excludes_scored_genesis_matching_leader():
+    # SCORED genesis present, but NO adopted champion / snapshot -> NOT an incumbent
+    # -> None -> has_champion=False -> bootstrap on BOTH sides (the fix).
+    genesis = SimpleNamespace(submission_id="sub_genesis", status="scored")
+    w = _bench_worker(adopted=None, snapshot_sid=None, scored_genesis=genesis)
+    assert w._resolve_incumbent_submission() is None
+
+
+def test_incumbent_returns_adopted_champion():
+    champ = SimpleNamespace(submission_id="sub_champ")
+    w = _bench_worker(adopted=champ)
+    assert w._resolve_incumbent_submission() is champ
+
+
+def test_incumbent_returns_snapshot_when_no_adopted():
+    snap = SimpleNamespace(submission_id="sub_snap")
+    w = _bench_worker(adopted=None, snapshot_sid="sub_snap", snapshot_sub=snap)
+    assert w._resolve_incumbent_submission() is snap

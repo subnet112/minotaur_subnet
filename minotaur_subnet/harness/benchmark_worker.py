@@ -1048,14 +1048,43 @@ class BenchmarkWorker:
 
         return 1
 
-    def _resolve_champion_submission(self) -> Any | None:
-        """The current champion SUBMISSION — an explicit adopted champion, else a
-        SCORED/ADOPTED genesis as the bootstrap incumbent; ``None`` at true bootstrap.
+    def _resolve_incumbent_submission(self) -> Any | None:
+        """The current INCUMBENT champion submission, resolved EXACTLY like the
+        leader's ``EpochManager._restore_active_champion_submission``: the ADOPTED
+        champion, else the round-store active-champion snapshot, else ``None``.
 
-        ``(_resolve_champion_submission() is not None)`` mirrors the leader's
-        ``bool(self._champion.submission_id)`` exactly, so a follower derives the
-        SAME ``has_champion`` the leader's adoption rule uses — regardless of
-        whether the champion's image happens to resolve.
+        ``(_resolve_incumbent_submission() is not None)`` therefore equals the
+        leader's ``bool(self._champion.submission_id)``, so the follower derives the
+        SAME ``has_champion`` for the adoption rule. CRUCIAL: a SCORED-but-never-
+        ADOPTED genesis is NOT an incumbent here — the leader doesn't count it
+        either (genesis is seeded SCORED and never adopt()ed), so that state is true
+        bootstrap (has_champion=False) on BOTH sides. (Do not confuse this with
+        ``_resolve_champion_image`` below, which DOES fall back to a scored genesis
+        to pick an image to *run* — a separate concern from has_champion.)
+        """
+        adopted = self._sub_store.get_champion()
+        if adopted is not None:
+            return adopted
+        if self._round_store is not None:
+            try:
+                snapshot = self._round_store.get_active_champion()
+                sid = getattr(snapshot, "submission_id", None)
+                if sid:
+                    return self._sub_store.get(sid)
+            except Exception:  # pragma: no cover - defensive
+                return None
+        return None
+
+    def _resolve_champion_image(self) -> str | None:
+        """Resolve the Docker image tag of the current champion (or genesis).
+
+        Mirrors the champion resolution in
+        ``_maybe_bootstrap_solving_apps_with_champion``: prefer an explicit
+        champion, fall back to a SCORED/ADOPTED genesis submission, and map a
+        genesis hotkey with no image to the configured genesis solver image.
+        Returns ``None`` when no usable champion image is available. (This is the
+        image to RUN/benchmark — NOT the has_champion incumbent; see
+        ``_resolve_incumbent_submission``.)
         """
         champion = self._sub_store.get_champion()
         if champion is None:
@@ -1065,18 +1094,6 @@ class BenchmarkWorker:
                 SubmissionStatus.ADOPTED,
             ):
                 champion = genesis
-        return champion
-
-    def _resolve_champion_image(self) -> str | None:
-        """Resolve the Docker image tag of the current champion (or genesis).
-
-        Mirrors the champion resolution in
-        ``_maybe_bootstrap_solving_apps_with_champion``: prefer an explicit
-        champion, fall back to a SCORED/ADOPTED genesis submission, and map a
-        genesis hotkey with no image to the configured genesis solver image.
-        Returns ``None`` when no usable champion image is available.
-        """
-        champion = self._resolve_champion_submission()
         if champion is None:
             return None
         image_tag = champion.image_tag
