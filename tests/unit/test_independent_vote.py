@@ -22,15 +22,24 @@ class _Card:
         return self._d
 
 
-class _Worker:
-    """Stand-in for BenchmarkWorker: serves champion image + scores + scorecards."""
+_PRESENT = object()  # sentinel: a champion submission exists
 
-    def __init__(self, *, champ_image, chal_card, champ_card, champ_score):
+
+class _Worker:
+    """Stand-in for BenchmarkWorker: serves champion submission/image + scores."""
+
+    def __init__(self, *, champ_image, chal_card, champ_card, champ_score, champ_sub=_PRESENT):
         self._champ_image = champ_image
         self._chal_card = chal_card
         self._champ_card = champ_card
         self._champ_score = champ_score
         self._epoch_block_number = 123
+        # The champion SUBMISSION (or None for true bootstrap). Defaults to present
+        # so the existing has-champion tests are unaffected.
+        self._champ_sub = champ_sub
+
+    def _resolve_champion_submission(self):
+        return self._champ_sub
 
     def _resolve_champion_image(self):
         return self._champ_image
@@ -113,9 +122,11 @@ def test_rejects_within_margin(monkeypatch):
     assert adopt is False
 
 
-def test_rejects_when_champion_image_unresolvable(monkeypatch):
-    # Conservative guard: no champion image -> never silently adopt.
+def test_rejects_when_champion_exists_but_image_unresolvable(monkeypatch):
+    # has_champion=True (a champion submission exists) but its image can't resolve
+    # -> can't benchmark the incumbent to prove the margin -> conservative REJECT.
     w = _Worker(
+        champ_sub=_PRESENT,
         champ_image=None,
         chal_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
         champ_card={},
@@ -123,3 +134,32 @@ def test_rejects_when_champion_image_unresolvable(monkeypatch):
     )
     adopt, score = _vote(w, 0.9, monkeypatch)
     assert adopt is False and score == 0.9
+
+
+def test_bootstrap_adopts_first_champion_when_no_incumbent(monkeypatch):
+    # True bootstrap: no champion submission AT ALL -> has_champion=False, matching
+    # the leader. A challenger that clears the absolute floor is ADOPTED (no margin,
+    # no incumbent benchmark) — NOT auto-rejected (which would deadlock first adoption).
+    w = _Worker(
+        champ_sub=None,
+        champ_image=None,
+        chal_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
+        champ_card={},
+        champ_score=0.0,
+    )
+    adopt, score = _vote(w, 0.9, monkeypatch)
+    assert adopt is True and score == 0.9
+
+
+def test_bootstrap_rejects_first_champion_below_floor(monkeypatch):
+    # Bootstrap but the challenger fails the absolute per-app floor -> REJECT even
+    # with no incumbent (the floor still applies).
+    w = _Worker(
+        champ_sub=None,
+        champ_image=None,
+        chal_card={"app_scores": {"dex": 0.1}, "app_onchain": {}},
+        champ_card={},
+        champ_score=0.0,
+    )
+    adopt, _ = _vote(w, 0.1, monkeypatch)
+    assert adopt is False

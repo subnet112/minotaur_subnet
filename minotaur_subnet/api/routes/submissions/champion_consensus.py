@@ -381,10 +381,48 @@ async def _independent_adopt_vote(
     from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
     chal_card = worker._build_scorecard(chal_results).to_dict()
+    # has_champion mirrors the leader EXACTLY: bool(self._champion.submission_id),
+    # i.e. whether a champion SUBMISSION (or scored/adopted genesis) exists —
+    # independent of whether its image resolves.
+    has_champion = worker._resolve_champion_submission() is not None
     champ_image = worker._resolve_champion_image()
+
+    if not has_champion:
+        # BOOTSTRAP (has_champion=False): no incumbent to dethrone. Match the leader
+        # — adopt a first champion that clears the absolute floor (no margin). MUST
+        # NOT auto-reject here: that would deadlock the very first adoption.
+        adopt, reason = evaluate_adoption(
+            challenger_score=chal_score,
+            champion_score=0.0,
+            challenger_scorecard=chal_card,
+            champion_scorecard={},
+            dethrone_margin=DETHRONE_MARGIN,
+            has_champion=False,
+        )
+        logger.info(
+            "[independent-vote] role=follower candidate=%s round=%s vote=%s "
+            "chal_score=%.4f champ=BOOTSTRAP(no incumbent): %s",
+            candidate.submission_id, round_id,
+            "ADOPT" if adopt else "REJECT", chal_score, reason,
+        )
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_independent_vote = {
+                "candidate_id": candidate.submission_id, "role": "follower",
+                "vote": "ADOPT" if adopt else "REJECT",
+                "chal_score": round(float(chal_score), 4), "champ_score": None,
+                "round_id": round_id, "reason": reason,
+            }
+        except Exception:  # observe-only — must never break verification
+            pass
+        return adopt, chal_score
+
     if not champ_image:
+        # has_champion=True but the incumbent's image can't be resolved — we cannot
+        # benchmark it to verify the challenger beats it, so REJECT conservatively
+        # (NOT a bootstrap: an incumbent exists, the margin must be proven).
         logger.warning(
-            "[independent-vote] candidate=%s: cannot resolve current champion image "
+            "[independent-vote] candidate=%s: champion exists but image unresolvable "
             "— voting REJECT (cannot verify improvement)",
             candidate.submission_id,
         )
