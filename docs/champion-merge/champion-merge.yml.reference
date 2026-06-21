@@ -1,0 +1,95 @@
+# Champion Cert Verification — ADVISORY check (NOT the merge gate).
+#
+# MERGE AUTHORITY DOES NOT LIVE HERE. The single source of merge authority is the
+# leader's own in-process on-chain verification in
+# minotaur_subnet/relayer/solver_repo.py::merge_miner_pr_when_certified(), which
+# re-resolves the PR head SHA, reads ChampionRegistry over web3, asserts
+# keccak(head.sha)==commitHash && exists && approvalCount>=getQuorumRequired(),
+# refuses any PR whose diff touches .github/**, and ONLY then squash-merges
+# pinned to that head SHA. This workflow is DEFENSE-IN-DEPTH + VISIBILITY only.
+#
+# WHY pull_request_target (NOT plain pull_request): under plain pull_request a
+# FORK PR runs the FORK's copy of this file, letting a fork emit a no-op job
+# named `verify-champion-cert` that satisfies a name-matched required check with
+# ZERO verification (v1 attack #1). pull_request_target pins the workflow to the
+# BASE/default branch, so a fork CANNOT substitute it. It is kept safe because we
+# NEVER actions/checkout fork HEAD and run ONLY string ops + pinned `cast`
+# on-chain reads against the authoritative event head.sha — no untrusted code is
+# fetched or executed, so the pull_request_target RCE class does not apply.
+# permissions: contents: read (read-only; this job writes nothing, merges nothing).
+#
+# Even if this check is somehow spoofed green, the leader ignores it — the
+# in-process web3 check is the gate. The ruleset lists this context only so an
+# HONEST PR cannot merge while verification is red (fail-closed UX).
+#
+# DO NOT rename the job `verify-champion-cert` without updating the ruleset
+# required_status_checks context. DO NOT add actions/checkout of fork HEAD, a
+# fork-controlled Makefile/composite-action, or flip back to plain pull_request —
+# CODEOWNERS on .github/workflows/ guards this file, and the leader auto-rejects
+# any champion PR whose diff touches .github/**.
+
+name: Champion Cert Verification
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: champion-verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-champion-cert:
+    name: verify-champion-cert
+    runs-on: ubuntu-latest
+    env:
+      BTEVM_STATE_RPC: https://lite.chain.opentensor.ai
+      CHAMPION_REGISTRY: ${{ vars.CHAMPION_REGISTRY_ADDRESS }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # NEVER actions/checkout — fork HEAD code is never fetched or executed.
+      - name: Install Foundry (cast)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Advisory on-chain cert check (NOT authoritative)
+        run: |
+          set -euo pipefail
+          [ -n "${CHAMPION_REGISTRY:-}" ] || { echo "::error::CHAMPION_REGISTRY_ADDRESS unset"; exit 1; }
+          REG="$CHAMPION_REGISTRY"
+
+          # Only the trusted event head.sha is an input (not fork-controlled content).
+          SHA="$(printf '%s' "$PR_HEAD_SHA" | tr 'A-Z' 'a-z')"
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::head sha not 40-hex: $PR_HEAD_SHA"; exit 1; }
+          # on-chain commitHash == keccak(utf8(lowercase-40-hex)) (_str_to_bytes32 keccak path)
+          TARGET="$(cast keccak "$SHA" | tr 'A-Z' 'a-z')"
+          echo "head sha=$SHA target=$TARGET"
+
+          rpc() { local i out; for i in 1 2 3 4 5; do
+            if out="$(cast "$@" --rpc-url "$BTEVM_STATE_RPC" 2>/dev/null)"; then printf '%s' "$out"; return 0; fi
+            sleep $((i*4)); done; return 1; }
+
+          QUORUM="$(rpc call "$REG" 'getQuorumRequired()(uint256)' | awk '{print $1}')" \
+            || { echo "::error::getQuorumRequired read failed"; exit 1; }
+          printf '%s' "$QUORUM" | grep -Eq '^[0-9]+$' && [ "$QUORUM" -ge 1 ] \
+            || { echo "::error::bad quorum $QUORUM (fail-closed)"; exit 1; }
+
+          REC="$(rpc call "$REG" 'getLatestChampion()((bytes32,bytes32,bytes32,bytes32,uint256,uint256,uint256,bool))')" \
+            || { echo "::error::getLatestChampion read failed"; exit 1; }
+          C="$(printf '%s' "$REC" | tr -d '() ')"
+          COMMIT="$(printf '%s' "$C" | cut -d, -f4 | tr 'A-Z' 'a-z')"
+          APPROVALS="$(printf '%s' "$C" | cut -d, -f7 | awk '{print $1}')"
+          EXISTS="$(printf '%s' "$C" | cut -d, -f8)"
+          echo "latest commit=$COMMIT approvals=$APPROVALS exists=$EXISTS quorum=$QUORUM"
+
+          [ "$EXISTS" = "true" ]      || { echo "::error::getLatestChampion.exists!=true (fail-closed)"; exit 1; }
+          [ "$COMMIT" = "$TARGET" ]   || { echo "::error::latest commitHash $COMMIT != keccak(head.sha) $TARGET — NOT certified-as-latest (advisory; leader re-checks by round)"; exit 1; }
+          printf '%s' "$APPROVALS" | grep -Eq '^[0-9]+$' || { echo "::error::non-numeric approvals"; exit 1; }
+          [ "$APPROVALS" -ge "$QUORUM" ] || { echo "::error::approvals $APPROVALS < quorum $QUORUM"; exit 1; }
+
+          echo "=== ADVISORY VERIFICATION PASSED — leader's in-process check is authoritative ==="
