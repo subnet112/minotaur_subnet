@@ -84,7 +84,7 @@ def test_better_challenger_votes_adopt(monkeypatch):
     assert vote["vote"] == "ADOPT", vote
     assert vote["champ_score"] == 0.70 and vote["chal_score"] == 0.90
     assert vote["champion_image"] == "champ:ref"
-    assert vote["validator_seed"] == "val-1"
+    assert vote["validator_id"] == "val-1"
 
 
 def test_worse_challenger_votes_reject(monkeypatch):

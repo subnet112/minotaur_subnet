@@ -150,13 +150,14 @@ def _allow_subprocess_benchmark() -> bool:
 
 
 def _challenger_quorum_mode() -> bool:
-    """Whether the diverse-subset / independent-vote challenger-validation model is on.
+    """Whether the challenger-vote OBSERVABILITY diagnostics are published.
 
-    Default OFF — the legacy shared (round_id-only) subset draw and the follower
-    reproducibility check are unchanged until this is explicitly enabled for the
-    quorum-validation rollout. When ON, each validator draws its own diverse
-    Stage-2 subset (seeded by its identity) so adoption is decided by a quorum of
-    independent verdicts rather than reproduction of the leader's number.
+    NOTE (#242): this no longer affects sampling or verification. The Stage-2
+    corpus is always a single round-seeded SHARED draw, and every follower always
+    casts an INDEPENDENT champion-vs-challenger verdict over it (the quorum). This
+    flag now only toggles the observe-only diagnostics — the leader's would-be
+    vote publish, the ``/health`` independent_vote view, and the admin shadow-vote
+    endpoint — so operators can watch fleet agreement without it gating consensus.
     """
     import os
 
@@ -185,12 +186,8 @@ class BenchmarkWorker:
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
-        validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
-        validator_set_provider: Any = None,  # Callable[[], list[str]] -> current validator IDs (partition)
-        validator_self_id_provider: Any = None,  # Callable[[], str] -> this node's id in the SET's space
+        validator_identity: str | None = None,  # this validator's stable id (observability label)
     ) -> None:
-        self._validator_set_provider = validator_set_provider
-        self._validator_self_id_provider = validator_self_id_provider
         self._sub_store = submission_store
         self._app_store = app_store
         self._js_engine = js_engine
@@ -205,8 +202,9 @@ class BenchmarkWorker:
         # Injected by the API layer (keeps the harness free of API imports):
         # round_id -> the round-anchored benchmark-chain fork block, or None.
         self._pin_resolver = pin_resolver
-        # Stable per-validator id (hotkey ss58); seeds this validator's diverse
-        # Stage-2 subset when CHALLENGER_QUORUM_MODE is on (else None = shared draw).
+        # Stable per-validator id (hotkey ss58) — observability label only; the
+        # Stage-2 corpus is a single round-seeded SHARED draw for every validator
+        # (#242), so it no longer seeds the sample.
         self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
@@ -216,62 +214,6 @@ class BenchmarkWorker:
         # (the shared BlockLoop engine already hot-reloads this way; this worker
         # keeps its own engine, so it needs the same hash-diff).
         self._loaded_js_hashes: dict[str, str] = {}
-
-    def set_validator_set_provider(self, provider: Any) -> None:
-        """Wire the current-validator-set resolver (for the coverage partition).
-
-        Set after construction because the validator set / consensus peers are
-        resolved later in startup than the benchmark worker is built.
-        """
-        self._validator_set_provider = provider
-
-    def set_validator_self_id_provider(self, provider: Any) -> None:
-        """Wire this node's own id resolver, in the SAME space as the set.
-
-        The partition matches this node against the validator set, so the self id
-        must be the EVM address (``manager.validator_id``), NOT the SS58 hotkey
-        used for the diverse-subset seed — otherwise ``me in set`` is always False
-        and the partition silently falls back to the (overlapping) diverse draw.
-        """
-        self._validator_self_id_provider = provider
-
-    def _resolve_stage2_partition(self) -> tuple[str | None, int | None, int | None]:
-        """Resolve this validator's Stage-2 corpus selection mode.
-
-        Returns ``(validator_seed, validator_index, validator_count)``:
-          - PARTITION (None, idx, count): quorum mode on AND this node's self id
-            resolves into the current validator set -> disjoint coverage slice.
-          - DIVERSE (hotkey, None, None): quorum mode on but the set/self-id can't
-            be resolved -> per-validator overlapping draw (graceful fallback).
-          - SHARED (None, None, None): quorum mode off -> round-only shared draw.
-
-        The self id and the set MUST be in the same space (EVM address). The
-        diverse-fallback seed uses the SS58 hotkey, which only needs to be stable.
-        """
-        if not _challenger_quorum_mode():
-            return None, None, None
-        _vset: list[str] = []
-        if self._validator_set_provider is not None:
-            try:
-                _vset = sorted({str(v) for v in (self._validator_set_provider() or []) if v})
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Validator-set resolve for partition failed: %s", exc)
-                _vset = []
-        _me: str | None = None
-        if self._validator_self_id_provider is not None:
-            try:
-                _raw = self._validator_self_id_provider()
-                _me = str(_raw) if _raw else None
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Self-id resolve for partition failed: %s", exc)
-                _me = None
-        if _vset and _me and _me in _vset:
-            idx = _vset.index(_me)
-            logger.info(
-                "Stage-2 partition: validator %d of %d (coverage slice)", idx, len(_vset)
-            )
-            return None, idx, len(_vset)
-        return self._validator_identity, None, None  # diverse-subset fallback
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.
@@ -908,9 +850,9 @@ class BenchmarkWorker:
         if n_per_chain is None:
             import os
             try:
-                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "10"))
+                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "50"))
             except ValueError:
-                n_per_chain = 10
+                n_per_chain = 50
 
         # Stage-2 corpus source. Default: the local order store. Opt-in
         # (BENCHMARK_CHAIN_CORPUS): rebuild it from chain (plan Phase 5b) so a
@@ -940,15 +882,14 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
-        _seed, _v_index, _v_count = self._resolve_stage2_partition()
+        # Single round-seeded SHARED draw — every validator derives the identical
+        # subset (#242), so the champion-vs-challenger verdict is over one common
+        # corpus and ratifiable by quorum.
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
             records=chain_records,
-            validator_seed=_seed,
-            validator_index=_v_index,
-            validator_count=_v_count,
         )
         if not sampled:
             return []
@@ -1233,7 +1174,7 @@ class BenchmarkWorker:
             "chal_score": round(float(chal_score), 4),
             "champ_score": round(float(champ_score), 4),
             "champion_image": champ_image,
-            "validator_seed": self._validator_identity,
+            "validator_id": self._validator_identity,
             "round_id": round_id,
             "reason": reason,
         }

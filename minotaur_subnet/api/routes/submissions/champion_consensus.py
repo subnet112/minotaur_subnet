@@ -125,10 +125,7 @@ async def _reactive_benchmark_candidate(
         require_real_sim_default,
         run_benchmark,
     )
-    from minotaur_subnet.harness.benchmark_worker import (
-        BenchmarkWorker,
-        _challenger_quorum_mode,
-    )
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 
     # Resolve the image this follower will run. Two modes, decided by the SHAPE of
     # the leader-proposed candidate_image_id (which the whole quorum signed):
@@ -252,10 +249,10 @@ async def _reactive_benchmark_candidate(
     score_fn = await worker._build_score_fn(intents)
     intents = worker._enrich_intents_with_manifests(intents)
 
-    # Stage 2 historical scenarios. Legacy (flag off): seeded by round_id alone so
-    # peers sample the SAME set as the leader (reproducibility check). Under
-    # CHALLENGER_QUORUM_MODE the worker's identity seeds a DIFFERENT, diverse subset
-    # per validator — intended, so each casts an independent verdict over its own slice.
+    # Stage 2 historical scenarios — a single round-seeded SHARED corpus, identical
+    # on every validator (#242). The follower re-runs this same corpus, so its
+    # independent champion-vs-challenger verdict (below) is directly comparable to
+    # the leader's and ratifiable by quorum.
     if round_id:
         try:
             historical = worker._load_historical_scenarios(round_id)
@@ -300,17 +297,6 @@ async def _reactive_benchmark_candidate(
     # Compute average score (same logic as BenchmarkWorker._compute_avg_score)
     local_score = worker._compute_avg_score(results)
 
-    # CHALLENGER_QUORUM_MODE: cast an INDEPENDENT adopt vote rather than reproducing
-    # the leader's number. Benchmark the CURRENT champion on this follower's own
-    # (diverse) intents and apply the SAME adoption rule the leader uses. The vote
-    # is this validator's own judgement; quorum of YES votes -> adopt.
-    if _challenger_quorum_mode():
-        return await _independent_adopt_vote(
-            worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
-            chal_results=results, chal_score=local_score, candidate=candidate,
-            round_id=round_id,
-        )
-
     logger.info(
         "Reactive benchmark for %s: local_score=%.4f leader_score=%.4f",
         candidate.submission_id, local_score, leader_score,
@@ -346,20 +332,17 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:  # observe-only — must never break verification
             logger.warning("[round-anchor-shadow] follower logging failed (ignored): %s", exc)
 
-    if leader_score <= 0:
-        # Leader claims zero — accept if we also scored zero
-        return local_score <= 0, local_score
-
-    relative_diff = abs(local_score - leader_score) / max(leader_score, 0.01)
-    verified = relative_diff <= tolerance_pct
-    if not verified:
-        logger.warning(
-            "Reactive benchmark REJECTED %s: relative_diff=%.2f%% > tolerance=%.2f%%",
-            candidate.submission_id,
-            relative_diff * 100,
-            tolerance_pct * 100,
-        )
-    return verified, local_score
+    # (#242) Follower verification = INDEPENDENT verdict over the SHARED corpus.
+    # Re-benchmark the CURRENT champion on the SAME shared intents and apply the
+    # adoption rule ourselves, signing only if WE conclude adopt — not merely
+    # reproducing the leader's number (the old relative-diff tolerance check). The
+    # corpus is identical fleet-wide, so a concentrated improvement is visible to
+    # every validator and the quorum of independent verdicts is meaningful.
+    return await _independent_adopt_vote(
+        worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
+        chal_results=results, chal_score=local_score, candidate=candidate,
+        round_id=round_id,
+    )
 
 
 async def _independent_adopt_vote(
@@ -373,12 +356,15 @@ async def _independent_adopt_vote(
     candidate: Any,
     round_id: str | None,
 ) -> tuple[bool, float]:
-    """This follower's INDEPENDENT adopt vote (CHALLENGER_QUORUM_MODE).
+    """This follower's INDEPENDENT adopt verdict over the SHARED corpus (#242).
 
-    Benchmarks the CURRENT champion on the SAME (this follower's diverse) intents
-    and applies the shared ``evaluate_adoption`` rule — so the vote reflects this
-    validator's own judgement over its own slice of orders, not reproduction of the
-    leader's number. Returns ``(adopt, chal_score)``.
+    Benchmarks the CURRENT champion on the SAME ``intents`` the challenger was just
+    scored on — the single round-seeded corpus that is identical on every validator
+    — and applies the shared ``evaluate_adoption`` rule, so the vote is this
+    validator's own judgement (challenger beats champion), not reproduction of the
+    leader's number. Because the corpus is shared, a concentrated improvement is
+    visible to the whole fleet and the quorum of YES verdicts is meaningful.
+    Returns ``(adopt, chal_score)``.
 
     Conservative on uncertainty: if the champion image can't be resolved, or its
     benchmark needs a real simulator and none is available, vote REJECT rather than
