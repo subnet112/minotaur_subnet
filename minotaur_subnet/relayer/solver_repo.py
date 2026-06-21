@@ -120,6 +120,37 @@ CHAMPION_REGISTRY_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        # Latest certified champion — O(1) state read (no log scan), used by the
+        # leader's in-process merge gate. champions[latestRoundId].
+        "inputs": [],
+        "name": "getLatestChampion",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "roundId", "type": "bytes32"},
+                    {"name": "candidateSubmissionId", "type": "bytes32"},
+                    {"name": "candidateImageId", "type": "bytes32"},
+                    {"name": "commitHash", "type": "bytes32"},
+                    {"name": "effectiveEpoch", "type": "uint256"},
+                    {"name": "certifiedAt", "type": "uint256"},
+                    {"name": "approvalCount", "type": "uint256"},
+                    {"name": "exists", "type": "bool"},
+                ],
+                "name": "",
+                "type": "tuple",
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getQuorumRequired",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 
@@ -569,6 +600,206 @@ def create_champion_pr(
         return None
 
 
+# ── Leader-authority merge gate ──────────────────────────────────────────────
+# MERGE AUTHORITY for the solver repo's main lives HERE, in the leader's trusted
+# process — NOT in a GitHub status check. Under fork PRs a GitHub check is
+# fork-authored (the fork runs its own workflow copy and required checks match by
+# NAME), so polling a check is spoofable. Instead the leader re-resolves the live
+# head SHA, refuses any PR whose diff touches .github/** (CI-disarm guard), reads
+# ChampionRegistry directly over web3, and squash-merges pinned to the head SHA
+# ONLY when a quorum cert binds keccak(head_sha). The champion-merge.yml Action is
+# advisory/visibility only. See project_champion_merge_fork_pr_redesign_2026_06_20.
+
+
+def _read_champion_registry() -> Any | None:
+    """web3 read handle for ChampionRegistry on BT EVM, or None if unconfigured.
+
+    Reuses the same env as attest_champion_on_chain (CHAMPION_REGISTRY_964 +
+    BITTENSOR_EVM_RPC_URL). State reads work on pruned RPCs (latest state), so no
+    archival node or log scan is needed.
+    """
+    addr = os.environ.get("CHAMPION_REGISTRY_964", "").strip()
+    rpc = os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
+    if not addr or not rpc:
+        return None
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        if not w3.is_connected():
+            logger.error("merge gate: cannot connect to BT EVM at %s", rpc)
+            return None
+        return w3.eth.contract(
+            address=Web3.to_checksum_address(addr), abi=CHAMPION_REGISTRY_ABI
+        )
+    except Exception as exc:
+        logger.error("merge gate: ChampionRegistry handle failed: %s", exc)
+        return None
+
+
+def _pr_touches_ci(owner: str, repo: str, pr_number: int) -> bool:
+    """True if the PR diff changes any .github/** path (CI-disarm guard).
+
+    A real champion submission only changes solver source. A PR that also edits
+    CI (e.g. to disarm/replace the advisory check, or land a malicious workflow)
+    is refused. FAIL-CLOSED: a read failure is treated as touching.
+    """
+    st, files = _github_api_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
+    )
+    if st != 200 or not isinstance(files, list):
+        logger.warning("merge gate: could not read PR #%s files (HTTP %s) — fail-closed", pr_number, st)
+        return True
+    return any((f.get("filename") or "").startswith(".github/") for f in files)
+
+
+def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
+    """Leader's OWN authority check: does a quorum cert on-chain bind this head SHA?
+
+    Asserts exists AND commitHash == keccak(utf8(lowercase head_sha)) AND
+    approvalCount >= getQuorumRequired(). Tries getLatestChampion() first (the
+    common case — the leader attests immediately before merging), then falls back
+    to getChampion(round_id) if latest has already moved past this round. The PR
+    body/comments are NEVER an input — only the on-chain record.
+    """
+    reg = _read_champion_registry()
+    if reg is None:
+        logger.error("merge gate: ChampionRegistry unreadable — refusing merge")
+        return False
+    target = _str_to_bytes32(head_sha.strip().lower())  # == keccak(utf8(head_sha))
+    try:
+        quorum = int(reg.functions.getQuorumRequired().call())
+        if quorum < 1:
+            logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+            return False
+
+        def _binds(rec: Any) -> bool:
+            # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
+            # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7])
+            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
+
+        if _binds(reg.functions.getLatestChampion().call()):
+            return True
+        if round_id:
+            return _binds(reg.functions.getChampion(_str_to_bytes32(round_id)).call())
+        return False
+    except Exception as exc:
+        logger.error("merge gate: on-chain cert read failed: %s — refusing merge", exc)
+        return False
+
+
+def merge_miner_pr_when_certified(
+    pr_number: int,
+    expected_head_sha: str,
+    *,
+    round_id: str | None = None,
+) -> bool:
+    """Squash-merge the miner's fork PR ONLY after the leader's OWN on-chain check.
+
+    Never polls a GitHub status check (fork-spoofable). Steps:
+      1. Re-resolve the LIVE head SHA via resolve_pr (TOCTOU); abort if it drifted
+         off the miner-signed SHA.
+      2. Refuse if the PR diff touches .github/** (CI-disarm guard).
+      3. Assert a quorum cert on-chain binds keccak(head_sha) (the authority).
+      4. PUT a squash merge pinned to ``sha=<resolved head>`` so GitHub itself
+         rejects on any head drift between the check and the merge.
+    Fails loud; never force-merges.
+    """
+    from minotaur_subnet.api.routes.submissions.github_pr import (
+        PRResolutionError,
+        resolve_pr,
+    )
+
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None or not pr_number:
+        logger.error("merge gate: no owner/repo or pr_number — cannot merge")
+        return False
+    owner, repo = owner_repo
+
+    # 1) TOCTOU — re-resolve the authoritative live head SHA.
+    try:
+        resolved = resolve_pr(int(pr_number))
+    except PRResolutionError as exc:
+        logger.error("merge gate: PR #%s unresolvable (closed/forced/bad base?): %s", pr_number, exc)
+        return False
+    live_head = (resolved.get("head_sha") or "").strip().lower()
+    if not live_head:
+        logger.error("merge gate: PR #%s has no resolvable head SHA", pr_number)
+        return False
+    if expected_head_sha and live_head != expected_head_sha.strip().lower():
+        logger.error(
+            "merge gate: PR #%s head drifted (%s) off the certified/signed SHA (%s) — refusing",
+            pr_number, live_head, expected_head_sha.strip().lower(),
+        )
+        return False
+
+    # 2) CI-disarm guard.
+    if _pr_touches_ci(owner, repo, int(pr_number)):
+        logger.error("merge gate: PR #%s diff touches .github/** — refusing (CI-disarm guard)", pr_number)
+        return False
+
+    # 3) The authority: on-chain quorum cert must bind this exact head SHA.
+    if not _onchain_cert_binds(live_head, round_id):
+        logger.error(
+            "merge gate: no on-chain quorum cert binds head %s (round %s) — refusing merge",
+            live_head, round_id,
+        )
+        return False
+
+    # 4) Squash-merge pinned to the resolved head (GitHub rejects on drift).
+    st, body = _github_api_request(
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{int(pr_number)}/merge",
+        {"merge_method": "squash", "sha": live_head},
+    )
+    if st == 200:
+        logger.info("merge gate: PR #%s squash-merged (head %s on-chain-certified)", pr_number, live_head)
+        return True
+    logger.error("merge gate: PR #%s merge failed: HTTP %s %s", pr_number, st, body)
+    return False
+
+
+def assert_solver_repo_token_not_admin() -> None:
+    """HARD-FAIL leader startup if the resolved solver-repo token is admin-scoped.
+
+    An admin token bypasses the protect-main ruleset regardless of empty
+    bypass_actors AND can edit/delete the ruleset — so it must never drive merges.
+    Requires SOLVER_REPO_PR_TOKEN to be set (refuses the possibly-admin
+    SOLVER_REPO_TOKEN fallback) and the bearer's collaborator permission to be
+    'write', not 'admin'. Call at leader boot before wiring the adopt/merge path.
+    """
+    if os.environ.get("ALLOW_ADMIN_SOLVER_REPO_TOKEN", "").strip().lower() in ("1", "true", "yes", "on"):
+        logger.warning("assert_solver_repo_token_not_admin: BYPASSED via ALLOW_ADMIN_SOLVER_REPO_TOKEN (unsafe)")
+        return
+    pr_tok = os.environ.get("SOLVER_REPO_PR_TOKEN", "").strip()
+    if not pr_tok:
+        raise RuntimeError(
+            "SOLVER_REPO_PR_TOKEN is unset — refusing to arm the adopt/merge path on the "
+            "possibly-admin SOLVER_REPO_TOKEN fallback. Provision a non-admin (write-role) "
+            "fine-grained PAT scoped to the solver repo (Contents:write + Pull requests:write)."
+        )
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None:
+        raise RuntimeError("SOLVER_REPO_URL unparseable — cannot verify solver-repo token scope")
+    owner, repo = owner_repo
+    su, who = _github_api_request("GET", "https://api.github.com/user")
+    login = (who or {}).get("login") if isinstance(who, dict) else None
+    if su != 200 or not login:
+        raise RuntimeError("Could not resolve SOLVER_REPO_PR_TOKEN bearer login — refusing to proceed")
+    sp, perm = _github_api_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/collaborators/{login}/permission"
+    )
+    permission = (perm or {}).get("permission") if isinstance(perm, dict) else None
+    if sp != 200 or not permission:
+        raise RuntimeError(f"Could not read collaborator permission for {login} on {owner}/{repo} — refusing")
+    if permission == "admin":
+        raise RuntimeError(
+            f"SOLVER_REPO_PR_TOKEN bearer {login} is repo ADMIN — refusing. An admin token "
+            "bypasses the protect-main ruleset and can edit/delete it. Use a WRITE-role machine account."
+        )
+    logger.info("solver-repo token OK: %s permission=%s (non-admin)", login, permission)
+
+
 # ── Orchestrator (replaces merge_champion_to_main) ───────────────────────────
 
 
@@ -623,32 +854,42 @@ def on_champion_adopted_pr(
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
 
-    # Mirror the ADOPT decision onto the miner's own PR (the fold): post the
-    # success report so the miner sees it; the cert-gated Action merges the PR.
+    # Mirror the ADOPT decision onto the miner's OWN signed fork PR. This is the
+    # SINGLE gated path onto main — the legacy create_champion_pr() (a second,
+    # leader-pushed champion/<round> branch) is intentionally NOT called: a
+    # parallel leader-controlled path would defeat "the on-chain cert is the sole
+    # merge authority". The leader posts a report comment, then merges via its
+    # OWN on-chain cert re-verification (merge_miner_pr_when_certified), never by
+    # trusting a fork-spoofable GitHub status check.
     _pr_number = getattr(submission, "pr_number", None)
-    if _pr_number:
-        comment_on_pr(
-            _pr_number,
-            f"### ✅ Adopted as champion\n\n"
-            f"- round: `{round_id}`\n- submission: `{submission_id}`\n"
-            f"- on-chain attest tx: `{tx_hash or 'pending'}`\n\n"
-            f"The cert-gated merge will land this PR.",
+    if not _pr_number:
+        logger.error(
+            "Adopt for %s has no pr_number (not a fork-PR submission) — attest %s, nothing to merge",
+            submission_id, tx_hash or "skipped",
         )
-
-    # Step 2: Create GitHub PR
-    pr_url = create_champion_pr(submission, round_id, tx_hash, certificate)
-
-    if pr_url:
-        logger.info(
-            "Champion adoption complete: attest=%s pr=%s round=%s",
-            tx_hash or "skipped",
-            pr_url,
-            round_id,
-        )
-        return True
-    else:
-        logger.error("Champion PR creation failed for %s", submission_id)
         return False
+
+    comment_on_pr(
+        _pr_number,
+        f"### ✅ Adopted as champion\n\n"
+        f"- round: `{round_id}`\n- submission: `{submission_id}`\n"
+        f"- on-chain attest tx: `{tx_hash or 'pending'}`\n\n"
+        f"The leader will squash-merge after its own on-chain cert re-verification.",
+    )
+
+    # MERGE AUTHORITY = the leader's OWN web3 cert check (re-resolve head, refuse
+    # .github/** diffs, assert quorum cert binds keccak(head_sha)), NOT a GitHub
+    # status check. Pins the squash merge to the resolved head SHA.
+    merged = merge_miner_pr_when_certified(
+        _pr_number,
+        commit_hash,
+        round_id=round_id,
+    )
+    logger.info(
+        "Champion adoption: attest=%s merge=%s pr=#%s round=%s",
+        tx_hash or "skipped", merged, _pr_number, round_id,
+    )
+    return bool(tx_hash) and merged
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────

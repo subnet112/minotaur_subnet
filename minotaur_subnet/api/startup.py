@@ -1937,13 +1937,32 @@ async def initialize(ctx: ServerContext) -> dict:
             _champion_reject_fn = None
             if os.environ.get("SOLVER_REPO_URL", "").strip() or os.environ.get("SOLVER_REPO_PATH", "").strip():
                 from minotaur_subnet.relayer.solver_repo import (
+                    assert_solver_repo_token_not_admin,
                     on_champion_adopted_pr,
                     on_champion_rejected_pr,
                 )
+                # The leader's solver-repo token must NOT be admin-scoped (an admin
+                # token bypasses + can edit the protect-main ruleset, defeating the
+                # cert gate). HARD-FAIL when adoption is LIVE; while frozen
+                # (DISABLE_CHAMPION_ADOPTION=1) the merge path never fires, so only
+                # WARN — this keeps the currently-frozen leader bootable before the
+                # non-admin PAT is provisioned. See solver_repo.py.
+                from minotaur_subnet.epoch.manager import _adoption_disabled
+                if _adoption_disabled():
+                    try:
+                        assert_solver_repo_token_not_admin()
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "[adoption-frozen] solver-repo token not yet hardened (%s) — "
+                            "MUST provision a non-admin PAT before flipping DISABLE_CHAMPION_ADOPTION=0",
+                            exc,
+                        )
+                else:
+                    assert_solver_repo_token_not_admin()  # adoption LIVE → hard-fail if admin
                 _champion_merge_fn = on_champion_adopted_pr
                 _champion_reject_fn = on_champion_rejected_pr
                 logger.info(
-                    "Champion adoption: on-chain attestation + GitHub PR (registry=%s, repo=%s)",
+                    "Champion adoption: on-chain attestation + leader-authority merge (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
                     os.environ.get("SOLVER_REPO_URL", "not set"),
                 )
