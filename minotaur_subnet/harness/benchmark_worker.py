@@ -1049,18 +1049,17 @@ class BenchmarkWorker:
         return 1
 
     def _resolve_incumbent_submission(self) -> Any | None:
-        """The current INCUMBENT champion submission, resolved EXACTLY like the
-        leader's ``EpochManager._restore_active_champion_submission``: the ADOPTED
-        champion, else the round-store active-champion snapshot, else ``None``.
+        """The current INCUMBENT champion submission — resolved to equal the leader's
+        ``bool(self._champion.submission_id)`` so the follower derives the SAME
+        ``has_champion``. Resolution order: the ADOPTED champion, else the round-store
+        active-champion snapshot, else a SCORED/ADOPTED genesis with a usable score.
 
-        ``(_resolve_incumbent_submission() is not None)`` therefore equals the
-        leader's ``bool(self._champion.submission_id)``, so the follower derives the
-        SAME ``has_champion`` for the adoption rule. CRUCIAL: a SCORED-but-never-
-        ADOPTED genesis is NOT an incumbent here — the leader doesn't count it
-        either (genesis is seeded SCORED and never adopt()ed), so that state is true
-        bootstrap (has_champion=False) on BOTH sides. (Do not confuse this with
-        ``_resolve_champion_image`` below, which DOES fall back to a scored genesis
-        to pick an image to *run* — a separate concern from has_champion.)
+        Genesis-as-bar (#242, user decision): the FIRST champion must BEAT genesis, so
+        a benchmarked (SCORED, score>0) genesis IS the incumbent here — mirroring the
+        leader's ``_maybe_seed_genesis_incumbent`` (which seeds self._champion from the
+        same predicate at decision time). KEEP this predicate identical to the leader's
+        or has_champion parity breaks. Returns ``None`` only at true bootstrap (no
+        adopted/snapshot champion AND no scored genesis yet).
         """
         adopted = self._sub_store.get_champion()
         if adopted is not None:
@@ -1073,6 +1072,15 @@ class BenchmarkWorker:
                     return self._sub_store.get(sid)
             except Exception:  # pragma: no cover - defensive
                 return None
+        # Genesis-as-bar: a SCORED/ADOPTED genesis with a usable score is the
+        # incumbent (same predicate as EpochManager._maybe_seed_genesis_incumbent).
+        genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+        if (
+            genesis is not None
+            and genesis.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED)
+            and (genesis.benchmark_score or 0.0) > 0
+        ):
+            return genesis
         return None
 
     def _resolve_champion_image(self) -> str | None:

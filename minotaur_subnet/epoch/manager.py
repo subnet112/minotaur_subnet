@@ -47,6 +47,8 @@ from minotaur_subnet.harness.round_store import (
     RoundStore,
 )
 from minotaur_subnet.weight_policy import (
+    GENESIS_EPOCH,
+    GENESIS_HOTKEY,
     apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
@@ -595,6 +597,47 @@ class EpochManager:
         eligible.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
         return eligible
 
+    def _maybe_seed_genesis_incumbent(self) -> None:
+        """Decision-time: when no champion is seeded, treat a SCORED genesis as the
+        incumbent BAR (has_champion=True) so the FIRST real champion must BEAT
+        genesis (>= genesis*(1+DETHRONE_MARGIN) + per-app floor + on-chain veto),
+        matching the follower's _resolve_incumbent_submission.
+
+        In-memory ONLY — never adopt()/_hot_swap()/set_active_champion() (those
+        trigger snapshot persistence + the on-chain certify path). Resolved at
+        DECISION time (not init) because genesis is scored mid-round. WEIGHT-SAFE:
+        hotkey is copied verbatim (==GENESIS_HOTKEY) so is_real_miner_hotkey stays
+        False and _build_weights_mapping still burns 100% to the owner — identical
+        to the empty-champion case.
+        """
+        if self._champion.submission_id:  # real/adopted/restored incumbent — keep it
+            return
+        if self._sub_store is None:
+            return
+        genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+        if genesis is None or genesis.status not in (
+            SubmissionStatus.SCORED,
+            SubmissionStatus.ADOPTED,
+        ):
+            return
+        if (genesis.benchmark_score or 0.0) <= 0:  # no usable bar yet -> stay bootstrap
+            return
+        assert genesis.hotkey == GENESIS_HOTKEY, "genesis incumbent must keep the burn hotkey"
+        self._champion = ChampionInfo(
+            submission_id=genesis.submission_id,
+            solver_name=genesis.solver_name,
+            solver_version=genesis.solver_version,
+            benchmark_score=genesis.benchmark_score or 0.0,
+            epoch_adopted=genesis.epoch,
+            image_tag=genesis.image_tag,  # None for genesis -> re-bench resolves the genesis image
+            hotkey=GENESIS_HOTKEY,  # keeps weights on the burn branch
+            adopted_at=genesis.updated_at,
+        )
+        logger.info(
+            "Seeded genesis as the adoption incumbent bar: %s score=%.4f (weights still burn)",
+            genesis.submission_id, genesis.benchmark_score or 0.0,
+        )
+
     async def _refresh_incumbent_score(self) -> None:
         """Re-benchmark the current champion with the latest scenarios.
 
@@ -608,6 +651,10 @@ class EpochManager:
         pack (issue #177). The score is left unchanged only when no benchmark
         worker — or no genesis image — is available.
         """
+        # Genesis-as-bar (#242): seed a SCORED genesis as the incumbent before the
+        # refresh, so both adoption paths (on_epoch_boundary + evaluate_round) and
+        # the follower agree the first champion must BEAT genesis.
+        self._maybe_seed_genesis_incumbent()
         if not self._champion.submission_id:
             return
         if not self._benchmark_worker:

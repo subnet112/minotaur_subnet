@@ -165,36 +165,49 @@ def test_bootstrap_rejects_first_champion_below_floor(monkeypatch):
     assert adopt is False
 
 
-# ── has_champion PARITY with the leader (the genesis-as-incumbent regression) ──
-# The leader's _restore_active_champion_submission counts ONLY an ADOPTED champion
-# or the active-champion snapshot — NOT a SCORED-but-never-ADOPTED genesis. The
-# follower MUST resolve has_champion identically, or the first adoption deadlocks
-# fleet-wide (leader has_champion=False adopts a floor-clearer; followers counting
-# genesis as incumbent demand the dethrone margin -> 0 quorum).
+# ── has_champion PARITY with the leader (genesis-as-bar, #242 user decision) ──
+# The first champion must BEAT the genesis reference. The leader seeds self._champion
+# from a SCORED genesis (score>0) at decision time (_maybe_seed_genesis_incumbent);
+# the follower MUST resolve has_champion identically via _resolve_incumbent_submission,
+# or the first adoption diverges -> 0 quorum. These lock the SHARED predicate
+# (adopted | snapshot | SCORED-genesis-with-score>0).
 
 def _bench_worker(*, adopted=None, snapshot_sid=None, snapshot_sub=None, scored_genesis=None):
     from unittest.mock import MagicMock
     from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
     sub = MagicMock()
     sub.get_champion.return_value = adopted
-    sub.get_by_hotkey_epoch.return_value = scored_genesis  # present but must NOT count
+    sub.get_by_hotkey_epoch.return_value = scored_genesis
     sub.get.return_value = snapshot_sub
     rs = MagicMock()
     rs.get_active_champion.return_value = SimpleNamespace(submission_id=snapshot_sid)
     return BenchmarkWorker(submission_store=sub, round_store=rs)
 
 
-def test_incumbent_excludes_scored_genesis_matching_leader():
-    # SCORED genesis present, but NO adopted champion / snapshot -> NOT an incumbent
-    # -> None -> has_champion=False -> bootstrap on BOTH sides (the fix).
-    genesis = SimpleNamespace(submission_id="sub_genesis", status="scored")
-    w = _bench_worker(adopted=None, snapshot_sid=None, scored_genesis=genesis)
+def _genesis(score):
+    from minotaur_subnet.harness.submission_store import SubmissionStatus
+    return SimpleNamespace(
+        submission_id="sub_genesis", status=SubmissionStatus.SCORED, benchmark_score=score
+    )
+
+
+def test_incumbent_includes_scored_genesis_as_bar():
+    # genesis-as-bar: a SCORED genesis with score>0 IS the incumbent (the first
+    # champion must beat it) — matching the leader's _maybe_seed_genesis_incumbent.
+    g = _genesis(0.5)
+    w = _bench_worker(adopted=None, snapshot_sid=None, scored_genesis=g)
+    assert w._resolve_incumbent_submission() is g
+
+
+def test_incumbent_excludes_unscored_genesis():
+    # Genesis present but no usable bar yet (score 0) -> None -> true bootstrap.
+    w = _bench_worker(adopted=None, snapshot_sid=None, scored_genesis=_genesis(0.0))
     assert w._resolve_incumbent_submission() is None
 
 
 def test_incumbent_returns_adopted_champion():
     champ = SimpleNamespace(submission_id="sub_champ")
-    w = _bench_worker(adopted=champ)
+    w = _bench_worker(adopted=champ, scored_genesis=_genesis(0.9))  # adopted wins over genesis
     assert w._resolve_incumbent_submission() is champ
 
 
