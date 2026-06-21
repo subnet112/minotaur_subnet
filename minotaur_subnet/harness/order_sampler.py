@@ -1,8 +1,9 @@
 """Deterministic sampling of historical orders for benchmark Stage 2.
 
-Samples filled orders from the app store to use as real-world benchmark
-scenarios. Sampling is deterministic from the round_id — all validators
-derive the same sample without needing to broadcast the selection.
+Samples terminal-demand orders (filled + the champion's failures) from the app
+store as real-world benchmark scenarios. Sampling is deterministic from the
+round_id alone — every validator derives the SAME shared subset without
+broadcasting the selection (#242: partitioned/diverse per-validator draws retired).
 
 Stage 2 replays these orders' parameters against the current benchmark
 fork (weekly-pinned Anvil), and the resulting per-app scores feed the
@@ -19,17 +20,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _order_partition(order_id: str, round_id: str, validator_count: int) -> int:
-    """Deterministically assign an order to one of ``validator_count`` validators.
-
-    ``hash(order_id + round_id) % V`` — stable across all validators (so the
-    partition is verifiable, not leader-chosen) and re-shuffles each round so
-    coverage rotates over time.
-    """
-    h = hashlib.sha256(f"{order_id}:{round_id}".encode("utf-8")).digest()
-    return int.from_bytes(h[:8], "big") % validator_count
-
-
 # Fields to strip for privacy when exposing sampled orders to solvers.
 # The solver only needs the trade parameters, not who submitted it.
 _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
@@ -39,12 +29,9 @@ def sample_historical_orders(
     app_store: Any,
     round_id: str,
     chain_ids: list[int] | None = None,
-    n_per_chain: int = 10,
+    n_per_chain: int = 50,
     exclude_statuses: set[str] | None = None,
     records: list[dict[str, Any]] | None = None,
-    validator_seed: str | None = None,
-    validator_index: int | None = None,
-    validator_count: int | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical TERMINAL-DEMAND orders for Stage 2.
 
@@ -62,29 +49,26 @@ def sample_historical_orders(
     fill block) replays against current state exactly like a filled one — no
     per-order fork anchor is needed, and the draw stays deterministic per the seed.
 
-    Seed = ``round_id`` alone (``validator_seed=None``, the default) → every
-    validator draws the SAME subset (legacy determinism). When ``validator_seed``
-    is supplied (e.g. the validator's hotkey/evm), it is mixed into the seed so
-    each validator draws a DIFFERENT subset — distributed cross-validation: a
-    challenger must beat the champion across the *union* of everyone's subsets,
-    which broadens regression coverage and resists overfitting to one fixed set.
-    The draw stays deterministic *per validator* (reproducible from
-    round_id+identity), so no selection broadcast is needed either way.
+    The draw is seeded by ``round_id`` ALONE, so EVERY validator derives the
+    IDENTICAL subset without broadcasting the selection — one shared corpus that
+    the champion-vs-challenger comparison is run over and ratified by quorum (#242).
+    Per-validator / partitioned draws were retired: a disjoint slice makes a
+    *concentrated* improvement invisible (only validators holding the targeted
+    orders would vote ADOPT → no quorum) and decentralized cross-validation needs
+    reproducible cross-machine sim + a cheap verification + slashing we don't have.
 
     Args:
         app_store: AppIntentStore with list_orders().
-        round_id: The current round identifier (part of the sample seed).
+        round_id: The current round identifier (the sole sample seed).
         chain_ids: Only include orders from these chains. None = all chains.
         n_per_chain: Target sample size per chain (may be smaller if
             insufficient historical orders).
         exclude_statuses: Order statuses to exclude. Default (None) = include the
             terminal-demand set {filled, rejected, expired}; pass a set to instead
             include all statuses except those given.
-        records: Pre-built candidate orders (e.g. a chain-derived corpus, plan
-            Phase 5b). When provided, they are the source instead of
-            app_store.list_orders() — same filter/sample/PII logic. None (default)
-            keeps the local-store path byte-for-byte.
-        validator_seed: Per-validator seed component (None = shared/legacy draw).
+        records: Pre-built candidate orders (e.g. a chain-derived corpus). When
+            provided, they are the source instead of app_store.list_orders() —
+            same filter/sample/PII logic. None (default) keeps the local-store path.
 
     Returns:
         List of order dicts, PII-stripped. May be empty if no history exists.
@@ -127,30 +111,13 @@ def sample_historical_orders(
             continue
         candidates.append(order)
 
-    # PARTITION mode (max coverage): when (validator_index, validator_count) are
-    # given, each validator keeps a DISJOINT slice — order assigned to validator
-    # ``hash(order_id+round_id) % V``. With V validators each benchmarking up to
-    # n_per_chain, the fleet covers min(total, V*n_per_chain) DISTINCT orders
-    # (filled or failed) instead of overlapping random subsets — more validators →
-    # more coverage. Each validator's slice is deterministic + verifiable, so no
-    # single party picks who benchmarks what.
-    if validator_index is not None and validator_count and validator_count > 0:
-        candidates = [
-            o for o in candidates
-            if _order_partition(o.get("order_id", ""), round_id, validator_count) == validator_index
-        ]
-
     if not candidates:
         return []
 
-    # Deterministic RNG seed: round_id alone (shared draw) or round_id+identity
-    # (per-validator diverse draw). Mixing the identity in shifts which orders
-    # this validator tests without making the draw non-deterministic.
-    seed_material = (
-        round_id if validator_seed is None else f"{round_id}:{validator_seed}"
-    )
+    # Deterministic RNG seed: round_id ALONE → every validator draws the identical
+    # shared subset (no per-validator seed, no broadcast).
     seed = int.from_bytes(
-        hashlib.sha256(seed_material.encode("utf-8")).digest()[:8], "big"
+        hashlib.sha256(round_id.encode("utf-8")).digest()[:8], "big"
     )
     rng = random.Random(seed)
 

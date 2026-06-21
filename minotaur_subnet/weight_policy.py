@@ -9,6 +9,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 GENESIS_HOTKEY = "__genesis__"
+# Epoch the genesis/bootstrap submission is keyed under in the submission store.
+GENESIS_EPOCH = 0
 
 
 def get_subnet_owner_hotkey() -> str:

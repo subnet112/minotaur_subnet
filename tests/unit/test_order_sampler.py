@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from minotaur_subnet.harness.order_sampler import (
-    _order_partition,
-    sample_historical_orders,
-)
+from minotaur_subnet.harness.order_sampler import sample_historical_orders
 
 
 class _FakeAppStore:
@@ -60,105 +57,29 @@ class TestDeterminism:
         assert ids1 != ids2
 
 
-class TestDiverseSubsets:
-    """Per-validator seed: each validator draws a different subset (cross-validation)."""
+class TestSharedCorpus:
+    """#242: one round-seeded SHARED draw — identical on every validator, no seed param."""
 
-    def test_none_seed_matches_legacy_round_only_draw(self):
-        # Backward compat: validator_seed=None must be byte-for-byte the old draw.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        legacy = sample_historical_orders(store, "round-123", n_per_chain=10)
-        explicit_none = sample_historical_orders(
-            store, "round-123", n_per_chain=10, validator_seed=None
-        )
-        assert [o["order_id"] for o in legacy] == [o["order_id"] for o in explicit_none]
+    def test_signature_has_no_per_validator_params(self):
+        import inspect
+        params = set(inspect.signature(sample_historical_orders).parameters)
+        assert {"validator_seed", "validator_index", "validator_count"}.isdisjoint(params)
 
-    def test_same_validator_seed_is_deterministic(self):
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        assert [o["order_id"] for o in a] == [o["order_id"] for o in b]
+    def test_default_n_per_chain_is_50(self):
+        import inspect
+        assert inspect.signature(sample_historical_orders).parameters["n_per_chain"].default == 50
 
-    def test_different_validators_draw_different_subsets(self):
-        # Same round, different validator identities → different (diverse) subsets.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALB")
-        ids_a = set(o["order_id"] for o in a)
-        ids_b = set(o["order_id"] for o in b)
-        assert ids_a != ids_b
-        # ...but each is still a valid full-size draw from the same pool.
-        assert len(ids_a) == 10 and len(ids_b) == 10
-
-
-class TestPartition:
-    """Partition mode: validators split the corpus into DISJOINT slices for max coverage."""
-
-    def test_partition_is_deterministic_and_in_range(self):
-        # Same (order, round, V) → same assignment everywhere; always in [0, V).
-        for i in range(100):
-            a = _order_partition(f"ord_{i}", "round-1", 5)
-            b = _order_partition(f"ord_{i}", "round-1", 5)
-            assert a == b
-            assert 0 <= a < 5
-
-    def test_partition_reshuffles_each_round(self):
-        # The same order lands in different validators across rounds (coverage rotates).
-        same = all(
-            _order_partition(f"ord_{i}", "round-1", 5)
-            == _order_partition(f"ord_{i}", "round-2", 5)
-            for i in range(200)
-        )
-        assert not same
-
-    def test_slices_are_disjoint_and_cover_the_pool(self):
-        # Every order goes to exactly one validator; the union is the full pool.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(60)]
-        store = _FakeAppStore(orders)
-        V = 5
-        slices = [
-            sample_historical_orders(
-                store, "round-1", n_per_chain=100,  # large n → keep whole slice
-                validator_index=idx, validator_count=V,
-            )
-            for idx in range(V)
-        ]
-        id_sets = [set(o["order_id"] for o in s) for s in slices]
-        # Disjoint: no order appears in two validators' slices.
-        for i in range(V):
-            for j in range(i + 1, V):
-                assert id_sets[i].isdisjoint(id_sets[j])
-        # Complete: the union is every order in the pool.
-        union = set().union(*id_sets)
-        assert union == {f"ord_{i:03d}" for i in range(60)}
-
-    def test_coverage_scales_with_validator_count(self):
-        # With n_per_chain cap, fleet covers min(total, V*n) distinct orders.
+    def test_every_validator_derives_the_identical_subset(self):
+        # The draw depends ONLY on round_id — independent of who runs it. Sampling
+        # the same store + round_id any number of times yields the identical subset,
+        # so the fleet shares one corpus (the basis for a meaningful quorum).
         orders = [_make_order(f"ord_{i:03d}") for i in range(100)]
         store = _FakeAppStore(orders)
-        V, n = 5, 4
-        union = set()
-        for idx in range(V):
-            s = sample_historical_orders(
-                store, "round-1", n_per_chain=n,
-                validator_index=idx, validator_count=V,
-            )
-            assert len(s) <= n  # each validator stays within its load budget
-            union |= {o["order_id"] for o in s}
-        # Fleet coverage = V*n distinct orders (well under the 100 available).
-        assert len(union) == V * n
-
-    def test_partition_disabled_when_count_none(self):
-        # Without (index, count) it's the legacy shared draw — no partition filter.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        legacy = sample_historical_orders(store, "round-1", n_per_chain=10)
-        no_part = sample_historical_orders(
-            store, "round-1", n_per_chain=10, validator_index=None, validator_count=None
-        )
-        assert [o["order_id"] for o in legacy] == [o["order_id"] for o in no_part]
+        draws = [
+            [o["order_id"] for o in sample_historical_orders(store, "round-42", n_per_chain=10)]
+            for _ in range(5)
+        ]
+        assert all(d == draws[0] for d in draws)
 
 
 class TestFiltering:
