@@ -176,6 +176,12 @@ class EpochManager:
         self._vote_recorder = vote_recorder
 
         self._champion = ChampionInfo()
+        # Set True by _refresh_incumbent_score when an incumbent EXISTS but could
+        # NOT be freshly re-benchmarked this round (unresolvable image / bad results
+        # / benchmark error incl. RealSimulationUnavailable). _should_adopt ABSTAINS
+        # when set, so the leader never decides adoption on a STALE champion bar —
+        # mirroring the follower's conservative REJECT (fleet parity).
+        self._incumbent_refresh_failed = False
         self._current_session: Any = None  # SolverSession
         self._current_epoch: int = 0
         self._epoch_history: list[dict[str, Any]] = []
@@ -655,6 +661,9 @@ class EpochManager:
         # refresh, so both adoption paths (on_epoch_boundary + evaluate_round) and
         # the follower agree the first champion must BEAT genesis.
         self._maybe_seed_genesis_incumbent()
+        # Stale-bar guard: assume the incumbent score is fresh this round unless a
+        # production re-benchmark path below fails (then _should_adopt abstains).
+        self._incumbent_refresh_failed = False
         if not self._champion.submission_id:
             return
         if not self._benchmark_worker:
@@ -665,6 +674,9 @@ class EpochManager:
         if self._sub_store:
             incumbent_sub = self._sub_store.get(self._champion.submission_id)
         if incumbent_sub is None:
+            # Incumbent exists but its submission can't be resolved (e.g. a stale
+            # cross-process store reload) → can't re-benchmark the bar → STALE.
+            self._incumbent_refresh_failed = True
             return
 
         image_tag = incumbent_sub.image_tag
@@ -677,7 +689,9 @@ class EpochManager:
             if callable(getattr(self._benchmark_worker, "_resolve_champion_image", None)):
                 image_tag = self._benchmark_worker._resolve_champion_image()
             if not image_tag:
-                return  # no genesis image configured → leave the stored score
+                # Incumbent image unresolvable → cannot re-benchmark the bar → STALE.
+                self._incumbent_refresh_failed = True
+                return  # leave the stored score; _should_adopt will abstain
 
         logger.info(
             "Re-benchmarking incumbent %s (%s) with current scenarios",
@@ -692,7 +706,15 @@ class EpochManager:
                 return
 
             intents = self._benchmark_worker._load_benchmark_intents()
-            if not isinstance(intents, list) or not intents:
+            if not isinstance(intents, list):
+                return  # mock/degenerate worker (real worker returns a list) — test-compat, no flag
+            if not intents:
+                # Real worker returned an EMPTY corpus — e.g. all apps non-operational
+                # during a redeploy window (status DEPLOYING/PAUSED/RETIRED). The
+                # incumbent can't be re-benchmarked this round → STALE bar → abstain.
+                # (Mirrors the follower, which scores the champion on the same shared
+                # corpus and never reuses a stale stored number.)
+                self._incumbent_refresh_failed = True
                 return
 
             score_fn = await self._benchmark_worker._build_score_fn(intents)
@@ -718,6 +740,7 @@ class EpochManager:
                 image_tag, intents, score_fn,
             )
             if not isinstance(results, list):
+                self._incumbent_refresh_failed = True  # bad benchmark → stale bar
                 return
             fresh_score = self._benchmark_worker._compute_avg_score(results)
 
@@ -742,8 +765,11 @@ class EpochManager:
                 self._champion.submission_id, old_score, fresh_score, len(results),
             )
         except Exception:
+            # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
+            # _should_adopt abstains rather than deciding on the prior score.
+            self._incumbent_refresh_failed = True
             logger.warning(
-                "Failed to re-benchmark incumbent %s — using stale score %.4f",
+                "Failed to re-benchmark incumbent %s — STALE bar, will abstain (was %.4f)",
                 self._champion.submission_id, self._champion.benchmark_score,
                 exc_info=True,
             )
@@ -819,6 +845,24 @@ class EpochManager:
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
+            return False
+
+        # Fail-closed stale-bar guard: if an incumbent EXISTS but could not be
+        # freshly re-benchmarked this round (_refresh_incumbent_score hit an
+        # unresolvable-image / bad-results / benchmark-error path), the champion bar
+        # is STALE — ABSTAIN rather than decide adoption on an outdated number. This
+        # mirrors the follower's conservative REJECT (champion_consensus), so the
+        # leader and fleet never diverge on a stale bar. (No incumbent => not stale,
+        # bootstrap proceeds.)
+        # getattr default False: a manager built via __new__ (tests) or never run
+        # through a refresh has not had a failed refresh -> not stale.
+        if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
+            logger.warning(
+                "[abstain] incumbent %s could not be freshly re-benchmarked this "
+                "round — abstaining (refusing to adopt %s against a stale bar)",
+                self._champion.submission_id,
+                getattr(challenger, "submission_id", "?"),
+            )
             return False
 
         # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the

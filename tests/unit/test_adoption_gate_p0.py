@@ -75,3 +75,19 @@ def test_dethrone_baseline_is_not_floored_for_a_degraded_champion():
     mgr._get_scorecard = lambda sub: {"app_scores": {"app_X": 0.5}}
 
     assert mgr._should_adopt(_challenger(0.5)) is True
+
+
+def test_abstains_when_incumbent_bar_is_stale():
+    # Stale-bar guard (#242): an incumbent exists but could NOT be freshly
+    # re-benchmarked this round (_refresh_incumbent_score failed) -> ABSTAIN, even
+    # for a clear improvement, mirroring the follower's conservative REJECT so the
+    # leader and fleet never diverge on a stale champion bar.
+    mgr = _mgr(champion_score=0.6)
+    mgr._get_incumbent_scorecard = lambda: {"app_scores": {"app_A": 0.6, "app_B": 0.6}}
+    mgr._get_scorecard = lambda sub: {"app_scores": {"app_A": 0.7, "app_B": 0.7}}
+
+    mgr._incumbent_refresh_failed = False
+    assert mgr._should_adopt(_challenger(0.7)) is True  # fresh bar -> adopts
+
+    mgr._incumbent_refresh_failed = True
+    assert mgr._should_adopt(_challenger(0.7)) is False  # stale bar -> abstain

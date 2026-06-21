@@ -78,3 +78,62 @@ def test_genesis_incumbent_still_burns_weights_to_owner():
     assert mgr._champion.hotkey == GENESIS_HOTKEY
     weights = mgr._build_weights_mapping(epoch=1)
     assert weights == {OWNER: 1.0}
+
+
+# ── stale-bar guard: _refresh_incumbent_score flags an un-refreshable incumbent ──
+
+def test_refresh_flags_stale_when_incumbent_image_unresolvable():
+    import asyncio
+    g = _genesis(0.5)  # image_tag=None
+    mgr = _mgr(genesis=g)
+    mgr._sub_store.get.return_value = g  # incumbent_sub = genesis (no image)
+    bw = MagicMock()
+    bw._resolve_champion_image.return_value = None  # genesis image unresolvable
+    mgr._benchmark_worker = bw
+    asyncio.run(mgr._refresh_incumbent_score())
+    assert mgr._champion.submission_id == "sub_genesis"  # seeded as incumbent
+    assert mgr._incumbent_refresh_failed is True  # couldn't re-benchmark -> stale
+
+
+def test_refresh_resets_stale_flag_when_no_incumbent():
+    import asyncio
+    mgr = _mgr(genesis=None)  # no champion, no scored genesis
+    mgr._incumbent_refresh_failed = True  # stale from a prior round
+    asyncio.run(mgr._refresh_incumbent_score())
+    # No incumbent -> early return after reset -> not stale (bootstrap proceeds).
+    assert not mgr._champion.submission_id
+    assert mgr._incumbent_refresh_failed is False
+
+
+def test_refresh_flags_stale_when_corpus_empty():
+    # Real benchmark_worker returns an EMPTY intents list (all apps non-operational
+    # during a redeploy window) -> incumbent can't be re-benchmarked -> stale ->
+    # _should_adopt will abstain. The non-list (mock) case must NOT flag (test-compat).
+    import asyncio
+    from minotaur_subnet.epoch.manager import ChampionInfo
+    real = SimpleNamespace(
+        submission_id="sub_real", solver_name="x", solver_version="1",
+        benchmark_score=0.4, epoch=3, image_tag="img:1", hotkey="5Real", updated_at=0,
+    )
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(submission_id="sub_real", hotkey="5Real", benchmark_score=0.4, image_tag="img:1")
+    mgr._sub_store.get.return_value = real
+    bw = MagicMock()
+    bw._load_benchmark_intents.return_value = []  # empty corpus (a real list)
+    mgr._benchmark_worker = bw
+    asyncio.run(mgr._refresh_incumbent_score())
+    assert mgr._incumbent_refresh_failed is True
+
+
+def test_refresh_does_not_flag_non_list_intents_mock_worker():
+    # A MagicMock benchmark_worker returns a non-list from _load_benchmark_intents;
+    # that's the test/degenerate guard -> return WITHOUT flagging stale.
+    import asyncio
+    from minotaur_subnet.epoch.manager import ChampionInfo
+    real = SimpleNamespace(submission_id="sub_real", image_tag="img:1", hotkey="5Real", benchmark_score=0.4)
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(submission_id="sub_real", hotkey="5Real", benchmark_score=0.4, image_tag="img:1")
+    mgr._sub_store.get.return_value = real
+    mgr._benchmark_worker = MagicMock()  # _load_benchmark_intents() -> MagicMock (not a list)
+    asyncio.run(mgr._refresh_incumbent_score())
+    assert mgr._incumbent_refresh_failed is False
