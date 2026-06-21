@@ -674,6 +674,9 @@ class EpochManager:
         if self._sub_store:
             incumbent_sub = self._sub_store.get(self._champion.submission_id)
         if incumbent_sub is None:
+            # Incumbent exists but its submission can't be resolved (e.g. a stale
+            # cross-process store reload) → can't re-benchmark the bar → STALE.
+            self._incumbent_refresh_failed = True
             return
 
         image_tag = incumbent_sub.image_tag
@@ -703,7 +706,15 @@ class EpochManager:
                 return
 
             intents = self._benchmark_worker._load_benchmark_intents()
-            if not isinstance(intents, list) or not intents:
+            if not isinstance(intents, list):
+                return  # mock/degenerate worker (real worker returns a list) — test-compat, no flag
+            if not intents:
+                # Real worker returned an EMPTY corpus — e.g. all apps non-operational
+                # during a redeploy window (status DEPLOYING/PAUSED/RETIRED). The
+                # incumbent can't be re-benchmarked this round → STALE bar → abstain.
+                # (Mirrors the follower, which scores the champion on the same shared
+                # corpus and never reuses a stale stored number.)
+                self._incumbent_refresh_failed = True
                 return
 
             score_fn = await self._benchmark_worker._build_score_fn(intents)
