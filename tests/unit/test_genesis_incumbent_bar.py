@@ -78,3 +78,28 @@ def test_genesis_incumbent_still_burns_weights_to_owner():
     assert mgr._champion.hotkey == GENESIS_HOTKEY
     weights = mgr._build_weights_mapping(epoch=1)
     assert weights == {OWNER: 1.0}
+
+
+# ── stale-bar guard: _refresh_incumbent_score flags an un-refreshable incumbent ──
+
+def test_refresh_flags_stale_when_incumbent_image_unresolvable():
+    import asyncio
+    g = _genesis(0.5)  # image_tag=None
+    mgr = _mgr(genesis=g)
+    mgr._sub_store.get.return_value = g  # incumbent_sub = genesis (no image)
+    bw = MagicMock()
+    bw._resolve_champion_image.return_value = None  # genesis image unresolvable
+    mgr._benchmark_worker = bw
+    asyncio.run(mgr._refresh_incumbent_score())
+    assert mgr._champion.submission_id == "sub_genesis"  # seeded as incumbent
+    assert mgr._incumbent_refresh_failed is True  # couldn't re-benchmark -> stale
+
+
+def test_refresh_resets_stale_flag_when_no_incumbent():
+    import asyncio
+    mgr = _mgr(genesis=None)  # no champion, no scored genesis
+    mgr._incumbent_refresh_failed = True  # stale from a prior round
+    asyncio.run(mgr._refresh_incumbent_score())
+    # No incumbent -> early return after reset -> not stale (bootstrap proceeds).
+    assert not mgr._champion.submission_id
+    assert mgr._incumbent_refresh_failed is False
