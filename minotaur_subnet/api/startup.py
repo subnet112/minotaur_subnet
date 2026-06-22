@@ -1290,26 +1290,39 @@ async def initialize(ctx: ServerContext) -> dict:
             rpc_urls[964] = btevm_url
             chain_ids.append(964)
 
-        # Solver — boot from Docker genesis image
+        # Solver — boot from a Docker image. FORCE_SOLVER_IMAGE (operator break-glass)
+        # wins over GENESIS_SOLVER_IMAGE; otherwise genesis.
         solver = None
-        _genesis_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
-        if _genesis_image:
+        from minotaur_subnet.harness.runtime_solver import resolve_boot_solver_image
+        _boot_image, _boot_forced = resolve_boot_solver_image()
+        if _boot_image:
             try:
                 from minotaur_subnet.harness.runtime_solver import DockerRuntimeSolver
                 solver = await DockerRuntimeSolver.create(
-                    image_ref=_genesis_image,
+                    image_ref=_boot_image,
                     chain_ids=chain_ids,
                     rpc_urls=rpc_urls,
                     bridge_registry=bridge_registry,
                 )
-                logger.info(
-                    "Genesis solver initialized via Docker (%s, chains=%s)",
-                    _genesis_image, list(rpc_urls.keys()),
-                )
+                if _boot_forced:
+                    logger.warning(
+                        "FORCE_SOLVER_IMAGE override ACTIVE — live solver pinned to %s "
+                        "(break-glass; clear FORCE_SOLVER_IMAGE to resume normal "
+                        "champion/genesis resolution). chains=%s",
+                        _boot_image, list(rpc_urls.keys()),
+                    )
+                else:
+                    logger.info(
+                        "Genesis solver initialized via Docker (%s, chains=%s)",
+                        _boot_image, list(rpc_urls.keys()),
+                    )
             except Exception as exc:
-                logger.warning("Genesis Docker solver unavailable: %s", exc)
+                logger.warning("Live solver Docker boot unavailable (%s): %s", _boot_image, exc)
         else:
-            logger.info("No GENESIS_SOLVER_IMAGE set — solver unavailable until champion is adopted")
+            logger.info(
+                "No FORCE_SOLVER_IMAGE / GENESIS_SOLVER_IMAGE set — solver unavailable "
+                "until champion is adopted",
+            )
 
         # Simulator
         simulator = None
@@ -1872,6 +1885,21 @@ async def initialize(ctx: ServerContext) -> dict:
 
             async def _build_live_solver(submission, epoch):
                 """Build the live solver object for an activated champion."""
+                # Operator break-glass: while FORCE_SOLVER_IMAGE is set, the live
+                # solver is pinned (boot built it) — refuse to hot-swap to a
+                # champion, so a broken champion can't reactivate over the forced
+                # image. Returning None keeps the current (forced) solver; the
+                # champion-of-record / weights still track adoption as normal.
+                from minotaur_subnet.harness.runtime_solver import forced_solver_image
+                _forced = forced_solver_image()
+                if _forced:
+                    logger.warning(
+                        "FORCE_SOLVER_IMAGE active (%s) — NOT hot-swapping to champion "
+                        "%s; keeping the forced live solver",
+                        _forced, getattr(submission, "submission_id", "?"),
+                    )
+                    return None
+
                 if not allow_champion_hot_swap:
                     logger.warning(
                         "Champion hot-swap disabled by policy; keeping current solver",

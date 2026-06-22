@@ -255,6 +255,11 @@ def health() -> dict:
         if hasattr(_solver, "respawn_state"):
             live_solver_diagnostics = _solver.respawn_state()
 
+    # Operator break-glass visibility: surface FORCE_SOLVER_IMAGE so it's obvious
+    # the live solver is pinned to an override (and to what).
+    from minotaur_subnet.harness.runtime_solver import forced_solver_image
+    _forced_image = forced_solver_image()
+
     data = {
         "status": "ok",
         "service": "app-intents-api",
@@ -267,6 +272,7 @@ def health() -> dict:
         "block_loop": "running" if loop_running else "disabled",
         "live_solver_running": live_solver_running,
         "live_solver": live_solver_diagnostics,
+        "forced_solver_image": _forced_image,  # operator break-glass override, or null
         "provenance_policy": dict(ctx.provenance_policy_health),
         "runtime_security_policy": dict(ctx.runtime_security_policy_health),
     }

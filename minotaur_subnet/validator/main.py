@@ -352,25 +352,34 @@ class AppIntentsValidator:
         if base_url:
             rpc_urls[8453] = base_url
             chain_ids.append(8453)
+        # FORCE_SOLVER_IMAGE (operator break-glass) wins over GENESIS_SOLVER_IMAGE.
         solver = None
-        _genesis_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
-        if _genesis_image:
+        from minotaur_subnet.harness.runtime_solver import resolve_boot_solver_image
+        _boot_image, _boot_forced = resolve_boot_solver_image()
+        if _boot_image:
             try:
                 from minotaur_subnet.harness.runtime_solver import DockerRuntimeSolver
                 import asyncio
                 solver = asyncio.get_event_loop().run_until_complete(
                     DockerRuntimeSolver.create(
-                        image_ref=_genesis_image,
+                        image_ref=_boot_image,
                         chain_ids=chain_ids or [31337],
                         rpc_urls=rpc_urls,
                         bridge_registry=bridge_registry,
                     )
                 )
-                logger.info("Genesis solver initialized via Docker (%s)", _genesis_image)
+                if _boot_forced:
+                    logger.warning(
+                        "FORCE_SOLVER_IMAGE override ACTIVE — live solver pinned to %s "
+                        "(break-glass; clear FORCE_SOLVER_IMAGE to resume normal resolution)",
+                        _boot_image,
+                    )
+                else:
+                    logger.info("Genesis solver initialized via Docker (%s)", _boot_image)
             except Exception as exc:
-                logger.warning("Genesis Docker solver unavailable: %s", exc)
+                logger.warning("Live solver Docker boot unavailable (%s): %s", _boot_image, exc)
         else:
-            logger.info("No GENESIS_SOLVER_IMAGE — solver unavailable until champion is adopted")
+            logger.info("No FORCE_SOLVER_IMAGE / GENESIS_SOLVER_IMAGE — solver unavailable until champion is adopted")
 
         self.block_loop = BlockLoop(
             orderbook=self.orderbook,
