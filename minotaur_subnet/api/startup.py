@@ -156,22 +156,14 @@ def _resolve_native_bittensor_target() -> str:
 
 
 def _round_anchor_chains() -> list[int]:
-    """Benchmark chains to pin, from ROUND_ANCHOR_CHAINS (default Base only).
+    """Benchmark chains to pin — the fleet-uniform CODE constant (Base only).
 
-    Fleet-consistent config like epoch_seconds — every validator must use the
-    same set or pack hashes diverge (which is the intended fail-loud signal).
+    No longer an env: the chain set folds into the pin and thus the pack hash, so
+    it must be identical fleet-wide (a 3rd-party override would split the fleet).
+    See ``consensus.round_anchor.ROUND_ANCHOR_CHAINS`` (the single source of truth).
     """
-    raw = os.environ.get("ROUND_ANCHOR_CHAINS", "8453").strip()
-    chains: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            chains.append(int(part))
-        except ValueError:
-            logger.warning("ROUND_ANCHOR_CHAINS: ignoring non-int chain %r", part)
-    return chains or [8453]
+    from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CHAINS
+    return list(ROUND_ANCHOR_CHAINS)
 
 
 def _round_anchor_rpc_timeout() -> float:
@@ -194,6 +186,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     from minotaur_subnet.epoch.clock import SolverRoundEpochClock
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
     from minotaur_subnet.consensus.round_anchor import (
+        ROUND_ANCHOR_CONFIRMATIONS,
         ForkPinUnavailable,
         derive_fork_pins,
         epoch_anchor_ts,
@@ -202,10 +195,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
     anchor_ts = epoch_anchor_ts(anchor_epoch, epoch_seconds)
     chains = _round_anchor_chains()
-    try:
-        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
-    except ValueError:
-        confirmations = 12
+    confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
     from web3 import Web3
 
@@ -463,15 +453,13 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
     or no RPC), and the caller maps timeouts/errors to their own statuses.
     """
     from minotaur_subnet.consensus.round_anchor import (
+        ROUND_ANCHOR_CONFIRMATIONS,
         round_anchored_pin_enabled,
         serialize_fork_pins,
     )
 
     chains = _round_anchor_chains()
-    try:
-        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
-    except ValueError:
-        confirmations = 12
+    confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
     pins = _derive_round_fork_pins(anchor_epoch)
     if pins:
         pin_map = {str(chain): int(block) for chain, block in sorted(pins.items())}
