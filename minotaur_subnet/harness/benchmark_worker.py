@@ -234,7 +234,8 @@ class BenchmarkWorker:
         raw = os.environ.get("BENCHMARK_EPOCH_BLOCK", "").strip()
         if not raw:
             return
-        if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+        from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+        if round_anchored_pin_enabled():
             if not self._warned_env_pin_ignored:
                 logger.warning(
                     "[fork-pin] BENCHMARK_EPOCH_BLOCK=%r ignored — ROUND_ANCHORED_PIN is on "

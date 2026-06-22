@@ -52,7 +52,7 @@ def _patch_pack_builder():
 
 def test_shadow_noop_when_shadow_flag_off(monkeypatch):
     monkeypatch.delenv("ROUND_ANCHOR_SHADOW", raising=False)
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     with patch("minotaur_subnet.api.startup._derive_round_fork_pins") as derive:
         _maybe_shadow_log_round_fork_pins(_ctx(), "round-x", role="leader", anchor_epoch=42)
     derive.assert_not_called()
@@ -69,7 +69,7 @@ def test_shadow_noop_when_real_gate_on(monkeypatch):
 
 def test_shadow_derives_and_logs_when_enabled(monkeypatch, caplog):
     monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     p_store, p_syn, p_hist = _patch_pack_builder()
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
@@ -86,7 +86,7 @@ def test_shadow_never_stores_pins(monkeypatch):
     # The whole point: shadow must NOT touch RoundState.fork_pins (which would
     # feed the real pack hash). It must never call set_round_fork_pins.
     monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     store = SimpleNamespace(
         get_round=lambda _rid: SimpleNamespace(close_epoch=42),
         set_round_fork_pins=lambda *a, **k: (_ for _ in ()).throw(
@@ -105,7 +105,7 @@ def test_shadow_never_stores_pins(monkeypatch):
 
 def test_shadow_resolves_anchor_from_round_store_when_not_passed(monkeypatch):
     monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     store = SimpleNamespace(get_round=lambda _rid: SimpleNamespace(close_epoch=99))
     p_store, p_syn, p_hist = _patch_pack_builder()
     with patch(
@@ -119,7 +119,7 @@ def test_shadow_resolves_anchor_from_round_store_when_not_passed(monkeypatch):
 
 def test_shadow_logs_deferred_when_pins_unavailable(monkeypatch, caplog):
     monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=None
     ), patch(
@@ -132,7 +132,7 @@ def test_shadow_logs_deferred_when_pins_unavailable(monkeypatch, caplog):
 
 def test_shadow_swallows_errors(monkeypatch):
     monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins",
         side_effect=RuntimeError("rpc down"),
@@ -145,7 +145,7 @@ def test_shadow_swallows_errors(monkeypatch):
 
 
 def test_pack_builder_shadow_override_changes_hash_without_gate(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)  # gate OFF
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate OFF (default is on)
     p_store, p_syn, p_hist = _patch_pack_builder()
     with p_store, p_syn, p_hist:
         ctx = _ctx()
@@ -166,7 +166,7 @@ def test_pack_builder_default_unchanged_when_gate_off(monkeypatch):
     # Sanity: with the gate off and no override, the builder never folds pins in,
     # so shadow logging (which only ever passes an override to a *throwaway* call)
     # cannot move the real pack hash.
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off (default is on)
     p_store, p_syn, p_hist = _patch_pack_builder()
     with p_store, p_syn, p_hist:
         ctx = _ctx()

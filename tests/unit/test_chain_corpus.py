@@ -123,19 +123,23 @@ def test_corpus_to_block_defaults_to_live_head(monkeypatch):
 
 def test_corpus_to_block_falls_back_to_epoch_pin(monkeypatch):
     # One knob pins both the fork AND the corpus: the round's fork-pin is the
-    # default cutoff when no explicit corpus pin is set.
+    # default cutoff when no explicit corpus pin is set. Legacy dev/test path —
+    # the BENCHMARK_* knobs are only honored with the round-anchored gate OFF.
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # default is on; demote env knobs
     monkeypatch.delenv("BENCHMARK_CORPUS_TO_BLOCK", raising=False)
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
     assert _corpus_to_block(_W3, 1) == 46904887
 
 
 def test_corpus_to_block_explicit_pin_wins(monkeypatch):
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # default is on; demote env knobs
     monkeypatch.setenv("BENCHMARK_CORPUS_TO_BLOCK", "46900000")
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
     assert _corpus_to_block(_W3, 1) == 46900000
 
 
 def test_corpus_to_block_invalid_pin_ignored(monkeypatch):
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # default is on; demote env knobs
     monkeypatch.setenv("BENCHMARK_CORPUS_TO_BLOCK", "not-an-int")
     monkeypatch.delenv("BENCHMARK_EPOCH_BLOCK", raising=False)
     assert _corpus_to_block(_W3, 1) == 999  # falls through to live head
