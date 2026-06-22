@@ -645,6 +645,10 @@ class AppIntentConfig:
         default_factory=lambda: [PolicyTier.STRICT, PolicyTier.HYBRID, PolicyTier.EXPERT]
     )
     manifest_version: str = "v1"
+    # Per-App on-chain fee mode baked into the contract at deploy (#239):
+    # "USER" = users pay the fee, "APP" = the App's paymaster pays. Empty string
+    # means "fall back to the operator's FEE_MODE_DEFAULT" at deploy time.
+    fee_mode: str = ""
 
 
 @dataclass

@@ -243,6 +243,7 @@ def create_app_intent(
     js_code: str,
     solidity_code: str,
     deployer: str = "",
+    fee_mode: str = "",
 ) -> dict:
     """Create a new App Intent definition.
 
@@ -253,6 +254,8 @@ def create_app_intent(
         js_code:          JS scoring code (required).
         solidity_code:    Solidity contract code (required).
         deployer:         Deployer wallet address. Only this address can update JS later.
+        fee_mode:         Per-App on-chain fee mode: "USER" (users pay the fee) or
+                          "APP" (the App's paymaster pays). Empty = operator default.
     """
     body: dict = {
         "name": name,
@@ -263,6 +266,8 @@ def create_app_intent(
     }
     if deployer:
         body["deployer"] = deployer
+    if fee_mode:
+        body["fee_mode"] = fee_mode
     return _post("/apps/", body)
 
 
