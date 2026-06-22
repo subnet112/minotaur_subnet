@@ -45,14 +45,23 @@ def _fake_web3(*, head: int, t0: int, spacing: int):
 # ── chain-set config ──────────────────────────────────────────────────────────
 
 
-def test_round_anchor_chains_default_base(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)
+def test_round_anchor_chains_is_base_only():
+    # De-env'd: the chain set is a fleet-uniform CODE constant (Base only).
     assert _round_anchor_chains() == [8453]
 
 
-def test_round_anchor_chains_parses_and_skips_garbage(monkeypatch):
-    monkeypatch.setenv("ROUND_ANCHOR_CHAINS", "8453, 964 , x,")
-    assert _round_anchor_chains() == [8453, 964]
+def test_round_anchor_chains_ignores_env_override(monkeypatch):
+    # The old ROUND_ANCHOR_CHAINS env is gone — a 3rd-party override that could
+    # split the fleet (different chains -> different pack hash) has NO effect.
+    monkeypatch.setenv("ROUND_ANCHOR_CHAINS", "8453,964,1")
+    assert _round_anchor_chains() == [8453]
+
+
+def test_round_anchor_confirmations_ignores_env_override(monkeypatch):
+    # Likewise ROUND_ANCHOR_CONFIRMATIONS is now a code constant (12), not an env.
+    from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CONFIRMATIONS
+    monkeypatch.setenv("ROUND_ANCHOR_CONFIRMATIONS", "3")
+    assert ROUND_ANCHOR_CONFIRMATIONS == 12
 
 
 # ── _derive_round_fork_pins (live adapter, web3 faked) ────────────────────────

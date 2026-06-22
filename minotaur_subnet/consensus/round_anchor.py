@@ -51,6 +51,21 @@ def round_anchored_pin_enabled() -> bool:
     return raw.strip().lower() not in _GATE_OFF_VALUES
 
 
+# Fleet-uniform benchmark-pin config. These fold into the round-anchored pin and
+# thus ``benchmark_pack_hash``, so — like the gate above and CHAMPION_MINER_WEIGHT_
+# FRACTION / EPOCH_SECONDS — they MUST be uniform CODE, never per-validator envs a
+# 3rd party could override to split the fleet (a different value -> a different pin
+# -> PACK_HASH_MISMATCH -> drops out of quorum). They are constants, not env reads.
+#
+# Base only: the benchmark fork_block is a SINGLE scalar applied to whichever chain
+# a plan routes to (anvil_simulator), so a second anchor chain would fold its pin
+# into the pack hash yet apply the Base block number to a non-Base fork. Do NOT
+# widen without a per-chain fork_block map.
+ROUND_ANCHOR_CHAINS: tuple[int, ...] = (8453,)
+# Finality margin for the bracketing guard in find_pin_block (head - confirmations).
+ROUND_ANCHOR_CONFIRMATIONS: int = 12
+
+
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:
     """Deterministic anchor timestamp for a (time-based) solver-round epoch.
 
