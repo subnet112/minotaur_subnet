@@ -58,7 +58,7 @@ def test_rpc_timeout_override_and_floor(monkeypatch):
 
 
 def test_snapshot_ok_with_pins(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # gate off -> gate_enabled False below
     monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
@@ -81,6 +81,17 @@ def test_snapshot_ok_with_pins(monkeypatch):
 
 def test_snapshot_gate_flag_reflects_env(monkeypatch):
     monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")
+    with patch(
+        "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
+    ):
+        snap = startup._compute_round_anchor_parity_snapshot(42)
+    assert snap["gate_enabled"] is True
+
+
+def test_snapshot_gate_flag_defaults_true_when_unset(monkeypatch):
+    # The /health reporter must reflect the real EFFECTIVE state: with the new
+    # fleet-uniform default, an unset env means the gate is ON.
+    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
     with patch(
         "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
     ):

@@ -249,6 +249,84 @@ def test_create_app_intent_persists_manifest_derived_config(tmp_path):
     assert "validation_warnings" in result
 
 
+def _ok_validation():
+    return patch(
+        "minotaur_subnet.engine.validation.validate_app_intent",
+        new=AsyncMock(return_value=CodeValidationResult(
+            valid=True, errors=[], warnings=[], js_config={}, js_manifest=None,
+        )),
+    )
+
+
+def _create(store, **kw):
+    with _ok_validation():
+        return services.create_app_intent(
+            store, name="App", description="d", supported_chains=[1],
+            js_code="module.exports = { score() { return { score: 1 }; } };",
+            solidity_code="pragma solidity ^0.8.24; contract T {}", **kw,
+        )
+
+
+def test_create_app_intent_persists_per_app_fee_mode(tmp_path):
+    # #239: fee_mode chosen at create is stored on the App config + survives reload.
+    store = AppIntentStore(store_path=tmp_path / "store.json")
+    res = _create(store, fee_mode="app")  # case-insensitive -> normalized to APP
+    app = store.get_app(res["app_id"])
+    assert app.config.fee_mode == "APP"
+    # Reload from disk (exercises _config_from_dict) — must round-trip.
+    store2 = AppIntentStore(store_path=tmp_path / "store.json")
+    assert store2.get_app(res["app_id"]).config.fee_mode == "APP"
+
+
+def test_create_app_intent_defaults_fee_mode_empty(tmp_path):
+    # Omitted -> "" (deploy falls back to FEE_MODE_DEFAULT).
+    store = AppIntentStore(store_path=tmp_path / "store.json")
+    res = _create(store)
+    assert store.get_app(res["app_id"]).config.fee_mode == ""
+
+
+def test_create_app_intent_rejects_bad_fee_mode(tmp_path):
+    store = AppIntentStore(store_path=tmp_path / "store.json")
+    res = _create(store, fee_mode="GASLESS")
+    assert "error" in res and "fee_mode" in res["error"]
+
+
+def test_two_apps_under_one_operator_get_distinct_fee_modes(tmp_path):
+    # The bug: every App got the operator-wide mode. Now each App keeps its own.
+    store = AppIntentStore(store_path=tmp_path / "store.json")
+    a = store.get_app(_create(store, fee_mode="USER")["app_id"])
+    b = store.get_app(_create(store, fee_mode="APP")["app_id"])
+    assert a.config.fee_mode == "USER" and b.config.fee_mode == "APP"
+
+
+def test_deployer_resolves_per_app_fee_mode_over_env(monkeypatch):
+    # The REAL deployer helper bakes the App's own fee_mode into the contract,
+    # overriding the operator-wide FEE_MODE_DEFAULT. FeeMode enum: USER=0, APP=1.
+    from minotaur_subnet.deployment.deployer import resolve_fee_mode
+
+    monkeypatch.setenv("FEE_MODE_DEFAULT", "USER")
+    assert resolve_fee_mode("APP") == ("APP", 1)    # App choice wins over env
+    assert resolve_fee_mode("app") == ("APP", 1)    # case-insensitive
+    monkeypatch.setenv("FEE_MODE_DEFAULT", "APP")
+    assert resolve_fee_mode("USER") == ("USER", 0)  # App choice wins over env
+    assert resolve_fee_mode("") == ("APP", 1)       # empty -> env fallback
+    assert resolve_fee_mode(None) == ("APP", 1)     # None -> env fallback
+    monkeypatch.setenv("FEE_MODE_DEFAULT", "USER")
+    assert resolve_fee_mode("") == ("USER", 0)
+
+
+def test_deployer_resolve_fee_mode_rejects_bad_value(monkeypatch):
+    import pytest
+    from minotaur_subnet.deployment.deployer import resolve_fee_mode
+    monkeypatch.setenv("FEE_MODE_DEFAULT", "USER")
+    with pytest.raises(ValueError, match="App config fee_mode must be USER or APP"):
+        resolve_fee_mode("GASLESS")
+    # A bad operator default is attributed to FEE_MODE_DEFAULT, not the App.
+    monkeypatch.setenv("FEE_MODE_DEFAULT", "WRONG")
+    with pytest.raises(ValueError, match="FEE_MODE_DEFAULT must be USER or APP"):
+        resolve_fee_mode("")
+
+
 def test_create_app_intent_rejects_invalid_manifest_semantics(tmp_path):
     store = AppIntentStore(store_path=tmp_path / "store.json")
     manifest = {

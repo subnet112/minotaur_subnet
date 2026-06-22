@@ -45,14 +45,23 @@ def _fake_web3(*, head: int, t0: int, spacing: int):
 # ── chain-set config ──────────────────────────────────────────────────────────
 
 
-def test_round_anchor_chains_default_base(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)
+def test_round_anchor_chains_is_base_only():
+    # De-env'd: the chain set is a fleet-uniform CODE constant (Base only).
     assert _round_anchor_chains() == [8453]
 
 
-def test_round_anchor_chains_parses_and_skips_garbage(monkeypatch):
-    monkeypatch.setenv("ROUND_ANCHOR_CHAINS", "8453, 964 , x,")
-    assert _round_anchor_chains() == [8453, 964]
+def test_round_anchor_chains_ignores_env_override(monkeypatch):
+    # The old ROUND_ANCHOR_CHAINS env is gone — a 3rd-party override that could
+    # split the fleet (different chains -> different pack hash) has NO effect.
+    monkeypatch.setenv("ROUND_ANCHOR_CHAINS", "8453,964,1")
+    assert _round_anchor_chains() == [8453]
+
+
+def test_round_anchor_confirmations_ignores_env_override(monkeypatch):
+    # Likewise ROUND_ANCHOR_CONFIRMATIONS is now a code constant (12), not an env.
+    from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CONFIRMATIONS
+    monkeypatch.setenv("ROUND_ANCHOR_CONFIRMATIONS", "3")
+    assert ROUND_ANCHOR_CONFIRMATIONS == 12
 
 
 # ── _derive_round_fork_pins (live adapter, web3 faked) ────────────────────────
@@ -103,7 +112,7 @@ def test_derive_defers_when_no_live_rpc(monkeypatch):
 
 
 def test_populate_noop_when_gate_off(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     store = MagicMock()
     with patch("minotaur_subnet.api.routes.submissions.get_round_store", return_value=store):
         _maybe_populate_round_fork_pins("r1", 100)

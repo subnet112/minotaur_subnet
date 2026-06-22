@@ -106,6 +106,9 @@ def _bare_worker():
 
 
 def test_epoch_block_pin_set_from_env(monkeypatch):
+    # Legacy dev/test path: BENCHMARK_EPOCH_BLOCK is only honored with the
+    # round-anchored gate OFF (default is now on, which ignores this env).
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
     w = _bare_worker()
     w._apply_epoch_block_pin()
@@ -120,6 +123,9 @@ def test_epoch_block_pin_unset_stays_none(monkeypatch):
 
 
 def test_epoch_block_pin_invalid_ignored(monkeypatch):
+    # Legacy dev/test path (gate OFF): an unparseable BENCHMARK_EPOCH_BLOCK is
+    # ignored via the int() guard. With the gate ON the env is ignored anyway.
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "not-an-int")
     w = _bare_worker()
     w._apply_epoch_block_pin()
