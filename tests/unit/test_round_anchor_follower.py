@@ -35,7 +35,7 @@ def _patch_store(store):
 
 
 def test_resolve_none_when_gate_off(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     rs = RoundState(round_id="r1", status=RoundStatus.CLOSED, close_epoch=100,
                     fork_pins={8453: 3000})
     with _patch_store(_store_with(rs)):

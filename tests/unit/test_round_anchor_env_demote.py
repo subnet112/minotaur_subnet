@@ -34,7 +34,7 @@ def test_env_pin_ignored_when_gate_on(monkeypatch):
 
 def test_env_pin_applies_when_gate_off(monkeypatch):
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "999")
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     w = _worker(epoch_block_number=None)
     w._apply_epoch_block_pin()
     assert w._epoch_block_number == 999  # dev/local path still works
@@ -52,6 +52,6 @@ def test_corpus_to_block_skips_env_when_gate_on(monkeypatch):
 
 
 def test_corpus_to_block_uses_env_when_gate_off(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     monkeypatch.setenv("BENCHMARK_CORPUS_TO_BLOCK", "46900000")
     assert _corpus_to_block(_W3, 1, to_block=None) == 46900000

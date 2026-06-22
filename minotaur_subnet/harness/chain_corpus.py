@@ -117,7 +117,8 @@ def _corpus_to_block(w3: Any, confirmations: int, *, to_block: int | None = None
     # on, the explicit to_block above is the production path and the env knobs
     # below are dev/test-only -> skip them (a deferred/None pin falls to live head,
     # not a stale env block).
-    if os.environ.get("ROUND_ANCHORED_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    if round_anchored_pin_enabled():
         return max(0, w3.eth.block_number - int(confirmations))
     for var in ("BENCHMARK_CORPUS_TO_BLOCK", "BENCHMARK_EPOCH_BLOCK"):
         raw = os.environ.get(var, "").strip()
