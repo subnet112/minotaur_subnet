@@ -32,7 +32,7 @@ def _patch_round(round_state):
 
 
 def test_segment_empty_when_gate_off_even_with_pins(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     with _patch_round(_round_with_pins({8453: 46_904_887, 964: 5_012_345})):
         assert _round_anchored_pin_segment("round-x") == ""
 

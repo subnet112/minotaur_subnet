@@ -254,7 +254,8 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
     benchmark runs at live head (inert). Followers derive their own independently
     (P3); divergence surfaces as PACK_HASH_MISMATCH, never a silent mis-score.
     """
-    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    if not round_anchored_pin_enabled():
         return
     pins = _derive_round_fork_pins(anchor_epoch)
     if not pins:
@@ -281,7 +282,8 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     This is what gives followers Option-b parity: each validator derives the same
     pin from the same anchor, with no trust in a leader-asserted number.
     """
-    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    if not round_anchored_pin_enabled():
         return None
     try:
         from minotaur_subnet.api.routes import submissions
@@ -369,9 +371,10 @@ def _maybe_shadow_log_round_fork_pins(
     (leader at close). When ``None`` (follower path) it is resolved from the
     round store, mirroring :func:`_resolve_round_fork_pins`.
     """
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not _env_true("ROUND_ANCHOR_SHADOW", default=False):
         return
-    if _env_true("ROUND_ANCHORED_PIN", default=False):
+    if round_anchored_pin_enabled():
         return  # live path already derives/binds/logs — shadow is redundant
     try:
         if anchor_epoch is None:
@@ -459,7 +462,10 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
     ``ok`` (pins derived), ``deferred`` (anchor not yet confirmation-bracketed
     or no RPC), and the caller maps timeouts/errors to their own statuses.
     """
-    from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
+    from minotaur_subnet.consensus.round_anchor import (
+        round_anchored_pin_enabled,
+        serialize_fork_pins,
+    )
 
     chains = _round_anchor_chains()
     try:
@@ -485,7 +491,7 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
         "pins": pin_map,
         "pin_hashes": pin_hashes,
         "pin_segment": pin_segment,
-        "gate_enabled": _env_true("ROUND_ANCHORED_PIN", default=False),
+        "gate_enabled": round_anchored_pin_enabled(),
         "derived_at": int(time.time()),
     }
 

@@ -103,7 +103,7 @@ def test_derive_defers_when_no_live_rpc(monkeypatch):
 
 
 def test_populate_noop_when_gate_off(monkeypatch):
-    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # emergency override -> off
     store = MagicMock()
     with patch("minotaur_subnet.api.routes.submissions.get_round_store", return_value=store):
         _maybe_populate_round_fork_pins("r1", 100)
