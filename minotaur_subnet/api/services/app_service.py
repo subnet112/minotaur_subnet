@@ -40,6 +40,7 @@ def create_app_intent(
     solidity_code: str | None = None,
     constructor_args: list[list[str]] | None = None,
     deployer: str = "",
+    fee_mode: str = "",
 ) -> dict[str, Any]:
     """Define a new App Intent with developer-provided JS and Solidity code.
 
@@ -67,6 +68,13 @@ def create_app_intent(
     for cid in supported_chains:
         if not isinstance(cid, int) or cid <= 0:
             return {"error": f"Invalid chain_id in supported_chains: {cid}"}
+
+    # Per-App fee mode (#239): "USER"/"APP", or empty to fall back to the
+    # operator's FEE_MODE_DEFAULT at deploy time. Normalize + validate here so a
+    # bad value is rejected at create with a clear error, not at deploy.
+    fee_mode = (fee_mode or "").strip().upper()
+    if fee_mode and fee_mode not in ("USER", "APP"):
+        return {"error": f"fee_mode must be 'USER', 'APP', or empty, got {fee_mode!r}"}
 
     # ── both JS and Solidity are required ────────────────────────────────
     has_js = bool(js_code and js_code.strip())
@@ -134,6 +142,7 @@ def create_app_intent(
         score_threshold=0.5,
         on_chain_threshold=5000,
         max_gas=500_000,
+        fee_mode=fee_mode,
     )
 
     manifest_errors, manifest_warnings, typed_manifest = (
