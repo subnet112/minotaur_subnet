@@ -522,6 +522,20 @@ class TestSubmissionAPI(unittest.TestCase):
         )
         self._sig_patcher.start()
 
+        # Mock PR resolution: create_submission resolves a solver-repo PR number to
+        # the fork clone_url + head SHA without hitting GitHub. head_sha matches the
+        # "a"*40 used in the submission bodies below so the force-push guard passes.
+        self._pr_patcher = patch(
+            "minotaur_subnet.api.routes.submissions.github_pr.resolve_pr",
+            return_value={
+                "clone_url": "https://github.com/miner/minotaur-solver.git",
+                "head_sha": "a" * 40,
+                "state": "open",
+                "base": "subnet112/minotaur-solver",
+            },
+        )
+        self._pr_patcher.start()
+
         # Import the app after setting the store
         from minotaur_subnet.api.server import app
         self.client = TestClient(app)
@@ -544,6 +558,7 @@ class TestSubmissionAPI(unittest.TestCase):
         sub_mod.set_champion_peer_network(None)
         sub_mod.set_solver_round_epoch_provider(None)
         self._sig_patcher.stop()
+        self._pr_patcher.stop()
 
     def test_health(self):
         resp = self.client.get("/health")
@@ -1054,8 +1069,8 @@ class TestSubmissionAPI(unittest.TestCase):
 
     def test_create_submission(self):
         resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             "signature": "dGVzdHNpZw==",
@@ -1073,8 +1088,8 @@ class TestSubmissionAPI(unittest.TestCase):
     def test_create_submission_round_id_mismatch_returns_409(self):
         self.round_store.ensure_open_round(opened_epoch=42)
         resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "round_id": "round-e42-n999",
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -1088,8 +1103,8 @@ class TestSubmissionAPI(unittest.TestCase):
         self.round_store.close_current_round(close_epoch=43)
 
         resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "round_id": current.round_id,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -1100,8 +1115,8 @@ class TestSubmissionAPI(unittest.TestCase):
 
     def test_create_duplicate_returns_409(self):
         body = {
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             "signature": "dGVzdHNpZw==",
@@ -1110,73 +1125,6 @@ class TestSubmissionAPI(unittest.TestCase):
         resp = self.client.post("/v1/submissions", json=body)
         self.assertEqual(resp.status_code, 409)
         self.assertIn("already submitted", resp.json()["detail"])
-
-    def test_create_bad_url_returns_400(self):
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "not-a-url",
-            "commit_hash": "abc123def456",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 400)
-
-    def test_http_repo_url_rejected_by_default(self):
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "http://github.com/miner/solver",
-            "commit_hash": "abc123def456",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("must use HTTPS", resp.json()["detail"])
-
-    def test_http_repo_url_allowed_with_policy(self):
-        os.environ["ALLOW_INSECURE_REPO_URLS"] = "1"
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "http://github.com/miner/solver",
-            "commit_hash": "abc123def456",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 201)
-        os.environ.pop("ALLOW_INSECURE_REPO_URLS", None)
-
-    def test_file_repo_url_rejected_by_default(self):
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "file:///solver-submissions/local-repo",
-            "commit_hash": "abc123def456",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("ALLOW_FILE_REPO_URLS", resp.json()["detail"])
-
-    def test_file_repo_url_allowed_with_policy(self):
-        os.environ["ALLOW_FILE_REPO_URLS"] = "1"
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "file:///solver-submissions/local-repo",
-            "commit_hash": "abc123def456",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 201)
-        os.environ.pop("ALLOW_FILE_REPO_URLS", None)
-
-    def test_non_hex_commit_hash_returns_400(self):
-        resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "nothexzzzz",
-            "epoch": 42,
-            "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            "signature": "dGVzdHNpZw==",
-        })
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("hexadecimal", resp.json()["detail"])
 
     def test_create_missing_fields_returns_422(self):
         resp = self.client.post("/v1/submissions", json={
@@ -1202,8 +1150,8 @@ class TestSubmissionAPI(unittest.TestCase):
             return_value=False,
         ):
             resp = self.client.post("/v1/submissions", json={
-                "repo_url": "https://github.com/miner/solver",
-                "commit_hash": "abc123def456",
+                "pr_number": 1,
+                "head_sha": "a" * 40,
                 "epoch": 42,
                 "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
                 "signature": "bm90YXZhbGlkc2ln",
@@ -1215,8 +1163,8 @@ class TestSubmissionAPI(unittest.TestCase):
     def test_missing_signature_returns_422(self):
         """Submission without signature field returns 422 (required field)."""
         resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
         })
@@ -1390,8 +1338,8 @@ class TestSubmissionAPI(unittest.TestCase):
     def test_submissions_accepting_kill_switch_returns_503(self):
         os.environ["SUBMISSIONS_ACCEPTING"] = "0"
         resp = self.client.post("/v1/submissions", json={
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             "signature": "dGVzdHNpZw==",
@@ -1403,8 +1351,8 @@ class TestSubmissionAPI(unittest.TestCase):
     def test_submission_api_key_required(self):
         os.environ["SUBMISSIONS_API_KEY"] = "secret-key"
         body = {
-            "repo_url": "https://github.com/miner/solver",
-            "commit_hash": "abc123def456",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
             "epoch": 42,
             "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
             "signature": "dGVzdHNpZw==",

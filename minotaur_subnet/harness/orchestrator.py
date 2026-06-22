@@ -449,6 +449,31 @@ class SolverOrchestrator:
         Returns:
             A SolverSession connected to the container.
         """
+        # Content-addressed run chokepoint: if handed a <repo>@sha256:D digest
+        # ref, pre-pull it so a host that didn't build the image (follower / fresh
+        # node / restart) runs the exact certified bytes. Pull-by-digest is
+        # self-verifying (the daemon rejects a manifest whose digest != D). This is
+        # a SEPARATE subprocess carrying none of the run flags below. A local tag
+        # is left untouched (no pull), so legacy behavior is unchanged.
+        from minotaur_subnet.harness.image_transport import is_digest_ref
+        if is_digest_ref(image):
+            try:
+                pull = await asyncio.create_subprocess_exec(
+                    "docker", "pull", image,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await asyncio.wait_for(pull.communicate(), timeout=600)
+                if pull.returncode != 0:
+                    logger.warning(
+                        "Pre-pull of %s failed (rc=%s): %s — attempting run anyway "
+                        "(image may be present locally)",
+                        image, pull.returncode,
+                        out.decode("utf-8", errors="replace")[:200],
+                    )
+            except (asyncio.TimeoutError, FileNotFoundError) as exc:
+                logger.warning("Pre-pull of %s errored: %s — attempting run anyway", image, exc)
+
         cmd = ["docker", "run", "--rm", "-i"]
         if labels:
             for k, v in labels.items():

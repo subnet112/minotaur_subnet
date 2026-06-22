@@ -150,13 +150,14 @@ def _allow_subprocess_benchmark() -> bool:
 
 
 def _challenger_quorum_mode() -> bool:
-    """Whether the diverse-subset / independent-vote challenger-validation model is on.
+    """Whether the challenger-vote OBSERVABILITY diagnostics are published.
 
-    Default OFF — the legacy shared (round_id-only) subset draw and the follower
-    reproducibility check are unchanged until this is explicitly enabled for the
-    quorum-validation rollout. When ON, each validator draws its own diverse
-    Stage-2 subset (seeded by its identity) so adoption is decided by a quorum of
-    independent verdicts rather than reproduction of the leader's number.
+    NOTE (#242): this no longer affects sampling or verification. The Stage-2
+    corpus is always a single round-seeded SHARED draw, and every follower always
+    casts an INDEPENDENT champion-vs-challenger verdict over it (the quorum). This
+    flag now only toggles the observe-only diagnostics — the leader's would-be
+    vote publish, the ``/health`` independent_vote view, and the admin shadow-vote
+    endpoint — so operators can watch fleet agreement without it gating consensus.
     """
     import os
 
@@ -185,7 +186,7 @@ class BenchmarkWorker:
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
         pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
-        validator_identity: str | None = None,  # this validator's stable id (diverse-subset seed)
+        validator_identity: str | None = None,  # this validator's stable id (observability label)
     ) -> None:
         self._sub_store = submission_store
         self._app_store = app_store
@@ -201,8 +202,9 @@ class BenchmarkWorker:
         # Injected by the API layer (keeps the harness free of API imports):
         # round_id -> the round-anchored benchmark-chain fork block, or None.
         self._pin_resolver = pin_resolver
-        # Stable per-validator id (hotkey ss58); seeds this validator's diverse
-        # Stage-2 subset when CHALLENGER_QUORUM_MODE is on (else None = shared draw).
+        # Stable per-validator id (hotkey ss58) — observability label only; the
+        # Stage-2 corpus is a single round-seeded SHARED draw for every validator
+        # (#242), so it no longer seeds the sample.
         self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
@@ -848,9 +850,9 @@ class BenchmarkWorker:
         if n_per_chain is None:
             import os
             try:
-                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "10"))
+                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "50"))
             except ValueError:
-                n_per_chain = 10
+                n_per_chain = 50
 
         # Stage-2 corpus source. Default: the local order store. Opt-in
         # (BENCHMARK_CHAIN_CORPUS): rebuild it from chain (plan Phase 5b) so a
@@ -880,16 +882,14 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("chain corpus build failed for chain %s: %s", cid, exc)
 
-        # Diverse-subset model: seed the draw with this validator's identity so it
-        # tests a DIFFERENT slice of real orders than its peers (broader regression
-        # coverage). Default (model off / no identity) -> shared round_id-only draw.
-        _seed = self._validator_identity if _challenger_quorum_mode() else None
+        # Single round-seeded SHARED draw — every validator derives the identical
+        # subset (#242), so the champion-vs-challenger verdict is over one common
+        # corpus and ratifiable by quorum.
         sampled = sample_historical_orders(
             app_store=self._app_store,
             round_id=round_id,
             n_per_chain=n_per_chain,
             records=chain_records,
-            validator_seed=_seed,
         )
         if not sampled:
             return []
@@ -1048,6 +1048,41 @@ class BenchmarkWorker:
 
         return 1
 
+    def _resolve_incumbent_submission(self) -> Any | None:
+        """The current INCUMBENT champion submission — resolved to equal the leader's
+        ``bool(self._champion.submission_id)`` so the follower derives the SAME
+        ``has_champion``. Resolution order: the ADOPTED champion, else the round-store
+        active-champion snapshot, else a SCORED/ADOPTED genesis with a usable score.
+
+        Genesis-as-bar (#242, user decision): the FIRST champion must BEAT genesis, so
+        a benchmarked (SCORED, score>0) genesis IS the incumbent here — mirroring the
+        leader's ``_maybe_seed_genesis_incumbent`` (which seeds self._champion from the
+        same predicate at decision time). KEEP this predicate identical to the leader's
+        or has_champion parity breaks. Returns ``None`` only at true bootstrap (no
+        adopted/snapshot champion AND no scored genesis yet).
+        """
+        adopted = self._sub_store.get_champion()
+        if adopted is not None:
+            return adopted
+        if self._round_store is not None:
+            try:
+                snapshot = self._round_store.get_active_champion()
+                sid = getattr(snapshot, "submission_id", None)
+                if sid:
+                    return self._sub_store.get(sid)
+            except Exception:  # pragma: no cover - defensive
+                return None
+        # Genesis-as-bar: a SCORED/ADOPTED genesis with a usable score is the
+        # incumbent (same predicate as EpochManager._maybe_seed_genesis_incumbent).
+        genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+        if (
+            genesis is not None
+            and genesis.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED)
+            and (genesis.benchmark_score or 0.0) > 0
+        ):
+            return genesis
+        return None
+
     def _resolve_champion_image(self) -> str | None:
         """Resolve the Docker image tag of the current champion (or genesis).
 
@@ -1055,7 +1090,9 @@ class BenchmarkWorker:
         ``_maybe_bootstrap_solving_apps_with_champion``: prefer an explicit
         champion, fall back to a SCORED/ADOPTED genesis submission, and map a
         genesis hotkey with no image to the configured genesis solver image.
-        Returns ``None`` when no usable champion image is available.
+        Returns ``None`` when no usable champion image is available. (This is the
+        image to RUN/benchmark — NOT the has_champion incumbent; see
+        ``_resolve_incumbent_submission``.)
         """
         champion = self._sub_store.get_champion()
         if champion is None:
@@ -1174,7 +1211,7 @@ class BenchmarkWorker:
             "chal_score": round(float(chal_score), 4),
             "champ_score": round(float(champ_score), 4),
             "champion_image": champ_image,
-            "validator_seed": self._validator_identity,
+            "validator_id": self._validator_identity,
             "round_id": round_id,
             "reason": reason,
         }

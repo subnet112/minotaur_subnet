@@ -135,6 +135,28 @@ class TestOrderRoutes(unittest.TestCase):
         self.assertEqual(data["count"], 2)
         self.assertEqual(len(data["orders"]), 2)
 
+    def test_public_orders_serves_failed_and_strips_sig(self):
+        # The order book is PUBLIC (no auth) — followers pull /v1/orders to build
+        # their benchmark corpus, so it must include FAILED orders (rejected/expired,
+        # which never reach the chain) and strip user_signature.
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        store.list_orders.return_value = [
+            {"order_id": "a", "status": "filled", "user_signature": "0xsecret"},
+            {"order_id": "b", "status": "rejected", "user_signature": "0xalso"},
+        ]
+        orders_module.set_app_store(store)
+        try:
+            # No auth required, returns both orders (incl. the rejected one), sig stripped
+            resp = self.client.get("/v1/orders")
+            self.assertEqual(resp.status_code, 200)
+            orders = resp.json()["orders"]
+            self.assertEqual({o["order_id"] for o in orders}, {"a", "b"})
+            # signature blanked (not leaked) for every entry
+            self.assertTrue(all(not o.get("user_signature") for o in orders))
+        finally:
+            orders_module.set_app_store(None)
+
     def test_list_orders_filter_by_app(self):
         self._submit(app_id="app-1", submitted_by="0xA")
         self._submit(app_id="app-2", submitted_by="0xB")

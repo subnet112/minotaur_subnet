@@ -1891,19 +1891,28 @@ async def initialize(ctx: ServerContext) -> dict:
                     logger.warning("Genesis champion activated but baseline solver unavailable")
                     return None
 
-                image_ref = (submission.image_id or "").strip()
-                if not image_ref.startswith("sha256:"):
-                    logger.warning(
-                        "Champion %s missing immutable image_id; refusing hot-swap",
-                        submission.submission_id,
-                    )
-                    return None
+                # Content-addressed: prefer the portable <repo>@sha256:D digest ref
+                # (pullable on any host — start_docker pre-pulls it) over the local
+                # {{.Id}} image_id (only present where the image was built). This is
+                # what lets a follower / fresh node / restart run the certified bytes.
+                from minotaur_subnet.harness.image_transport import is_digest_ref
+                _digest = (getattr(submission, "image_digest", None) or "").strip()
+                if is_digest_ref(_digest):
+                    image_ref = _digest
+                else:
+                    image_ref = (submission.image_id or "").strip()
+                    if not image_ref.startswith("sha256:"):
+                        logger.warning(
+                            "Champion %s missing immutable image_id/digest; refusing hot-swap",
+                            submission.submission_id,
+                        )
+                        return None
 
                 from minotaur_subnet.harness.runtime_solver import DockerRuntimeSolver
 
                 logger.info(
-                    "Starting champion runtime from image_id %s",
-                    image_ref[:20],
+                    "Starting champion runtime from image_ref %s",
+                    image_ref[:24],
                 )
                 new_solver = await asyncio.wait_for(
                     DockerRuntimeSolver.create(
@@ -1925,11 +1934,35 @@ async def initialize(ctx: ServerContext) -> dict:
                 return new_solver
 
             _champion_merge_fn = None
+            _champion_reject_fn = None
             if os.environ.get("SOLVER_REPO_URL", "").strip() or os.environ.get("SOLVER_REPO_PATH", "").strip():
-                from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+                from minotaur_subnet.relayer.solver_repo import (
+                    assert_solver_repo_token_not_admin,
+                    on_champion_adopted_pr,
+                    on_champion_rejected_pr,
+                )
+                # The leader's solver-repo token must NOT be admin-scoped (an admin
+                # token bypasses + can edit the protect-main ruleset, defeating the
+                # cert gate). HARD-FAIL when adoption is LIVE; while frozen
+                # (DISABLE_CHAMPION_ADOPTION=1) the merge path never fires, so only
+                # WARN — this keeps the currently-frozen leader bootable before the
+                # non-admin PAT is provisioned. See solver_repo.py.
+                from minotaur_subnet.epoch.manager import _adoption_disabled
+                if _adoption_disabled():
+                    try:
+                        assert_solver_repo_token_not_admin()
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "[adoption-frozen] solver-repo token not yet hardened (%s) — "
+                            "MUST provision a non-admin PAT before flipping DISABLE_CHAMPION_ADOPTION=0",
+                            exc,
+                        )
+                else:
+                    assert_solver_repo_token_not_admin()  # adoption LIVE → hard-fail if admin
                 _champion_merge_fn = on_champion_adopted_pr
+                _champion_reject_fn = on_champion_rejected_pr
                 logger.info(
-                    "Champion adoption: on-chain attestation + GitHub PR (registry=%s, repo=%s)",
+                    "Champion adoption: on-chain attestation + leader-authority merge (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
                     os.environ.get("SOLVER_REPO_URL", "not set"),
                 )
@@ -1942,6 +1975,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 round_store=round_store,
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,
+                on_champion_rejected=_champion_reject_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
@@ -2081,6 +2115,41 @@ async def initialize(ctx: ServerContext) -> dict:
                 if ctx.solver_round_metagraph_sync is None:
                     return True
                 return ctx.solver_round_metagraph_sync.is_leader
+
+            # Order-book sync (#228): each FOLLOWER pulls the leader's full order set
+            # — including the FAILED orders (rejected/expired) that never reach the
+            # chain and are broadcast nowhere — so it can build a representative
+            # Stage-2 benchmark corpus for the diverse-subset adoption vote. No-ops
+            # on the leader (the source); idempotent upsert is self-healing.
+            def _resolve_leader_api_url() -> str | None:
+                _sync = ctx.solver_round_metagraph_sync
+                if _sync is None or _sync.state is None or _sync.state.leader is None:
+                    return None
+                _leader = _sync.state.leader
+                # Reuse the champion peer network's resolved :8080 endpoints (the
+                # CHAMPION_CONSENSUS_PEERS pin on the testnet + the axon->api
+                # transform on prod), matching the leader by evm validator_id.
+                _net = submissions.get_champion_peer_network()
+                if _net is not None:
+                    for _peer in _net.peers:
+                        if (_peer.validator_id or "").lower() == (_leader.evm_address or "").lower():
+                            return _peer.url
+                return _champion_axon_to_api_url(_leader.axon_url) or None
+
+            try:
+                from minotaur_subnet.blockloop.order_sync import OrderSync
+                _order_sync = OrderSync(
+                    app_store=ctx.store,
+                    leader_api_url=_resolve_leader_api_url,
+                    is_follower=(
+                        lambda: ctx.solver_round_metagraph_sync is not None
+                        and not _is_solver_round_leader()
+                    ),
+                )
+                ctx.order_sync_task = asyncio.create_task(_order_sync.run_loop())
+                logger.info("Order-book sync loop started (followers pull the leader's orders)")
+            except Exception:
+                logger.warning("Order-book sync not started", exc_info=True)
 
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
