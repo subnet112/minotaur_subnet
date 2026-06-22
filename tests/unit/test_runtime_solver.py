@@ -168,3 +168,45 @@ async def test_create_reaps_orphans_and_labels_container():
         "minotaur.launcher": _live_solver_launcher_id(),
     }
     assert kwargs["live"] is True
+
+
+# ── FORCE_SOLVER_IMAGE operator break-glass (#digest-pin recovery lever) ───────
+
+from minotaur_subnet.harness.runtime_solver import (  # noqa: E402
+    forced_solver_image,
+    resolve_boot_solver_image,
+)
+
+
+def test_forced_solver_image_unset_is_none(monkeypatch):
+    monkeypatch.delenv("FORCE_SOLVER_IMAGE", raising=False)
+    assert forced_solver_image() is None
+
+
+def test_forced_solver_image_whitespace_is_none(monkeypatch):
+    monkeypatch.setenv("FORCE_SOLVER_IMAGE", "   ")
+    assert forced_solver_image() is None
+
+
+def test_forced_solver_image_returns_ref(monkeypatch):
+    ref = "ghcr.io/subnet112/minotaur-solver@sha256:" + "a" * 64
+    monkeypatch.setenv("FORCE_SOLVER_IMAGE", "  " + ref + "  ")
+    assert forced_solver_image() == ref  # stripped
+
+
+def test_resolve_boot_prefers_force_over_genesis(monkeypatch):
+    monkeypatch.setenv("GENESIS_SOLVER_IMAGE", "ghcr.io/x/solver:latest")
+    monkeypatch.setenv("FORCE_SOLVER_IMAGE", "ghcr.io/x/solver:known-good")
+    assert resolve_boot_solver_image() == ("ghcr.io/x/solver:known-good", True)
+
+
+def test_resolve_boot_falls_back_to_genesis(monkeypatch):
+    monkeypatch.delenv("FORCE_SOLVER_IMAGE", raising=False)
+    monkeypatch.setenv("GENESIS_SOLVER_IMAGE", "ghcr.io/x/solver:latest")
+    assert resolve_boot_solver_image() == ("ghcr.io/x/solver:latest", False)
+
+
+def test_resolve_boot_none_when_neither_set(monkeypatch):
+    monkeypatch.delenv("FORCE_SOLVER_IMAGE", raising=False)
+    monkeypatch.delenv("GENESIS_SOLVER_IMAGE", raising=False)
+    assert resolve_boot_solver_image() == (None, False)
