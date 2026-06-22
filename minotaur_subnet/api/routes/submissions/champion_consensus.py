@@ -61,11 +61,43 @@ async def _resolve_local_image_id(image_tag: str) -> str | None:
     return stdout.decode("utf-8", errors="replace").strip() or None
 
 
+async def _pull_image_by_digest(digest_ref: str) -> bool:
+    """Pull a ``<repo>@sha256:D`` image. Returns True on success.
+
+    Pulling BY DIGEST is self-verifying: the Docker daemon refuses a manifest
+    whose computed digest != D, so a successful pull guarantees the follower runs
+    byte-identical bytes to what the leader built and signed — this is what makes
+    cross-host content-addressed benchmarking sound (no ``{{.Id}}`` divergence).
+    """
+    import asyncio as _asyncio
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "docker", "pull", digest_ref,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        out, _ = await _asyncio.wait_for(proc.communicate(), timeout=600)
+    except _asyncio.TimeoutError:
+        logger.warning("docker pull timed out for %s", digest_ref)
+        return False
+    except FileNotFoundError:
+        logger.warning("docker not found while pulling %s", digest_ref)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "docker pull %s failed: %s",
+            digest_ref, out.decode("utf-8", errors="replace")[:300],
+        )
+        return False
+    return True
+
+
 async def _reactive_benchmark_candidate(
     candidate: Any,
     leader_score: float,
     tolerance_pct: float = 0.15,
     round_id: str | None = None,
+    candidate_image_id: str | None = None,
 ) -> tuple[bool, float]:
     """Independently benchmark a champion candidate to verify the leader's score.
 
@@ -93,39 +125,72 @@ async def _reactive_benchmark_candidate(
         require_real_sim_default,
         run_benchmark,
     )
-    from minotaur_subnet.harness.benchmark_worker import (
-        BenchmarkWorker,
-        _challenger_quorum_mode,
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+    # Resolve the image this follower will run. Two modes, decided by the SHAPE of
+    # the leader-proposed candidate_image_id (which the whole quorum signed):
+    #
+    #   digest mode  (bare 64-hex D): reconstruct <candidate_repo>@sha256:D and
+    #     `docker pull` it. Pull-by-digest is self-verifying — the daemon rejects a
+    #     manifest whose digest != D — so the follower runs byte-identical bytes to
+    #     what the leader built. This REPLACES the broken cross-host {{.Id}} compare
+    #     (two hosts that rebuild from source get different {{.Id}}s → false reject).
+    #
+    #   legacy mode  (sha256:<id> / builtin / unset): keep the local {{.Id}} compare
+    #     against the leader's image_id — the candidate must already be built locally.
+    from minotaur_subnet.harness.image_transport import (
+        candidate_repo,
+        is_bare_digest,
+        make_digest_ref,
     )
 
-    image_tag = candidate.image_tag
-    if not image_tag:
-        logger.warning(
-            "Candidate %s has no image_tag — cannot benchmark reactively",
-            candidate.submission_id,
+    if is_bare_digest(candidate_image_id):
+        run_image = make_digest_ref(candidate_repo(), candidate_image_id)
+        if not run_image:
+            logger.warning(
+                "Reactive benchmark: cannot build digest ref for %s (D=%s) — refusing",
+                candidate.submission_id, candidate_image_id,
+            )
+            return False, 0.0
+        if not await _pull_image_by_digest(run_image):
+            logger.warning(
+                "Reactive benchmark: pull-by-digest failed for %s (%s) — refusing to sign",
+                candidate.submission_id, run_image,
+            )
+            return False, 0.0
+        logger.info(
+            "Reactive benchmark: pulled content-addressed candidate %s (%s)",
+            candidate.submission_id, run_image,
         )
-        return False, 0.0
+    else:
+        run_image = candidate.image_tag
+        if not run_image:
+            logger.warning(
+                "Candidate %s has no image_tag — cannot benchmark reactively",
+                candidate.submission_id,
+            )
+            return False, 0.0
 
-    # Before burning CPU, make sure the image tag on this peer resolves to
-    # the same sha256 image_id the leader built. Tags are local refs; two
-    # hosts can end up with different bytecode under the same tag.
-    expected_image_id = (candidate.image_id or "").strip()
-    if expected_image_id:
-        local_image_id = await _resolve_local_image_id(image_tag)
-        if local_image_id is None:
-            logger.warning(
-                "Reactive benchmark: cannot resolve local image_id for %s — "
-                "refusing to benchmark",
-                image_tag,
-            )
-            return False, 0.0
-        if local_image_id.lower() != expected_image_id.lower():
-            logger.warning(
-                "Reactive benchmark image_id mismatch for %s: local=%s expected=%s "
-                "— refusing to benchmark",
-                candidate.submission_id, local_image_id, expected_image_id,
-            )
-            return False, 0.0
+        # Before burning CPU, make sure the image tag on this peer resolves to
+        # the same sha256 image_id the leader built. Tags are local refs; two
+        # hosts can end up with different bytecode under the same tag.
+        expected_image_id = (candidate.image_id or "").strip()
+        if expected_image_id:
+            local_image_id = await _resolve_local_image_id(run_image)
+            if local_image_id is None:
+                logger.warning(
+                    "Reactive benchmark: cannot resolve local image_id for %s — "
+                    "refusing to benchmark",
+                    run_image,
+                )
+                return False, 0.0
+            if local_image_id.lower() != expected_image_id.lower():
+                logger.warning(
+                    "Reactive benchmark image_id mismatch for %s: local=%s expected=%s "
+                    "— refusing to benchmark",
+                    candidate.submission_id, local_image_id, expected_image_id,
+                )
+                return False, 0.0
 
     # Build a temporary BenchmarkWorker to reuse intent loading and scoring
     app_store = ctx.store
@@ -184,10 +249,10 @@ async def _reactive_benchmark_candidate(
     score_fn = await worker._build_score_fn(intents)
     intents = worker._enrich_intents_with_manifests(intents)
 
-    # Stage 2 historical scenarios. Legacy (flag off): seeded by round_id alone so
-    # peers sample the SAME set as the leader (reproducibility check). Under
-    # CHALLENGER_QUORUM_MODE the worker's identity seeds a DIFFERENT, diverse subset
-    # per validator — intended, so each casts an independent verdict over its own slice.
+    # Stage 2 historical scenarios — a single round-seeded SHARED corpus, identical
+    # on every validator (#242). The follower re-runs this same corpus, so its
+    # independent champion-vs-challenger verdict (below) is directly comparable to
+    # the leader's and ratifiable by quorum.
     if round_id:
         try:
             historical = worker._load_historical_scenarios(round_id)
@@ -206,7 +271,7 @@ async def _reactive_benchmark_candidate(
     # silently diverge consensus.
     _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
-    session = await orch.start_docker(image_tag)
+    session = await orch.start_docker(run_image)
     try:
         results = await run_benchmark(
             session,
@@ -231,17 +296,6 @@ async def _reactive_benchmark_candidate(
 
     # Compute average score (same logic as BenchmarkWorker._compute_avg_score)
     local_score = worker._compute_avg_score(results)
-
-    # CHALLENGER_QUORUM_MODE: cast an INDEPENDENT adopt vote rather than reproducing
-    # the leader's number. Benchmark the CURRENT champion on this follower's own
-    # (diverse) intents and apply the SAME adoption rule the leader uses. The vote
-    # is this validator's own judgement; quorum of YES votes -> adopt.
-    if _challenger_quorum_mode():
-        return await _independent_adopt_vote(
-            worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
-            chal_results=results, chal_score=local_score, candidate=candidate,
-            round_id=round_id,
-        )
 
     logger.info(
         "Reactive benchmark for %s: local_score=%.4f leader_score=%.4f",
@@ -278,20 +332,17 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:  # observe-only — must never break verification
             logger.warning("[round-anchor-shadow] follower logging failed (ignored): %s", exc)
 
-    if leader_score <= 0:
-        # Leader claims zero — accept if we also scored zero
-        return local_score <= 0, local_score
-
-    relative_diff = abs(local_score - leader_score) / max(leader_score, 0.01)
-    verified = relative_diff <= tolerance_pct
-    if not verified:
-        logger.warning(
-            "Reactive benchmark REJECTED %s: relative_diff=%.2f%% > tolerance=%.2f%%",
-            candidate.submission_id,
-            relative_diff * 100,
-            tolerance_pct * 100,
-        )
-    return verified, local_score
+    # (#242) Follower verification = INDEPENDENT verdict over the SHARED corpus.
+    # Re-benchmark the CURRENT champion on the SAME shared intents and apply the
+    # adoption rule ourselves, signing only if WE conclude adopt — not merely
+    # reproducing the leader's number (the old relative-diff tolerance check). The
+    # corpus is identical fleet-wide, so a concentrated improvement is visible to
+    # every validator and the quorum of independent verdicts is meaningful.
+    return await _independent_adopt_vote(
+        worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
+        chal_results=results, chal_score=local_score, candidate=candidate,
+        round_id=round_id,
+    )
 
 
 async def _independent_adopt_vote(
@@ -305,12 +356,15 @@ async def _independent_adopt_vote(
     candidate: Any,
     round_id: str | None,
 ) -> tuple[bool, float]:
-    """This follower's INDEPENDENT adopt vote (CHALLENGER_QUORUM_MODE).
+    """This follower's INDEPENDENT adopt verdict over the SHARED corpus (#242).
 
-    Benchmarks the CURRENT champion on the SAME (this follower's diverse) intents
-    and applies the shared ``evaluate_adoption`` rule — so the vote reflects this
-    validator's own judgement over its own slice of orders, not reproduction of the
-    leader's number. Returns ``(adopt, chal_score)``.
+    Benchmarks the CURRENT champion on the SAME ``intents`` the challenger was just
+    scored on — the single round-seeded corpus that is identical on every validator
+    — and applies the shared ``evaluate_adoption`` rule, so the vote is this
+    validator's own judgement (challenger beats champion), not reproduction of the
+    leader's number. Because the corpus is shared, a concentrated improvement is
+    visible to the whole fleet and the quorum of YES verdicts is meaningful.
+    Returns ``(adopt, chal_score)``.
 
     Conservative on uncertainty: if the champion image can't be resolved, or its
     benchmark needs a real simulator and none is available, vote REJECT rather than
@@ -327,10 +381,51 @@ async def _independent_adopt_vote(
     from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
     chal_card = worker._build_scorecard(chal_results).to_dict()
+    # has_champion mirrors the leader EXACTLY: adopted champion, active-champion
+    # snapshot, OR a SCORED genesis with a usable score (genesis-as-bar, #242 — the
+    # first champion must BEAT genesis). The leader seeds self._champion from the
+    # same predicate at decision time (_maybe_seed_genesis_incumbent), so
+    # _resolve_incumbent_submission() replicates it. The bootstrap branch below is
+    # reached only at TRUE bootstrap — no champion AND no scored genesis yet.
+    has_champion = worker._resolve_incumbent_submission() is not None
     champ_image = worker._resolve_champion_image()
+
+    if not has_champion:
+        # BOOTSTRAP (has_champion=False): no incumbent to dethrone. Match the leader
+        # — adopt a first champion that clears the absolute floor (no margin). MUST
+        # NOT auto-reject here: that would deadlock the very first adoption.
+        adopt, reason = evaluate_adoption(
+            challenger_score=chal_score,
+            champion_score=0.0,
+            challenger_scorecard=chal_card,
+            champion_scorecard={},
+            dethrone_margin=DETHRONE_MARGIN,
+            has_champion=False,
+        )
+        logger.info(
+            "[independent-vote] role=follower candidate=%s round=%s vote=%s "
+            "chal_score=%.4f champ=BOOTSTRAP(no incumbent): %s",
+            candidate.submission_id, round_id,
+            "ADOPT" if adopt else "REJECT", chal_score, reason,
+        )
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_independent_vote = {
+                "candidate_id": candidate.submission_id, "role": "follower",
+                "vote": "ADOPT" if adopt else "REJECT",
+                "chal_score": round(float(chal_score), 4), "champ_score": None,
+                "round_id": round_id, "reason": reason,
+            }
+        except Exception:  # observe-only — must never break verification
+            pass
+        return adopt, chal_score
+
     if not champ_image:
+        # has_champion=True but the incumbent's image can't be resolved — we cannot
+        # benchmark it to verify the challenger beats it, so REJECT conservatively
+        # (NOT a bootstrap: an incumbent exists, the margin must be proven).
         logger.warning(
-            "[independent-vote] candidate=%s: cannot resolve current champion image "
+            "[independent-vote] candidate=%s: champion exists but image unresolvable "
             "— voting REJECT (cannot verify improvement)",
             candidate.submission_id,
         )
@@ -523,7 +618,19 @@ def _build_champion_proposal_for_round(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Certified submission not found")
 
-    resolved_image_id = candidate_image_id or candidate.image_id or round_state.finalist_image_id
+    # Content-addressed (digest mode): when the candidate has a pushed GHCR manifest
+    # digest, carry its BARE 64-hex so on-chain candidateImageId == D and followers
+    # reconstruct <repo>@sha256:D to pull. Falls back to the local {{.Id}} image_id
+    # (legacy) when no digest was pushed. Peers receive the leader's resolved value
+    # via candidate_image_id, so the whole quorum signs the same D.
+    from minotaur_subnet.harness.image_transport import bare_hex
+    _candidate_digest = bare_hex(getattr(candidate, "image_digest", None))
+    resolved_image_id = (
+        candidate_image_id
+        or _candidate_digest
+        or candidate.image_id
+        or round_state.finalist_image_id
+    )
     if not resolved_image_id:
         # Genesis/subprocess submissions don't have Docker image_ids.
         # Use a placeholder so they can still be certified as bootstrap champions.

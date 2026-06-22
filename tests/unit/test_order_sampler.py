@@ -57,60 +57,57 @@ class TestDeterminism:
         assert ids1 != ids2
 
 
-class TestDiverseSubsets:
-    """Per-validator seed: each validator draws a different subset (cross-validation)."""
+class TestSharedCorpus:
+    """#242: one round-seeded SHARED draw — identical on every validator, no seed param."""
 
-    def test_none_seed_matches_legacy_round_only_draw(self):
-        # Backward compat: validator_seed=None must be byte-for-byte the old draw.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        legacy = sample_historical_orders(store, "round-123", n_per_chain=10)
-        explicit_none = sample_historical_orders(
-            store, "round-123", n_per_chain=10, validator_seed=None
-        )
-        assert [o["order_id"] for o in legacy] == [o["order_id"] for o in explicit_none]
+    def test_signature_has_no_per_validator_params(self):
+        import inspect
+        params = set(inspect.signature(sample_historical_orders).parameters)
+        assert {"validator_seed", "validator_index", "validator_count"}.isdisjoint(params)
 
-    def test_same_validator_seed_is_deterministic(self):
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
-        store = _FakeAppStore(orders)
-        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        assert [o["order_id"] for o in a] == [o["order_id"] for o in b]
+    def test_default_n_per_chain_is_50(self):
+        import inspect
+        assert inspect.signature(sample_historical_orders).parameters["n_per_chain"].default == 50
 
-    def test_different_validators_draw_different_subsets(self):
-        # Same round, different validator identities → different (diverse) subsets.
-        orders = [_make_order(f"ord_{i:03d}") for i in range(50)]
+    def test_every_validator_derives_the_identical_subset(self):
+        # The draw depends ONLY on round_id — independent of who runs it. Sampling
+        # the same store + round_id any number of times yields the identical subset,
+        # so the fleet shares one corpus (the basis for a meaningful quorum).
+        orders = [_make_order(f"ord_{i:03d}") for i in range(100)]
         store = _FakeAppStore(orders)
-        a = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALA")
-        b = sample_historical_orders(store, "round-1", n_per_chain=10, validator_seed="0xVALB")
-        ids_a = set(o["order_id"] for o in a)
-        ids_b = set(o["order_id"] for o in b)
-        assert ids_a != ids_b
-        # ...but each is still a valid full-size draw from the same pool.
-        assert len(ids_a) == 10 and len(ids_b) == 10
+        draws = [
+            [o["order_id"] for o in sample_historical_orders(store, "round-42", n_per_chain=10)]
+            for _ in range(5)
+        ]
+        assert all(d == draws[0] for d in draws)
 
 
 class TestFiltering:
-    def test_excludes_non_filled_orders(self):
+    def test_includes_terminal_demand_excludes_inflight(self):
+        # #228: terminal demand (filled + the champion's failures rejected/expired)
+        # is sampled; in-flight (open) and user-cancelled are not — not solver signal.
         orders = [
             _make_order("ord_filled", status="filled"),
             _make_order("ord_rejected", status="rejected"),
+            _make_order("ord_expired", status="expired"),
             _make_order("ord_open", status="open"),
+            _make_order("ord_cancelled", status="cancelled"),
         ]
         store = _FakeAppStore(orders)
         sample = sample_historical_orders(store, "round-1", n_per_chain=10)
-        assert len(sample) == 1
-        assert sample[0]["order_id"] == "ord_filled"
+        assert {o["order_id"] for o in sample} == {"ord_filled", "ord_rejected", "ord_expired"}
 
-    def test_excludes_orders_without_block_number(self):
+    def test_includes_unfilled_orders_without_block_number(self):
+        # #228: block_number is NOT required — the benchmark forks at the round/
+        # live-head pin, not the order's block, so unfilled demand (no fill block)
+        # replays against current state just like a filled order.
         orders = [
-            _make_order("ord_with_block", block_number=28000000),
-            _make_order("ord_no_block", block_number=None),
+            _make_order("ord_filled", status="filled", block_number=28000000),
+            _make_order("ord_rejected_noblock", status="rejected", block_number=None),
         ]
         store = _FakeAppStore(orders)
         sample = sample_historical_orders(store, "round-1", n_per_chain=10)
-        assert len(sample) == 1
-        assert sample[0]["order_id"] == "ord_with_block"
+        assert {o["order_id"] for o in sample} == {"ord_filled", "ord_rejected_noblock"}
 
     def test_filters_by_chain_ids(self):
         orders = [

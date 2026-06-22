@@ -8,18 +8,23 @@ from pydantic import BaseModel, Field
 
 
 class SubmitRequest(BaseModel):
-    repo_url: str = Field(
+    pr_number: int = Field(
         ...,
+        ge=1,
         description=(
-            "Git repo URL (HTTPS). Public in production; private allowed in "
-            "controlled demos when the screening service has separate read-only "
-            "clone credentials."
+            "Pull-request number on the canonical solver repo "
+            "(subnet112/minotaur-solver). The miner forks, opens a PR, and submits "
+            "its number; the leader resolves it to the fork clone_url + head SHA."
         ),
-        examples=["https://github.com/miner/my-solver"],
+        examples=[123],
     )
-    commit_hash: str = Field(
-        ..., description="Git commit hash to pin",
-        min_length=7, max_length=64,
+    head_sha: str = Field(
+        ...,
+        min_length=40, max_length=40,
+        description=(
+            "Full 40-char PR head commit SHA the signature covers. The leader "
+            "rejects the submission if the live PR head != this (force-push guard)."
+        ),
     )
     round_id: str | None = Field(
         default=None,

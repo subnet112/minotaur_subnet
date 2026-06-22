@@ -38,6 +38,7 @@ class ChampionSnapshot:
 
     submission_id: str | None = None
     image_id: str | None = None
+    image_digest: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
     hotkey: str | None = None
@@ -49,6 +50,7 @@ class ChampionSnapshot:
         return {
             "submission_id": self.submission_id,
             "image_id": self.image_id,
+            "image_digest": self.image_digest,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "hotkey": self.hotkey,
@@ -63,6 +65,7 @@ class ChampionSnapshot:
         return cls(
             submission_id=data.get("submission_id"),
             image_id=data.get("image_id"),
+            image_digest=data.get("image_digest"),
             solver_name=data.get("solver_name"),
             solver_version=data.get("solver_version"),
             hotkey=data.get("hotkey"),

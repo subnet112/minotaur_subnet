@@ -74,8 +74,8 @@ class TestGitSubmit:
         with patch("minotaur_subnet.miner.main.aiohttp.ClientSession", return_value=mock_session), \
              patch("bittensor_wallet.Wallet", return_value=mock_wallet):
             result = await submit_solver_git(
-                repo_url="https://github.com/miner/solver",
-                commit_hash="abc123def456",
+                pr_number=123,
+                head_sha="a" * 40,
                 hotkey="test-wallet",
                 validator_url="http://localhost:9100",
             )
@@ -83,6 +83,8 @@ class TestGitSubmit:
         assert result.get("submission_id") == "sub_test123"
         assert captured_payload.get("round_id") == "round-5-n1"
         assert captured_payload.get("epoch") == 5
+        assert captured_payload.get("pr_number") == 123
+        assert captured_payload.get("head_sha") == "a" * 40
         assert captured_payload.get("signature")  # Should be non-empty
 
     @pytest.mark.asyncio

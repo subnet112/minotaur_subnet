@@ -47,6 +47,8 @@ from minotaur_subnet.harness.round_store import (
     RoundStore,
 )
 from minotaur_subnet.weight_policy import (
+    GENESIS_EPOCH,
+    GENESIS_HOTKEY,
     apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
@@ -148,6 +150,7 @@ class EpochManager:
         weight_decay: float = 0.6,
         owner_hotkey: str | None = None,
         on_champion_adopted: Any = None,
+        on_champion_rejected: Any = None,
         vote_recorder: Any = None,
     ) -> None:
         self._block_loop = block_loop
@@ -167,11 +170,18 @@ class EpochManager:
         self._owner_chain_source: Any = None
         self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
+        self._on_champion_rejected = on_champion_rejected
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
         self._vote_recorder = vote_recorder
 
         self._champion = ChampionInfo()
+        # Set True by _refresh_incumbent_score when an incumbent EXISTS but could
+        # NOT be freshly re-benchmarked this round (unresolvable image / bad results
+        # / benchmark error incl. RealSimulationUnavailable). _should_adopt ABSTAINS
+        # when set, so the leader never decides adoption on a STALE champion bar —
+        # mirroring the follower's conservative REJECT (fleet parity).
+        self._incumbent_refresh_failed = False
         self._current_session: Any = None  # SolverSession
         self._current_epoch: int = 0
         self._epoch_history: list[dict[str, Any]] = []
@@ -314,6 +324,7 @@ class EpochManager:
                 self._champion.benchmark_score,
                 self._dethrone_margin * 100,
             )
+            self._notify_champion_rejected(new_champion_sub, "did not beat the champion")
             next_round = self._complete_round(
                 current_round,
                 epoch,
@@ -405,6 +416,8 @@ class EpochManager:
                 activated=False,
                 abort_reason="dethrone_margin_not_met",
             )
+            # Mirror the reject onto the challenger's PR (comment + close + GC).
+            self._notify_champion_rejected(finalist, "did not beat the champion")
             result["status_after"] = RoundStatus.ABORTED.value
             result["abort_reason"] = "dethrone_margin_not_met"
             if next_round is not None:
@@ -495,6 +508,19 @@ class EpochManager:
 
         return result
 
+    def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
+        """Best-effort fire the reject callback (PR comment + close + GC). Sync —
+        called from the round-evaluation path; the callback itself is sync GitHub
+        API. No-op without a callback / a PR-based submission."""
+        if self._on_champion_rejected is None:
+            return
+        if not getattr(submission, "pr_number", None):
+            return
+        try:
+            self._on_champion_rejected(submission, reason)
+        except Exception as exc:
+            logger.warning("on_champion_rejected callback failed: %s", exc)
+
     def get_champion(self) -> dict[str, Any]:
         """Return metadata about the current champion solver."""
         return self._champion.to_dict()
@@ -577,6 +603,47 @@ class EpochManager:
         eligible.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
         return eligible
 
+    def _maybe_seed_genesis_incumbent(self) -> None:
+        """Decision-time: when no champion is seeded, treat a SCORED genesis as the
+        incumbent BAR (has_champion=True) so the FIRST real champion must BEAT
+        genesis (>= genesis*(1+DETHRONE_MARGIN) + per-app floor + on-chain veto),
+        matching the follower's _resolve_incumbent_submission.
+
+        In-memory ONLY — never adopt()/_hot_swap()/set_active_champion() (those
+        trigger snapshot persistence + the on-chain certify path). Resolved at
+        DECISION time (not init) because genesis is scored mid-round. WEIGHT-SAFE:
+        hotkey is copied verbatim (==GENESIS_HOTKEY) so is_real_miner_hotkey stays
+        False and _build_weights_mapping still burns 100% to the owner — identical
+        to the empty-champion case.
+        """
+        if self._champion.submission_id:  # real/adopted/restored incumbent — keep it
+            return
+        if self._sub_store is None:
+            return
+        genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
+        if genesis is None or genesis.status not in (
+            SubmissionStatus.SCORED,
+            SubmissionStatus.ADOPTED,
+        ):
+            return
+        if (genesis.benchmark_score or 0.0) <= 0:  # no usable bar yet -> stay bootstrap
+            return
+        assert genesis.hotkey == GENESIS_HOTKEY, "genesis incumbent must keep the burn hotkey"
+        self._champion = ChampionInfo(
+            submission_id=genesis.submission_id,
+            solver_name=genesis.solver_name,
+            solver_version=genesis.solver_version,
+            benchmark_score=genesis.benchmark_score or 0.0,
+            epoch_adopted=genesis.epoch,
+            image_tag=genesis.image_tag,  # None for genesis -> re-bench resolves the genesis image
+            hotkey=GENESIS_HOTKEY,  # keeps weights on the burn branch
+            adopted_at=genesis.updated_at,
+        )
+        logger.info(
+            "Seeded genesis as the adoption incumbent bar: %s score=%.4f (weights still burn)",
+            genesis.submission_id, genesis.benchmark_score or 0.0,
+        )
+
     async def _refresh_incumbent_score(self) -> None:
         """Re-benchmark the current champion with the latest scenarios.
 
@@ -590,6 +657,13 @@ class EpochManager:
         pack (issue #177). The score is left unchanged only when no benchmark
         worker — or no genesis image — is available.
         """
+        # Genesis-as-bar (#242): seed a SCORED genesis as the incumbent before the
+        # refresh, so both adoption paths (on_epoch_boundary + evaluate_round) and
+        # the follower agree the first champion must BEAT genesis.
+        self._maybe_seed_genesis_incumbent()
+        # Stale-bar guard: assume the incumbent score is fresh this round unless a
+        # production re-benchmark path below fails (then _should_adopt abstains).
+        self._incumbent_refresh_failed = False
         if not self._champion.submission_id:
             return
         if not self._benchmark_worker:
@@ -600,6 +674,9 @@ class EpochManager:
         if self._sub_store:
             incumbent_sub = self._sub_store.get(self._champion.submission_id)
         if incumbent_sub is None:
+            # Incumbent exists but its submission can't be resolved (e.g. a stale
+            # cross-process store reload) → can't re-benchmark the bar → STALE.
+            self._incumbent_refresh_failed = True
             return
 
         image_tag = incumbent_sub.image_tag
@@ -612,7 +689,9 @@ class EpochManager:
             if callable(getattr(self._benchmark_worker, "_resolve_champion_image", None)):
                 image_tag = self._benchmark_worker._resolve_champion_image()
             if not image_tag:
-                return  # no genesis image configured → leave the stored score
+                # Incumbent image unresolvable → cannot re-benchmark the bar → STALE.
+                self._incumbent_refresh_failed = True
+                return  # leave the stored score; _should_adopt will abstain
 
         logger.info(
             "Re-benchmarking incumbent %s (%s) with current scenarios",
@@ -627,7 +706,15 @@ class EpochManager:
                 return
 
             intents = self._benchmark_worker._load_benchmark_intents()
-            if not isinstance(intents, list) or not intents:
+            if not isinstance(intents, list):
+                return  # mock/degenerate worker (real worker returns a list) — test-compat, no flag
+            if not intents:
+                # Real worker returned an EMPTY corpus — e.g. all apps non-operational
+                # during a redeploy window (status DEPLOYING/PAUSED/RETIRED). The
+                # incumbent can't be re-benchmarked this round → STALE bar → abstain.
+                # (Mirrors the follower, which scores the champion on the same shared
+                # corpus and never reuses a stale stored number.)
+                self._incumbent_refresh_failed = True
                 return
 
             score_fn = await self._benchmark_worker._build_score_fn(intents)
@@ -653,6 +740,7 @@ class EpochManager:
                 image_tag, intents, score_fn,
             )
             if not isinstance(results, list):
+                self._incumbent_refresh_failed = True  # bad benchmark → stale bar
                 return
             fresh_score = self._benchmark_worker._compute_avg_score(results)
 
@@ -677,8 +765,11 @@ class EpochManager:
                 self._champion.submission_id, old_score, fresh_score, len(results),
             )
         except Exception:
+            # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
+            # _should_adopt abstains rather than deciding on the prior score.
+            self._incumbent_refresh_failed = True
             logger.warning(
-                "Failed to re-benchmark incumbent %s — using stale score %.4f",
+                "Failed to re-benchmark incumbent %s — STALE bar, will abstain (was %.4f)",
                 self._champion.submission_id, self._champion.benchmark_score,
                 exc_info=True,
             )
@@ -754,6 +845,24 @@ class EpochManager:
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
+            return False
+
+        # Fail-closed stale-bar guard: if an incumbent EXISTS but could not be
+        # freshly re-benchmarked this round (_refresh_incumbent_score hit an
+        # unresolvable-image / bad-results / benchmark-error path), the champion bar
+        # is STALE — ABSTAIN rather than decide adoption on an outdated number. This
+        # mirrors the follower's conservative REJECT (champion_consensus), so the
+        # leader and fleet never diverge on a stale bar. (No incumbent => not stale,
+        # bootstrap proceeds.)
+        # getattr default False: a manager built via __new__ (tests) or never run
+        # through a refresh has not had a failed refresh -> not stale.
+        if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
+            logger.warning(
+                "[abstain] incumbent %s could not be freshly re-benchmarked this "
+                "round — abstaining (refusing to adopt %s against a stale bar)",
+                self._champion.submission_id,
+                getattr(challenger, "submission_id", "?"),
+            )
             return False
 
         # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
@@ -1352,10 +1461,46 @@ class EpochManager:
                 abort_reason or "round_aborted",
             )
 
+        # #227: reap submissions still BENCHMARKING for this now-terminal round.
+        # The benchmark worker only processes the current-open or replay round, so
+        # once this round leaves CLOSED/REPLAYING they would be stranded in
+        # BENCHMARKING forever with no signal (e.g. non-finalist challengers when
+        # the round activates on the first finalist). Fail them with a clear reason
+        # and fire the reject callback so the miner knows to resubmit.
+        self._reap_orphaned_benchmarking(round_state.round_id)
+
         return self._round_store.open_next_round(
             opened_epoch=epoch,
             incumbent=self._get_incumbent_snapshot(),
         )
+
+    def _reap_orphaned_benchmarking(self, round_id: str) -> None:
+        """Reject submissions left BENCHMARKING after their round terminated (#227)."""
+        if self._sub_store is None or not round_id:
+            return
+        try:
+            subs = self._sub_store.list_by_round(round_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Reaper: list_by_round(%s) failed: %s", round_id, exc)
+            return
+        for sub in subs:
+            if sub.status != SubmissionStatus.BENCHMARKING:
+                continue
+            try:
+                self._sub_store.reject(
+                    sub.submission_id,
+                    "benchmark_window_elapsed: round closed before scoring — "
+                    "resubmit to a fresh open round",
+                )
+                self._notify_champion_rejected(
+                    sub, "benchmark window elapsed before scoring",
+                )
+                logger.info(
+                    "Reaped orphaned BENCHMARKING submission %s (round %s terminal)",
+                    sub.submission_id, round_id,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Reaper: failed to reject %s: %s", sub.submission_id, exc)
 
     def _get_incumbent_snapshot(self) -> ChampionSnapshot | None:
         """Return the best available active champion snapshot for round sync."""

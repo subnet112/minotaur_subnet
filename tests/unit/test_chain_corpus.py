@@ -84,17 +84,20 @@ def test_sample_records_path_is_deterministic_and_store_free():
     assert len(s1) == 5
 
 
-def test_sample_records_filters_unfilled_and_unreplayable():
+def test_sample_records_filters_inflight_keeps_unfilled_demand():
+    # #228: terminal demand (filled/rejected/expired) is kept regardless of
+    # block_number (benchmark forks at the round/live-head pin, not the order's
+    # block); only in-flight (open/assigned) demand is filtered.
     recs = [
         {"order_id": "ok", "app_id": "a", "chain_id": 1, "status": "filled", "block_number": 5,
          "params": {}},
         {"order_id": "pending", "app_id": "a", "chain_id": 1, "status": "open", "block_number": 6,
          "params": {}},
-        {"order_id": "noblock", "app_id": "a", "chain_id": 1, "status": "filled", "block_number": None,
+        {"order_id": "noblock", "app_id": "a", "chain_id": 1, "status": "rejected", "block_number": None,
          "params": {}},
     ]
     sampled = sample_historical_orders(app_store=None, round_id="r", n_per_chain=10, records=recs)
-    assert [o["order_id"] for o in sampled] == ["ok"]
+    assert {o["order_id"] for o in sampled} == {"ok", "noblock"}  # in-flight 'pending' dropped
 
 
 def test_chain_corpus_gate_default_off(monkeypatch):
