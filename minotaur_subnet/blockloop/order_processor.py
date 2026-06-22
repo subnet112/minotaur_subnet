@@ -388,11 +388,12 @@ class OrderProcessor:
         oc_score = simulation.on_chain_score
         if oc_score is not None:
             self.orderbook.update_order(order.order_id, on_chain_score=oc_score)
-        # Fail-closed (opt-in): a deployed contract must yield a passing on-chain
-        # score. None means scoreIntent returned valid=False (plan breaks an
-        # on-chain invariant) or was unreadable — the contract did NOT bless the
-        # plan, so don't relay it on the JS score alone. Leader + follower share
-        # onchain_score_fail_closed() so they gate identically.
+        # Fail-closed (DEFAULT ON fleet-wide): a deployed contract must yield a
+        # passing on-chain score. None means scoreIntent returned valid=False (plan
+        # breaks an on-chain invariant) or was unreadable — the contract did NOT
+        # bless the plan, so don't relay it on the JS score alone. Leader + follower
+        # share onchain_score_fail_closed() so they gate identically (break-glass:
+        # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
             self.orderbook.update_order(
                 order.order_id,

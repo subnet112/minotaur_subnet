@@ -1843,7 +1843,16 @@ async def initialize(ctx: ServerContext) -> dict:
                         exc_info=True,
                     )
 
-            allow_champion_hot_swap = _env_true("ALLOW_CHAMPION_HOT_SWAP", default=False)
+            # Fleet-uniform DEFAULT ON: after a certified adoption, a follower with
+            # hot-swap OFF keeps running the STALE champion solver to serve orders
+            # while the leader runs the NEW one → post-adoption order-execution
+            # divergence (weights route to the new champion but execution doesn't).
+            # Prod + both compose templates already set "1", so default-True matches
+            # deployed intent and removes a 3rd-party footgun. FORCE_SOLVER_IMAGE
+            # still takes precedence in _build_live_solver (operator pin preserved).
+            # Break-glass: set ALLOW_CHAMPION_HOT_SWAP=0 to disable. Inert under the
+            # adoption freeze (no certification fires → no swap).
+            allow_champion_hot_swap = _env_true("ALLOW_CHAMPION_HOT_SWAP", default=True)
             coordinator_enabled = _env_true("ENABLE_SOLVER_ROUND_COORDINATOR", default=True)
             try:
                 champion_swap_timeout = float(
