@@ -15,8 +15,31 @@ from minotaur_subnet.consensus.round_anchor import (
     derive_fork_pins,
     epoch_anchor_ts,
     find_pin_block,
+    round_anchored_pin_enabled,
     serialize_fork_pins,
 )
+
+
+# ── round_anchored_pin_enabled (fleet-uniform gate, DEFAULT ON) ───────────────
+
+
+def test_gate_default_on_when_unset(monkeypatch):
+    monkeypatch.delenv("ROUND_ANCHORED_PIN", raising=False)
+    assert round_anchored_pin_enabled() is True
+
+
+@pytest.mark.parametrize("val", ["0", "false", "FALSE", "no", "off", " Off "])
+def test_gate_disabled_by_explicit_off_values(monkeypatch, val):
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", val)
+    assert round_anchored_pin_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["1", "true", "on", "yes", "", "garbage", "2"])
+def test_gate_enabled_for_anything_but_off_values(monkeypatch, val):
+    # Critical fail-safe: a typo (e.g. "garbage"/empty) must NOT silently disable
+    # one validator and split it off the fleet — only the explicit off-set does.
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", val)
+    assert round_anchored_pin_enabled() is True
 
 
 # ── epoch_anchor_ts ───────────────────────────────────────────────────────────

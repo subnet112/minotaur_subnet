@@ -32,6 +32,34 @@ from minotaur_subnet.shared.types import AppIntentDefinition, ExecutionPlan, Int
 
 logger = logging.getLogger(__name__)
 
+
+def forced_solver_image() -> str | None:
+    """Operator break-glass override for the live solver image, or None.
+
+    ``FORCE_SOLVER_IMAGE`` lets an operator pin THIS node's live order-processing
+    solver to a specific image ref (a ``<repo>@sha256:D`` digest or a ``<repo>:tag``)
+    to restore functionality when the active champion's code is broken — without
+    waiting on re-adoption or fighting champion resolution. Operator-LOCAL, not
+    consensus: the live solver only generates plans on the leader (followers
+    re-simulate the plan, not the solver), and weights/benchmarking are untouched.
+    Applied on restart (set the env, redeploy). Unset = normal champion/genesis
+    resolution.
+    """
+    return os.environ.get("FORCE_SOLVER_IMAGE", "").strip() or None
+
+
+def resolve_boot_solver_image() -> tuple[str | None, bool]:
+    """The image the live solver boots from, and whether it is a forced override.
+
+    Precedence: ``FORCE_SOLVER_IMAGE`` (break-glass) wins over ``GENESIS_SOLVER_IMAGE``.
+    Returns ``(image_ref_or_None, is_forced)``.
+    """
+    forced = forced_solver_image()
+    if forced:
+        return forced, True
+    return (os.environ.get("GENESIS_SOLVER_IMAGE", "").strip() or None), False
+
+
 # Marker placed on every live-solver container. Lets us reap orphans from
 # prior API restarts (the --rm flag only runs on clean exit, so a SIGKILLed
 # API leaves its child container running).

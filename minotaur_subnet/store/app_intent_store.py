@@ -108,6 +108,7 @@ def _config_from_dict(d: dict[str, Any]) -> AppIntentConfig:
         policy_tier=_policy_tier_from_str(d.get("policy_tier", "hybrid")),
         supported_policy_tiers=supported_policy_tiers,
         manifest_version=d.get("manifest_version", "v1"),
+        fee_mode=d.get("fee_mode", ""),
     )
 
 

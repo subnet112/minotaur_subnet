@@ -299,6 +299,10 @@ class CreateAppRequest(BaseModel):
         None, description="Extra constructor args: [[abi_type, value], ...]",
     )
     deployer: str = Field("", description="Deployer address (only this address can update JS later)")
+    fee_mode: str = Field(
+        "", description="Per-App on-chain fee mode: 'USER' (users pay) or 'APP' "
+        "(the App's paymaster pays). Empty = operator default (FEE_MODE_DEFAULT).",
+    )
 
 
 class ValidateAppRequest(BaseModel):
@@ -370,6 +374,7 @@ def create_app(
         solidity_code=body.solidity_code or None,
         constructor_args=body.constructor_args,
         deployer=body.deployer,
+        fee_mode=body.fee_mode,
     )
 
 

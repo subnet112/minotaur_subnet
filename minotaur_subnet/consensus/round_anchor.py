@@ -17,12 +17,53 @@ tests), which keeps the derivation trivially testable and import-light.
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 # Accessor signatures injected by the caller.
 HeadFn = Callable[[int], int]               # chain_id -> current head block number
 BlockTimestampFn = Callable[[int, int], int]  # (chain_id, block) -> unix timestamp
 LoFn = Callable[[int], int]                 # chain_id -> earliest searchable block
+
+# Explicit disable values for the fleet-uniform gate. Anything else (including
+# unset, empty, or garbage) is treated as ENABLED so a typo can never silently
+# fall a single validator back to live-head and split it off the fleet.
+_GATE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def round_anchored_pin_enabled() -> bool:
+    """Fleet-uniform gate for round-anchored fork pinning. **DEFAULT ON.**
+
+    Round-anchored pinning is consensus-relevant config: it folds into
+    ``benchmark_pack_hash`` and the on-chain veto, so it must be uniform CODE
+    propagated via ``:stable``/redeploy, NOT a per-validator env that 3rd-party
+    validators would never set (the same reason ``CHAMPION_MINER_WEIGHT_FRACTION``
+    and ``EPOCH_SECONDS`` are hardcoded). Hence the default is ON in code.
+
+    Emergency override only: set ``ROUND_ANCHORED_PIN`` to one of
+    ``{0, false, no, off}`` (case-insensitive) to disable fleet-wide via compose
+    without a code revert. Unset / any other value = enabled. This is the single
+    place the default lives, so every read site stays in lock-step.
+    """
+    raw = os.environ.get("ROUND_ANCHORED_PIN")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _GATE_OFF_VALUES
+
+
+# Fleet-uniform benchmark-pin config. These fold into the round-anchored pin and
+# thus ``benchmark_pack_hash``, so — like the gate above and CHAMPION_MINER_WEIGHT_
+# FRACTION / EPOCH_SECONDS — they MUST be uniform CODE, never per-validator envs a
+# 3rd party could override to split the fleet (a different value -> a different pin
+# -> PACK_HASH_MISMATCH -> drops out of quorum). They are constants, not env reads.
+#
+# Base only: the benchmark fork_block is a SINGLE scalar applied to whichever chain
+# a plan routes to (anvil_simulator), so a second anchor chain would fold its pin
+# into the pack hash yet apply the Base block number to a non-Base fork. Do NOT
+# widen without a per-chain fork_block map.
+ROUND_ANCHOR_CHAINS: tuple[int, ...] = (8453,)
+# Finality margin for the bracketing guard in find_pin_block (head - confirmations).
+ROUND_ANCHOR_CONFIRMATIONS: int = 12
 
 
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:

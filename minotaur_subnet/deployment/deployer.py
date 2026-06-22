@@ -25,6 +25,23 @@ from .compiler import ForgeCompiler
 logger = logging.getLogger(__name__)
 
 
+def resolve_fee_mode(app_fee_mode: str | None) -> tuple[str, int]:
+    """Resolve the on-chain FeeMode for an App (#239).
+
+    The App's own ``config.fee_mode`` wins; the operator-wide ``FEE_MODE_DEFAULT``
+    is only the fallback when the App didn't choose one. Returns
+    ``(mode_str, enum)`` where enum is the contract's FeeMode (USER=0, APP=1).
+
+    Raises ``ValueError`` (with a source-attributed message) on an invalid value.
+    """
+    app_choice = (app_fee_mode or "").strip().upper()
+    mode = app_choice or os.environ.get("FEE_MODE_DEFAULT", "USER").upper()
+    if mode not in ("USER", "APP"):
+        src = "App config fee_mode" if app_choice else "FEE_MODE_DEFAULT"
+        raise ValueError(f"{src} must be USER or APP, got {mode!r}")
+    return mode, (1 if mode == "APP" else 0)
+
+
 def _detect_contract_name(solidity_source: str, fallback_name: str) -> str:
     """Detect the primary Solidity contract name from source.
 
@@ -152,16 +169,19 @@ class DeployService:
         platform_fee_collector = relayer_cs  # Relayer collects fees by default
         min_platform_fee = int(os.environ.get("MIN_PLATFORM_FEE_WEI", "0"))
         max_platform_fee = int(os.environ.get("MAX_PLATFORM_FEE_WEI", str(10**17)))  # 0.1 ETH
-        fee_mode_str = os.environ.get("FEE_MODE_DEFAULT", "USER").upper()
-        if fee_mode_str not in ("USER", "APP"):
+        # Per-App fee mode (#239): the App's own config choice wins; the
+        # operator-wide FEE_MODE_DEFAULT is only the fallback. Bakes USER vs APP
+        # into THIS App's contract.
+        try:
+            fee_mode_str, fee_mode = resolve_fee_mode(getattr(app.config, "fee_mode", ""))
+        except ValueError as exc:
             return DeploymentResult(
                 app_id=app.app_id,
                 status=AppStatus.DRAFT,
                 js_code_hash=js_hash,
                 chain_id=chain_id,
-                error=f"FEE_MODE_DEFAULT must be USER or APP, got {fee_mode_str!r}",
+                error=str(exc),
             )
-        fee_mode = 1 if fee_mode_str == "APP" else 0  # FeeMode enum: USER=0, APP=1
         zero_addr = Web3.to_checksum_address("0x" + "0" * 40)
         app_paymaster = zero_addr  # informational; apps override via constructor_args if needed
 

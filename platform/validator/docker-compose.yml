@@ -370,20 +370,35 @@ services:
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
 
-      # Determinism — the production mechanism is AUTOMATIC and per-round.
-      # Set ROUND_ANCHORED_PIN: "1" fleet-wide (coordinated) and every
-      # validator independently derives the SAME canonical fork block from
-      # the round's epoch anchor — no manual per-round block coordination.
-      # ROUND_ANCHORED_PIN: "0"   # default off; flip to 1 fleet-wide to enable
+      # Determinism — the production mechanism is AUTOMATIC and per-round, and
+      # is now ON BY DEFAULT IN CODE (shipped via :stable). Every validator
+      # independently derives the SAME canonical fork block from the round's
+      # epoch anchor — no env to set, no manual per-round block coordination.
+      # This is intentionally NOT a per-validator env: consensus-relevant config
+      # must be uniform code (like CHAMPION_MINER_WEIGHT_FRACTION / EPOCH_SECONDS)
+      # so a third-party validator can never split off the fleet by not setting it.
+      #
+      # HARD REQUIREMENT: every validator MUST provide a Base upstream RPC
+      # (BASE_UPSTREAM_RPC_URL / BASE_RPC_URL). Without it the pin cannot derive,
+      # the node defers to live head, and its benchmark_pack_hash diverges from
+      # pinning peers → it FAILS the pack-hash check and cannot sign (fail-loud,
+      # never a silent mis-score). This is the SAFE failure mode, but it drops the
+      # node out of the adoption quorum — so the RPC is mandatory.
+      #
+      # EMERGENCY OVERRIDE ONLY (do not set in normal operation): to disable the
+      # mechanism fleet-wide without a code revert, set one of
+      #   ROUND_ANCHORED_PIN: "0"   (also accepts false/no/off, case-insensitive)
+      # Unset or any other value = enabled (default). A typo can never silently
+      # disable a single node and split it off — only the explicit off-set does.
       #
       # Pre-flight parity check (default-ON, observe-only): a background probe
       # derives this node's fork pin for the current epoch anchor and publishes
-      # it on GET /health under "round_anchor" (pins, anchor_epoch, status). The
-      # subnet team polls every validator's /health and diffs the pin per epoch
-      # to confirm the WHOLE fleet derives an identical block BEFORE flipping
-      # ROUND_ANCHORED_PIN — no log scraping, no action needed from you. It never
-      # changes consensus and runs with a bounded RPC timeout. Opt out (not
-      # recommended) with ROUND_ANCHOR_PARITY: "0".
+      # it on GET /health under "round_anchor" (pins, pin_hashes, anchor_epoch,
+      # status, gate_enabled). The subnet team polls every validator's /health and
+      # diffs the pin (and block hash) per epoch to confirm the WHOLE fleet derives
+      # an identical block — the parity evidence backing the default-ON rollout. It
+      # never changes consensus and runs with a bounded RPC timeout. The probe runs
+      # regardless of the gate. Opt out (not recommended) with ROUND_ANCHOR_PARITY: "0".
       #
       # SHADOW (recommended before flipping the gate): set ROUND_ANCHOR_SHADOW: "1"
       # fleet-wide while ROUND_ANCHORED_PIN stays "0". Each validator then derives

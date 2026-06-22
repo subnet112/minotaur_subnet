@@ -92,6 +92,10 @@ async def _run_reactive(captured: dict):
 
 @pytest.mark.asyncio
 async def test_reactive_benchmark_honors_epoch_block_pin(monkeypatch):
+    # Exercise the legacy dev/test env-pin path (gate OFF). In production the
+    # round-anchored derivation supplies fork_block instead; the threading from
+    # the pin into run_benchmark is identical either way and is what this asserts.
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
     captured: dict = {}
     await _run_reactive(captured)
@@ -112,6 +116,7 @@ async def test_reactive_benchmark_default_stays_live_head(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reactive_determinism_log_emitted(monkeypatch, caplog):
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "0")  # legacy env-pin path (gate off)
     monkeypatch.setenv("BENCHMARK_EPOCH_BLOCK", "46904887")
     captured: dict = {}
     with caplog.at_level(logging.INFO):

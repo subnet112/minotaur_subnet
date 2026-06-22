@@ -156,22 +156,14 @@ def _resolve_native_bittensor_target() -> str:
 
 
 def _round_anchor_chains() -> list[int]:
-    """Benchmark chains to pin, from ROUND_ANCHOR_CHAINS (default Base only).
+    """Benchmark chains to pin — the fleet-uniform CODE constant (Base only).
 
-    Fleet-consistent config like epoch_seconds — every validator must use the
-    same set or pack hashes diverge (which is the intended fail-loud signal).
+    No longer an env: the chain set folds into the pin and thus the pack hash, so
+    it must be identical fleet-wide (a 3rd-party override would split the fleet).
+    See ``consensus.round_anchor.ROUND_ANCHOR_CHAINS`` (the single source of truth).
     """
-    raw = os.environ.get("ROUND_ANCHOR_CHAINS", "8453").strip()
-    chains: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            chains.append(int(part))
-        except ValueError:
-            logger.warning("ROUND_ANCHOR_CHAINS: ignoring non-int chain %r", part)
-    return chains or [8453]
+    from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CHAINS
+    return list(ROUND_ANCHOR_CHAINS)
 
 
 def _round_anchor_rpc_timeout() -> float:
@@ -194,6 +186,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     from minotaur_subnet.epoch.clock import SolverRoundEpochClock
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
     from minotaur_subnet.consensus.round_anchor import (
+        ROUND_ANCHOR_CONFIRMATIONS,
         ForkPinUnavailable,
         derive_fork_pins,
         epoch_anchor_ts,
@@ -202,10 +195,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
     anchor_ts = epoch_anchor_ts(anchor_epoch, epoch_seconds)
     chains = _round_anchor_chains()
-    try:
-        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
-    except ValueError:
-        confirmations = 12
+    confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
     from web3 import Web3
 
@@ -254,7 +244,8 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
     benchmark runs at live head (inert). Followers derive their own independently
     (P3); divergence surfaces as PACK_HASH_MISMATCH, never a silent mis-score.
     """
-    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    if not round_anchored_pin_enabled():
         return
     pins = _derive_round_fork_pins(anchor_epoch)
     if not pins:
@@ -281,7 +272,8 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     This is what gives followers Option-b parity: each validator derives the same
     pin from the same anchor, with no trust in a leader-asserted number.
     """
-    if not _env_true("ROUND_ANCHORED_PIN", default=False):
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    if not round_anchored_pin_enabled():
         return None
     try:
         from minotaur_subnet.api.routes import submissions
@@ -369,9 +361,10 @@ def _maybe_shadow_log_round_fork_pins(
     (leader at close). When ``None`` (follower path) it is resolved from the
     round store, mirroring :func:`_resolve_round_fork_pins`.
     """
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not _env_true("ROUND_ANCHOR_SHADOW", default=False):
         return
-    if _env_true("ROUND_ANCHORED_PIN", default=False):
+    if round_anchored_pin_enabled():
         return  # live path already derives/binds/logs — shadow is redundant
     try:
         if anchor_epoch is None:
@@ -459,13 +452,14 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
     ``ok`` (pins derived), ``deferred`` (anchor not yet confirmation-bracketed
     or no RPC), and the caller maps timeouts/errors to their own statuses.
     """
-    from minotaur_subnet.consensus.round_anchor import serialize_fork_pins
+    from minotaur_subnet.consensus.round_anchor import (
+        ROUND_ANCHOR_CONFIRMATIONS,
+        round_anchored_pin_enabled,
+        serialize_fork_pins,
+    )
 
     chains = _round_anchor_chains()
-    try:
-        confirmations = int(os.environ.get("ROUND_ANCHOR_CONFIRMATIONS", "12"))
-    except ValueError:
-        confirmations = 12
+    confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
     pins = _derive_round_fork_pins(anchor_epoch)
     if pins:
         pin_map = {str(chain): int(block) for chain, block in sorted(pins.items())}
@@ -485,7 +479,7 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
         "pins": pin_map,
         "pin_hashes": pin_hashes,
         "pin_segment": pin_segment,
-        "gate_enabled": _env_true("ROUND_ANCHORED_PIN", default=False),
+        "gate_enabled": round_anchored_pin_enabled(),
         "derived_at": int(time.time()),
     }
 
@@ -1296,26 +1290,39 @@ async def initialize(ctx: ServerContext) -> dict:
             rpc_urls[964] = btevm_url
             chain_ids.append(964)
 
-        # Solver — boot from Docker genesis image
+        # Solver — boot from a Docker image. FORCE_SOLVER_IMAGE (operator break-glass)
+        # wins over GENESIS_SOLVER_IMAGE; otherwise genesis.
         solver = None
-        _genesis_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
-        if _genesis_image:
+        from minotaur_subnet.harness.runtime_solver import resolve_boot_solver_image
+        _boot_image, _boot_forced = resolve_boot_solver_image()
+        if _boot_image:
             try:
                 from minotaur_subnet.harness.runtime_solver import DockerRuntimeSolver
                 solver = await DockerRuntimeSolver.create(
-                    image_ref=_genesis_image,
+                    image_ref=_boot_image,
                     chain_ids=chain_ids,
                     rpc_urls=rpc_urls,
                     bridge_registry=bridge_registry,
                 )
-                logger.info(
-                    "Genesis solver initialized via Docker (%s, chains=%s)",
-                    _genesis_image, list(rpc_urls.keys()),
-                )
+                if _boot_forced:
+                    logger.warning(
+                        "FORCE_SOLVER_IMAGE override ACTIVE — live solver pinned to %s "
+                        "(break-glass; clear FORCE_SOLVER_IMAGE to resume normal "
+                        "champion/genesis resolution). chains=%s",
+                        _boot_image, list(rpc_urls.keys()),
+                    )
+                else:
+                    logger.info(
+                        "Genesis solver initialized via Docker (%s, chains=%s)",
+                        _boot_image, list(rpc_urls.keys()),
+                    )
             except Exception as exc:
-                logger.warning("Genesis Docker solver unavailable: %s", exc)
+                logger.warning("Live solver Docker boot unavailable (%s): %s", _boot_image, exc)
         else:
-            logger.info("No GENESIS_SOLVER_IMAGE set — solver unavailable until champion is adopted")
+            logger.info(
+                "No FORCE_SOLVER_IMAGE / GENESIS_SOLVER_IMAGE set — solver unavailable "
+                "until champion is adopted",
+            )
 
         # Simulator
         simulator = None
@@ -1878,6 +1885,21 @@ async def initialize(ctx: ServerContext) -> dict:
 
             async def _build_live_solver(submission, epoch):
                 """Build the live solver object for an activated champion."""
+                # Operator break-glass: while FORCE_SOLVER_IMAGE is set, the live
+                # solver is pinned (boot built it) — refuse to hot-swap to a
+                # champion, so a broken champion can't reactivate over the forced
+                # image. Returning None keeps the current (forced) solver; the
+                # champion-of-record / weights still track adoption as normal.
+                from minotaur_subnet.harness.runtime_solver import forced_solver_image
+                _forced = forced_solver_image()
+                if _forced:
+                    logger.warning(
+                        "FORCE_SOLVER_IMAGE active (%s) — NOT hot-swapping to champion "
+                        "%s; keeping the forced live solver",
+                        _forced, getattr(submission, "submission_id", "?"),
+                    )
+                    return None
+
                 if not allow_champion_hot_swap:
                     logger.warning(
                         "Champion hot-swap disabled by policy; keeping current solver",
