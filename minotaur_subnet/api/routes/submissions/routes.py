@@ -1015,6 +1015,7 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     # detail + aggregate-vs-champion. Best-effort — never break /status on it.
     try:
         from .report import build_submission_report
+        from minotaur_subnet.epoch.adopt_rule import PER_APP_MIN_SCORE
         from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
         champion_score: float | None = None
@@ -1028,7 +1029,7 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         # dethrone bar (champion*(1+margin)) is computed inside the report as
         # score_to_beat, which drives the "scored but didn't dethrone" outcome;
         # keeping threshold distinct from it keeps both outcomes reachable.
-        threshold = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
+        threshold = PER_APP_MIN_SCORE
         reason = d.get("rejection_reason")
         if not reason and sub.round_id:
             rs = get_round_store().get_round(sub.round_id)

@@ -300,6 +300,10 @@ class TestSolverSwap:
     @pytest.mark.asyncio
     async def test_policy_assessment_shadow_mode_persists_assessment(self, temp_store, monkeypatch):
         monkeypatch.setenv("V3_POLICY_ASSESSMENT_ENABLED", "1")
+        # This test exercises the V3 policy-assessment path with a mock simulator
+        # (no on-chain score); the on-chain dual-scoring gate now fails CLOSED by
+        # default, so use the break-glass to keep the legacy approve-on-None path.
+        monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "0")
 
         app = AppIntentDefinition(
             app_id="dex_app",
@@ -657,12 +661,14 @@ class TestDualScoring:
         assert "On-chain score unavailable" in (rejected[0].error or "")
 
     @pytest.mark.asyncio
-    async def test_dual_scoring_fail_open_on_none_when_flag_unset(
+    async def test_dual_scoring_fail_open_on_none_with_break_glass(
         self, temp_store, app_def, monkeypatch,
     ):
-        """Default (flag unset): a None on-chain score must NOT reject — legacy
-        skip-on-None preserved (order rides on the JS gate)."""
-        monkeypatch.delenv("ONCHAIN_SCORE_FAIL_CLOSED", raising=False)
+        """Break-glass fail-OPEN (ONCHAIN_SCORE_FAIL_CLOSED=0): a None on-chain
+        score must NOT reject — the order rides on the JS gate. The default is now
+        fail-CLOSED fleet-wide, so reaching the legacy skip-on-None behavior
+        requires explicitly setting the emergency override."""
+        monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "0")
         app_def.config.score_threshold = 0.3
         temp_store.save_app(app_def)
         temp_store.save_deployment(DeploymentResult(
@@ -688,13 +694,17 @@ class TestDualScoring:
 
 
 def test_onchain_score_fail_closed_flag(monkeypatch):
-    """The shared dual-scoring fail-closed flag: default off, on when set."""
+    """The shared dual-scoring fail-closed gate: DEFAULT ON fleet-wide (it is the
+    secure, consensus-uniform value, like round_anchored_pin_enabled), with a
+    break-glass to fail-OPEN via {0,false,no,off}."""
     from minotaur_subnet.shared.simulation import onchain_score_fail_closed
     monkeypatch.delenv("ONCHAIN_SCORE_FAIL_CLOSED", raising=False)
-    assert onchain_score_fail_closed() is False
+    assert onchain_score_fail_closed() is True            # default ON
     monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "1")
     assert onchain_score_fail_closed() is True
-    monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "off")
+    monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "off")  # break-glass fail-open
+    assert onchain_score_fail_closed() is False
+    monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "0")
     assert onchain_score_fail_closed() is False
 
 
@@ -728,8 +738,12 @@ class TestPerAppScoreThreshold:
         assert result.orders_rejected == 1
 
     @pytest.mark.asyncio
-    async def test_low_per_app_threshold_accepts(self, temp_store, app_def):
+    async def test_low_per_app_threshold_accepts(self, temp_store, app_def, monkeypatch):
         """App with low per-app threshold should accept mock-scored orders."""
+        # Mock simulator yields no on-chain score; the dual-scoring gate now fails
+        # CLOSED by default, so use the break-glass to test the per-app threshold in
+        # isolation (the on-chain gate has its own dedicated tests above).
+        monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "0")
         app_def.config.score_threshold = 0.1  # Lower than mock score
         temp_store.save_app(app_def)
         temp_store.save_deployment(DeploymentResult(

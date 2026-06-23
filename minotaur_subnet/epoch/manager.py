@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from minotaur_subnet.epoch.adopt_rule import (
+    ADOPT_RULE,
+    DEFAULT_ADOPT_RULE_CONFIG,
     _app_onchain_mean,
     _evaluate_onchain,
     evaluate_adoption,
@@ -409,7 +411,14 @@ class EpochManager:
         # easier scenarios) impossible to beat.
         await self._refresh_incumbent_score()
 
-        if not self._should_adopt(finalist):
+        # Record the leader's would-be vote (observability), then proceed on the
+        # PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced at the
+        # COMMIT boundary (activate_certified_round), NOT here — so under the freeze
+        # the round still broadcasts + collects a would-be quorum (observe-only)
+        # before the commit is blocked, letting the fleet's cross-host agreement be
+        # measured without ever adopting.
+        self._record_would_be_vote(finalist)
+        if not self._meets_adoption_criteria(finalist):
             next_round = self._complete_round(
                 round_state,
                 epoch,
@@ -462,6 +471,28 @@ class EpochManager:
             "next_round_id": None,
             "weights_emitted": False,
         }
+        # COMMIT-BOUNDARY FREEZE GATE (relocated from _should_adopt): the round was
+        # certified by quorum — the FULL consensus ran observe-only (broadcast →
+        # peers independently re-benchmarked + voted + signed) — but
+        # DISABLE_CHAMPION_ADOPTION blocks the actual commit. Advance WITHOUT
+        # changing the champion: no hot-swap, no weight emit, no on-chain attest.
+        # The toggle now disables the ADOPTION ACTION, not the pipeline. Defense in
+        # depth: _hot_swap also refuses under the freeze and the merge callback is
+        # unwired, so this is one of three independent guards on the commit.
+        if _adoption_disabled():
+            logger.warning(
+                "[no-adopt] round %s certified by quorum but DISABLE_CHAMPION_ADOPTION "
+                "is set — NOT activating (no hot-swap / weights / on-chain attest); "
+                "champion unchanged.", round_id,
+            )
+            next_round = self._complete_round(
+                round_state, epoch, activated=False, abort_reason="adoption_frozen",
+            )
+            result["abort_reason"] = "adoption_frozen"
+            if next_round is not None:
+                result["next_round_id"] = next_round.round_id
+            return result
+
         if epoch < effective_epoch:
             return result
 
@@ -775,15 +806,20 @@ class EpochManager:
             )
 
     def _record_would_be_vote(self, challenger: Submission) -> None:
-        """Publish this leader's INDEPENDENT would-be adopt vote (CHALLENGER_QUORUM_MODE).
+        """Publish this leader's INDEPENDENT would-be adopt vote (observability).
 
         Computed via the shared rule and recorded REGARDLESS of
         DISABLE_CHAMPION_ADOPTION, so the fleet quorum can be observed with adoption
         OFF. Best-effort and side-effect-free — never affects the live decision.
+
+        Gated by the fleet-uniform observability default (CHALLENGER_QUORUM_MODE,
+        DEFAULT ON; break-glass {0,false,no,off}). Uses the single helper so the
+        leader's would-be vote and the follower's vote default-publish identically —
+        the empirical fleet test needs no per-validator config.
         """
-        if os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
+        from minotaur_subnet.harness.benchmark_worker import _challenger_quorum_mode
+
+        if not _challenger_quorum_mode():
             return
         try:
             challenger_score = challenger.benchmark_score or 0
@@ -840,6 +876,21 @@ class EpochManager:
             )
             return False
 
+        return self._meets_adoption_criteria(challenger)
+
+    def _meets_adoption_criteria(self, challenger: Submission) -> bool:
+        """The PURE adoption verdict — challenger beats the champion per the shared
+        ``evaluate_adoption`` rule.
+
+        Does NOT consult ``DISABLE_CHAMPION_ADOPTION``: the freeze is enforced at the
+        COMMIT boundary (``activate_certified_round``), so the consensus pipeline can
+        broadcast + collect a would-be quorum observe-only under the freeze and the
+        fleet's cross-host agreement can be measured without ever adopting. This is
+        the identical rule body the followers run, so leader and fleet decide alike.
+
+        The synchronous standalone path (``process_epoch``) uses ``_should_adopt``
+        instead, which keeps the freeze check because it commits immediately.
+        """
         challenger_score = challenger.benchmark_score or 0
         champion_score = self._champion.benchmark_score or 0
 
@@ -865,11 +916,12 @@ class EpochManager:
             )
             return False
 
-        # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
-        # shared pure rule below. ADOPT_RULE=p2oc ranks the dethrone on the unfakeable
-        # on-chain OUTPUT surplus instead of the gas-polluted JS score. MUST NOT be
-        # enabled live until the cross-machine determinism gate passes.
-        if os.environ.get("ADOPT_RULE", "current").strip().lower() == "p2oc":
+        # On-chain co-ranked dethrone (code-gated). Default "current" falls through to
+        # the shared pure rule below. ADOPT_RULE=="p2oc" ranks the dethrone on the
+        # unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score. It is
+        # a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE), not a per-validator env,
+        # and MUST NOT be enabled live until the cross-machine determinism gate passes.
+        if ADOPT_RULE == "p2oc":
             return self._should_adopt_onchain(challenger)
 
         challenger_scorecard = self._get_scorecard(challenger)
@@ -909,6 +961,7 @@ class EpochManager:
             champion_scorecard=self._get_incumbent_scorecard(),
             dethrone_margin=self._dethrone_margin,
             has_champion=bool(self._champion.submission_id),
+            config=DEFAULT_ADOPT_RULE_CONFIG,
         )
         logger.info("p2oc decision for %s: adopt=%s (%s)",
                     getattr(challenger, "submission_id", "?"), adopt, reason)

@@ -375,6 +375,8 @@ def health() -> dict:
         data["round_anchor"] = dict(ctx.round_anchor_parity)
     if ctx.last_independent_vote:
         data["independent_vote"] = dict(ctx.last_independent_vote)
+    if ctx.last_champion_quorum:
+        data["champion_quorum"] = dict(ctx.last_champion_quorum)
     return data
 
 

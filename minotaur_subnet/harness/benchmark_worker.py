@@ -149,21 +149,38 @@ def _allow_subprocess_benchmark() -> bool:
     return False
 
 
-def _challenger_quorum_mode() -> bool:
-    """Whether the challenger-vote OBSERVABILITY diagnostics are published.
+# Explicit OFF values for the challenger-vote observability gate. Anything else
+# (including unset) keeps it ENABLED, so the empirical fleet-agreement test needs
+# ZERO per-validator config — a 3rd-party validator publishes its would-be vote by
+# default, exactly like our lead.
+_CHALLENGER_QUORUM_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
-    NOTE (#242): this no longer affects sampling or verification. The Stage-2
-    corpus is always a single round-seeded SHARED draw, and every follower always
-    casts an INDEPENDENT champion-vs-challenger verdict over it (the quorum). This
-    flag now only toggles the observe-only diagnostics — the leader's would-be
-    vote publish, the ``/health`` independent_vote view, and the admin shadow-vote
-    endpoint — so operators can watch fleet agreement without it gating consensus.
+
+def _challenger_quorum_mode() -> bool:
+    """Whether the challenger-vote OBSERVABILITY diagnostics are published. **DEFAULT ON.**
+
+    NOTE (#242): this NEVER affects sampling or verification. The Stage-2 corpus is
+    always a single round-seeded SHARED draw, and every follower always casts an
+    INDEPENDENT champion-vs-challenger verdict over it (the quorum). This flag ONLY
+    toggles observe-only diagnostics — the leader's would-be vote publish and the
+    ``/health`` independent_vote view — so operators can watch fleet agreement.
+
+    Defaulted ON in code (publish-only, touches no verdict / weights / adoption) so
+    the empirical fleet test needs no per-validator coordination — a bare ``:stable``
+    3rd-party publishes its vote like our lead. Emergency override: set
+    ``CHALLENGER_QUORUM_MODE`` to one of ``{0, false, no, off}`` to silence.
+
+    The admin ``POST /v1/admin/shadow-vote`` endpoint (which SPAWNS benchmarks on
+    demand) is gated SEPARATELY and explicitly in ``api/routes/monitoring.py`` — it
+    is NOT enabled by this default, so default-on observability opens no active
+    surface.
     """
     import os
 
-    return os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    raw = os.environ.get("CHALLENGER_QUORUM_MODE")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _CHALLENGER_QUORUM_OFF_VALUES
 
 
 class BenchmarkWorker:
@@ -846,14 +863,17 @@ class BenchmarkWorker:
         if self._app_store is None:
             return []
 
-        from minotaur_subnet.harness.order_sampler import sample_historical_orders
+        from minotaur_subnet.harness.order_sampler import (
+            STAGE2_CORPUS_SAMPLES,
+            sample_historical_orders,
+        )
 
         if n_per_chain is None:
-            import os
-            try:
-                n_per_chain = int(os.environ.get("BENCHMARK_HISTORICAL_SAMPLES", "50"))
-            except ValueError:
-                n_per_chain = 50
+            # Fleet-uniform Stage-2 corpus size — a CODE constant, not the former
+            # BENCHMARK_HISTORICAL_SAMPLES env (which let our lead score 10 while bare
+            # followers scored 50 → divergent verdicts + a pack-hash blind to the split,
+            # since startup.py's pack-hash builder used the same constant default).
+            n_per_chain = STAGE2_CORPUS_SAMPLES
 
         # Stage-2 corpus source. Default: the local order store. Opt-in
         # (BENCHMARK_CHAIN_CORPUS): rebuild it from chain (plan Phase 5b) so a
