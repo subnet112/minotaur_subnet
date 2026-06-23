@@ -200,9 +200,13 @@ async def _reactive_benchmark_candidate(
     from minotaur_subnet.api.routes import apps as _apps_module
     simulator = getattr(_apps_module, "_simulator", None)
 
-    # This follower's stable identity seeds its OWN diverse Stage-2 subset under
-    # CHALLENGER_QUORUM_MODE, so it independently tests a different slice than the
-    # leader. Best-effort: None falls back to the shared round_id-only draw.
+    # This follower's stable identity is an OBSERVABILITY LABEL only (#242): the
+    # Stage-2 corpus is a single round-seeded SHARED draw (sample_historical_orders
+    # seeds on round_id ALONE), identical on every validator, so the follower scores
+    # the champion-vs-challenger verdict over the SAME corpus as the leader — that
+    # shared corpus is what makes the independent verdict ratifiable by quorum. The
+    # identity is NOT a per-validator corpus seed (that was retired; a disjoint slice
+    # makes a concentrated improvement invisible). Best-effort: None is fine.
     try:
         from minotaur_subnet.api.startup import _resolve_solver_round_hotkey
         _my_identity = _resolve_solver_round_hotkey()

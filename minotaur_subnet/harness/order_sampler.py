@@ -25,11 +25,24 @@ logger = logging.getLogger(__name__)
 _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
 
 
+# Stage-2 SHARED corpus size per chain — THE SINGLE SOURCE OF TRUTH, consensus-
+# relevant and fleet-uniform. The corpus is a round-seeded SHARED draw (#242), but
+# the size is a MULTIPLIER on that draw: ``rng.sample(orders, k=min(N, len))`` with a
+# different N selects a different-membership subset even from the identical round_id
+# seed → the "shared" corpus is no longer shared → champion-vs-challenger scores
+# differ fleet-wide → divergent independent verdicts → the adoption quorum cannot
+# form, AND the leader's benchmark_pack_hash (built with this same constant) would no
+# longer match the corpus it actually scored. So it is a CODE constant, NOT a per-
+# validator env (was BENCHMARK_HISTORICAL_SAMPLES; our prod lead forced it to 10
+# while bare followers defaulted to 50 — the concrete live split this removes).
+STAGE2_CORPUS_SAMPLES: int = 50
+
+
 def sample_historical_orders(
     app_store: Any,
     round_id: str,
     chain_ids: list[int] | None = None,
-    n_per_chain: int = 50,
+    n_per_chain: int = STAGE2_CORPUS_SAMPLES,
     exclude_statuses: set[str] | None = None,
     records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:

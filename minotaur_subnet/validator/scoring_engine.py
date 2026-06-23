@@ -605,10 +605,10 @@ class ScoringEngine:
                 else 5000
             )
             oc_score = simulation.on_chain_score
-            # Fail-closed (opt-in): a deployed contract must yield a passing
-            # on-chain score. None = scoreIntent returned valid=False / unreadable
-            # → the contract didn't bless the plan, so don't sign it on the JS
-            # score alone.
+            # Fail-closed (DEFAULT ON fleet-wide): a deployed contract must yield a
+            # passing on-chain score. None = scoreIntent returned valid=False /
+            # unreadable → the contract didn't bless the plan, so don't sign it on
+            # the JS score alone. Shares onchain_score_fail_closed() with the leader.
             if contract_address and oc_score is None and onchain_score_fail_closed():
                 return {
                     "approved": False,

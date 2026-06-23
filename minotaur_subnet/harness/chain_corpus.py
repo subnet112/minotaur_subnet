@@ -198,4 +198,14 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
 
 
 def chain_corpus_enabled() -> bool:
-    return os.environ.get("BENCHMARK_CHAIN_CORPUS", "").strip().lower() in ("1", "true", "yes", "on")
+    """Stage-2 chain-derived corpus source — HARDCODED OFF fleet-wide.
+
+    Consensus-relevant: rebuilding the Stage-2 corpus from chain (vs the local order
+    store) changes the corpus SOURCE → a different sample → divergent champion-vs-
+    challenger scores, and it is NOT cross-machine deterministic yet. It was a per-
+    validator env (``BENCHMARK_CHAIN_CORPUS``) that a 3rd party could flip to split
+    the fleet, so it is pinned OFF in code (single source of truth) — exactly until
+    the cross-machine corpus-determinism gate passes, at which point this becomes a
+    deliberate fleet-wide CODE flip, never a per-validator env.
+    """
+    return False

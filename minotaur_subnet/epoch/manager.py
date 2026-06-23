@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from minotaur_subnet.epoch.adopt_rule import (
+    ADOPT_RULE,
+    DEFAULT_ADOPT_RULE_CONFIG,
     _app_onchain_mean,
     _evaluate_onchain,
     evaluate_adoption,
@@ -775,15 +777,20 @@ class EpochManager:
             )
 
     def _record_would_be_vote(self, challenger: Submission) -> None:
-        """Publish this leader's INDEPENDENT would-be adopt vote (CHALLENGER_QUORUM_MODE).
+        """Publish this leader's INDEPENDENT would-be adopt vote (observability).
 
         Computed via the shared rule and recorded REGARDLESS of
         DISABLE_CHAMPION_ADOPTION, so the fleet quorum can be observed with adoption
         OFF. Best-effort and side-effect-free — never affects the live decision.
+
+        Gated by the fleet-uniform observability default (CHALLENGER_QUORUM_MODE,
+        DEFAULT ON; break-glass {0,false,no,off}). Uses the single helper so the
+        leader's would-be vote and the follower's vote default-publish identically —
+        the empirical fleet test needs no per-validator config.
         """
-        if os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
+        from minotaur_subnet.harness.benchmark_worker import _challenger_quorum_mode
+
+        if not _challenger_quorum_mode():
             return
         try:
             challenger_score = challenger.benchmark_score or 0
@@ -865,11 +872,12 @@ class EpochManager:
             )
             return False
 
-        # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
-        # shared pure rule below. ADOPT_RULE=p2oc ranks the dethrone on the unfakeable
-        # on-chain OUTPUT surplus instead of the gas-polluted JS score. MUST NOT be
-        # enabled live until the cross-machine determinism gate passes.
-        if os.environ.get("ADOPT_RULE", "current").strip().lower() == "p2oc":
+        # On-chain co-ranked dethrone (code-gated). Default "current" falls through to
+        # the shared pure rule below. ADOPT_RULE=="p2oc" ranks the dethrone on the
+        # unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score. It is
+        # a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE), not a per-validator env,
+        # and MUST NOT be enabled live until the cross-machine determinism gate passes.
+        if ADOPT_RULE == "p2oc":
             return self._should_adopt_onchain(challenger)
 
         challenger_scorecard = self._get_scorecard(challenger)
@@ -909,6 +917,7 @@ class EpochManager:
             champion_scorecard=self._get_incumbent_scorecard(),
             dethrone_margin=self._dethrone_margin,
             has_champion=bool(self._champion.submission_id),
+            config=DEFAULT_ADOPT_RULE_CONFIG,
         )
         logger.info("p2oc decision for %s: adopt=%s (%s)",
                     getattr(challenger, "submission_id", "?"), adopt, reason)
