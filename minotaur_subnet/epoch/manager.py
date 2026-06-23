@@ -411,7 +411,14 @@ class EpochManager:
         # easier scenarios) impossible to beat.
         await self._refresh_incumbent_score()
 
-        if not self._should_adopt(finalist):
+        # Record the leader's would-be vote (observability), then proceed on the
+        # PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced at the
+        # COMMIT boundary (activate_certified_round), NOT here — so under the freeze
+        # the round still broadcasts + collects a would-be quorum (observe-only)
+        # before the commit is blocked, letting the fleet's cross-host agreement be
+        # measured without ever adopting.
+        self._record_would_be_vote(finalist)
+        if not self._meets_adoption_criteria(finalist):
             next_round = self._complete_round(
                 round_state,
                 epoch,
@@ -464,6 +471,28 @@ class EpochManager:
             "next_round_id": None,
             "weights_emitted": False,
         }
+        # COMMIT-BOUNDARY FREEZE GATE (relocated from _should_adopt): the round was
+        # certified by quorum — the FULL consensus ran observe-only (broadcast →
+        # peers independently re-benchmarked + voted + signed) — but
+        # DISABLE_CHAMPION_ADOPTION blocks the actual commit. Advance WITHOUT
+        # changing the champion: no hot-swap, no weight emit, no on-chain attest.
+        # The toggle now disables the ADOPTION ACTION, not the pipeline. Defense in
+        # depth: _hot_swap also refuses under the freeze and the merge callback is
+        # unwired, so this is one of three independent guards on the commit.
+        if _adoption_disabled():
+            logger.warning(
+                "[no-adopt] round %s certified by quorum but DISABLE_CHAMPION_ADOPTION "
+                "is set — NOT activating (no hot-swap / weights / on-chain attest); "
+                "champion unchanged.", round_id,
+            )
+            next_round = self._complete_round(
+                round_state, epoch, activated=False, abort_reason="adoption_frozen",
+            )
+            result["abort_reason"] = "adoption_frozen"
+            if next_round is not None:
+                result["next_round_id"] = next_round.round_id
+            return result
+
         if epoch < effective_epoch:
             return result
 
@@ -847,6 +876,21 @@ class EpochManager:
             )
             return False
 
+        return self._meets_adoption_criteria(challenger)
+
+    def _meets_adoption_criteria(self, challenger: Submission) -> bool:
+        """The PURE adoption verdict — challenger beats the champion per the shared
+        ``evaluate_adoption`` rule.
+
+        Does NOT consult ``DISABLE_CHAMPION_ADOPTION``: the freeze is enforced at the
+        COMMIT boundary (``activate_certified_round``), so the consensus pipeline can
+        broadcast + collect a would-be quorum observe-only under the freeze and the
+        fleet's cross-host agreement can be measured without ever adopting. This is
+        the identical rule body the followers run, so leader and fleet decide alike.
+
+        The synchronous standalone path (``process_epoch``) uses ``_should_adopt``
+        instead, which keeps the freeze check because it commits immediately.
+        """
         challenger_score = challenger.benchmark_score or 0
         champion_score = self._champion.benchmark_score or 0
 

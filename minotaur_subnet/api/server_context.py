@@ -49,6 +49,12 @@ class ServerContext:
     # This validator's latest independent ADOPT/REJECT vote on a candidate,
     # published on /health for the fleet shadow tally (poll, group by candidate).
     last_independent_vote: dict = field(default_factory=dict)
+    # Leader's latest would-be champion quorum tally (collected/quorum/signers),
+    # published on /health. Populated by the certify path on every round —
+    # including under DISABLE_CHAMPION_ADOPTION, where the full consensus runs but
+    # the commit is blocked at activation — so the fleet's cross-host agreement is
+    # observable with adoption frozen. Never reflects an actual adoption.
+    last_champion_quorum: dict = field(default_factory=dict)
 
     # ── champion-consensus ProtocolConfig ────────────────────────────────
     # Created at startup pointed at BT EVM ValidatorRegistry (for the

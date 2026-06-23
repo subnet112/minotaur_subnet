@@ -861,6 +861,23 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                 await broadcast_task
             except asyncio.CancelledError:
                 pass
+        # Observability: publish the would-be quorum tally to /health so operators
+        # can watch fleet agreement — including under DISABLE_CHAMPION_ADOPTION,
+        # where the full consensus runs but the commit is blocked at activation.
+        # Pure side-effect-free recording; never affects the decision.
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_champion_quorum = {
+                "round_id": proposal.round_id,
+                "candidate_submission_id": proposal.candidate_submission_id,
+                "candidate_image_id": proposal.candidate_image_id,
+                "collected": result.collected,
+                "quorum_required": result.quorum,
+                "reached": bool(result.reached),
+                "signers": [a.validator_id for a in (result.approvals or [])],
+            }
+        except Exception:  # observe-only — must never break certification
+            pass
         if not result.reached or result.certificate is None:
             raise HTTPException(
                 status_code=409,
