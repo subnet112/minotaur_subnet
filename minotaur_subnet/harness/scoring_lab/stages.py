@@ -7,12 +7,10 @@ redesign change made here maps 1:1 onto production.
 """
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
 from minotaur_subnet.engine.js_engine import JsExecutionEngine
-from minotaur_subnet.epoch.manager import EpochManager
 from minotaur_subnet.harness.benchmark_worker import BenchmarkScorecard, BenchmarkWorker
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
 from minotaur_subnet.shared.types import (
@@ -23,7 +21,6 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
     TokenTransfer,
 )
-from types import SimpleNamespace
 
 from .model import Fill, LabConfig, Scenario, StageRecord
 
@@ -208,26 +205,26 @@ class CurrentAdoptRule(AdoptRule):
 
     def evaluate(self, champ_card, chal_card, champ_oc, chal_oc, cfg, champ_qa=None, chal_qa=None) -> tuple[bool, StageRecord]:
         t0 = time.monotonic()
-        # Drive the floors via env (as the real gate reads them) + margin via the ctor field.
-        prev = {k: os.environ.get(k) for k in
-                ("PER_APP_MIN_SCORE", "MAX_APP_REGRESSION")}
-        os.environ["PER_APP_MIN_SCORE"] = str(cfg.per_app_min_score)
-        os.environ["MAX_APP_REGRESSION"] = str(cfg.max_app_regression)
-        try:
-            mgr = EpochManager.__new__(EpochManager)
-            mgr._champion = SimpleNamespace(submission_id="champion",
-                                            benchmark_score=champ_card.global_score)
-            mgr._dethrone_margin = cfg.dethrone_margin
-            mgr._get_incumbent_scorecard = lambda: champ_card.to_dict()
-            mgr._get_scorecard = lambda sub: chal_card.to_dict()
-            adopt = mgr._should_adopt(
-                SimpleNamespace(submission_id="challenger", benchmark_score=chal_card.global_score))
-        finally:
-            for k, v in prev.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
+        # Drive the floors by passing an explicit config to the SAME pure rule the
+        # production gate runs (evaluate_adoption). Production never passes a config
+        # (it always uses the fleet-uniform code constants), so the lab is the only
+        # caller that sweeps these — and it does so WITHOUT mutating process env, so a
+        # sweep value can never leak into a live validator's rule.
+        from minotaur_subnet.epoch.adopt_rule import _AdoptRuleConfig, evaluate_adoption
+        lab_config = _AdoptRuleConfig(
+            per_app_min_score=cfg.per_app_min_score,
+            max_app_regression=cfg.max_app_regression,
+            onchain_max_regression=cfg.max_app_regression,
+        )
+        adopt, _reason = evaluate_adoption(
+            challenger_score=chal_card.global_score,
+            champion_score=champ_card.global_score,
+            challenger_scorecard=chal_card.to_dict(),
+            champion_scorecard=champ_card.to_dict(),
+            dethrone_margin=cfg.dethrone_margin,
+            has_champion=True,
+            config=lab_config,
+        )
         rec = StageRecord(
             stage="adopt", scenario="(all)", ok=True,
             summary=f"rule=current -> {'ADOPT' if adopt else 'REJECT'}",

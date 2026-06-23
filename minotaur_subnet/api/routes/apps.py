@@ -417,9 +417,37 @@ async def deploy_app(
     """
     import asyncio
     loop = asyncio.get_running_loop()
+    # Admin route -> is_admin=True: deploys free, as today. The #238 deploy-fee /
+    # public-deployment gate only bites a non-admin (public) caller, which has no
+    # route yet — this keeps the fee unbypassable when the public API lands.
     return await loop.run_in_executor(
-        None, lambda: _tools.deploy_app_intent(_store(), app_id, chain_id=chain_id),
+        None,
+        lambda: _tools.deploy_app_intent(
+            _store(), app_id, chain_id=chain_id, is_admin=True,
+        ),
     )
+
+
+@router.get("/apps/{app_id}/deploy-quote", dependencies=[Depends(_require_admin)])
+def deploy_quote(app_id: str, chain_id: int | None = None) -> dict[str, Any]:
+    """Quote the cost to deploy this App (#238): estimated gas per targeted chain
+    + the deploy fee. Informational — gas is relayer-fronted today and the fee is
+    not yet collected (public deployment is gated off until collection is live).
+    """
+    from minotaur_subnet.deployment.deploy_fee import quote_deployment
+
+    definition = _store().get_app(app_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
+    supported = list(definition.config.supported_chains or [])
+    chains = [chain_id] if chain_id is not None else supported
+    if not chains:
+        raise HTTPException(
+            status_code=400, detail="App has no supported_chains configured"
+        )
+    quote = quote_deployment(chains)
+    quote["app_id"] = app_id
+    return quote
 
 
 @router.get("/apps/")

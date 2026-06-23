@@ -39,6 +39,29 @@ from minotaur_subnet.v3.flags import load_v3_flags
 logger = logging.getLogger(__name__)
 
 
+# Revert signatures of a USER-side signature fault at settlement (#229). When
+# executeIntent reverts on one of these, the user's order signature was invalid —
+# the plan still passed JS scoring, on-chain sim scoring, and the validator quorum
+# (scoreIntent never verifies the user sig). So this is NOT the solver's fault and
+# the blameless miner must NOT be debited (record_execution success=False). Covers
+# the OpenZeppelin ECDSA errors and the EIP712Verifier/AppIntentBase revert string.
+_USER_SIG_FAULT_MARKERS = (
+    "0xf645eedf",              # ECDSAInvalidSignature (confirmed in prod, #229)
+    "0xfce698f7",              # ECDSAInvalidSignatureLength
+    "0xd78bce0c",              # ECDSAInvalidSignatureS
+    "invalid user signature",  # AppIntentBase revert string (post-#229 contract)
+    "ecdsainvalidsignature",   # error name (defensive, if surfaced by name)
+)
+
+
+def _is_user_signature_fault(error: str | None) -> bool:
+    """True if a settlement revert is a USER signature fault, not a solver fault (#229)."""
+    if not error:
+        return False
+    e = error.lower()
+    return any(m in e for m in _USER_SIG_FAULT_MARKERS)
+
+
 class OrderProcessor:
     """Processes a single order through the full execution pipeline.
 
@@ -388,11 +411,12 @@ class OrderProcessor:
         oc_score = simulation.on_chain_score
         if oc_score is not None:
             self.orderbook.update_order(order.order_id, on_chain_score=oc_score)
-        # Fail-closed (opt-in): a deployed contract must yield a passing on-chain
-        # score. None means scoreIntent returned valid=False (plan breaks an
-        # on-chain invariant) or was unreadable — the contract did NOT bless the
-        # plan, so don't relay it on the JS score alone. Leader + follower share
-        # onchain_score_fail_closed() so they gate identically.
+        # Fail-closed (DEFAULT ON fleet-wide): a deployed contract must yield a
+        # passing on-chain score. None means scoreIntent returned valid=False (plan
+        # breaks an on-chain invariant) or was unreadable — the contract did NOT
+        # bless the plan, so don't relay it on the JS score alone. Leader + follower
+        # share onchain_score_fail_closed() so they gate identically (break-glass:
+        # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
             self.orderbook.update_order(
                 order.order_id,
@@ -535,18 +559,47 @@ class OrderProcessor:
                         status=OrderStatus.OPEN,
                     )
             self.order_persistence.sync(order.order_id)
-        else:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.REJECTED,
-                error=f"Relayer submission failed: {submit_result.error}",
-            )
-            self.order_persistence.sync(order.order_id)
+            self._record_settlement_stats(order, score, submit_result)
+            return True
 
-        self.app_store.record_execution(
-            order.app_id, score, success=submit_result.success,
+        # Settlement reverted. Distinguish a USER signature fault (#229) — the plan
+        # passed scoring + quorum, the user's sig was invalid — from a solver fault.
+        # The order is REJECTED either way (it didn't fill), but a user-fault revert
+        # does NOT debit the blameless miner's execution stats.
+        user_fault = _is_user_signature_fault(submit_result.error)
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error=(
+                f"User signature rejected at settlement: {submit_result.error}"
+                if user_fault
+                else f"Relayer submission failed: {submit_result.error}"
+            ),
         )
-        return submit_result.success
+        self.order_persistence.sync(order.order_id)
+        self._record_settlement_stats(order, score, submit_result)
+        return False
+
+    def _record_settlement_stats(self, order: Order, score: float, submit_result: Any) -> None:
+        """Record execution stats for a settled order (#229 blameless miner).
+
+        A USER signature fault at settlement is NOT debited to the solver: the plan
+        passed JS scoring, on-chain sim scoring, and the validator quorum — the
+        user's order signature was invalid, which is entirely upstream of the
+        solver. The order is still REJECTED (handled by the caller); it just isn't
+        counted as a solver failure. Solver-attributable reverts still count.
+        """
+        if submit_result.success:
+            self.app_store.record_execution(order.app_id, score, success=True)
+            return
+        if _is_user_signature_fault(submit_result.error):
+            logger.warning(
+                "Order %s settlement reverted on a USER signature fault (%s) — NOT "
+                "debiting the solver (blameless miner, #229)",
+                order.order_id, (submit_result.error or "")[:80],
+            )
+            return
+        self.app_store.record_execution(order.app_id, score, success=False)
 
     def _build_snapshot(self, order: Order, app: AppIntentDefinition):
         """Build a MarketSnapshot for plan generation.

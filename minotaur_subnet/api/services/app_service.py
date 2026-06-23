@@ -207,6 +207,9 @@ def deploy_app_intent(
     store: AppIntentStore,
     app_id: str,
     chain_id: int | None = None,
+    *,
+    is_admin: bool = True,
+    fee_paid: bool = False,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain.
 
@@ -219,14 +222,30 @@ def deploy_app_intent(
         app_id:   The app_id returned by create_app_intent.
         chain_id: Target chain ID.  If None, defaults to the first chain
                   in the app's ``supported_chains``.
+        is_admin: True for an operator/admin deploy (free, as today). A PUBLIC /
+                  3rd-party deploy passes False and is gated by the #238 deploy-fee
+                  / public-deployment check below.
+        fee_paid: Whether the #238 deploy fee was collected (only meaningful for a
+                  public deploy; collection is not wired yet, so always False there).
 
     Returns:
         DeploymentResult dict with status, contract address, and js_code_hash.
     """
     from ._state import _deploy_service
+    from minotaur_subnet.deployment.deploy_fee import (
+        DeploymentFeeRequired,
+        require_deployment_authorized,
+    )
 
     if not app_id:
         return {"error": "app_id is required"}
+
+    # Hard gate (#238): admin deploys pass; a public/3rd-party deploy is refused
+    # until public deployment is enabled AND the deploy fee is collected.
+    try:
+        require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
+    except DeploymentFeeRequired as exc:
+        return {"error": str(exc), "deploy_fee_required": True}
 
     definition = store.get_app(app_id)
     if definition is None:
