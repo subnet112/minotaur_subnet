@@ -100,11 +100,15 @@ def test_sample_records_filters_inflight_keeps_unfilled_demand():
     assert {o["order_id"] for o in sampled} == {"ok", "noblock"}  # in-flight 'pending' dropped
 
 
-def test_chain_corpus_gate_default_off(monkeypatch):
+def test_chain_corpus_gate_hardcoded_off(monkeypatch):
+    # The chain-derived Stage-2 corpus source is HARDCODED OFF fleet-wide — it is
+    # consensus-relevant and not yet cross-machine deterministic, so it is no longer
+    # a per-validator env (BENCHMARK_CHAIN_CORPUS) a 3rd party could flip to split
+    # the fleet. Even with the legacy env set, the gate stays off.
     monkeypatch.delenv("BENCHMARK_CHAIN_CORPUS", raising=False)
     assert chain_corpus_enabled() is False
     monkeypatch.setenv("BENCHMARK_CHAIN_CORPUS", "1")
-    assert chain_corpus_enabled() is True
+    assert chain_corpus_enabled() is False
 
 
 # ── to_block pin (cross-validator corpus parity) ──────────────────────────────

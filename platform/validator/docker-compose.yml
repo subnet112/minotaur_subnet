@@ -358,6 +358,10 @@ services:
       # Reactive benchmark (runs when a champion proposal arrives) DOES
       # still happen on followers — that's the peer integrity check. The
       # api spawns the solver container via the docker-socket-proxy.
+      # NOTE: ALLOW_CHAMPION_HOT_SWAP now DEFAULTS ON in code (a bare :stable
+      # 3rd-party validator hot-swaps adopted champions without setting it, so
+      # the fleet runs the same solver bytes). This line is redundant but kept
+      # explicit; set it to "0" only as a break-glass.
       ALLOW_CHAMPION_HOT_SWAP: "1"
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
 

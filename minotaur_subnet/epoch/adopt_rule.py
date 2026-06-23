@@ -7,15 +7,22 @@ followers (champion-consensus re-validation) without duplicating the logic.
 
 The function mirrors the rule body EXACTLY — everything AFTER the
 adoption-disabled / same-submission / shadow preamble (those stay in
-``EpochManager`` because they touch instance state / logging side effects). It
-reads the same environment knobs at call time:
+``EpochManager`` because they touch instance state / logging side effects).
 
-    PER_APP_MIN_SCORE    (default 0.3)  per-app score floor (current rule)
-    MAX_APP_REGRESSION   (default 0.10) per-app non-regression / catastrophe veto
-    ONCHAIN_MAX_REGRESSION (default MAX_APP_REGRESSION, else 0.10)
-                                         on-chain HARD-VETO non-regression band
-    ONCHAIN_FLOOR_BPS    (unset = off)  on-chain admission floor (both rules)
-    ADOPT_RULE           (current|p2oc) dispatch between the two rules
+These knobs are FLEET-UNIFORM CODE CONSTANTS, not per-validator env reads
+(see ``_AdoptRuleConfig`` below). They are consensus-relevant: the leader
+(``EpochManager._should_adopt``) and every follower
+(``champion_consensus._independent_adopt_vote``) route through THIS pure rule,
+so a divergent value on any single node flips its verdict and breaks the
+adoption quorum — exactly the split the round-anchored pin (#246/#247) and
+``DETHRONE_MARGIN`` already foreclose by being code. So they are constants here
+(the single source of truth), NOT envs a 3rd-party validator would never set:
+
+    PER_APP_MIN_SCORE      = 0.3   per-app score floor (current + p2oc rules)
+    MAX_APP_REGRESSION     = 0.10  per-app non-regression / catastrophe veto
+    ONCHAIN_MAX_REGRESSION = 0.10  on-chain HARD-VETO non-regression band
+    ONCHAIN_FLOOR_BPS      = None  on-chain admission floor (off, both rules)
+    ADOPT_RULE             = current  ranking rule (p2oc gated to a code flip)
 
 It returns ``(adopt, reason)`` where ``reason`` is a human-readable string in
 every branch (for logging by the caller).
@@ -33,9 +40,51 @@ pure function.
 from __future__ import annotations
 
 import logging
-import os
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# ── Fleet-uniform adoption-rule constants — THE SINGLE SOURCE OF TRUTH ──────────
+#
+# Consensus-relevant config: leader + every follower route through this pure rule,
+# so these MUST be identical fleet-wide or the adoption quorum splits (a divergent
+# floor/band/rule on one node flips its verdict). They are therefore hardcoded CODE
+# (propagated via :stable / redeploy), NOT per-validator envs a 3rd-party validator
+# would never set — the same reason ``DETHRONE_MARGIN`` (manager.py),
+# ``CHAMPION_MINER_WEIGHT_FRACTION``, ``EPOCH_SECONDS`` and the round-anchored fork
+# pin (consensus/round_anchor.py) are constants. Change here = move the bar fleet-
+# wide in one place.
+PER_APP_MIN_SCORE: float = 0.3          # per-app sanity floor (current + p2oc)
+MAX_APP_REGRESSION: float = 0.10        # per-app JS non-regression / catastrophe veto
+ONCHAIN_MAX_REGRESSION: float = 0.10    # on-chain HARD-VETO non-regression band
+ONCHAIN_FLOOR_BPS: "int | None" = None  # on-chain admission floor (off; one value, not per-node)
+# Ranking rule. Pinned to "current" in code: p2oc is a DIFFERENT ranking (on-chain
+# surplus) and MUST NOT go live until the cross-machine determinism gate passes —
+# one node on p2oc and the rest on current is a guaranteed split. Flipping the rule
+# is a deliberate CODE change here, never a per-validator env.
+ADOPT_RULE: str = "current"
+
+
+@dataclass(frozen=True)
+class _AdoptRuleConfig:
+    """Bundle of the fleet-uniform adoption thresholds.
+
+    Production ALWAYS uses :data:`DEFAULT_ADOPT_RULE_CONFIG` (the constants above),
+    so leader + followers are byte-identical. The ONLY override path is the offline
+    scoring-lab parameter sweep, which constructs its own config and passes it
+    explicitly — it never mutates process env, so it cannot leak a non-default value
+    into a live validator's rule.
+    """
+
+    per_app_min_score: float = PER_APP_MIN_SCORE
+    max_app_regression: float = MAX_APP_REGRESSION
+    onchain_max_regression: float = ONCHAIN_MAX_REGRESSION
+    onchain_floor_bps: "int | None" = ONCHAIN_FLOOR_BPS
+    adopt_rule: str = ADOPT_RULE
+
+
+DEFAULT_ADOPT_RULE_CONFIG = _AdoptRuleConfig()
 
 
 def _onchain_pass(scores: list, floor: int) -> tuple[bool, "int | None", int]:
@@ -101,6 +150,7 @@ def _evaluate_onchain(
     champion_scorecard: dict | None,
     dethrone_margin: float,
     has_champion: bool,
+    config: _AdoptRuleConfig,
 ) -> tuple[bool, str]:
     """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — port of the lab's
     P2OcAdoptRule. Ranks the dethrone on the unfakeable on-chain OUTPUT surplus
@@ -116,7 +166,7 @@ def _evaluate_onchain(
     """
     # Per-app sanity floor — applies to the genesis (no-champion) case too, so a
     # garbage first champion can't self-adopt under p2oc (mirrors the current rule).
-    per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
+    per_app_min = config.per_app_min_score
     for app_id, app_score in (challenger_scorecard or {}).get("app_scores", {}).items():
         if app_score < per_app_min:
             return False, (
@@ -133,9 +183,8 @@ def _evaluate_onchain(
     chal_apps = chal_card.get("app_scores", {})
     champ_oc = champ_card.get("app_onchain", {})
     chal_oc = chal_card.get("app_onchain", {})
-    max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
-    floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
-    floor = int(floor_env) if floor_env else None
+    max_regression = config.max_app_regression
+    floor = config.onchain_floor_bps
 
     oc_surpluses: list[float] = []
     for app, inc in champ_apps.items():
@@ -181,14 +230,18 @@ def evaluate_adoption(
     champion_scorecard: dict | None,
     dethrone_margin: float,
     has_champion: bool,
+    config: _AdoptRuleConfig = DEFAULT_ADOPT_RULE_CONFIG,
 ) -> tuple[bool, str]:
     """Pure per-validator adoption decision -> (adopt, reason).
 
     Mirrors ``EpochManager._should_adopt``'s rule body EXACTLY — everything
     AFTER the adoption-disabled / same-submission / shadow preamble (those stay
-    in ``EpochManager``). Reads the same env knobs (``PER_APP_MIN_SCORE``,
-    ``MAX_APP_REGRESSION``, ``ONCHAIN_FLOOR_BPS``, ``ADOPT_RULE``). Dispatches
-    ``ADOPT_RULE=p2oc`` to the on-chain-surplus variant internally.
+    in ``EpochManager``). The thresholds come from ``config`` — production passes
+    nothing, so they are the fleet-uniform CODE CONSTANTS
+    (:data:`DEFAULT_ADOPT_RULE_CONFIG`: ``PER_APP_MIN_SCORE``,
+    ``MAX_APP_REGRESSION``, ``ONCHAIN_MAX_REGRESSION``, ``ONCHAIN_FLOOR_BPS``,
+    ``ADOPT_RULE``); only the offline scoring-lab passes an explicit override.
+    Dispatches ``config.adopt_rule == "p2oc"`` to the on-chain-surplus variant.
 
     Enforces (default "current" rule):
     1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — the absolute sanity floor.
@@ -213,19 +266,22 @@ def evaluate_adoption(
     ``has_champion`` is True iff there is a current champion submission_id
     (i.e. ``bool(self._champion.submission_id)``).
     """
-    per_app_min = float(os.environ.get("PER_APP_MIN_SCORE", "0.3"))
-    max_regression = float(os.environ.get("MAX_APP_REGRESSION", "0.10"))
+    per_app_min = config.per_app_min_score
+    max_regression = config.max_app_regression
 
-    # On-chain co-ranked dethrone (opt-in). Default "current" falls through to the
-    # JS logic below, byte-for-byte unchanged. ADOPT_RULE=p2oc ranks the dethrone on
-    # the unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score.
-    # MUST NOT be enabled live until the cross-machine determinism gate passes.
-    if os.environ.get("ADOPT_RULE", "current").strip().lower() == "p2oc":
+    # On-chain co-ranked dethrone (code-gated). Default "current" falls through to the
+    # JS logic below, byte-for-byte unchanged. config.adopt_rule=="p2oc" ranks the
+    # dethrone on the unfakeable on-chain OUTPUT surplus instead of the gas-polluted
+    # JS score. MUST NOT be enabled live until the cross-machine determinism gate
+    # passes — and it is a code constant, never a per-validator env, so it can only
+    # be flipped fleet-wide.
+    if config.adopt_rule == "p2oc":
         return _evaluate_onchain(
             challenger_scorecard=challenger_scorecard,
             champion_scorecard=champion_scorecard,
             dethrone_margin=dethrone_margin,
             has_champion=has_champion,
+            config=config,
         )
 
     # Belt-and-suspenders: a challenger benchmarked on the fabricated mock
@@ -275,11 +331,8 @@ def evaluate_adoption(
     # On-chain HARD GATE: the challenger's plans must validly EXECUTE on-chain (not
     # revert / mock) and not regress vs the champion, for apps the champion scores
     # on-chain. Keeps JS as the ranking signal; this only vetoes.
-    onchain_regression = float(
-        os.environ.get("ONCHAIN_MAX_REGRESSION", os.environ.get("MAX_APP_REGRESSION", "0.10"))
-    )
-    _floor_env = os.environ.get("ONCHAIN_FLOOR_BPS", "").strip()
-    onchain_floor = int(_floor_env) if _floor_env else None
+    onchain_regression = config.onchain_max_regression
+    onchain_floor = config.onchain_floor_bps
     oc_ok, oc_reason = _evaluate_onchain_gate(
         challenger_scorecard=challenger_scorecard,
         champion_scorecard=champion_scorecard,

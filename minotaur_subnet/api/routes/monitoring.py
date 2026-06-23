@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -39,13 +38,15 @@ async def shadow_vote(body: ShadowVoteRequest) -> dict[str, Any]:
     shared adoption rule, and returns this validator's vote. Never adopts, never
     touches the real champion or weights — it lets the fleet demonstrate the
     challenger-quorum decision (good->adopt / bad->reject by majority) without an
-    organic champion. Admin-gated (spawns benchmarks) + requires
-    ``CHALLENGER_QUORUM_MODE``.
+    organic champion. The REAL protection is the admin-auth dependency
+    (``_require_admin``, spawns benchmarks); the observability gate
+    (``CHALLENGER_QUORUM_MODE``, DEFAULT ON via ``_challenger_quorum_mode``) lets it
+    be silenced as a break-glass, so the fleet test needs no per-validator config.
     """
-    if os.environ.get("CHALLENGER_QUORUM_MODE", "").strip().lower() not in (
-        "1", "true", "yes", "on",
-    ):
-        raise HTTPException(status_code=503, detail="CHALLENGER_QUORUM_MODE not enabled")
+    from minotaur_subnet.harness.benchmark_worker import _challenger_quorum_mode
+
+    if not _challenger_quorum_mode():
+        raise HTTPException(status_code=503, detail="CHALLENGER_QUORUM_MODE disabled (break-glass)")
     from minotaur_subnet.api.server_context import ctx
     worker = getattr(ctx, "benchmark_worker", None)
     if worker is None:

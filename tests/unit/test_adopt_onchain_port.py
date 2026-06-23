@@ -104,7 +104,10 @@ def test_dispatch_default_is_current_rule(monkeypatch):
 
 
 def test_dispatch_routes_to_p2oc_when_enabled(monkeypatch):
-    monkeypatch.setenv("ADOPT_RULE", "p2oc")
+    # ADOPT_RULE is now a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE),
+    # imported into the manager namespace — not a per-validator env. Flipping the
+    # rule is a code change, so the test patches the constant the dispatch reads.
+    monkeypatch.setattr("minotaur_subnet.epoch.manager.ADOPT_RULE", "p2oc")
     mgr = _mgr()
     mgr._should_adopt_onchain = lambda c: "ROUTED"
     _cards(mgr, _card({"A": 0.6}, {"A": [5000]}), _card({"A": 0.7}, {"A": [5000]}))
