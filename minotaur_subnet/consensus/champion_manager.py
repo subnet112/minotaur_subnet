@@ -140,14 +140,52 @@ class ChampionConsensusManager:
 
     @property
     def validators(self) -> list[str]:
-        """Current trusted validator set."""
+        """Current trusted validator set — union of self, env-pinned, discovered.
+
+        Sources, in order, deduped by lowercased EVM address (first-seen wins):
+          1. ``self.validator_id`` — always included.
+          2. ``validators=...`` ctor arg / ``set_validators`` (env-pinned set,
+             typically in-cluster peers that aren't on the Bittensor metagraph
+             and therefore can't be reached via ProtocolConfig discovery).
+          3. ``protocol_config.peers`` — auto-discovered set that has passed
+             ``/identity`` EIP-712 cross-attestation against the on-chain
+             ``ValidatorRegistry``.
+
+        Mirrors ``ConsensusManager.validators`` (order consensus). The
+        previous shape returned the env pin OR discovery (mutually
+        exclusive): a ``CHAMPION_CONSENSUS_PEERS`` pin *capped* the set and
+        suppressed discovery entirely, while order consensus's
+        ``VALIDATOR_ADDRESSES`` pin acts as a *floor* unioned with discovery.
+        That asymmetry meant champion consensus, with no pin set, fell back to
+        discovery-only and showed just the lead until its refresh loop
+        resolved peers — whereas order consensus always held its pinned floor.
+        Unioning here makes a pin a floor, not a cap, so an in-cluster pin and
+        on-chain-discovered third-party validators coexist.
+
+        Note: with no pin (``_validators_override is None`` — the production
+        default, ``CHAMPION_CONSENSUS_PEERS`` unset) this is unchanged:
+        ``[self.validator_id] + discovered peers``.
+        """
+        seen: set[str] = {self.validator_id.lower()}
+        result: list[str] = [self.validator_id]
+
         if self._validators_override is not None:
-            return self._validators_override
-        if self.protocol_config is None:
-            return [self.validator_id]
-        return [self.validator_id] + [
-            p.evm_address for p in self.protocol_config.peers
-        ]
+            for v in self._validators_override:
+                key = v.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(v)
+
+        if self.protocol_config is not None:
+            for p in self.protocol_config.peers:
+                key = p.evm_address.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(p.evm_address)
+
+        return result
 
     def _is_authorized_signer(self, address: str) -> bool:
         """Whether ``address`` is allowed to sign champion-consensus approvals.
