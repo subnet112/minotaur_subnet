@@ -382,6 +382,24 @@ def _resolve_client_ip(request: Request) -> str:
     return request.client.host if request.client and request.client.host else "unknown"
 
 
+def _max_submissions_per_round() -> int:
+    """Per-(hotkey, round) submission cap — anti-spam for the screening pipeline.
+
+    Each accepted submission queues an expensive build + benchmark, so a single
+    miner flooding one round can starve the validator. Configurable via
+    ``SUBMISSIONS_MAX_PER_ROUND`` (default 1); a value <= 0 disables the cap.
+
+    This is operator-local admission control enforced at the leader gateway —
+    the only ingress for submissions — NOT a fleet-consensus parameter, so an
+    env knob is the right shape (mirrors SUBMISSIONS_RATE_LIMIT_PER_MINUTE).
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_PER_ROUND", "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+
 def _enforce_rate_limit(request: Request, principal: str) -> None:
     """Simple in-memory fixed-window limiter for submission creation endpoints."""
     raw_limit = os.environ.get("SUBMISSIONS_RATE_LIMIT_PER_MINUTE", "60").strip()
@@ -493,6 +511,8 @@ async def create_source_submission(
 
     code_hash = hashlib.sha256(body.solver_source.encode()).hexdigest()[:12]
 
+    # Same per-round cap as the git path so SUBMISSIONS_MAX_PER_ROUND applies
+    # uniformly across both submission ingresses.
     try:
         sub = store.create(
             repo_url="source://inline",
@@ -500,6 +520,7 @@ async def create_source_submission(
             epoch=body.epoch,
             hotkey=body.hotkey,
             round_id=current_round.round_id,
+            max_per_round=_max_submissions_per_round(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -554,6 +575,26 @@ async def create_submission(
         requested_round_id=body.round_id,
     )
 
+    # Per-round submission cap (anti-spam). Reject an over-cap miner BEFORE the
+    # expensive PR resolution + signature verification + screening queue. The
+    # store enforces the same cap atomically inside create() as a backstop
+    # against a race between this check and the insert.
+    max_per_round = _max_submissions_per_round()
+    if max_per_round > 0:
+        already = store.count_by_hotkey_round(body.hotkey, current_round.round_id)
+        if already >= max_per_round:
+            # 409 Conflict (not 429) to match the store-level backstop and the
+            # historical per-round duplicate semantics: this is a quota conflict
+            # for the round, not a transient rate limit — retry NEXT round.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Miner has already submitted {already} time(s) for round "
+                    f"{current_round.round_id} (max {max_per_round} per round); "
+                    f"try again next round."
+                ),
+            )
+
     # Resolve the PR (host fixed to the canonical solver repo) -> fork clone_url +
     # the live head SHA, and reject if the live head != the miner-signed head_sha
     # (force-push / TOCTOU guard). The miner signs the exact commit it built.
@@ -598,6 +639,7 @@ async def create_submission(
             hotkey=body.hotkey,
             round_id=current_round.round_id,
             pr_number=body.pr_number,
+            max_per_round=max_per_round,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
