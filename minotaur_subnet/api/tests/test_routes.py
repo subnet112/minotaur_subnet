@@ -629,6 +629,45 @@ class TestScorePlanRoutes(unittest.TestCase):
         finally:
             apps_module.set_simulator(None)
 
+    def test_score_surfaces_revert_reason(self):
+        """A real-sim revert exposes the decoded reason in simulation.revert_reason
+        so a miner can debug WHY their plan failed without their own node."""
+        from unittest.mock import AsyncMock
+        from minotaur_subnet.shared.types import ScoreResult, SimulationResult
+
+        create_resp = self.client.post("/v1/apps/", json={
+            "name": "Revert Reason App",
+            "supported_chains": [1],
+            "js_code": "module.exports = { score: () => ({score: 0.0}) }",
+            "solidity_code": "contract RevertReasonApp {}",
+        })
+        app_id = create_resp.json()["app_id"]
+
+        mock_engine = MagicMock()
+        mock_engine._intents = {app_id: "// js"}
+        mock_engine.score = AsyncMock(return_value=ScoreResult(score=0.0, valid=False))
+        apps_module.set_js_engine(mock_engine)
+
+        mock_sim = MagicMock()
+        mock_sim.simulate = AsyncMock(return_value=SimulationResult(
+            success=False,
+            error='scoreIntent reverted: Error("Too little received")',
+            revert_reason='Error("Too little received")',
+        ))
+        apps_module.set_simulator(mock_sim)
+
+        try:
+            resp = self.client.post(f"/v1/apps/{app_id}/score", json={
+                "plan": {"interactions": [{"target": "0x00", "value": "0", "call_data": "0x"}]},
+                "params": {},
+            })
+            self.assertEqual(resp.status_code, 200)
+            sim = resp.json()["simulation"]
+            self.assertFalse(sim["success"])
+            self.assertEqual(sim["revert_reason"], 'Error("Too little received")')
+        finally:
+            apps_module.set_simulator(None)
+
     def test_score_simulator_fallback(self):
         """When simulator raises, should fall back to mock simulation."""
         from unittest.mock import AsyncMock
