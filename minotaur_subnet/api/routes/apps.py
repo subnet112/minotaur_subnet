@@ -189,7 +189,13 @@ def _require_admin_or_signed_miner(
     are rate-limited per-hotkey via a sliding 60-min window
     (default 60 calls/hour, override with MINER_RATE_LIMIT_PER_HOUR).
     """
-    # ── 1. admin bypass (unchanged path; admin keys can always call) ──
+    # ── 1. admin bypass + dev-open (mirror _require_admin's matrix so this
+    #       gate is a strict SUPERSET — endpoints can swap _require_admin ->
+    #       this one without losing the admin / local-testnet paths) ──
+    if not os.environ.get("RELAYER_URL", "").strip() and _env_true(
+        "LOCAL_TESTNET", default=False
+    ):
+        return  # dev path: no relayer + local-testnet flag → open (prod gated)
     admin_key = os.environ.get("ADMIN_API_KEY", "").strip()
     if admin_key and x_admin_key and x_admin_key == admin_key:
         return
@@ -562,7 +568,10 @@ def activate_app(
     return {"app_id": app_id, "chain_id": dep.chain_id, "status": "active"}
 
 
-@router.post("/apps/{app_id}/score", dependencies=[Depends(_require_admin)])
+@router.post(
+    "/apps/{app_id}/score",
+    dependencies=[Depends(_require_admin_or_signed_miner)],
+)
 async def score_plan(
     app_id: str,
     body: ScorePlanRequest,
@@ -570,15 +579,20 @@ async def score_plan(
 ) -> dict[str, Any]:
     """Score an execution plan against an app's JS scoring function.
 
-    Used by miners to test how well their generated plans score.
-    Runs the full pipeline when Anvil is available (simulation + JS scoring),
-    falling back to mock simulation otherwise.
+    The miner-facing dry-run: run a plan through the validator's REAL fork
+    simulation (the same scoreIntent path production uses) and get the full
+    report back — JS score, on-chain score, gas, transfers, AND the decoded
+    revert reason when it fails — so a miner can debug a plan WITHOUT running
+    their own archive node. Falls back to mock simulation only if Anvil is
+    unavailable (``simulation_mode`` says which ran).
 
-    Admin-gated + per-IP rate-limited as of PR-2 (audit H4): each call
-    rewinds the chain's Anvil fork (potentially to an archive block) and
-    runs JS scoring in the sandbox. Anonymous abuse can pin the
-    simulator at a historical block, breaking every other ongoing
-    simulation, and burn upstream archive RPC quota.
+    Gate (audit H4): each call rewinds the chain's Anvil fork and runs JS
+    scoring in the sandbox, so it's not anonymous. Accepts EITHER an admin key
+    OR a metagraph-registered miner signing the request (see
+    ``_require_admin_or_signed_miner`` / ``scripts/miner_dry_run.py``);
+    signed-miner calls are per-hotkey rate-limited (default 60/hr). The
+    ``fork_block`` clamp (±100 from head) bounds the rewind so a dry-run can't
+    pin the shared simulator at a deep archive block or burn archive RPC quota.
     """
     _debug_rate_limit(request, per_minute=5)
 
@@ -796,6 +810,10 @@ async def score_plan(
                 "on_chain_score": simulation.on_chain_score,
                 "token_transfers": len(simulation.token_transfers),
                 "error": simulation.error,
+                # Decoded on-chain revert reason (Error(string)/Panic/custom
+                # error) when the real sim reverted — the actionable "trace" so
+                # a miner sees WHY their plan failed, not just that it did.
+                "revert_reason": getattr(simulation, "revert_reason", None),
             },
         }
     except Exception as exc:

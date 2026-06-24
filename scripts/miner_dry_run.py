@@ -6,6 +6,13 @@ request. This script demonstrates the miner path: it loads your local
 bittensor wallet, signs the canonical message, and POSTs the dry-run
 request.
 
+The ``/orders/{id}/dry-run`` path below scores a plan with a MOCK simulation
+(fast, JS score only). For the full REAL-simulation report — on-chain score,
+gas, transfers, and the decoded on-chain ``revert_reason`` when it fails — POST
+the SAME signed headers to ``/v1/apps/{app_id}/score`` instead (it runs the
+validator's fork so you don't need your own archive node). Only the path + body
+change; the signing protocol below is identical.
+
 Usage::
 
     # Default leader API
