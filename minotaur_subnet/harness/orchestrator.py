@@ -137,6 +137,7 @@ class BenchmarkResult:
     error: str | None = None
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
+    revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
 
 
 # Type alias for the scoring callback
@@ -1088,6 +1089,7 @@ async def run_benchmark(
                                     intent.app_id, sim.error,
                                 )
                                 br.error = f"real_sim_reverted: {sim.error}"
+                                br.revert_reason = getattr(sim, "revert_reason", None)
                                 fail_closed_miss = True
                         except Exception as sim_exc:
                             if require_real_sim:

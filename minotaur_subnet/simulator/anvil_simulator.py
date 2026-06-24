@@ -560,19 +560,37 @@ class AnvilSimulator:
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=30)
 
             if receipt["status"] == 0:
-                # Try to get revert reason via eth_call
-                revert_reason = "unknown"
+                # Decode WHY it reverted so the miner can see it (benchmark
+                # report + dry-run surface this). Prefer Anvil's
+                # debug_traceTransaction — it decodes Error(string)/Panic/known
+                # custom errors from the revert payload — and fall back to an
+                # eth_call replay string when the trace has no revert data.
+                revert_reason = ""
                 try:
-                    self.w3.eth.call({
-                        "from": relayer_addr,
-                        "to": target,
-                        "data": calldata,
-                        "gas": 2_000_000,
-                    })
-                except Exception as revert_exc:
-                    revert_reason = str(revert_exc)
+                    revert_reason = extract_revert_via_trace(self.w3, tx_hash_hex)
+                except Exception:
+                    revert_reason = ""
+                if not revert_reason:
+                    try:
+                        self.w3.eth.call({
+                            "from": relayer_addr,
+                            "to": target,
+                            "data": calldata,
+                            "gas": 2_000_000,
+                        })
+                        revert_reason = "reverted (no revert data)"
+                    except Exception as revert_exc:
+                        revert_reason = str(revert_exc)
                 print(f"[SIM] scoreIntent REVERTED: {revert_reason}", flush=True)
-                return None
+                # Carry the reason up instead of discarding it. Fail-closed
+                # semantics are unchanged (success=False), exactly like the
+                # generic path simulate() used to build from a None return.
+                return SimulationResult(
+                    success=False,
+                    gas_used=receipt.get("gasUsed", 0),
+                    error=f"scoreIntent reverted: {revert_reason}",
+                    revert_reason=revert_reason,
+                )
 
             # Parse transfer events and gas
             all_transfers = self._parse_transfer_events(receipt)
