@@ -167,6 +167,40 @@ class SolverSession:
         # where session lifetime is the container's lifetime, not a
         # single benchmark run.
         self._live_mode = live_mode
+        # Set by SolverOrchestrator.start_docker/start_subprocess to a 0-arg
+        # async closure that relaunches the underlying process with the SAME
+        # image/args. Enables ``restart()`` so the benchmark can recover from a
+        # per-scenario timeout/crash WITHOUT truncating the rest of the run.
+        self._relaunch: Any = None
+
+    async def restart(self) -> None:
+        """Relaunch the underlying solver process in place (same image/args).
+
+        A per-scenario timeout kills the process (or the solver crashes), which
+        previously cascaded: the next scenario hit the dead process and the run
+        was truncated — non-deterministically, since *which* scenario is slow
+        depends on RPC latency. ``restart()`` lets ``run_benchmark`` score only
+        the offending scenario 0 and continue on a fresh process, so the result
+        set stays the full corpus and is reproducible across hosts. Reuses the
+        same SolverSession object so the caller's lifecycle (``shutdown``) is
+        unchanged. Raises if no relaunch closure was wired.
+        """
+        if self._relaunch is None:
+            raise SolverCrashedError("session has no relaunch closure; cannot restart")
+        # Force-reap the old process directly (``kill()`` no-ops once _closed is
+        # set, so it could leak a zombie on respawn).
+        try:
+            self._proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=_KILL_REAP_TIMEOUT)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        self._proc = await self._relaunch()
+        self._closed = False
+        self._start_time = time.monotonic()
+        logger.info("[%s] Process respawned", self._label)
 
     async def initialize(self, config: dict[str, Any]) -> None:
         """Send initialize command."""
@@ -563,15 +597,19 @@ class SolverOrchestrator:
 
         logger.info("Starting Docker solver: %s", " ".join(cmd))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        async def _relaunch() -> asyncio.subprocess.Process:
+            return await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
+        proc = await _relaunch()
         label = f"docker:{image.split(':')[0][-12:]}"
-        return SolverSession(proc, label=label, live_mode=live)
+        session = SolverSession(proc, label=label, live_mode=live)
+        session._relaunch = _relaunch
+        return session
 
     async def start_subprocess(
         self,
@@ -599,15 +637,19 @@ class SolverOrchestrator:
 
         logger.info("Starting subprocess solver: %s", solver_path)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        async def _relaunch() -> asyncio.subprocess.Process:
+            return await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
+        proc = await _relaunch()
         label = f"subprocess:{solver_path.split('/')[-1]}"
-        return SolverSession(proc, label=label)
+        session = SolverSession(proc, label=label)
+        session._relaunch = _relaunch
+        return session
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -868,6 +910,46 @@ async def run_benchmark(
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)
 
+    # Respawn budget: a per-scenario timeout/crash kills the solver process. We
+    # restart it and continue so the offending scenario scores 0 ALONE instead
+    # of cascade-truncating the rest of the run (which made the score depend on
+    # WHICH scenario was slow — RPC-latency-dependent, non-deterministic across
+    # hosts). Bounded so a pathologically-crashing solver can't loop forever.
+    max_respawns = max(4, len(intents))
+    respawns = 0
+    solver_dead = False
+    dead_reason = "skipped: solver unrecoverable"
+    # Hard per-RUN wall-clock ceiling. restart() resets the per-SESSION
+    # TOTAL_BENCHMARK_TIMEOUT, so without a run-level budget a pathologically slow
+    # solver (timing out + respawning every scenario) could run several-fold past
+    # 900s and disrupt round timing. Once the whole run exceeds the budget the
+    # remaining scenarios score 0 deterministically (a corpus-sized respawn count
+    # already bounds it; this restores the absolute ceiling the old per-session
+    # cap provided before respawn existed).
+    run_start = time.monotonic()
+
+    async def _respawn_session() -> bool:
+        """Restart + re-init the solver for the next scenario.
+
+        Returns True on success; False (→ solver_dead) when the relaunch closure
+        is missing, the respawn budget is exhausted, or relaunch/init throws.
+        """
+        nonlocal respawns
+        if session._relaunch is None or respawns >= max_respawns:
+            return False
+        try:
+            await session.restart()
+            await session.initialize(init_config)
+            await session.on_benchmark_start(len(intents))
+            respawns += 1
+            return True
+        except Exception as exc:
+            logger.error(
+                "[benchmark] solver respawn failed (%s); remaining scenarios "
+                "score 0", exc,
+            )
+            return False
+
     # Get metadata for logging
     try:
         meta = await session.metadata()
@@ -887,6 +969,25 @@ async def run_benchmark(
         scenario_name = state.control_view().get("_scenario_name", "")
         intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
         br = BenchmarkResult(intent_id=intent_label)
+
+        if not solver_dead and (time.monotonic() - run_start) > TOTAL_BENCHMARK_TIMEOUT:
+            logger.warning(
+                "[benchmark] total run budget (%.0fs) exceeded; scoring remaining "
+                "scenarios 0", TOTAL_BENCHMARK_TIMEOUT,
+            )
+            solver_dead = True
+            dead_reason = "skipped: total run budget exceeded"
+
+        if solver_dead:
+            # Solver is unrecoverable (respawn budget exhausted / relaunch failed)
+            # or the run budget is spent. Score the remaining scenarios 0
+            # deterministically rather than truncate, so every validator produces
+            # the same full result set.
+            br.error = dead_reason
+            br.elapsed_ms = 0
+            results.append(br)
+            continue
+        need_respawn = False
 
         # Champion BLIND SPOT. The reference pre-pass marked this scenario as one
         # the CHAMPION could not quote (surfaced/logged there — the anti-masking
@@ -914,11 +1015,15 @@ async def run_benchmark(
         # deployed scoreIntent reverts. Populate the source:"quote" params from
         # a REAL quote — exactly like the live get_quote path — so downstream
         # _build_benchmark_intent_order emits the full (CoW) layout.
-        state = await _enrich_state_with_quote(
-            session, intent, state, snapshot, _ref,
-        )
-
         try:
+            # Keep quote-enrich inside the try: _enrich_state_with_quote swallows
+            # its own quote exceptions, but on an already-dead solver the next
+            # generate_plan raises SolverCrashedError — which the respawn path
+            # below recovers from instead of aborting the whole run.
+            state = await _enrich_state_with_quote(
+                session, intent, state, snapshot, _ref,
+            )
+
             from minotaur_subnet.shared.types import TriggerType
 
             is_auto = (
@@ -1041,18 +1146,25 @@ async def run_benchmark(
                     br.error = f"scoring_error: {exc}"
 
         except SolverTimeoutError as exc:
+            # This scenario scores 0 (recorded in br.error). The timeout killed
+            # the process, so respawn below before the next scenario.
             br.error = f"timeout: {exc}"
+            need_respawn = True
         except SolverCrashedError as exc:
             br.error = f"crashed: {exc}"
-            # If the solver crashed, we can't continue
-            br.elapsed_ms = int((time.monotonic() - start) * 1000)
-            results.append(br)
-            break
+            need_respawn = True
         except Exception as exc:
             br.error = f"error: {exc}"
 
         br.elapsed_ms = int((time.monotonic() - start) * 1000)
         results.append(br)
+
+        # A timeout/crash left the process dead — respawn so the NEXT scenario
+        # runs on a live solver instead of cascade-crashing + truncating the run.
+        # Only THIS scenario scored 0; the result set stays the full corpus. If
+        # the solver can't be recovered, mark it dead (loop scores the rest 0).
+        if need_respawn:
+            solver_dead = not await _respawn_session()
 
     # Signal benchmark end with final scores
     summary = [
