@@ -388,6 +388,66 @@ async def _resolve_image_id(image_tag: str) -> str | None:
     return image_id
 
 
+# Post-push manifest-retrievability verification. A ``docker push`` can return
+# rc=0 with the manifest not yet durably retrievable from the registry — on the
+# containerd image store ``RepoDigests`` is read from the LOCAL store, not the
+# registry, so the digest looks good locally while a follower 404s on pull
+# (observed live on GHCR: rc=0, blobs uploaded, manifest 404 for minutes until a
+# re-push). These bound the verify+re-push loop in ``_verify_digest_retrievable``.
+_PUSH_VERIFY_ATTEMPTS = 5
+_PUSH_VERIFY_BACKOFF_SECONDS = 3.0
+
+
+async def _verify_digest_retrievable(
+    ref: str,
+    digest_ref: str,
+    docker_fn,
+    *,
+    attempts: int = _PUSH_VERIFY_ATTEMPTS,
+    backoff_seconds: float = _PUSH_VERIFY_BACKOFF_SECONDS,
+    sleep_fn=asyncio.sleep,
+) -> str | None:
+    """Confirm ``<repo>@sha256:D`` is actually RETRIEVABLE from the registry.
+
+    The leader must never propose a digest the fleet can't pull: a follower that
+    404s on the candidate image returns REJECT-on-pull, which reads as solver
+    dissent and silently breaks champion consensus. ``docker manifest inspect``
+    queries the REGISTRY (unlike ``RepoDigests``, which the containerd image
+    store populates from the LOCAL store), so it detects a push that returned
+    rc=0 but didn't durably land the manifest. Between failed attempts it
+    re-pushes — the empirically confirmed remedy — with linear backoff to also
+    ride out registry propagation, and returns ``None`` if the digest never
+    becomes retrievable so the caller fails closed (``image_digest`` unset).
+
+    ``docker_fn`` is the same ``async (*args, timeout) -> (rc, msg)`` runner the
+    push uses; injectable so the verify+re-push loop is unit-testable without a
+    registry.
+    """
+    for attempt in range(attempts):
+        rc, _msg = await docker_fn("manifest", "inspect", digest_ref, timeout=30)
+        if rc == 0:
+            if attempt:
+                logger.info(
+                    "Candidate digest %s retrievable after %d re-push attempt(s)",
+                    digest_ref, attempt,
+                )
+            return digest_ref
+        if attempt < attempts - 1:
+            logger.warning(
+                "Candidate digest %s not yet registry-retrievable "
+                "(attempt %d/%d); re-pushing %s",
+                digest_ref, attempt + 1, attempts, ref,
+            )
+            await docker_fn("push", ref, timeout=600)
+            await sleep_fn(backoff_seconds * (attempt + 1))
+    logger.warning(
+        "Candidate digest %s NOT registry-retrievable after %d attempts; failing "
+        "closed (image_digest unset — leader will not propose an unpullable digest)",
+        digest_ref, attempts,
+    )
+    return None
+
+
 async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
     """Retag the locally-built screening image to the candidate repo, push it
     (single-arch — the local build is already single-arch), and return the
@@ -452,7 +512,10 @@ async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
             "No RepoDigest matching %s after push (got %s)", prefix, repo_digests,
         )
         return None
-    return digest_ref
+    # ``docker push`` rc=0 + the (local-store) RepoDigests are NOT proof the
+    # fleet can pull this digest — verify it's registry-retrievable (re-pushing
+    # if not) before trusting it, else fail closed.
+    return await _verify_digest_retrievable(ref, digest_ref, _docker)
 
 
 async def _run_screening_pipeline(submission_id: str) -> None:
