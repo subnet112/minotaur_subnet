@@ -122,3 +122,34 @@ def test_no_champion_means_no_score_to_beat():
     assert r["aggregate"]["score_to_beat"] is None
     assert r["aggregate"]["gap"] is None
     assert r["outcome"] == "scored"   # can't be "not adopted" without a bar
+
+
+# ── revert reason surfaced (trace-in-report) ──────────────────────────────────
+
+
+def test_per_case_surfaces_revert_reason():
+    """A real-sim revert decodes a reason that reaches per_case.your, so a miner
+    can see WHY their plan failed on-chain without running their own node."""
+    details = {
+        "total_intents": 1, "plans_generated": 1, "errors": 1, "avg_score": 0.0,
+        "scorecard": {"scenario_scores": {"WETH_to_DAI": 0.0}},
+        "per_intent": [
+            {"intent_id": "WETH_to_DAI", "score": 0.0, "on_chain_score": None,
+             "has_plan": True,
+             "error": 'real_sim_reverted: scoreIntent reverted: Error("Too little received")',
+             "revert_reason": 'Error("Too little received")',
+             "mock_simulation": False},
+        ],
+    }
+    case = _report(_sub("scored", score=0.0, details=details))["per_case"][0]
+    assert case["case"] == "WETH_to_DAI"
+    assert case["your"]["revert_reason"] == 'Error("Too little received")'
+    assert case["your"]["passed"] is False
+
+
+def test_per_case_revert_reason_key_present_and_none_when_absent():
+    """A normal (non-reverting) case still carries the key, valued None — so the
+    field is stable for clients regardless of outcome."""
+    for case in _report(_sub("scored", 0.594, _DETAILS))["per_case"]:
+        assert "revert_reason" in case["your"]
+        assert case["your"]["revert_reason"] is None

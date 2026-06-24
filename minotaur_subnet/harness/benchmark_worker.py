@@ -1591,6 +1591,7 @@ class BenchmarkWorker:
                     "on_chain_score": getattr(r, "on_chain_score", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
+                    "revert_reason": getattr(r, "revert_reason", None),
                     "has_plan": r.plan is not None,
                     "mock_simulation": getattr(r, "mock_simulation", False),
                 }
