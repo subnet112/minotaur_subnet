@@ -106,6 +106,53 @@ class TestSubmissionStore(unittest.TestCase):
         )
         self.assertNotEqual(s1.submission_id, s2.submission_id)
 
+    def test_max_per_round_default_is_one(self):
+        """Default cap is 1: a second submission for the same round is rejected."""
+        hk = "5GrwvaEF_cap"
+        self.store.create(repo_url="r", commit_hash="c1", epoch=1, hotkey=hk, round_id="r-1")
+        with self.assertRaises(ValueError) as ctx:
+            self.store.create(repo_url="r", commit_hash="c2", epoch=1, hotkey=hk, round_id="r-1")
+        self.assertIn("already submitted", str(ctx.exception))
+        self.assertIn("max 1 per round", str(ctx.exception))
+
+    def test_max_per_round_configurable_higher(self):
+        """A cap of 3 allows three submissions for a round and rejects the fourth."""
+        hk = "5GrwvaEF_cap3"
+        for i in range(3):
+            self.store.create(
+                repo_url="r", commit_hash=f"c{i}", epoch=1, hotkey=hk,
+                round_id="r-3", max_per_round=3,
+            )
+        self.assertEqual(self.store.count_by_hotkey_round(hk, "r-3"), 3)
+        with self.assertRaises(ValueError):
+            self.store.create(
+                repo_url="r", commit_hash="c4", epoch=1, hotkey=hk,
+                round_id="r-3", max_per_round=3,
+            )
+
+    def test_max_per_round_unlimited_when_non_positive(self):
+        """max_per_round <= 0 disables the cap entirely."""
+        hk = "5GrwvaEF_unl"
+        for i in range(5):
+            self.store.create(
+                repo_url="r", commit_hash=f"u{i}", epoch=1, hotkey=hk,
+                round_id="r-0", max_per_round=0,
+            )
+        self.assertEqual(self.store.count_by_hotkey_round(hk, "r-0"), 5)
+
+    def test_count_by_hotkey_round_isolation(self):
+        """The count is scoped per (hotkey, round) — other miners/rounds don't leak."""
+        a, b = "5Gminer_A", "5Gminer_B"
+        self.store.create(repo_url="r", commit_hash="a1", epoch=1, hotkey=a, round_id="r-1")
+        self.store.create(
+            repo_url="r", commit_hash="a2", epoch=1, hotkey=a, round_id="r-2", max_per_round=2,
+        )
+        self.store.create(repo_url="r", commit_hash="b1", epoch=1, hotkey=b, round_id="r-1")
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-1"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-2"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(b, "r-1"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-nope"), 0)
+
     def test_get_by_hotkey_round(self):
         sub = self.store.create(
             repo_url="https://github.com/miner/solver",
