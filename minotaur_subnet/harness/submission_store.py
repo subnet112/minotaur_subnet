@@ -151,18 +151,33 @@ class SubmissionStore:
         hotkey: str,
         round_id: str | None = None,
         pr_number: int | None = None,
+        max_per_round: int = 1,
     ) -> Submission:
-        """Create a new submission. Raises ValueError for duplicates."""
+        """Create a new submission. Raises ValueError when the per-round cap is hit.
+
+        ``max_per_round`` caps how many submissions a single hotkey may make for
+        one round — anti-spam protection for the validator's screening +
+        benchmark pipeline (each accepted submission queues a build + score).
+        Default 1, the historical behaviour (one entry per miner per round). A
+        value <= 0 disables the cap (unlimited). The cap counts ALL of the
+        miner's submissions for the round, regardless of their final status, so
+        a screening rejection still consumes an attempt.
+        """
         self._maybe_reload()
         resolved_round_id = (round_id or "").strip() or self._legacy_round_id(epoch)
         round_key = f"{hotkey}:{resolved_round_id}"
         epoch_key = f"{hotkey}:{epoch}"
-        if round_key in self._by_hotkey_round:
-            existing_id = self._by_hotkey_round[round_key]
-            raise ValueError(
-                f"Miner {hotkey[:12]}... already submitted for round {resolved_round_id} "
-                f"(submission {existing_id})"
+        if max_per_round > 0:
+            existing_count = sum(
+                1 for s in self._submissions.values()
+                if s.hotkey == hotkey and s.round_id == resolved_round_id
             )
+            if existing_count >= max_per_round:
+                raise ValueError(
+                    f"Miner {hotkey[:12]}... already submitted {existing_count} "
+                    f"time(s) for round {resolved_round_id} "
+                    f"(max {max_per_round} per round)"
+                )
 
         now = time.time()
         sub = Submission(
@@ -203,13 +218,30 @@ class SubmissionStore:
         return None
 
     def get_by_hotkey_round(self, hotkey: str, round_id: str) -> Submission | None:
-        """Get a submission by miner hotkey and round ID."""
+        """Get a submission by miner hotkey and round ID.
+
+        When the per-round cap allows more than one, this returns the most
+        recently indexed submission for the (hotkey, round) pair.
+        """
         self._maybe_reload()
         key = f"{hotkey}:{round_id}"
         sub_id = self._by_hotkey_round.get(key)
         if sub_id:
             return self._submissions.get(sub_id)
         return None
+
+    def count_by_hotkey_round(self, hotkey: str, round_id: str) -> int:
+        """Number of submissions this miner has made for ``round_id``.
+
+        The submission gate reads this to enforce the per-round cap BEFORE any
+        expensive work (PR resolution, screening). Scoped strictly to the
+        (hotkey, round) pair — other miners and other rounds never leak in.
+        """
+        self._maybe_reload()
+        return sum(
+            1 for s in self._submissions.values()
+            if s.hotkey == hotkey and s.round_id == round_id
+        )
 
     def list_by_epoch(self, epoch: int) -> list[Submission]:
         """List all submissions for an epoch, ordered by creation time."""

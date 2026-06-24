@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -105,6 +106,53 @@ class TestSubmissionStore(unittest.TestCase):
             round_id="round-b",
         )
         self.assertNotEqual(s1.submission_id, s2.submission_id)
+
+    def test_max_per_round_default_is_one(self):
+        """Default cap is 1: a second submission for the same round is rejected."""
+        hk = "5GrwvaEF_cap"
+        self.store.create(repo_url="r", commit_hash="c1", epoch=1, hotkey=hk, round_id="r-1")
+        with self.assertRaises(ValueError) as ctx:
+            self.store.create(repo_url="r", commit_hash="c2", epoch=1, hotkey=hk, round_id="r-1")
+        self.assertIn("already submitted", str(ctx.exception))
+        self.assertIn("max 1 per round", str(ctx.exception))
+
+    def test_max_per_round_configurable_higher(self):
+        """A cap of 3 allows three submissions for a round and rejects the fourth."""
+        hk = "5GrwvaEF_cap3"
+        for i in range(3):
+            self.store.create(
+                repo_url="r", commit_hash=f"c{i}", epoch=1, hotkey=hk,
+                round_id="r-3", max_per_round=3,
+            )
+        self.assertEqual(self.store.count_by_hotkey_round(hk, "r-3"), 3)
+        with self.assertRaises(ValueError):
+            self.store.create(
+                repo_url="r", commit_hash="c4", epoch=1, hotkey=hk,
+                round_id="r-3", max_per_round=3,
+            )
+
+    def test_max_per_round_unlimited_when_non_positive(self):
+        """max_per_round <= 0 disables the cap entirely."""
+        hk = "5GrwvaEF_unl"
+        for i in range(5):
+            self.store.create(
+                repo_url="r", commit_hash=f"u{i}", epoch=1, hotkey=hk,
+                round_id="r-0", max_per_round=0,
+            )
+        self.assertEqual(self.store.count_by_hotkey_round(hk, "r-0"), 5)
+
+    def test_count_by_hotkey_round_isolation(self):
+        """The count is scoped per (hotkey, round) — other miners/rounds don't leak."""
+        a, b = "5Gminer_A", "5Gminer_B"
+        self.store.create(repo_url="r", commit_hash="a1", epoch=1, hotkey=a, round_id="r-1")
+        self.store.create(
+            repo_url="r", commit_hash="a2", epoch=1, hotkey=a, round_id="r-2", max_per_round=2,
+        )
+        self.store.create(repo_url="r", commit_hash="b1", epoch=1, hotkey=b, round_id="r-1")
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-1"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-2"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(b, "r-1"), 1)
+        self.assertEqual(self.store.count_by_hotkey_round(a, "r-nope"), 0)
 
     def test_get_by_hotkey_round(self):
         sub = self.store.create(
@@ -1548,6 +1596,70 @@ class TestScreeningBackground(unittest.TestCase):
         asyncio.run(
             _run_screening_pipeline("sub_doesnotexist")
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                  CANDIDATE PUSH DIGEST-VERIFY TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPushDigestVerify(unittest.TestCase):
+    """Post-push manifest-retrievability verify (anti spurious-REJECT-on-pull).
+
+    A push can return rc=0 with the manifest not yet registry-retrievable (the
+    containerd image store reads RepoDigests locally), so the leader must verify
+    <repo>@sha256:D is actually pullable — re-pushing if not — before proposing
+    it, else fail closed so a follower never 404s on the candidate image.
+    """
+
+    DIGEST_REF = "ghcr.io/subnet112/minotaur-solver@sha256:" + "a" * 64
+    REF = "ghcr.io/subnet112/minotaur-solver:pr-9"
+
+    def _drive(self, inspect_rcs):
+        """Run the verify loop with a fake docker runner scripted to return the
+        given rc sequence for `manifest inspect`; record every docker call."""
+        from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+            _verify_digest_retrievable,
+        )
+        calls = []
+        rcs = iter(inspect_rcs)
+
+        async def fake_docker(*args, timeout):
+            calls.append(args)
+            if args[:2] == ("manifest", "inspect"):
+                return (next(rcs), "")
+            return (0, "")  # push / tag / anything else
+
+        async def no_sleep(_seconds):
+            return None
+
+        result = asyncio.run(
+            _verify_digest_retrievable(
+                self.REF, self.DIGEST_REF, fake_docker,
+                attempts=5, sleep_fn=no_sleep,
+            )
+        )
+        inspects = sum(1 for c in calls if c[:2] == ("manifest", "inspect"))
+        pushes = sum(1 for c in calls if c[0] == "push")
+        return result, inspects, pushes
+
+    def test_returns_digest_when_immediately_retrievable(self):
+        result, inspects, pushes = self._drive([0])
+        self.assertEqual(result, self.DIGEST_REF)
+        self.assertEqual(inspects, 1)
+        self.assertEqual(pushes, 0)  # no re-push needed
+
+    def test_repushes_then_succeeds(self):
+        result, inspects, pushes = self._drive([1, 1, 0])
+        self.assertEqual(result, self.DIGEST_REF)
+        self.assertEqual(inspects, 3)
+        self.assertEqual(pushes, 2)  # one re-push before each retry
+
+    def test_fails_closed_when_never_retrievable(self):
+        result, inspects, pushes = self._drive([1, 1, 1, 1, 1])
+        self.assertIsNone(result)  # never propose an unpullable digest
+        self.assertEqual(inspects, 5)  # attempts
+        self.assertEqual(pushes, 4)  # attempts - 1 re-pushes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

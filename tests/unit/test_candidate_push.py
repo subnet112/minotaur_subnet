@@ -40,6 +40,7 @@ def test_push_candidate_success(monkeypatch):
         _FakeProc(0),                              # docker tag
         _FakeProc(0, b"pushed"),                   # docker push
         _FakeProc(0, (repo_digests + "\n").encode()),  # docker image inspect {{json .RepoDigests}}
+        _FakeProc(0),                              # docker manifest inspect -> digest IS registry-retrievable
     ]
     with _patch_docker(procs) as m:
         out = _run(_push_candidate_image("solver-abc123:screening", 7))
