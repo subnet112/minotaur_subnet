@@ -47,6 +47,14 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
+from minotaur_subnet.harness.solver_read_proxy import (
+    CHAIN_NAMES,
+    build_pin_blocks,
+    close_session,
+    open_session,
+    proxy_rpc_url,
+    read_proxy_config,
+)
 from minotaur_subnet.harness.protocol import (
     Command,
     HarnessRequest,
@@ -922,6 +930,36 @@ async def run_benchmark(
         if require_real_sim:
             raise RealSimulationUnavailable(msg)
         logger.error("[benchmark] %s", msg)
+
+    # SOLVER_READ_PROXY (split-fork): route the untrusted solver's reads for the
+    # routed chain(s) through the block-pin proxy at the round's fork_block — one
+    # fast upstream round-trip per call, pinned + deterministic on any archive
+    # provider — instead of the Anvil fork (which lazily fetches every cold slot,
+    # the timeout + cross-host non-determinism source). Inert unless set.
+    _read_proxy = read_proxy_config()
+    _proxy_session_id: str | None = None
+    if _read_proxy is not None and fork_block is not None and rpc_map:
+        pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+        if pin_blocks:
+            _proxy_session_id = f"bench-{id(session):x}-{fork_block}"
+            try:
+                rec = await open_session(_read_proxy, _proxy_session_id, pin_blocks)
+            except Exception as exc:  # noqa: BLE001
+                # Fail loud: a silent fallback to the unpinned Anvil fork would
+                # reintroduce the very non-determinism this exists to remove.
+                raise RealSimulationUnavailable(
+                    f"SOLVER_READ_PROXY set but opening the proxy session failed: {exc}"
+                ) from exc
+            for cid in list(rpc_map):
+                if cid in _read_proxy.chain_ids and cid in CHAIN_NAMES:
+                    rpc_map[cid] = proxy_rpc_url(_read_proxy, _proxy_session_id, cid)
+            logger.info(
+                "[benchmark] solver reads routed via block-pin proxy "
+                "session=%s pinned=%s",
+                _proxy_session_id,
+                rec.get("blocks"),
+            )
+
     if rpc_map:
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)
@@ -1216,6 +1254,10 @@ async def run_benchmark(
     except (SolverTimeoutError, SolverCrashedError):
         pass
 
+    # Close the block-pin proxy session (best-effort; the proxy also caps its
+    # registry so an exception-path skip can't leak unboundedly).
+    if _proxy_session_id is not None and _read_proxy is not None:
+        await close_session(_read_proxy, _proxy_session_id)
     return results
 
 

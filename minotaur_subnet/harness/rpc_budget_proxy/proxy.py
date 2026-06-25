@@ -75,6 +75,9 @@ DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8645
 DEFAULT_MODE = "observe"
 DEFAULT_BUDGET = 1000
+# Bound the session registry: per-run session ids the orchestrator may not
+# explicitly close can't grow unbounded on a long-lived proxy (oldest evicted).
+MAX_SESSIONS = 64
 
 # How long to wait on the upstream Anvil before surfacing the error to the
 # solver. This is a transport timeout, NOT the deterministic budget — it never
@@ -174,6 +177,7 @@ class BudgetProxy:
         *,
         default_mode: str = DEFAULT_MODE,
         default_budget: int = DEFAULT_BUDGET,
+        control_token: str | None = None,
     ) -> None:
         if not upstreams:
             raise ValueError("BudgetProxy requires at least one upstream URL")
@@ -182,6 +186,12 @@ class BudgetProxy:
         self._default_chain: str = next(iter(self.upstreams))
         self.default_mode = _normalize_mode(default_mode)
         self.default_budget = int(default_budget)
+        # Shared secret guarding the control plane. When set, /control/* requires
+        # an X-Control-Token header matching it — so an untrusted solver that can
+        # reach the data plane on the SAME port cannot open/reset/close sessions
+        # (it can neither override its pin nor reset its budget). Empty = no auth
+        # (dev/local; the standalone-validation deploy ran without it).
+        self.control_token: str = str(control_token or "")
         self.sessions: dict[str, Session] = {}
         self._client: ClientSession | None = None
 
@@ -464,6 +474,13 @@ class BudgetProxy:
         blocks, berr = _normalize_blocks(data.get("blocks"))
         if berr is not None:
             return web.json_response({"error": berr}, status=400)
+        # Bound the registry (evict oldest non-anon) so per-run session ids the
+        # orchestrator may not explicitly close can't grow unbounded.
+        while len(self.sessions) >= MAX_SESSIONS and session_id not in self.sessions:
+            oldest = next((k for k in self.sessions if k != ANON_SESSION), None)
+            if oldest is None:
+                break
+            self.sessions.pop(oldest, None)
         # create OR replace, spent reset to 0
         self.sessions[session_id] = Session(session_id, budget, mode, blocks=blocks)
         logger.info(
@@ -523,7 +540,20 @@ class BudgetProxy:
     # -- app factory -------------------------------------------------------
 
     def build_app(self) -> web.Application:
-        app = web.Application()
+        token = self.control_token
+
+        @web.middleware
+        async def _control_auth(request: web.Request, handler: Any) -> web.StreamResponse:
+            # The untrusted solver shares the proxy's port (data plane), so the
+            # control plane must require the shared secret when one is configured.
+            if token and request.path.startswith("/control/"):
+                if request.headers.get("X-Control-Token") != token:
+                    return web.json_response(
+                        {"error": "control: forbidden"}, status=403
+                    )
+            return await handler(request)
+
+        app = web.Application(middlewares=[_control_auth])
         app.on_startup.append(self._on_startup)
         app.on_cleanup.append(self._on_cleanup)
         app.add_routes(
@@ -669,7 +699,12 @@ def make_app() -> web.Application:
     except (TypeError, ValueError):
         default_budget = DEFAULT_BUDGET
 
-    proxy = BudgetProxy(upstreams, default_mode=mode, default_budget=default_budget)
+    proxy = BudgetProxy(
+        upstreams,
+        default_mode=mode,
+        default_budget=default_budget,
+        control_token=os.environ.get("CONTROL_TOKEN", ""),
+    )
     return proxy.build_app()
 
 

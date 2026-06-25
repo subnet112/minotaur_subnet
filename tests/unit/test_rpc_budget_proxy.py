@@ -501,3 +501,43 @@ async def test_reset_repoints_blocks(proxy_client):
     await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
     sent = json.loads(upstream.received[-1])
     assert sent["params"][1] == "0x3e7"  # re-pointed to the new round's block
+
+
+# ---------------------------------------------------------------------------
+# (i) control-plane auth + session registry cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_token_guards_control_plane(upstream):
+    proxy = BudgetProxy({"eth": upstream.url}, control_token="s3kr3t")
+    client = TestClient(TestServer(proxy.build_app()))
+    await client.start_server()
+    try:
+        assert (await client.post("/control/open", json={"session_id": "s"})).status == 403
+        r = await client.post("/control/open", json={"session_id": "s"},
+                              headers={"X-Control-Token": "nope"})
+        assert r.status == 403
+        r = await client.post("/control/open", json={"session_id": "s"},
+                              headers={"X-Control-Token": "s3kr3t"})
+        assert r.status == 200
+        # data plane is NOT token-guarded (the untrusted solver uses it freely)
+        assert (await client.post("/rpc/s/eth", json=_rpc("eth_call"))).status == 200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_registry_capped(upstream):
+    from minotaur_subnet.harness.rpc_budget_proxy import proxy as proxymod
+    proxy = BudgetProxy({"eth": upstream.url})
+    client = TestClient(TestServer(proxy.build_app()))
+    await client.start_server()
+    try:
+        for i in range(proxymod.MAX_SESSIONS + 5):
+            await client.post("/control/open", json={"session_id": f"s{i}"})
+        assert len(proxy.sessions) <= proxymod.MAX_SESSIONS  # bounded
+        assert "s0" not in proxy.sessions  # oldest evicted
+        assert f"s{proxymod.MAX_SESSIONS + 4}" in proxy.sessions  # newest kept
+    finally:
+        await client.close()
