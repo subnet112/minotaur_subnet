@@ -328,6 +328,18 @@ class UpdateScoringRequest(BaseModel):
     deadline: int = Field(0, description="Unix-seconds expiry the signature was signed with.")
 
 
+class DeployRequest(BaseModel):
+    """Optional body for POST /apps/{id}/deploy. When the payment fields are set,
+    the deploy is treated as payment-backed (a public/3rd-party deploy) and
+    authorized via the deployer's EIP-712 pay_deploy_fee signature + on-chain
+    payment proof. Omit the body entirely for an operator/admin deploy."""
+    payment_ref: str = Field("", description="On-chain payment reference (e.g. tx hash) for the deploy fee.")
+    payment_nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce).")
+    payment_deadline: int = Field(0, description="Unix-seconds expiry the pay_deploy_fee signature was signed with.")
+    payment_signature: str = Field("", description="EIP-712 pay_deploy_fee signature from the app's deployer, binding "
+                                   "(app_id, payment_ref, chain_id, amount).")
+
+
 class ScorePlanRequest(BaseModel):
     plan: dict[str, Any] = Field(..., description="Execution plan to score")
     params: dict[str, Any] = Field(..., description="Order params → state.raw_params")
@@ -413,6 +425,7 @@ async def validate_app(
 async def deploy_app(
     app_id: str,
     chain_id: int | None = None,
+    body: DeployRequest | None = None,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
 
@@ -422,18 +435,37 @@ async def deploy_app(
     the deployed contract still can't execute orders (AppRegistry gate
     is GATED + allowlist) but the gas burn is real.
 
+    With a payment body, the deploy is authorized via the deployer's EIP-712
+    pay_deploy_fee signature + on-chain payment proof instead of admin privilege
+    (the shape the public deploy API will use). It still can't succeed until
+    collection is live — the #238 gate and the (default-off) payment verifier
+    keep it closed — so the fee stays unbypassable.
+
     Runs in a thread executor so the synchronous compile + deploy chain
     can call asyncio.run() without conflicting with the FastAPI event loop.
     """
     import asyncio
     loop = asyncio.get_running_loop()
-    # Admin route -> is_admin=True: deploys free, as today. The #238 deploy-fee /
-    # public-deployment gate only bites a non-admin (public) caller, which has no
-    # route yet — this keeps the fee unbypassable when the public API lands.
+
+    payment = None
+    if body is not None and (body.payment_signature or body.payment_ref):
+        from minotaur_subnet.api.services.deploy_payment import DeployFeePayment
+        payment = DeployFeePayment(
+            payment_ref=body.payment_ref,
+            nonce=body.payment_nonce,
+            deadline=body.payment_deadline,
+            signature=body.payment_signature,
+        )
+
+    # No payment claim → operator/admin deploy (is_admin=True, free, as today).
+    # Payment claim → public/3rd-party deploy: deploy_app_intent flips to
+    # is_admin=False and authorizes via the fee payment.
     return await loop.run_in_executor(
         None,
         lambda: _tools.deploy_app_intent(
-            _store(), app_id, chain_id=chain_id, is_admin=True,
+            _store(), app_id, chain_id=chain_id,
+            is_admin=(payment is None),
+            payment=payment,
         ),
     )
 
