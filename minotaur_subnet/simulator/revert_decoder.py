@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 _ERROR_SELECTOR = bytes.fromhex("08c379a0")    # Error(string)
 _PANIC_SELECTOR = bytes.fromhex("4e487b71")    # Panic(uint256)
+# EphemeralProxy.CallFailed(uint256 index, bytes reason): wraps the i-th plan
+# interaction's revert. Decoded specially (recurse into `reason`) so the report
+# shows the ACTUAL inner cause, not just which interaction failed.
+_CALLFAILED_SELECTOR = bytes.fromhex("5c0dee5d")
 
 # Solidity Panic(uint256) codes — from the language reference.
 _PANIC_REASONS: dict[int, str] = {
@@ -115,14 +119,18 @@ def decode_call(calldata: bytes | str) -> str:
     return _FUNCTION_NAMES.get(selector, f"selector=0x{selector.hex()}")
 
 
-def decode_revert_data(data: bytes | str) -> str:
+def decode_revert_data(data: bytes | str, _depth: int = 0) -> str:
     """Decode an EVM revert payload into a human string.
 
     Recognises:
       - ``Error(string)`` (Solidity ``require(x, "msg")`` and ``revert("msg")``)
       - ``Panic(uint256)`` (built-in panics: overflow, divide-by-zero, etc.)
+      - ``CallFailed(index, reason)`` (EphemeralProxy wrapper) → recurses into
+        ``reason`` so the ACTUAL inner cause shows, not just the failed index
       - Known custom errors (4-byte selector lookup, see ``_CUSTOM_ERRORS``)
       - Unknown custom errors → reports selector + first 32 bytes of body
+
+    ``_depth`` is internal (bounds CallFailed recursion); callers omit it.
     """
     if isinstance(data, str):
         s = data[2:] if data.startswith("0x") else data
@@ -149,6 +157,22 @@ def decode_revert_data(data: bytes | str) -> str:
             return f"Panic(0x{code:02x}): {label}"
         except Exception:
             return "Panic(undecodable)"
+    if selector == _CALLFAILED_SELECTOR:
+        # EphemeralProxy wraps the i-th plan interaction's revert in
+        # CallFailed(uint256 index, bytes reason). Recurse into `reason` so the
+        # report names the real cause (e.g. "Too little received") instead of
+        # just which interaction failed. Depth-bounded against nested wrappers.
+        try:
+            index, reason = _abi_decode(["uint256", "bytes"], body)
+            if _depth >= 4:
+                inner = "(nested too deep)"
+            elif reason:
+                inner = decode_revert_data(reason, _depth + 1)
+            else:
+                inner = "(no inner reason)"
+            return f"CallFailed(index={index}, {inner})"
+        except Exception:
+            return "CallFailed(undecodable)"
     name = _CUSTOM_ERRORS.get(selector)
     if name:
         return f"{name}"
