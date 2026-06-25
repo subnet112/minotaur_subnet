@@ -321,6 +321,9 @@ class AppIntentStore:
                     permission_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS native_executions(
                     execution_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS developer_nonces(
+                    app_id TEXT NOT NULL, deployer TEXT NOT NULL,
+                    nonce INTEGER NOT NULL, PRIMARY KEY(app_id, deployer));
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
                 """
@@ -467,6 +470,63 @@ class AppIntentStore:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM apps WHERE app_id=?", (app_id,))
             return cur.rowcount > 0
+
+    # ── developer-auth nonces ─────────────────────────────────────────────
+    #
+    # Monotonic, single-use nonces for EIP-712 developer authorizations (see
+    # ``api/services/developer_auth``). One counter per ``(app_id, deployer)``;
+    # the last *consumed* value is stored, so the next valid nonce is +1.
+
+    def get_developer_nonce(self, app_id: str, deployer: str) -> int:
+        """Last consumed developer-auth nonce for ``(app, deployer)`` (0 if none).
+
+        The next nonce a signer should use is this value + 1.
+        """
+        dep = (deployer or "").strip().lower()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT nonce FROM developer_nonces WHERE app_id=? AND deployer=?",
+                (app_id, dep),
+            ).fetchone()
+        return int(row["nonce"]) if row else 0
+
+    def consume_developer_nonce(
+        self, app_id: str, deployer: str, nonce: int,
+    ) -> tuple[bool, str]:
+        """Atomically consume ``nonce`` for ``(app, deployer)``.
+
+        Valid iff ``nonce == last_consumed + 1``; on success the counter
+        advances. Serialized via ``BEGIN IMMEDIATE`` so two concurrent requests
+        can never both consume the same nonce (replay protection). Returns
+        ``(ok, error)``.
+        """
+        dep = (deployer or "").strip().lower()
+        try:
+            n = int(nonce)
+        except (TypeError, ValueError):
+            return False, f"invalid nonce: {nonce!r}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT nonce FROM developer_nonces WHERE app_id=? AND deployer=?",
+                    (app_id, dep),
+                ).fetchone()
+                current = int(row["nonce"]) if row else 0
+                expected = current + 1
+                if n != expected:
+                    conn.execute("ROLLBACK")
+                    return False, f"bad nonce: got {n}, expected {expected}"
+                conn.execute(
+                    "INSERT INTO developer_nonces(app_id, deployer, nonce) VALUES(?,?,?) "
+                    "ON CONFLICT(app_id, deployer) DO UPDATE SET nonce=excluded.nonce",
+                    (app_id, dep, n),
+                )
+                conn.execute("COMMIT")
+                return True, ""
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # ── wallets ──────────────────────────────────────────────────────────
 
