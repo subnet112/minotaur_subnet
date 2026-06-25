@@ -60,6 +60,7 @@ from typing import Any
 from aiohttp import ClientSession, ClientTimeout, web
 
 from .cost_table import batch_cost, request_cost
+from .rewrite_table import rewrite_single
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +92,27 @@ class Session:
     it stays set until an explicit ``/control/reset`` — deterministic.
     """
 
-    __slots__ = ("session_id", "budget", "mode", "spent", "exhausted", "peak")
+    __slots__ = (
+        "session_id", "budget", "mode", "spent", "exhausted", "peak", "blocks",
+    )
 
-    def __init__(self, session_id: str, budget: int, mode: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        budget: int,
+        mode: str,
+        blocks: dict[str, str] | None = None,
+    ) -> None:
         self.session_id = session_id
         self.budget = int(budget)
         self.mode = mode
         self.spent = 0
         self.exhausted = False
         self.peak = 0
+        # Per-chain pinned block (hex, 0x-prefixed). When a block is set for a
+        # chain, every read on that chain is rewritten to it before forwarding —
+        # the block-pin half of the proxy. Empty = byte-transparent (budget-only).
+        self.blocks: dict[str, str] = dict(blocks or {})
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -109,6 +122,7 @@ class Session:
             "spent": self.spent,
             "exhausted": self.exhausted,
             "peak": self.peak,
+            "blocks": dict(self.blocks),
         }
 
 
@@ -116,6 +130,31 @@ def _normalize_mode(mode: Any) -> str:
     """Coerce a mode value to ``observe`` or ``enforce`` (default observe)."""
     m = str(mode or "").strip().lower()
     return "enforce" if m == "enforce" else "observe"
+
+
+def _normalize_blocks(raw: Any) -> tuple[dict[str, str], str | None]:
+    """Coerce a ``{chain: block}`` map to ``{chain: "0x<hex>"}``.
+
+    ``block`` may be an int or a hex/decimal string. ``None``/empty -> ({}, None)
+    (no pinning). A non-mapping or an unparseable/negative block -> ({}, error).
+    """
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, "blocks must be a {chain: block} object"
+    out: dict[str, str] = {}
+    for chain, block in raw.items():
+        try:
+            if isinstance(block, str):
+                n = int(block, 16) if block.lower().startswith("0x") else int(block)
+            else:
+                n = int(block)
+        except (TypeError, ValueError):
+            return {}, f"invalid block for chain {chain!r}: {block!r}"
+        if n < 0:
+            return {}, f"negative block for chain {chain!r}"
+        out[str(chain)] = hex(n)
+    return out, None
 
 
 class BudgetProxy:
@@ -282,6 +321,19 @@ class BudgetProxy:
             session.mode,
             is_batch,
         )
+
+        # Block-pin: when this session has a pinned block for the chain, FORCE
+        # every read to it (rewriting the request body) so the untrusted solver
+        # reads exactly the scored state — deterministic on any archive upstream.
+        # No block configured for the chain -> byte-transparent raw forward
+        # (budget-only / legacy mode).
+        block_hex = session.blocks.get(chain or self._default_chain)
+        if block_hex is not None and parse_ok:
+            pinned = self._block_pin(parsed, block_hex)
+            if isinstance(pinned, web.StreamResponse):
+                return pinned  # synthetic: eth_blockNumber result / rejected method
+            return await self._forward(upstream, pinned, request)  # rewritten body
+
         return await self._forward(upstream, raw_body, request)
 
     async def _forward(
@@ -350,6 +402,52 @@ class BudgetProxy:
             status=http_status,
         )
 
+    # -- block-pin ---------------------------------------------------------
+
+    def _block_pin(self, parsed: Any, block_hex: str) -> Any:
+        """Apply the block-pin rewrite to a parsed JSON-RPC body.
+
+        Returns either a synthetic ``web.Response`` (an intercepted
+        ``eth_blockNumber`` answered with the pin, a rejected state-changing
+        method, or a batch mixing those) OR the rewritten body ``bytes`` to
+        forward. For a batch with no intercept/reject members, each member's
+        block tag is rewritten and the batch is forwarded as one.
+        """
+        if isinstance(parsed, list):
+            out = []
+            for member in parsed:
+                action, payload = rewrite_single(member, block_hex)
+                if action in ("blocknumber", "reject"):
+                    # A batch mixing intercepted/rejected members can't be a
+                    # single upstream forward; reject it whole (fail-loud, rare —
+                    # the reference solver issues single calls, handled fully).
+                    return self._json_error_response(
+                        None,
+                        code=-32601,
+                        message=(
+                            "eth_blockNumber / state-changing methods must be "
+                            "single calls under block-pin"
+                        ),
+                        http_status=200,
+                    )
+                out.append(payload)
+            return json.dumps(out).encode()
+
+        action, payload = rewrite_single(parsed, block_hex)
+        req_id = parsed.get("id") if isinstance(parsed, dict) else None
+        if action == "blocknumber":
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": req_id, "result": payload}
+            )
+        if action == "reject":
+            return self._json_error_response(
+                req_id,
+                code=-32601,
+                message=f"method {payload!r} not allowed (read-only block-pinned proxy)",
+                http_status=200,
+            )
+        return json.dumps(payload).encode()
+
     # -- control plane -----------------------------------------------------
 
     async def control_open(self, request: web.Request) -> web.Response:
@@ -363,10 +461,14 @@ class BudgetProxy:
         except (TypeError, ValueError):
             return web.json_response({"error": "budget must be an integer"}, status=400)
         mode = _normalize_mode(data.get("mode", self.default_mode))
+        blocks, berr = _normalize_blocks(data.get("blocks"))
+        if berr is not None:
+            return web.json_response({"error": berr}, status=400)
         # create OR replace, spent reset to 0
-        self.sessions[session_id] = Session(session_id, budget, mode)
+        self.sessions[session_id] = Session(session_id, budget, mode, blocks=blocks)
         logger.info(
-            "control/open session=%s budget=%d mode=%s", session_id, budget, mode
+            "control/open session=%s budget=%d mode=%s blocks=%s",
+            session_id, budget, mode, blocks,
         )
         return web.json_response(self.sessions[session_id].to_record())
 
@@ -378,8 +480,13 @@ class BudgetProxy:
             return web.json_response({"error": "unknown session_id"}, status=404)
         session.spent = 0
         session.exhausted = False
+        if "blocks" in data:
+            blocks, berr = _normalize_blocks(data.get("blocks"))
+            if berr is not None:
+                return web.json_response({"error": berr}, status=400)
+            session.blocks = blocks  # re-point to the new round's blocks
         # peak is intentionally NOT reset here; it tracks across scenarios.
-        logger.info("control/reset session=%s", session_id)
+        logger.info("control/reset session=%s blocks=%s", session_id, session.blocks)
         return web.json_response(session.to_record())
 
     async def control_close(self, request: web.Request) -> web.Response:

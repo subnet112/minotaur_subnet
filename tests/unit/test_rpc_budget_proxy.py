@@ -382,3 +382,122 @@ async def test_concurrent_calls_cannot_exceed_budget(upstream):
     finally:
         await client.close()
         await upserver.close()
+
+
+# ---------------------------------------------------------------------------
+# (g) block-pin: rewrite_table (pure)
+# ---------------------------------------------------------------------------
+
+from minotaur_subnet.harness.rpc_budget_proxy import rewrite_table as rt  # noqa: E402
+
+
+def test_classify():
+    assert rt.classify("eth_call") == "rewrite"
+    assert rt.classify("eth_getStorageAt") == "rewrite"
+    assert rt.classify("eth_blockNumber") == "blocknumber"
+    assert rt.classify("eth_getLogs") == "getlogs"
+    assert rt.classify("eth_sendRawTransaction") == "reject"
+    assert rt.classify("anvil_setBalance") == "reject"
+    assert rt.classify("evm_snapshot") == "reject"
+    assert rt.classify("eth_chainId") == "passthrough"
+    assert rt.classify(123) == "passthrough"
+
+
+def test_rewrite_params_forces_and_pads():
+    B = "0x3039"  # 12345
+    assert rt.rewrite_params("eth_call", [{"to": "0x0"}, "latest"], B) == [{"to": "0x0"}, B]
+    assert rt.rewrite_params("eth_call", [{"to": "0x0"}], B) == [{"to": "0x0"}, B]  # omitted -> padded+forced
+    assert rt.rewrite_params("eth_getStorageAt", ["0xa", "0x1"], B) == ["0xa", "0x1", B]
+    assert rt.rewrite_params("eth_getBlockByNumber", ["latest", True], B) == [B, True]
+    f = rt.rewrite_params("eth_getLogs", [{"address": "0xa", "fromBlock": "0x0", "toBlock": "latest"}], B)
+    assert f[0]["fromBlock"] == B and f[0]["toBlock"] == B
+
+
+def test_rewrite_single_actions():
+    B = "0x3039"
+    assert rt.rewrite_single({"method": "eth_blockNumber", "params": []}, B) == ("blocknumber", B)
+    assert rt.rewrite_single({"method": "anvil_setBalance", "params": []}, B)[0] == "reject"
+    a, p = rt.rewrite_single({"method": "eth_call", "params": [{"to": "0x0"}]}, B)
+    assert a == "forward" and p["params"] == [{"to": "0x0"}, B]
+
+
+def test_rewrite_table_record_stable():
+    r = rt.rewrite_table_record()
+    assert r["version"] == "v1"
+    assert r == rt.rewrite_table_record()
+    assert list(r["block_param_index"]) == sorted(r["block_param_index"])
+
+
+# ---------------------------------------------------------------------------
+# (h) block-pin: proxy integration
+# ---------------------------------------------------------------------------
+
+
+async def _open_pinned(client, sid, block):
+    await client.post("/control/open", json={
+        "session_id": sid, "budget": 10 ** 9, "mode": "observe", "blocks": {"eth": block},
+    })
+
+
+def _call(params, method="eth_call"):
+    return {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+
+
+@pytest.mark.asyncio
+async def test_pin_rewrites_block_tag(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)  # 0x3039
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}, "latest"]))
+    sent = json.loads(upstream.received[-1])
+    assert sent["params"][1] == "0x3039"  # 'latest' forced to the pin
+
+
+@pytest.mark.asyncio
+async def test_pin_forces_block_when_omitted(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))  # NO block arg
+    sent = json.loads(upstream.received[-1])
+    assert sent["params"][1] == "0x3039"  # padded + pinned (can't dodge by omission)
+
+
+@pytest.mark.asyncio
+async def test_pin_intercepts_blocknumber(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    before = len(upstream.received)
+    resp = await client.post("/rpc/p/eth", json=_call([], "eth_blockNumber"))
+    body = await resp.json()
+    assert body["result"] == "0x3039"        # answered with the pin
+    assert len(upstream.received) == before  # NOT forwarded
+
+
+@pytest.mark.asyncio
+async def test_pin_rejects_state_changing(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    before = len(upstream.received)
+    for m in ("eth_sendRawTransaction", "anvil_setBalance", "evm_revert"):
+        resp = await client.post("/rpc/p/eth", json=_call([], m))
+        body = await resp.json()
+        assert "error" in body and "not allowed" in body["error"]["message"]
+    assert len(upstream.received) == before  # none forwarded
+
+
+@pytest.mark.asyncio
+async def test_no_pin_is_transparent(proxy_client):
+    _, client, upstream = proxy_client
+    await client.post("/control/open", json={"session_id": "np", "budget": 10 ** 9})  # no blocks
+    await client.post("/rpc/np/eth", json=_call([{"to": "0xq"}, "latest"]))
+    sent = json.loads(upstream.received[-1])
+    assert sent["params"][1] == "latest"  # NOT rewritten (byte-transparent)
+
+
+@pytest.mark.asyncio
+async def test_reset_repoints_blocks(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/control/reset", json={"session_id": "p", "blocks": {"eth": 999}})  # 0x3e7
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    sent = json.loads(upstream.received[-1])
+    assert sent["params"][1] == "0x3e7"  # re-pointed to the new round's block
