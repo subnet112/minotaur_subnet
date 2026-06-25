@@ -618,6 +618,29 @@ class AnvilSimulator:
             logger.warning("scoreIntent simulation failed: %s", exc)
             return None
 
+    def pin_read_fork(self, chain_id: int, block_number: int) -> bool:
+        """Pin this fork to ``block_number`` for the SOLVER's reads.
+
+        The solver currently quotes/routes against the fork at live HEAD while
+        the simulator SCORES at ``fork_block`` — a block mismatch that (a) makes
+        the solver's RPC call sequence host-dependent (non-deterministic across
+        validators) and (b) misprices its quotes relative to the executed block
+        (a likely source of "Too little received" reverts). Resetting the read
+        fork to the round's pinned block makes the solver read exactly the state
+        it is scored against, identically on every validator. No-op when already
+        at the block (the prior scenario's simulate leaves the fork pinned, so we
+        avoid a redundant, expensive re-fork). ``chain_id`` is accepted for a
+        uniform interface with :class:`MultiChainSimulator` and ignored here
+        (this is a single fork). Returns True iff a re-fork happened.
+        """
+        try:
+            if int(self.w3.eth.block_number) == int(block_number):
+                return False
+        except Exception:  # noqa: BLE001 - fall through to a reset on any read error
+            pass
+        self._reset_fork(block_number=int(block_number))
+        return True
+
     def _reset_fork(self, block_number: int | None = None) -> None:
         """Reset the Anvil fork to a clean baseline.
 
@@ -1446,6 +1469,23 @@ class MultiChainSimulator:
         if sim is None:
             sim = self.simulators.get(self.default_chain_id)
         return sim
+
+    def pin_read_fork(self, chain_id: int, block_number: int) -> bool:
+        """Pin the SOLVER's read fork for ``chain_id`` to ``block_number``.
+
+        Routes to the per-chain sub-simulator (falling back to the default
+        chain) and pins it so the solver reads the same block the simulator
+        scores at. See :meth:`AnvilSimulator.pin_read_fork`. Returns True iff a
+        re-fork happened.
+        """
+        try:
+            cid = int(chain_id)
+        except (TypeError, ValueError):
+            cid = self.default_chain_id
+        sim = self.simulators.get(cid) or self.simulators.get(self.default_chain_id)
+        if sim is None:
+            return False
+        return sim.pin_read_fork(cid, block_number)
 
     async def simulate(
         self,
