@@ -32,9 +32,16 @@ CHAIN_NAMES: dict[int, str] = {1: "eth", 31337: "eth", 8453: "base", 964: "btevm
 
 @dataclass(frozen=True)
 class ReadProxyConfig:
-    """Resolved wiring for routing solver reads through the proxy."""
+    """Resolved wiring for routing solver reads through the proxy.
 
-    url: str  # proxy base, e.g. http://172.30.0.5:8645 (no trailing slash)
+    TWO addresses because the trusted api (control plane) and the untrusted
+    solver (data plane) sit on DIFFERENT docker networks: the api reaches the
+    proxy on the validator/minotaur net; the solver reaches it on the sealed
+    sandbox net (a different IP). A single URL can't serve both.
+    """
+
+    url: str  # DATA-plane base the SOLVER dials (e.g. http://172.30.0.5:8645)
+    control_url: str  # CONTROL-plane base the API dials (e.g. http://rpc-pin-proxy:8645)
     token: str  # control-plane shared secret (sent as X-Control-Token)
     chain_ids: tuple[int, ...]  # chains to route + pin through the proxy
 
@@ -54,6 +61,10 @@ def read_proxy_config() -> ReadProxyConfig | None:
     base = os.environ.get("SOLVER_READ_PROXY", "").strip()
     if not base:
         return None
+    # The api (control) and the solver (data) are on different networks, so the
+    # control-plane address may differ from the solver-facing one. Defaults to
+    # the data URL when they coincide (e.g. local testnet, single network).
+    control = os.environ.get("SOLVER_READ_PROXY_CONTROL", "").strip() or base
     token = os.environ.get("SOLVER_READ_PROXY_TOKEN", "").strip()
     raw = os.environ.get("SOLVER_READ_PROXY_CHAINS", "8453").strip()
     try:
@@ -61,7 +72,12 @@ def read_proxy_config() -> ReadProxyConfig | None:
     except ValueError:
         logger.error("SOLVER_READ_PROXY_CHAINS not a csv of ints: %r; using (8453,)", raw)
         chains = (8453,)
-    return ReadProxyConfig(url=base.rstrip("/"), token=token, chain_ids=chains)
+    return ReadProxyConfig(
+        url=base.rstrip("/"),
+        control_url=control.rstrip("/"),
+        token=token,
+        chain_ids=chains,
+    )
 
 
 def build_pin_blocks(
@@ -91,7 +107,9 @@ def _control_post(cfg: ReadProxyConfig, path: str, body: dict, timeout: float = 
     headers = {"content-type": "application/json"}
     if cfg.token:
         headers["X-Control-Token"] = cfg.token
-    req = urllib.request.Request(cfg.url + path, data=data, headers=headers, method="POST")
+    req = urllib.request.Request(
+        cfg.control_url + path, data=data, headers=headers, method="POST"
+    )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted internal URL)
         return json.loads(resp.read())
 
