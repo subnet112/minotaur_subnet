@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from minotaur_subnet.harness.benchmark_pack import compute_pack_hash
 from minotaur_subnet.harness.rpc_budget_proxy.cost_table import compute_budget_record
+from minotaur_subnet.harness.rpc_budget_proxy.rewrite_table import rewrite_table_record
 
 
 class TestComputeBudgetFold:
@@ -32,6 +33,39 @@ class TestComputeBudgetFold:
         rec_t = compute_budget_record(5000)
         rec_t["cost_table"]["methods"]["eth_call"] = 99   # a tampered cost table also diverges
         assert compute_pack_hash("r", self._S, self._H, compute_budget=rec_t) != h_a
+
+
+class TestBlockRewriteFold:
+    """The block-pin rewrite-table record folds into the pack hash ONLY when the
+    solver-read proxy routes — inert by default (backward compatible)."""
+
+    _S = [{"app_id": "a", "name": "n", "params": {"x": 1}}]
+    _H = ["ord_a", "ord_b"]
+
+    def test_none_is_backward_compatible(self):
+        assert compute_pack_hash("r", self._S, self._H, block_rewrite=None) == \
+            compute_pack_hash("r", self._S, self._H)
+
+    def test_active_rewrite_changes_hash_and_is_deterministic(self):
+        base = compute_pack_hash("r", self._S, self._H)
+        h1 = compute_pack_hash("r", self._S, self._H, block_rewrite=rewrite_table_record())
+        h2 = compute_pack_hash("r", self._S, self._H, block_rewrite=rewrite_table_record())
+        assert h1 != base   # routing through the proxy is consensus-breaking
+        assert h1 == h2     # same rewrite table → same hash (fleet agrees)
+
+    def test_tampered_rewrite_table_diverges(self):
+        h_a = compute_pack_hash("r", self._S, self._H, block_rewrite=rewrite_table_record())
+        rec = rewrite_table_record()
+        rec["block_param_index"]["eth_call"] = 99   # a different pinning rule
+        assert compute_pack_hash("r", self._S, self._H, block_rewrite=rec) != h_a
+
+    def test_composes_with_compute_budget(self):
+        # both folds active → distinct from either alone (orthogonal, composable)
+        bud = compute_budget_record(5000)
+        rw = rewrite_table_record()
+        both = compute_pack_hash("r", self._S, self._H, compute_budget=bud, block_rewrite=rw)
+        assert both != compute_pack_hash("r", self._S, self._H, compute_budget=bud)
+        assert both != compute_pack_hash("r", self._S, self._H, block_rewrite=rw)
 
 
 class TestDeterminism:

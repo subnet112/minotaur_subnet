@@ -134,3 +134,25 @@ async def close_session(cfg: ReadProxyConfig, session_id: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("read-proxy close failed for session=%s: %s", session_id, exc)
+
+
+def pack_hash_block_rewrite() -> dict | None:
+    """The block-rewrite record to fold into the benchmark pack hash, or ``None``.
+
+    Folded IFF this round's scoring actually routes solver reads through the
+    proxy — i.e. the proxy is configured (``SOLVER_READ_PROXY``) AND the round is
+    pinned (``ROUND_ANCHORED_PIN``), exactly the condition under which
+    :func:`run_benchmark` repoints reads to the proxy. Returning ``None``
+    otherwise keeps the pack hash byte-identical to validators not routing
+    through the proxy, so a non-proxy fleet is unaffected; once a fleet routes, a
+    divergent ``BLOCK_REWRITE_VERSION`` yields a different hash and cannot reach
+    quorum (consensus-versioned, same discipline as the compute budget).
+    """
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    from minotaur_subnet.harness.rpc_budget_proxy.rewrite_table import (
+        rewrite_table_record,
+    )
+
+    if read_proxy_config() is not None and round_anchored_pin_enabled():
+        return rewrite_table_record()
+    return None

@@ -607,7 +607,17 @@ def _build_solver_round_benchmark_pack_hash(
         logger.warning("pack_hash: historical sampling failed: %s", exc)
         historical_order_ids = []
 
-    scenario_hash = compute_pack_hash(round_id, synthetic_scenarios, historical_order_ids)
+    # Fold the block-pin rewrite-table version into the pack hash when (and only
+    # when) this round routes solver reads through the proxy (proxy configured +
+    # round pinned). Inert otherwise — byte-identical to a non-proxy fleet.
+    from minotaur_subnet.harness.solver_read_proxy import pack_hash_block_rewrite
+
+    scenario_hash = compute_pack_hash(
+        round_id,
+        synthetic_scenarios,
+        historical_order_ids,
+        block_rewrite=pack_hash_block_rewrite(),
+    )
 
     payload = {
         "round_id": round_id,
