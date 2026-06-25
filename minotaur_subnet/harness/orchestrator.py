@@ -814,6 +814,21 @@ def build_rpc_url_map(chain_ids) -> dict[int, str]:
     return rpc_map
 
 
+def _pin_solver_read_block_enabled() -> bool:
+    """Whether to pin the SOLVER's read fork to the round's fork_block before
+    generate_plan (Phase 0 of the deterministic-budget work).
+
+    CONSENSUS-RELEVANT: changes the block state the solver reads, hence its
+    routes/quotes/scores. Must be fleet-uniform — ships OFF so it can soak
+    inert on the lead (observe the revert/score effect under the adoption
+    freeze) and be flipped fleet-wide together (folded into the pack hash) once
+    proven, exactly like ROUND_ANCHORED_PIN. Default OFF.
+    """
+    return os.environ.get("PIN_SOLVER_READ_BLOCK", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 async def run_benchmark(
     session: SolverSession,
     intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -1016,6 +1031,29 @@ async def run_benchmark(
         # deployed scoreIntent reverts. Populate the source:"quote" params from
         # a REAL quote — exactly like the live get_quote path — so downstream
         # _build_benchmark_intent_order emits the full (CoW) layout.
+        # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE
+        # it quotes/routes, so it reads the SAME state the simulator scores at:
+        # cross-host deterministic (the precondition for a deterministic compute
+        # budget) AND it stops the solver mispricing quotes against a different
+        # (drifting, per-host) block. No-op when the fork is already pinned.
+        # Gated + consensus-relevant — ships OFF, flips fleet-uniformly.
+        if (
+            _pin_solver_read_block_enabled()
+            and fork_block is not None
+            and simulator is not None
+            and state is not None
+            and getattr(state, "chain_id", None)
+        ):
+            try:
+                pin_fn = getattr(simulator, "pin_read_fork", None)
+                if pin_fn is not None:
+                    pin_fn(state.chain_id, fork_block)
+            except Exception as exc:  # noqa: BLE001 - never let a pin failure abort the run
+                logger.warning(
+                    "[pin-read-block] fork pin failed for chain %s @ %s: %s",
+                    getattr(state, "chain_id", "?"), fork_block, exc,
+                )
+
         try:
             # Keep quote-enrich inside the try: _enrich_state_with_quote swallows
             # its own quote exceptions, but on an already-dead solver the next
