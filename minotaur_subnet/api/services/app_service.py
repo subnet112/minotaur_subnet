@@ -209,6 +209,7 @@ def deploy_app_intent(
     *,
     is_admin: bool = True,
     fee_paid: bool = False,
+    payment: Any = None,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain.
 
@@ -225,7 +226,11 @@ def deploy_app_intent(
                   3rd-party deploy passes False and is gated by the #238 deploy-fee
                   / public-deployment check below.
         fee_paid: Whether the #238 deploy fee was collected (only meaningful for a
-                  public deploy; collection is not wired yet, so always False there).
+                  public deploy). Computed from ``payment`` when one is supplied.
+        payment:  Optional ``deploy_payment.DeployFeePayment``. When supplied, the
+                  deploy is treated as payment-backed (``is_admin=False``) and
+                  authorized via the deployer's EIP-712 ``pay_deploy_fee``
+                  signature + on-chain payment proof. ``None`` → admin deploy.
 
     Returns:
         DeploymentResult dict with status, contract address, and js_code_hash.
@@ -239,18 +244,20 @@ def deploy_app_intent(
     if not app_id:
         return {"error": "app_id is required"}
 
-    # Hard gate (#238): admin deploys pass; a public/3rd-party deploy is refused
-    # until public deployment is enabled AND the deploy fee is collected.
-    try:
-        require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
-    except DeploymentFeeRequired as exc:
-        return {"error": str(exc), "deploy_fee_required": True}
+    # Hard gate (#238) for the no-payment case: admin deploys pass; a public
+    # deploy with no payment claim is refused here, BEFORE any store lookup, so
+    # an unauthorized public caller does zero work (and a bare store is fine).
+    if payment is None:
+        try:
+            require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
+        except DeploymentFeeRequired as exc:
+            return {"error": str(exc), "deploy_fee_required": True}
 
     definition = store.get_app(app_id)
     if definition is None:
         return {"error": f"App not found: {app_id}"}
 
-    # Resolve target chain
+    # Resolve target chain (a payment authorization binds the chain it paid for).
     supported = definition.config.supported_chains
     if not supported:
         return {"error": "App has no supported_chains configured"}
@@ -263,6 +270,20 @@ def deploy_app_intent(
                 f"{supported}"
             ),
         }
+
+    # A payment-backed deploy (a payment claim is supplied) is a public/3rd-party
+    # deploy: authorize it via the deployer's EIP-712 pay_deploy_fee signature +
+    # on-chain payment proof. verify_deploy_fee_payment IS the #238 gate for this
+    # path — it enforces public_deployment_enabled() and only succeeds once the
+    # fee is confirmed, consuming the nonce. No claim → admin deploy (free).
+    if payment is not None:
+        from minotaur_subnet.api.services.deploy_payment import verify_deploy_fee_payment
+
+        ok, fee_err = verify_deploy_fee_payment(
+            store, definition, chain_id=chain_id, payment=payment,
+        )
+        if not ok:
+            return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
 
     # Check not already deployed on this chain
     existing = store.get_deployment(app_id, chain_id=chain_id)
