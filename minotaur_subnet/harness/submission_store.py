@@ -18,14 +18,25 @@ Usage:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
+    # Without fcntl we cannot take a cross-process advisory lock; the store
+    # degrades to in-process locking only (its historical behaviour).
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +141,60 @@ class Submission:
         }
 
 
+def _write_locked(method):
+    """Serialize a store mutation across threads *and* processes.
+
+    Every mutating method here is a read-modify-write: it reloads the latest
+    persisted state, mutates in memory, then rewrites the whole JSON file.
+    When several workers share one backing file (FastAPI workers, or the
+    validator + API processes) two such sequences can interleave — two
+    concurrent ``create`` calls both pass the per-round cap check before either
+    persists, or one writer's whole-file rewrite clobbers another's
+    just-created record. This decorator brackets the method with an exclusive
+    advisory file lock (plus an in-process lock) so each read-modify-write runs
+    to completion before the next begins.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._write_guard():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SubmissionStore:
-    """In-memory store for submissions with optional JSON persistence."""
+    """In-memory store for submissions with optional JSON persistence.
+
+    Mutations are serialized across threads and processes (see
+    :func:`_write_locked`) so the per-(hotkey, round) cap in :meth:`create`
+    holds even when multiple workers share the backing file. Reads stay
+    lock-free; :meth:`_persist` writes atomically (temp file + ``os.replace``)
+    so a concurrent reader never observes a half-written file.
+    """
 
     def __init__(self, persist_path: Path | None = None) -> None:
         self._submissions: dict[str, Submission] = {}
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
         self._persist_path = persist_path
+        # Cross-process advisory lock lives in a sibling file that is never
+        # rewritten — locking the data file itself would break, since each
+        # persist replaces it (a new inode the held fd no longer refers to).
+        self._lock_path = (
+            persist_path.with_name(persist_path.name + ".lock")
+            if persist_path is not None
+            else None
+        )
+        self._rmw_lock = threading.RLock()  # in-process serialization
+        self._lock_fd: int | None = None
+        self._lock_depth = 0
         self._persist_mtime_ns: int | None = None
 
         if persist_path and persist_path.exists():
             self._load()
 
+    @_write_locked
     def create(
         self,
         repo_url: str,
@@ -273,6 +325,7 @@ class SubmissionStore:
             if s.status == status
         ]
 
+    @_write_locked
     def update_status(
         self,
         submission_id: str,
@@ -288,6 +341,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_screening_result(
         self,
         submission_id: str,
@@ -318,6 +372,7 @@ class SubmissionStore:
 
         self._persist()
 
+    @_write_locked
     def set_image_tag(self, submission_id: str, image_tag: str) -> None:
         """Set the Docker image tag after successful build."""
         self._maybe_reload()
@@ -328,6 +383,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_image_id(self, submission_id: str, image_id: str) -> None:
         """Set immutable image identifier after successful build."""
         self._maybe_reload()
@@ -338,6 +394,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_image_digest(self, submission_id: str, image_digest: str) -> None:
         """Set the global GHCR manifest ref (<repo>@sha256:<64hex>) after push."""
         self._maybe_reload()
@@ -348,6 +405,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_provenance(
         self,
         submission_id: str,
@@ -362,6 +420,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_solver_path(self, submission_id: str, solver_path: str) -> None:
         """Set the local solver file path for source submissions."""
         self._maybe_reload()
@@ -372,6 +431,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_solver_info(
         self,
         submission_id: str,
@@ -388,6 +448,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_benchmark_result(
         self,
         submission_id: str,
@@ -434,6 +495,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def reject(self, submission_id: str, reason: str) -> None:
         """Reject a submission with a reason."""
         self._maybe_reload()
@@ -445,6 +507,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def adopt(self, submission_id: str) -> None:
         """Mark a submission as the adopted champion.
 
@@ -469,6 +532,63 @@ class SubmissionStore:
         adopted = self.list_by_status(SubmissionStatus.ADOPTED)
         return adopted[0] if adopted else None
 
+    # ── Cross-process write lock ─────────────────────────────────────────────
+
+    @contextmanager
+    def _write_guard(self):
+        """Hold the write lock around a single read-modify-write.
+
+        Acquires the in-process lock (threads) then the exclusive advisory file
+        lock (processes), adopts the freshest persisted state, and yields for
+        the caller to mutate + persist. Re-entrant on one thread: nested guards
+        share the outermost lock and skip the reload so an in-progress mutation
+        is never discarded. When there is no ``persist_path`` (pure in-memory)
+        or ``fcntl`` is unavailable, the file lock is a no-op and only the
+        in-process lock applies.
+        """
+        with self._rmw_lock:
+            outermost = self._lock_depth == 0
+            self._lock_depth += 1
+            if outermost:
+                self._lock_fd = self._acquire_file_lock()
+            try:
+                if (
+                    outermost
+                    and self._persist_path is not None
+                    and self._persist_path.exists()
+                ):
+                    # Under the exclusive lock, take the latest committed state
+                    # so the check-and-write below cannot race another writer.
+                    self._load(quiet=True)
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0:
+                    self._release_file_lock(self._lock_fd)
+                    self._lock_fd = None
+
+    def _acquire_file_lock(self) -> int | None:
+        """Open the sibling lock file and take an exclusive advisory lock."""
+        if self._lock_path is None or fcntl is None:
+            return None
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _release_file_lock(fd: int | None) -> None:
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _maybe_reload(self) -> None:
@@ -483,7 +603,11 @@ class SubmissionStore:
             self._load()
 
     def _persist(self) -> None:
-        """Write state to disk if persist_path is set."""
+        """Write state to disk atomically if persist_path is set.
+
+        Writes a temp file then ``os.replace``s it into place so a concurrent
+        lock-free reader always sees a complete file, never a half-written one.
+        """
         if self._persist_path is None:
             return
         try:
@@ -492,13 +616,17 @@ class SubmissionStore:
                 for sid, sub in self._submissions.items()
             }
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            self._persist_path.write_text(json.dumps(data, indent=2))
+            tmp_path = self._persist_path.with_name(
+                f".{self._persist_path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.write_text(json.dumps(data, indent=2))
+            os.replace(tmp_path, self._persist_path)
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("Failed to persist submissions: %s", exc)
 
-    def _load(self) -> None:
-        """Load state from disk."""
+    def _load(self, *, quiet: bool = False) -> None:
+        """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
         try:
             data = json.loads(self._persist_path.read_text())
             submissions: dict[str, Submission] = {}
@@ -539,7 +667,8 @@ class SubmissionStore:
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
-            logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
+            if not quiet:
+                logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
         except Exception as exc:
             logger.warning("Failed to load submissions: %s", exc)
 
