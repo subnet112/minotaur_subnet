@@ -3,6 +3,35 @@
 from __future__ import annotations
 
 from minotaur_subnet.harness.benchmark_pack import compute_pack_hash
+from minotaur_subnet.harness.rpc_budget_proxy.cost_table import compute_budget_record
+
+
+class TestComputeBudgetFold:
+    """The deterministic-budget {budget, cost_table} record folds into the pack
+    hash ONLY when active — inert by default (backward compatible)."""
+
+    _S = [{"app_id": "a", "name": "n", "params": {"x": 1}}]
+    _H = ["ord_a", "ord_b"]
+
+    def test_none_is_backward_compatible(self):
+        # No budget → byte-identical to the pre-budget pack hash.
+        assert compute_pack_hash("r", self._S, self._H, compute_budget=None) == \
+            compute_pack_hash("r", self._S, self._H)
+
+    def test_active_budget_changes_hash_and_is_deterministic(self):
+        base = compute_pack_hash("r", self._S, self._H)
+        h1 = compute_pack_hash("r", self._S, self._H, compute_budget=compute_budget_record(5000))
+        h2 = compute_pack_hash("r", self._S, self._H, compute_budget=compute_budget_record(5000))
+        assert h1 != base                      # folding it in is consensus-breaking
+        assert h1 == h2                        # same budget+table → same hash (fleet agrees)
+
+    def test_different_budget_or_table_diverges(self):
+        h_a = compute_pack_hash("r", self._S, self._H, compute_budget=compute_budget_record(5000))
+        h_b = compute_pack_hash("r", self._S, self._H, compute_budget=compute_budget_record(6000))
+        assert h_a != h_b                      # a different budget can't reach quorum
+        rec_t = compute_budget_record(5000)
+        rec_t["cost_table"]["methods"]["eth_call"] = 99   # a tampered cost table also diverges
+        assert compute_pack_hash("r", self._S, self._H, compute_budget=rec_t) != h_a
 
 
 class TestDeterminism:

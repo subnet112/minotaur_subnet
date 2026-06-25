@@ -29,6 +29,7 @@ def compute_pack_hash(
     round_id: str,
     synthetic_scenarios: Iterable[dict[str, Any]],
     historical_order_ids: Iterable[str],
+    compute_budget: dict[str, Any] | None = None,
 ) -> str:
     """Compute the canonical SHA-256 hash of a benchmark pack.
 
@@ -70,6 +71,23 @@ def compute_pack_hash(
     h.update(b"HISTORICAL\n")
     for order_id in historical_sorted:
         h.update(order_id.encode("utf-8"))
+        h.update(b"\n")
+
+    # Deterministic RPC compute budget (the budget proxy's {budget, cost_table}
+    # record). Folded in ONLY when active, so the hash is byte-identical to the
+    # pre-budget pack while inert (backward-compatible — a fleet not yet running
+    # the budget computes the unchanged hash). Once a fleet enforces the budget,
+    # this binds it into consensus: a validator on a different budget or cost
+    # table produces a different pack hash and cannot reach quorum with the
+    # majority. CONSENSUS-BREAKING the instant it goes non-None fleet-wide — the
+    # cost_table_version must be bumped + rolled out atomically (same discipline
+    # as ROUND_ANCHORED_PIN), or quorum silently drops during a staggered
+    # upgrade.
+    if compute_budget is not None:
+        h.update(b"COMPUTE_BUDGET_V1\n")
+        h.update(
+            json.dumps(compute_budget, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
         h.update(b"\n")
 
     return "0x" + h.hexdigest()

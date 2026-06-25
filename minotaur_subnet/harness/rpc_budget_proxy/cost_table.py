@@ -109,3 +109,17 @@ def cost_table_record() -> dict:
         "default": DEFAULT_COST,
         "methods": dict(sorted(METHOD_COST.items())),
     }
+
+
+def compute_budget_record(budget: int) -> dict:
+    """The consensus record bound into the benchmark pack hash when the budget
+    is ACTIVE: ``{"budget": int, "cost_table": cost_table_record()}``.
+
+    Callers pass this to ``benchmark_pack.compute_pack_hash(..., compute_budget=)``
+    ONLY when the fleet is enforcing the budget. While inert they pass ``None``,
+    so the pack hash is byte-identical to the pre-budget pack (backward
+    compatible). The instant a fleet folds this in, the budget + cost table are
+    bound into consensus — roll out atomically (bump :data:`COST_TABLE_VERSION`
+    on any change).
+    """
+    return {"budget": int(budget), "cost_table": cost_table_record()}
