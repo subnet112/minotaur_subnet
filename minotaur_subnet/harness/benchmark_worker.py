@@ -1457,6 +1457,16 @@ class BenchmarkWorker:
                 "(%s); scenarios will self-quote", exc,
             )
             return {}
+        from minotaur_subnet.harness.solver_read_proxy import (
+            CHAIN_NAMES,
+            build_pin_blocks,
+            close_session,
+            open_session,
+            proxy_rpc_url,
+            read_proxy_config,
+        )
+        _read_proxy = read_proxy_config()
+        _proxy_session_id: str | None = None
         try:
             chain_ids = list({s.chain_id for _, s, _ in intents} or {1})
             rpc_map = build_rpc_url_map(chain_ids)
@@ -1473,6 +1483,29 @@ class BenchmarkWorker:
                     f"on snapshot fallback (incomplete pools). Set "
                     f"BENCHMARK_ANVIL_RPC_* / *_SIM_RPC_URL / *_RPC_URL."
                 )
+            # Route the champion's reads through the SAME block-pin proxy the
+            # challenger benchmark uses (orchestrator.run_benchmark), pinned at the
+            # round's fork block. Without this the champion dials the RAW anvil fork
+            # — unreachable on the sealed sandbox net (BENCHMARK_ALLOWED_HOSTS only
+            # permits the proxy) → "Web3 not connected" → 0 reference quotes → every
+            # challenger self-quotes (champion scores 0 everywhere, so the benchmark
+            # measures nothing). This was the migration gap: the challenger path
+            # moved to the proxy, the champion pre-pass kept the raw-anvil wiring.
+            fork_block = self._epoch_block_number
+            if _read_proxy is not None and fork_block is not None and rpc_map:
+                pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+                if pin_blocks:
+                    _proxy_session_id = f"refquote-{id(session):x}-{fork_block}"
+                    await open_session(_read_proxy, _proxy_session_id, pin_blocks)
+                    for cid in list(rpc_map):
+                        if cid in _read_proxy.chain_ids and cid in CHAIN_NAMES:
+                            rpc_map[cid] = proxy_rpc_url(
+                                _read_proxy, _proxy_session_id, cid,
+                            )
+                    logger.info(
+                        "[reference-quote] champion reads routed via block-pin "
+                        "proxy session=%s pinned=%s", _proxy_session_id, pin_blocks,
+                    )
             await session.initialize({
                 "chain_ids": chain_ids,
                 "rpc_urls": {str(k): v for k, v in rpc_map.items()},
@@ -1532,6 +1565,11 @@ class BenchmarkWorker:
                 )
         finally:
             await session.shutdown()
+            if _proxy_session_id is not None and _read_proxy is not None:
+                try:
+                    await close_session(_read_proxy, _proxy_session_id)
+                except Exception:  # noqa: BLE001 — cleanup must not mask the result
+                    pass
         return reference
 
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
