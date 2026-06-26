@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from fastapi import HTTPException
@@ -49,6 +50,78 @@ def _env_true(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+_ROUND_ID_RE = re.compile(r"^round-e(\d+)-n\d+$")
+
+
+def _parse_round_opened_epoch(round_id: str) -> int | None:
+    """Extract the opened_epoch from a canonical ``round-e{epoch}-n{count}`` id."""
+    if not round_id:
+        return None
+    match = _ROUND_ID_RE.match(round_id)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _adopt_leader_round_if_behind(
+    round_id: str,
+    *,
+    status: RoundStatus,
+    incumbent: ChampionSnapshot | None = None,
+    **field_updates: Any,
+) -> bool:
+    """Adopt the leader's round verbatim when this follower is behind.
+
+    A follower CANNOT reconstruct the leader's exact round_id locally, so when a
+    lifecycle broadcast references a round we don't have AND the leader is ahead
+    of our current round, we materialize the leader's round_id verbatim in
+    ``status`` so the broadcast's handler can proceed.
+
+    SAFETY: only ever called from internal/sync helpers reached after the round
+    has been authenticated by ``_authorize_internal_round``, which accepts the
+    leader's EIP-712 signature OR (default, since REQUIRE_SIGNED_ROUND_LIFECYCLE
+    is off) the shared SOLVER_ROUND_INTERNAL_API_KEY. Returns True if a round was
+    adopted, False otherwise (caller proceeds with normal resolution).
+
+    Never adopts a round OLDER-or-equal than our current open round (the
+    ``leader_epoch <= current.opened_epoch`` guard). At cold start (no current
+    round) it additionally refuses any round older than the highest opened_epoch
+    already in the store, so a replayed ancient signed broadcast can't pin a
+    restarted follower at a stale round.
+    """
+    if not round_id:
+        return False
+    round_store = get_round_store()
+    # Already have this round locally — let the handler resolve it normally.
+    if round_store.get_round(round_id) is not None:
+        return False
+    leader_epoch = _parse_round_opened_epoch(round_id)
+    if leader_epoch is None:
+        return False
+    current = round_store.get_current_round()
+    if current is not None:
+        if current.round_id != round_id and leader_epoch <= current.opened_epoch:
+            # Older-or-equal than what we already track = stale/replay; do NOT adopt.
+            return False
+    else:
+        # Cold start (no current round): refuse a replayed ancient broadcast that
+        # would pin us behind rounds we already know about. Accept only when the
+        # store is truly empty OR the leader is at/ahead of our newest round.
+        known = round_store.list_rounds()
+        if known:
+            max_epoch = max(r.opened_epoch for r in known)
+            if leader_epoch < max_epoch:
+                return False
+    round_store.adopt_round(
+        round_id=round_id,
+        opened_epoch=leader_epoch,
+        status=status,
+        incumbent=incumbent,
+        **field_updates,
+    )
+    return True
 
 
 def _current_solver_round_epoch() -> int:
@@ -295,6 +368,28 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
                 )
         except Exception:  # noqa: BLE001 — snapshot mirroring must not drop the close
             logger.warning("submission snapshot upsert failed", exc_info=True)
+    # Adopt the leader's round verbatim when this follower is BEHIND. SAFETY: the
+    # caller (internal_close_solver_round) already ran _authorize_internal_round,
+    # which accepts the leader's EIP-712 signature OR (default, since
+    # REQUIRE_SIGNED_ROUND_LIFECYCLE is off) the shared SOLVER_ROUND_INTERNAL_API_KEY.
+    # A behind follower cannot reconstruct the leader's round_id, so
+    # _close_solver_round_state would 409 against its own stale current round.
+    # Adopting materializes body.round_id directly as CLOSED with the broadcast
+    # fields, so we return it here rather than re-running the OPEN-only close path.
+    if _adopt_leader_round_if_behind(
+        body.round_id,
+        status=RoundStatus.CLOSED,
+        close_epoch=body.close_epoch,
+        benchmark_pack_hash=body.benchmark_pack_hash,
+        committee_block=body.committee_block,
+        committee_hash=body.committee_hash,
+        quorum_required=body.quorum_required,
+        decision_deadline_epoch=body.decision_deadline_epoch,
+        effective_epoch=body.effective_epoch,
+    ):
+        adopted = round_store.get_round(body.round_id)
+        if adopted is not None:
+            return adopted
     return _close_solver_round_state(body)
 
 
@@ -408,6 +503,11 @@ def _sync_abort_solver_round_state(body: AbortRoundRequest) -> RoundState:
         if body.reason and existing.abort_reason != body.reason:
             return round_store.abort_round(body.round_id, body.reason)
         return existing
+    # NOTE: we deliberately do NOT adopt-when-behind on abort. Adopting a
+    # never-seen round here yields no catch-up value (abort is terminal) yet
+    # would supersede this follower's current OPEN round into a terminal state,
+    # stranding it with no open round. The useful catch-up paths are CLOSE and
+    # CERTIFY, which create/advance the round so a later activate can proceed.
     return _abort_solver_round_state(body)
 
 
@@ -426,6 +526,12 @@ async def _activate_solver_round_state(body: ActivateRoundRequest) -> dict[str, 
             "weights_emitted": False,
             "status_after": existing.status.value,
         }
+    # NOTE: we deliberately do NOT adopt-when-behind on activate. A fresh-adopted
+    # CERTIFIED round would carry NO champion data (that arrives via certify), so
+    # activate_certified_round would just 409, while adoption would supersede this
+    # follower's current OPEN round into a terminal state. The catch-up happens on
+    # the CLOSE/CERTIFY broadcasts, which materialize the round so this activate
+    # finds the now-existing CERTIFIED round normally.
     manager = _get_or_create_epoch_manager()
     return await manager.activate_certified_round(
         body.round_id,
