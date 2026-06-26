@@ -135,11 +135,18 @@ class ValidatorPeerNetwork:
                 if key == me_lower or key in seen:
                     continue
                 seen.add(key)
-                url = (
-                    self._peer_url_transform(p.axon_url)
-                    if self._peer_url_transform is not None
-                    else p.axon_url
-                )
+                # Prefer the peer's advertised public API base (from /identity)
+                # when present — it's the reachable endpoint the operator chose,
+                # which may differ from the daemon axon's host:port (e.g. an API
+                # behind a domain/LB). Otherwise fall back to the axon→API port
+                # transform (or the raw axon when no transform is configured).
+                advertised = getattr(p, "api_url", None)
+                if advertised:
+                    url = advertised
+                elif self._peer_url_transform is not None:
+                    url = self._peer_url_transform(p.axon_url)
+                else:
+                    url = p.axon_url
                 result.append(
                     PeerEndpoint(validator_id=p.evm_address, url=url)
                 )

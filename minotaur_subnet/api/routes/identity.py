@@ -77,9 +77,15 @@ def get_identity() -> dict[str, Any]:
 
     from minotaur_subnet.consensus.identity import sign_identity
 
+    # Advisory public API base (e.g. https://api.example.com). Lets followers
+    # route order-book pulls to a reachable API endpoint distinct from the
+    # daemon axon's host:port. Optional — absent → followers fall back to the
+    # axon→API port transform.
+    api_url = os.environ.get("API_URL", "").strip() or None
     identity = sign_identity(
         _signing_key,
         _metagraph_sync.my_hotkey,
         axon_url,
+        api_url=api_url,
     )
     return identity.to_dict()
