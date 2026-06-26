@@ -1911,18 +1911,31 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
             except ValueError:
                 solver_round_open_seconds = 300.0
+            # Two-phase round defaults: a ~5-min OPEN phase (collect submissions +
+            # build/distribute images; SOLVER_ROUND_OPEN_SECONDS=300) followed by a
+            # ~5-min CLOSED phase to benchmark the champion + the round's submissions
+            # and certify. Benchmarking only starts at close (the round-anchored fork
+            # pin seals on close_epoch), so the closed window must fit the post-close
+            # batch — hence DECISION_EPOCHS=5 (5 epochs x EPOCH_SECONDS). Too small a
+            # value silently aborts contested rounds (certification_deadline_elapsed)
+            # instead of adopting. Leader-driven + broadcast (followers adopt the
+            # leader's decision_deadline_epoch / effective_epoch), so it is the
+            # LEADER's value that governs a round; keep it fleet-uniform across the
+            # rollout so a leadership change doesn't shift the schedule mid-flight.
             try:
                 solver_round_decision_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "1").strip() or "1",
+                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "5").strip() or "5",
                 )
             except ValueError:
-                solver_round_decision_epochs = 1
+                solver_round_decision_epochs = 5
+            # Activate the certified champion one epoch AFTER the decision deadline,
+            # so certification has fully landed before the swap takes effect.
             try:
                 solver_round_activation_delay_epochs = int(
-                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "1").strip() or "1",
+                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "6").strip() or "6",
                 )
             except ValueError:
-                solver_round_activation_delay_epochs = 1
+                solver_round_activation_delay_epochs = 6
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
