@@ -25,6 +25,7 @@ from aiohttp import web
 
 from minotaur_subnet.consensus.leader_wrapper import (
     WrapperPayload,
+    compute_champion_finalize_hash,
     compute_deploy_hash,
     is_wrapper_fresh,
     recover_wrapper_signer,
@@ -514,6 +515,269 @@ class RelayerService:
             "error": submit_result.error,
         })
 
+    async def handle_finalize_champion(self, request: web.Request) -> web.Response:
+        """POST /v1/finalize-champion — attest + squash-merge a certified champion.
+
+        Champion FINALIZATION (the on-chain ``ChampionRegistry.certify()`` tx +
+        the GitHub PR squash-merge) lives HERE, in the trusted relayer that holds
+        ``RELAYER_PRIVATE_KEY`` + ``SOLVER_REPO_TOKEN`` — NOT on the leader, which
+        may be a third party we don't control. The leader asks us to finalize and
+        gates its local adoption on our boolean reply (see
+        ``solver_repo.on_champion_adopted_via_relayer`` + the #326 adoption gate in
+        ``epoch.manager.activate_certified_round``).
+
+        The relayer does NOT trust the leader: it independently re-verifies the
+        validator quorum on the ``ChampionCertificate`` before spending gas /
+        merging — exactly mirroring ``handle_submit_plan``'s security model:
+
+          1. Each approval's EIP-712 signature is verified against the champion
+             DOMAIN_SEPARATOR (``CHAMPION_REGISTRY_964`` on the champion chain).
+          2. Each verified signer must be in the on-chain ``ValidatorRegistry``
+             (the BT-EVM / chain-964 registry the cert was signed against).
+          3. The count of distinct authorized verified signers must meet
+             ``cert.quorum_required`` (and quorum_required >= 1).
+          4. A leader-signed wrapper (over ``round_id + candidate_submission_id``)
+             whose recovered signer is an authorized validator gates the caller
+             (anti-spam; the certificate quorum is the real authority).
+
+        Body shape (see ``solver_repo.on_champion_adopted_via_relayer``):
+
+            {
+              "certificate": <ChampionCertificate.to_dict()>,
+              "submission":  {"submission_id", "commit_hash", "pr_number"},
+              "round_id":    str,
+              "wrapper":     {plan_hash, submission_nonce, timestamp, chain_id},
+              "wrapper_signature": "0x..."
+            }
+
+        FAIL-CLOSED: on quorum miss or ANY error this returns HTTP 200 with
+        ``{"merge_ok": false, "reason": ...}`` and never attests/merges — the
+        leader's #326 gate then aborts the round (``merge_failed``) and the
+        champion is left unchanged. We never 500 the leader.
+        """
+        import types
+
+        from minotaur_subnet.consensus.champion_manager import (
+            ChampionProposal,
+            verify_champion_approval,
+        )
+        from minotaur_subnet.consensus.eip712 import build_domain_separator
+        from minotaur_subnet.harness.round_store import ChampionCertificate
+        from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+
+        try:
+            data = await request.json()
+        except Exception as exc:
+            return web.json_response(
+                {"merge_ok": False, "reason": f"bad JSON: {exc}"}, status=200,
+            )
+
+        try:
+            round_id = str(data.get("round_id") or "").strip()
+            cert = ChampionCertificate.from_dict(data.get("certificate"))
+            if cert is None:
+                return web.json_response(
+                    {"merge_ok": False, "reason": "missing certificate"}, status=200,
+                )
+            if not cert.approvals:
+                return web.json_response(
+                    {"merge_ok": False, "reason": "certificate has no approvals"},
+                    status=200,
+                )
+
+            quorum_required = int(cert.quorum_required or 0)
+            if quorum_required < 1:
+                return web.json_response(
+                    {
+                        "merge_ok": False,
+                        "reason": f"invalid quorum_required {quorum_required} (< 1)",
+                    },
+                    status=200,
+                )
+
+            # ── Champion DOMAIN_SEPARATOR ──────────────────────────────────
+            # Recompute the SAME separator the validators signed with — the
+            # ChampionConsensusManager builds it as build_domain_separator(
+            # champion_chain_id, CHAMPION_REGISTRY_<chain>, "MinotaurChampionConsensus",
+            # "1") (see api/startup.py + consensus/champion_manager.py). Keep this
+            # in lock-step with that wiring.
+            champion_chain_id = int(
+                os.environ.get("CHAMPION_CONSENSUS_CHAIN_ID", "964").strip() or "964"
+            )
+            champion_registry_address = (
+                os.environ.get(f"CHAMPION_REGISTRY_{champion_chain_id}", "").strip()
+                or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
+            )
+            if not champion_registry_address:
+                return web.json_response(
+                    {
+                        "merge_ok": False,
+                        "reason": (
+                            f"no CHAMPION_REGISTRY_{champion_chain_id} configured — "
+                            "cannot recompute champion domain separator"
+                        ),
+                    },
+                    status=200,
+                )
+            domain_separator = build_domain_separator(
+                champion_chain_id,
+                champion_registry_address,
+                name="MinotaurChampionConsensus",
+                version="1",
+            )
+
+            # ── Verify each approval's EIP-712 signature ───────────────────
+            # Distinct signers whose signature verifies against the champion
+            # tuple. One approval per validator counts once.
+            verified_signers: set[str] = set()
+            for ap in cert.approvals:
+                proposal = ChampionProposal(
+                    round_id=ap.round_id,
+                    committee_hash=ap.committee_hash,
+                    incumbent_image_id=ap.incumbent_image_id,
+                    candidate_submission_id=ap.candidate_submission_id or "",
+                    candidate_image_id=ap.candidate_image_id or "",
+                    benchmark_pack_hash=ap.benchmark_pack_hash,
+                    shadow_case_log_hash=ap.shadow_case_log_hash,
+                    effective_epoch=int(ap.effective_epoch or 0),
+                    commit_hash=ap.commit_hash,
+                    nonce=int(ap.nonce or 0),
+                    deadline=int(ap.deadline or 0),
+                )
+                if verify_champion_approval(
+                    ap.validator_id,
+                    ap.signature,
+                    proposal,
+                    domain_separator=domain_separator,
+                ):
+                    verified_signers.add(ap.validator_id.lower())
+
+            # ── Authorized-validator membership (on-chain) ─────────────────
+            # The cert is signed against the BT-EVM (champion-chain) ValidatorRegistry.
+            chain_cfg = self.chains.get(champion_chain_id)
+            if chain_cfg is None or not chain_cfg.validator_registry_address:
+                return web.json_response(
+                    {
+                        "merge_ok": False,
+                        "reason": (
+                            f"no ValidatorRegistry configured on champion chain "
+                            f"{champion_chain_id}"
+                        ),
+                    },
+                    status=200,
+                )
+            try:
+                authorized = _read_authorized_validators(
+                    chain_cfg.rpc_url,
+                    chain_cfg.validator_registry_address,
+                )
+            except Exception as exc:
+                return web.json_response(
+                    {"merge_ok": False, "reason": f"ValidatorRegistry read failed: {exc}"},
+                    status=200,
+                )
+            authorized_lower = {addr.lower() for addr in authorized}
+            authorized_verified = verified_signers & authorized_lower
+
+            # ── Leader wrapper (anti-spam): caller must be a validator ─────
+            # Binds round_id + candidate_submission_id (repurposing the wrapper's
+            # bytes32 plan_hash field, same pattern as compute_deploy_hash). The
+            # certificate quorum below is the real authority.
+            wrapper_data = data.get("wrapper")
+            wrapper_sig = data.get("wrapper_signature")
+            if not wrapper_data or not wrapper_sig:
+                return web.json_response(
+                    {"merge_ok": False, "reason": "missing wrapper or wrapper_signature"},
+                    status=200,
+                )
+            try:
+                wrapper = WrapperPayload(
+                    plan_hash=wrapper_data["plan_hash"],
+                    submission_nonce=int(wrapper_data["submission_nonce"]),
+                    timestamp=int(wrapper_data["timestamp"]),
+                    chain_id=int(wrapper_data["chain_id"]),
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                return web.json_response(
+                    {"merge_ok": False, "reason": f"malformed wrapper: {exc}"},
+                    status=200,
+                )
+            expected_wrapper_hash = compute_champion_finalize_hash(
+                round_id, cert.candidate_submission_id or "",
+            )
+            if wrapper.plan_hash != expected_wrapper_hash:
+                return web.json_response(
+                    {
+                        "merge_ok": False,
+                        "reason": "wrapper plan_hash doesn't bind round+submission",
+                    },
+                    status=200,
+                )
+            ok, err = is_wrapper_fresh(wrapper)
+            if not ok:
+                return web.json_response({"merge_ok": False, "reason": err}, status=200)
+            try:
+                wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
+            except Exception as exc:
+                return web.json_response(
+                    {"merge_ok": False, "reason": f"wrapper sig invalid: {exc}"},
+                    status=200,
+                )
+            if wrapper_signer.lower() not in authorized_lower:
+                return web.json_response(
+                    {
+                        "merge_ok": False,
+                        "reason": (
+                            f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                            f"on champion chain {champion_chain_id}"
+                        ),
+                    },
+                    status=200,
+                )
+
+            # ── Quorum gate (THE authority) ────────────────────────────────
+            if len(authorized_verified) < quorum_required:
+                reason = (
+                    f"quorum not reached: {len(authorized_verified)}/{quorum_required} "
+                    f"authorized verified signers (of {len(authorized)} validators)"
+                )
+                logger.warning("Relayer: finalize-champion REFUSED (%s) round=%s", reason, round_id)
+                return web.json_response(
+                    {"merge_ok": False, "reason": reason, "round_id": round_id},
+                    status=200,
+                )
+
+            # ── Quorum OK → attest on-chain + squash-merge ─────────────────
+            submission_data = data.get("submission") or {}
+            ns = types.SimpleNamespace(
+                submission_id=submission_data.get("submission_id", ""),
+                commit_hash=submission_data.get("commit_hash", ""),
+                pr_number=submission_data.get("pr_number"),
+            )
+            logger.info(
+                "Relayer: finalize-champion accepted (round=%s submission=%s signers=%d/%d "
+                "wrapper-signer=%s) — attesting + merging",
+                round_id,
+                ns.submission_id,
+                len(authorized_verified),
+                quorum_required,
+                wrapper_signer[:10],
+            )
+            merge_ok = bool(on_champion_adopted_pr(ns, round_id, certificate=cert))
+            return web.json_response(
+                {
+                    "merge_ok": merge_ok,
+                    "round_id": round_id,
+                    "submission_id": ns.submission_id,
+                },
+                status=200,
+            )
+        except Exception as exc:
+            logger.exception("Relayer: finalize-champion crashed")
+            return web.json_response(
+                {"merge_ok": False, "reason": f"finalize crashed: {exc}"}, status=200,
+            )
+
     async def handle_deploy(self, request: web.Request) -> web.Response:
         """POST /deploy — deploy an App contract.
 
@@ -711,6 +975,7 @@ def create_app() -> web.Application:
     # /signatures route removed in H3 audit fix; only /v1/submit-plan is
     # the canonical submission path now.
     app.router.add_post("/v1/submit-plan", service.handle_submit_plan)
+    app.router.add_post("/v1/finalize-champion", service.handle_finalize_champion)
     app.router.add_post("/deploy", service.handle_deploy)
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
     app.router.add_get("/gas-balances", service.handle_gas_balances)

@@ -999,6 +999,138 @@ def on_champion_adopted_pr(
     return bool(tx_hash) and merged
 
 
+# ── Relayer-delegated finalization (third-party leader) ──────────────────────
+# When the leader is a third party we don't control, champion FINALIZATION (the
+# on-chain attest + the squash-merge) must run on the TRUSTED relayer that holds
+# RELAYER_PRIVATE_KEY + SOLVER_REPO_TOKEN — not on the leader. The leader calls
+# the relayer's POST /v1/finalize-champion (which re-verifies the validator quorum
+# independently) and gates its local adoption on the boolean reply. This mirrors
+# the on_champion_adopted_pr signature so it drops straight into the #326 gate.
+
+
+def on_champion_adopted_via_relayer(
+    submission: Any,
+    round_id: str | None = None,
+    *,
+    certificate: Any = None,
+) -> bool:
+    """Ask the trusted relayer to finalize a certified champion; return its verdict.
+
+    POSTs the certificate + submission identity to ``{RELAYER_URL}/v1/finalize-champion``.
+    The relayer independently re-verifies the validator quorum, then attests on-chain
+    and squash-merges the miner's PR using ITS OWN keys (the leader never holds them).
+
+    FAIL-CLOSED: any missing config, non-git submission, network error, timeout,
+    non-200, or a ``merge_ok != true`` reply returns False — the #326 adoption gate
+    then aborts the round (``merge_failed``) and the champion is left unchanged. We
+    never adopt on an unconfirmed merge.
+
+    Matches ``on_champion_adopted_pr``'s signature so it slots into the same
+    ``EpochManager.on_champion_adopted`` callback.
+    """
+    import requests
+
+    from minotaur_subnet.consensus.leader_wrapper import (
+        compute_champion_finalize_hash,
+        sign_wrapper,
+    )
+
+    relayer_url = os.environ.get("RELAYER_URL", "").strip()
+    if not relayer_url:
+        logger.error("on_champion_adopted_via_relayer: RELAYER_URL unset — cannot finalize")
+        return False
+
+    commit_hash = getattr(submission, "commit_hash", "") or ""
+    submission_id = getattr(submission, "submission_id", "") or ""
+    if not commit_hash or commit_hash in ("builtin", ""):
+        logger.info(
+            "Skipping relayer finalization for non-git submission: %s", submission_id,
+        )
+        return False
+
+    if certificate is None:
+        logger.error(
+            "on_champion_adopted_via_relayer: no certificate for %s — refusing", submission_id,
+        )
+        return False
+
+    validator_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+    if not validator_key:
+        logger.error(
+            "on_champion_adopted_via_relayer: VALIDATOR_PRIVATE_KEY unset — cannot sign wrapper",
+        )
+        return False
+
+    rid = str(round_id or "")
+    candidate_submission_id = (
+        getattr(certificate, "candidate_submission_id", None) or submission_id or ""
+    )
+    champion_chain_id = int(
+        os.environ.get("CHAMPION_CONSENSUS_CHAIN_ID", "964").strip() or "964"
+    )
+
+    # Anti-spam wrapper: bind round_id + candidate_submission_id (the relayer
+    # recomputes the SAME hash via compute_champion_finalize_hash — keep in sync).
+    finalize_hash = compute_champion_finalize_hash(rid, candidate_submission_id)
+    wrapper, wrapper_sig = sign_wrapper(
+        validator_key,
+        plan_hash=finalize_hash,
+        submission_nonce=int(time.time()),
+        chain_id=champion_chain_id,
+    )
+
+    body = {
+        "certificate": certificate.to_dict(),
+        "submission": {
+            "submission_id": submission_id,
+            "commit_hash": commit_hash,
+            "pr_number": getattr(submission, "pr_number", None),
+        },
+        "round_id": rid,
+        "wrapper": {
+            "plan_hash": wrapper.plan_hash,
+            "submission_nonce": wrapper.submission_nonce,
+            "timestamp": wrapper.timestamp,
+            "chain_id": wrapper.chain_id,
+        },
+        "wrapper_signature": wrapper_sig,
+    }
+
+    url = relayer_url.rstrip("/") + "/v1/finalize-champion"
+    try:
+        # Generous timeout: the on-chain attest (with up to 3 retries) + the
+        # squash-merge can take a while.
+        resp = requests.post(url, json=body, timeout=180)
+    except Exception as exc:
+        logger.error(
+            "on_champion_adopted_via_relayer: POST %s failed (%s) — FAIL-CLOSED (no adopt)",
+            url, exc,
+        )
+        return False
+
+    if resp.status_code != 200:
+        logger.error(
+            "on_champion_adopted_via_relayer: relayer HTTP %s for round=%s — FAIL-CLOSED",
+            resp.status_code, rid,
+        )
+        return False
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        logger.error(
+            "on_champion_adopted_via_relayer: bad JSON reply (%s) — FAIL-CLOSED", exc,
+        )
+        return False
+
+    merge_ok = bool(payload.get("merge_ok"))
+    logger.info(
+        "Champion finalization via relayer: round=%s submission=%s merge_ok=%s reason=%s",
+        rid, submission_id, merge_ok, payload.get("reason"),
+    )
+    return merge_ok
+
+
 # ── Legacy compat ────────────────────────────────────────────────────────────
 # Keep the old function name as an alias so existing imports don't break.
 # It delegates to the new PR-based flow.

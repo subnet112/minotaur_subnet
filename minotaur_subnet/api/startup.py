@@ -2048,11 +2048,30 @@ async def initialize(ctx: ServerContext) -> dict:
                         )
                 else:
                     assert_solver_repo_token_not_admin()  # adoption LIVE → hard-fail if admin
-                _champion_merge_fn = on_champion_adopted_pr
+                # FINALIZATION (attest + squash-merge) is delegated to the trusted
+                # relayer when RELAYER_URL is set — so a third-party leader (which we
+                # don't control + which doesn't hold RELAYER_PRIVATE_KEY/SOLVER_REPO_TOKEN)
+                # asks the relayer to finalize and gates its local adoption on the
+                # relayer's boolean reply (the relayer re-verifies the quorum). Falls
+                # back to the legacy in-process path only when no relayer is wired
+                # (e.g. the local testnet). PR FEEDBACK (reject/finalist comments)
+                # stays on the leader regardless.
+                if os.environ.get("RELAYER_URL", "").strip():
+                    from minotaur_subnet.relayer.solver_repo import (
+                        on_champion_adopted_via_relayer,
+                    )
+                    _champion_merge_fn = on_champion_adopted_via_relayer
+                    logger.info(
+                        "Champion finalization: delegated to relayer at %s",
+                        os.environ.get("RELAYER_URL"),
+                    )
+                else:
+                    _champion_merge_fn = on_champion_adopted_pr  # legacy in-process (no relayer)
+                    logger.info("Champion finalization: in-process (no RELAYER_URL)")
                 _champion_reject_fn = on_champion_rejected_pr
                 _champion_finalist_fn = on_champion_finalist_pr
                 logger.info(
-                    "Champion adoption: on-chain attestation + leader-authority merge (registry=%s, repo=%s)",
+                    "Champion adoption: on-chain attestation + PR merge (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
                     os.environ.get("SOLVER_REPO_URL", "not set"),
                 )
