@@ -632,6 +632,7 @@ class TestSubmissionAPI(unittest.TestCase):
                 "head_sha": "a" * 40,
                 "state": "open",
                 "base": "subnet112/minotaur-solver",
+                "fork_owner": "miner",
             },
         )
         self._pr_patcher.start()
@@ -639,6 +640,15 @@ class TestSubmissionAPI(unittest.TestCase):
         # Import the app after setting the store
         from minotaur_subnet.api.server import app
         self.client = TestClient(app)
+
+        # Register the test miner's GitHub-account↔hotkey binding so the submission
+        # ownership gate accepts PRs whose (mocked) fork owner is "miner".
+        from minotaur_subnet.api.server_context import ctx
+        if getattr(ctx, "store", None) is not None and hasattr(ctx.store, "set_miner_identity"):
+            ctx.store.set_miner_identity(
+                "miner", "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                proof_ref="test", linked_at=0.0,
+            )
 
     def tearDown(self):
         os.environ.pop("SUBMISSIONS_API_KEY", None)
@@ -1184,6 +1194,36 @@ class TestSubmissionAPI(unittest.TestCase):
         created = self.store.get(data["submission_id"])
         self.assertEqual(created.round_id, data["round_id"])
         self.assertEqual(created.epoch, 42)
+
+    def test_create_rejected_when_fork_owner_unregistered(self):
+        # A PR whose fork owner isn't linked to any hotkey is refused (Attack A:
+        # submitting from an account you don't own).
+        with patch(
+            "minotaur_subnet.api.routes.submissions.github_pr.resolve_pr",
+            return_value={
+                "clone_url": "https://github.com/stranger/minotaur-solver.git",
+                "head_sha": "a" * 40, "state": "open",
+                "base": "subnet112/minotaur-solver", "fork_owner": "stranger",
+            },
+        ):
+            resp = self.client.post("/v1/submissions", json={
+                "pr_number": 1, "head_sha": "a" * 40, "epoch": 42,
+                "hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+                "signature": "dGVzdHNpZw==",
+            })
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("not linked", resp.json()["detail"])
+
+    def test_create_rejected_when_fork_owner_bound_to_other_hotkey(self):
+        # "miner" is registered to the setUp hotkey; submitting that fork under a
+        # DIFFERENT hotkey (the copy attack) is refused.
+        resp = self.client.post("/v1/submissions", json={
+            "pr_number": 1, "head_sha": "a" * 40, "epoch": 42,
+            "hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",  # not the bound one
+            "signature": "dGVzdHNpZw==",
+        })
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("different hotkey", resp.json()["detail"])
 
     def test_create_submission_round_id_mismatch_returns_409(self):
         self.round_store.ensure_open_round(opened_epoch=42)
