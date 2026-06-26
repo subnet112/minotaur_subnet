@@ -38,12 +38,12 @@ services:
   # locally so the validator can re-simulate execution plans against the
   # same state the leader saw, without touching mainnet.
   #
-  # On the `minotaur` net ONLY: the validator + api reach the forks here for
-  # re-simulation. The forks are intentionally NOT on the sealed
-  # benchmark-sandbox net — an untrusted benchmark solver on that net must be
-  # able to reach ONLY the block-pin proxy (172.30.0.5), never a raw anvil RPC.
-  # The solver's price-discovery reads go through that proxy (pinned + budgeted);
-  # the simulator's executeIntent stays on these forks via the minotaur net.
+  # Multi-homed onto two networks:
+  #   - minotaur:           the main bridge; validator + api reach forks here
+  #   - benchmark-sandbox:  the internal sealed network; solver containers
+  #                         spawned during reactive benchmarking reach forks
+  #                         here via static IP (since hostnames don't resolve
+  #                         across compose projects when api launches solvers)
   #
   # `tmpfs` on /root and /tmp keep Anvil's writable layer in RAM rather
   # than the container overlay. Reduces but does not eliminate disk
@@ -82,12 +82,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 60s
-    # minotaur ONLY. The anvil forks are deliberately NOT on benchmark-sandbox:
-    # an untrusted solver on that sealed net must reach the deterministic
-    # block-pin proxy (.5) and nothing else. The simulator/api/validator reach
-    # this fork via the minotaur hostname (ANVIL_RPC_URL=http://anvil-base:8546
-    # etc.), so dropping the sandbox attachment does not affect execution.
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.2
 
   anvil-base:
     image: ghcr.io/foundry-rs/foundry:latest
@@ -115,8 +113,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 60s
-    # minotaur ONLY — see anvil-eth. Solver reaches Base state via the pin proxy.
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.3
 
   anvil-btevm:
     image: ghcr.io/foundry-rs/foundry:latest
@@ -144,8 +144,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 90s
-    # minotaur ONLY — see anvil-eth. Solver reaches BT EVM state via the pin proxy.
-    networks: [minotaur]
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.4
 
   # ── Block-pin RPC proxy (deterministic solver reads) ─────────────────
   # NOT a compose service ON PURPOSE. The proxy routes the solver's READS to the
@@ -384,23 +386,11 @@ services:
       # into this sealed network so they can't reach the internet but
       # can hit the local anvils for price discovery.
       BENCHMARK_DOCKER_NETWORK: "benchmark-sandbox"
-      # .5 (the block-pin proxy) is the ONLY host the solver can reach on the
-      # sealed benchmark-sandbox net. The .2/.3/.4 anvils have been removed from
-      # this net (see the anvil services above) so a malicious solver can no
-      # longer dial a fork directly to call anvil_setStorageAt or read off the
-      # pin+budget. The honest solver's reads go proxy → upstream archive at the
-      # round fork block (via init_config rpc_urls, set per-run by run_benchmark).
-      # The simulator's executeIntent still reaches the anvils on the minotaur net
-      # (ANVIL_RPC_URL=http://anvil-base:8546 above) — unaffected.
-      #
-      # BENCHMARK_ANVIL_RPC_* are KEPT pointing at the now-DEAD anvil sandbox IPs
-      # on purpose. start_docker writes these into the solver's container env
-      # (ANVIL_RPC_URL/BASE_RPC_URL/BITTENSOR_EVM_RPC_URL, a backward-compat path);
-      # with the anvils gone from the sandbox these resolve to UNREACHABLE IPs — a
-      # dead end, never a live fork. Do NOT unset them: BASE_RPC_URL would then
-      # fall back to the upstream ARCHIVE url (which carries the provider API key)
-      # and leak it into the untrusted solver's env. A dead IP beats a leaked key.
-      BENCHMARK_ALLOWED_HOSTS: "172.30.0.5"
+      # .5 is the block-pin proxy (the solver's read path); the .2/.3/.4 anvils
+      # stay reachable for the simulator's executeIntent. (Dropping the anvils
+      # here to force the solver onto ONLY the proxy is a follow-up hardening —
+      # an honest solver already reads via init_config's rpc_urls = the proxy.)
+      BENCHMARK_ALLOWED_HOSTS: "172.30.0.2,172.30.0.3,172.30.0.4,172.30.0.5"
       BENCHMARK_ANVIL_RPC_ETH: "http://172.30.0.2:8545"
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
@@ -615,33 +605,26 @@ networks:
   # reactive champion verification. `internal: true` removes the Docker-
   # installed MASQUERADE rule, so containers attached only to this
   # network cannot egress to the internet, the host, or other Docker
-  # networks.
-  #
-  # The ONLY non-solver endpoint on this net is the api-launched block-pin
-  # proxy at 172.30.0.5:8645 (see read_proxy_manager.py). The three anvil
-  # forks are deliberately NOT attached here (they live on `minotaur` only),
-  # so an untrusted solver can reach the proxy and nothing else — it has no
-  # route to a raw anvil RPC at all.
+  # networks. The three anvils are multi-homed onto this network with
+  # static IPs (.2, .3, .4) so solvers can still reach them for price
+  # discovery, but nothing else.
   #
   # PR-7 / audit C4 defense-in-depth NOTE FOR OPERATORS:
   #   Anvil exposes the `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC
   #   namespaces unauthenticated by design — anvil has no flag to
-  #   disable them. Keeping the anvils OFF this sealed network is the
-  #   primary containment: a solver simply cannot dial them. The block-pin
-  #   proxy is read-only by contract — it REJECTS anvil_*/evm_*/hardhat_*/
-  #   ots_* and all state-changing methods (rpc_budget_proxy/rewrite_table.py)
-  #   on every PINNED chain — so even the one reachable endpoint cannot be
-  #   used to mutate fork state. (Caveat: rejection is applied per pinned
-  #   chain; a routed chain with no pin forwards transparently. Today the
-  #   proxy's upstreams are live ARCHIVE RPCs, not the anvils, so a write
-  #   there cannot poison a fork the simulator re-reads — but see the
-  #   eth/btevm handling in the api env block before routing more chains.)
+  #   disable them. A malicious solver container reaching the anvils
+  #   on this network CAN call `anvil_setBalance` /
+  #   `anvil_setStorageAt` to bias its own benchmark or attempt to
+  #   poison fork state that the validator later re-reads. The
+  #   application-layer boundary that contains this is in
+  #   minotaur_subnet/simulator/anvil_simulator.py:
   #
-  #   The application-layer boundary that backstops the simulator's own
-  #   executeIntent fork (minotaur_subnet/simulator/anvil_simulator.py) is
-  #   unchanged: per-simulation evm_snapshot + evm_revert, a startup baseline
-  #   snapshot (SimulatorStateError on revert failure), and a periodic
-  #   _assert_baseline_alive() probe that forces a re-fork on mismatch.
+  #     - per-simulation evm_snapshot + evm_revert wrap every
+  #       AnvilSimulator.simulate() call;
+  #     - a startup "baseline" snapshot lets us recover if a per-sim
+  #       revert fails (raises SimulatorStateError);
+  #     - a periodic _assert_baseline_alive() probe reads a stable
+  #       storage slot and forces a re-fork (or raises) on mismatch.
   #
   #   If you suspect a fork has been poisoned despite the above:
   #     docker compose restart anvil-eth anvil-base anvil-btevm

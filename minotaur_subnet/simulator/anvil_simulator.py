@@ -4,16 +4,14 @@ Uses snapshot/revert for isolation: each simulate() call leaves no
 lasting state changes on the fork.
 
 Defense-in-depth note (PR-7, audit finding C4):
-  PRIMARY containment is now at the NETWORK layer: the anvil forks live
-  ONLY on the `minotaur` net (the validator/simulator execution path) and
-  are NO LONGER on the sealed `benchmark-sandbox` net. An untrusted
-  benchmark solver on that net can reach only the read-only block-pin proxy
-  (172.30.0.5), never a raw anvil RPC — so it cannot call the unauthenticated
-  `anvil_*` / `hardhat_*` / `evm_*` cheat-code namespace (which anvil has no
-  flag to disable) to bias its own benchmark or poison fork state the
-  validator later re-reads. This baseline/probe boundary below is retained as
-  a backstop for an IN-PROCESS state change (a simulation whose revert
-  silently failed), not for a direct external attacker — which is now cut off.
+  The three anvil containers are multi-homed onto the benchmark-sandbox
+  network so reactive-benchmark solver containers can reach them on
+  static IPs. The anvil `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC
+  namespaces are unauthenticated by design (anvil has no flag to
+  disable them) — a malicious solver can call `anvil_setBalance` /
+  `anvil_setStorageAt` to bias its own benchmark or poison fork state
+  that the validator daemon later re-reads when re-simulating an
+  unrelated honest proposal.
 
   Our boundary: snapshot at startup ("baseline"), snapshot again per
   simulation, revert in a finally. If a revert fails, the baseline
@@ -54,12 +52,12 @@ logger = logging.getLogger(__name__)
 class SimulatorStateError(RuntimeError):
     """Raised when the anvil fork's baseline state cannot be restored.
 
-    Indicates state poisoning detected alongside a failed snapshot/revert
-    recovery. With the anvils now off the benchmark-sandbox net, an untrusted
-    solver can no longer reach the cheat-code namespace directly, so this most
-    likely means an IN-PROCESS state change whose revert silently failed.
-    Callers should treat it as a hard failure — the fork must be recycled
-    (container restart) before further simulations can be trusted.
+    Indicates likely state poisoning by an attacker who reached the
+    unauthenticated anvil cheat-code namespace (e.g., a malicious solver
+    container reachable on the benchmark-sandbox network), AND that our
+    snapshot/revert recovery failed. Callers should treat this as a
+    hard failure — the fork must be recycled (container restart) before
+    further simulations can be trusted.
     """
 
 
@@ -221,11 +219,11 @@ class AnvilSimulator:
             )
 
         # PR-7: cheap periodic probe of a known-stable storage slot. Catches
-        # out-of-band state mutation. With the anvils now network-isolated from
-        # the solver sandbox, the realistic source is an in-process state change
-        # whose revert silently failed (not a direct external attacker). Raises
-        # SimulatorStateError on poisoning evidence with no upstream to re-fork
-        # from; surfaces as a failed simulation rather than a silently wrong score.
+        # out-of-band state mutation from the unauthenticated anvil cheat-
+        # code namespace reachable on benchmark-sandbox. Raises
+        # SimulatorStateError on poisoning evidence with no upstream to
+        # re-fork from; surfaces as a failed simulation rather than a
+        # silently wrong score.
         try:
             self._assert_baseline_alive()
         except SimulatorStateError as exc:
@@ -770,10 +768,10 @@ class AnvilSimulator:
     # Reads storage slot 0 of the zero address (cheap, stable, never
     # written to in any well-known protocol). If a later read disagrees
     # with the value captured at baseline time, the fork has been
-    # mutated OUTSIDE our snapshot/revert window — now almost certainly a
-    # state change inside a simulation whose revert silently failed without
-    # raising (a direct cheat-code RPC from a solver is cut off at the network
-    # layer — anvils are off the benchmark-sandbox net). Treat as poisoning.
+    # mutated OUTSIDE our snapshot/revert window — i.e., either via a
+    # direct cheat-code RPC call from an attacker on benchmark-sandbox,
+    # or via a state change inside a simulation whose revert silently
+    # failed without raising. Either way, treat as poisoning evidence.
 
     # A well-known stable slot: storage[0] of address(0). The zero
     # address has no code and no canonical mutator; we expect this
