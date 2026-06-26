@@ -87,6 +87,7 @@ def build_submission_report(
                     "passed": js is not None and js >= threshold,
                     "had_plan": pi.get("has_plan"),
                     "error": pi.get("error"),
+                    "revert_reason": pi.get("revert_reason"),
                     "mock_sim": pi.get("mock_simulation", False),
                 },
             }

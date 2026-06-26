@@ -149,6 +149,47 @@ services:
       benchmark-sandbox:
         ipv4_address: 172.30.0.4
 
+  # ── Block-pin RPC proxy (deterministic solver reads) ─────────────────
+  # The solver's READS (pool discovery + quoting) route through this proxy to
+  # the validator's own upstream archive RPC, FORCED to the round's canonical
+  # fork block. A quote is then ONE upstream round-trip (~30ms, evaluated against
+  # the provider's archive) instead of the Anvil fork lazily fetching every cold
+  # storage slot (~15-30s on a cold multi-hop) — and every validator reads the
+  # SAME pinned state, deterministically on ANY compliant archive provider. The
+  # simulator's EXECUTION (scoreIntent) stays on the Anvil forks above.
+  #
+  # SELF-ACTIVATING — no operator config: reuses the validator image (the proxy
+  # is a module in it), the upstream RPCs you already set (UPSTREAMS), and the
+  # SOLVER_ROUND_INTERNAL_API_KEY you already set (as the control token that
+  # guards /control from the untrusted solver, which shares the data-plane port).
+  # Multi-homed like the anvils: `minotaur` for egress to the upstream + the api's
+  # control plane; `benchmark-sandbox` (static .5) for the solver's data plane.
+  rpc-pin-proxy:
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    # Image entrypoint is `python`; override to launch the proxy module.
+    entrypoint: ["python", "-m", "minotaur_subnet.harness.rpc_budget_proxy.proxy"]
+    environment:
+      UPSTREAMS: "eth=${ETH_UPSTREAM_RPC_URL},base=${BASE_UPSTREAM_RPC_URL},btevm=${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      LISTEN_PORT: "8645"
+      # /control shares the data-plane port the untrusted solver reaches, so it
+      # MUST require a secret. Reuse the existing required key (no new secret to
+      # manage); the api sends the same value as SOLVER_READ_PROXY_TOKEN.
+      CONTROL_TOKEN: "${SOLVER_ROUND_INTERNAL_API_KEY:?SOLVER_ROUND_INTERNAL_API_KEY is required}"
+      LOG_LEVEL: "INFO"
+    networks:
+      minotaur: {}
+      benchmark-sandbox:
+        ipv4_address: 172.30.0.5
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('127.0.0.1',8645),timeout=5).close()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
   # ── Validator daemon ─────────────────────────────────────────────────
   # Order-consensus follower role: receives proposals from the current
   # leader, re-simulates them on the local Anvil forks, signs approvals
@@ -299,6 +340,8 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+      rpc-pin-proxy:
+        condition: service_healthy
     environment:
       # Same Bittensor identity as the validator daemon — both processes
       # use the same hotkey + EVM signing key.
@@ -369,10 +412,26 @@ services:
       # into this sealed network so they can't reach the internet but
       # can hit the local anvils for price discovery.
       BENCHMARK_DOCKER_NETWORK: "benchmark-sandbox"
-      BENCHMARK_ALLOWED_HOSTS: "172.30.0.2,172.30.0.3,172.30.0.4"
+      # .5 is the block-pin proxy (the solver's read path); the .2/.3/.4 anvils
+      # stay reachable for the simulator's executeIntent. (Dropping the anvils
+      # here to force the solver onto ONLY the proxy is a follow-up hardening —
+      # an honest solver already reads via init_config's rpc_urls = the proxy.)
+      BENCHMARK_ALLOWED_HOSTS: "172.30.0.2,172.30.0.3,172.30.0.4,172.30.0.5"
       BENCHMARK_ANVIL_RPC_ETH: "http://172.30.0.2:8545"
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
+
+      # Block-pin RPC proxy (the rpc-pin-proxy sidecar) — the solver's reads route
+      # here, pinned to the round fork block (deterministic, ~30ms). Activates
+      # automatically. Data-plane URL = the proxy's static sandbox IP (the solver
+      # dials it on benchmark-sandbox); control-plane URL = the service name (the
+      # api dials it on minotaur). The token matches the proxy's CONTROL_TOKEN.
+      # The budget + rewrite-table are uniform CODE constants (not env) — every
+      # validator folds the SAME value into benchmark_pack_hash.
+      SOLVER_READ_PROXY: "http://172.30.0.5:8645"
+      SOLVER_READ_PROXY_CONTROL: "http://rpc-pin-proxy:8645"
+      SOLVER_READ_PROXY_CHAINS: "8453"
+      SOLVER_READ_PROXY_TOKEN: "${SOLVER_ROUND_INTERNAL_API_KEY}"
 
       # Determinism — the production mechanism is AUTOMATIC and per-round, and
       # is now ON BY DEFAULT IN CODE (shipped via :stable). Every validator

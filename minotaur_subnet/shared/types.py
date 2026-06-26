@@ -452,6 +452,10 @@ class SimulationResult:
     success: bool
     gas_used: int = 0
     error: str | None = None
+    # Decoded on-chain revert reason (Error(string)/Panic/custom error) when a
+    # real simulation reverts — surfaced in the benchmark report + dry-run so a
+    # miner can see WHY their plan failed without running their own node.
+    revert_reason: str | None = None
     token_transfers: list[TokenTransfer] = field(default_factory=list)
     state_changes: list[dict[str, Any]] = field(default_factory=list)
     approval_changes: list[dict[str, Any]] = field(default_factory=list)
