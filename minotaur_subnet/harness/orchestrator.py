@@ -129,6 +129,41 @@ def require_real_sim_default() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _revert_trace_budget() -> int:
+    """How many reverted cases per run to capture a per-step trace for.
+
+    Re-executing the plan for a trace is pure diagnostics (never touches the
+    score or the pack hash), but it is extra work on the scoring path — so it's
+    bounded per run and disableable. ``BENCHMARK_REVERT_TRACE_MAX=0`` turns it
+    off; default 10.
+    """
+    raw = os.environ.get("BENCHMARK_REVERT_TRACE_MAX", "10").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 10
+
+
+def _capture_revert_trace(
+    simulator: Any, plan: Any, token_balances: dict[str, int] | None,
+) -> dict[str, Any] | None:
+    """Best-effort per-step interaction trace for a reverted plan. Never raises.
+
+    Mirrors the local-testnet replay path: resolves the per-chain AnvilSimulator
+    from a MultiChainSimulator and calls its ``simulate_with_trace``.
+    """
+    try:
+        sim = simulator._get_simulator(plan) if hasattr(simulator, "_get_simulator") else simulator
+        runner = getattr(sim, "simulate_with_trace", None)
+        if runner is None:
+            return None
+        trace = runner(plan, token_balances=token_balances or {})
+        return trace if isinstance(trace, dict) else None
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never break scoring
+        logger.debug("revert trace capture failed: %s", exc)
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          SOLVER SESSION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -149,6 +184,9 @@ class BenchmarkResult:
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
+    # Per-step interaction trace ({interactions, total_gas, summary}) captured on
+    # a real-sim revert — pure diagnostics for the miner; never feeds the score.
+    revert_trace: dict[str, Any] | None = None
 
 
 # Type alias for the scoring callback
@@ -1025,6 +1063,9 @@ async def run_benchmark(
     # already bounds it; this restores the absolute ceiling the old per-session
     # cap provided before respawn existed).
     run_start = time.monotonic()
+    # Per-run budget for diagnostic revert traces (0 disables). Decremented as
+    # reverted cases are traced; bounds the extra scoring-path work.
+    trace_budget = _revert_trace_budget()
 
     async def _respawn_session() -> bool:
         """Restart + re-init the solver for the next scenario.
@@ -1222,6 +1263,14 @@ async def run_benchmark(
                                 )
                                 br.error = f"real_sim_reverted: {sim.error}"
                                 br.revert_reason = getattr(sim, "revert_reason", None)
+                                # Diagnostics only: capture a per-step trace so the
+                                # miner sees WHICH call reverted. Bounded per run;
+                                # never affects the score.
+                                if trace_budget > 0:
+                                    tr = _capture_revert_trace(simulator, plan, token_balances)
+                                    if tr is not None:
+                                        br.revert_trace = tr
+                                        trace_budget -= 1
                                 fail_closed_miss = True
                         except Exception as sim_exc:
                             if require_real_sim:
