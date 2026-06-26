@@ -319,9 +319,37 @@ class ValidateAppRequest(BaseModel):
 
 class UpdateScoringRequest(BaseModel):
     new_js_code: str = Field(..., description="New JavaScript scoring source")
-    caller: str = Field("", description="Caller address (must match deployer if one was set at creation)")
-    signature: str = Field("", description="EIP-191 signature proving caller owns the deployer address. "
-                           "Message = keccak256(abi.encode(app_id, sha256(new_js_code)))")
+    caller: str = Field("", description="Deprecated, ignored. Authorization is by `signature`.")
+    signature: str = Field("", description="EIP-712 developer-auth signature from the app's deployer "
+                           "(required if a deployer was set). Binds action=update_scoring, app_id, "
+                           "keccak(new_js_code), nonce, deadline.")
+    nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce). "
+                       "Must equal last_consumed + 1; consumed once on success.")
+    deadline: int = Field(0, description="Unix-seconds expiry the signature was signed with.")
+
+
+class DeployRequest(BaseModel):
+    """Optional body for POST /apps/{id}/deploy. When the payment fields are set,
+    the deploy is treated as payment-backed (a public/3rd-party deploy) and
+    authorized via the deployer's EIP-712 pay_deploy_fee signature + on-chain
+    payment proof. Omit the body entirely for an operator/admin deploy."""
+    payment_ref: str = Field("", description="On-chain payment reference (e.g. tx hash) for the deploy fee.")
+    payment_nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce).")
+    payment_deadline: int = Field(0, description="Unix-seconds expiry the pay_deploy_fee signature was signed with.")
+    payment_signature: str = Field("", description="EIP-712 pay_deploy_fee signature from the app's deployer, binding "
+                                   "(app_id, payment_ref, chain_id, amount).")
+
+
+class LinkSS58Request(BaseModel):
+    """Dual-signed link of the app's EVM deployer to a Bittensor SS58 coldkey.
+    Both signatures are required (see api/services/developer_link)."""
+    ss58: str = Field(..., description="The Bittensor SS58 coldkey to link as the app's payer.")
+    nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce).")
+    deadline: int = Field(0, description="Unix-seconds expiry the EVM link_ss58 signature was signed with.")
+    evm_signature: str = Field(..., description="EIP-712 link_ss58 signature from the EVM deployer, binding "
+                               "(app_id, ss58, nonce, deadline).")
+    ss58_signature: str = Field(..., description="Substrate signature by the coldkey over "
+                                "'MinotaurLinkSS58:{app_id}:{deployer_lower}:{nonce}' (hex).")
 
 
 class ScorePlanRequest(BaseModel):
@@ -409,6 +437,7 @@ async def validate_app(
 async def deploy_app(
     app_id: str,
     chain_id: int | None = None,
+    body: DeployRequest | None = None,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
 
@@ -418,18 +447,37 @@ async def deploy_app(
     the deployed contract still can't execute orders (AppRegistry gate
     is GATED + allowlist) but the gas burn is real.
 
+    With a payment body, the deploy is authorized via the deployer's EIP-712
+    pay_deploy_fee signature + on-chain payment proof instead of admin privilege
+    (the shape the public deploy API will use). It still can't succeed until
+    collection is live — the #238 gate and the (default-off) payment verifier
+    keep it closed — so the fee stays unbypassable.
+
     Runs in a thread executor so the synchronous compile + deploy chain
     can call asyncio.run() without conflicting with the FastAPI event loop.
     """
     import asyncio
     loop = asyncio.get_running_loop()
-    # Admin route -> is_admin=True: deploys free, as today. The #238 deploy-fee /
-    # public-deployment gate only bites a non-admin (public) caller, which has no
-    # route yet — this keeps the fee unbypassable when the public API lands.
+
+    payment = None
+    if body is not None and (body.payment_signature or body.payment_ref):
+        from minotaur_subnet.api.services.deploy_payment import DeployFeePayment
+        payment = DeployFeePayment(
+            payment_ref=body.payment_ref,
+            nonce=body.payment_nonce,
+            deadline=body.payment_deadline,
+            signature=body.payment_signature,
+        )
+
+    # No payment claim → operator/admin deploy (is_admin=True, free, as today).
+    # Payment claim → public/3rd-party deploy: deploy_app_intent flips to
+    # is_admin=False and authorizes via the fee payment.
     return await loop.run_in_executor(
         None,
         lambda: _tools.deploy_app_intent(
-            _store(), app_id, chain_id=chain_id, is_admin=True,
+            _store(), app_id, chain_id=chain_id,
+            is_admin=(payment is None),
+            payment=payment,
         ),
     )
 
@@ -490,7 +538,65 @@ def update_scoring(
         _store(), app_id, body.new_js_code,
         caller=body.caller,
         signature=body.signature,
+        nonce=body.nonce,
+        deadline=body.deadline,
     )
+
+
+@router.get("/apps/{app_id}/auth-nonce")
+def get_auth_nonce(app_id: str, deployer: str = "") -> dict[str, Any]:
+    """Next developer-auth nonce to sign for owner-gated actions on this app.
+
+    The deployer reads this, signs an EIP-712 developer-auth message with
+    ``nonce = next_nonce``, and submits it (e.g. to ``PUT .../scoring``). Public
+    read — the nonce is a non-secret monotonic counter, like an account nonce.
+    """
+    s = _store()
+    definition = s.get_app(app_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
+    dep = (deployer or definition.deployer or "").strip()
+    if not dep:
+        raise HTTPException(
+            status_code=400,
+            detail="App has no deployer; owner-gated actions need no signature",
+        )
+    current = s.get_developer_nonce(app_id, dep.lower())
+    return {"app_id": app_id, "deployer": dep, "next_nonce": current + 1}
+
+
+@router.post("/apps/{app_id}/link-ss58", dependencies=[Depends(_require_admin)])
+def link_ss58(app_id: str, body: LinkSS58Request) -> dict[str, Any]:
+    """Link the app's EVM deployer to a Bittensor SS58 coldkey (dual-signed).
+
+    Requires BOTH the deployer's EIP-712 link_ss58 signature AND the coldkey's
+    substrate signature (see api/services/developer_link). The linked coldkey is
+    what a future finney deploy-fee verifier checks the payment came from.
+    """
+    from minotaur_subnet.api.services.developer_link import link_payer_ss58
+
+    ok, err = link_payer_ss58(
+        _store(), app_id, body.ss58,
+        nonce=body.nonce, deadline=body.deadline,
+        evm_signature=body.evm_signature, ss58_signature=body.ss58_signature,
+    )
+    if not ok:
+        return {"error": f"Link failed: {err}"}
+    return {"app_id": app_id, "payer_ss58": body.ss58, "status": "linked"}
+
+
+@router.get("/apps/{app_id}/payer-ss58")
+def get_payer_ss58(app_id: str) -> dict[str, Any]:
+    """The Bittensor coldkey linked to this app's deployer ("" if unlinked)."""
+    s = _store()
+    definition = s.get_app(app_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
+    return {
+        "app_id": app_id,
+        "deployer": definition.deployer,
+        "payer_ss58": s.get_payer_ss58(app_id),
+    }
 
 
 @router.get("/apps/{app_id}/manifest")

@@ -321,6 +321,15 @@ class AppIntentStore:
                     permission_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS native_executions(
                     execution_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS developer_nonces(
+                    app_id TEXT NOT NULL, deployer TEXT NOT NULL,
+                    nonce INTEGER NOT NULL, PRIMARY KEY(app_id, deployer));
+                CREATE TABLE IF NOT EXISTS developer_links(
+                    app_id TEXT PRIMARY KEY, evm_deployer TEXT NOT NULL,
+                    ss58 TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS consumed_payments(
+                    payment_ref TEXT PRIMARY KEY, app_id TEXT NOT NULL,
+                    consumed_at REAL);
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
                 """
@@ -467,6 +476,120 @@ class AppIntentStore:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM apps WHERE app_id=?", (app_id,))
             return cur.rowcount > 0
+
+    # ── developer-auth nonces ─────────────────────────────────────────────
+    #
+    # Monotonic, single-use nonces for EIP-712 developer authorizations (see
+    # ``api/services/developer_auth``). One counter per ``(app_id, deployer)``;
+    # the last *consumed* value is stored, so the next valid nonce is +1.
+
+    def get_developer_nonce(self, app_id: str, deployer: str) -> int:
+        """Last consumed developer-auth nonce for ``(app, deployer)`` (0 if none).
+
+        The next nonce a signer should use is this value + 1.
+        """
+        dep = (deployer or "").strip().lower()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT nonce FROM developer_nonces WHERE app_id=? AND deployer=?",
+                (app_id, dep),
+            ).fetchone()
+        return int(row["nonce"]) if row else 0
+
+    def consume_developer_nonce(
+        self, app_id: str, deployer: str, nonce: int,
+    ) -> tuple[bool, str]:
+        """Atomically consume ``nonce`` for ``(app, deployer)``.
+
+        Valid iff ``nonce == last_consumed + 1``; on success the counter
+        advances. Serialized via ``BEGIN IMMEDIATE`` so two concurrent requests
+        can never both consume the same nonce (replay protection). Returns
+        ``(ok, error)``.
+        """
+        dep = (deployer or "").strip().lower()
+        try:
+            n = int(nonce)
+        except (TypeError, ValueError):
+            return False, f"invalid nonce: {nonce!r}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT nonce FROM developer_nonces WHERE app_id=? AND deployer=?",
+                    (app_id, dep),
+                ).fetchone()
+                current = int(row["nonce"]) if row else 0
+                expected = current + 1
+                if n != expected:
+                    conn.execute("ROLLBACK")
+                    return False, f"bad nonce: got {n}, expected {expected}"
+                conn.execute(
+                    "INSERT INTO developer_nonces(app_id, deployer, nonce) VALUES(?,?,?) "
+                    "ON CONFLICT(app_id, deployer) DO UPDATE SET nonce=excluded.nonce",
+                    (app_id, dep, n),
+                )
+                conn.execute("COMMIT")
+                return True, ""
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    # ── developer EVM↔SS58 links ──────────────────────────────────────────
+    #
+    # The coldkey SS58 bound to an app's EVM deployer (see
+    # ``api/services/developer_link``). One link per app; ``evm_deployer``
+    # records which EVM address authorized it (for audit / re-link detection).
+
+    def get_payer_ss58(self, app_id: str) -> str:
+        """The SS58 coldkey linked to ``app_id``'s deployer, or "" if none."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ss58 FROM developer_links WHERE app_id=?", (app_id,)
+            ).fetchone()
+        return str(row["ss58"]) if row else ""
+
+    def set_payer_ss58(self, app_id: str, evm_deployer: str, ss58: str) -> None:
+        """Record (or replace) the deployer↔coldkey link for ``app_id``."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO developer_links(app_id, evm_deployer, ss58) VALUES(?,?,?) "
+                "ON CONFLICT(app_id) DO UPDATE SET "
+                "evm_deployer=excluded.evm_deployer, ss58=excluded.ss58",
+                (app_id, (evm_deployer or "").strip().lower(), ss58),
+            )
+
+    # ── consumed deploy-fee payments ──────────────────────────────────────
+    #
+    # One on-chain payment authorizes exactly one deploy. The payment verifier
+    # consumes the payment reference here after confirming it on-chain.
+
+    def consume_payment_ref(self, payment_ref: str, app_id: str) -> tuple[bool, str]:
+        """Atomically mark ``payment_ref`` spent. Rejects if already consumed,
+        so a single payment can't authorize a second deploy. Serialized via
+        ``BEGIN IMMEDIATE``. Returns ``(ok, error)``.
+        """
+        ref = (payment_ref or "").strip()
+        if not ref:
+            return False, "payment_ref is required"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT app_id FROM consumed_payments WHERE payment_ref=?", (ref,)
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("ROLLBACK")
+                    return False, "payment already used for a deploy"
+                conn.execute(
+                    "INSERT INTO consumed_payments(payment_ref, app_id, consumed_at) "
+                    "VALUES(?,?,?)",
+                    (ref, app_id, time.time()),
+                )
+                conn.execute("COMMIT")
+                return True, ""
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # ── wallets ──────────────────────────────────────────────────────────
 

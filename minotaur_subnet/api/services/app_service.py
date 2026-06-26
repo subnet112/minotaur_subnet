@@ -7,7 +7,6 @@ get_app_manifest, list_app_manifests.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import asdict
 from typing import Any
 
@@ -210,6 +209,7 @@ def deploy_app_intent(
     *,
     is_admin: bool = True,
     fee_paid: bool = False,
+    payment: Any = None,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain.
 
@@ -226,7 +226,11 @@ def deploy_app_intent(
                   3rd-party deploy passes False and is gated by the #238 deploy-fee
                   / public-deployment check below.
         fee_paid: Whether the #238 deploy fee was collected (only meaningful for a
-                  public deploy; collection is not wired yet, so always False there).
+                  public deploy). Computed from ``payment`` when one is supplied.
+        payment:  Optional ``deploy_payment.DeployFeePayment``. When supplied, the
+                  deploy is treated as payment-backed (``is_admin=False``) and
+                  authorized via the deployer's EIP-712 ``pay_deploy_fee``
+                  signature + on-chain payment proof. ``None`` → admin deploy.
 
     Returns:
         DeploymentResult dict with status, contract address, and js_code_hash.
@@ -240,18 +244,20 @@ def deploy_app_intent(
     if not app_id:
         return {"error": "app_id is required"}
 
-    # Hard gate (#238): admin deploys pass; a public/3rd-party deploy is refused
-    # until public deployment is enabled AND the deploy fee is collected.
-    try:
-        require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
-    except DeploymentFeeRequired as exc:
-        return {"error": str(exc), "deploy_fee_required": True}
+    # Hard gate (#238) for the no-payment case: admin deploys pass; a public
+    # deploy with no payment claim is refused here, BEFORE any store lookup, so
+    # an unauthorized public caller does zero work (and a bare store is fine).
+    if payment is None:
+        try:
+            require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
+        except DeploymentFeeRequired as exc:
+            return {"error": str(exc), "deploy_fee_required": True}
 
     definition = store.get_app(app_id)
     if definition is None:
         return {"error": f"App not found: {app_id}"}
 
-    # Resolve target chain
+    # Resolve target chain (a payment authorization binds the chain it paid for).
     supported = definition.config.supported_chains
     if not supported:
         return {"error": "App has no supported_chains configured"}
@@ -264,6 +270,20 @@ def deploy_app_intent(
                 f"{supported}"
             ),
         }
+
+    # A payment-backed deploy (a payment claim is supplied) is a public/3rd-party
+    # deploy: authorize it via the deployer's EIP-712 pay_deploy_fee signature +
+    # on-chain payment proof. verify_deploy_fee_payment IS the #238 gate for this
+    # path — it enforces public_deployment_enabled() and only succeeds once the
+    # fee is confirmed, consuming the nonce. No claim → admin deploy (free).
+    if payment is not None:
+        from minotaur_subnet.api.services.deploy_payment import verify_deploy_fee_payment
+
+        ok, fee_err = verify_deploy_fee_payment(
+            store, definition, chain_id=chain_id, payment=payment,
+        )
+        if not ok:
+            return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
 
     # Check not already deployed on this chain
     existing = store.get_deployment(app_id, chain_id=chain_id)
@@ -463,52 +483,14 @@ def get_app_status(
     }
 
 
-def _verify_scoring_update_signature(
-    app_id: str,
-    new_js_code: str,
-    signature: str,
-    expected_deployer: str,
-) -> tuple[bool, str]:
-    """Verify EIP-191 signature for a scoring update request.
-
-    The signed message is keccak256(abi.encode(app_id, sha256(new_js_code))).
-    Returns (ok, error_message).
-    """
-    try:
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
-        from eth_abi import encode as abi_encode
-        from web3 import Web3
-    except ImportError as exc:
-        logger.warning("Signature verification deps missing: %s", exc)
-        return False, f"Server missing dependency for signature verification: {exc}"
-
-    js_code_hash = hashlib.sha256(new_js_code.encode()).hexdigest()
-    # abi.encode(string, string) -- keccak256 of that gives the message
-    encoded = abi_encode(["string", "string"], [app_id, js_code_hash])
-    message_hash = Web3.keccak(encoded)
-
-    # Sign over the raw 32-byte hash using EIP-191 personal sign
-    signable = encode_defunct(primitive=message_hash)
-    try:
-        recovered = Account.recover_message(signable, signature=signature)
-    except Exception as exc:
-        return False, f"Signature recovery failed: {exc}"
-
-    if recovered.lower() != expected_deployer.strip().lower():
-        return False, (
-            f"Signature mismatch: recovered {recovered.lower()}, "
-            f"expected deployer {expected_deployer.strip().lower()}"
-        )
-    return True, ""
-
-
 def update_scoring(
     store: AppIntentStore,
     app_id: str,
     new_js_code: str,
     caller: str = "",
     signature: str = "",
+    nonce: int = 0,
+    deadline: int = 0,
 ) -> dict[str, Any]:
     """Update the JS scoring code for an existing App Intent.
 
@@ -518,11 +500,14 @@ def update_scoring(
     Args:
         app_id:      The app whose scoring to update.
         new_js_code: New JavaScript scoring source code.
-        caller:      Address of the caller. Must match the app's deployer
-                     (if one was set at creation time).
-        signature:   EIP-191 signature proving the caller owns the deployer
-                     address. Message = keccak256(abi.encode(app_id, sha256(new_js_code))).
-                     Optional for backward compatibility but strongly recommended.
+        caller:      Deprecated, ignored. Authorization is by ``signature`` only.
+        signature:   EIP-712 developer-auth signature from the app's deployer
+                     (see ``developer_auth``). Required when a deployer is set.
+                     Binds (action="update_scoring", app_id, keccak(new_js_code),
+                     nonce, deadline); the nonce is consumed once on success.
+        nonce:       The deployer's next developer-auth nonce (read from
+                     ``GET /apps/{id}/auth-nonce``). Must equal last_consumed + 1.
+        deadline:    Unix-seconds expiry the signature was signed with.
 
     Returns:
         Dict with the new js_code_hash and update status.
@@ -571,21 +556,30 @@ def update_scoring(
     if definition is None:
         return {"error": f"App not found: {app_id}"}
 
-    # Authorization: if the app has a deployer, only that address can update.
-    # Prefer cryptographic signature verification; fall back to caller field
-    # with a deprecation warning for backward compatibility.
+    # Authorization: if the app has a deployer, only that address can update,
+    # proven by an EIP-712 developer-auth signature with a single-use nonce.
+    # The nonce + deadline make a captured signature unusable twice — closing
+    # the version-rollback replay the old nonce-less scheme allowed.
     if definition.deployer:
+        from minotaur_subnet.api.services import developer_auth
+
         deployer_addr = definition.deployer.strip().lower()
-        if not signature:
-            return {
-                "error": "Unauthorized: signature is required to update scoring. "
-                "Sign keccak256(app_id + js_code_hash) with the deployer key."
-            }
-        ok, err = _verify_scoring_update_signature(
-            app_id, new_js_code, signature, deployer_addr,
+        ok, err = developer_auth.verify_developer_auth(
+            expected_deployer=deployer_addr,
+            action=developer_auth.ACTION_UPDATE_SCORING,
+            app_id=app_id,
+            params_hash=developer_auth.params_hash(new_js_code.encode()),
+            nonce=nonce,
+            deadline=deadline,
+            signature=signature,
         )
         if not ok:
             return {"error": f"Unauthorized: {err}"}
+        # Consume the nonce only after the signature checks out, so a bad
+        # signature never burns a nonce. Atomic in the store (replay-safe).
+        consumed, cerr = store.consume_developer_nonce(app_id, deployer_addr, nonce)
+        if not consumed:
+            return {"error": f"Unauthorized: {cerr}"}
 
     manifest_errors, manifest_warnings, typed_manifest = (
         _validate_manifest_semantics_for_response(
