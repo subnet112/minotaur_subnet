@@ -44,6 +44,13 @@ class ReadProxyConfig:
     control_url: str  # CONTROL-plane base the API dials (e.g. http://rpc-pin-proxy:8645)
     token: str  # control-plane shared secret (sent as X-Control-Token)
     chain_ids: tuple[int, ...]  # chains to route + pin through the proxy
+    # Deterministic per-scenario RPC-read budget (integer cost units, metered by
+    # the proxy against the versioned cost table). 0 = NOT enforced: the proxy
+    # session runs in observe mode and the non-deterministic wall-clock timeout
+    # remains the cutoff (today's behavior). >0 = the budget IS the per-scenario
+    # cutoff (the wall-clock loosens to a runaway backstop). Defaults to 0 so
+    # existing instantiations keep observe semantics.
+    budget: int = 0
 
 
 def read_proxy_config() -> ReadProxyConfig | None:
@@ -57,6 +64,10 @@ def read_proxy_config() -> ReadProxyConfig | None:
         (default ``8453`` — the Base round anchor). A single ``fork_block`` pins
         these; multi-chain with distinct block heights needs per-chain blocks
         (a future extension — see :func:`build_pin_blocks`).
+      - ``SOLVER_READ_PROXY_BUDGET``: integer per-scenario RPC-read budget. Unset,
+        invalid, or ``<=0`` -> 0 (observe mode; wall-clock stays the cutoff). ``>0``
+        -> the proxy enforces this budget as the DETERMINISTIC per-scenario cutoff
+        and it folds into the benchmark pack hash (consensus-bound).
     """
     base = os.environ.get("SOLVER_READ_PROXY", "").strip()
     if not base:
@@ -72,12 +83,34 @@ def read_proxy_config() -> ReadProxyConfig | None:
     except ValueError:
         logger.error("SOLVER_READ_PROXY_CHAINS not a csv of ints: %r; using (8453,)", raw)
         chains = (8453,)
+    # Budget: invalid/unset/non-positive -> 0 (observe; inert as a cutoff).
+    raw_budget = os.environ.get("SOLVER_READ_PROXY_BUDGET", "").strip()
+    try:
+        budget = int(raw_budget) if raw_budget else 0
+    except ValueError:
+        logger.error("SOLVER_READ_PROXY_BUDGET not an int: %r; using 0 (observe)", raw_budget)
+        budget = 0
+    if budget < 0:
+        budget = 0
     return ReadProxyConfig(
         url=base.rstrip("/"),
         control_url=control.rstrip("/"),
         token=token,
         chain_ids=chains,
+        budget=budget,
     )
+
+
+def budget_enforced() -> bool:
+    """``True`` iff the proxy is configured AND a positive budget is set.
+
+    When ``True`` the proxy session runs in enforce mode with a deterministic
+    integer cutoff, so the wall-clock GENERATE_PLAN timeout is no longer the
+    cutoff (it loosens to a runaway backstop) and the budget folds into the
+    benchmark pack hash. ``False`` => everything budget-related is inert.
+    """
+    cfg = read_proxy_config()
+    return cfg is not None and cfg.budget > 0
 
 
 def build_pin_blocks(
@@ -120,10 +153,35 @@ async def open_session(cfg: ReadProxyConfig, session_id: str, blocks: dict[str, 
     Runs the (blocking) control POST off the event loop. Raises on transport or
     auth failure — the caller fails the run loud rather than silently falling
     back to the unpinned Anvil fork (which would re-introduce non-determinism).
+
+    When ``cfg.budget > 0`` the session opens in ``enforce`` mode with that
+    budget (the deterministic per-scenario cutoff). Otherwise budget/mode are
+    omitted, so the proxy applies its observe defaults (today's behavior).
     """
-    return await asyncio.to_thread(
-        _control_post, cfg, "/control/open", {"session_id": session_id, "blocks": blocks}
-    )
+    body: dict = {"session_id": session_id, "blocks": blocks}
+    if cfg.budget > 0:
+        body["budget"] = cfg.budget
+        body["mode"] = "enforce"
+    return await asyncio.to_thread(_control_post, cfg, "/control/open", body)
+
+
+async def reset_session(cfg: ReadProxyConfig, session_id: str) -> None:
+    """Reset a session's spent budget to 0 (best-effort).
+
+    Called before each ``generate_plan`` so every scenario starts with a fresh
+    budget ``B`` — making the budget a PER-SCENARIO cutoff that mirrors the
+    per-scenario wall-clock timeout it replaces. The blocks/pin are left intact
+    (``/control/reset`` only zeros spent + clears exhausted when no ``blocks``
+    key is sent). A failed reset is logged and swallowed: it must not crash the
+    benchmark (worst case the next scenario continues with carried-over spend,
+    which only makes the cutoff stricter, never silently looser).
+    """
+    try:
+        await asyncio.to_thread(
+            _control_post, cfg, "/control/reset", {"session_id": session_id}
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed reset must not abort the run
+        logger.warning("read-proxy reset failed for session=%s: %s", session_id, exc)
 
 
 async def close_session(cfg: ReadProxyConfig, session_id: str) -> None:
@@ -156,3 +214,52 @@ def pack_hash_block_rewrite() -> dict | None:
     if read_proxy_config() is not None and round_anchored_pin_enabled():
         return rewrite_table_record()
     return None
+
+
+def pack_hash_compute_budget() -> dict | None:
+    """The compute-budget record to fold into the benchmark pack hash, or ``None``.
+
+    Folded IFF the budget is the ACTIVE per-scenario cutoff for this round — i.e.
+    the proxy is configured (``SOLVER_READ_PROXY``), the round is pinned
+    (``ROUND_ANCHORED_PIN``, so :func:`run_benchmark` actually routes reads
+    through the proxy), AND a positive budget is set (``SOLVER_READ_PROXY_BUDGET``
+    > 0). This mirrors :func:`pack_hash_block_rewrite`'s gating exactly, plus the
+    budget>0 condition, so the record is folded under precisely the conditions in
+    which the budget enforces.
+
+    Returning ``None`` otherwise keeps the pack hash byte-identical to validators
+    not enforcing a budget, so an inert fleet is unaffected. Once a fleet
+    enforces, a validator on a different ``B`` (or a different cost-table version,
+    or in observe) computes a different pack hash and cannot reach quorum
+    (consensus-versioned — same discipline as ROUND_ANCHORED_PIN / the block
+    rewrite). Fail-loud, never silent.
+    """
+    from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+    from minotaur_subnet.harness.rpc_budget_proxy.cost_table import (
+        compute_budget_record,
+    )
+
+    cfg = read_proxy_config()
+    if cfg is not None and round_anchored_pin_enabled() and cfg.budget > 0:
+        return compute_budget_record(cfg.budget)
+    return None
+
+
+def generate_plan_recv_timeout(default: float) -> float:
+    """The wall-clock recv timeout to apply to a GENERATE_PLAN response.
+
+    When the deterministic budget is the cutoff (:func:`budget_enforced`), the
+    wall-clock is NO LONGER the cutoff — it would re-introduce the very cross-host
+    non-determinism the budget removes (a slow host/RPC/GC could trip 30s and
+    score 0 on validator A but not B, with an identical pack hash). So loosen it
+    to a mere runaway backstop (``GENERATE_PLAN_BACKSTOP_SECONDS``, default 300s,
+    never below ``default``). When the budget is off, return ``default`` unchanged
+    (today's behavior — fully inert).
+    """
+    if not budget_enforced():
+        return default
+    try:
+        backstop = float(os.environ.get("GENERATE_PLAN_BACKSTOP_SECONDS", "300"))
+    except ValueError:
+        backstop = 300.0
+    return max(default, backstop)
