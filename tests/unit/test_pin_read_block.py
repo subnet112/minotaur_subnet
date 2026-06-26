@@ -115,6 +115,38 @@ def test_run_benchmark_fail_loud_when_proxy_configured_but_no_fork_block(monkeyp
     assert sim.order == []  # raised before any benchmark work ran
 
 
+def test_fail_closed_on_unrouted_chain(monkeypatch):
+    """Firewall hardening: when the block-pin proxy is the configured read path,
+    a benchmarked chain NOT in SOLVER_READ_PROXY_CHAINS makes run_benchmark raise
+    RealSimulationUnavailable — never hands the solver a raw/dead URL or an
+    un-pinned read path. Fires BEFORE any proxy session is opened (the proxy URL
+    here points at a dead port and is never contacted)."""
+    import pytest
+    from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
+    from minotaur_subnet.harness.test_harness import (
+        make_intent, make_snapshot, make_state,
+    )
+    monkeypatch.setenv("SOLVER_READ_PROXY", "http://127.0.0.1:1")  # never contacted
+    monkeypatch.setenv("SOLVER_READ_PROXY_CHAINS", "8453")          # only Base routed
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://eth-anvil:8545")    # chain 1 resolvable
+    monkeypatch.setenv("BASE_RPC_URL", "http://base-anvil:8546")    # chain 8453 resolvable
+    monkeypatch.delenv("PIN_SOLVER_READ_BLOCK", raising=False)
+    intent, state, snapshot = make_intent(), make_state(), make_snapshot()
+    plan = ExecutionPlan(intent_id=intent.app_id, interactions=[], deadline=0, nonce=0)
+    sim = _PinRecordingSimulator()
+
+    async def score_fn(app_id, plan, simulation, st):
+        return ScoreResult(score=0.5)
+
+    with pytest.raises(RealSimulationUnavailable, match="NOT routed through"):
+        asyncio.run(run_benchmark(
+            _FakeSession(plan), [(intent, state, snapshot)],
+            config=BenchmarkConfig(chain_ids=[1, 8453]),  # eth(1) is NOT routed
+            score_fn=score_fn, simulator=sim, fork_block=12345,
+        ))
+    assert sim.order == []  # raised before any simulate/generate_plan ran
+
+
 def test_anvil_pin_read_fork_noop_when_already_at_block():
     from minotaur_subnet.simulator.anvil_simulator import AnvilSimulator
     sim = AnvilSimulator.__new__(AnvilSimulator)      # bypass __init__ / no real RPC
