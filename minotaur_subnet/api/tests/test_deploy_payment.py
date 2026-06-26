@@ -1,6 +1,7 @@
 """Tests for deploy-fee payment authorization (deploy_payment) and its gate
 integration in deploy_app_intent. The on-chain payment check is stubbed with a
-mock verifier; the default DisabledPaymentVerifier keeps the #238 gate closed."""
+mock verifier; the default (always-finney) verifier refuses until configured,
+keeping the #238 gate closed."""
 
 from __future__ import annotations
 
@@ -104,14 +105,16 @@ class TestDeployFeePaymentAuth(unittest.TestCase):
         self.assertTrue(ok, err)
         self.assertEqual(self.store.get_developer_nonce(self.app_id, DEPLOYER), 1)
 
-    def test_default_disabled_verifier_refuses(self):
+    def test_default_finney_verifier_refuses_unconfigured(self):
+        # No injected verifier → the (always-finney) default. With no coldkey
+        # linked it refuses, and the nonce is not burned.
         defn = self._seed()
         with _collection_enabled():
             ok, err = dp.verify_deploy_fee_payment(
                 self.store, defn, chain_id=CHAIN, payment=self._payment(),
-            )  # no verifier → DisabledPaymentVerifier
+            )
         self.assertFalse(ok)
-        self.assertIn("not configured", err)
+        self.assertIn("link", err.lower())
         self.assertEqual(self.store.get_developer_nonce(self.app_id, DEPLOYER), 0)
 
     def test_no_deployer_rejected(self):
