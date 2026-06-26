@@ -273,6 +273,8 @@ class AppIntentsValidator:
         # Follower app catalog sync (optional)
         leader_api_url: str = "",
         app_sync_poll_interval: float = 60.0,
+        # Local champion source for weight emission (read-only; the api writes it)
+        round_store_path: str | None = None,
     ) -> None:
         self.store = store
         self.port = port
@@ -283,6 +285,27 @@ class AppIntentsValidator:
             owner_hotkey=os.environ.get("SUBNET_OWNER_HOTKEY", "")
             or os.environ.get("OWNER_HOTKEY", ""),
         )
+
+        # Read-only handle on THIS validator's round store so the epoch loop can
+        # weight the champion IT locally adopted (written by its own api). The
+        # champion is NEVER read from chain — every validator must independently
+        # know the champion (it did the benchmark/consensus work), so a 3rd party
+        # can't free-ride by copying a published answer.
+        self._champion_round_store = None
+        try:
+            from minotaur_subnet.harness.round_store import RoundStore
+
+            _rs_path = (round_store_path or "").strip()
+            if _rs_path:
+                self._champion_round_store = RoundStore(persist_path=Path(_rs_path))
+                logger.info("Weight emission champion source: round store %s", _rs_path)
+            else:
+                logger.warning(
+                    "No round_store_path — weight emission can't see the local "
+                    "champion and will burn 100%% to owner until one is wired",
+                )
+        except Exception as exc:
+            logger.warning("Local champion round store unavailable for weights: %s", exc)
         self.orderbook = IntentOrderBook()
 
         # Shared bridge registry for quote/solve paths.
@@ -996,6 +1019,24 @@ class AppIntentsValidator:
             except Exception as exc:
                 logger.error("Rescan error: %s", exc)
 
+    def _local_champion_hotkey(self) -> str | None:
+        """Hotkey of THIS validator's locally-adopted champion, or None before a
+        real miner champion exists. Read from the local round store (written by
+        this validator's own api when it adopted) — never from chain. Drives the
+        0.05/0.95 champion burn ramp so a standing champion keeps its share every
+        epoch, including rounds with no new submissions; None ⇒ 100% burn."""
+        rs = self._champion_round_store
+        if rs is None:
+            return None
+        try:
+            from minotaur_subnet.weight_policy import is_real_miner_hotkey
+
+            hotkey = (rs.get_active_champion().hotkey or "").strip()
+            return hotkey if is_real_miner_hotkey(hotkey) else None
+        except Exception as exc:
+            logger.warning("Could not read local champion for weights: %s", exc)
+            return None
+
     async def _epoch_loop(self) -> None:
         """Periodically emit weights — single source of chain set_weights calls.
 
@@ -1045,7 +1086,11 @@ class AppIntentsValidator:
                 await self._do_emit(queued, source=source)
                 continue
 
-            # Priority 2: burn fallback via ChampionWeights.
+            # Priority 2: burn fallback via ChampionWeights. Refresh the champion
+            # from the LOCAL round store first so a standing champion keeps its
+            # 0.05 every epoch (even in rounds with no new PRs) instead of silently
+            # reverting to a 100% burn. None ⇒ genesis/no champion ⇒ burn.
+            self._champion_miner_id = self._local_champion_hotkey()
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights:
                 await self._do_emit(epoch_weights, source="burn_fallback")
@@ -1549,6 +1594,13 @@ def main() -> None:
     store_path = Path(args.store_path) if args.store_path else None
     store = AppIntentStore(store_path=store_path)
 
+    # Round store written by this validator's api (shared /data volume) — the
+    # local champion source for weight emission. Prefer the explicit env; else
+    # the conventional sibling of the app store.
+    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
+    if not round_store_path and store_path is not None:
+        round_store_path = str(store_path.parent / "solver_rounds.json")
+
     contract_address = os.environ.get("SWAP_APP_ADDRESS", "") or os.environ.get("APP_INTENT_BASE_31337", "")
     if not contract_address:
         contract_address = "0x" + "00" * 20
@@ -1611,6 +1663,7 @@ def main() -> None:
         contract_address=contract_address,
         leader_api_url=leader_api_url,
         app_sync_poll_interval=args.app_sync_interval,
+        round_store_path=round_store_path,
     )
     asyncio.run(validator.start())
 
