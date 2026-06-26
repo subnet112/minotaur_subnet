@@ -794,8 +794,10 @@ class TestWeightEmission:
         assert abs(sum(mapping.values()) - 1.0) < 1e-6
 
     @pytest.mark.asyncio
-    async def test_weights_exponential_decay(self, monkeypatch):
-        """Weight mapping uses exponential decay: champion gets most weight."""
+    async def test_weights_winner_takes_all(self, monkeypatch):
+        """Winner-takes-all: ONLY the adopted champion earns weight (0.05), 0.95
+        burns to owner — there is NO exponential-decay tail to other scored
+        submissions. (Replaces the old decay-tail behavior.)"""
         sub1 = _make_submission(
             submission_id="sub_best", epoch=1, score=0.90,
             hotkey="5Gminer_best",
@@ -816,25 +818,23 @@ class TestWeightEmission:
         session = _FakeQueueSession()
         _patch_queue_post(monkeypatch, session)
 
+        owner = "5OwnerHotkeyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
         mgr = EpochManager(
             benchmark_worker=worker,
             submission_store=store,
-            weight_decay=0.6,
+            owner_hotkey=owner,
         )
 
         await mgr.on_epoch_boundary(epoch=1)
 
         mapping = session.posted_mapping()
-        # All three miners should have weight
-        assert len(mapping) == 3
-        # Champion gets highest weight
-        assert mapping["5Gminer_best"] > mapping["5Gminer_mid"]
-        assert mapping["5Gminer_mid"] > mapping["5Gminer_low"]
-        # Verify decay ratios: rank1/rank0 ≈ 0.6, rank2/rank1 ≈ 0.6
-        ratio_1 = mapping["5Gminer_mid"] / mapping["5Gminer_best"]
-        ratio_2 = mapping["5Gminer_low"] / mapping["5Gminer_mid"]
-        assert abs(ratio_1 - 0.6) < 0.01
-        assert abs(ratio_2 - 0.6) < 0.01
+        # Only the champion earns weight; the runners-up get nothing.
+        assert "5Gminer_best" in mapping
+        assert "5Gminer_mid" not in mapping
+        assert "5Gminer_low" not in mapping
+        # 0.05 to the champion, 0.95 burns to owner.
+        assert mapping["5Gminer_best"] == pytest.approx(0.05)
+        assert mapping[owner] == pytest.approx(0.95)
 
     @pytest.mark.asyncio
     async def test_no_champion_burns_to_owner(self, monkeypatch):
