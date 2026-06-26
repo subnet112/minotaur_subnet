@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,6 +92,11 @@ logger = logging.getLogger(__name__)
 # event loop otherwise stays healthy. Bounding the wait guarantees the lock
 # is always released; the worst case is a lingering zombie, not an outage.
 _KILL_REAP_TIMEOUT = 5.0
+
+# Trailing stderr lines kept per session for crash diagnostics (surfaced in the
+# SolverCrashedError when a solver dies / hangs). Bounded so a chatty solver
+# can't grow memory without bound.
+_STDERR_TAIL_LINES = 50
 
 
 class SolverTimeoutError(Exception):
@@ -222,6 +228,59 @@ class SolverSession:
         # image/args. Enables ``restart()`` so the benchmark can recover from a
         # per-scenario timeout/crash WITHOUT truncating the rest of the run.
         self._relaunch: Any = None
+        # The process is launched with stderr=PIPE. If NOTHING reads it, a chatty
+        # solver fills the ~64KB kernel pipe buffer and BLOCKS on its next stderr
+        # write — which stalls quoting until the per-command timeout kills it, after
+        # which every later scenario sees a dead process ("Solver process is not
+        # running"). Drain it continuously in the background, keeping a bounded tail
+        # for crash diagnostics.
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+        self._stderr_task: Any = None
+        self._begin_stderr_drain()
+
+    def _begin_stderr_drain(self) -> None:
+        """(Re)start the background task draining the current process's stderr.
+
+        Called on construction and after ``restart()`` swaps the process. Idempotent
+        — cancels any prior task first. No-op when there is no stderr pipe or no
+        running event loop (e.g. a synchronous unit test constructing a session).
+        """
+        task = self._stderr_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._stderr_task = None
+        stream = getattr(self._proc, "stderr", None)
+        if stream is None:
+            return
+        try:
+            self._stderr_task = asyncio.ensure_future(self._drain_stderr(stream))
+        except RuntimeError:
+            self._stderr_task = None
+
+    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
+        """Continuously read the solver's stderr so its pipe never backs up.
+
+        Takes the stream explicitly (not ``self._proc.stderr``) so a task started
+        for the pre-restart process keeps draining IT, not the replacement.
+        """
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    self._stderr_tail.append(text)
+                    logger.debug("[%s solver-stderr] %s", self._label, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — draining must never break the session
+            logger.debug("[%s] stderr drain ended: %r", self._label, exc)
+
+    def _stderr_snapshot(self) -> str:
+        """The last captured stderr lines, for surfacing in a crash error."""
+        tail = getattr(self, "_stderr_tail", None)
+        return " | ".join(tail) if tail else "no stderr captured"
 
     async def restart(self) -> None:
         """Relaunch the underlying solver process in place (same image/args).
@@ -250,6 +309,7 @@ class SolverSession:
         self._proc = await self._relaunch()
         self._closed = False
         self._start_time = time.monotonic()
+        self._begin_stderr_drain()  # drain the NEW process's stderr too
         logger.info("[%s] Process respawned", self._label)
 
     async def initialize(self, config: dict[str, Any]) -> None:
@@ -381,6 +441,9 @@ class SolverSession:
         if self._closed:
             return
         self._closed = True
+        task = self._stderr_task
+        if task is not None and not task.done():
+            task.cancel()
         try:
             self._proc.kill()
             # Bounded reap — never block the caller (and the runtime lock it
@@ -406,7 +469,9 @@ class SolverSession:
     async def _send(self, request: HarnessRequest) -> HarnessResponse:
         """Send a request and wait for the response, with timeout."""
         if self._closed:
-            raise SolverCrashedError("Solver process is not running")
+            raise SolverCrashedError(
+                f"Solver process is not running (last stderr: {self._stderr_snapshot()})"
+            )
 
         if self._proc.stdin is None or self._proc.stdout is None:
             raise SolverCrashedError("Solver process has no stdin/stdout")
@@ -440,15 +505,18 @@ class SolverSession:
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
+            stderr_tail = self._stderr_snapshot()
             await self.kill()
             raise SolverTimeoutError(
-                f"Command {request.command} timed out after {timeout}s"
+                f"Command {request.command} timed out after {timeout}s "
+                f"(last stderr: {stderr_tail})"
             )
 
         if not raw_line:
             self._closed = True
             raise SolverCrashedError(
-                f"Solver process exited during {request.command}"
+                f"Solver process exited during {request.command} "
+                f"(last stderr: {self._stderr_snapshot()})"
             )
 
         line = raw_line.decode("utf-8", errors="replace").strip()
