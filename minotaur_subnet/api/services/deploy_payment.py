@@ -12,11 +12,10 @@ What is built here: the EIP-712 authorization binding
 single-use nonce consume (shared with the other developer actions, so a nonce
 can't be replayed across actions), and the plumbing into ``deploy_app_intent``.
 
-What is deliberately NOT built here: the actual on-chain payment check. It sits
-behind :class:`PaymentVerifier` and defaults to :class:`DisabledPaymentVerifier`
-(refuses everything), so the structural #238 block holds — public deploys stay
-closed until a real verifier (EVM wTAO transfer / finney TAO extrinsic) is wired
-*and* ``ENABLE_PUBLIC_DEPLOYMENT=1``. Fee routing is likewise out of scope.
+The on-chain payment check itself lives behind :class:`PaymentVerifier`; the
+rail is always finney (native TAO) — see ``finney_payment``. The structural #238
+block holds until ``ENABLE_PUBLIC_DEPLOYMENT=1`` *and* the verifier's config
+(collector + the app's linked coldkey) is in place. Fee routing is out of scope.
 """
 
 from __future__ import annotations
@@ -50,44 +49,35 @@ class PaymentVerifier(Protocol):
     def verify(
         self,
         *,
+        store: Any,
         app_id: str,
         deployer: str,
         payment_ref: str,
         chain_id: int,
         amount_rao: int,
     ) -> tuple[bool, str]:
-        """Return ``(ok, error)``: did ``deployer`` pay at least ``amount_rao``,
-        referenced by ``payment_ref``, to the deploy-fee collector on
-        ``chain_id``?"""
+        """Return ``(ok, error)``: did the app's payer pay at least
+        ``amount_rao``, referenced by ``payment_ref``, to the deploy-fee
+        collector on ``chain_id``? Implementations own consume-once of the
+        payment (``store.consume_payment_ref``) so one payment authorizes one
+        deploy; ``store`` also resolves the rail's payer identity (e.g. the
+        linked SS58 coldkey)."""
         ...
 
 
-class DisabledPaymentVerifier:
-    """Default verifier: on-chain payment verification is NOT wired (#238).
-
-    Refuses everything so the deploy-fee gate stays structurally closed. Swap in
-    a real verifier via :func:`get_payment_verifier` once one exists:
-
-    * **EVM wTAO** — confirm an ERC-20 ``Transfer`` (``payment_ref`` = tx hash)
-      to the configured collector on chain 964 of ``>= amount_rao``, using
-      ``blockchain.tokens.get_erc20_balance`` / a tx receipt.
-    * **finney TAO** — confirm a ``Balances.Transfer`` extrinsic
-      (``payment_ref``) from the deployer's coldkey to the collector of
-      ``>= amount_rao`` via substrate-interface.
-
-    A real verifier MUST also enforce single-use of ``payment_ref`` (a payment
-    authorizes exactly one deploy) — the nonce guards the *authorization*, but
-    the payment itself must not be reusable across apps.
-    """
-
-    def verify(self, **_: Any) -> tuple[bool, str]:
-        return False, "on-chain deploy-fee payment verification is not configured"
-
-
 def get_payment_verifier() -> PaymentVerifier:
-    """Resolve the active payment verifier. Default off (#238) — a real rail is
-    selected here once collection is wired."""
-    return DisabledPaymentVerifier()
+    """The deploy-fee payment verifier. The rail is always finney (native TAO) —
+    there is no rail selection; the fee is paid in TAO on Bittensor mainnet.
+
+    Safe by default regardless: the finney verifier refuses unless the collector
+    (``DEPLOY_FEE_COLLECTOR_SS58``) and the app's coldkey link are configured,
+    and ``verify_deploy_fee_payment`` never calls it at all unless
+    ``ENABLE_PUBLIC_DEPLOYMENT=1``. So collection stays closed (#238) until those
+    are deliberately set.
+    """
+    from minotaur_subnet.api.services.finney_payment import FinneyPaymentVerifier
+
+    return FinneyPaymentVerifier()
 
 
 def deploy_fee_params_hash(payment_ref: str, chain_id: int, amount_rao: int) -> bytes:
@@ -154,6 +144,7 @@ def verify_deploy_fee_payment(
 
     active = verifier or get_payment_verifier()
     paid, perr = active.verify(
+        store=store,
         app_id=definition.app_id,
         deployer=deployer,
         payment_ref=payment.payment_ref,
