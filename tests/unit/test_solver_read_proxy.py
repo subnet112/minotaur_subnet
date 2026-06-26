@@ -83,29 +83,35 @@ def test_pack_hash_block_rewrite_gating(monkeypatch):
 # ── Deterministic compute-budget: config parsing ──────────────────────────────
 
 
-def test_read_proxy_config_budget_unset_is_zero(monkeypatch):
+def test_read_proxy_config_budget_unset_is_default(monkeypatch):
+    # UNSET -> the uniform code constant (default-on, so a bare :stable validator
+    # enforces the SAME B as the fleet).
     monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
     monkeypatch.delenv("SOLVER_READ_PROXY_BUDGET", raising=False)
-    cfg = srp.read_proxy_config()
-    assert cfg.budget == 0  # default (observe; inert as a cutoff)
+    assert srp.read_proxy_config().budget == srp.DEFAULT_GENERATE_PLAN_BUDGET
 
 
-def test_read_proxy_config_budget_parsed(monkeypatch):
+def test_read_proxy_config_budget_parsed_override(monkeypatch):
     monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
     monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "2000")
     assert srp.read_proxy_config().budget == 2000
 
 
-def test_read_proxy_config_budget_invalid_is_zero(monkeypatch):
+def test_read_proxy_config_budget_explicit_zero_disables(monkeypatch):
+    # Explicit 0 = observe (emergency disable).
+    monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
+    monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "0")
+    assert srp.read_proxy_config().budget == 0
+
+
+def test_read_proxy_config_budget_invalid_falls_back_to_default(monkeypatch):
+    # Invalid/negative -> the constant (fail-safe to the uniform default, never
+    # silently drop ONE node to observe).
     monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
     monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "not-an-int")
-    assert srp.read_proxy_config().budget == 0
-
-
-def test_read_proxy_config_budget_negative_is_zero(monkeypatch):
-    monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
+    assert srp.read_proxy_config().budget == srp.DEFAULT_GENERATE_PLAN_BUDGET
     monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "-5")
-    assert srp.read_proxy_config().budget == 0
+    assert srp.read_proxy_config().budget == srp.DEFAULT_GENERATE_PLAN_BUDGET
 
 
 # ── budget_enforced gating ────────────────────────────────────────────────────
@@ -113,20 +119,20 @@ def test_read_proxy_config_budget_negative_is_zero(monkeypatch):
 
 def test_budget_enforced_false_without_proxy(monkeypatch):
     monkeypatch.delenv("SOLVER_READ_PROXY", raising=False)
-    monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "2000")
     assert srp.budget_enforced() is False  # no proxy -> inert
 
 
-def test_budget_enforced_false_when_budget_zero(monkeypatch):
+def test_budget_enforced_true_by_default_when_proxy(monkeypatch):
+    # Proxy configured + budget unset -> default-on (the in-place activation).
     monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
     monkeypatch.delenv("SOLVER_READ_PROXY_BUDGET", raising=False)
-    assert srp.budget_enforced() is False  # proxy but no budget -> observe
-
-
-def test_budget_enforced_true_when_proxy_and_budget(monkeypatch):
-    monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
-    monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "2000")
     assert srp.budget_enforced() is True
+
+
+def test_budget_enforced_false_when_explicit_zero(monkeypatch):
+    monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
+    monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "0")  # emergency disable
+    assert srp.budget_enforced() is False
 
 
 # ── open_session body: budget + mode only when enforcing ──────────────────────
@@ -203,12 +209,17 @@ def test_pack_hash_compute_budget_gating(monkeypatch):
     monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "2000")
     assert srp.pack_hash_compute_budget() is None
 
-    # proxy + pin (default-on) but budget 0 -> None (observe, not the cutoff)
+    # proxy + pin (default-on) + budget unset -> the DEFAULT budget record
+    # (default-on: a bare validator folds the same B as the fleet)
     monkeypatch.setenv("SOLVER_READ_PROXY", "http://p:8645")
     monkeypatch.delenv("SOLVER_READ_PROXY_BUDGET", raising=False)
+    assert srp.pack_hash_compute_budget() == compute_budget_record(srp.DEFAULT_GENERATE_PLAN_BUDGET)
+
+    # explicit 0 -> None (observe, emergency-disabled; not the cutoff)
+    monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "0")
     assert srp.pack_hash_compute_budget() is None
 
-    # proxy + pin (default-on) + budget>0 -> the budget record (it's the cutoff)
+    # proxy + pin (default-on) + budget override -> that budget record (the cutoff)
     monkeypatch.setenv("SOLVER_READ_PROXY_BUDGET", "2000")
     assert srp.pack_hash_compute_budget() == compute_budget_record(2000)
 
