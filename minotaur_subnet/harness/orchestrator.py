@@ -949,6 +949,28 @@ async def run_benchmark(
     _proxy_session_id: str | None = None
     if _read_proxy is not None and fork_block is not None and rpc_map:
         pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+        # Fail-CLOSED on a non-routed chain — BEFORE opening any session (no leak)
+        # AND before the `if pin_blocks:` branch, so an all-unrouted benchmark (no
+        # routed chain → empty pin_blocks) ALSO fails loud rather than silently
+        # handing the solver raw/dead URLs. Once the proxy is the configured read
+        # path, EVERY benchmarked chain MUST be routed through it: the solver runs
+        # on the sealed sandbox net where only the proxy is reachable, so any chain
+        # left on a raw upstream URL is (a) unreachable → silent mis-score and (b)
+        # the exact un-pinned, un-budgeted hole this hardening closes. A Base-only
+        # round is unaffected (its one chain is routed); this only fires if a
+        # future scenario benchmarks a chain not in SOLVER_READ_PROXY_CHAINS.
+        unrouted = [
+            cid for cid in rpc_map
+            if cid not in _read_proxy.chain_ids or cid not in CHAIN_NAMES
+        ]
+        if unrouted:
+            raise RealSimulationUnavailable(
+                f"SOLVER_READ_PROXY_CHAINS={sorted(_read_proxy.chain_ids)} but "
+                f"benchmark chain(s) {sorted(unrouted)} are NOT routed through the "
+                f"block-pin proxy — the solver (sealed sandbox net) would either "
+                f"fail to reach them or bypass the pin/budget. Add them to "
+                f"SOLVER_READ_PROXY_CHAINS (fleet-wide) before benchmarking them."
+            )
         if pin_blocks:
             _proxy_session_id = f"bench-{id(session):x}-{fork_block}"
             try:
