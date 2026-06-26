@@ -41,7 +41,7 @@ class ReadProxyConfig:
     """
 
     url: str  # DATA-plane base the SOLVER dials (e.g. http://172.30.0.5:8645)
-    control_url: str  # CONTROL-plane base the API dials (e.g. http://rpc-pin-proxy:8645)
+    control_url: str  # CONTROL-plane base the API dials (e.g. http://minotaur-rpc-pin-proxy:8645)
     token: str  # control-plane shared secret (sent as X-Control-Token)
     chain_ids: tuple[int, ...]  # chains to route + pin through the proxy
     # Deterministic per-scenario RPC-read budget (integer cost units, metered by
