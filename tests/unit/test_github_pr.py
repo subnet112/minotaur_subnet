@@ -9,8 +9,10 @@ HEAD = "a" * 40
 FORK = "https://github.com/miner/minotaur-solver.git"
 
 
-def _pr(*, state="open", base=f"{OWNER}/{REPO}", head_sha=HEAD, clone_url=FORK, head_repo=True):
-    head = {"sha": head_sha, "repo": ({"clone_url": clone_url} if head_repo else None)}
+def _pr(*, state="open", base=f"{OWNER}/{REPO}", head_sha=HEAD, clone_url=FORK,
+        head_repo=True, fork_owner="miner"):
+    repo = {"clone_url": clone_url, "owner": {"login": fork_owner}} if head_repo else None
+    head = {"sha": head_sha, "repo": repo}
     return {"state": state, "base": {"repo": {"full_name": base}}, "head": head}
 
 
@@ -32,7 +34,10 @@ def test_canonical_repo_from_env(monkeypatch):
 
 def test_resolve_happy_path():
     out = gp.resolve_pr(7, fetch=_fetch(_pr()))
-    assert out == {"clone_url": FORK, "head_sha": HEAD, "state": "open", "base": f"{OWNER}/{REPO}"}
+    assert out == {
+        "clone_url": FORK, "head_sha": HEAD, "state": "open",
+        "base": f"{OWNER}/{REPO}", "fork_owner": "miner",
+    }
 
 
 def test_resolve_normalizes_head_sha_case():

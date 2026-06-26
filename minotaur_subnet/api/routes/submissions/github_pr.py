@@ -96,10 +96,57 @@ def resolve_pr(pr_number: int, *, fetch=_fetch_pr) -> dict:
     if len(head_sha) != 40 or any(c not in _HEX for c in head_sha):
         raise PRResolutionError(f"PR #{pr_number} head sha is malformed: {head_sha!r}")
 
-    clone_url = ((head.get("repo") or {}).get("clone_url") or "").strip()
+    head_repo = head.get("repo") or {}
+    clone_url = (head_repo.get("clone_url") or "").strip()
     if not clone_url.startswith("https://github.com/"):
         raise PRResolutionError(
             f"PR #{pr_number} head clone_url missing/non-github (fork deleted?): {clone_url!r}"
         )
+    # The fork owner's GitHub login — the account that hosts the head commit. Checked
+    # against the registered GitHub-account↔hotkey binding so a miner can't submit a
+    # PR from an account they don't own (see api/services/miner_identity).
+    fork_owner = ((head_repo.get("owner") or {}).get("login") or "").strip()
 
-    return {"clone_url": clone_url, "head_sha": head_sha, "state": state, "base": base_full}
+    return {
+        "clone_url": clone_url,
+        "head_sha": head_sha,
+        "state": state,
+        "base": base_full,
+        "fork_owner": fork_owner,
+    }
+
+
+def _fetch_gist(gist_id: str, *, timeout: float = 15.0) -> dict:
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{gist_id}",
+        headers=_github_headers(),
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed host
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def resolve_gist(gist_id: str, *, fetch=_fetch_gist) -> tuple[str, str]:
+    """Resolve a public gist to ``(owner_login, first_file_content)``.
+
+    The owner login comes from GitHub's authoritative response, so a registrant
+    can't claim a gist they don't own (only the owning account can host a gist under
+    it) — that ownership is what proves control of the GitHub account. ``fetch`` is
+    injectable for tests. Raises :class:`PRResolutionError`.
+    """
+    gid = (gist_id or "").strip()
+    if not gid or not gid.isalnum() or len(gid) > 64:
+        raise PRResolutionError(f"malformed gist id: {gist_id!r}")
+    try:
+        data = fetch(gid)
+    except Exception as exc:  # network / 404 / json
+        raise PRResolutionError(f"could not fetch gist {gid}: {exc}") from exc
+
+    owner_login = ((data.get("owner") or {}).get("login") or "").strip()
+    if not owner_login:
+        raise PRResolutionError(f"gist {gid} has no owner login")
+    files = data.get("files") or {}
+    first = next(iter(files.values()), None) or {}
+    content = (first.get("content") or "").strip()
+    if not content:
+        raise PRResolutionError(f"gist {gid} has no readable file content")
+    return owner_login, content
