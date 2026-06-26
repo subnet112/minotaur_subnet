@@ -27,7 +27,7 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
 from minotaur_subnet.harness.submission_store import SubmissionStatus
 from minotaur_subnet.harness.round_store import RoundStatus
@@ -40,6 +40,8 @@ from .models import (
     CloseRoundRequest,
     SolverChampionResponse,
     SolverRoundResponse,
+    SolverRoundSummary,
+    SolverRoundsResponse,
     SourceSubmitRequest,
     StatusResponse,
     SubmitRequest,
@@ -1067,6 +1069,57 @@ async def get_solver_round_by_id(round_id: str) -> SolverRoundResponse:
     if round_state is None:
         raise HTTPException(status_code=404, detail="Solver round not found")
     return _round_state_to_response(round_state)
+
+
+def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
+    """Build a compact history row from a persisted round dict (RoundState.to_dict)."""
+    status = str(d.get("status") or "")
+    cert = d.get("certificate") or {}
+    adopted = status == "activated"
+    return SolverRoundSummary(
+        round_id=str(d.get("round_id") or ""),
+        status=status,
+        opened_epoch=int(d.get("opened_epoch") or 0),
+        close_epoch=d.get("close_epoch"),
+        finalist_submission_id=d.get("finalist_submission_id"),
+        finalist_score=d.get("finalist_score"),
+        incumbent_submission_id=d.get("incumbent_submission_id"),
+        adopted=adopted,
+        adopted_submission_id=(
+            (cert.get("candidate_submission_id") or d.get("finalist_submission_id"))
+            if adopted else None
+        ),
+        effective_epoch=d.get("effective_epoch"),
+        abort_reason=d.get("abort_reason"),
+        created_at=float(d.get("created_at") or 0.0),
+        updated_at=float(d.get("updated_at") or 0.0),
+    )
+
+
+@router.get("/solver/rounds", response_model=SolverRoundsResponse)
+async def list_solver_rounds(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: str | None = Query(None),
+) -> SolverRoundsResponse:
+    """Paginated solver-round HISTORY (newest first), sourced from the durable
+    order-book DB (AppIntentStore) that the round store mirrors into."""
+    # Ensure the round-store singleton is wired (installs the history sink + the
+    # one-time backfill of rounds already in the JSON store).
+    get_round_store()
+    from minotaur_subnet.api.server_context import ctx
+    store = getattr(ctx, "store", None)
+    rows: list[dict[str, Any]] = []
+    total = 0
+    if store is not None and hasattr(store, "list_rounds"):
+        rows = store.list_rounds(limit=limit, offset=offset, status=status)
+        total = store.count_rounds(status=status)
+    return SolverRoundsResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        rounds=[_round_summary_from_dict(d) for d in rows],
+    )
 
 
 @router.get("/solver/champion", response_model=SolverChampionResponse)

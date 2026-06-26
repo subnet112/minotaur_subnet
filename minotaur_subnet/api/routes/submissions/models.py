@@ -124,6 +124,33 @@ class SolverChampionResponse(BaseModel):
     activated_at: float = 0.0
 
 
+class SolverRoundSummary(BaseModel):
+    """Compact per-round history row (for GET /v1/solver/rounds list views)."""
+    round_id: str
+    status: str
+    opened_epoch: int = 0
+    close_epoch: int | None = None
+    finalist_submission_id: str | None = None
+    finalist_score: float | None = None
+    incumbent_submission_id: str | None = None
+    # Outcome: `adopted` is True when the round activated a new champion;
+    # `adopted_submission_id` is the certified challenger that won.
+    adopted: bool = False
+    adopted_submission_id: str | None = None
+    effective_epoch: int | None = None
+    abort_reason: str | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+class SolverRoundsResponse(BaseModel):
+    """Paginated solver-round history, newest first."""
+    total: int = 0
+    limit: int = 0
+    offset: int = 0
+    rounds: list[SolverRoundSummary] = []
+
+
 class CloseRoundRequest(BaseModel):
     round_id: str | None = None
     close_epoch: int = Field(..., ge=0)
