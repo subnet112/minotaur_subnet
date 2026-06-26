@@ -400,6 +400,23 @@ def _max_submissions_per_round() -> int:
         return 1
 
 
+def _max_submissions_per_round_total() -> int:
+    """Round-wide submission cap across ALL miners — bounds the per-round
+    benchmark batch (first-come; the rest retry next round).
+
+    Configurable via ``SOLVER_ROUND_MAX_SUBMISSIONS`` (default 0 = unlimited =
+    today's behaviour). Like the per-hotkey cap, this is operator-local admission
+    control at the leader gateway (the only ingress) — submissions are
+    leader-canonical and followers mirror the leader's accepted set — so it is
+    NOT a fleet-consensus parameter and an env knob is the right shape.
+    """
+    raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def _enforce_rate_limit(request: Request, principal: str) -> None:
     """Simple in-memory fixed-window limiter for submission creation endpoints."""
     raw_limit = os.environ.get("SUBMISSIONS_RATE_LIMIT_PER_MINUTE", "60").strip()
@@ -511,8 +528,8 @@ async def create_source_submission(
 
     code_hash = hashlib.sha256(body.solver_source.encode()).hexdigest()[:12]
 
-    # Same per-round cap as the git path so SUBMISSIONS_MAX_PER_ROUND applies
-    # uniformly across both submission ingresses.
+    # Same per-round caps as the git path so SUBMISSIONS_MAX_PER_ROUND and
+    # SOLVER_ROUND_MAX_SUBMISSIONS apply uniformly across both ingresses.
     try:
         sub = store.create(
             repo_url="source://inline",
@@ -521,6 +538,7 @@ async def create_source_submission(
             hotkey=body.hotkey,
             round_id=current_round.round_id,
             max_per_round=_max_submissions_per_round(),
+            max_total_per_round=_max_submissions_per_round_total(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -595,6 +613,20 @@ async def create_submission(
                 ),
             )
 
+    # Round-wide cap across all miners (bounds the per-round benchmark batch).
+    # First-come; the store re-checks atomically inside create() as the backstop.
+    max_total = _max_submissions_per_round_total()
+    if max_total > 0:
+        round_total = store.count_by_round(current_round.round_id)
+        if round_total >= max_total:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Round {current_round.round_id} is full "
+                    f"({round_total}/{max_total} submissions); try again next round."
+                ),
+            )
+
     # Resolve the PR (host fixed to the canonical solver repo) -> fork clone_url +
     # the live head SHA, and reject if the live head != the miner-signed head_sha
     # (force-push / TOCTOU guard). The miner signs the exact commit it built.
@@ -640,6 +672,7 @@ async def create_submission(
             round_id=current_round.round_id,
             pr_number=body.pr_number,
             max_per_round=max_per_round,
+            max_total_per_round=max_total,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
