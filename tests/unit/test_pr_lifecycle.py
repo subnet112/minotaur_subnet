@@ -81,7 +81,10 @@ def test_delete_candidate_image_no_matching_tag(monkeypatch):
         assert sr.delete_candidate_image(7) is False  # pr-7 absent -> nothing deleted
 
 
-def test_on_champion_rejected_pr_comments_closes_gcs(monkeypatch):
+def test_on_champion_rejected_pr_comments_and_gcs_but_never_closes(monkeypatch):
+    # Policy: a failure NEVER closes the PR — only a successful merge closes one
+    # (GitHub auto-closes a squash-merged PR). The reject path comments feedback +
+    # GCs the candidate image, leaving the PR OPEN so the miner can iterate.
     _patch_env(monkeypatch)
     sub = SimpleNamespace(submission_id="sub_1", pr_number=7)
     order = []
@@ -89,7 +92,8 @@ def test_on_champion_rejected_pr_comments_closes_gcs(monkeypatch):
          patch.object(sr, "close_pr", lambda n: order.append(("close", n)) or True), \
          patch.object(sr, "delete_candidate_image", lambda n: order.append(("gc", n)) or True):
         assert sr.on_champion_rejected_pr(sub, "too slow") is True
-    assert order == [("comment", 7), ("close", 7), ("gc", 7)]
+    assert order == [("comment", 7), ("gc", 7)]
+    assert ("close", 7) not in order  # the PR is left OPEN on a reject
 
 
 def test_on_champion_rejected_pr_no_pr_number_noop(monkeypatch):

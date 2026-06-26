@@ -464,10 +464,11 @@ def on_champion_rejected_pr(
     dethrone_margin: float | None = None,
     champion_details: dict | None = None,
 ) -> bool:
-    """REJECT path: comment the reason + scored report on the miner's PR, close
-    it, and GC the candidate image. Mirrors the off-chain quorum's reject
-    decision onto the PR. Usable while adoption is frozen — pure miner feedback,
-    no chain writes.
+    """REJECT path: comment the reason + scored report on the miner's PR and GC the
+    candidate image. The PR is left OPEN — only a successful merge ever closes a PR;
+    reject / merge-gate failures keep it open so the miner can read the feedback and
+    iterate on the same PR. Mirrors the off-chain quorum's reject decision onto the
+    PR. Usable while adoption is frozen — pure miner feedback, no chain writes.
 
     When ``report_md`` isn't supplied, builds the full per-case benchmark report
     (your score vs the champion per case, the dethrone gap, every case
@@ -476,7 +477,7 @@ def on_champion_rejected_pr(
     pr_number = getattr(submission, "pr_number", None)
     if not pr_number:
         logger.info(
-            "Champion reject for %s has no pr_number — skipping PR close",
+            "Champion reject for %s has no pr_number — skipping PR feedback",
             getattr(submission, "submission_id", "?"),
         )
         return False
@@ -484,13 +485,15 @@ def on_champion_rejected_pr(
         submission, reason, champion_score, dethrone_margin, champion_details,
     )
     commented = comment_on_pr(pr_number, body)
-    closed = close_pr(pr_number)
+    # Do NOT close the PR on a failure — only a successful squash-merge ever closes a
+    # PR (GitHub auto-closes on merge). Leaving reject / merge-gate failures OPEN lets
+    # the miner read the feedback and iterate on the same PR.
     gced = delete_candidate_image(pr_number)
     logger.info(
-        "Champion reject PR#%s: comment=%s close=%s gc=%s",
-        pr_number, commented, closed, gced,
+        "Champion reject PR#%s: comment=%s gc=%s (PR left OPEN — only a merge closes)",
+        pr_number, commented, gced,
     )
-    return closed
+    return commented
 
 
 def on_champion_finalist_pr(

@@ -513,6 +513,62 @@ class EpochManager:
                 f"Certified submission not found: {certificate.candidate_submission_id}",
             )
 
+        # PROVENANCE GATE (runs BEFORE the hot-swap): notify the relayer to attest
+        # the certificate on-chain (BT EVM ChampionRegistry, recording the validator
+        # signatures + tx hash for the GitHub Action) and squash-merge the miner's
+        # signed fork PR. The callback returns True only when BOTH the attestation
+        # and the merge succeed. We capture that result up front to gate the adoption
+        # before any champion change takes effect. With no merge callback wired (e.g.
+        # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
+        merge_ok = True
+        if self._on_champion_adopted is not None:
+            try:
+                cb_result = self._on_champion_adopted(
+                    submission, round_id, certificate=certificate,
+                )
+                if inspect.isawaitable(cb_result):
+                    cb_result = await cb_result
+                merge_ok = bool(cb_result)
+            except Exception as exc:
+                logger.warning("on_champion_adopted callback failed: %s", exc)
+                merge_ok = False
+
+        # A failed attest/merge ABORTS the adoption — UNCONDITIONALLY, by design (no
+        # opt-out env var): no hot-swap, no weight emit, champion unchanged. A
+        # challenger whose source can't be merged to main + attested on-chain (e.g. a
+        # drifted PR head, or a missing on-chain proof) MUST NOT earn weights — its
+        # provenance can't be established. The fleet still RUNS the certified image
+        # digest at runtime, but a champion that can't be recorded is not adopted.
+        if not merge_ok:
+            logger.error(
+                "[merge-gate] round %s certified, but on-chain attest + PR merge did "
+                "NOT both succeed for %s — REFUSING to adopt (no hot-swap / weights); "
+                "champion unchanged.",
+                round_id, certificate.candidate_submission_id,
+            )
+            # Mirror the failure onto the miner's PR via the SAME reject-feedback
+            # path used for benchmark rejections (_notify_champion_rejected →
+            # on_champion_rejected_pr → PR comment): tell the miner WHY their win
+            # couldn't be finalized so they can fix it (typically: reset the PR head
+            # back to the certified commit). Leader-gated + best-effort internally.
+            self._notify_champion_rejected(
+                submission,
+                "adoption blocked — this submission won the round, but the champion "
+                "could not be finalized: its on-chain attestation and/or the "
+                "squash-merge of this PR did not both succeed. The most common cause "
+                "is the PR head being pushed PAST the certified commit, so the quorum "
+                "certificate no longer binds the head SHA (do not push to the branch "
+                "after submitting). The round was aborted and the champion is "
+                "unchanged; re-submit with the PR head pinned to the certified commit.",
+            )
+            next_round = self._complete_round(
+                round_state, epoch, activated=False, abort_reason="merge_failed",
+            )
+            result["abort_reason"] = "merge_failed"
+            if next_round is not None:
+                result["next_round_id"] = next_round.round_id
+            return result
+
         await self._hot_swap(submission, effective_epoch, round_id=round_id)
         activated = self._round_store.activate_round(
             round_id,
@@ -531,21 +587,6 @@ class EpochManager:
             round_id=round_id,
         )
         result["status_after"] = activated.status.value
-
-        # Notify the relayer to attest on-chain + create GitHub PR.
-        # The certificate is passed so the callback can record the validator
-        # signatures on BT EVM's ChampionRegistry and include the on-chain
-        # tx hash in the PR body for the GitHub Action to verify.
-        if self._on_champion_adopted is not None:
-            try:
-                cb_result = self._on_champion_adopted(
-                    submission, round_id, certificate=certificate,
-                )
-                if inspect.isawaitable(cb_result):
-                    await cb_result
-            except Exception as exc:
-                logger.warning("on_champion_adopted callback failed: %s", exc)
-
         return result
 
     def set_leader_check(self, is_leader: Any) -> None:
@@ -554,7 +595,8 @@ class EpochManager:
         self._is_leader = is_leader
 
     def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
-        """Best-effort fire the reject callback (PR comment + close + GC). Sync —
+        """Best-effort fire the reject callback (PR comment + image GC; the PR is
+        left OPEN — only a merge closes a PR). Sync —
         called from the round-evaluation path; the callback itself is sync GitHub
         API. No-op without a callback / a PR-based submission.
 

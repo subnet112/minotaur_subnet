@@ -53,6 +53,19 @@ findings".)
    publish immutable `:sha-<short>` for audit) closes the
    `docker-publish push:[main] → :latest → GENESIS_SOLVER_IMAGE` alternate path.
 
+   **The merge is a hard precondition for adoption (always-on).** Despite the digest
+   transport above, a champion is NOT adopted unless its on-chain attestation AND its
+   PR squash-merge both succeed. At the activation commit boundary the leader runs the
+   attestation + merge FIRST, and if either fails — no on-chain proof, or an
+   unmergeable PR (e.g. the miner pushed the head past the certified commit, so the
+   cert no longer binds the head SHA) — the round aborts (`merge_failed`), the champion
+   is left unchanged, and the failure is mirrored onto the miner's PR via the same
+   reject-feedback path used for benchmark rejections. This is **unconditional — there
+   is no env var to disable it**. The certified image digest is still what the fleet
+   RUNS at runtime; the gate just ensures a champion that can't be recorded on-chain +
+   on `main` never earns weights. A failure **never closes a PR** — only a successful
+   merge closes one — so the miner can fix the head and iterate on the same PR.
+
 ## What this PR ships (inert under the freeze)
 
 - `relayer/solver_repo.py`: ABI `getLatestChampion`/`getQuorumRequired`,
