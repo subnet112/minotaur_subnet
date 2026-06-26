@@ -61,7 +61,10 @@ TIMEOUTS: dict[str, float] = {
     Command.SERIALIZE_STATE: 30.0,
     Command.RESTORE_STATE: 30.0,
     Command.METADATA: 5.0,
-    Command.QUOTE: 5.0,
+    # Live quote path hits real RPC (Base/Aerodrome pool reads) and runs ~10s,
+    # so 5s killed the live solver mid-quote (crash/respawn loop). Bumped to 15s
+    # for headroom. (scoring_lab/fork.py further raises this to 45s for lab runs.)
+    Command.QUOTE: 15.0,
     Command.SHUTDOWN: 5.0,
 }
 
