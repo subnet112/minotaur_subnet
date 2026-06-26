@@ -174,6 +174,10 @@ async def test_merge_gate_aborts_when_merge_fails(monkeypatch):
     m._round_store.activate_round.assert_not_called()
     # The miner is told WHY on the PR (same reject-feedback path as benchmark fails).
     m._notify_champion_rejected.assert_called_once()
+    # And the candidate is TERMINAL-rejected so it can never re-enter a weight
+    # mapping (it would otherwise stay SCORED and rank #1 by score).
+    m._sub_store.reject.assert_called_once()
+    assert m._sub_store.reject.call_args[0][0] == "sub_chal"
     assert result["champion_changed"] is False
     assert result["abort_reason"] == "merge_failed"
     assert result["next_round_id"] == "r2"
@@ -192,6 +196,8 @@ async def test_merge_gate_commits_when_merge_succeeds(monkeypatch):
 
     m._on_champion_adopted.assert_called_once()
     m._hot_swap.assert_awaited_once()
+    # A successful merge must NOT reject the winner.
+    m._sub_store.reject.assert_not_called()
     assert result["champion_changed"] is True
     assert "abort_reason" not in result
 

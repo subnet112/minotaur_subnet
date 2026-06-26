@@ -561,6 +561,17 @@ class EpochManager:
                 "after submitting). The round was aborted and the champion is "
                 "unchanged; re-submit with the PR head pinned to the certified commit.",
             )
+            # Terminal-reject so a merge-failed winner can NEVER earn weight. The
+            # abort otherwise leaves the submission SCORED, and _eligible_candidates
+            # ranks SCORED/ADOPTED by score — so this (top-scoring) candidate would
+            # re-enter a weight emission the moment one is epoch-scoped rather than
+            # round-scoped. REJECTED is terminal and excluded by _eligible_candidates,
+            # so the weights vector is closed BY CONSTRUCTION (image/solver are already
+            # blocked by this early return preceding _hot_swap).
+            self._sub_store.reject(
+                submission.submission_id,
+                "merge gate: on-chain attest and/or PR squash-merge failed — not adopted",
+            )
             next_round = self._complete_round(
                 round_state, epoch, activated=False, abort_reason="merge_failed",
             )
