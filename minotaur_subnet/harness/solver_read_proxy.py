@@ -53,6 +53,16 @@ class ReadProxyConfig:
     budget: int = 0
 
 
+# The deterministic per-scenario RPC-read budget — a CONSENSUS-UNIFORM CODE
+# CONSTANT (like EPOCH_SECONDS / the cost-table version), NOT a per-validator env,
+# so the whole fleet enforces the SAME cutoff and folds the SAME value into the
+# benchmark pack hash. A bare :stable validator therefore gets the same B as the
+# fleet with no env to set. Calibrated generous: the observed per-scenario max via
+# the proxy is ~300 reads (cold DAI multi-hop), so 5000 is ~16x headroom — legit
+# scenarios always pass; only a runaway loop is cut. Tighten only fleet-wide.
+DEFAULT_GENERATE_PLAN_BUDGET = 5000
+
+
 def read_proxy_config() -> ReadProxyConfig | None:
     """Resolve the proxy wiring from the environment, or ``None`` if disabled.
 
@@ -83,15 +93,26 @@ def read_proxy_config() -> ReadProxyConfig | None:
     except ValueError:
         logger.error("SOLVER_READ_PROXY_CHAINS not a csv of ints: %r; using (8453,)", raw)
         chains = (8453,)
-    # Budget: invalid/unset/non-positive -> 0 (observe; inert as a cutoff).
+    # Budget: UNSET -> the uniform code constant (default-on, consensus-bound; so a
+    # bare :stable validator enforces the SAME B as the fleet with no env). An
+    # explicit positive value overrides (dev/tuning — but a non-uniform value splits
+    # the pack hash, same discipline as ROUND_ANCHORED_PIN). Explicit 0 disables
+    # (observe; emergency only). Invalid/negative -> the constant (fail-safe to the
+    # uniform default rather than silently dropping ONE node to observe).
     raw_budget = os.environ.get("SOLVER_READ_PROXY_BUDGET", "").strip()
-    try:
-        budget = int(raw_budget) if raw_budget else 0
-    except ValueError:
-        logger.error("SOLVER_READ_PROXY_BUDGET not an int: %r; using 0 (observe)", raw_budget)
-        budget = 0
-    if budget < 0:
-        budget = 0
+    if not raw_budget:
+        budget = DEFAULT_GENERATE_PLAN_BUDGET
+    else:
+        try:
+            budget = int(raw_budget)
+        except ValueError:
+            logger.error(
+                "SOLVER_READ_PROXY_BUDGET not an int: %r; using default %d",
+                raw_budget, DEFAULT_GENERATE_PLAN_BUDGET,
+            )
+            budget = DEFAULT_GENERATE_PLAN_BUDGET
+        if budget < 0:
+            budget = DEFAULT_GENERATE_PLAN_BUDGET
     return ReadProxyConfig(
         url=base.rstrip("/"),
         control_url=control.rstrip("/"),
