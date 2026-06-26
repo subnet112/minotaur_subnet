@@ -327,6 +327,9 @@ class AppIntentStore:
                 CREATE TABLE IF NOT EXISTS developer_links(
                     app_id TEXT PRIMARY KEY, evm_deployer TEXT NOT NULL,
                     ss58 TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS consumed_payments(
+                    payment_ref TEXT PRIMARY KEY, app_id TEXT NOT NULL,
+                    consumed_at REAL);
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
                 """
@@ -554,6 +557,39 @@ class AppIntentStore:
                 "evm_deployer=excluded.evm_deployer, ss58=excluded.ss58",
                 (app_id, (evm_deployer or "").strip().lower(), ss58),
             )
+
+    # ── consumed deploy-fee payments ──────────────────────────────────────
+    #
+    # One on-chain payment authorizes exactly one deploy. The payment verifier
+    # consumes the payment reference here after confirming it on-chain.
+
+    def consume_payment_ref(self, payment_ref: str, app_id: str) -> tuple[bool, str]:
+        """Atomically mark ``payment_ref`` spent. Rejects if already consumed,
+        so a single payment can't authorize a second deploy. Serialized via
+        ``BEGIN IMMEDIATE``. Returns ``(ok, error)``.
+        """
+        ref = (payment_ref or "").strip()
+        if not ref:
+            return False, "payment_ref is required"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT app_id FROM consumed_payments WHERE payment_ref=?", (ref,)
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("ROLLBACK")
+                    return False, "payment already used for a deploy"
+                conn.execute(
+                    "INSERT INTO consumed_payments(payment_ref, app_id, consumed_at) "
+                    "VALUES(?,?,?)",
+                    (ref, app_id, time.time()),
+                )
+                conn.execute("COMMIT")
+                return True, ""
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # ── wallets ──────────────────────────────────────────────────────────
 
