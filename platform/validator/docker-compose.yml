@@ -379,6 +379,13 @@ services:
       # explicit; set it to "0" only as a break-glass.
       ALLOW_CHAMPION_HOT_SWAP: "1"
       DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+      # Pin the docker client API version. Unpinned, the modern CLI negotiates a version
+      # whose probe the socket-proxy 403s for `docker inspect <id>` — which leaves the
+      # api-launched proxy unable to detect an api-image change (it falls back to leaving
+      # the running proxy, so it wouldn't track a consensus-relevant rewrite-table version
+      # bump). Pinned, inspect works and the proxy is refreshed when the api image changes.
+      # (Watchtower pins this too, for the same socket-proxy reason.)
+      DOCKER_API_VERSION: "1.45"
 
       # Benchmark sandbox network — the api launches solver containers
       # into this sealed network so they can't reach the internet but
