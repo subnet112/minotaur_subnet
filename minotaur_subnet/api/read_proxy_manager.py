@@ -94,17 +94,26 @@ def _export_env(token: str) -> None:
         os.environ.setdefault("SOLVER_READ_PROXY_TOKEN", token)
 
 
-async def _proxy_is_running() -> bool:
-    """True if the managed proxy container is up — via ``docker ps`` (NOT inspect).
+async def _proxy_state() -> tuple[bool, str]:
+    """``(running?, image)`` of the managed proxy.
 
-    ``docker ps`` is ``GET /containers/json``, which the docker-socket-proxy allows even
-    on deployments where ``docker inspect <id>`` (``GET /containers/<id>/json``) returns
-    403 — the exact failure that silently un-wired the api and caused raw-anvil reads.
+    Tries ``docker inspect`` (precise image — so the proxy can be RECREATED when the api
+    image changes, e.g. a consensus-relevant rewrite-table version bump; needs the docker
+    CLI's API version pinned via ``DOCKER_API_VERSION``, else the unpinned CLI's version
+    negotiation gets a 403 from the socket-proxy). Falls back to ``docker ps``
+    (running-only, image ``""``) where inspect is denied — ``GET /containers/json`` is
+    allowed even where ``GET /containers/<id>/json`` 403s. Never blocks on the socket.
     """
+    rc, out, _ = await _docker(
+        "inspect", PROXY_CONTAINER_NAME, "--format", "{{.State.Running}}|{{.Image}}",
+    )
+    if rc == 0 and "|" in out:
+        running, image = (out.split("|", 1) + [""])[:2]
+        return running.strip() == "true", image.strip()
     rc, names, _ = await _docker(
         "ps", "--filter", f"name=^{PROXY_CONTAINER_NAME}$", "--format", "{{.Names}}",
     )
-    return rc == 0 and PROXY_CONTAINER_NAME in names.split()
+    return (rc == 0 and PROXY_CONTAINER_NAME in names.split()), ""
 
 
 async def _resolve_self_image_and_net() -> tuple[str, str | None]:
@@ -159,13 +168,21 @@ async def ensure_read_proxy_container() -> bool:
     # (1) WIRE FIRST — unconditional, no docker call (fixed proxy address).
     _export_env(token)
 
-    # (2) Already running? Leave it (running-check via `docker ps`, survives the 403).
-    if await _proxy_is_running():
-        logger.info("[read-proxy] env wired to %s; managed proxy already running", PROXY_DATA_URL)
-        return True
-
-    # (3) Not running — launch it from the api's image on the sandbox + minotaur nets.
+    # (2) Resolve the api's OWN image (to launch/refresh the proxy from it) + minotaur net.
     image, minotaur_net = await _resolve_self_image_and_net()
+
+    # (3) If the proxy is already running, leave it ONLY when it's on the api's current
+    # image — so the proxy TRACKS the api (a consensus-relevant rewrite-table version bump
+    # must not leave a stale proxy applying old rewrites). When we can't compare images
+    # (inspect denied -> ''), fall back to leaving a running proxy alone (#301 robustness:
+    # never block on the socket; a stale proxy is the rare, opt-in-only risk then).
+    running, proxy_image = await _proxy_state()
+    if running and (not image or not proxy_image or proxy_image == image):
+        logger.info(
+            "[read-proxy] env wired to %s; managed proxy running (%s)", PROXY_DATA_URL,
+            "current image" if proxy_image and proxy_image == image else "image uncompared",
+        )
+        return True
     if not image:
         logger.error(
             "[read-proxy] env wired to %s but could NOT determine the api image to launch "
@@ -174,10 +191,15 @@ async def ensure_read_proxy_container() -> bool:
             PROXY_DATA_URL,
         )
         return False
-    await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # clear any stopped/stale instance
+    if running:
+        logger.info(
+            "[read-proxy] proxy on stale image %s != api %s — recreating to track the api",
+            proxy_image[:19], image[:19],
+        )
+    await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # clear any stale/stopped instance
     sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
-    # NOTE: no Watchtower label — the api owns this container's lifecycle. (It is left in
-    # place if already running; to force an update, remove it and restart the api.)
+    # NOTE: no Watchtower label — the api owns this container's lifecycle: it recreates the
+    # proxy from its OWN image when they diverge (api update) and leaves it otherwise.
     create = [
         "run", "-d", "--name", PROXY_CONTAINER_NAME, "--restart", "unless-stopped",
         "--network", sandbox, "--ip", PROXY_STATIC_IP,

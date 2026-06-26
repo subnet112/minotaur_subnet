@@ -35,41 +35,80 @@ def test_disabled_skips_docker(monkeypatch):
     assert os.environ.get("SOLVER_READ_PROXY") is None
 
 
-def test_env_wired_when_proxy_already_running(monkeypatch):
-    # The lead's steady state: proxy up → `docker ps` confirms → env wired, no launch.
-    _clear_env(monkeypatch)
-    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
-    fake = FakeDocker([(0, "minotaur-rpc-pin-proxy", "")])  # _proxy_is_running -> present
-    monkeypatch.setattr(rpm, "_docker", fake)
-    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
-    assert not any(c and c[0] == "run" for c in fake.calls)        # no relaunch
-    assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL   # env WIRED
-    assert os.environ["SOLVER_READ_PROXY_TOKEN"] == "tok"
-
-
-def test_env_wired_even_when_docker_inspect_403(monkeypatch):
-    # ROOT-CAUSE FIX: proxy not running AND both inspect + ps-fallback fail (socket-proxy
-    # 403) -> the env is STILL exported. The api routes to a previously-launched proxy /
-    # fails loud — it NEVER silently falls back to the raw anvil (the repoint intermittency).
+def test_proxy_running_current_image_left_alone(monkeypatch):
+    # inspect works: proxy running on the api's CURRENT image -> leave it, env wired.
     _clear_env(monkeypatch)
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
-        (0, "", ""),                # _proxy_is_running: docker ps -> empty (not running)
-        (1, "", "403 Forbidden"),   # docker inspect self -> 403
-        (1, "", "403 Forbidden"),   # docker ps id-fallback -> also denied
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # _resolve_self -> api image
+        (0, "true|sha256:img", ""),                         # _proxy_state -> running, SAME image
     ])
     monkeypatch.setattr(rpm, "_docker", fake)
-    assert asyncio.run(rpm.ensure_read_proxy_container()) is False    # couldn't launch
-    assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL      # but env IS wired (THE FIX)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
+    assert not any(c and c[0] == "run" for c in fake.calls)        # no relaunch
+    assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL
+    assert os.environ["SOLVER_READ_PROXY_TOKEN"] == "tok"
 
 
-def test_launch_when_absent_inspect_works(monkeypatch):
+def test_proxy_stale_image_recreated(monkeypatch):
+    # inspect works: proxy running on a STALE image -> recreate so it tracks the api.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    fake = FakeDocker([
+        (0, "sha256:NEW|minotaur benchmark-sandbox ", ""),  # api image NEW
+        (0, "true|sha256:OLD", ""),                         # proxy running OLD image
+        (0, "", ""),                                        # rm -f
+        (0, "cid", ""),                                     # run
+        (0, "", ""),                                        # network connect
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
+    assert any(c[:2] == ("rm", "-f") for c in fake.calls)   # removed stale
+    assert any(c and c[0] == "run" for c in fake.calls)     # recreated on the new image
+
+
+def test_env_wired_inspect_403_running_proxy_left(monkeypatch):
+    # inspect 403s for BOTH self + proxy -> ps fallbacks (api image via ps; proxy running,
+    # image UNcompared) -> leave it. env wired throughout (the #301 robustness path).
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    fake = FakeDocker([
+        (1, "", "403 Forbidden"),                                          # inspect self -> 403
+        (0, "ghcr.io/x:latest|production_minotaur,benchmark-sandbox", ""),  # self ps fallback
+        (1, "", "403 Forbidden"),                                          # inspect proxy -> 403
+        (0, "minotaur-rpc-pin-proxy", ""),                                 # proxy ps -> running
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
+    assert not any(c and c[0] == "run" for c in fake.calls)       # left alone (uncompared)
+    assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL
+
+
+def test_env_wired_even_when_all_docker_fails(monkeypatch):
+    # ROOT-CAUSE FIX: every docker call 403s + proxy not running -> can't launch (False),
+    # BUT the env is STILL wired -> the api never silently reads the raw anvil.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    fake = FakeDocker([
+        (1, "", "403 Forbidden"),   # inspect self -> 403
+        (1, "", "403 Forbidden"),   # self ps fallback -> 403  (api image = "")
+        (1, "", "403 Forbidden"),   # inspect proxy -> 403
+        (1, "", "403 Forbidden"),   # proxy ps -> 403  (running=False)
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is False
+    assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL  # env wired (THE FIX)
+
+
+def test_launch_when_absent(monkeypatch):
+    # proxy not running, inspect works -> launch from the api image.
     _clear_env(monkeypatch)
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok123")
     monkeypatch.setenv("BASE_RPC_URL", "https://base.example")
     fake = FakeDocker([
-        (0, "", ""),                                           # not running
-        (0, "sha256:apiimg|minotaur benchmark-sandbox ", ""),  # inspect self OK
+        (0, "sha256:apiimg|minotaur benchmark-sandbox ", ""),  # api image
+        (1, "", "No such object"),                             # proxy inspect -> absent
+        (0, "", ""),                                           # proxy ps -> empty (not running)
         (0, "", ""),                                           # rm -f
         (0, "cid", ""),                                        # run
         (0, "", ""),                                           # network connect
@@ -86,16 +125,17 @@ def test_launch_when_absent_inspect_works(monkeypatch):
 
 
 def test_launch_via_ps_fallback_when_inspect_403(monkeypatch):
-    # inspect-by-id 403s -> fall back to `docker ps` to resolve the api image + net.
+    # self-inspect 403s -> ps fallback resolves the api image + net; proxy not running -> launch.
     _clear_env(monkeypatch)
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
-        (0, "", ""),                                  # not running
-        (1, "", "403 Forbidden"),                     # inspect self -> 403
-        (0, "ghcr.io/x/img:latest|production_minotaur,benchmark-sandbox", ""),  # ps fallback
-        (0, "", ""),                                  # rm -f
-        (0, "cid", ""),                               # run
-        (0, "", ""),                                  # network connect
+        (1, "", "403 Forbidden"),                                          # inspect self -> 403
+        (0, "ghcr.io/x/img:latest|production_minotaur,benchmark-sandbox", ""),  # self ps fallback
+        (1, "", "No such object"),                                         # proxy inspect -> absent
+        (0, "", ""),                                                       # proxy ps -> not running
+        (0, "", ""),                                                       # rm -f
+        (0, "cid", ""),                                                    # run
+        (0, "", ""),                                                       # network connect
     ])
     monkeypatch.setattr(rpm, "_docker", fake)
     assert asyncio.run(rpm.ensure_read_proxy_container()) is True
@@ -110,8 +150,9 @@ def test_create_failure_still_wires_env(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
-        (0, "", ""),                                          # not running
-        (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # inspect self OK
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # api image
+        (1, "", "No such object"),                           # proxy inspect -> absent
+        (0, "", ""),                                          # proxy ps -> not running
         (0, "", ""),                                          # rm -f
         (1, "", "Address already in use"),                   # run FAILS
     ])
