@@ -407,17 +407,23 @@ def delete_candidate_image(pr_number: int) -> bool:
     return False  # no matching tag (already pruned / never pushed)
 
 
-def _render_reject_body(
+def _render_report_body(
     submission: Any,
     reason: str,
     champion_score: float | None,
     dethrone_margin: float | None,
     champion_details: dict | None = None,
+    *,
+    won: bool = False,
 ) -> str:
-    """PR-comment body for a rejection: the full scored benchmark report when the
-    submission was benchmarked (with the champion per-case comparison and any
-    revert traces), else the concise reason. Never raises."""
-    fallback = f"### ❌ Submission rejected\n\n{reason}"
+    """PR-comment body for a champion-consensus outcome: the full scored benchmark
+    report when the submission was benchmarked (with the champion per-case
+    comparison and any revert traces), else the concise reason. ``won=True`` renders
+    it as a win (header + fallback), otherwise as a rejection. Never raises."""
+    fallback = (
+        f"### 🏆 Beat the champion\n\n{reason}" if won
+        else f"### ❌ Submission rejected\n\n{reason}"
+    )
     try:
         from minotaur_subnet.api.routes.submissions.report import (
             build_submission_report,
@@ -433,6 +439,7 @@ def _render_reject_body(
             dethrone_margin=(dethrone_margin if dethrone_margin is not None else DETHRONE_MARGIN),
             reason=reason,
             champion_details=champion_details,
+            won=won,
         )
         if not report:
             return fallback
@@ -473,7 +480,7 @@ def on_champion_rejected_pr(
             getattr(submission, "submission_id", "?"),
         )
         return False
-    body = report_md or _render_reject_body(
+    body = report_md or _render_report_body(
         submission, reason, champion_score, dethrone_margin, champion_details,
     )
     commented = comment_on_pr(pr_number, body)
@@ -484,6 +491,46 @@ def on_champion_rejected_pr(
         pr_number, commented, closed, gced,
     )
     return closed
+
+
+def on_champion_finalist_pr(
+    submission: Any,
+    reason: str,
+    report_md: str | None = None,
+    *,
+    champion_score: float | None = None,
+    dethrone_margin: float | None = None,
+    champion_details: dict | None = None,
+) -> bool:
+    """WIN path: comment the full scored report on a WINNING candidate's PR so
+    winners get feedback even when the round later fails to certify — and NEVER
+    close the PR (the winner's PR must stay open for the cert-gated merge).
+
+    Mirrors the leader's finalist selection (the candidate beat the champion by
+    the dethrone margin) onto the miner's PR. Unlike the reject path, this only
+    comments — no ``close_pr`` and no candidate-image GC.
+
+    When ``report_md`` isn't supplied, builds the full per-case benchmark report
+    (your score vs the champion per case, the dethrone gap, every case
+    worst-first, and per-step revert traces) from the submission, given
+    ``champion_score`` / ``dethrone_margin`` / ``champion_details``."""
+    pr_number = getattr(submission, "pr_number", None)
+    if not pr_number:
+        logger.info(
+            "Champion finalist for %s has no pr_number — skipping PR comment",
+            getattr(submission, "submission_id", "?"),
+        )
+        return False
+    body = report_md or _render_report_body(
+        submission, reason, champion_score, dethrone_margin, champion_details,
+        won=True,
+    )
+    commented = comment_on_pr(pr_number, body)
+    logger.info(
+        "Champion finalist PR#%s: comment=%s (kept open for cert-gated merge)",
+        pr_number, commented,
+    )
+    return commented
 
 
 def _parse_github_owner_repo() -> tuple[str, str] | None:

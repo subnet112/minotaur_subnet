@@ -2018,10 +2018,12 @@ async def initialize(ctx: ServerContext) -> dict:
 
             _champion_merge_fn = None
             _champion_reject_fn = None
+            _champion_finalist_fn = None
             if os.environ.get("SOLVER_REPO_URL", "").strip() or os.environ.get("SOLVER_REPO_PATH", "").strip():
                 from minotaur_subnet.relayer.solver_repo import (
                     assert_solver_repo_token_not_admin,
                     on_champion_adopted_pr,
+                    on_champion_finalist_pr,
                     on_champion_rejected_pr,
                 )
                 # The leader's solver-repo token must NOT be admin-scoped (an admin
@@ -2044,6 +2046,7 @@ async def initialize(ctx: ServerContext) -> dict:
                     assert_solver_repo_token_not_admin()  # adoption LIVE → hard-fail if admin
                 _champion_merge_fn = on_champion_adopted_pr
                 _champion_reject_fn = on_champion_rejected_pr
+                _champion_finalist_fn = on_champion_finalist_pr
                 logger.info(
                     "Champion adoption: on-chain attestation + leader-authority merge (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
@@ -2059,6 +2062,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 runtime_builder=_build_live_solver,
                 on_champion_adopted=_champion_merge_fn,
                 on_champion_rejected=_champion_reject_fn,
+                on_champion_finalist=_champion_finalist_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
