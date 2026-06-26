@@ -184,6 +184,40 @@ def _challenger_quorum_mode() -> bool:
     return raw.strip().lower() not in _CHALLENGER_QUORUM_OFF_VALUES
 
 
+def _consolidate_champion_bench() -> bool:
+    """Whether to MEMOIZE the champion benchmark within a round so the two
+    champion-run paths (dethrone re-bench in ``_refresh_incumbent_score`` and the
+    trustless quorum verdict in ``_independent_adopt_vote``) share ONE result
+    instead of each re-running the champion solver. **DEFAULT OFF.**
+
+    Pure compute optimization: a cached result is reused ONLY when round_id +
+    champion image + fork block + corpus fingerprint + real-sim mode all match,
+    so a hit is provably the SAME deterministic computation — the verdict and the
+    persisted score are byte-identical to recomputing. Flag-gated so the saving
+    can be enabled + validated separately. Off → both paths recompute (legacy).
+    """
+    import os
+
+    return os.environ.get("CONSOLIDATE_CHAMPION_BENCH", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+# PROCESS-WIDE champion-benchmark memo. Must be shared, NOT per-worker: the
+# dethrone re-bench runs on the EpochManager's worker while the quorum verdict
+# (_reactive_benchmark_candidate) constructs a FRESH BenchmarkWorker, so a
+# per-instance cache would never share and the consolidation would be a no-op.
+# Sharing across instances is safe because the key fully + deterministically
+# describes the result (round, image, fork block, real-sim, corpus, scoring-JS).
+_CHAMPION_BENCH_CACHE: dict[tuple, list] = {}
+_CHAMPION_BENCH_CACHE_MAX = 32  # hard backstop; normally holds only the current round
+
+
+def _clear_champion_bench_cache() -> None:
+    """Reset the process-wide champion-bench memo (test hook / operational reset)."""
+    _CHAMPION_BENCH_CACHE.clear()
+
+
 class BenchmarkWorker:
     """Processes BENCHMARKING submissions by scoring them against active intents.
 
@@ -232,6 +266,88 @@ class BenchmarkWorker:
         # (the shared BlockLoop engine already hot-reloads this way; this worker
         # keeps its own engine, so it needs the same hash-diff).
         self._loaded_js_hashes: dict[str, str] = {}
+
+    def _corpus_fingerprint(self, intents: list) -> str:
+        """Stable hash of the corpus IDENTITY (ordered scenario labels), using the
+        same ``app_id[:scenario_name]`` labelling as the reference-quote pre-pass.
+        Guards the champion memo: a different corpus → different fingerprint → no
+        reuse. Robust to missing fields (label degrades to app_id)."""
+        import hashlib
+
+        labels = []
+        for intent, state, _snapshot in intents:
+            scenario_name = ""
+            try:
+                scenario_name = state.control_view().get("_scenario_name", "") or ""
+            except Exception:
+                scenario_name = ""
+            app_id = getattr(intent, "app_id", "") or ""
+            labels.append(f"{app_id}:{scenario_name}" if scenario_name else app_id)
+        return hashlib.sha256("\n".join(labels).encode()).hexdigest()[:16]
+
+    def _loaded_js_fingerprint(self, intents: list) -> str:
+        """Hash of the scoring-JS versions CURRENTLY loaded for the corpus's apps.
+
+        Both champion paths call ``_build_score_fn`` (which hot-reloads JS and
+        records ``_loaded_js_hashes``) before the memo, so this captures the exact
+        scoring used. Folded into the key so a mid-round ``PUT /scoring`` update
+        invalidates the memo — otherwise a result scored with the OLD JS could be
+        reused for a verdict expecting the NEW JS (a wrong vote)."""
+        import hashlib
+
+        app_ids = sorted({getattr(intent, "app_id", "") or "" for intent, _, _ in intents})
+        parts = [f"{a}={self._loaded_js_hashes.get(a, '')}" for a in app_ids]
+        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+    async def memo_champion_bench(
+        self,
+        *,
+        round_id: str | None,
+        image: str | None,
+        fork_block: int | None,
+        intents: list,
+        require_real_sim: bool,
+        run: Any,
+    ) -> list[BenchmarkResult]:
+        """Run (or reuse) the champion benchmark for this round, via the PROCESS-WIDE
+        memo so the dethrone re-bench and the quorum verdict (different worker
+        instances) share ONE result.
+
+        ``run`` is the caller's own async benchmark thunk (it owns session setup +
+        exception semantics). Returns the cached result ONLY on an exact key match —
+        round_id, image, fork_block, real-sim, corpus fingerprint, AND scoring-JS
+        fingerprint — i.e. the identical deterministic computation, so a follower's
+        verdict and persisted score are unchanged. Disabled (always recompute) when
+        the flag is off, the key is incomplete (no round_id/image), or fork_block is
+        None — a None pin means live-head (dev), where reuse across blocks is unsafe.
+        """
+        if (
+            not _consolidate_champion_bench()
+            or not round_id or not image or fork_block is None
+        ):
+            return await run()
+        key = (
+            round_id, image, int(fork_block), bool(require_real_sim),
+            self._corpus_fingerprint(intents), self._loaded_js_fingerprint(intents),
+        )
+        hit = _CHAMPION_BENCH_CACHE.get(key)
+        if hit is not None:
+            logger.info(
+                "[champion-bench] reuse cached champion run round=%s image=%s "
+                "(consolidated; skipped a redundant benchmark)", round_id, image,
+            )
+            return hit
+        results = await run()
+        if isinstance(results, list):
+            # Bound to the current round (drop stale rounds in place), with a hard
+            # cap backstop. In-place mutation keeps concurrent readers consistent;
+            # concurrent misses just recompute (no saving) — never a wrong result.
+            for k in [k for k in _CHAMPION_BENCH_CACHE if k[0] != round_id]:
+                _CHAMPION_BENCH_CACHE.pop(k, None)
+            if len(_CHAMPION_BENCH_CACHE) >= _CHAMPION_BENCH_CACHE_MAX:
+                _CHAMPION_BENCH_CACHE.clear()
+            _CHAMPION_BENCH_CACHE[key] = results
+        return results
 
     def set_epoch_block(self, block_number: int) -> None:
         """Set the block number for this epoch's snapshot.

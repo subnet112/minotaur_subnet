@@ -437,18 +437,38 @@ async def _independent_adopt_vote(
 
     _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
-    champ_session = await orch.start_docker(champ_image)
+
+    async def _run_champ():
+        champ_session = await orch.start_docker(champ_image)
+        try:
+            return await run_benchmark(
+                champ_session,
+                intents,
+                config=BenchmarkConfig(
+                    chain_ids=list({s.chain_id for _, s, _ in intents} or {1}),
+                ),
+                score_fn=score_fn,
+                simulator=simulator,
+                require_real_sim=_require_real_sim,
+                fork_block=worker._epoch_block_number,
+            )
+        finally:
+            await champ_session.shutdown()
+
     try:
-        champ_results = await run_benchmark(
-            champ_session,
-            intents,
-            config=BenchmarkConfig(
-                chain_ids=list({s.chain_id for _, s, _ in intents} or {1}),
-            ),
-            score_fn=score_fn,
-            simulator=simulator,
-            require_real_sim=_require_real_sim,
+        # Champion run #2 (the quorum verdict). When CONSOLIDATE_CHAMPION_BENCH is
+        # on and the key matches the dethrone re-bench (same round/image/fork/corpus
+        # /real-sim), REUSE that result — it is the identical deterministic
+        # computation, so this validator's verdict is unchanged. On a cache hit
+        # _run_champ never executes (no champion session is started). Off → runs
+        # _run_champ directly, exactly as before.
+        champ_results = await worker.memo_champion_bench(
+            round_id=round_id,
+            image=champ_image,
             fork_block=worker._epoch_block_number,
+            intents=intents,
+            require_real_sim=_require_real_sim,
+            run=_run_champ,
         )
     except RealSimulationUnavailable:
         logger.error(
@@ -457,8 +477,6 @@ async def _independent_adopt_vote(
             candidate.submission_id,
         )
         return False, chal_score
-    finally:
-        await champ_session.shutdown()
 
     champ_score = worker._compute_avg_score(champ_results)
     champ_card = worker._build_scorecard(champ_results).to_dict()

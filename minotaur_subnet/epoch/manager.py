@@ -804,8 +804,31 @@ class EpochManager:
                 except Exception:
                     pass  # fall through with synthetic-only scenarios
 
-            results = await self._benchmark_worker._benchmark_submission(
-                image_tag, intents, score_fn,
+            # Champion run (the dethrone bar). Route through the per-round memo so
+            # a follower's quorum verdict (_independent_adopt_vote) can REUSE this
+            # exact champion result instead of re-benchmarking the champion a
+            # second time. CONSOLIDATE_CHAMPION_BENCH off → a plain re-bench,
+            # byte-identical to before.
+            _memo_round_id = None
+            if self._round_store is not None:
+                try:
+                    _mcr = self._round_store.get_current_round()
+                    _memo_round_id = _mcr.round_id if _mcr is not None else None
+                except Exception:
+                    _memo_round_id = None
+
+            async def _run_champion_bench():
+                return await self._benchmark_worker._benchmark_submission(
+                    image_tag, intents, score_fn,
+                )
+
+            results = await self._benchmark_worker.memo_champion_bench(
+                round_id=_memo_round_id,
+                image=image_tag,
+                fork_block=getattr(self._benchmark_worker, "_epoch_block_number", None),
+                intents=intents,
+                require_real_sim=getattr(self._benchmark_worker, "_require_real_sim", False),
+                run=_run_champion_bench,
             )
             if not isinstance(results, list):
                 self._incumbent_refresh_failed = True  # bad benchmark → stale bar
