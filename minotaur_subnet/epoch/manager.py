@@ -558,7 +558,11 @@ class EpochManager:
         divergent) report. Only the configured leader mirrors it."""
         if self._on_champion_rejected is None:
             return
-        if self._is_leader is not None and not self._is_leader():
+        # Defensive read: the reaper path can construct an EpochManager via __new__
+        # (bypassing __init__ where _is_leader is set), so use getattr to avoid an
+        # AttributeError that the reaper would swallow and silently skip the reject.
+        _is_leader = getattr(self, "_is_leader", None)
+        if _is_leader is not None and not _is_leader():
             return  # followers don't post — the leader is the single source
         if not getattr(submission, "pr_number", None):
             return
