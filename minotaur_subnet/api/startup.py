@@ -964,6 +964,21 @@ async def initialize(ctx: ServerContext) -> dict:
             "Invalid runtime security profile: " + "; ".join(runtime_violations),
         )
 
+    # ── block-pin RPC proxy (api-managed) ────────────────────────────────
+    # Launch the deterministic-read proxy as a managed container BEFORE the
+    # benchmark worker / reactive verification so the read path is wired when the
+    # first benchmark runs. The api owns it (not a compose service) so the whole
+    # determinism rollout rides the normal :stable image update — zero operator
+    # action. Runs on leaders (proactive bench) AND followers (reactive champion
+    # verification); both score through the same run_benchmark read path. Never
+    # blocks startup — on failure the read path stays unwired and benchmarks fail
+    # loud (drop from quorum) rather than mis-score.
+    from minotaur_subnet.api.read_proxy_manager import ensure_read_proxy_container
+    try:
+        await ensure_read_proxy_container()
+    except Exception as exc:
+        logger.error("[read-proxy] manager raised (continuing startup): %s", exc)
+
     # ── benchmark worker ─────────────────────────────────────────────────
     sub_store = None
     benchmark_worker_enabled = os.environ.get(
