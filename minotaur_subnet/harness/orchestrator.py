@@ -947,6 +947,19 @@ async def run_benchmark(
     # the timeout + cross-host non-determinism source). Inert unless set.
     _read_proxy = read_proxy_config()
     _proxy_session_id: str | None = None
+    # Safety net (closes the silent-anvil determinism channel): the proxy IS the
+    # deterministic read path. If it's configured but we have no fork_block to pin to,
+    # refuse to benchmark via the raw, un-pinned anvil — defer LOUD rather than silently
+    # diverge cross-host. Normally fork_block is always set when the proxy is active (the
+    # worker resolves the round-anchored pin before benchmarking); this guards any path
+    # that reaches run_benchmark without one (and the historical bug where the read-proxy
+    # env failed to wire, so reads fell back to the anvil).
+    if _read_proxy is not None and rpc_map and fork_block is None:
+        raise RealSimulationUnavailable(
+            "SOLVER_READ_PROXY is configured (the deterministic read path) but no "
+            "fork_block was resolved for this benchmark — refusing to read the raw anvil "
+            "(non-deterministic, silent cross-host divergence)."
+        )
     if _read_proxy is not None and fork_block is not None and rpc_map:
         pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
         if pin_blocks:
