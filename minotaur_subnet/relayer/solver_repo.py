@@ -374,6 +374,66 @@ def close_pr(pr_number: int) -> bool:
     return status == 200
 
 
+def close_stale_submission_prs(
+    winner_pr_number: int,
+    *,
+    champion_label: str = "the new champion",
+) -> int:
+    """Close OTHER open miner-submission PRs after a champion's PR merges to main.
+
+    A champion merge advances ``main`` to its ``solver.py``. Every other open
+    submission PR replaces ``solver.py`` too, so they ALL become conflicting against
+    the new ``main`` and can no longer be merged/adopted — even if they win a future
+    benchmark — until rebased. Close them (with a rebase instruction) so the miner
+    resubmits on the new base. This is a DISTINCT trigger from the per-round reject
+    path (``on_champion_rejected_pr`` keeps PRs OPEN): here the base itself moved.
+
+    Only FORK PRs (head owned by a non-canonical account) are closed — team branch
+    PRs on the solver repo are left alone — and the just-merged ``winner_pr_number``
+    is skipped (the merge already closed it). Best-effort; returns the count closed.
+    """
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None:
+        return 0
+    owner, repo = owner_repo
+    status, prs = _github_api_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=100",
+    )
+    if status != 200 or not isinstance(prs, list):
+        logger.warning("close-stale: could not list open PRs (HTTP %s)", status)
+        return 0
+    closed = 0
+    for pr in prs:
+        num = pr.get("number")
+        if not num or int(num) == int(winner_pr_number):
+            continue
+        head_owner = (
+            (((pr.get("head") or {}).get("repo") or {}).get("owner") or {}).get("login")
+            or ""
+        )
+        # Only miner FORK submissions go stale on a champion change; skip team branch
+        # PRs (head on the canonical repo) and headless/ghost PRs (deleted fork).
+        if not head_owner or head_owner.lower() == owner.lower():
+            continue
+        comment_on_pr(
+            int(num),
+            "### Closed — a new champion was elected\n\n"
+            f"`main` has advanced to {champion_label}, so this PR's base is now stale: "
+            "it replaces `solver.py` from an older `main` and will conflict — it can no "
+            "longer be merged or adopted, even if it wins a benchmark.\n\n"
+            "**Rebase your fork onto the latest `main` and resubmit** to compete "
+            "against the new champion.",
+        )
+        if close_pr(int(num)):
+            closed += 1
+    logger.info(
+        "close-stale: closed %d stale submission PR(s) after champion merge "
+        "(winner #%s)", closed, winner_pr_number,
+    )
+    return closed
+
+
 def delete_candidate_image(pr_number: int) -> bool:
     """GC a rejected candidate's ``pr-<N>`` image tag from GHCR.
 
@@ -992,6 +1052,15 @@ def on_champion_adopted_pr(
         commit_hash,
         round_id=round_id,
     )
+    if merged:
+        # The winner is on main now → every OTHER open submission PR replaces the
+        # same solver.py from an older main and is conflicting/un-adoptable until
+        # rebased. Close them (with a rebase instruction) so miners resubmit on the
+        # new base. Best-effort: never let cleanup affect the adoption result.
+        try:
+            close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("close-stale failed after champion merge: %s", exc)
     logger.info(
         "Champion adoption: attest=%s merge=%s pr=#%s round=%s",
         tx_hash or "skipped", merged, _pr_number, round_id,

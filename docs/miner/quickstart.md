@@ -96,6 +96,8 @@ Notes:
 - `--epoch` is optional — `submit` auto-detects it from the current open round (`GET /v1/solver/round`). The signed message is `{repo_url}:{commit_hash}:{round_id}`.
 - `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
 
+> **⚠️ Important — base your PR on the current `main`.** Every champion's solver is squash-merged to the solver repo's `main`, so `main` always holds the **current champion's code**. Your submission replaces `solver.py` *on top of the current `main`*. If your fork is based on an older `main` (e.g. from before the latest champion), your PR will conflict and **cannot be adopted even if it wins the benchmark**. After any champion change, **rebase your fork onto the latest `main` and resubmit**. When a new champion is elected the validator auto-closes the now-stale submission PRs with a rebase reminder — that's your cue to rebase and resubmit.
+
 ## 6) Optional: direct source submission (local/dev)
 
 You can submit inline solver code directly:
