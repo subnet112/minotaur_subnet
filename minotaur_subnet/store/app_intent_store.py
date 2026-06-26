@@ -324,6 +324,9 @@ class AppIntentStore:
                 CREATE TABLE IF NOT EXISTS developer_nonces(
                     app_id TEXT NOT NULL, deployer TEXT NOT NULL,
                     nonce INTEGER NOT NULL, PRIMARY KEY(app_id, deployer));
+                CREATE TABLE IF NOT EXISTS developer_links(
+                    app_id TEXT PRIMARY KEY, evm_deployer TEXT NOT NULL,
+                    ss58 TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
                 """
@@ -527,6 +530,30 @@ class AppIntentStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+    # ── developer EVM↔SS58 links ──────────────────────────────────────────
+    #
+    # The coldkey SS58 bound to an app's EVM deployer (see
+    # ``api/services/developer_link``). One link per app; ``evm_deployer``
+    # records which EVM address authorized it (for audit / re-link detection).
+
+    def get_payer_ss58(self, app_id: str) -> str:
+        """The SS58 coldkey linked to ``app_id``'s deployer, or "" if none."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ss58 FROM developer_links WHERE app_id=?", (app_id,)
+            ).fetchone()
+        return str(row["ss58"]) if row else ""
+
+    def set_payer_ss58(self, app_id: str, evm_deployer: str, ss58: str) -> None:
+        """Record (or replace) the deployer↔coldkey link for ``app_id``."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO developer_links(app_id, evm_deployer, ss58) VALUES(?,?,?) "
+                "ON CONFLICT(app_id) DO UPDATE SET "
+                "evm_deployer=excluded.evm_deployer, ss58=excluded.ss58",
+                (app_id, (evm_deployer or "").strip().lower(), ss58),
+            )
 
     # ── wallets ──────────────────────────────────────────────────────────
 

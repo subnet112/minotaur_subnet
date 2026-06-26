@@ -340,6 +340,18 @@ class DeployRequest(BaseModel):
                                    "(app_id, payment_ref, chain_id, amount).")
 
 
+class LinkSS58Request(BaseModel):
+    """Dual-signed link of the app's EVM deployer to a Bittensor SS58 coldkey.
+    Both signatures are required (see api/services/developer_link)."""
+    ss58: str = Field(..., description="The Bittensor SS58 coldkey to link as the app's payer.")
+    nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce).")
+    deadline: int = Field(0, description="Unix-seconds expiry the EVM link_ss58 signature was signed with.")
+    evm_signature: str = Field(..., description="EIP-712 link_ss58 signature from the EVM deployer, binding "
+                               "(app_id, ss58, nonce, deadline).")
+    ss58_signature: str = Field(..., description="Substrate signature by the coldkey over "
+                                "'MinotaurLinkSS58:{app_id}:{deployer_lower}:{nonce}' (hex).")
+
+
 class ScorePlanRequest(BaseModel):
     plan: dict[str, Any] = Field(..., description="Execution plan to score")
     params: dict[str, Any] = Field(..., description="Order params → state.raw_params")
@@ -551,6 +563,40 @@ def get_auth_nonce(app_id: str, deployer: str = "") -> dict[str, Any]:
         )
     current = s.get_developer_nonce(app_id, dep.lower())
     return {"app_id": app_id, "deployer": dep, "next_nonce": current + 1}
+
+
+@router.post("/apps/{app_id}/link-ss58", dependencies=[Depends(_require_admin)])
+def link_ss58(app_id: str, body: LinkSS58Request) -> dict[str, Any]:
+    """Link the app's EVM deployer to a Bittensor SS58 coldkey (dual-signed).
+
+    Requires BOTH the deployer's EIP-712 link_ss58 signature AND the coldkey's
+    substrate signature (see api/services/developer_link). The linked coldkey is
+    what a future finney deploy-fee verifier checks the payment came from.
+    """
+    from minotaur_subnet.api.services.developer_link import link_payer_ss58
+
+    ok, err = link_payer_ss58(
+        _store(), app_id, body.ss58,
+        nonce=body.nonce, deadline=body.deadline,
+        evm_signature=body.evm_signature, ss58_signature=body.ss58_signature,
+    )
+    if not ok:
+        return {"error": f"Link failed: {err}"}
+    return {"app_id": app_id, "payer_ss58": body.ss58, "status": "linked"}
+
+
+@router.get("/apps/{app_id}/payer-ss58")
+def get_payer_ss58(app_id: str) -> dict[str, Any]:
+    """The Bittensor coldkey linked to this app's deployer ("" if unlinked)."""
+    s = _store()
+    definition = s.get_app(app_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
+    return {
+        "app_id": app_id,
+        "deployer": definition.deployer,
+        "payer_ss58": s.get_payer_ss58(app_id),
+    }
 
 
 @router.get("/apps/{app_id}/manifest")

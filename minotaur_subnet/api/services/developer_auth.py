@@ -51,6 +51,7 @@ _TYPES: Final[dict] = {
 ACTION_UPDATE_SCORING: Final[str] = "update_scoring"
 ACTION_DEPLOY: Final[str] = "deploy"
 ACTION_PAY_DEPLOY_FEE: Final[str] = "pay_deploy_fee"
+ACTION_LINK_SS58: Final[str] = "link_ss58"
 
 # Reject deadlines further out than this — caps how long a signed-but-unused
 # authorization can sit before replay, even though the nonce already makes it
