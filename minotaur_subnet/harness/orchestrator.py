@@ -49,11 +49,14 @@ from minotaur_subnet.shared.types import (
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
 from minotaur_subnet.harness.solver_read_proxy import (
     CHAIN_NAMES,
+    budget_enforced,
     build_pin_blocks,
     close_session,
+    generate_plan_recv_timeout,
     open_session,
     proxy_rpc_url,
     read_proxy_config,
+    reset_session,
 )
 from minotaur_subnet.harness.protocol import (
     Command,
@@ -378,6 +381,12 @@ class SolverSession:
             )
 
         timeout = TIMEOUTS.get(request.command, 30.0)
+        # When the deterministic RPC-read budget is the cutoff, the wall-clock
+        # GENERATE_PLAN timeout is no longer the cutoff (it would re-introduce
+        # cross-host non-determinism). Loosen it to a runaway backstop. No-op when
+        # the budget is off (inert). Other commands keep their wall-clock.
+        if request.command == Command.GENERATE_PLAN:
+            timeout = generate_plan_recv_timeout(timeout)
         msg = request.to_json() + "\n"
 
         try:
@@ -1112,6 +1121,18 @@ async def run_benchmark(
                 br.trigger_decision = await session.check_trigger(
                     intent, state, snapshot,
                 )
+
+            # Deterministic per-scenario budget: reset the proxy session's spent
+            # budget to 0 so EACH generate_plan starts with a fresh budget B (a
+            # per-scenario cutoff, matching the per-scenario wall-clock it
+            # replaces). Best-effort + inert unless a proxy session is active AND
+            # the budget is enforced; a failed reset never aborts the run.
+            if (
+                _proxy_session_id is not None
+                and _read_proxy is not None
+                and budget_enforced()
+            ):
+                await reset_session(_read_proxy, _proxy_session_id)
 
             # Generate plan
             plan = await session.generate_plan(intent, state, snapshot)
