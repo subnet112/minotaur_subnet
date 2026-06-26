@@ -232,10 +232,27 @@ def _close_solver_round_state(body: CloseRoundRequest) -> RoundState:
 
 def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
     """Apply a leader-broadcast close to the local round store idempotently."""
+    # Idempotency FIRST: if the round is already closed locally, a late/duplicate
+    # close broadcast must NOT re-upsert its (now stale) snapshot over fresher
+    # state. The very first close (round still OPEN) is the one that mirrors the
+    # snapshot; followers never close a round on their own (close is leader-gated).
     round_store = get_round_store()
     existing = round_store.get_round(body.round_id or "")
     if existing is not None and existing.status != RoundStatus.OPEN:
         return existing
+    # Mirror the leader's close-time submission snapshot so the local pack-hash
+    # recompute matches the leader's (else PACK_HASH_MISMATCH drops us from the
+    # round's quorum). Batch-persisted + best-effort (bad records skipped inside).
+    if body.submissions:
+        try:
+            n = get_store().upsert_submissions(body.submissions)
+            if n:
+                logger.info(
+                    "Submission snapshot: upserted %d records for round %s from leader close",
+                    n, body.round_id,
+                )
+        except Exception:  # noqa: BLE001 — snapshot mirroring must not drop the close
+            logger.warning("submission snapshot upsert failed", exc_info=True)
     return _close_solver_round_state(body)
 
 
@@ -250,7 +267,7 @@ def _round_certification_deadline_elapsed(round_state: RoundState) -> bool:
 
 def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
     """Serialize a closed round for peer sync."""
-    return {
+    payload: dict[str, Any] = {
         "round_id": state.round_id,
         "close_epoch": state.close_epoch,
         "benchmark_pack_hash": state.benchmark_pack_hash,
@@ -260,6 +277,16 @@ def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "decision_deadline_epoch": state.decision_deadline_epoch,
         "effective_epoch": state.effective_epoch,
     }
+    # Same close-time submission snapshot as the coordinator-loop close path
+    # (_close_sync_payload in startup.py), so the explicit /solver/round/close
+    # route also lets followers reproduce the pack hash. Default-off.
+    if _env_true("SUBMISSION_SNAPSHOT_SYNC", default=False):
+        try:
+            _subs = get_store().list_by_round(state.round_id)
+            payload["submissions"] = [s.to_dict() for s in _subs]
+        except Exception:
+            logger.warning("close payload: submission snapshot failed", exc_info=True)
+    return payload
 
 
 def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
