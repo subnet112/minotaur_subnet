@@ -27,7 +27,7 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
 from minotaur_subnet.harness.submission_store import SubmissionStatus
 from minotaur_subnet.harness.round_store import RoundStatus
@@ -40,6 +40,8 @@ from .models import (
     CloseRoundRequest,
     SolverChampionResponse,
     SolverRoundResponse,
+    SolverRoundSummary,
+    SolverRoundsResponse,
     SourceSubmitRequest,
     StatusResponse,
     SubmitRequest,
@@ -156,6 +158,138 @@ def _require_internal_round_api_key(request: Request) -> None:
     provided = request.headers.get("x-solver-round-internal-key", "").strip()
     if provided != expected:
         raise HTTPException(status_code=401, detail="Invalid internal solver round key")
+
+
+def _verify_internal_round_signature(raw: dict[str, Any]) -> str | None:
+    """Verify a leader EIP-712 signature over a raw lifecycle sync payload.
+
+    Mirrors ``_verify_champion_proposal_signature`` exactly, but operates over
+    the RAW request dict (lifecycle payloads are plain dicts built by the
+    round_manager payload builders, not a pydantic body). Canonicalizes the
+    payload with only ``proposer_signature`` stripped (``proposer`` is KEPT),
+    recovers the signer, checks recovered == declared proposer, then applies
+    the locked-leader lock (if set) else the on-chain BT-EVM ValidatorRegistry
+    (chain 964) check when enforcement is enabled.
+
+    Returns an error string on failure, or None on pass. Callers MUST treat a
+    non-None result as a hard 401 (never fall through to the shared key).
+    """
+    signer_declared = str(raw.get("proposer", "") or "").strip()
+    sig_hex = str(raw.get("proposer_signature", "") or "").strip()
+    if not signer_declared or not sig_hex:
+        return "Missing proposer / proposer_signature"
+
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        import json as _json
+    except Exception as exc:
+        return f"eth_account unavailable: {exc}"
+
+    payload = dict(raw)
+    payload.pop("proposer_signature", None)
+    canonical = _json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    try:
+        recovered = Account.recover_message(
+            encode_defunct(text=canonical),
+            signature=sig_hex,
+        )
+    except Exception as exc:
+        return f"Signature recovery failed: {exc}"
+
+    if recovered.lower() != signer_declared.lower():
+        return (
+            f"Signer mismatch: signature recovers to {recovered[:10]}... "
+            f"but proposer declared {signer_declared[:10]}..."
+        )
+
+    # Leader-lock: when LOCKED_LEADER_EVM_ADDRESS is set, only that signer may
+    # drive round lifecycle. Falls back to the on-chain registry check only
+    # when the lock is cleared. Mirrors _verify_champion_proposal_signature.
+    from minotaur_subnet.validator.metagraph_sync import (
+        LOCKED_LEADER_EVM_ADDRESS,
+    )
+    if LOCKED_LEADER_EVM_ADDRESS:
+        if recovered.lower() != LOCKED_LEADER_EVM_ADDRESS.lower():
+            return (
+                f"Signer {recovered[:10]}... is not the locked leader "
+                f"({LOCKED_LEADER_EVM_ADDRESS})"
+            )
+        return None
+
+    from minotaur_subnet.consensus.validator_registry_cache import (
+        is_on_chain_validator, enforce_enabled,
+    )
+    if enforce_enabled():
+        if not is_on_chain_validator(recovered, 964):
+            return f"Signer {recovered[:10]}... is not a registered validator"
+    return None
+
+
+async def _authorize_internal_round(request: Request) -> None:
+    """Authorize a cross-validator round-lifecycle broadcast.
+
+    Backward-compatible auth for the staggered EIP-712 migration:
+
+      1. If the body carries a non-empty ``proposer`` + ``proposer_signature``,
+         verify the leader signature. A valid signature authorizes the call.
+         A PRESENT-but-INVALID signature is ALWAYS a 401 — it must NOT fall
+         through to the shared-key path, so a forged sig can't be retried as
+         a key.
+      2. If no signature is present and ``REQUIRE_SIGNED_ROUND_LIFECYCLE`` is
+         set, reject (the rollout has completed; unsigned legacy leaders are
+         no longer accepted).
+      3. Otherwise fall back to the legacy shared-key path
+         (``_require_internal_round_api_key``) so not-yet-upgraded leaders
+         still authenticate during the rollout.
+
+    REPLAY SAFETY: lifecycle payloads carry no nonce/timestamp, so a captured
+    valid signed broadcast is replayable indefinitely. This is SAFE because the
+    auth layer delegates replay protection to two invariants downstream:
+    (1) round_ids are epoch-unique (``round-e{epoch}-n{count}``), so a replay
+    only ever targets its original, already-transitioned round; and (2) every
+    lifecycle handler is idempotent — close/certify/abort/activate short-circuit
+    on an already-transitioned round (status guard), and activate additionally
+    requires ``status == CERTIFIED`` plus monotonic effective-epoch gating, so a
+    replayed certify/activate can neither re-adopt a stale champion nor roll the
+    round back. If a future change ever makes a transition non-idempotent OR
+    reuses a round_id, add a signed monotonic nonce to the payloads and reject
+    stale/duplicate proposals here — the signature alone provides no freshness.
+
+    Starlette caches the request body, so ``await request.json()`` here is
+    safe even though the handler also binds a pydantic model parameter.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        raw = {}
+
+    has_sig = bool(
+        str(raw.get("proposer", "") or "").strip()
+        and str(raw.get("proposer_signature", "") or "").strip()
+    )
+    if has_sig:
+        err = _verify_internal_round_signature(raw)
+        if err is not None:
+            # Present-but-invalid signature: hard fail, never fall through to
+            # the shared key (a forged sig must not be retryable as a key).
+            raise HTTPException(
+                status_code=401,
+                detail=f"Invalid round-lifecycle signature: {err}",
+            )
+        return
+
+    if _env_true("REQUIRE_SIGNED_ROUND_LIFECYCLE", default=False):
+        raise HTTPException(
+            status_code=401,
+            detail="signed round-lifecycle broadcasts required",
+        )
+
+    # Legacy shared-key fallback for not-yet-upgraded leaders.
+    _require_internal_round_api_key(request)
 
 
 # Per-signer, per-round rate limit state for champion proposals. Keyed by
@@ -698,7 +832,7 @@ async def close_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Explicitly close the current solver round for replay evaluation."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     closed = _close_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/close",
@@ -713,7 +847,7 @@ async def certify_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a champion certificate for a replay-qualified finalist."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     # Close the explicit-certify bypass: this public (operator) endpoint must not
     # silently certify an ARBITRARY candidate that never won the round's adoption
     # rule. Allow only the round's rule-selected finalist, a genesis/builtin
@@ -759,7 +893,7 @@ async def internal_close_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round close on this validator."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     closed = _sync_close_solver_round_state(body)
     return _round_state_to_response(closed)
 
@@ -770,7 +904,7 @@ async def internal_certify_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round certificate on this validator."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     certified = await _sync_certified_round_state(body)
     return _round_state_to_response(certified)
 
@@ -781,7 +915,7 @@ async def internal_abort_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round abort on this validator."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     aborted = _sync_abort_solver_round_state(body)
     return _round_state_to_response(aborted)
 
@@ -1009,7 +1143,7 @@ async def internal_activate_solver_round(
     request: Request,
 ) -> dict[str, Any]:
     """Persist a leader-broadcast round activation on this validator."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     try:
         return await _activate_solver_round_state(body)
     except KeyError as exc:
@@ -1024,7 +1158,7 @@ async def activate_solver_round(
     request: Request,
 ) -> dict[str, Any]:
     """Activate a previously certified round at an explicit epoch."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     try:
         result = await _activate_solver_round_state(body)
     except KeyError as exc:
@@ -1044,7 +1178,7 @@ async def abort_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Abort a solver round without activating a challenger."""
-    _require_internal_round_api_key(request)
+    await _authorize_internal_round(request)
     aborted = _abort_solver_round_state(body)
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/abort",
@@ -1067,6 +1201,57 @@ async def get_solver_round_by_id(round_id: str) -> SolverRoundResponse:
     if round_state is None:
         raise HTTPException(status_code=404, detail="Solver round not found")
     return _round_state_to_response(round_state)
+
+
+def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
+    """Build a compact history row from a persisted round dict (RoundState.to_dict)."""
+    status = str(d.get("status") or "")
+    cert = d.get("certificate") or {}
+    adopted = status == "activated"
+    return SolverRoundSummary(
+        round_id=str(d.get("round_id") or ""),
+        status=status,
+        opened_epoch=int(d.get("opened_epoch") or 0),
+        close_epoch=d.get("close_epoch"),
+        finalist_submission_id=d.get("finalist_submission_id"),
+        finalist_score=d.get("finalist_score"),
+        incumbent_submission_id=d.get("incumbent_submission_id"),
+        adopted=adopted,
+        adopted_submission_id=(
+            (cert.get("candidate_submission_id") or d.get("finalist_submission_id"))
+            if adopted else None
+        ),
+        effective_epoch=d.get("effective_epoch"),
+        abort_reason=d.get("abort_reason"),
+        created_at=float(d.get("created_at") or 0.0),
+        updated_at=float(d.get("updated_at") or 0.0),
+    )
+
+
+@router.get("/solver/rounds", response_model=SolverRoundsResponse)
+async def list_solver_rounds(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status: str | None = Query(None),
+) -> SolverRoundsResponse:
+    """Paginated solver-round HISTORY (newest first), sourced from the durable
+    order-book DB (AppIntentStore) that the round store mirrors into."""
+    # Ensure the round-store singleton is wired (installs the history sink + the
+    # one-time backfill of rounds already in the JSON store).
+    get_round_store()
+    from minotaur_subnet.api.server_context import ctx
+    store = getattr(ctx, "store", None)
+    rows: list[dict[str, Any]] = []
+    total = 0
+    if store is not None and hasattr(store, "list_rounds"):
+        rows = store.list_rounds(limit=limit, offset=offset, status=status)
+        total = store.count_rounds(status=status)
+    return SolverRoundsResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        rounds=[_round_summary_from_dict(d) for d in rows],
+    )
 
 
 @router.get("/solver/champion", response_model=SolverChampionResponse)

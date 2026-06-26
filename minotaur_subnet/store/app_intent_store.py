@@ -313,6 +313,11 @@ class AppIntentStore:
                 CREATE INDEX IF NOT EXISTS idx_orders_app ON orders(app_id);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
                 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+                CREATE TABLE IF NOT EXISTS solver_rounds(
+                    round_id TEXT PRIMARY KEY, status TEXT,
+                    opened_epoch INTEGER, created_at REAL, data TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_solver_rounds_status ON solver_rounds(status);
+                CREATE INDEX IF NOT EXISTS idx_solver_rounds_created ON solver_rounds(created_at);
                 CREATE TABLE IF NOT EXISTS app_stats(
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS quote_stats(
@@ -729,6 +734,53 @@ class AppIntentStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(r["data"]) for r in rows]
+
+    # ── solver rounds (history mirror of RoundStore) ────────────────────
+
+    def save_round(self, round_dict: dict[str, Any]) -> None:
+        """Save or update a solver round record (round history)."""
+        round_id = round_dict["round_id"]
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO solver_rounds(round_id, status, opened_epoch, created_at, data) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(round_id) DO UPDATE SET "
+                "status=excluded.status, opened_epoch=excluded.opened_epoch, "
+                "created_at=excluded.created_at, data=excluded.data",
+                (
+                    round_id,
+                    _enum_value(round_dict.get("status")),
+                    round_dict.get("opened_epoch"),
+                    round_dict.get("created_at"),
+                    _dumps(round_dict),
+                ),
+            )
+
+    def list_rounds(
+        self, limit: int = 50, offset: int = 0, status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Solver rounds newest-first (by created_at), paginated."""
+        query = "SELECT data FROM solver_rounds"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            params.append(_enum_value(status))
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def count_rounds(self, status: str | None = None) -> int:
+        """Total number of solver rounds (optionally filtered by status)."""
+        query = "SELECT COUNT(*) AS n FROM solver_rounds"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            params.append(_enum_value(status))
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["n"]) if row else 0
 
     def update_order(self, order_id: str, updates: dict[str, Any]) -> bool:
         """Apply partial updates to an order. Returns True if found."""

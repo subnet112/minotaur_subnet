@@ -124,6 +124,33 @@ class SolverChampionResponse(BaseModel):
     activated_at: float = 0.0
 
 
+class SolverRoundSummary(BaseModel):
+    """Compact per-round history row (for GET /v1/solver/rounds list views)."""
+    round_id: str
+    status: str
+    opened_epoch: int = 0
+    close_epoch: int | None = None
+    finalist_submission_id: str | None = None
+    finalist_score: float | None = None
+    incumbent_submission_id: str | None = None
+    # Outcome: `adopted` is True when the round activated a new champion;
+    # `adopted_submission_id` is the certified challenger that won.
+    adopted: bool = False
+    adopted_submission_id: str | None = None
+    effective_epoch: int | None = None
+    abort_reason: str | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+class SolverRoundsResponse(BaseModel):
+    """Paginated solver-round history, newest first."""
+    total: int = 0
+    limit: int = 0
+    offset: int = 0
+    rounds: list[SolverRoundSummary] = []
+
+
 class CloseRoundRequest(BaseModel):
     round_id: str | None = None
     close_epoch: int = Field(..., ge=0)
@@ -139,6 +166,11 @@ class CloseRoundRequest(BaseModel):
     # max_length bounds a hostile/buggy leader's payload (a real round holds at
     # most one submission per active miner; far below this cap).
     submissions: list[dict[str, Any]] | None = Field(default=None, max_length=1024)
+    # Leader EIP-712 signature over the canonical JSON of this sync payload
+    # (with proposer_signature stripped). Backward-compatible: empty during the
+    # staggered rollout, when followers fall back to the shared-key header.
+    proposer: str = ""
+    proposer_signature: str = ""
 
 
 class ChampionApprovalPayload(BaseModel):
@@ -173,16 +205,28 @@ class CertifyRoundRequest(BaseModel):
     # Audited (logged loudly). Default off so the public endpoint can't silently
     # bypass the adoption rule.
     force: bool = False
+    # Leader EIP-712 signature over the canonical JSON of this sync payload
+    # (with proposer_signature stripped). Empty during the staggered rollout.
+    proposer: str = ""
+    proposer_signature: str = ""
 
 
 class ActivateRoundRequest(BaseModel):
     round_id: str
     activation_epoch: int = Field(..., ge=0)
+    # Leader EIP-712 signature over the canonical JSON of this sync payload
+    # (with proposer_signature stripped). Empty during the staggered rollout.
+    proposer: str = ""
+    proposer_signature: str = ""
 
 
 class AbortRoundRequest(BaseModel):
     round_id: str
     reason: str = Field(..., min_length=1, max_length=256)
+    # Leader EIP-712 signature over the canonical JSON of this sync payload
+    # (with proposer_signature stripped). Empty during the staggered rollout.
+    proposer: str = ""
+    proposer_signature: str = ""
 
 
 class ChampionConsensusProposalRequest(BaseModel):

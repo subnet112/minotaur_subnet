@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 from typing import Any
@@ -61,6 +62,46 @@ def _current_solver_round_epoch() -> int:
     return SolverRoundEpochClock.from_env().current_epoch()
 
 
+def _sign_internal_round_payload(network: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Add ``proposer`` + ``proposer_signature`` to a lifecycle sync payload.
+
+    Mirrors ``ValidatorPeerNetwork._build_champion_proposal_payload``: set
+    ``proposer`` to the leader's EVM address, then sign the canonical JSON of
+    the payload *including* the ``proposer`` field (only ``proposer_signature``
+    is ever stripped by the verifier). The follower's
+    ``_authorize_internal_round`` reproduces this exact canonicalization.
+
+    Backward-compatible: when no signing key is available (or signing fails),
+    the payload is returned unsigned — not-yet-upgraded followers still
+    authenticate via the legacy shared-key header, which the broadcast carries
+    in ``default_headers``. NEVER raises into the broadcast path.
+    """
+    private_key = getattr(network, "private_key", None)
+    if not private_key:
+        return payload
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        signed = dict(payload)
+        signed.pop("proposer_signature", None)
+        signed["proposer"] = Account.from_key(private_key).address
+        canonical = json.dumps(signed, sort_keys=True, separators=(",", ":"))
+        signature = Account.sign_message(
+            encode_defunct(text=canonical),
+            private_key=private_key,
+        )
+        signed["proposer_signature"] = signature.signature.hex()
+        return signed
+    except Exception:
+        logger.warning(
+            "Failed to sign internal round-lifecycle payload; broadcasting "
+            "unsigned (legacy shared-key path)",
+            exc_info=True,
+        )
+        return payload
+
+
 async def _broadcast_internal_round_sync(path: str, payload: dict[str, Any]) -> None:
     """Broadcast round state to peer validators when peer sync is configured."""
     network = get_champion_peer_network()
@@ -70,6 +111,7 @@ async def _broadcast_internal_round_sync(path: str, payload: dict[str, Any]) -> 
         broadcast = getattr(network, "broadcast_json", None)
         if broadcast is None:
             return
+        payload = _sign_internal_round_payload(network, payload)
         result = broadcast(path, payload)
         if inspect.isawaitable(result):
             await result
