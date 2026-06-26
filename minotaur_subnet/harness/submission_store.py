@@ -152,8 +152,9 @@ class SubmissionStore:
         round_id: str | None = None,
         pr_number: int | None = None,
         max_per_round: int = 1,
+        max_total_per_round: int = 0,
     ) -> Submission:
-        """Create a new submission. Raises ValueError when the per-round cap is hit.
+        """Create a new submission. Raises ValueError when a per-round cap is hit.
 
         ``max_per_round`` caps how many submissions a single hotkey may make for
         one round — anti-spam protection for the validator's screening +
@@ -162,6 +163,12 @@ class SubmissionStore:
         value <= 0 disables the cap (unlimited). The cap counts ALL of the
         miner's submissions for the round, regardless of their final status, so
         a screening rejection still consumes an attempt.
+
+        ``max_total_per_round`` caps the TOTAL submissions for the round across
+        ALL miners (first-come, rest retry next round) — bounds the per-round
+        benchmark batch. Default 0 = unlimited. Both checks run atomically here
+        as the backstop against a TOCTOU race between the route's pre-check and
+        the insert. Counts are over ALL statuses.
         """
         self._maybe_reload()
         resolved_round_id = (round_id or "").strip() or self._legacy_round_id(epoch)
@@ -177,6 +184,17 @@ class SubmissionStore:
                     f"Miner {hotkey[:12]}... already submitted {existing_count} "
                     f"time(s) for round {resolved_round_id} "
                     f"(max {max_per_round} per round)"
+                )
+        if max_total_per_round > 0:
+            round_total = sum(
+                1 for s in self._submissions.values()
+                if s.round_id == resolved_round_id
+            )
+            if round_total >= max_total_per_round:
+                raise ValueError(
+                    f"Round {resolved_round_id} is full "
+                    f"({round_total}/{max_total_per_round} submissions); "
+                    f"try again next round"
                 )
 
         now = time.time()
@@ -242,6 +260,16 @@ class SubmissionStore:
             1 for s in self._submissions.values()
             if s.hotkey == hotkey and s.round_id == round_id
         )
+
+    def count_by_round(self, round_id: str) -> int:
+        """Total submissions for ``round_id`` across ALL miners.
+
+        The submission gate reads this to enforce the round-wide cap (bounding
+        the per-round benchmark batch) BEFORE any expensive work. Counts every
+        status, so a screening rejection still consumes one of the round's slots.
+        """
+        self._maybe_reload()
+        return sum(1 for s in self._submissions.values() if s.round_id == round_id)
 
     def list_by_epoch(self, epoch: int) -> list[Submission]:
         """List all submissions for an epoch, ordered by creation time."""
