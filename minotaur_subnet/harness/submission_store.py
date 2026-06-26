@@ -18,14 +18,25 @@ Usage:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
+    # Without fcntl we cannot take a cross-process advisory lock; the store
+    # degrades to in-process locking only (its historical behaviour).
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +141,60 @@ class Submission:
         }
 
 
+def _write_locked(method):
+    """Serialize a store mutation across threads *and* processes.
+
+    Every mutating method here is a read-modify-write: it reloads the latest
+    persisted state, mutates in memory, then rewrites the whole JSON file.
+    When several workers share one backing file (FastAPI workers, or the
+    validator + API processes) two such sequences can interleave — two
+    concurrent ``create`` calls both pass the per-round cap check before either
+    persists, or one writer's whole-file rewrite clobbers another's
+    just-created record. This decorator brackets the method with an exclusive
+    advisory file lock (plus an in-process lock) so each read-modify-write runs
+    to completion before the next begins.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._write_guard():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SubmissionStore:
-    """In-memory store for submissions with optional JSON persistence."""
+    """In-memory store for submissions with optional JSON persistence.
+
+    Mutations are serialized across threads and processes (see
+    :func:`_write_locked`) so the per-(hotkey, round) cap in :meth:`create`
+    holds even when multiple workers share the backing file. Reads stay
+    lock-free; :meth:`_persist` writes atomically (temp file + ``os.replace``)
+    so a concurrent reader never observes a half-written file.
+    """
 
     def __init__(self, persist_path: Path | None = None) -> None:
         self._submissions: dict[str, Submission] = {}
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
         self._persist_path = persist_path
+        # Cross-process advisory lock lives in a sibling file that is never
+        # rewritten — locking the data file itself would break, since each
+        # persist replaces it (a new inode the held fd no longer refers to).
+        self._lock_path = (
+            persist_path.with_name(persist_path.name + ".lock")
+            if persist_path is not None
+            else None
+        )
+        self._rmw_lock = threading.RLock()  # in-process serialization
+        self._lock_fd: int | None = None
+        self._lock_depth = 0
         self._persist_mtime_ns: int | None = None
 
         if persist_path and persist_path.exists():
             self._load()
 
+    @_write_locked
     def create(
         self,
         repo_url: str,
@@ -152,8 +204,9 @@ class SubmissionStore:
         round_id: str | None = None,
         pr_number: int | None = None,
         max_per_round: int = 1,
+        max_total_per_round: int = 0,
     ) -> Submission:
-        """Create a new submission. Raises ValueError when the per-round cap is hit.
+        """Create a new submission. Raises ValueError when a per-round cap is hit.
 
         ``max_per_round`` caps how many submissions a single hotkey may make for
         one round — anti-spam protection for the validator's screening +
@@ -162,6 +215,12 @@ class SubmissionStore:
         value <= 0 disables the cap (unlimited). The cap counts ALL of the
         miner's submissions for the round, regardless of their final status, so
         a screening rejection still consumes an attempt.
+
+        ``max_total_per_round`` caps the TOTAL submissions for the round across
+        ALL miners (first-come, rest retry next round) — bounds the per-round
+        benchmark batch. Default 0 = unlimited. Both checks run atomically here
+        as the backstop against a TOCTOU race between the route's pre-check and
+        the insert. Counts are over ALL statuses.
         """
         self._maybe_reload()
         resolved_round_id = (round_id or "").strip() or self._legacy_round_id(epoch)
@@ -177,6 +236,17 @@ class SubmissionStore:
                     f"Miner {hotkey[:12]}... already submitted {existing_count} "
                     f"time(s) for round {resolved_round_id} "
                     f"(max {max_per_round} per round)"
+                )
+        if max_total_per_round > 0:
+            round_total = sum(
+                1 for s in self._submissions.values()
+                if s.round_id == resolved_round_id
+            )
+            if round_total >= max_total_per_round:
+                raise ValueError(
+                    f"Round {resolved_round_id} is full "
+                    f"({round_total}/{max_total_per_round} submissions); "
+                    f"try again next round"
                 )
 
         now = time.time()
@@ -202,6 +272,91 @@ class SubmissionStore:
             sub.submission_id, hotkey[:12], resolved_round_id, epoch, repo_url, commit_hash[:8],
         )
         return sub
+
+    def _upsert_one(self, record: dict[str, Any]) -> Submission:
+        """Build + index a submission from a caller-provided record WITHOUT
+        persisting. Caller-provided ``submission_id`` is preserved (no new uuid).
+        Tolerant of an unknown ``status`` (falls back to QUEUED) — status is a
+        local lifecycle marker and is NOT part of the benchmark pack hash, so a
+        record must never be dropped just because its status string is unknown.
+        Raises ValueError only when ``submission_id`` is missing.
+        """
+        sid = (record.get("submission_id") or "").strip()
+        if not sid:
+            raise ValueError("upsert requires a submission_id")
+        round_id = record.get("round_id") or self._legacy_round_id(record.get("epoch", 0))
+        raw_status = record.get("status", SubmissionStatus.QUEUED.value)
+        try:
+            status = SubmissionStatus(raw_status)
+        except ValueError:
+            logger.warning("upsert: unknown status %r for %s; defaulting QUEUED", raw_status, sid)
+            status = SubmissionStatus.QUEUED
+        sub = Submission(
+            submission_id=sid,
+            repo_url=record.get("repo_url", ""),
+            commit_hash=record.get("commit_hash", ""),
+            epoch=int(record.get("epoch", 0) or 0),
+            hotkey=record.get("hotkey", ""),
+            round_id=round_id,
+            pr_number=record.get("pr_number"),
+            status=status,
+            created_at=record.get("created_at", 0.0) or 0.0,
+            updated_at=record.get("updated_at", 0.0) or 0.0,
+            screening=record.get("screening") or {},
+            image_tag=record.get("image_tag"),
+            image_id=record.get("image_id"),
+            image_digest=record.get("image_digest"),
+            provenance=record.get("provenance"),
+            solver_path=record.get("solver_path"),
+            solver_name=record.get("solver_name"),
+            solver_version=record.get("solver_version"),
+            benchmark_score=record.get("benchmark_score"),
+            benchmark_rank=record.get("benchmark_rank"),
+            benchmark_details=record.get("benchmark_details"),
+            rejection_reason=record.get("rejection_reason"),
+        )
+        # _submissions is the source of truth for list_by_round / the pack hash;
+        # the indexes are best-effort lookups (last-wins is fine, they aren't
+        # consulted by the pack hash).
+        self._submissions[sid] = sub
+        self._by_hotkey_round[f"{sub.hotkey}:{sub.round_id}"] = sid
+        self._by_hotkey_epoch[f"{sub.hotkey}:{sub.epoch}"] = sid
+        return sub
+
+    def upsert_submission(self, record: dict[str, Any]) -> Submission:
+        """Insert or replace a single submission by caller-provided
+        ``submission_id`` and persist. See ``_upsert_one`` for field handling.
+
+        Used to mirror the leader's close-time submission snapshot so the
+        benchmark pack hash agrees fleet-wide (a follower lacking the leader's
+        records recomputes a divergent hash → PACK_HASH_MISMATCH). No per-round
+        cap (the leader already enforced it at ingest).
+        """
+        self._maybe_reload()
+        sub = self._upsert_one(record)
+        self._persist()
+        return sub
+
+    def upsert_submissions(self, records: list[dict[str, Any]]) -> int:
+        """Batch upsert the leader's snapshot, persisting ONCE (O(n), not the
+        O(n²) of per-record persist). Bad records (missing submission_id) are
+        skipped + logged so one malformed entry can't drop the whole snapshot;
+        returns the number successfully upserted.
+        """
+        self._maybe_reload()
+        n = 0
+        for record in records or []:
+            try:
+                self._upsert_one(record)
+                n += 1
+            except Exception as exc:  # noqa: BLE001 — skip the bad record, keep the rest
+                logger.warning(
+                    "upsert_submissions: skipped record %r: %s",
+                    (record or {}).get("submission_id"), exc,
+                )
+        if n:
+            self._persist()
+        return n
 
     def get(self, submission_id: str) -> Submission | None:
         """Get a submission by ID."""
@@ -243,6 +398,16 @@ class SubmissionStore:
             if s.hotkey == hotkey and s.round_id == round_id
         )
 
+    def count_by_round(self, round_id: str) -> int:
+        """Total submissions for ``round_id`` across ALL miners.
+
+        The submission gate reads this to enforce the round-wide cap (bounding
+        the per-round benchmark batch) BEFORE any expensive work. Counts every
+        status, so a screening rejection still consumes one of the round's slots.
+        """
+        self._maybe_reload()
+        return sum(1 for s in self._submissions.values() if s.round_id == round_id)
+
     def list_by_epoch(self, epoch: int) -> list[Submission]:
         """List all submissions for an epoch, ordered by creation time."""
         self._maybe_reload()
@@ -273,6 +438,7 @@ class SubmissionStore:
             if s.status == status
         ]
 
+    @_write_locked
     def update_status(
         self,
         submission_id: str,
@@ -288,6 +454,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_screening_result(
         self,
         submission_id: str,
@@ -318,6 +485,7 @@ class SubmissionStore:
 
         self._persist()
 
+    @_write_locked
     def set_image_tag(self, submission_id: str, image_tag: str) -> None:
         """Set the Docker image tag after successful build."""
         self._maybe_reload()
@@ -328,6 +496,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_image_id(self, submission_id: str, image_id: str) -> None:
         """Set immutable image identifier after successful build."""
         self._maybe_reload()
@@ -338,6 +507,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_image_digest(self, submission_id: str, image_digest: str) -> None:
         """Set the global GHCR manifest ref (<repo>@sha256:<64hex>) after push."""
         self._maybe_reload()
@@ -348,6 +518,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_provenance(
         self,
         submission_id: str,
@@ -362,6 +533,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_solver_path(self, submission_id: str, solver_path: str) -> None:
         """Set the local solver file path for source submissions."""
         self._maybe_reload()
@@ -372,6 +544,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_solver_info(
         self,
         submission_id: str,
@@ -388,6 +561,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def set_benchmark_result(
         self,
         submission_id: str,
@@ -434,6 +608,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def reject(self, submission_id: str, reason: str) -> None:
         """Reject a submission with a reason."""
         self._maybe_reload()
@@ -445,6 +620,7 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist()
 
+    @_write_locked
     def adopt(self, submission_id: str) -> None:
         """Mark a submission as the adopted champion.
 
@@ -469,6 +645,63 @@ class SubmissionStore:
         adopted = self.list_by_status(SubmissionStatus.ADOPTED)
         return adopted[0] if adopted else None
 
+    # ── Cross-process write lock ─────────────────────────────────────────────
+
+    @contextmanager
+    def _write_guard(self):
+        """Hold the write lock around a single read-modify-write.
+
+        Acquires the in-process lock (threads) then the exclusive advisory file
+        lock (processes), adopts the freshest persisted state, and yields for
+        the caller to mutate + persist. Re-entrant on one thread: nested guards
+        share the outermost lock and skip the reload so an in-progress mutation
+        is never discarded. When there is no ``persist_path`` (pure in-memory)
+        or ``fcntl`` is unavailable, the file lock is a no-op and only the
+        in-process lock applies.
+        """
+        with self._rmw_lock:
+            outermost = self._lock_depth == 0
+            self._lock_depth += 1
+            if outermost:
+                self._lock_fd = self._acquire_file_lock()
+            try:
+                if (
+                    outermost
+                    and self._persist_path is not None
+                    and self._persist_path.exists()
+                ):
+                    # Under the exclusive lock, take the latest committed state
+                    # so the check-and-write below cannot race another writer.
+                    self._load(quiet=True)
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0:
+                    self._release_file_lock(self._lock_fd)
+                    self._lock_fd = None
+
+    def _acquire_file_lock(self) -> int | None:
+        """Open the sibling lock file and take an exclusive advisory lock."""
+        if self._lock_path is None or fcntl is None:
+            return None
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _release_file_lock(fd: int | None) -> None:
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _maybe_reload(self) -> None:
@@ -483,7 +716,11 @@ class SubmissionStore:
             self._load()
 
     def _persist(self) -> None:
-        """Write state to disk if persist_path is set."""
+        """Write state to disk atomically if persist_path is set.
+
+        Writes a temp file then ``os.replace``s it into place so a concurrent
+        lock-free reader always sees a complete file, never a half-written one.
+        """
         if self._persist_path is None:
             return
         try:
@@ -492,13 +729,17 @@ class SubmissionStore:
                 for sid, sub in self._submissions.items()
             }
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            self._persist_path.write_text(json.dumps(data, indent=2))
+            tmp_path = self._persist_path.with_name(
+                f".{self._persist_path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.write_text(json.dumps(data, indent=2))
+            os.replace(tmp_path, self._persist_path)
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("Failed to persist submissions: %s", exc)
 
-    def _load(self) -> None:
-        """Load state from disk."""
+    def _load(self, *, quiet: bool = False) -> None:
+        """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
         try:
             data = json.loads(self._persist_path.read_text())
             submissions: dict[str, Submission] = {}
@@ -539,7 +780,8 @@ class SubmissionStore:
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
-            logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
+            if not quiet:
+                logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
         except Exception as exc:
             logger.warning("Failed to load submissions: %s", exc)
 

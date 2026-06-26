@@ -173,6 +173,10 @@ class EpochManager:
         self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         self._on_champion_rejected = on_champion_rejected
+        # Leader gate for PR-mirroring side effects: only the configured leader
+        # posts the reject report onto the miner's PR. None → ungated (tests /
+        # not wired). Set via ``set_leader_check`` in startup.
+        self._is_leader: Any = None
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
         self._vote_recorder = vote_recorder
@@ -539,16 +543,49 @@ class EpochManager:
 
         return result
 
+    def set_leader_check(self, is_leader: Any) -> None:
+        """Wire the leader predicate (callable → bool). When set, only the leader
+        mirrors the reject decision onto the PR."""
+        self._is_leader = is_leader
+
     def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
         """Best-effort fire the reject callback (PR comment + close + GC). Sync —
         called from the round-evaluation path; the callback itself is sync GitHub
-        API. No-op without a callback / a PR-based submission."""
+        API. No-op without a callback / a PR-based submission.
+
+        Leader-gated: ``evaluate_round`` runs on every validator, so without this
+        gate every node with a solver-repo token would post its own (possibly
+        divergent) report. Only the configured leader mirrors it."""
         if self._on_champion_rejected is None:
             return
+        # Defensive read: the reaper path can construct an EpochManager via __new__
+        # (bypassing __init__ where _is_leader is set), so use getattr to avoid an
+        # AttributeError that the reaper would swallow and silently skip the reject.
+        _is_leader = getattr(self, "_is_leader", None)
+        if _is_leader is not None and not _is_leader():
+            return  # followers don't post — the leader is the single source
         if not getattr(submission, "pr_number", None):
             return
+        # Pass champion context so the callback can render the full scored report
+        # on the PR (your score vs the champion per case). Only forward kwargs the
+        # callback accepts — mock/legacy callbacks take just (submission, reason).
+        kwargs: dict[str, Any] = {}
         try:
-            self._on_champion_rejected(submission, reason)
+            params = inspect.signature(self._on_champion_rejected).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "champion_score" in params:
+            kwargs["champion_score"] = self._champion.benchmark_score
+        if "dethrone_margin" in params:
+            kwargs["dethrone_margin"] = self._dethrone_margin
+        if "champion_details" in params and self._champion.submission_id:
+            try:
+                champ_sub = self._sub_store.get(self._champion.submission_id)
+                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
+            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
+                pass
+        try:
+            self._on_champion_rejected(submission, reason, **kwargs)
         except Exception as exc:
             logger.warning("on_champion_rejected callback failed: %s", exc)
 
@@ -767,8 +804,31 @@ class EpochManager:
                 except Exception:
                     pass  # fall through with synthetic-only scenarios
 
-            results = await self._benchmark_worker._benchmark_submission(
-                image_tag, intents, score_fn,
+            # Champion run (the dethrone bar). Route through the per-round memo so
+            # a follower's quorum verdict (_independent_adopt_vote) can REUSE this
+            # exact champion result instead of re-benchmarking the champion a
+            # second time. CONSOLIDATE_CHAMPION_BENCH off → a plain re-bench,
+            # byte-identical to before.
+            _memo_round_id = None
+            if self._round_store is not None:
+                try:
+                    _mcr = self._round_store.get_current_round()
+                    _memo_round_id = _mcr.round_id if _mcr is not None else None
+                except Exception:
+                    _memo_round_id = None
+
+            async def _run_champion_bench():
+                return await self._benchmark_worker._benchmark_submission(
+                    image_tag, intents, score_fn,
+                )
+
+            results = await self._benchmark_worker.memo_champion_bench(
+                round_id=_memo_round_id,
+                image=image_tag,
+                fork_block=getattr(self._benchmark_worker, "_epoch_block_number", None),
+                intents=intents,
+                require_real_sim=getattr(self._benchmark_worker, "_require_real_sim", False),
+                run=_run_champion_bench,
             )
             if not isinstance(results, list):
                 self._incumbent_refresh_failed = True  # bad benchmark → stale bar
