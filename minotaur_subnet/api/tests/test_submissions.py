@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -503,6 +504,57 @@ class TestSubmissionStorePersistence(unittest.TestCase):
                     epoch=42,
                     hotkey="5GrwvaEF_test",
                 )
+
+    def test_concurrent_create_dedup_across_processes(self):
+        """Concurrent creates on a shared file must accept exactly one.
+
+        Each ``SubmissionStore`` opens its own advisory-lock fd, and separate
+        open-file descriptions contend under ``flock`` exactly as separate
+        processes do — so several stores + a barrier reproduce the
+        multi-worker race the lock is meant to close. Without the cross-process
+        guard, several creates pass the per-round cap before any persists and
+        the whole-file rewrites clobber each other; with it, exactly one wins.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "submissions.json"
+            workers = 8
+            stores = [
+                SubmissionStore(persist_path=persist_path) for _ in range(workers)
+            ]
+            barrier = threading.Barrier(workers)
+            outcomes: list[str] = []
+            outcomes_lock = threading.Lock()
+
+            def attempt(store: SubmissionStore) -> None:
+                barrier.wait()  # release all threads onto the check-and-write together
+                try:
+                    store.create(
+                        repo_url="source://inline",
+                        commit_hash="abc123",
+                        epoch=7,
+                        hotkey="5GrwvaEF_test",
+                        round_id="round-e7-n1",
+                    )
+                    outcome = "created"
+                except ValueError:
+                    outcome = "rejected"
+                with outcomes_lock:
+                    outcomes.append(outcome)
+
+            threads = [
+                threading.Thread(target=attempt, args=(store,)) for store in stores
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(outcomes.count("created"), 1, outcomes)
+            self.assertEqual(outcomes.count("rejected"), workers - 1, outcomes)
+
+            # The persisted file must hold exactly one submission for the round.
+            verifier = SubmissionStore(persist_path=persist_path)
+            self.assertEqual(len(verifier.list_by_round("round-e7-n1")), 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
