@@ -1394,10 +1394,18 @@ class EpochManager:
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
 
-        Before a real miner-backed champion exists, emits 100% to the subnet
-        owner hotkey (burn behavior). Once a real miner champion exists, ranks
-        scored submissions by benchmark_score descending, applies exponential
-        decay (weight_decay^(rank-1)), and normalizes so all weights sum to 1.0.
+        WINNER-TAKES-ALL, champion-only: 100% burn to the subnet owner before a
+        real miner-backed champion exists; once one does, the champion gets
+        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05) and 0.95 burns to the owner.
+
+        Only ``self._champion`` — the submission that won AND was finalized
+        (merge-gate passed → ``_hot_swap`` set it as the live champion) — is ever
+        weighted. There is NO score-ranked decay tail across other scored
+        submissions: a runner-up, and in particular a candidate whose merge
+        FAILED (it never becomes ``self._champion`` — the gate aborts before
+        ``_hot_swap``), can never earn weight. The champion is always THIS
+        validator's own locally-adopted one — never copied from chain — so a
+        third party can't free-ride without doing the benchmark work itself.
 
         Returns:
             Dict mapping hotkey SS58 → normalized weight.
@@ -1405,44 +1413,10 @@ class EpochManager:
         if not self._sub_store:
             return {}
 
-        if not is_real_miner_hotkey(self._champion.hotkey):
-            return build_bootstrap_or_champion_weights(
-                self._champion.hotkey,
-                owner_hotkey=self._resolve_owner_hotkey(),
-            )
-
-        # Gather champion-eligible submissions from this epoch
-        subs = (
-            self._sub_store.list_by_round(round_id)
-            if round_id is not None
-            else self._sub_store.list_by_epoch(epoch)
+        return build_bootstrap_or_champion_weights(
+            self._champion.hotkey,
+            owner_hotkey=self._resolve_owner_hotkey(),
         )
-        scored = [s for s in self._eligible_candidates(subs) if s.hotkey]
-
-        if not scored:
-            return {}
-
-        # Sort by score descending
-        scored.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
-
-        # Apply exponential decay: weight = decay^(rank-1)
-        raw_weights: dict[str, float] = {}
-        for rank, sub in enumerate(scored):
-            weight = self._weight_decay ** rank  # rank 0 = champion
-            raw_weights[sub.hotkey] = weight
-
-        # Normalize to sum=1, then apply the champion burn ramp so the miners
-        # collectively receive only CHAMPION_MINER_WEIGHT_FRACTION (0.05) and the
-        # rest burns to the owner — the same conservative cap the daemon's
-        # burn-fallback builder applies, so a freshly-adopted champion's share is
-        # bounded however its weights were built.
-        total = sum(raw_weights.values())
-        if total > 0:
-            normalized = {k: v / total for k, v in raw_weights.items()}
-            return apply_champion_burn_ramp(
-                normalized, owner_hotkey=self._resolve_owner_hotkey(),
-            )
-        return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
         """Queue weights for emission by POSTing to the validator daemon.

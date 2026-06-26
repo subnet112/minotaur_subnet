@@ -11,6 +11,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from minotaur_subnet.epoch.manager import ChampionInfo, EpochManager
 from minotaur_subnet.harness.submission_store import SubmissionStatus
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
@@ -78,6 +80,33 @@ def test_genesis_incumbent_still_burns_weights_to_owner():
     assert mgr._champion.hotkey == GENESIS_HOTKEY
     weights = mgr._build_weights_mapping(epoch=1)
     assert weights == {OWNER: 1.0}
+
+
+def test_winner_takes_all_only_champion_earns_weight():
+    # With a REAL miner champion, _build_weights_mapping is winner-takes-all:
+    # ONLY self._champion gets 0.05, owner gets 0.95 — NO score-ranked decay tail
+    # to other scored submissions. Folds #329: a non-adopted candidate (e.g. a
+    # merge-failed winner that's still SCORED) is never self._champion, so even if
+    # it out-scores the champion it can never appear in the weight mapping.
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(
+        submission_id="sub_real", hotkey="5RealMiner",
+        benchmark_score=0.8, image_tag="img",
+    )
+    higher_scoring_non_champion = SimpleNamespace(
+        submission_id="sub_other", solver_name="x", solver_version="1",
+        benchmark_score=0.99, epoch=1, image_tag="img2", hotkey="5OtherMiner",
+        updated_at=0, status=SubmissionStatus.SCORED,
+    )
+    mgr._sub_store.list_by_round.return_value = [higher_scoring_non_champion]
+    mgr._sub_store.list_by_epoch.return_value = [higher_scoring_non_champion]
+
+    weights = mgr._build_weights_mapping(epoch=1, round_id="r1")
+
+    assert set(weights) == {"5RealMiner", OWNER}
+    assert weights["5RealMiner"] == pytest.approx(0.05)
+    assert weights[OWNER] == pytest.approx(0.95)
+    assert "5OtherMiner" not in weights  # no decay tail; non-champion earns nothing
 
 
 # ── stale-bar guard: _refresh_incumbent_score flags an un-refreshable incumbent ──
