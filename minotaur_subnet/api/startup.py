@@ -2164,6 +2164,13 @@ async def initialize(ctx: ServerContext) -> dict:
                     return True
                 return ctx.solver_round_metagraph_sync.is_leader
 
+            # Only the leader mirrors the reject report onto the miner's PR —
+            # evaluate_round runs on every validator, so gate the PR side effect
+            # explicitly (config alone — a solver-repo token — is too fragile now
+            # that the comment carries the full scorecard).
+            if ctx.epoch_manager is not None:
+                ctx.epoch_manager.set_leader_check(_is_solver_round_leader)
+
             # Order-book sync (#228): each FOLLOWER pulls the leader's full order set
             # — including the FAILED orders (rejected/expired) that never reach the
             # chain and are broadcast nowhere — so it can build a representative

@@ -169,6 +169,7 @@ def test_manager_forwards_champion_context():
         _champion=SimpleNamespace(benchmark_score=0.85, submission_id="champ1"),
         _dethrone_margin=0.05,
         _sub_store=SimpleNamespace(get=lambda sid: champ_sub),
+        _is_leader=lambda: True,
     )
     EpochManager._notify_champion_rejected(fake_self, SimpleNamespace(pr_number=11), "lost")
     assert rec == {"champion_score": 0.85, "dethrone_margin": 0.05,
@@ -183,9 +184,24 @@ def test_manager_legacy_two_arg_callback_still_works():
         _champion=SimpleNamespace(benchmark_score=0.85, submission_id="c"),
         _dethrone_margin=0.05,
         _sub_store=SimpleNamespace(get=lambda sid: None),
+        _is_leader=None,  # ungated
     )
     EpochManager._notify_champion_rejected(fake_self, SimpleNamespace(pr_number=11), "lost")
     assert seen.get("ok") is True
+
+
+def test_manager_leader_gate_blocks_follower():
+    from minotaur_subnet.epoch.manager import EpochManager
+    seen = {}
+    fake_self = SimpleNamespace(
+        _on_champion_rejected=lambda submission, reason, **kw: seen.update(posted=True),
+        _champion=SimpleNamespace(benchmark_score=0.85, submission_id="c"),
+        _dethrone_margin=0.05,
+        _sub_store=SimpleNamespace(get=lambda sid: None),
+        _is_leader=lambda: False,  # this node is NOT the leader
+    )
+    EpochManager._notify_champion_rejected(fake_self, SimpleNamespace(pr_number=11), "lost")
+    assert seen == {}  # follower posts nothing
 
 
 # ── orchestrator: revert-trace capture helpers ───────────────────────────────

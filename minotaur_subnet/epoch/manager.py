@@ -173,6 +173,10 @@ class EpochManager:
         self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         self._on_champion_rejected = on_champion_rejected
+        # Leader gate for PR-mirroring side effects: only the configured leader
+        # posts the reject report onto the miner's PR. None → ungated (tests /
+        # not wired). Set via ``set_leader_check`` in startup.
+        self._is_leader: Any = None
         # CHALLENGER_QUORUM_MODE observability: optional callback(dict) that publishes
         # this leader's would-be adopt vote for the fleet shadow tally. No decision effect.
         self._vote_recorder = vote_recorder
@@ -539,12 +543,23 @@ class EpochManager:
 
         return result
 
+    def set_leader_check(self, is_leader: Any) -> None:
+        """Wire the leader predicate (callable → bool). When set, only the leader
+        mirrors the reject decision onto the PR."""
+        self._is_leader = is_leader
+
     def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
         """Best-effort fire the reject callback (PR comment + close + GC). Sync —
         called from the round-evaluation path; the callback itself is sync GitHub
-        API. No-op without a callback / a PR-based submission."""
+        API. No-op without a callback / a PR-based submission.
+
+        Leader-gated: ``evaluate_round`` runs on every validator, so without this
+        gate every node with a solver-repo token would post its own (possibly
+        divergent) report. Only the configured leader mirrors it."""
         if self._on_champion_rejected is None:
             return
+        if self._is_leader is not None and not self._is_leader():
+            return  # followers don't post — the leader is the single source
         if not getattr(submission, "pr_number", None):
             return
         # Pass champion context so the callback can render the full scored report
