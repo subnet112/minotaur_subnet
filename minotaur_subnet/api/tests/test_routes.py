@@ -6,11 +6,14 @@ Follows the same test patterns as test_submissions.py.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure repo root is importable
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -254,10 +257,72 @@ class TestAppRoutes(unittest.TestCase):
 
 
 class TestDeployerAuthorization(unittest.TestCase):
-    """Tests for deployer-based authorization on update_scoring."""
+    """Tests for deployer-based authorization on update_scoring (EIP-712 + nonce)."""
+
+    # Deterministic test key (Anvil account #0). The deployer is its address.
+    DEPLOYER_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+    OTHER_PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 
     def setUp(self):
+        # Open the admin gate (no relayer + LOCAL_TESTNET) so these route tests
+        # exercise authorization, not the gate. Restore env afterwards so the
+        # flag doesn't leak into other test classes.
+        self._env_prev = {
+            k: os.environ.get(k) for k in ("LOCAL_TESTNET", "RELAYER_URL", "ADMIN_API_KEY")
+        }
+        self.addCleanup(self._restore_env)
+        os.environ["LOCAL_TESTNET"] = "1"
+        os.environ.pop("RELAYER_URL", None)
+        os.environ.pop("ADMIN_API_KEY", None)
         self.client = TestClient(app, raise_server_exceptions=False)
+        from eth_account import Account
+        self.deployer = Account.from_key(self.DEPLOYER_PK).address
+        self.new_js = "module.exports = { score: () => ({score: 0.9, valid: true}) }"
+
+    def _restore_env(self):
+        for k, v in self._env_prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _seed_app(self, deployer=""):
+        """Insert an app straight into the route's store, bypassing the
+        validation-heavy create path (which is covered by its own tests)."""
+        import uuid
+        from minotaur_subnet.api.server import store as server_store
+        from minotaur_subnet.shared.types import AppIntentDefinition
+        app_id = f"auth-test-{uuid.uuid4().hex[:10]}"
+        server_store.save_app(AppIntentDefinition(
+            app_id=app_id, name="Auth Test", version="1.0.0", intent_type="swap",
+            js_code="module.exports = { score: () => ({score: 0.5, valid: true}) }",
+            deployer=deployer,
+        ))
+        return app_id
+
+    def _sign(self, app_id, nonce, deadline, *, pk=None):
+        from minotaur_subnet.api.services import developer_auth as da
+        return da.sign_developer_auth(
+            pk or self.DEPLOYER_PK, action=da.ACTION_UPDATE_SCORING, app_id=app_id,
+            params_hash=da.params_hash(self.new_js.encode()), nonce=nonce, deadline=deadline,
+        )
+
+    @contextlib.contextmanager
+    def _mock_validation(self):
+        """Stub JS/app validation so route tests exercise auth + storage, not
+        the JS engine or Forge (those paths have their own coverage)."""
+        valid = SimpleNamespace(valid=True, errors=[], warnings=[], js_manifest=None)
+        with patch(
+            "minotaur_subnet.engine.validation.validate_js_code",
+            new=AsyncMock(return_value=valid),
+        ), patch(
+            "minotaur_subnet.engine.validation.validate_app_intent",
+            new=AsyncMock(return_value=valid),
+        ), patch(
+            "minotaur_subnet.api.services.app_service._validate_manifest_semantics_for_response",
+            return_value=([], [], None),
+        ):
+            yield
 
     def _create_app_payload(self, deployer=""):
         payload = {
@@ -272,89 +337,94 @@ class TestDeployerAuthorization(unittest.TestCase):
 
     def test_create_app_stores_deployer(self):
         """Creating an app with deployer sets it on the definition."""
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload(
-            deployer="0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-        ))
+        with self._mock_validation():
+            resp = self.client.post("/v1/apps/", json=self._create_app_payload(
+                deployer="0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+            ))
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertEqual(data["deployer"], "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
 
     def test_create_app_no_deployer(self):
         """Creating an app without deployer stores empty string."""
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload())
+        with self._mock_validation():
+            resp = self.client.post("/v1/apps/", json=self._create_app_payload())
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["deployer"], "")
 
-    def test_update_scoring_authorized(self):
-        """Deployer can update their own app's JS."""
-        deployer = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload(deployer=deployer))
-        app_id = resp.json()["app_id"]
-
-        resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
-            "new_js_code": "module.exports = { score: () => ({score: 0.9, valid: true}) }",
-            "caller": deployer,
-        })
+    def test_auth_nonce_endpoint(self):
+        """GET /auth-nonce returns next nonce = 1 for a fresh app."""
+        app_id = self._seed_app(deployer=self.deployer)
+        resp = self.client.get(f"/v1/apps/{app_id}/auth-nonce")
         self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["status"], "updated")
+        self.assertEqual(resp.json()["next_nonce"], 1)
+
+    def test_update_scoring_authorized(self):
+        """Deployer with a valid EIP-712 signature can update their app's JS."""
+        app_id = self._seed_app(deployer=self.deployer)
+        deadline = int(time.time()) + 300
+        sig = self._sign(app_id, 1, deadline)
+        with self._mock_validation():
+            resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
+                "new_js_code": self.new_js,
+                "signature": sig, "nonce": 1, "deadline": deadline,
+            })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json().get("status"), "updated", resp.json())
+
+    def test_update_scoring_replay_rejected(self):
+        """Re-submitting the same signed request is rejected (nonce consumed)."""
+        app_id = self._seed_app(deployer=self.deployer)
+        deadline = int(time.time()) + 300
+        sig = self._sign(app_id, 1, deadline)
+        body = {"new_js_code": self.new_js, "signature": sig, "nonce": 1, "deadline": deadline}
+        with self._mock_validation():
+            first = self.client.put(f"/v1/apps/{app_id}/scoring", json=body)
+            self.assertEqual(first.json().get("status"), "updated", first.json())
+            replay = self.client.put(f"/v1/apps/{app_id}/scoring", json=body)
+        self.assertIn("Unauthorized", replay.json().get("error", ""))
 
     def test_update_scoring_unauthorized(self):
-        """Non-deployer cannot update the app's JS."""
-        deployer = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload(deployer=deployer))
-        app_id = resp.json()["app_id"]
+        """A signature from a non-deployer key is rejected."""
+        app_id = self._seed_app(deployer=self.deployer)
+        deadline = int(time.time()) + 300
+        sig = self._sign(app_id, 1, deadline, pk=self.OTHER_PK)
+        with self._mock_validation():
+            resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
+                "new_js_code": self.new_js,
+                "signature": sig, "nonce": 1, "deadline": deadline,
+            })
+        self.assertIn("Unauthorized", resp.json().get("error", ""))
 
-        resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
-            "new_js_code": "module.exports = { score: () => ({score: 0.9, valid: true}) }",
-            "caller": "0x1234567890123456789012345678901234567890",
-        })
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertIn("error", data)
-        self.assertIn("Unauthorized", data["error"])
-
-    def test_update_scoring_no_caller_with_deployer_set(self):
-        """Missing caller when deployer is set should be rejected."""
-        deployer = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload(deployer=deployer))
-        app_id = resp.json()["app_id"]
-
-        resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
-            "new_js_code": "module.exports = { score: () => ({score: 0.9, valid: true}) }",
-        })
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertIn("error", data)
-        self.assertIn("Unauthorized", data["error"])
+    def test_update_scoring_no_signature_with_deployer_set(self):
+        """Missing signature when a deployer is set should be rejected."""
+        app_id = self._seed_app(deployer=self.deployer)
+        with self._mock_validation():
+            resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
+                "new_js_code": self.new_js,
+            })
+        self.assertIn("Unauthorized", resp.json().get("error", ""))
 
     def test_update_scoring_no_deployer_allows_anyone(self):
-        """Apps created without deployer allow anyone to update (backward compat)."""
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload())
-        app_id = resp.json()["app_id"]
-
-        resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
-            "new_js_code": "module.exports = { score: () => ({score: 0.9, valid: true}) }",
-        })
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["status"], "updated")
+        """Apps with no deployer allow anyone to update (backward compat)."""
+        app_id = self._seed_app(deployer="")
+        with self._mock_validation():
+            resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
+                "new_js_code": self.new_js,
+            })
+        self.assertEqual(resp.json().get("status"), "updated", resp.json())
 
     def test_update_scoring_case_insensitive(self):
-        """Deployer check should be case-insensitive (EIP-55 mixed case)."""
-        deployer_lower = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
-        deployer_mixed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-
-        resp = self.client.post("/v1/apps/", json=self._create_app_payload(deployer=deployer_mixed))
-        app_id = resp.json()["app_id"]
-
-        resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
-            "new_js_code": "module.exports = { score: () => ({score: 0.9, valid: true}) }",
-            "caller": deployer_lower,
-        })
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["status"], "updated")
+        """Deployer match is case-insensitive (EIP-55 mixed case stored)."""
+        app_id = self._seed_app(deployer=self.deployer.upper())
+        deadline = int(time.time()) + 300
+        sig = self._sign(app_id, 1, deadline)  # signed by the same key
+        with self._mock_validation():
+            resp = self.client.put(f"/v1/apps/{app_id}/scoring", json={
+                "new_js_code": self.new_js,
+                "signature": sig, "nonce": 1, "deadline": deadline,
+            })
+        self.assertEqual(resp.json().get("status"), "updated", resp.json())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -319,9 +319,13 @@ class ValidateAppRequest(BaseModel):
 
 class UpdateScoringRequest(BaseModel):
     new_js_code: str = Field(..., description="New JavaScript scoring source")
-    caller: str = Field("", description="Caller address (must match deployer if one was set at creation)")
-    signature: str = Field("", description="EIP-191 signature proving caller owns the deployer address. "
-                           "Message = keccak256(abi.encode(app_id, sha256(new_js_code)))")
+    caller: str = Field("", description="Deprecated, ignored. Authorization is by `signature`.")
+    signature: str = Field("", description="EIP-712 developer-auth signature from the app's deployer "
+                           "(required if a deployer was set). Binds action=update_scoring, app_id, "
+                           "keccak(new_js_code), nonce, deadline.")
+    nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce). "
+                       "Must equal last_consumed + 1; consumed once on success.")
+    deadline: int = Field(0, description="Unix-seconds expiry the signature was signed with.")
 
 
 class ScorePlanRequest(BaseModel):
@@ -490,7 +494,31 @@ def update_scoring(
         _store(), app_id, body.new_js_code,
         caller=body.caller,
         signature=body.signature,
+        nonce=body.nonce,
+        deadline=body.deadline,
     )
+
+
+@router.get("/apps/{app_id}/auth-nonce")
+def get_auth_nonce(app_id: str, deployer: str = "") -> dict[str, Any]:
+    """Next developer-auth nonce to sign for owner-gated actions on this app.
+
+    The deployer reads this, signs an EIP-712 developer-auth message with
+    ``nonce = next_nonce``, and submits it (e.g. to ``PUT .../scoring``). Public
+    read — the nonce is a non-secret monotonic counter, like an account nonce.
+    """
+    s = _store()
+    definition = s.get_app(app_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail=f"App not found: {app_id}")
+    dep = (deployer or definition.deployer or "").strip()
+    if not dep:
+        raise HTTPException(
+            status_code=400,
+            detail="App has no deployer; owner-gated actions need no signature",
+        )
+    current = s.get_developer_nonce(app_id, dep.lower())
+    return {"app_id": app_id, "deployer": dep, "next_nonce": current + 1}
 
 
 @router.get("/apps/{app_id}/manifest")
