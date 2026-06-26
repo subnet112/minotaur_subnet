@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -296,8 +296,15 @@ class RoundState:
 class RoundStore:
     """In-memory round store with optional JSON persistence."""
 
-    def __init__(self, persist_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        persist_path: Path | None = None,
+        record_sink: Callable[[RoundState], None] | None = None,
+    ) -> None:
         self._persist_path = persist_path
+        # Best-effort mirror of each round mutation to durable history (e.g. the
+        # order-book DB). NEVER affects round state — failures are swallowed.
+        self._record_sink = record_sink
         self._persist_mtime_ns: int | None = None
         self._rounds: dict[str, RoundState] = {}
         self._current_round_id: str | None = None
@@ -369,6 +376,7 @@ class RoundStore:
                 self._active_champion = copy.deepcopy(incumbent)
                 current.sync_incumbent(incumbent)
                 self._persist()
+                self._record(current)
             return copy.deepcopy(current)
 
         now = time.time()
@@ -386,6 +394,7 @@ class RoundStore:
         self._rounds[round_id] = state
         self._current_round_id = round_id
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def close_current_round(
@@ -417,6 +426,7 @@ class RoundStore:
             current.effective_epoch = effective_epoch
         current.updated_at = time.time()
         self._persist()
+        self._record(current)
         return copy.deepcopy(current)
 
     def set_round_status(self, round_id: str, status: RoundStatus) -> RoundState:
@@ -427,6 +437,7 @@ class RoundStore:
         state.status = status
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def set_round_finalist(
@@ -450,6 +461,7 @@ class RoundStore:
         state.status = RoundStatus.CERTIFYING
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def set_round_fork_pins(
@@ -468,6 +480,7 @@ class RoundStore:
         state.fork_pins = {int(k): int(v) for k, v in pins.items()} if pins else None
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def certify_round(
@@ -490,6 +503,7 @@ class RoundStore:
         state.status = RoundStatus.CERTIFIED
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def activate_round(self, round_id: str, *, effective_epoch: int) -> RoundState:
@@ -502,6 +516,7 @@ class RoundStore:
         state.abort_reason = None
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def open_next_round(
@@ -525,6 +540,7 @@ class RoundStore:
         state.abort_reason = reason
         state.updated_at = time.time()
         self._persist()
+        self._record(state)
         return copy.deepcopy(state)
 
     def _get_current_round_ref(self) -> RoundState | None:
@@ -552,6 +568,20 @@ class RoundStore:
             return
         if self._persist_mtime_ns is None or current_mtime_ns > self._persist_mtime_ns:
             self._load()
+
+    def _record(self, state: RoundState) -> None:
+        """Best-effort mirror of a round mutation to the durable history sink
+        (e.g. the order-book DB). MUST never raise — round consensus does not
+        depend on history recording."""
+        if self._record_sink is None:
+            return
+        try:
+            self._record_sink(state)
+        except Exception as exc:  # noqa: BLE001 — history is best-effort
+            logger.warning(
+                "round history record failed for %s: %s",
+                getattr(state, "round_id", "?"), exc,
+            )
 
     def _persist(self) -> None:
         if self._persist_path is None:

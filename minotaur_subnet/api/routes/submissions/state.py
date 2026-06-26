@@ -13,7 +13,7 @@ from collections import deque
 from typing import Any
 
 from minotaur_subnet.harness.submission_store import SubmissionStore
-from minotaur_subnet.harness.round_store import RoundStore
+from minotaur_subnet.harness.round_store import RoundState, RoundStore
 
 # ── Singleton state ─────────────────────────────────────────────────────────
 
@@ -46,6 +46,19 @@ def set_store(store: SubmissionStore) -> None:
     _store = store
 
 
+def _round_history_sink(state: RoundState) -> None:
+    """Mirror a round mutation into the order-book DB (AppIntentStore) so round
+    history is durable + queryable via GET /v1/solver/rounds. Best-effort —
+    never breaks round logic (RoundStore._record also guards)."""
+    try:
+        from minotaur_subnet.api.server_context import ctx
+        save = getattr(getattr(ctx, "store", None), "save_round", None)
+        if callable(save):
+            save(state.to_dict())
+    except Exception:  # noqa: BLE001 — history is best-effort
+        pass
+
+
 def get_round_store() -> RoundStore:
     """Get or create the solver round store singleton."""
     global _round_store
@@ -55,7 +68,15 @@ def get_round_store() -> RoundStore:
         persist_path = os.environ.get("SOLVER_ROUND_STORE_PATH")
         _round_store = RoundStore(
             persist_path=Path(persist_path) if persist_path else None,
+            record_sink=_round_history_sink,
         )
+        # One-time backfill: mirror rounds already in the JSON store into the
+        # order-book DB so history is complete from first use (best-effort).
+        try:
+            for _rs in _round_store.list_rounds():
+                _round_history_sink(_rs)
+        except Exception:  # noqa: BLE001
+            pass
     return _round_store
 
 
