@@ -47,6 +47,17 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
+from minotaur_subnet.harness.solver_read_proxy import (
+    CHAIN_NAMES,
+    budget_enforced,
+    build_pin_blocks,
+    close_session,
+    generate_plan_recv_timeout,
+    open_session,
+    proxy_rpc_url,
+    read_proxy_config,
+    reset_session,
+)
 from minotaur_subnet.harness.protocol import (
     Command,
     HarnessRequest,
@@ -137,6 +148,7 @@ class BenchmarkResult:
     error: str | None = None
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
+    revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
 
 
 # Type alias for the scoring callback
@@ -369,6 +381,12 @@ class SolverSession:
             )
 
         timeout = TIMEOUTS.get(request.command, 30.0)
+        # When the deterministic RPC-read budget is the cutoff, the wall-clock
+        # GENERATE_PLAN timeout is no longer the cutoff (it would re-introduce
+        # cross-host non-determinism). Loosen it to a runaway backstop. No-op when
+        # the budget is off (inert). Other commands keep their wall-clock.
+        if request.command == Command.GENERATE_PLAN:
+            timeout = generate_plan_recv_timeout(timeout)
         msg = request.to_json() + "\n"
 
         try:
@@ -813,6 +831,21 @@ def build_rpc_url_map(chain_ids) -> dict[int, str]:
     return rpc_map
 
 
+def _pin_solver_read_block_enabled() -> bool:
+    """Whether to pin the SOLVER's read fork to the round's fork_block before
+    generate_plan (Phase 0 of the deterministic-budget work).
+
+    CONSENSUS-RELEVANT: changes the block state the solver reads, hence its
+    routes/quotes/scores. Must be fleet-uniform — ships OFF so it can soak
+    inert on the lead (observe the revert/score effect under the adoption
+    freeze) and be flipped fleet-wide together (folded into the pack hash) once
+    proven, exactly like ROUND_ANCHORED_PIN. Default OFF.
+    """
+    return os.environ.get("PIN_SOLVER_READ_BLOCK", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 async def run_benchmark(
     session: SolverSession,
     intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -906,6 +939,36 @@ async def run_benchmark(
         if require_real_sim:
             raise RealSimulationUnavailable(msg)
         logger.error("[benchmark] %s", msg)
+
+    # SOLVER_READ_PROXY (split-fork): route the untrusted solver's reads for the
+    # routed chain(s) through the block-pin proxy at the round's fork_block — one
+    # fast upstream round-trip per call, pinned + deterministic on any archive
+    # provider — instead of the Anvil fork (which lazily fetches every cold slot,
+    # the timeout + cross-host non-determinism source). Inert unless set.
+    _read_proxy = read_proxy_config()
+    _proxy_session_id: str | None = None
+    if _read_proxy is not None and fork_block is not None and rpc_map:
+        pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+        if pin_blocks:
+            _proxy_session_id = f"bench-{id(session):x}-{fork_block}"
+            try:
+                rec = await open_session(_read_proxy, _proxy_session_id, pin_blocks)
+            except Exception as exc:  # noqa: BLE001
+                # Fail loud: a silent fallback to the unpinned Anvil fork would
+                # reintroduce the very non-determinism this exists to remove.
+                raise RealSimulationUnavailable(
+                    f"SOLVER_READ_PROXY set but opening the proxy session failed: {exc}"
+                ) from exc
+            for cid in list(rpc_map):
+                if cid in _read_proxy.chain_ids and cid in CHAIN_NAMES:
+                    rpc_map[cid] = proxy_rpc_url(_read_proxy, _proxy_session_id, cid)
+            logger.info(
+                "[benchmark] solver reads routed via block-pin proxy "
+                "session=%s pinned=%s",
+                _proxy_session_id,
+                rec.get("blocks"),
+            )
+
     if rpc_map:
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)
@@ -1015,6 +1078,29 @@ async def run_benchmark(
         # deployed scoreIntent reverts. Populate the source:"quote" params from
         # a REAL quote — exactly like the live get_quote path — so downstream
         # _build_benchmark_intent_order emits the full (CoW) layout.
+        # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE
+        # it quotes/routes, so it reads the SAME state the simulator scores at:
+        # cross-host deterministic (the precondition for a deterministic compute
+        # budget) AND it stops the solver mispricing quotes against a different
+        # (drifting, per-host) block. No-op when the fork is already pinned.
+        # Gated + consensus-relevant — ships OFF, flips fleet-uniformly.
+        if (
+            _pin_solver_read_block_enabled()
+            and fork_block is not None
+            and simulator is not None
+            and state is not None
+            and getattr(state, "chain_id", None)
+        ):
+            try:
+                pin_fn = getattr(simulator, "pin_read_fork", None)
+                if pin_fn is not None:
+                    pin_fn(state.chain_id, fork_block)
+            except Exception as exc:  # noqa: BLE001 - never let a pin failure abort the run
+                logger.warning(
+                    "[pin-read-block] fork pin failed for chain %s @ %s: %s",
+                    getattr(state, "chain_id", "?"), fork_block, exc,
+                )
+
         try:
             # Keep quote-enrich inside the try: _enrich_state_with_quote swallows
             # its own quote exceptions, but on an already-dead solver the next
@@ -1035,6 +1121,18 @@ async def run_benchmark(
                 br.trigger_decision = await session.check_trigger(
                     intent, state, snapshot,
                 )
+
+            # Deterministic per-scenario budget: reset the proxy session's spent
+            # budget to 0 so EACH generate_plan starts with a fresh budget B (a
+            # per-scenario cutoff, matching the per-scenario wall-clock it
+            # replaces). Best-effort + inert unless a proxy session is active AND
+            # the budget is enforced; a failed reset never aborts the run.
+            if (
+                _proxy_session_id is not None
+                and _read_proxy is not None
+                and budget_enforced()
+            ):
+                await reset_session(_read_proxy, _proxy_session_id)
 
             # Generate plan
             plan = await session.generate_plan(intent, state, snapshot)
@@ -1088,6 +1186,7 @@ async def run_benchmark(
                                     intent.app_id, sim.error,
                                 )
                                 br.error = f"real_sim_reverted: {sim.error}"
+                                br.revert_reason = getattr(sim, "revert_reason", None)
                                 fail_closed_miss = True
                         except Exception as sim_exc:
                             if require_real_sim:
@@ -1176,6 +1275,10 @@ async def run_benchmark(
     except (SolverTimeoutError, SolverCrashedError):
         pass
 
+    # Close the block-pin proxy session (best-effort; the proxy also caps its
+    # registry so an exception-path skip can't leak unboundedly).
+    if _proxy_session_id is not None and _read_proxy is not None:
+        await close_session(_read_proxy, _proxy_session_id)
     return results
 
 
