@@ -1913,29 +1913,33 @@ async def initialize(ctx: ServerContext) -> dict:
                 solver_round_open_seconds = 300.0
             # Two-phase round defaults: a ~5-min OPEN phase (collect submissions +
             # build/distribute images; SOLVER_ROUND_OPEN_SECONDS=300) followed by a
-            # ~5-min CLOSED phase to benchmark the champion + the round's submissions
-            # and certify. Benchmarking only starts at close (the round-anchored fork
-            # pin seals on close_epoch), so the closed window must fit the post-close
-            # batch — hence DECISION_EPOCHS=5 (5 epochs x EPOCH_SECONDS). Too small a
-            # value silently aborts contested rounds (certification_deadline_elapsed)
-            # instead of adopting. Leader-driven + broadcast (followers adopt the
-            # leader's decision_deadline_epoch / effective_epoch), so it is the
+            # CLOSED phase to benchmark the champion + the round's submissions and
+            # certify. Benchmarking only starts at close (the round-anchored fork pin
+            # seals on close_epoch), so the closed window must fit the post-close
+            # batch — which routinely runs well over 5 min with several submissions
+            # and/or a slow champion reference (each scenario re-quotes the champion).
+            # DECISION_EPOCHS=20 (20 epochs x EPOCH_SECONDS, ~20 min) gives that
+            # margin: too small a value silently aborts contested rounds
+            # (certification_deadline_elapsed) the instant after the leader decides to
+            # adopt, instead of adopting. Leader-driven + broadcast (followers adopt
+            # the leader's decision_deadline_epoch / effective_epoch), so it is the
             # LEADER's value that governs a round; keep it fleet-uniform across the
             # rollout so a leadership change doesn't shift the schedule mid-flight.
             try:
                 solver_round_decision_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "5").strip() or "5",
+                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "20").strip() or "20",
                 )
             except ValueError:
-                solver_round_decision_epochs = 5
-            # Activate the certified champion one epoch AFTER the decision deadline,
-            # so certification has fully landed before the swap takes effect.
+                solver_round_decision_epochs = 20
+            # Activate the certified champion just AFTER the decision deadline, so
+            # certification has fully landed before the swap takes effect — keep
+            # ACTIVATION_DELAY >= DECISION_EPOCHS.
             try:
                 solver_round_activation_delay_epochs = int(
-                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "6").strip() or "6",
+                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "22").strip() or "22",
                 )
             except ValueError:
-                solver_round_activation_delay_epochs = 6
+                solver_round_activation_delay_epochs = 22
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
