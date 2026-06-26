@@ -547,8 +547,26 @@ class EpochManager:
             return
         if not getattr(submission, "pr_number", None):
             return
+        # Pass champion context so the callback can render the full scored report
+        # on the PR (your score vs the champion per case). Only forward kwargs the
+        # callback accepts — mock/legacy callbacks take just (submission, reason).
+        kwargs: dict[str, Any] = {}
         try:
-            self._on_champion_rejected(submission, reason)
+            params = inspect.signature(self._on_champion_rejected).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "champion_score" in params:
+            kwargs["champion_score"] = self._champion.benchmark_score
+        if "dethrone_margin" in params:
+            kwargs["dethrone_margin"] = self._dethrone_margin
+        if "champion_details" in params and self._champion.submission_id:
+            try:
+                champ_sub = self._sub_store.get(self._champion.submission_id)
+                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
+            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
+                pass
+        try:
+            self._on_champion_rejected(submission, reason, **kwargs)
         except Exception as exc:
             logger.warning("on_champion_rejected callback failed: %s", exc)
 

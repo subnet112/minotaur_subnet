@@ -407,10 +407,65 @@ def delete_candidate_image(pr_number: int) -> bool:
     return False  # no matching tag (already pruned / never pushed)
 
 
-def on_champion_rejected_pr(submission: Any, reason: str, report_md: str | None = None) -> bool:
-    """REJECT path: comment the reason/report on the miner's PR, close it, and GC
-    the candidate image. Mirrors the off-chain quorum's reject decision onto the
-    PR. Usable while adoption is frozen — pure miner feedback, no chain writes."""
+def _render_reject_body(
+    submission: Any,
+    reason: str,
+    champion_score: float | None,
+    dethrone_margin: float | None,
+    champion_details: dict | None = None,
+) -> str:
+    """PR-comment body for a rejection: the full scored benchmark report when the
+    submission was benchmarked (with the champion per-case comparison and any
+    revert traces), else the concise reason. Never raises."""
+    fallback = f"### ❌ Submission rejected\n\n{reason}"
+    try:
+        from minotaur_subnet.api.routes.submissions.report import (
+            build_submission_report,
+            render_report_md,
+        )
+        from minotaur_subnet.epoch.adopt_rule import PER_APP_MIN_SCORE
+        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+
+        report = build_submission_report(
+            submission,
+            champion_score=champion_score,
+            threshold=PER_APP_MIN_SCORE,
+            dethrone_margin=(dethrone_margin if dethrone_margin is not None else DETHRONE_MARGIN),
+            reason=reason,
+            champion_details=champion_details,
+        )
+        if not report:
+            return fallback
+        # Only enrich when there's real benchmark detail to show; a screening or
+        # otherwise-empty report falls back to the concise message.
+        agg = report.get("aggregate") or {}
+        if not (report.get("per_case") or agg.get("your_score") is not None):
+            return fallback
+        md = render_report_md(report, submission_id=getattr(submission, "submission_id", None))
+        return md or fallback
+    except Exception as exc:
+        logger.warning("PR rejection report render failed: %s", exc)
+        return fallback
+
+
+def on_champion_rejected_pr(
+    submission: Any,
+    reason: str,
+    report_md: str | None = None,
+    *,
+    champion_score: float | None = None,
+    dethrone_margin: float | None = None,
+    champion_details: dict | None = None,
+) -> bool:
+    """REJECT path: comment the reason + scored report on the miner's PR, close
+    it, and GC the candidate image. Mirrors the off-chain quorum's reject
+    decision onto the PR. Usable while adoption is frozen — pure miner feedback,
+    no chain writes.
+
+    When ``report_md`` isn't supplied, builds the full per-case benchmark report
+    (your score vs the champion per case, the dethrone gap, every case
+    worst-first, and per-step revert traces) from the submission, given
+    ``champion_score`` / ``dethrone_margin`` / ``champion_details``."""
     pr_number = getattr(submission, "pr_number", None)
     if not pr_number:
         logger.info(
@@ -418,7 +473,9 @@ def on_champion_rejected_pr(submission: Any, reason: str, report_md: str | None 
             getattr(submission, "submission_id", "?"),
         )
         return False
-    body = report_md or f"### ❌ Submission rejected\n\n{reason}"
+    body = report_md or _render_reject_body(
+        submission, reason, champion_score, dethrone_margin, champion_details,
+    )
     commented = comment_on_pr(pr_number, body)
     closed = close_pr(pr_number)
     gced = delete_candidate_image(pr_number)
