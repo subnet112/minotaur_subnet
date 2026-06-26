@@ -35,6 +35,7 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStore,
 )
 from minotaur_subnet.harness.round_store import RoundStatus, RoundStore
+from minotaur_subnet.consensus.round_anchor import ForkPinUnavailable
 from minotaur_subnet.harness.orchestrator import (
     BenchmarkConfig,
     BenchmarkResult,
@@ -272,21 +273,51 @@ class BenchmarkWorker:
                         block)
 
     def _apply_round_anchored_pin(self, round_id: str | None) -> None:
-        """Override the fork pin with the round-anchored block (Option b).
+        """Pin the benchmark fork to the round-anchored block.
 
-        Uses the injected resolver (round_id -> canonical benchmark-chain block).
-        Authoritative over the env fallback, so call AFTER _apply_epoch_block_pin.
-        No-op without a resolver / round_id / pin (gate off or deferred -> the
-        env/live-head value stands). Never raises into the benchmark.
+        When ROUND_ANCHORED_PIN is ON the pin is MANDATORY: ``benchmark_pack_hash``
+        seals the *intended* fork block, so benchmarking at any OTHER block (live
+        head, or a stale pin carried over from a prior round) produces a DIFFERENT
+        score than peers while signing the SAME pack hash — a SILENT cross-host
+        divergence (a validator believes it agrees but scored a different state).
+        So if the pin cannot be resolved — no resolver/round_id, the resolver
+        raised/deferred (``ForkPinUnavailable``), or it returned ``None`` — this
+        RAISES ``ForkPinUnavailable`` and the caller DEFERS (retries next tick)
+        rather than scoring at the wrong block. When the gate is OFF it stays a
+        best-effort no-op (dev / live head; the env value stands).
         """
+        from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
+
+        gate_on = round_anchored_pin_enabled()
         if self._pin_resolver is None or not round_id:
+            if gate_on:
+                raise ForkPinUnavailable(
+                    "ROUND_ANCHORED_PIN on but cannot pin "
+                    f"(resolver={'set' if self._pin_resolver else 'none'}, "
+                    f"round_id={round_id!r})"
+                )
             return
         try:
             pin = self._pin_resolver(round_id)
-        except Exception as exc:
+        except ForkPinUnavailable:
+            if gate_on:
+                raise  # defer LOUD — never silently fall back to live head under the gate
+            logger.warning("[fork-pin] round-anchored resolve deferred (gate off, live head)")
+            return
+        except Exception as exc:  # noqa: BLE001
+            if gate_on:
+                raise ForkPinUnavailable(
+                    f"round-anchored pin resolve failed for {round_id}: {exc}"
+                ) from exc
             logger.warning("[fork-pin] round-anchored resolve failed: %s", exc)
             return
-        if pin is not None and int(pin) != self._epoch_block_number:
+        if pin is None:
+            if gate_on:
+                raise ForkPinUnavailable(
+                    f"round-anchored pin unavailable (deferred) for {round_id}"
+                )
+            return
+        if int(pin) != self._epoch_block_number:
             self.set_epoch_block(int(pin))
             logger.info("[fork-pin] benchmark pinned to Base block %d (round-anchored, %s)",
                         int(pin), round_id)
@@ -356,7 +387,17 @@ class BenchmarkWorker:
             _cur = self._round_store.get_current_round()
             if _cur is not None:
                 _pin_round_id = _cur.round_id
-        self._apply_round_anchored_pin(_pin_round_id)
+        try:
+            self._apply_round_anchored_pin(_pin_round_id)
+        except ForkPinUnavailable as exc:
+            logger.warning(
+                "[benchmark] DEFERRING run_once — round-anchored pin unavailable: %s. "
+                "Refusing to benchmark at live head while the pack hash seals the pin "
+                "(would score a different block than peers -> silent cross-host "
+                "divergence). Retrying next tick.",
+                exc,
+            )
+            return 0
         benchmarking = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
         if replay_round is not None:
             benchmarking = [
