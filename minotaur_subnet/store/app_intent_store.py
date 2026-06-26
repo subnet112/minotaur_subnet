@@ -332,6 +332,9 @@ class AppIntentStore:
                 CREATE TABLE IF NOT EXISTS developer_links(
                     app_id TEXT PRIMARY KEY, evm_deployer TEXT NOT NULL,
                     ss58 TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS miner_identities(
+                    github_login TEXT PRIMARY KEY, hotkey TEXT NOT NULL,
+                    proof_ref TEXT, linked_at REAL);
                 CREATE TABLE IF NOT EXISTS consumed_payments(
                     payment_ref TEXT PRIMARY KEY, app_id TEXT NOT NULL,
                     consumed_at REAL);
@@ -561,6 +564,40 @@ class AppIntentStore:
                 "ON CONFLICT(app_id) DO UPDATE SET "
                 "evm_deployer=excluded.evm_deployer, ss58=excluded.ss58",
                 (app_id, (evm_deployer or "").strip().lower(), ss58),
+            )
+
+    # ── miner GitHub-account ↔ hotkey identity ─────────────────────────────
+    # Binds a miner's GitHub account (the PR fork owner) to their Bittensor
+    # hotkey, so a submission's fork owner can be checked against the submitting
+    # hotkey (see api/services/miner_identity). Persisted here (SQLite, same DB
+    # as everything else) so the binding survives a restart — the leader/api
+    # re-reads it on boot instead of forcing every miner to re-register.
+
+    def get_miner_hotkey(self, github_login: str) -> str:
+        """The hotkey bound to a GitHub account (case-insensitive), or "" if none."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT hotkey FROM miner_identities WHERE github_login=?",
+                ((github_login or "").strip().lower(),),
+            ).fetchone()
+        return str(row["hotkey"]) if row else ""
+
+    def set_miner_identity(
+        self, github_login: str, hotkey: str, proof_ref: str, linked_at: float,
+    ) -> None:
+        """Record (or replace) a GitHub-account↔hotkey binding.
+
+        ``github_login`` is lower-cased (GitHub logins are case-insensitive);
+        ``proof_ref`` records where the binding was proven (the gist id) for audit.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO miner_identities(github_login, hotkey, proof_ref, linked_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(github_login) DO UPDATE SET "
+                "hotkey=excluded.hotkey, proof_ref=excluded.proof_ref, "
+                "linked_at=excluded.linked_at",
+                ((github_login or "").strip().lower(), (hotkey or "").strip(),
+                 (proof_ref or "").strip(), float(linked_at)),
             )
 
     # ── consumed deploy-fee payments ──────────────────────────────────────

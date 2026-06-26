@@ -795,6 +795,43 @@ async def create_submission(
             detail="Invalid hotkey signature",
         )
 
+    # OWNERSHIP GATE: the PR's fork owner must be a GitHub account THIS hotkey has
+    # registered (POST /v1/miner/link-github). The signature above only proves the
+    # submitter holds the hotkey — NOT that they authored/own the PR; without this,
+    # anyone can submit another miner's open PR under their own hotkey. Read from the
+    # persistent identity store; enforced whenever that store is wired (always in a
+    # real deployment — ctx.store is None only in isolated unit tests).
+    from minotaur_subnet.api.server_context import ctx
+    _id_store = getattr(ctx, "store", None)
+    if _id_store is not None and hasattr(_id_store, "get_miner_hotkey"):
+        fork_owner = (pr.get("fork_owner") or "").strip()
+        if not fork_owner:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PR #{body.pr_number} head fork has no owner login (fork deleted?)",
+            )
+        bound_hotkey = _id_store.get_miner_hotkey(fork_owner)
+        if not bound_hotkey:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"GitHub account '{fork_owner}' (this PR's fork owner) is not linked to "
+                    f"any hotkey. Link it first via POST /v1/miner/link-github: sign "
+                    f"'MinotaurGithubLink:{fork_owner.lower()}:{body.hotkey.strip()}' with "
+                    f"your hotkey, put {{\"hotkey\",\"signature\"}} in a PUBLIC gist on that "
+                    f"GitHub account, and submit the gist id."
+                ),
+            )
+        if bound_hotkey != body.hotkey.strip():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"GitHub account '{fork_owner}' is linked to a different hotkey — you can "
+                    f"only submit PRs from a fork you own (copying another miner's PR under "
+                    f"your hotkey is rejected)."
+                ),
+            )
+
     # Check for duplicate submission. Store the RESOLVED fork clone_url + head SHA
     # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).
     try:
@@ -824,6 +861,42 @@ async def create_submission(
         round_id=sub.round_id,
         epoch=sub.epoch,
     )
+
+
+@router.post("/miner/link-github")
+def link_github_identity(body: dict[str, Any]) -> dict[str, Any]:
+    """Bind your GitHub account to your hotkey via a hotkey-signed public gist.
+
+    Proves both directions with ZERO artifacts in the solver repo: create a PUBLIC
+    gist on the GitHub account you submit PRs from, with a file holding JSON
+    ``{"hotkey": "5G..", "signature": "0x.."}`` where the signature is your hotkey's
+    signature over ``MinotaurGithubLink:{github_login}:{hotkey}``. POST the gist id
+    here. The validator reads the gist OWNER (authoritative — proves GitHub-account
+    control) and verifies the signature (proves hotkey control), then persists the
+    GitHub-account → hotkey binding. A submission's PR fork owner is checked against
+    this binding so nobody can submit a PR from an account they don't own.
+    """
+    gist_id = str((body or {}).get("gist_id") or "").strip()
+    if not gist_id:
+        raise HTTPException(status_code=422, detail="gist_id is required")
+    from minotaur_subnet.api.server_context import ctx
+    from minotaur_subnet.api.services.miner_identity import link_miner_identity
+    store = getattr(ctx, "store", None)
+    if store is None or not hasattr(store, "set_miner_identity"):
+        raise HTTPException(status_code=503, detail="identity store unavailable")
+    ok, err, binding = link_miner_identity(store, gist_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"identity link failed: {err}")
+    return {"status": "linked", **binding}
+
+
+@router.get("/miner/identity/{github_login}")
+def get_miner_identity(github_login: str) -> dict[str, Any]:
+    """The hotkey bound to a GitHub account ("" if unregistered)."""
+    from minotaur_subnet.api.server_context import ctx
+    store = getattr(ctx, "store", None)
+    hotkey = store.get_miner_hotkey(github_login) if store is not None and hasattr(store, "get_miner_hotkey") else ""
+    return {"github_login": github_login.lower(), "hotkey": hotkey, "linked": bool(hotkey)}
 
 
 @router.post("/solver/round/close", response_model=SolverRoundResponse)
