@@ -607,15 +607,22 @@ def _build_solver_round_benchmark_pack_hash(
         logger.warning("pack_hash: historical sampling failed: %s", exc)
         historical_order_ids = []
 
-    # Fold the block-pin rewrite-table version into the pack hash when (and only
-    # when) this round routes solver reads through the proxy (proxy configured +
-    # round pinned). Inert otherwise — byte-identical to a non-proxy fleet.
-    from minotaur_subnet.harness.solver_read_proxy import pack_hash_block_rewrite
+    # Fold the block-pin rewrite-table version AND the deterministic compute
+    # budget into the pack hash when (and only when) this round routes solver
+    # reads through the proxy (proxy configured + round pinned), with the budget
+    # folded additionally only when it's enforced (positive). Inert otherwise —
+    # byte-identical to a non-proxy / non-budget fleet, so a divergent budget or
+    # rewrite version drops out of quorum (PACK_HASH_MISMATCH, loud).
+    from minotaur_subnet.harness.solver_read_proxy import (
+        pack_hash_block_rewrite,
+        pack_hash_compute_budget,
+    )
 
     scenario_hash = compute_pack_hash(
         round_id,
         synthetic_scenarios,
         historical_order_ids,
+        compute_budget=pack_hash_compute_budget(),
         block_rewrite=pack_hash_block_rewrite(),
     )
 
