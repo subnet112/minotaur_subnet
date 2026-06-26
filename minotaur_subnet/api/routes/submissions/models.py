@@ -133,6 +133,12 @@ class CloseRoundRequest(BaseModel):
     quorum_required: int | None = Field(default=None, ge=0)
     decision_deadline_epoch: int | None = Field(default=None, ge=0)
     effective_epoch: int | None = Field(default=None, ge=0)
+    # Leader's close-time submission snapshot (full records). Followers upsert
+    # these so their local pack-hash recompute matches the leader's. Present only
+    # when the leader has SUBMISSION_SNAPSHOT_SYNC enabled; None = legacy.
+    # max_length bounds a hostile/buggy leader's payload (a real round holds at
+    # most one submission per active miner; far below this cap).
+    submissions: list[dict[str, Any]] | None = Field(default=None, max_length=1024)
 
 
 class ChampionApprovalPayload(BaseModel):

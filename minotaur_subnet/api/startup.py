@@ -577,6 +577,14 @@ def _build_solver_round_benchmark_pack_hash(
         }
         for app in sorted(ctx.store.list_apps(), key=lambda item: item.app_id)
     ]
+    # NOTE: submission `status` is deliberately NOT folded into the hash. status
+    # is a MUTABLE lifecycle marker (QUEUED→…→BENCHMARKING→SCORED/REJECTED), and
+    # the leader computes+stores this hash AT CLOSE while a follower recomputes it
+    # AFTER its own evaluate_round has advanced statuses — folding status would
+    # make the hash unreproducible across that boundary (guaranteed
+    # PACK_HASH_MISMATCH). The 7 fields below are the submission's IDENTITY (what
+    # is benchmarked) and are stable post-screening, so they fully + stably
+    # commit to the round's submission set.
     submissions_payload = [
         {
             "submission_id": sub.submission_id,
@@ -586,7 +594,6 @@ def _build_solver_round_benchmark_pack_hash(
             "image_id": sub.image_id,
             "solver_name": sub.solver_name,
             "solver_version": sub.solver_version,
-            "status": sub.status.value,
         }
         for sub in sorted(round_subs, key=lambda item: item.submission_id)
     ]
@@ -2262,7 +2269,7 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
 
             def _close_sync_payload(round_state) -> dict[str, object]:
-                return {
+                payload: dict[str, object] = {
                     "round_id": round_state.round_id,
                     "close_epoch": round_state.close_epoch,
                     "benchmark_pack_hash": round_state.benchmark_pack_hash,
@@ -2272,6 +2279,20 @@ async def initialize(ctx: ServerContext) -> dict:
                     "decision_deadline_epoch": round_state.decision_deadline_epoch,
                     "effective_epoch": round_state.effective_epoch,
                 }
+                # Bind the leader's close-time submission snapshot to the close
+                # broadcast so followers reproduce the SAME pack hash. The leader
+                # awaits this broadcast before proposing, so the snapshot lands
+                # before the follower's pack-hash check. Default-off until fleet
+                # pack-hash parity is validated.
+                if _env_true("SUBMISSION_SNAPSHOT_SYNC", default=False):
+                    try:
+                        _subs = submissions.get_store().list_by_round(round_state.round_id)
+                        payload["submissions"] = [s.to_dict() for s in _subs]
+                    except Exception:
+                        logger.warning(
+                            "close payload: submission snapshot failed", exc_info=True,
+                        )
+                return payload
 
             def _certify_sync_payload(round_state) -> dict[str, object]:
                 certificate = round_state.certificate

@@ -203,6 +203,91 @@ class SubmissionStore:
         )
         return sub
 
+    def _upsert_one(self, record: dict[str, Any]) -> Submission:
+        """Build + index a submission from a caller-provided record WITHOUT
+        persisting. Caller-provided ``submission_id`` is preserved (no new uuid).
+        Tolerant of an unknown ``status`` (falls back to QUEUED) — status is a
+        local lifecycle marker and is NOT part of the benchmark pack hash, so a
+        record must never be dropped just because its status string is unknown.
+        Raises ValueError only when ``submission_id`` is missing.
+        """
+        sid = (record.get("submission_id") or "").strip()
+        if not sid:
+            raise ValueError("upsert requires a submission_id")
+        round_id = record.get("round_id") or self._legacy_round_id(record.get("epoch", 0))
+        raw_status = record.get("status", SubmissionStatus.QUEUED.value)
+        try:
+            status = SubmissionStatus(raw_status)
+        except ValueError:
+            logger.warning("upsert: unknown status %r for %s; defaulting QUEUED", raw_status, sid)
+            status = SubmissionStatus.QUEUED
+        sub = Submission(
+            submission_id=sid,
+            repo_url=record.get("repo_url", ""),
+            commit_hash=record.get("commit_hash", ""),
+            epoch=int(record.get("epoch", 0) or 0),
+            hotkey=record.get("hotkey", ""),
+            round_id=round_id,
+            pr_number=record.get("pr_number"),
+            status=status,
+            created_at=record.get("created_at", 0.0) or 0.0,
+            updated_at=record.get("updated_at", 0.0) or 0.0,
+            screening=record.get("screening") or {},
+            image_tag=record.get("image_tag"),
+            image_id=record.get("image_id"),
+            image_digest=record.get("image_digest"),
+            provenance=record.get("provenance"),
+            solver_path=record.get("solver_path"),
+            solver_name=record.get("solver_name"),
+            solver_version=record.get("solver_version"),
+            benchmark_score=record.get("benchmark_score"),
+            benchmark_rank=record.get("benchmark_rank"),
+            benchmark_details=record.get("benchmark_details"),
+            rejection_reason=record.get("rejection_reason"),
+        )
+        # _submissions is the source of truth for list_by_round / the pack hash;
+        # the indexes are best-effort lookups (last-wins is fine, they aren't
+        # consulted by the pack hash).
+        self._submissions[sid] = sub
+        self._by_hotkey_round[f"{sub.hotkey}:{sub.round_id}"] = sid
+        self._by_hotkey_epoch[f"{sub.hotkey}:{sub.epoch}"] = sid
+        return sub
+
+    def upsert_submission(self, record: dict[str, Any]) -> Submission:
+        """Insert or replace a single submission by caller-provided
+        ``submission_id`` and persist. See ``_upsert_one`` for field handling.
+
+        Used to mirror the leader's close-time submission snapshot so the
+        benchmark pack hash agrees fleet-wide (a follower lacking the leader's
+        records recomputes a divergent hash → PACK_HASH_MISMATCH). No per-round
+        cap (the leader already enforced it at ingest).
+        """
+        self._maybe_reload()
+        sub = self._upsert_one(record)
+        self._persist()
+        return sub
+
+    def upsert_submissions(self, records: list[dict[str, Any]]) -> int:
+        """Batch upsert the leader's snapshot, persisting ONCE (O(n), not the
+        O(n²) of per-record persist). Bad records (missing submission_id) are
+        skipped + logged so one malformed entry can't drop the whole snapshot;
+        returns the number successfully upserted.
+        """
+        self._maybe_reload()
+        n = 0
+        for record in records or []:
+            try:
+                self._upsert_one(record)
+                n += 1
+            except Exception as exc:  # noqa: BLE001 — skip the bad record, keep the rest
+                logger.warning(
+                    "upsert_submissions: skipped record %r: %s",
+                    (record or {}).get("submission_id"), exc,
+                )
+        if n:
+            self._persist()
+        return n
+
     def get(self, submission_id: str) -> Submission | None:
         """Get a submission by ID."""
         self._maybe_reload()
