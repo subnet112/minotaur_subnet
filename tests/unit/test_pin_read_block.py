@@ -85,6 +85,36 @@ def test_pin_not_called_when_disabled(monkeypatch):
     assert sim.pins == []                             # default OFF — inert
 
 
+def test_run_benchmark_fail_loud_when_proxy_configured_but_no_fork_block(monkeypatch):
+    """Safety net (closes the silent-anvil channel): if the block-pin proxy is configured
+    (the deterministic read path) but no fork_block was resolved, run_benchmark RAISES
+    rather than reading the raw, un-pinned anvil — exactly the failure mode behind the
+    repoint intermittency (env wired to the proxy, but a path reached run_benchmark with
+    fork_block=None and would otherwise fall back to the anvil)."""
+    import pytest
+    from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
+    from minotaur_subnet.harness.test_harness import (
+        make_intent, make_snapshot, make_state,
+    )
+    monkeypatch.setenv("SOLVER_READ_PROXY", "http://127.0.0.1:1")  # proxy configured
+    monkeypatch.setenv("BASE_RPC_URL", "http://base-anvil:8546")    # chain 8453 resolvable
+    monkeypatch.delenv("PIN_SOLVER_READ_BLOCK", raising=False)
+    intent, state, snapshot = make_intent(), make_state(), make_snapshot()
+    plan = ExecutionPlan(intent_id=intent.app_id, interactions=[], deadline=0, nonce=0)
+    sim = _PinRecordingSimulator()
+
+    async def score_fn(app_id, plan, simulation, st):
+        return ScoreResult(score=0.5)
+
+    with pytest.raises(RealSimulationUnavailable, match="no fork_block"):
+        asyncio.run(run_benchmark(
+            _FakeSession(plan), [(intent, state, snapshot)],
+            config=BenchmarkConfig(chain_ids=[8453]),   # routed chain in rpc_map
+            score_fn=score_fn, simulator=sim, fork_block=None,  # but NO pin resolved
+        ))
+    assert sim.order == []  # raised before any benchmark work ran
+
+
 def test_anvil_pin_read_fork_noop_when_already_at_block():
     from minotaur_subnet.simulator.anvil_simulator import AnvilSimulator
     sim = AnvilSimulator.__new__(AnvilSimulator)      # bypass __init__ / no real RPC
