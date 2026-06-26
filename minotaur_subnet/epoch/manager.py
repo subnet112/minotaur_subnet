@@ -153,6 +153,7 @@ class EpochManager:
         owner_hotkey: str | None = None,
         on_champion_adopted: Any = None,
         on_champion_rejected: Any = None,
+        on_champion_finalist: Any = None,
         vote_recorder: Any = None,
     ) -> None:
         self._block_loop = block_loop
@@ -173,6 +174,7 @@ class EpochManager:
         self._resolved_owner: str = ""
         self._on_champion_adopted = on_champion_adopted
         self._on_champion_rejected = on_champion_rejected
+        self._on_champion_finalist = on_champion_finalist
         # Leader gate for PR-mirroring side effects: only the configured leader
         # posts the reject report onto the miner's PR. None → ungated (tests /
         # not wired). Set via ``set_leader_check`` in startup.
@@ -446,6 +448,9 @@ class EpochManager:
         result["status_after"] = updated.status.value
         result["finalist_submission_id"] = updated.finalist_submission_id
         result["finalist_image_id"] = updated.finalist_image_id
+        # Mirror the WIN onto the finalist's PR (full report, no close — the PR
+        # stays open for the cert-gated merge).
+        self._notify_champion_finalist(finalist, "selected as finalist")
         return result
 
     async def activate_certified_round(self, round_id: str, *, epoch: int) -> dict[str, Any]:
@@ -588,6 +593,48 @@ class EpochManager:
             self._on_champion_rejected(submission, reason, **kwargs)
         except Exception as exc:
             logger.warning("on_champion_rejected callback failed: %s", exc)
+
+    def _notify_champion_finalist(self, submission: Any, reason: str) -> None:
+        """WIN mirror of ``_notify_champion_rejected``: best-effort fire the
+        finalist callback (PR comment only — posts the full scored report). NEVER
+        closes the PR; the winner's PR must stay open for the cert-gated merge.
+
+        Same leader gate as the reject path: ``evaluate_round`` runs on every
+        validator, so without the gate every node with a solver-repo token would
+        post its own (possibly divergent) report. Only the configured leader
+        mirrors it. No-op without a callback / a PR-based submission."""
+        if self._on_champion_finalist is None:
+            return
+        # Defensive read: the reaper path can construct an EpochManager via __new__
+        # (bypassing __init__ where _is_leader is set), so use getattr to avoid an
+        # AttributeError that the reaper would swallow and silently skip the win.
+        _is_leader = getattr(self, "_is_leader", None)
+        if _is_leader is not None and not _is_leader():
+            return  # followers don't post — the leader is the single source
+        if not getattr(submission, "pr_number", None):
+            return
+        # Pass champion context so the callback can render the full scored report
+        # on the PR (your score vs the champion per case). Only forward kwargs the
+        # callback accepts — mock/legacy callbacks take just (submission, reason).
+        kwargs: dict[str, Any] = {}
+        try:
+            params = inspect.signature(self._on_champion_finalist).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "champion_score" in params:
+            kwargs["champion_score"] = self._champion.benchmark_score
+        if "dethrone_margin" in params:
+            kwargs["dethrone_margin"] = self._dethrone_margin
+        if "champion_details" in params and self._champion.submission_id:
+            try:
+                champ_sub = self._sub_store.get(self._champion.submission_id)
+                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
+            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
+                pass
+        try:
+            self._on_champion_finalist(submission, reason, **kwargs)
+        except Exception as exc:
+            logger.warning("on_champion_finalist callback failed: %s", exc)
 
     def get_champion(self) -> dict[str, Any]:
         """Return metadata about the current champion solver."""

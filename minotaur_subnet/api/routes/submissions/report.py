@@ -38,6 +38,7 @@ def build_submission_report(
     dethrone_margin: float,
     reason: str | None,
     champion_details: dict[str, Any] | None = None,
+    won: bool = False,
 ) -> dict[str, Any] | None:
     """Assemble the feedback report, or None if the submission isn't far enough.
 
@@ -141,6 +142,11 @@ def build_submission_report(
     else:
         outcome = status or "scored"
 
+    if won:
+        # Leader selected this as the round finalist (it beat the champion by the
+        # dethrone margin). Override any score-derived outcome so the PR renders a win.
+        outcome = "won"
+
     report: dict[str, Any] = {
         "outcome": outcome,
         "reason": reason,
@@ -208,11 +214,13 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
 
     if outcome == "adopted":
         header = "### ✅ Adopted as champion"
+    elif outcome == "won":
+        header = "### 🏆 Beat the champion — selected as finalist"
     elif outcome == "rejected_screening":
         header = "### ❌ Screening rejected"
     else:
         header = "### ❌ Submission rejected"
-    if reason and outcome != "adopted":
+    if reason and outcome not in ("adopted", "won"):
         header += f" — {reason}"
     lines = [header, ""]
 

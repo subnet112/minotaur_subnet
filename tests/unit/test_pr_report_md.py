@@ -123,6 +123,21 @@ def test_render_adopted_header():
     assert "✅ Adopted as champion" in render_report_md(rep)
 
 
+def test_build_and_render_won_header():
+    # A scored finalist that BEAT the champion: won=True overrides the
+    # score-derived outcome → "won", and renders the 🏆 win header (not ❌).
+    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
+    rep = build_submission_report(sub, champion_score=0.5, threshold=0.3,
+                                  dethrone_margin=0.05, reason="selected as finalist",
+                                  won=True)
+    assert rep["outcome"] == "won"
+    md = render_report_md(rep, submission_id="sub_x")
+    assert "🏆 Beat the champion — selected as finalist" in md
+    assert "❌ Submission rejected" not in md
+    # The win header is not double-suffixed with the reason.
+    assert "selected as finalist — selected as finalist" not in md
+
+
 # ── relayer enrichment ───────────────────────────────────────────────────────
 
 def test_on_champion_rejected_pr_body_has_scores_and_trace():
@@ -151,6 +166,34 @@ def test_on_champion_rejected_pr_falls_back_when_not_benchmarked():
          patch.object(sr, "delete_candidate_image", lambda n: True):
         sr.on_champion_rejected_pr(sub, "screening boom")
     assert captured["body"] == "### ❌ Submission rejected\n\nscreening boom"
+
+
+def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
+    # WIN path: posts the scored report rendered as a win, and does NOT close the
+    # PR or GC the image (the PR stays open for the cert-gated merge).
+    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
+    sub.pr_number = 22
+    champ = {"per_intent": [{"intent_id": "a", "score": 0.5}]}
+    captured = {}
+    calls = {"close": 0, "gc": 0}
+    with patch.object(sr, "comment_on_pr", lambda n, b: captured.update(n=n, body=b) or True), \
+         patch.object(sr, "close_pr", lambda n: calls.__setitem__("close", calls["close"] + 1) or True), \
+         patch.object(sr, "delete_candidate_image",
+                      lambda n: calls.__setitem__("gc", calls["gc"] + 1) or True):
+        result = sr.on_champion_finalist_pr(sub, "selected as finalist",
+                                            champion_score=0.5, dethrone_margin=0.05,
+                                            champion_details=champ)
+    assert result is True
+    assert captured["n"] == 22
+    assert "🏆 Beat the champion" in captured["body"]
+    assert "Your score" in captured["body"]
+    assert calls == {"close": 0, "gc": 0}  # PR stays open; image not GC'd
+
+
+def test_on_champion_finalist_pr_skips_without_pr_number():
+    sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.9)  # no pr_number
+    with patch.object(sr, "comment_on_pr", lambda n, b: (_ for _ in ()).throw(AssertionError("posted"))):
+        assert sr.on_champion_finalist_pr(sub, "selected as finalist") is False
 
 
 # ── manager wiring (call the method unbound with a fake self) ─────────────────
