@@ -94,53 +94,94 @@ def _export_env(token: str) -> None:
         os.environ.setdefault("SOLVER_READ_PROXY_TOKEN", token)
 
 
-async def ensure_read_proxy_container() -> bool:
-    """Ensure the block-pin proxy runs as a managed container on the api's image.
+async def _proxy_is_running() -> bool:
+    """True if the managed proxy container is up — via ``docker ps`` (NOT inspect).
 
-    Returns True if the proxy is up + the env exported, else False (logged). Safe and
-    idempotent to call once at api startup.
+    ``docker ps`` is ``GET /containers/json``, which the docker-socket-proxy allows even
+    on deployments where ``docker inspect <id>`` (``GET /containers/<id>/json``) returns
+    403 — the exact failure that silently un-wired the api and caused raw-anvil reads.
     """
-    if read_proxy_launch_disabled():
-        logger.info("[read-proxy] DISABLE_READ_PROXY set — not launching the managed proxy")
-        return False
+    rc, names, _ = await _docker(
+        "ps", "--filter", f"name=^{PROXY_CONTAINER_NAME}$", "--format", "{{.Names}}",
+    )
+    return rc == 0 and PROXY_CONTAINER_NAME in names.split()
 
-    # Self-inspect: the api's OWN image (so the proxy is the api's exact image and
-    # auto-updates with it) + the api's networks (to find the minotaur/validator net).
-    rc, info, err = await _docker(
-        "inspect", socket.gethostname(),
+
+async def _resolve_self_image_and_net() -> tuple[str, str | None]:
+    """The api's own image + its minotaur/validator network (to launch the proxy from the
+    same image, attached to the same egress net).
+
+    Tries the precise ``docker inspect self``; falls back to ``docker ps`` where the
+    socket-proxy denies inspect-by-id (403). Returns ("", None) if both fail.
+    """
+    host = socket.gethostname()
+    sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
+    rc, info, _ = await _docker(
+        "inspect", host,
         "--format", "{{.Image}}|{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}",
     )
-    if rc != 0 or "|" not in info:
+    if rc == 0 and "|" in info:
+        image, nets_s = info.split("|", 1)
+        net = next((n for n in nets_s.split() if n and n != sandbox), None)
+        return image.strip(), net
+    rc, row, _ = await _docker(
+        "ps", "--no-trunc", "--filter", f"id={host}", "--format", "{{.Image}}|{{.Networks}}",
+    )
+    if rc == 0 and "|" in row:
+        image, nets_s = row.split("|", 1)
+        net = next(
+            (n.strip() for n in nets_s.split(",") if n.strip() and n.strip() != sandbox), None
+        )
+        return image.strip(), net
+    return "", None
+
+
+async def ensure_read_proxy_container() -> bool:
+    """Ensure the api ROUTES through the block-pin proxy, launching the managed container
+    if it isn't already up. Idempotent; call once at api startup.
+
+    CRITICAL ORDER: the env wiring (``SOLVER_READ_PROXY*``) is exported FIRST and is
+    INDEPENDENT of any docker call. The proxy lives at a FIXED address, so a docker-socket
+    failure (e.g. a 403 on self-inspect) must NEVER leave the api un-wired — that was the
+    root cause of the repoint intermittency: the manager couldn't ``docker inspect`` itself,
+    bailed BEFORE exporting, and every benchmark then read the un-pinned raw anvil instead
+    of the proxy (silently pre-firewall; "no Web3" once the anvil was network-isolated).
+
+    Returns True if the proxy is up + env wired, False if only the env could be wired
+    (logged) — in which case a previously-launched proxy must already exist, else
+    benchmarks fail loud (defer) rather than read the anvil.
+    """
+    if read_proxy_launch_disabled():
+        logger.info("[read-proxy] DISABLE_READ_PROXY set — not wiring/launching the managed proxy")
+        return False
+
+    token = os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
+    # (1) WIRE FIRST — unconditional, no docker call (fixed proxy address).
+    _export_env(token)
+
+    # (2) Already running? Leave it (running-check via `docker ps`, survives the 403).
+    if await _proxy_is_running():
+        logger.info("[read-proxy] env wired to %s; managed proxy already running", PROXY_DATA_URL)
+        return True
+
+    # (3) Not running — launch it from the api's image on the sandbox + minotaur nets.
+    image, minotaur_net = await _resolve_self_image_and_net()
+    if not image:
         logger.error(
-            "[read-proxy] cannot inspect self (no docker-socket access?): %s — proxy NOT "
-            "launched; benchmarks will fail loud rather than mis-score", err or info,
+            "[read-proxy] env wired to %s but could NOT determine the api image to launch "
+            "the proxy (docker inspect AND ps both failed) — a previously-launched proxy is "
+            "required; otherwise benchmarks fail loud (defer), never read the anvil.",
+            PROXY_DATA_URL,
         )
         return False
-    image, nets_s = info.split("|", 1)
-    image = image.strip()
+    await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # clear any stopped/stale instance
     sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
-    minotaur_net = next((n for n in nets_s.split() if n and n != sandbox), None)
-    token = os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
-    upstreams = _build_upstreams()
-
-    # Idempotency: a running proxy already on the current image is correct as-is.
-    rc, cur, _ = await _docker(
-        "inspect", PROXY_CONTAINER_NAME, "--format", "{{.State.Running}}|{{.Image}}",
-    )
-    if rc == 0:
-        parts = (cur.split("|", 1) + [""])[:2]
-        if parts[0].strip() == "true" and parts[1].strip() == image:
-            logger.info("[read-proxy] managed proxy already running on the current image")
-            _export_env(token)
-            return True
-        await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # stale image / stopped -> replace
-
-    # NOTE: no Watchtower label — the api (not Watchtower) owns this container's
-    # lifecycle; it is re-created from the new image when the api itself updates.
+    # NOTE: no Watchtower label — the api owns this container's lifecycle. (It is left in
+    # place if already running; to force an update, remove it and restart the api.)
     create = [
         "run", "-d", "--name", PROXY_CONTAINER_NAME, "--restart", "unless-stopped",
         "--network", sandbox, "--ip", PROXY_STATIC_IP,
-        "-e", f"UPSTREAMS={upstreams}",
+        "-e", f"UPSTREAMS={_build_upstreams()}",
         "-e", f"CONTROL_TOKEN={token}",
         "-e", f"LISTEN_PORT={PROXY_PORT}",
         "-e", "LOG_LEVEL=INFO",
@@ -149,12 +190,11 @@ async def ensure_read_proxy_container() -> bool:
     rc, _cid, err = await _docker(*create, timeout=90)
     if rc != 0:
         logger.error(
-            "[read-proxy] FAILED to launch managed proxy: %s — benchmarks will fail loud "
-            "(no deterministic read path); node drops from quorum, never mis-scores", err,
+            "[read-proxy] env wired to %s but FAILED to launch the managed proxy: %s — "
+            "benchmarks fail loud (defer) until a proxy is up; they never read the anvil.",
+            PROXY_DATA_URL, err,
         )
         return False
-
-    # Attach the minotaur/validator net too (egress to upstream + the api's control plane).
     if minotaur_net:
         rcn, _, errn = await _docker("network", "connect", minotaur_net, PROXY_CONTAINER_NAME)
         if rcn != 0:
@@ -162,10 +202,8 @@ async def ensure_read_proxy_container() -> bool:
                 "[read-proxy] could not attach %s to %s: %s",
                 PROXY_CONTAINER_NAME, minotaur_net, errn,
             )
-
-    _export_env(token)
     logger.info(
-        "[read-proxy] launched managed proxy %s on %s(.5)+%s from image %s",
-        PROXY_CONTAINER_NAME, sandbox, minotaur_net, image[:24],
+        "[read-proxy] launched managed proxy %s on %s(.5)+%s from image %s; env wired to %s",
+        PROXY_CONTAINER_NAME, sandbox, minotaur_net, image[:24], PROXY_DATA_URL,
     )
     return True
