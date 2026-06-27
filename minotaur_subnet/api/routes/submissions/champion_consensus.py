@@ -667,7 +667,7 @@ def _build_champion_proposal_for_round(
     # reconstruct <repo>@sha256:D to pull. Falls back to the local {{.Id}} image_id
     # (legacy) when no digest was pushed. Peers receive the leader's resolved value
     # via candidate_image_id, so the whole quorum signs the same D.
-    from minotaur_subnet.harness.image_transport import bare_hex
+    from minotaur_subnet.harness.image_transport import bare_hex, is_bare_digest
     _candidate_digest = bare_hex(getattr(candidate, "image_digest", None))
     resolved_image_id = (
         candidate_image_id
@@ -705,6 +705,27 @@ def _build_champion_proposal_for_round(
         round_state.quorum_required
         or (consensus_manager.quorum_required if consensus_manager is not None else 0)
     )
+
+    # Cross-host verifiability gate (quorum>1): a follower can only re-benchmark +
+    # vote on a candidate it can independently PULL by content digest. If the image
+    # push was best-effort-skipped (image_digest unset), resolved_image_id falls back
+    # to the leader's LOCAL {{.Id}} sha — unverifiable on any other host, so every
+    # follower would be forced to REJECT (reads as dissent) and the round could never
+    # reach quorum. Fail CLOSED here rather than broadcast an un-poolable candidate.
+    # Genesis/builtin candidates carry no image and are exempt; at quorum<=1 the
+    # single (leader) voter benchmarks locally so the legacy id is fine.
+    _is_builtin = str(resolved_image_id).startswith("builtin:")
+    if resolved_quorum > 1 and not _is_builtin and not is_bare_digest(resolved_image_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Candidate {candidate.submission_id} has no pushed image digest "
+                f"(image_digest unset) — refusing to propose at quorum {resolved_quorum}: "
+                f"followers cannot pull-by-digest to independently verify it. The "
+                f"candidate image must be pushed to the registry (CANDIDATE_IMAGE_REPO) "
+                f"before it can be certified by a multi-validator quorum."
+            ),
+        )
 
     # v2 digest fields: commit_hash binds the git SHA, nonce/deadline are
     # replay protection. Nonce uses millisecond wall-clock — monotonic in
