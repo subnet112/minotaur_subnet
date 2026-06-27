@@ -919,11 +919,20 @@ class EpochManager:
                 except Exception:
                     pass  # fall through with synthetic-only scenarios
 
-            # Champion run (the dethrone bar). Route through the per-round memo so
-            # a follower's quorum verdict (_independent_adopt_vote) can REUSE this
-            # exact champion result instead of re-benchmarking the champion a
-            # second time. CONSOLIDATE_CHAMPION_BENCH off → a plain re-bench,
-            # byte-identical to before.
+            # Champion run (the dethrone bar). Use the SAME champion reference
+            # quote anchor that challenger benchmarking uses; otherwise challengers
+            # are graded against the champion's quote while the incumbent bar is
+            # still self-quoted/stored, making "as good as champion" look like ~0.5.
+            #
+            # Route through the per-round memo so a follower's quorum verdict
+            # (_independent_adopt_vote) can REUSE this exact champion result instead
+            # of re-benchmarking the champion a second time. The memo key includes
+            # the reference quote fingerprint, so self-quoted and anchored champion
+            # runs cannot collide.
+            reference_quotes = await self._benchmark_worker._build_reference_quotes(
+                intents,
+                image_tag=image_tag,
+            )
             _memo_round_id = None
             if self._round_store is not None:
                 try:
@@ -934,7 +943,10 @@ class EpochManager:
 
             async def _run_champion_bench():
                 return await self._benchmark_worker._benchmark_submission(
-                    image_tag, intents, score_fn,
+                    image_tag,
+                    intents,
+                    score_fn,
+                    reference_quotes=reference_quotes,
                 )
 
             results = await self._benchmark_worker.memo_champion_bench(
@@ -943,6 +955,7 @@ class EpochManager:
                 fork_block=getattr(self._benchmark_worker, "_epoch_block_number", None),
                 intents=intents,
                 require_real_sim=getattr(self._benchmark_worker, "_require_real_sim", False),
+                reference_quotes=reference_quotes,
                 run=_run_champion_bench,
             )
             if not isinstance(results, list):
@@ -967,8 +980,10 @@ class EpochManager:
                 )
 
             logger.info(
-                "Incumbent re-scored: %s %.4f → %.4f (%d scenarios)",
+                "Incumbent re-scored on champion reference anchor: %s %.4f → %.4f "
+                "(%d scenarios, %d reference quote entries)",
                 self._champion.submission_id, old_score, fresh_score, len(results),
+                len(reference_quotes),
             )
         except Exception:
             # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
