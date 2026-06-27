@@ -17,7 +17,7 @@ def test_comment_on_pr_posts_to_issues_endpoint(monkeypatch):
     _patch_env(monkeypatch)
     calls = []
 
-    def fake_req(method, url, payload=None):
+    def fake_req(method, url, payload=None, token=None):
         calls.append((method, url, payload))
         return 201, {"id": 1}
 
@@ -39,7 +39,7 @@ def test_close_pr_patches_state_closed(monkeypatch):
     _patch_env(monkeypatch)
     calls = []
 
-    def fake_req(method, url, payload=None):
+    def fake_req(method, url, payload=None, token=None):
         calls.append((method, url, payload))
         return 200, {"state": "closed"}
 
@@ -59,7 +59,7 @@ def test_delete_candidate_image_finds_tag_and_deletes(monkeypatch):
     ]
     seen = []
 
-    def fake_req(method, url, payload=None):
+    def fake_req(method, url, payload=None, token=None):
         seen.append((method, url))
         if method == "GET":
             return 200, versions
@@ -88,7 +88,7 @@ def test_on_champion_rejected_pr_comments_and_gcs_but_never_closes(monkeypatch):
     _patch_env(monkeypatch)
     sub = SimpleNamespace(submission_id="sub_1", pr_number=7)
     order = []
-    with patch.object(sr, "comment_on_pr", lambda n, b: order.append(("comment", n)) or True), \
+    with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: order.append(("comment", n)) or True), \
          patch.object(sr, "close_pr", lambda n: order.append(("close", n)) or True), \
          patch.object(sr, "delete_candidate_image", lambda n: order.append(("gc", n)) or True):
         assert sr.on_champion_rejected_pr(sub, "too slow") is True
@@ -115,13 +115,13 @@ def test_close_stale_submission_prs_closes_other_forks_only(monkeypatch):
     ]
     closed = []
 
-    def fake_req(method, url, payload=None):
+    def fake_req(method, url, payload=None, token=None):
         if method == "GET" and "/pulls?state=open" in url:
             return 200, open_prs
         return 200, {}
 
     with patch.object(sr, "_github_api_request", fake_req), \
-         patch.object(sr, "comment_on_pr", lambda n, b: True), \
+         patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: True), \
          patch.object(sr, "close_pr", lambda n: closed.append(n) or True):
         n = sr.close_stale_submission_prs(70, champion_label="PR #70")
     assert n == 1
