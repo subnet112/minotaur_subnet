@@ -1429,9 +1429,13 @@ class BenchmarkWorker:
         Per-scenario: when the champion session is up but FAILS to quote a
         specific scenario (raises or returns ``None``), that scenario's entry is
         set to the ``REFERENCE_QUOTE_FAILED_SENTINEL`` marker instead of being
-        omitted. ``run_benchmark`` detects the marker and scores the scenario 0
-        with an explicit error rather than silently self-quoting it — surfacing
-        the failure instead of masking it behind a non-comparable self-quote.
+        omitted. ``run_benchmark`` detects the marker and treats the scenario as
+        a CHAMPION BLIND-SPOT: every solver SELF-QUOTES it (see the
+        ``[champion-blind-spot]`` path in ``orchestrator.run_benchmark``). The
+        champion — which can't quote it — scores 0 there, while a challenger that
+        CAN quote + execute reveals real capability the champion lacks. The
+        marker exists so this is a *surfaced, logged* blind spot, not a silently
+        masked self-quote.
         """
         if not self._use_docker:
             return {}
@@ -1527,11 +1531,14 @@ class BenchmarkWorker:
                 except Exception as exc:
                     # Surface, don't mask: a champion that can't quote a scenario
                     # is a real failure (broken solver, bad scenario, RPC issue).
-                    # Mark it so run_benchmark scores 0 with an explicit error
-                    # instead of silently self-quoting a non-comparable pass.
+                    # Mark it as a champion blind-spot so run_benchmark SELF-QUOTES
+                    # it per-solver (champion scores 0 there; a challenger that can
+                    # quote + execute reveals capability) instead of masking the
+                    # champion failure behind a comparable pass.
                     logger.error(
                         "[reference-quote-FAILED] champion quote raised for %s "
-                        "(%s); scenario will score 0, NOT self-quote", label, exc,
+                        "(%s); champion blind-spot — solvers SELF-QUOTE this "
+                        "scenario, champion scores 0 here", label, exc,
                     )
                     reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
                     failed.add(label)
@@ -1539,7 +1546,8 @@ class BenchmarkWorker:
                 if quote_result is None:
                     logger.error(
                         "[reference-quote-FAILED] champion quote returned None "
-                        "for %s; scenario will score 0, NOT self-quote", label,
+                        "for %s; champion blind-spot — solvers SELF-QUOTE this "
+                        "scenario, champion scores 0 here", label,
                     )
                     reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
                     failed.add(label)
@@ -1554,8 +1562,8 @@ class BenchmarkWorker:
             if failed:
                 logger.error(
                     "Reference-quote pre-pass: built %d champion reference "
-                    "quotes; %d scenario(s) FAILED to quote (scored 0, not "
-                    "self-quoted): %s",
+                    "quotes; %d scenario(s) FAILED to quote (champion blind-spots "
+                    "— solvers self-quote these, champion scores 0): %s",
                     built, len(failed), sorted(failed),
                 )
             else:

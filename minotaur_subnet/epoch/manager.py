@@ -944,6 +944,41 @@ class EpochManager:
                 "Incumbent re-scored: %s %.4f → %.4f (%d scenarios)",
                 self._champion.submission_id, old_score, fresh_score, len(results),
             )
+
+            # FIX-1 SHADOW (env-gated, OBSERVE-ONLY). The live bar above is the
+            # incumbent's SELF-QUOTE score (reference_quotes=None) — but challengers
+            # are graded against the champion REFERENCE quotes. To measure whether
+            # making the bar SYMMETRIC with challengers (FIX-1) would change it,
+            # also score the champion against that same reference anchor and log the
+            # delta. This never touches fresh_score / the adoption decision, and runs
+            # in its OWN try/except so a shadow failure can't flip the real bar to
+            # stale. Costs ~2 extra champion passes/round → keep OFF except while
+            # measuring. (Mirrors the SHADOW_DETERMINISM observe-only pattern.)
+            if os.environ.get("FIX1_REFERENCE_SHADOW", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ):
+                try:
+                    _ref_q = await self._benchmark_worker._build_reference_quotes(
+                        intents, image_tag=image_tag,
+                    )
+                    _ref_results = await self._benchmark_worker._benchmark_submission(
+                        image_tag, intents, score_fn, reference_quotes=_ref_q,
+                    )
+                    if isinstance(_ref_results, list):
+                        _ref_score = self._benchmark_worker._compute_avg_score(
+                            _ref_results,
+                        )
+                        logger.info(
+                            "[fix1-shadow] incumbent %s: self_quote=%.4f "
+                            "reference_quote=%.4f delta=%+.4f (ref_quotes=%d) "
+                            "— OBSERVE ONLY, live bar unchanged",
+                            self._champion.submission_id, fresh_score, _ref_score,
+                            _ref_score - fresh_score, len(_ref_q),
+                        )
+                except Exception as _shadow_exc:  # noqa: BLE001 — never affect the real bar
+                    logger.warning(
+                        "[fix1-shadow] measurement failed (ignored): %s", _shadow_exc,
+                    )
         except Exception:
             # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
             # _should_adopt abstains rather than deciding on the prior score.
