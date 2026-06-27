@@ -50,7 +50,17 @@ class _Worker:
     def _build_scorecard(self, results):
         return _Card(self._champ_card if results == "CHAMP_RESULTS" else self._chal_card)
 
-    async def memo_champion_bench(self, *, round_id, image, fork_block, intents, require_real_sim, run):
+    async def memo_champion_bench(
+        self,
+        *,
+        round_id,
+        image,
+        fork_block,
+        intents,
+        require_real_sim,
+        reference_quotes=None,
+        run,
+    ):
         # Pass-through stub matching BenchmarkWorker.memo_champion_bench's keyword-only
         # surface; the memo itself is covered by test_champion_bench_memo.py, so here we
         # just run the caller's thunk (== flag-off behavior).
