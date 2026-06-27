@@ -1221,7 +1221,19 @@ class AppIntentsValidator:
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         loaded = self.engine.list_loaded_intents()
+        # Source orderbook stats from the DURABLE store, mirroring the api
+        # /blockloop/status fix (fdef554). self.orderbook is the in-memory working
+        # set — empty on followers (OrderSync upserts the store, not this object)
+        # and holds only the active set on the leader — so self.orderbook.stats()
+        # under-reports to {} even when the store holds the full corpus, which is
+        # what made the validator-health dashboard read OrderBook 0 everywhere.
+        # Defensive: a store hiccup must never 500 the health probe.
         ob_stats = self.orderbook.stats()
+        if self.store is not None and hasattr(self.store, "count_orders_by_status"):
+            try:
+                ob_stats = self.store.count_orders_by_status()
+            except Exception:
+                pass
         # Build version: MINOTAUR_IMAGE_SHA (baked by CI/Dockerfile) for
         # published images; falls back to the source checkout's git SHA for
         # from-source / bare-metal operators (e.g. no-Docker validators);
