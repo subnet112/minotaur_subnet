@@ -105,6 +105,20 @@ class SubmitResponse(BaseModel):
     epoch: int
 
 
+class DiagnosticScoreRequest(BaseModel):
+    """Score an arbitrary image through the EXACT challenger path — diagnostic only.
+
+    No submission, no round, never adoption-eligible. Used to score a known solver
+    (e.g. a king-clone, image digest sha256:...) against the live champion reference
+    anchor + round pin, to verify scoring symmetry.
+    """
+    image: str = Field(
+        ..., min_length=1,
+        description="Image tag or digest to benchmark as a challenger (e.g. ghcr.io/...@sha256:...)",
+    )
+    label: str | None = Field(default=None, description="Optional human label for logs/results")
+
+
 class StatusResponse(BaseModel):
     submission_id: str
     status: str
