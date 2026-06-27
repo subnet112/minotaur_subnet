@@ -446,33 +446,11 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
-        # Private-submission ADOPTION is not yet supported: the on-chain cert binds
-        # the PRIVATE head SHA, which cannot equal a re-committed canonical commit,
-        # so the cert-gated merge + verify-champion-cert ruleset check would reject
-        # it. Routing a private finalist into adoption would fail finalization every
-        # round and STALL champion progression. Until private finalization lands, a
-        # private finalist gets the full benchmark feedback on its PR (so the miner
-        # sees it would win) but is NOT set as the round finalist — the public
-        # champion path is never wedged. To actually claim the championship today,
-        # the miner resubmits publicly. (Public finalists are unaffected below.)
-        if getattr(finalist, "is_private", False):
-            self._notify_champion_finalist(
-                finalist,
-                "selected as finalist — private champion adoption is not yet enabled; "
-                "resubmit publicly to claim the championship",
-            )
-            next_round = self._complete_round(
-                round_state,
-                epoch,
-                activated=False,
-                abort_reason="private_finalist_adoption_deferred",
-            )
-            result["status_after"] = RoundStatus.ABORTED.value
-            result["abort_reason"] = "private_finalist_adoption_deferred"
-            if next_round is not None:
-                result["next_round_id"] = next_round.round_id
-            return result
-
+        # Private and public finalists follow the SAME adoption path. A private
+        # finalist was certified by the quorum against its image digest (followers
+        # pull-by-digest; they never need the private source), and the relayer lands
+        # it on canonical main via publish_private_champion_when_certified. No
+        # special-casing here — the dispatch on is_private happens at finalization.
         updated = self._round_store.set_round_finalist(
             round_id,
             submission_id=finalist.submission_id,
