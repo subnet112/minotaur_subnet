@@ -187,3 +187,22 @@ def test_serialize_is_sorted_and_insertion_order_independent():
 
 def test_serialize_empty():
     assert serialize_fork_pins({}) == ""
+
+
+# ── round_anchor_ts (confirmation-margin lookback) ────────────────────────────
+
+
+def test_round_anchor_ts_applies_one_epoch_lookback():
+    from minotaur_subnet.consensus.round_anchor import (
+        ROUND_ANCHOR_LOOKBACK_EPOCHS,
+        epoch_anchor_ts,
+        round_anchor_ts,
+    )
+    # The fork-pin anchor is one round-epoch earlier than the round's (close) epoch,
+    # so the ~24s confirmation margin can confirm-bracket it by close instead of
+    # deferring forever. Still a pure function of the epoch (no chain read).
+    assert ROUND_ANCHOR_LOOKBACK_EPOCHS == 1
+    # epoch 100, epoch_seconds 60 -> anchor at (100-1)*60 = 5940 (epoch 99's boundary)
+    assert round_anchor_ts(100, 60) == epoch_anchor_ts(99, 60) == 5940
+    # exactly one epoch_seconds earlier than the naive close-epoch anchor
+    assert round_anchor_ts(100, 60) == epoch_anchor_ts(100, 60) - 60
