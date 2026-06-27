@@ -81,7 +81,10 @@ def test_delete_candidate_image_no_matching_tag(monkeypatch):
         assert sr.delete_candidate_image(7) is False  # pr-7 absent -> nothing deleted
 
 
-def test_on_champion_rejected_pr_comments_closes_gcs(monkeypatch):
+def test_on_champion_rejected_pr_comments_and_gcs_but_never_closes(monkeypatch):
+    # Policy: a failure NEVER closes the PR — only a successful merge closes one
+    # (GitHub auto-closes a squash-merged PR). The reject path comments feedback +
+    # GCs the candidate image, leaving the PR OPEN so the miner can iterate.
     _patch_env(monkeypatch)
     sub = SimpleNamespace(submission_id="sub_1", pr_number=7)
     order = []
@@ -89,7 +92,8 @@ def test_on_champion_rejected_pr_comments_closes_gcs(monkeypatch):
          patch.object(sr, "close_pr", lambda n: order.append(("close", n)) or True), \
          patch.object(sr, "delete_candidate_image", lambda n: order.append(("gc", n)) or True):
         assert sr.on_champion_rejected_pr(sub, "too slow") is True
-    assert order == [("comment", 7), ("close", 7), ("gc", 7)]
+    assert order == [("comment", 7), ("gc", 7)]
+    assert ("close", 7) not in order  # the PR is left OPEN on a reject
 
 
 def test_on_champion_rejected_pr_no_pr_number_noop(monkeypatch):
@@ -97,3 +101,34 @@ def test_on_champion_rejected_pr_no_pr_number_noop(monkeypatch):
     sub = SimpleNamespace(submission_id="sub_1", pr_number=None)
     with patch.object(sr, "close_pr", lambda n: True):
         assert sr.on_champion_rejected_pr(sub, "x") is False
+
+
+def test_close_stale_submission_prs_closes_other_forks_only(monkeypatch):
+    # After a champion merge, OTHER open miner FORK PRs are stale (conflicting) and
+    # get closed; the winner, team branch PRs, and ghost (deleted-fork) PRs are left.
+    _patch_env(monkeypatch)
+    open_prs = [
+        {"number": 70, "head": {"repo": {"owner": {"login": "kingminer"}}}},         # winner -> skip
+        {"number": 62, "head": {"repo": {"owner": {"login": "assasin030511-cmd"}}}},  # fork  -> close
+        {"number": 6,  "head": {"repo": {"owner": {"login": "subnet112"}}}},          # team  -> skip
+        {"number": 55, "head": {"repo": None}},                                       # ghost -> skip
+    ]
+    closed = []
+
+    def fake_req(method, url, payload=None):
+        if method == "GET" and "/pulls?state=open" in url:
+            return 200, open_prs
+        return 200, {}
+
+    with patch.object(sr, "_github_api_request", fake_req), \
+         patch.object(sr, "comment_on_pr", lambda n, b: True), \
+         patch.object(sr, "close_pr", lambda n: closed.append(n) or True):
+        n = sr.close_stale_submission_prs(70, champion_label="PR #70")
+    assert n == 1
+    assert closed == [62]  # only the OTHER miner fork
+
+
+def test_close_stale_submission_prs_noop_on_list_failure(monkeypatch):
+    _patch_env(monkeypatch)
+    with patch.object(sr, "_github_api_request", lambda m, u, p=None: (500, None)):
+        assert sr.close_stale_submission_prs(70) == 0

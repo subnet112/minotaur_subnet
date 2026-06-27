@@ -513,6 +513,81 @@ class EpochManager:
                 f"Certified submission not found: {certificate.candidate_submission_id}",
             )
 
+        # PROVENANCE GATE (runs BEFORE the hot-swap): notify the relayer to attest
+        # the certificate on-chain (BT EVM ChampionRegistry, recording the validator
+        # signatures + tx hash for the GitHub Action) and squash-merge the miner's
+        # signed fork PR. The callback returns True only when BOTH the attestation
+        # and the merge succeed. We capture that result up front to gate the adoption
+        # before any champion change takes effect. With no merge callback wired (e.g.
+        # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
+        merge_ok = True
+        # Finalization (on-chain attest + squash-merge the miner's PR) is the
+        # LEADER's job: it alone holds the solver-repo PAT and is the single
+        # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
+        # PAT (the callback would fail → merge_ok False → it would wrongly REFUSE
+        # to adopt and never earn the champion's weights) and duplicate writers
+        # would race. The follower already INDEPENDENTLY verified this certificate
+        # at certify time (every approval checked against the on-chain
+        # ValidatorRegistry + EIP-712 in _certify_solver_round_state), so it adopts
+        # the quorum-verified winner directly. Leadership is dynamic → check at call
+        # time. _is_leader unset (local testnet / single-node / tests) → treat as
+        # leader, preserving the original behavior.
+        _leader_check = getattr(self, "_is_leader", None)
+        _is_follower = _leader_check is not None and not _leader_check()
+        if self._on_champion_adopted is not None and not _is_follower:
+            try:
+                cb_result = self._on_champion_adopted(
+                    submission, round_id, certificate=certificate,
+                )
+                if inspect.isawaitable(cb_result):
+                    cb_result = await cb_result
+                merge_ok = bool(cb_result)
+            except Exception as exc:
+                logger.warning("on_champion_adopted callback failed: %s", exc)
+                merge_ok = False
+        elif _is_follower:
+            logger.info(
+                "[merge-gate] round %s: follower adopts quorum-certified champion %s "
+                "on the verified certificate (leader owns attest + PR merge).",
+                round_id, certificate.candidate_submission_id,
+            )
+
+        # A failed attest/merge ABORTS the adoption — UNCONDITIONALLY, by design (no
+        # opt-out env var): no hot-swap, no weight emit, champion unchanged. A
+        # challenger whose source can't be merged to main + attested on-chain (e.g. a
+        # drifted PR head, or a missing on-chain proof) MUST NOT earn weights — its
+        # provenance can't be established. The fleet still RUNS the certified image
+        # digest at runtime, but a champion that can't be recorded is not adopted.
+        if not merge_ok:
+            logger.error(
+                "[merge-gate] round %s certified, but on-chain attest + PR merge did "
+                "NOT both succeed for %s — REFUSING to adopt (no hot-swap / weights); "
+                "champion unchanged.",
+                round_id, certificate.candidate_submission_id,
+            )
+            # Mirror the failure onto the miner's PR via the SAME reject-feedback
+            # path used for benchmark rejections (_notify_champion_rejected →
+            # on_champion_rejected_pr → PR comment): tell the miner WHY their win
+            # couldn't be finalized so they can fix it (typically: reset the PR head
+            # back to the certified commit). Leader-gated + best-effort internally.
+            self._notify_champion_rejected(
+                submission,
+                "adoption blocked — this submission won the round, but the champion "
+                "could not be finalized: its on-chain attestation and/or the "
+                "squash-merge of this PR did not both succeed. The most common cause "
+                "is the PR head being pushed PAST the certified commit, so the quorum "
+                "certificate no longer binds the head SHA (do not push to the branch "
+                "after submitting). The round was aborted and the champion is "
+                "unchanged; re-submit with the PR head pinned to the certified commit.",
+            )
+            next_round = self._complete_round(
+                round_state, epoch, activated=False, abort_reason="merge_failed",
+            )
+            result["abort_reason"] = "merge_failed"
+            if next_round is not None:
+                result["next_round_id"] = next_round.round_id
+            return result
+
         await self._hot_swap(submission, effective_epoch, round_id=round_id)
         activated = self._round_store.activate_round(
             round_id,
@@ -531,21 +606,6 @@ class EpochManager:
             round_id=round_id,
         )
         result["status_after"] = activated.status.value
-
-        # Notify the relayer to attest on-chain + create GitHub PR.
-        # The certificate is passed so the callback can record the validator
-        # signatures on BT EVM's ChampionRegistry and include the on-chain
-        # tx hash in the PR body for the GitHub Action to verify.
-        if self._on_champion_adopted is not None:
-            try:
-                cb_result = self._on_champion_adopted(
-                    submission, round_id, certificate=certificate,
-                )
-                if inspect.isawaitable(cb_result):
-                    await cb_result
-            except Exception as exc:
-                logger.warning("on_champion_adopted callback failed: %s", exc)
-
         return result
 
     def set_leader_check(self, is_leader: Any) -> None:
@@ -554,7 +614,8 @@ class EpochManager:
         self._is_leader = is_leader
 
     def _notify_champion_rejected(self, submission: Any, reason: str) -> None:
-        """Best-effort fire the reject callback (PR comment + close + GC). Sync —
+        """Best-effort fire the reject callback (PR comment + image GC; the PR is
+        left OPEN — only a merge closes a PR). Sync —
         called from the round-evaluation path; the callback itself is sync GitHub
         API. No-op without a callback / a PR-based submission.
 
@@ -902,6 +963,41 @@ class EpochManager:
                 "Incumbent re-scored: %s %.4f → %.4f (%d scenarios)",
                 self._champion.submission_id, old_score, fresh_score, len(results),
             )
+
+            # FIX-1 SHADOW (env-gated, OBSERVE-ONLY). The live bar above is the
+            # incumbent's SELF-QUOTE score (reference_quotes=None) — but challengers
+            # are graded against the champion REFERENCE quotes. To measure whether
+            # making the bar SYMMETRIC with challengers (FIX-1) would change it,
+            # also score the champion against that same reference anchor and log the
+            # delta. This never touches fresh_score / the adoption decision, and runs
+            # in its OWN try/except so a shadow failure can't flip the real bar to
+            # stale. Costs ~2 extra champion passes/round → keep OFF except while
+            # measuring. (Mirrors the SHADOW_DETERMINISM observe-only pattern.)
+            if os.environ.get("FIX1_REFERENCE_SHADOW", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            ):
+                try:
+                    _ref_q = await self._benchmark_worker._build_reference_quotes(
+                        intents, image_tag=image_tag,
+                    )
+                    _ref_results = await self._benchmark_worker._benchmark_submission(
+                        image_tag, intents, score_fn, reference_quotes=_ref_q,
+                    )
+                    if isinstance(_ref_results, list):
+                        _ref_score = self._benchmark_worker._compute_avg_score(
+                            _ref_results,
+                        )
+                        logger.info(
+                            "[fix1-shadow] incumbent %s: self_quote=%.4f "
+                            "reference_quote=%.4f delta=%+.4f (ref_quotes=%d) "
+                            "— OBSERVE ONLY, live bar unchanged",
+                            self._champion.submission_id, fresh_score, _ref_score,
+                            _ref_score - fresh_score, len(_ref_q),
+                        )
+                except Exception as _shadow_exc:  # noqa: BLE001 — never affect the real bar
+                    logger.warning(
+                        "[fix1-shadow] measurement failed (ignored): %s", _shadow_exc,
+                    )
         except Exception:
             # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
             # _should_adopt abstains rather than deciding on the prior score.
@@ -1352,10 +1448,18 @@ class EpochManager:
     def _build_weights_mapping(self, epoch: int, *, round_id: str | None = None) -> dict[str, float]:
         """Build a hotkey→weight mapping for emission policy.
 
-        Before a real miner-backed champion exists, emits 100% to the subnet
-        owner hotkey (burn behavior). Once a real miner champion exists, ranks
-        scored submissions by benchmark_score descending, applies exponential
-        decay (weight_decay^(rank-1)), and normalizes so all weights sum to 1.0.
+        WINNER-TAKES-ALL, champion-only: 100% burn to the subnet owner before a
+        real miner-backed champion exists; once one does, the champion gets
+        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05) and 0.95 burns to the owner.
+
+        Only ``self._champion`` — the submission that won AND was finalized
+        (merge-gate passed → ``_hot_swap`` set it as the live champion) — is ever
+        weighted. There is NO score-ranked decay tail across other scored
+        submissions: a runner-up, and in particular a candidate whose merge
+        FAILED (it never becomes ``self._champion`` — the gate aborts before
+        ``_hot_swap``), can never earn weight. The champion is always THIS
+        validator's own locally-adopted one — never copied from chain — so a
+        third party can't free-ride without doing the benchmark work itself.
 
         Returns:
             Dict mapping hotkey SS58 → normalized weight.
@@ -1363,44 +1467,10 @@ class EpochManager:
         if not self._sub_store:
             return {}
 
-        if not is_real_miner_hotkey(self._champion.hotkey):
-            return build_bootstrap_or_champion_weights(
-                self._champion.hotkey,
-                owner_hotkey=self._resolve_owner_hotkey(),
-            )
-
-        # Gather champion-eligible submissions from this epoch
-        subs = (
-            self._sub_store.list_by_round(round_id)
-            if round_id is not None
-            else self._sub_store.list_by_epoch(epoch)
+        return build_bootstrap_or_champion_weights(
+            self._champion.hotkey,
+            owner_hotkey=self._resolve_owner_hotkey(),
         )
-        scored = [s for s in self._eligible_candidates(subs) if s.hotkey]
-
-        if not scored:
-            return {}
-
-        # Sort by score descending
-        scored.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
-
-        # Apply exponential decay: weight = decay^(rank-1)
-        raw_weights: dict[str, float] = {}
-        for rank, sub in enumerate(scored):
-            weight = self._weight_decay ** rank  # rank 0 = champion
-            raw_weights[sub.hotkey] = weight
-
-        # Normalize to sum=1, then apply the champion burn ramp so the miners
-        # collectively receive only CHAMPION_MINER_WEIGHT_FRACTION (0.05) and the
-        # rest burns to the owner — the same conservative cap the daemon's
-        # burn-fallback builder applies, so a freshly-adopted champion's share is
-        # bounded however its weights were built.
-        total = sum(raw_weights.values())
-        if total > 0:
-            normalized = {k: v / total for k, v in raw_weights.items()}
-            return apply_champion_burn_ramp(
-                normalized, owner_hotkey=self._resolve_owner_hotkey(),
-            )
-        return raw_weights
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
         """Queue weights for emission by POSTing to the validator daemon.

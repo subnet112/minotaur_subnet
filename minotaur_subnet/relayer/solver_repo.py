@@ -374,6 +374,66 @@ def close_pr(pr_number: int) -> bool:
     return status == 200
 
 
+def close_stale_submission_prs(
+    winner_pr_number: int,
+    *,
+    champion_label: str = "the new champion",
+) -> int:
+    """Close OTHER open miner-submission PRs after a champion's PR merges to main.
+
+    A champion merge advances ``main`` to its ``solver.py``. Every other open
+    submission PR replaces ``solver.py`` too, so they ALL become conflicting against
+    the new ``main`` and can no longer be merged/adopted — even if they win a future
+    benchmark — until rebased. Close them (with a rebase instruction) so the miner
+    resubmits on the new base. This is a DISTINCT trigger from the per-round reject
+    path (``on_champion_rejected_pr`` keeps PRs OPEN): here the base itself moved.
+
+    Only FORK PRs (head owned by a non-canonical account) are closed — team branch
+    PRs on the solver repo are left alone — and the just-merged ``winner_pr_number``
+    is skipped (the merge already closed it). Best-effort; returns the count closed.
+    """
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None:
+        return 0
+    owner, repo = owner_repo
+    status, prs = _github_api_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=100",
+    )
+    if status != 200 or not isinstance(prs, list):
+        logger.warning("close-stale: could not list open PRs (HTTP %s)", status)
+        return 0
+    closed = 0
+    for pr in prs:
+        num = pr.get("number")
+        if not num or int(num) == int(winner_pr_number):
+            continue
+        head_owner = (
+            (((pr.get("head") or {}).get("repo") or {}).get("owner") or {}).get("login")
+            or ""
+        )
+        # Only miner FORK submissions go stale on a champion change; skip team branch
+        # PRs (head on the canonical repo) and headless/ghost PRs (deleted fork).
+        if not head_owner or head_owner.lower() == owner.lower():
+            continue
+        comment_on_pr(
+            int(num),
+            "### Closed — a new champion was elected\n\n"
+            f"`main` has advanced to {champion_label}, so this PR's base is now stale: "
+            "it replaces `solver.py` from an older `main` and will conflict — it can no "
+            "longer be merged or adopted, even if it wins a benchmark.\n\n"
+            "**Rebase your fork onto the latest `main` and resubmit** to compete "
+            "against the new champion.",
+        )
+        if close_pr(int(num)):
+            closed += 1
+    logger.info(
+        "close-stale: closed %d stale submission PR(s) after champion merge "
+        "(winner #%s)", closed, winner_pr_number,
+    )
+    return closed
+
+
 def delete_candidate_image(pr_number: int) -> bool:
     """GC a rejected candidate's ``pr-<N>`` image tag from GHCR.
 
@@ -464,10 +524,11 @@ def on_champion_rejected_pr(
     dethrone_margin: float | None = None,
     champion_details: dict | None = None,
 ) -> bool:
-    """REJECT path: comment the reason + scored report on the miner's PR, close
-    it, and GC the candidate image. Mirrors the off-chain quorum's reject
-    decision onto the PR. Usable while adoption is frozen — pure miner feedback,
-    no chain writes.
+    """REJECT path: comment the reason + scored report on the miner's PR and GC the
+    candidate image. The PR is left OPEN — only a successful merge ever closes a PR;
+    reject / merge-gate failures keep it open so the miner can read the feedback and
+    iterate on the same PR. Mirrors the off-chain quorum's reject decision onto the
+    PR. Usable while adoption is frozen — pure miner feedback, no chain writes.
 
     When ``report_md`` isn't supplied, builds the full per-case benchmark report
     (your score vs the champion per case, the dethrone gap, every case
@@ -476,7 +537,7 @@ def on_champion_rejected_pr(
     pr_number = getattr(submission, "pr_number", None)
     if not pr_number:
         logger.info(
-            "Champion reject for %s has no pr_number — skipping PR close",
+            "Champion reject for %s has no pr_number — skipping PR feedback",
             getattr(submission, "submission_id", "?"),
         )
         return False
@@ -484,13 +545,15 @@ def on_champion_rejected_pr(
         submission, reason, champion_score, dethrone_margin, champion_details,
     )
     commented = comment_on_pr(pr_number, body)
-    closed = close_pr(pr_number)
+    # Do NOT close the PR on a failure — only a successful squash-merge ever closes a
+    # PR (GitHub auto-closes on merge). Leaving reject / merge-gate failures OPEN lets
+    # the miner read the feedback and iterate on the same PR.
     gced = delete_candidate_image(pr_number)
     logger.info(
-        "Champion reject PR#%s: comment=%s close=%s gc=%s",
-        pr_number, commented, closed, gced,
+        "Champion reject PR#%s: comment=%s gc=%s (PR left OPEN — only a merge closes)",
+        pr_number, commented, gced,
     )
-    return closed
+    return commented
 
 
 def on_champion_finalist_pr(
@@ -989,11 +1052,152 @@ def on_champion_adopted_pr(
         commit_hash,
         round_id=round_id,
     )
+    if merged:
+        # The winner is on main now → every OTHER open submission PR replaces the
+        # same solver.py from an older main and is conflicting/un-adoptable until
+        # rebased. Close them (with a rebase instruction) so miners resubmit on the
+        # new base. Best-effort: never let cleanup affect the adoption result.
+        try:
+            close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("close-stale failed after champion merge: %s", exc)
     logger.info(
         "Champion adoption: attest=%s merge=%s pr=#%s round=%s",
         tx_hash or "skipped", merged, _pr_number, round_id,
     )
     return bool(tx_hash) and merged
+
+
+# ── Relayer-delegated finalization (third-party leader) ──────────────────────
+# When the leader is a third party we don't control, champion FINALIZATION (the
+# on-chain attest + the squash-merge) must run on the TRUSTED relayer that holds
+# RELAYER_PRIVATE_KEY + SOLVER_REPO_TOKEN — not on the leader. The leader calls
+# the relayer's POST /v1/finalize-champion (which re-verifies the validator quorum
+# independently) and gates its local adoption on the boolean reply. This mirrors
+# the on_champion_adopted_pr signature so it drops straight into the #326 gate.
+
+
+def on_champion_adopted_via_relayer(
+    submission: Any,
+    round_id: str | None = None,
+    *,
+    certificate: Any = None,
+) -> bool:
+    """Ask the trusted relayer to finalize a certified champion; return its verdict.
+
+    POSTs the certificate + submission identity to ``{RELAYER_URL}/v1/finalize-champion``.
+    The relayer independently re-verifies the validator quorum, then attests on-chain
+    and squash-merges the miner's PR using ITS OWN keys (the leader never holds them).
+
+    FAIL-CLOSED: any missing config, non-git submission, network error, timeout,
+    non-200, or a ``merge_ok != true`` reply returns False — the #326 adoption gate
+    then aborts the round (``merge_failed``) and the champion is left unchanged. We
+    never adopt on an unconfirmed merge.
+
+    Matches ``on_champion_adopted_pr``'s signature so it slots into the same
+    ``EpochManager.on_champion_adopted`` callback.
+    """
+    import requests
+
+    from minotaur_subnet.consensus.leader_wrapper import (
+        compute_champion_finalize_hash,
+        sign_wrapper,
+    )
+
+    relayer_url = os.environ.get("RELAYER_URL", "").strip()
+    if not relayer_url:
+        logger.error("on_champion_adopted_via_relayer: RELAYER_URL unset — cannot finalize")
+        return False
+
+    commit_hash = getattr(submission, "commit_hash", "") or ""
+    submission_id = getattr(submission, "submission_id", "") or ""
+    if not commit_hash or commit_hash in ("builtin", ""):
+        logger.info(
+            "Skipping relayer finalization for non-git submission: %s", submission_id,
+        )
+        return False
+
+    if certificate is None:
+        logger.error(
+            "on_champion_adopted_via_relayer: no certificate for %s — refusing", submission_id,
+        )
+        return False
+
+    validator_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+    if not validator_key:
+        logger.error(
+            "on_champion_adopted_via_relayer: VALIDATOR_PRIVATE_KEY unset — cannot sign wrapper",
+        )
+        return False
+
+    rid = str(round_id or "")
+    candidate_submission_id = (
+        getattr(certificate, "candidate_submission_id", None) or submission_id or ""
+    )
+    champion_chain_id = int(
+        os.environ.get("CHAMPION_CONSENSUS_CHAIN_ID", "964").strip() or "964"
+    )
+
+    # Anti-spam wrapper: bind round_id + candidate_submission_id (the relayer
+    # recomputes the SAME hash via compute_champion_finalize_hash — keep in sync).
+    finalize_hash = compute_champion_finalize_hash(rid, candidate_submission_id)
+    wrapper, wrapper_sig = sign_wrapper(
+        validator_key,
+        plan_hash=finalize_hash,
+        submission_nonce=int(time.time()),
+        chain_id=champion_chain_id,
+    )
+
+    body = {
+        "certificate": certificate.to_dict(),
+        "submission": {
+            "submission_id": submission_id,
+            "commit_hash": commit_hash,
+            "pr_number": getattr(submission, "pr_number", None),
+        },
+        "round_id": rid,
+        "wrapper": {
+            "plan_hash": wrapper.plan_hash,
+            "submission_nonce": wrapper.submission_nonce,
+            "timestamp": wrapper.timestamp,
+            "chain_id": wrapper.chain_id,
+        },
+        "wrapper_signature": wrapper_sig,
+    }
+
+    url = relayer_url.rstrip("/") + "/v1/finalize-champion"
+    try:
+        # Generous timeout: the on-chain attest (with up to 3 retries) + the
+        # squash-merge can take a while.
+        resp = requests.post(url, json=body, timeout=180)
+    except Exception as exc:
+        logger.error(
+            "on_champion_adopted_via_relayer: POST %s failed (%s) — FAIL-CLOSED (no adopt)",
+            url, exc,
+        )
+        return False
+
+    if resp.status_code != 200:
+        logger.error(
+            "on_champion_adopted_via_relayer: relayer HTTP %s for round=%s — FAIL-CLOSED",
+            resp.status_code, rid,
+        )
+        return False
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        logger.error(
+            "on_champion_adopted_via_relayer: bad JSON reply (%s) — FAIL-CLOSED", exc,
+        )
+        return False
+
+    merge_ok = bool(payload.get("merge_ok"))
+    logger.info(
+        "Champion finalization via relayer: round=%s submission=%s merge_ok=%s reason=%s",
+        rid, submission_id, merge_ok, payload.get("reason"),
+    )
+    return merge_ok
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────
