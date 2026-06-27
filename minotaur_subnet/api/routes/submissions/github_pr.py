@@ -11,6 +11,7 @@ the miner-signed ``head_sha`` (force-push / TOCTOU guard).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -44,37 +45,54 @@ def canonical_solver_repo() -> tuple[str, str]:
     return DEFAULT_SOLVER_REPO
 
 
-def _github_headers() -> dict[str, str]:
-    token = (
-        os.environ.get("SOLVER_REPO_PR_TOKEN")
+def _github_headers(token: str | None = None) -> dict[str, str]:
+    """Auth headers for the GitHub API.
+
+    ``token`` (the private path's per-submission PAT) wins; otherwise we fall
+    back to the validator's canonical-repo token from the environment.
+    """
+    tok = (
+        token
+        or os.environ.get("SOLVER_REPO_PR_TOKEN")
         or os.environ.get("SOLVER_REPO_TOKEN")
         or ""
     ).strip()
     h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token:
-        h["Authorization"] = f"Bearer {token}"
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
     return h
 
 
-def _fetch_pr(owner: str, repo: str, pr_number: int, *, timeout: float = 15.0) -> dict:
+def _fetch_pr(
+    owner: str, repo: str, pr_number: int, *, timeout: float = 15.0, token: str | None = None,
+) -> dict:
     req = urllib.request.Request(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers=_github_headers(),
+        headers=_github_headers(token),
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed host
         return json.loads(resp.read().decode("utf-8"))
 
 
-def resolve_pr(pr_number: int, *, fetch=_fetch_pr) -> dict:
-    """Resolve a canonical-solver-repo PR to ``{clone_url, head_sha, state, base}``.
+def resolve_pr(pr_number: int, *, fetch=_fetch_pr, owner_repo=None, token=None) -> dict:
+    """Resolve a solver-repo PR to ``{clone_url, head_sha, state, base}``.
 
-    Validates: the PR is OPEN; its base repo is the canonical solver repo (a miner
-    cannot point the base at a repo we do not control); the head fork ``clone_url``
-    is an ``https://github.com/`` URL (rejects a deleted fork, where ``head.repo``
-    is null, and any non-github host). Raises :class:`PRResolutionError` otherwise.
-    ``fetch`` is injectable for tests.
+    Public path (``owner_repo=None``): the base MUST be the canonical solver repo
+    (a miner cannot point the base at a repo we do not control), authed with the
+    validator's environment token.
+
+    Private path (``owner_repo=(owner, repo)`` + ``token``): the base MUST equal
+    the miner's declared private repo, authed with the per-submission PAT.
+
+    Always validates the PR is OPEN and the head ``clone_url`` is an
+    ``https://github.com/`` URL (rejects a deleted fork / non-github host).
+    Raises :class:`PRResolutionError` otherwise. ``fetch`` is injectable for tests.
     """
-    owner, repo = canonical_solver_repo()
+    owner, repo = owner_repo or canonical_solver_repo()
+    # Thread the per-submission token into the default fetcher without changing
+    # the (owner, repo, pr_number) call shape that injected test doubles rely on.
+    if token is not None and fetch is _fetch_pr:
+        fetch = functools.partial(_fetch_pr, token=token)
     try:
         data = fetch(owner, repo, pr_number)
     except PRResolutionError:
@@ -87,9 +105,11 @@ def resolve_pr(pr_number: int, *, fetch=_fetch_pr) -> dict:
         raise PRResolutionError(f"PR #{pr_number} is not open (state={state!r})")
 
     base_full = ((data.get("base") or {}).get("repo") or {}).get("full_name") or ""
-    if base_full.lower() != f"{owner}/{repo}".lower():
+    expected_base = f"{owner}/{repo}"
+    if base_full.lower() != expected_base.lower():
+        kind = "declared private repo" if owner_repo else "canonical"
         raise PRResolutionError(
-            f"PR #{pr_number} base is {base_full!r}, not the canonical {owner}/{repo}"
+            f"PR #{pr_number} base is {base_full!r}, not the {kind} {expected_base}"
         )
 
     head = data.get("head") or {}
@@ -107,7 +127,7 @@ def resolve_pr(pr_number: int, *, fetch=_fetch_pr) -> dict:
 
 
 def assess_pr_mergeability(
-    pr_number: int, *, fetch=_fetch_pr, _sleep=time.sleep,
+    pr_number: int, *, fetch=_fetch_pr, _sleep=time.sleep, owner_repo=None, token=None,
 ) -> tuple[bool, str | None]:
     """Check whether a PR can actually be merged — for fail-fast feedback at submit.
 
@@ -123,7 +143,9 @@ def assess_pr_mergeability(
     on-chain-certified merge gate remains the authoritative backstop.
     ``fetch``/``_sleep`` are injectable for tests.
     """
-    owner, repo = canonical_solver_repo()
+    owner, repo = owner_repo or canonical_solver_repo()
+    if token is not None and fetch is _fetch_pr:
+        fetch = functools.partial(_fetch_pr, token=token)
     for attempt in range(2):
         try:
             data = fetch(owner, repo, pr_number)

@@ -446,6 +446,33 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
+        # Private-submission ADOPTION is not yet supported: the on-chain cert binds
+        # the PRIVATE head SHA, which cannot equal a re-committed canonical commit,
+        # so the cert-gated merge + verify-champion-cert ruleset check would reject
+        # it. Routing a private finalist into adoption would fail finalization every
+        # round and STALL champion progression. Until private finalization lands, a
+        # private finalist gets the full benchmark feedback on its PR (so the miner
+        # sees it would win) but is NOT set as the round finalist — the public
+        # champion path is never wedged. To actually claim the championship today,
+        # the miner resubmits publicly. (Public finalists are unaffected below.)
+        if getattr(finalist, "is_private", False):
+            self._notify_champion_finalist(
+                finalist,
+                "selected as finalist — private champion adoption is not yet enabled; "
+                "resubmit publicly to claim the championship",
+            )
+            next_round = self._complete_round(
+                round_state,
+                epoch,
+                activated=False,
+                abort_reason="private_finalist_adoption_deferred",
+            )
+            result["status_after"] = RoundStatus.ABORTED.value
+            result["abort_reason"] = "private_finalist_adoption_deferred"
+            if next_round is not None:
+                result["next_round_id"] = next_round.round_id
+            return result
+
         updated = self._round_store.set_round_finalist(
             round_id,
             submission_id=finalist.submission_id,
@@ -657,6 +684,16 @@ class EpochManager:
                 kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
             except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
                 pass
+        # Private submissions: the report must post to the miner's PRIVATE repo,
+        # which needs the per-submission token. Fetch it from the (same-process)
+        # store; None for public submissions → the callback falls back to canonical.
+        if "repo_token" in params:
+            try:
+                kwargs["repo_token"] = self._sub_store.get_repo_token(
+                    getattr(submission, "submission_id", "") or "",
+                )
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._on_champion_rejected(submission, reason, **kwargs)
         except Exception as exc:
@@ -698,6 +735,15 @@ class EpochManager:
                 champ_sub = self._sub_store.get(self._champion.submission_id)
                 kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
             except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
+                pass
+        # Private submissions: report must post to the miner's PRIVATE repo (needs
+        # the per-submission token). None for public → callback uses canonical.
+        if "repo_token" in params:
+            try:
+                kwargs["repo_token"] = self._sub_store.get_repo_token(
+                    getattr(submission, "submission_id", "") or "",
+                )
+            except Exception:  # noqa: BLE001
                 pass
         try:
             self._on_champion_finalist(submission, reason, **kwargs)
