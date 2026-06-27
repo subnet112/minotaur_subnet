@@ -105,8 +105,17 @@ Notes:
 
 By default your PR is **public** on the canonical solver repo, so anyone can read
 your solver before you earn from it. The **private path** keeps your code private
-through screening + benchmarking; it is published to canonical `main` **only if it
-wins** (leak-on-champion).
+through screening + benchmarking: the validator clones it, scores it, and posts
+the benchmark report onto your private PR — so you can iterate without anyone
+seeing your code.
+
+> **⚠️ Current limitation — a private submission cannot yet become champion.**
+> Champion *adoption* for private submissions is not enabled yet: if your private
+> solver out-scores the champion, you'll get the full "you would win" report on
+> your private PR, but it is **not** adopted and earns **no emissions**. To claim
+> the championship today, **resubmit the same solver via the public path**. So the
+> private path is for **front-run-protected development/iteration**; public is how
+> you actually win. (Private champion landing is a planned follow-up.)
 
 How it works:
 
@@ -141,8 +150,9 @@ Notes:
   when the submission reaches a terminal state. It is **never written to disk**.
 - The validator (leader) sees your private source while building/benchmarking — the
   privacy guarantee is against **other miners and the public**, not the leader.
-- If your private champion wins, its source is published to canonical `main` so
-  `main` again reflects the live champion (your code only leaks once you've won).
+- A private submission is **scored but not adopted** (see the limitation above):
+  use it to develop and prove your score privately, then submit the winning solver
+  publicly to actually take the championship and earn emissions.
 
 ## 6) Optional: direct source submission (local/dev)
 
