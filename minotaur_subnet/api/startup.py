@@ -1913,29 +1913,33 @@ async def initialize(ctx: ServerContext) -> dict:
                 solver_round_open_seconds = 300.0
             # Two-phase round defaults: a ~5-min OPEN phase (collect submissions +
             # build/distribute images; SOLVER_ROUND_OPEN_SECONDS=300) followed by a
-            # ~5-min CLOSED phase to benchmark the champion + the round's submissions
-            # and certify. Benchmarking only starts at close (the round-anchored fork
-            # pin seals on close_epoch), so the closed window must fit the post-close
-            # batch — hence DECISION_EPOCHS=5 (5 epochs x EPOCH_SECONDS). Too small a
-            # value silently aborts contested rounds (certification_deadline_elapsed)
-            # instead of adopting. Leader-driven + broadcast (followers adopt the
-            # leader's decision_deadline_epoch / effective_epoch), so it is the
+            # CLOSED phase to benchmark the champion + the round's submissions and
+            # certify. Benchmarking only starts at close (the round-anchored fork pin
+            # seals on close_epoch), so the closed window must fit the post-close
+            # batch — which routinely runs well over 5 min with several submissions
+            # and/or a slow champion reference (each scenario re-quotes the champion).
+            # DECISION_EPOCHS=20 (20 epochs x EPOCH_SECONDS, ~20 min) gives that
+            # margin: too small a value silently aborts contested rounds
+            # (certification_deadline_elapsed) the instant after the leader decides to
+            # adopt, instead of adopting. Leader-driven + broadcast (followers adopt
+            # the leader's decision_deadline_epoch / effective_epoch), so it is the
             # LEADER's value that governs a round; keep it fleet-uniform across the
             # rollout so a leadership change doesn't shift the schedule mid-flight.
             try:
                 solver_round_decision_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "5").strip() or "5",
+                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "20").strip() or "20",
                 )
             except ValueError:
-                solver_round_decision_epochs = 5
-            # Activate the certified champion one epoch AFTER the decision deadline,
-            # so certification has fully landed before the swap takes effect.
+                solver_round_decision_epochs = 20
+            # Activate the certified champion just AFTER the decision deadline, so
+            # certification has fully landed before the swap takes effect — keep
+            # ACTIVATION_DELAY >= DECISION_EPOCHS.
             try:
                 solver_round_activation_delay_epochs = int(
-                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "6").strip() or "6",
+                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "22").strip() or "22",
                 )
             except ValueError:
-                solver_round_activation_delay_epochs = 6
+                solver_round_activation_delay_epochs = 22
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
@@ -2044,11 +2048,30 @@ async def initialize(ctx: ServerContext) -> dict:
                         )
                 else:
                     assert_solver_repo_token_not_admin()  # adoption LIVE → hard-fail if admin
-                _champion_merge_fn = on_champion_adopted_pr
+                # FINALIZATION (attest + squash-merge) is delegated to the trusted
+                # relayer when RELAYER_URL is set — so a third-party leader (which we
+                # don't control + which doesn't hold RELAYER_PRIVATE_KEY/SOLVER_REPO_TOKEN)
+                # asks the relayer to finalize and gates its local adoption on the
+                # relayer's boolean reply (the relayer re-verifies the quorum). Falls
+                # back to the legacy in-process path only when no relayer is wired
+                # (e.g. the local testnet). PR FEEDBACK (reject/finalist comments)
+                # stays on the leader regardless.
+                if os.environ.get("RELAYER_URL", "").strip():
+                    from minotaur_subnet.relayer.solver_repo import (
+                        on_champion_adopted_via_relayer,
+                    )
+                    _champion_merge_fn = on_champion_adopted_via_relayer
+                    logger.info(
+                        "Champion finalization: delegated to relayer at %s",
+                        os.environ.get("RELAYER_URL"),
+                    )
+                else:
+                    _champion_merge_fn = on_champion_adopted_pr  # legacy in-process (no relayer)
+                    logger.info("Champion finalization: in-process (no RELAYER_URL)")
                 _champion_reject_fn = on_champion_rejected_pr
                 _champion_finalist_fn = on_champion_finalist_pr
                 logger.info(
-                    "Champion adoption: on-chain attestation + leader-authority merge (registry=%s, repo=%s)",
+                    "Champion adoption: on-chain attestation + PR merge (registry=%s, repo=%s)",
                     os.environ.get("CHAMPION_REGISTRY_964", "not set"),
                     os.environ.get("SOLVER_REPO_URL", "not set"),
                 )
@@ -2278,6 +2301,17 @@ async def initialize(ctx: ServerContext) -> dict:
                 if network is None or not network.peers:
                     return
                 try:
+                    # EIP-712 sign the lifecycle payload (#319) — the AUTOMATIC
+                    # coordinator loop was previously broadcasting UNSIGNED (only the
+                    # manual operator endpoints in round_manager signed), so followers
+                    # fell to the legacy shared-key path and 401'd across operators
+                    # (responses=0). Followers verify this signature against the
+                    # on-chain ValidatorRegistry / locked-leader, so a cross-operator
+                    # broadcast now authenticates without any shared secret.
+                    from minotaur_subnet.api.routes.submissions.round_manager import (
+                        _sign_internal_round_payload,
+                    )
+                    payload = _sign_internal_round_payload(network, payload)
                     responses = await network.broadcast_json(path, payload)
                     logger.info(
                         "Solver round %s sync broadcast: responses=%d path=%s",

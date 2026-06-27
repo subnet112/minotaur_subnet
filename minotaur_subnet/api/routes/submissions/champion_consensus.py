@@ -35,6 +35,7 @@ from .state import (
     get_store,
 )
 from .round_manager import (
+    _adopt_leader_round_if_behind,
     _current_solver_round_epoch,
     _round_certification_deadline_elapsed,
 )
@@ -542,6 +543,27 @@ async def _maybe_prepare_round_for_certification(
     flow, not in explicit certification requests.
     """
     round_store = get_round_store()
+    # Adopt the leader's round verbatim when this follower is BEHIND and doesn't
+    # have it yet. SAFETY: every caller authenticates the leader BEFORE reaching
+    # here. The /solver/round/consensus/proposal handler is sig-only
+    # (_verify_champion_proposal_signature, EIP-712 leader sig). The sync certify
+    # handler goes through _authorize_internal_round, which accepts the leader's
+    # EIP-712 signature OR (default, since REQUIRE_SIGNED_ROUND_LIFECYCLE is off)
+    # the shared SOLVER_ROUND_INTERNAL_API_KEY. Without this the get_round() below
+    # 404s on the leader's unknown round_id. Adopt as CLOSED so the existing prep
+    # flow (close->evaluate->CERTIFYING) advances it normally.
+    if round_store.get_round(round_id) is None:
+        _adopt_leader_round_if_behind(
+            round_id,
+            status=RoundStatus.CLOSED,
+            close_epoch=close_epoch,
+            benchmark_pack_hash=benchmark_pack_hash,
+            committee_block=committee_block,
+            committee_hash=committee_hash,
+            quorum_required=quorum_required,
+            decision_deadline_epoch=decision_deadline_epoch,
+            effective_epoch=effective_epoch,
+        )
     round_state = round_store.get_round(round_id)
     if round_state is None:
         raise HTTPException(status_code=404, detail="Solver round not found")

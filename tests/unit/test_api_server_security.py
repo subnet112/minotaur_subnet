@@ -135,6 +135,57 @@ def test_health_includes_security_sections():
     assert "runtime_security_policy" in data
 
 
+def _health_with_store(store_obj):
+    """Call api_server.health() with a patched persistent store + the ctx
+    patches the security-sections test relies on. Returns the /health dict."""
+    from minotaur_subnet.api.server_context import ctx
+    prov = {
+        "valid": True, "startup_validated": True, "mode": "optional",
+        "require_signed": False, "require_asymmetric": False,
+        "submissions_accepting": True, "signer_configured": False,
+        "verifier_configured": False, "allowed_signers_count": 0,
+        "hmac_configured": False, "error": "",
+    }
+    runtime = {
+        "valid": True, "startup_validated": True, "enforced": False,
+        "violations": [], "enable_source_submissions": False,
+        "allow_subprocess_benchmark": False, "require_signed_provenance": False,
+        "require_asymmetric_provenance": False, "allowed_signers_count": 0,
+        "hmac_configured": False, "submissions_accepting": True,
+        "submissions_api_key_configured": False,
+        "submissions_rate_limit_per_minute": 60,
+    }
+    with patch.object(api_server, "store", store_obj), \
+            patch.object(ctx, "benchmark_worker", None), \
+            patch.object(ctx, "block_loop", None), \
+            patch.object(ctx, "provenance_policy_health", prov), \
+            patch.object(ctx, "runtime_security_policy_health", runtime):
+        return api_server.health()
+
+
+def test_health_orderbook_is_store_backed():
+    """/health 'orderbook' reflects the DURABLE store count
+    (count_orders_by_status) — not the daemon's in-memory working set — so the
+    validator-health monitor sees real persisted orders on the leader AND
+    followers, making an order-sync drift visible."""
+    class _FakeStore:
+        def count_orders_by_status(self):
+            return {"filled": 32, "rejected": 46}
+    data = _health_with_store(_FakeStore())
+    assert data["orderbook"] == {"filled": 32, "rejected": 46}
+
+
+def test_health_orderbook_defensive_on_store_error():
+    """A store hiccup must never 500 /health — 'orderbook' degrades to None
+    (rendered as '—'), and the rest of /health still answers."""
+    class _BoomStore:
+        def count_orders_by_status(self):
+            raise RuntimeError("db is locked")
+    data = _health_with_store(_BoomStore())
+    assert data["orderbook"] is None
+    assert data["status"] == "ok"
+
+
 def test_looks_like_mainnet_bittensor_target_detects_finney():
     assert api_server._looks_like_mainnet_bittensor_target("finney") is True
     assert api_server._looks_like_mainnet_bittensor_target("wss://entrypoint-finney.opentensor.ai:443") is True

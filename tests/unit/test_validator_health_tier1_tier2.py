@@ -645,8 +645,9 @@ def test_fmt_orderbook_none_is_em_dash():
 
 
 def test_fmt_orderbook_empty_dict_is_zero():
-    """Daemon up but holding no orders renders ``0`` — the normal follower
-    state, distinct from the ``—`` of a daemon that can't report at all."""
+    """Api reachable but the persisted store is empty renders ``0`` (a follower
+    that hasn't synced the leader's orders, or simply no orders yet) — distinct
+    from the ``—`` of an unreachable api / legacy image."""
     assert _fmt_orderbook({}) == "0"
 
 

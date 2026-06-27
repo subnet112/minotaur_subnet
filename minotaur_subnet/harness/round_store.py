@@ -397,6 +397,74 @@ class RoundStore:
         self._record(state)
         return copy.deepcopy(state)
 
+    def adopt_round(
+        self,
+        *,
+        round_id: str,
+        opened_epoch: int,
+        status: RoundStatus,
+        incumbent: ChampionSnapshot | None = None,
+        **field_updates: Any,
+    ) -> RoundState:
+        """Adopt a leader's round verbatim by its broadcast round_id.
+
+        Used by a follower that is BEHIND the leader: it cannot reconstruct the
+        leader's exact round_id locally, so it takes the leader's round_id (from
+        an already-authenticated lifecycle broadcast) and materializes it in the
+        target ``status`` with the broadcast fields. A stale current OPEN round
+        whose id differs is superseded (aborted) so it can't shadow the adopted
+        one. Only ``field_updates`` values that are not None AND name a real
+        ``RoundState`` field are applied; unknown keys are skipped (logged at
+        debug) so a buggy/hostile caller can't set arbitrary attributes.
+        """
+        self._maybe_reload()
+        now = time.time()
+
+        # Supersede a stale current OPEN round so it can't keep masquerading as
+        # the live round once we adopt the leader's newer one.
+        current = self._get_current_round_ref()
+        if (
+            current is not None
+            and current.status == RoundStatus.OPEN
+            and current.round_id != round_id
+        ):
+            current.status = RoundStatus.ABORTED
+            current.abort_reason = f"superseded by leader round {round_id}"
+            current.updated_at = now
+            self._record(current)
+
+        state = self._rounds.get(round_id)
+        if state is None:
+            state = RoundState(
+                round_id=round_id,
+                status=status,
+                opened_epoch=opened_epoch,
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            state.opened_epoch = opened_epoch
+            state.status = status
+            state.updated_at = now
+
+        allowed_fields = RoundState.__dataclass_fields__
+        for key, value in field_updates.items():
+            if value is None:
+                continue
+            if key not in allowed_fields:
+                logger.debug("adopt_round: ignoring unknown field %r", key)
+                continue
+            setattr(state, key, value)
+        if incumbent is not None:
+            self._active_champion = copy.deepcopy(incumbent)
+            state.sync_incumbent(incumbent)
+
+        self._rounds[round_id] = state
+        self._current_round_id = round_id
+        self._persist()
+        self._record(state)
+        return copy.deepcopy(state)
+
     def close_current_round(
         self,
         *,

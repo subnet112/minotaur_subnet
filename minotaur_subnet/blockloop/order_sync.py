@@ -44,7 +44,10 @@ class OrderSync:
             try:
                 await self.sync_once()
             except Exception as exc:  # never let the loop die
-                logger.warning("Order sync loop error: %s", exc)
+                # %r, not %s: connection-level exceptions (TimeoutError,
+                # ServerDisconnectedError, ClientConnectorError) have an empty
+                # str(), so %s logged a blank line and hid the real cause.
+                logger.warning("Order sync loop error: %r", exc)
             await asyncio.sleep(self._interval)
 
     async def sync_once(self) -> int:

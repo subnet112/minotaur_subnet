@@ -377,6 +377,16 @@ def health() -> dict:
         data["independent_vote"] = dict(ctx.last_independent_vote)
     if ctx.last_champion_quorum:
         data["champion_quorum"] = dict(ctx.last_champion_quorum)
+    # Durable order counts from the persistent store (NOT the daemon's in-memory
+    # IntentOrderBook, which is only the block-loop's live working set — empty on
+    # followers, and ~empty even on the leader whenever no orders are in flight).
+    # This lets the validator-health "OrderBook" column reflect real persisted
+    # orders for leader AND followers, so an order-sync drift is visible.
+    # Defensive: a store hiccup must never 500 /health.
+    try:
+        data["orderbook"] = store.count_orders_by_status()
+    except Exception:
+        data["orderbook"] = None
     return data
 
 

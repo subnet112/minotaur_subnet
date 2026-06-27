@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -66,7 +67,8 @@ class ValidatorPeerNetwork:
         peer_url_transform: Callable[[str], str] | None = None,
     ) -> None:
         self.validator_id = validator_id
-        self.private_key = private_key
+        self._private_key = private_key
+        self._signing_key_fallback_warned = False
         self.consensus = consensus
         # When peers is explicitly passed, pin it (tests, manual override).
         # When None and protocol_config is set, the peers property reads
@@ -81,6 +83,35 @@ class ValidatorPeerNetwork:
         self._default_headers = dict(default_headers or {})
         self._peer_url_transform = peer_url_transform
         self._session: aiohttp.ClientSession | None = None
+
+    @property
+    def private_key(self) -> str:
+        """This validator's signing key (hex).
+
+        Resolves to the construction-time key, but falls back to the
+        ``VALIDATOR_PRIVATE_KEY`` env var when that is empty. This keeps
+        lifecycle broadcasts and champion proposals SIGNED even if this instance
+        was somehow handed an empty key — observed in production as a
+        recreate-vs-restart difference where a freshly recreated container's
+        champion network reaches sign-time with no key, so broadcasts went out
+        unsigned and followers 401'd. ``VALIDATOR_PRIVATE_KEY`` is set from the
+        compose substitution on every boot, so it is the reliable source of
+        truth; the warning below flags the underlying keyless-instance bug for
+        root-causing without ever dropping a signature.
+        """
+        if self._private_key:
+            return self._private_key
+        env_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+        if env_key and not self._signing_key_fallback_warned:
+            logger.warning(
+                "ValidatorPeerNetwork(%s): construction-time signing key was "
+                "empty; falling back to VALIDATOR_PRIVATE_KEY env so broadcasts "
+                "and proposals stay signed. This flags the recreate-vs-restart "
+                "keyless-instance bug — investigate the empty construction key.",
+                self.validator_id[:10],
+            )
+            self._signing_key_fallback_warned = True
+        return env_key
 
     def set_peers(self, peers: list[PeerEndpoint]) -> None:
         """Set the pinned peer override.
@@ -135,11 +166,18 @@ class ValidatorPeerNetwork:
                 if key == me_lower or key in seen:
                     continue
                 seen.add(key)
-                url = (
-                    self._peer_url_transform(p.axon_url)
-                    if self._peer_url_transform is not None
-                    else p.axon_url
-                )
+                # Prefer the peer's advertised public API base (from /identity)
+                # when present — it's the reachable endpoint the operator chose,
+                # which may differ from the daemon axon's host:port (e.g. an API
+                # behind a domain/LB). Otherwise fall back to the axon→API port
+                # transform (or the raw axon when no transform is configured).
+                advertised = getattr(p, "api_url", None)
+                if advertised:
+                    url = advertised
+                elif self._peer_url_transform is not None:
+                    url = self._peer_url_transform(p.axon_url)
+                else:
+                    url = p.axon_url
                 result.append(
                     PeerEndpoint(validator_id=p.evm_address, url=url)
                 )

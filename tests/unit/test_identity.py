@@ -97,3 +97,36 @@ def test_now_override_lets_us_check_future_validity():
     ident = sign_identity(KEY, HOTKEY, AXON, ttl_seconds=60, now=1000)
     assert verify_identity(ident, now=1059) is not None
     assert verify_identity(ident, now=1061) is None
+
+
+def test_api_url_carried_and_round_trips_unsigned():
+    """api_url rides along in the payload + round-trips, and verification still
+    passes (it is NOT part of the signed binding)."""
+    ident = sign_identity(KEY, HOTKEY, AXON, api_url="https://api.example.com")
+    assert ident.api_url == "https://api.example.com"
+    assert verify_identity(ident) is not None
+    rehydrated = ValidatorIdentity.from_dict(ident.to_dict())
+    assert rehydrated.api_url == "https://api.example.com"
+    assert verify_identity(rehydrated) is not None
+
+
+def test_api_url_is_advisory_tamper_does_not_break_verify():
+    """Because api_url is OUTSIDE the EIP-712 binding, changing it after signing
+    does NOT invalidate the signature — contrast test_tampered_axon_url_rejected,
+    where axon_url IS signed. api_url is a best-effort routing hint only."""
+    ident = sign_identity(KEY, HOTKEY, AXON, api_url="https://api.example.com")
+    ident.api_url = "https://attacker.example.com"
+    assert verify_identity(ident) is not None  # still valid — not signed
+
+
+def test_identity_without_api_url_is_backward_compatible():
+    """Signing without api_url leaves it None and verifies; deserializing a
+    legacy payload that lacks the key yields None (no crash, still verifies)."""
+    ident = sign_identity(KEY, HOTKEY, AXON)
+    assert ident.api_url is None
+    assert verify_identity(ident) is not None
+    legacy = ident.to_dict()
+    legacy.pop("api_url", None)  # old image: no api_url key on the wire
+    rehydrated = ValidatorIdentity.from_dict(legacy)
+    assert rehydrated.api_url is None
+    assert verify_identity(rehydrated) is not None

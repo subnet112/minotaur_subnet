@@ -125,3 +125,87 @@ async def test_activation_commits_when_unfrozen(monkeypatch):
 
     m._hot_swap.assert_awaited_once()
     assert result["champion_changed"] is True
+
+
+# ── 3. The provenance gate: a failed attest/merge unconditionally vetoes adoption ──
+
+
+def _wire_commit_mocks(m):
+    """Common commit-path doubles so activation can reach the hot-swap."""
+    round_state = SimpleNamespace(
+        status=RoundStatus.CERTIFIED,
+        round_id="r1",
+        effective_epoch=5,
+        certificate=SimpleNamespace(candidate_submission_id="sub_chal", effective_epoch=5),
+    )
+    m._round_store = MagicMock()
+    m._round_store.get_round.return_value = round_state
+    m._round_store.activate_round.return_value = SimpleNamespace(status=RoundStatus.ACTIVATED)
+    m._round_store.open_next_round.return_value = SimpleNamespace(round_id="r2")
+    m._sub_store = MagicMock()
+    m._sub_store.get.return_value = SimpleNamespace(submission_id="sub_chal")
+    m._hot_swap = AsyncMock()
+    m._emit_weights = AsyncMock(return_value=True)
+    m._champion = SimpleNamespace(
+        submission_id="sub_chal", to_dict=lambda: {"submission_id": "sub_chal"},
+    )
+    m._get_incumbent_snapshot = MagicMock(return_value=None)
+    m._complete_round = MagicMock(return_value=SimpleNamespace(round_id="r2"))
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_aborts_when_merge_fails(monkeypatch):
+    # The attest/merge callback returns False → the round aborts (merge_failed) and the
+    # champion is NOT swapped. This is the head-drift / missing-on-chain-proof case:
+    # provenance can't be established, so no weights. The gate is UNCONDITIONAL — no
+    # env var enables or disables it.
+    m = _bare_manager()
+    _wire_commit_mocks(m)
+    m._on_champion_adopted = MagicMock(return_value=False)  # attest or merge failed
+    m._notify_champion_rejected = MagicMock()  # the gate mirrors feedback onto the PR
+
+    monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
+    result = await m.activate_certified_round("r1", epoch=5)
+
+    # The callback DID run (the gate consults its result), but the commit is vetoed.
+    m._on_champion_adopted.assert_called_once()
+    m._hot_swap.assert_not_called()
+    m._emit_weights.assert_not_called()
+    m._round_store.activate_round.assert_not_called()
+    # The miner is told WHY on the PR (same reject-feedback path as benchmark fails).
+    m._notify_champion_rejected.assert_called_once()
+    assert result["champion_changed"] is False
+    assert result["abort_reason"] == "merge_failed"
+    assert result["next_round_id"] == "r2"
+    m._complete_round.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_commits_when_merge_succeeds(monkeypatch):
+    # The callback returns True (attest + merge both succeeded) → normal commit.
+    m = _bare_manager()
+    _wire_commit_mocks(m)
+    m._on_champion_adopted = MagicMock(return_value=True)
+
+    monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
+    result = await m.activate_certified_round("r1", epoch=5)
+
+    m._on_champion_adopted.assert_called_once()
+    m._hot_swap.assert_awaited_once()
+    assert result["champion_changed"] is True
+    assert "abort_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_no_merge_callback_commits(monkeypatch):
+    # With no merge callback wired (e.g. a testnet without a solver repo) the gate
+    # no-ops: merge_ok stays True and the adoption commits normally.
+    m = _bare_manager()
+    _wire_commit_mocks(m)
+    m._on_champion_adopted = None
+
+    monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
+    result = await m.activate_certified_round("r1", epoch=5)
+
+    m._hot_swap.assert_awaited_once()
+    assert result["champion_changed"] is True
