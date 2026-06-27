@@ -54,6 +54,9 @@ async def _run_one_iteration(self_stub) -> None:
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,
     )
+    # The order-volume ramp runs inside _do_emit; stub it to a passthrough so
+    # these emit-path tests see the mapping unchanged (ramp covered separately).
+    self_stub._scale_emission_by_order_volume = lambda mapping: mapping
 
     call_count = {"sleep": 0}
 
