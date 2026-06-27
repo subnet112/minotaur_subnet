@@ -41,19 +41,26 @@ Defaults:
 
 ```bash
 python -m minotaur_subnet.miner.main submit \
-  --repo-url <https-url> \
-  --commit-hash <hash> \
+  --pr-number <n> \
+  --head-sha <40-char-sha> \
   --hotkey <wallet-name> \
   [--wallet-path <path>] \
   [--validator-url <url>] \
+  [--round-id <id>] \
   [--epoch <n>] \
   [--poll]
 ```
 
+The PR must target the canonical solver repo (`subnet112/minotaur-solver`).
+The leader resolves `--pr-number` to the fork's `clone_url` + live head SHA and
+rejects the submission if the live head no longer matches `--head-sha`
+(force-push guard).
+
 Defaults:
 
 - `--validator-url`: `http://localhost:9100`
-- `--epoch`: optional override; auto-detected from the open round (`GET {validator_url}/v1/solver/round`)
+- `--round-id`: optional; auto-detected from the open round (`GET {validator_url}/v1/solver/round`)
+- `--epoch`: optional override; auto-detected from the open round
 - `--wallet-path`: `~/.bittensor/wallets` (or `BT_WALLET_PATH`)
 
 Important notes:
@@ -61,9 +68,9 @@ Important notes:
 - In local testnet/API flows, `--validator-url` is usually `http://localhost:8080` for `/v1/submissions*`.
 - Submissions target the current open round; if none is open or it isn't accepting, `submit` errors clearly (there is no epoch fallback).
 - Request payload includes:
-  - `repo_url`, `commit_hash`, `round_id`, `epoch`
+  - `pr_number`, `head_sha`, `round_id`, `epoch`
   - `hotkey` (SS58)
-  - `signature` over `{repo_url}:{commit_hash}:{round_id}`
+  - `signature` over `{pr_number}:{head_sha}:{round_id}`
 
 ## `status`
 
@@ -102,10 +109,9 @@ Git submission:
 
 ```bash
 python -m minotaur_subnet.miner.main submit \
-  --repo-url https://github.com/myuser/my-solver \
-  --commit-hash abc123def456 \
+  --pr-number 42 \
+  --head-sha abc123def4567890abc123def4567890abc12345 \
   --hotkey my-hotkey \
-  --epoch 0 \
   --validator-url http://localhost:8080 \
   --poll
 ```
