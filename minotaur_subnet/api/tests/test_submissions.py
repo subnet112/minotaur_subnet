@@ -1041,55 +1041,45 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertFalse(data["approved"])
         self.assertIn("exceeded certification deadline", data["reason"])
 
-    def test_internal_close_solver_round_endpoint_uses_internal_key(self):
+    def test_internal_close_solver_round_requires_eip712(self):
+        # The cross-validator /internal/ close receiver is EIP-712 ONLY: the legacy
+        # shared key is no longer a fallback here (it never worked across operators).
+        # The operator /solver/round/close keeps the shared key (tested elsewhere).
         os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
         current = self.round_store.ensure_open_round(opened_epoch=42)
-
-        unauthorized = self.client.post("/v1/solver/round/internal/close", json={
-            "round_id": current.round_id,
-            "close_epoch": 43,
-            "benchmark_pack_hash": "pack-43",
-            "committee_hash": "committee-43",
+        body = {
+            "round_id": current.round_id, "close_epoch": 43,
+            "benchmark_pack_hash": "pack-43", "committee_hash": "committee-43",
             "quorum_required": 1,
-        })
-        self.assertEqual(unauthorized.status_code, 401)
-
-        authorized = self.client.post(
-            "/v1/solver/round/internal/close",
-            json={
-                "round_id": current.round_id,
-                "close_epoch": 43,
-                "benchmark_pack_hash": "pack-43",
-                "committee_hash": "committee-43",
-                "quorum_required": 1,
-            },
+        }
+        # no auth -> 401
+        self.assertEqual(
+            self.client.post("/v1/solver/round/internal/close", json=body).status_code, 401
+        )
+        # shared-key header alone -> 401 (no fallback on /internal/); requires a signature
+        keyed = self.client.post(
+            "/v1/solver/round/internal/close", json=body,
             headers={"x-solver-round-internal-key": "internal-secret"},
         )
-        self.assertEqual(authorized.status_code, 200)
-        self.assertEqual(authorized.json()["status"], RoundStatus.CLOSED.value)
+        self.assertEqual(keyed.status_code, 401)
+        self.assertIn("eip-712", keyed.json()["detail"].lower())
 
-    def test_internal_abort_solver_round_endpoint_uses_internal_key(self):
+    def test_internal_abort_solver_round_requires_eip712(self):
         os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
         current = self.round_store.ensure_open_round(opened_epoch=42)
         self.round_store.close_current_round(close_epoch=43)
-
-        unauthorized = self.client.post("/v1/solver/round/internal/abort", json={
-            "round_id": current.round_id,
-            "reason": "no_champion_candidate",
-        })
-        self.assertEqual(unauthorized.status_code, 401)
-
-        authorized = self.client.post(
-            "/v1/solver/round/internal/abort",
-            json={
-                "round_id": current.round_id,
-                "reason": "no_champion_candidate",
-            },
+        body = {"round_id": current.round_id, "reason": "no_champion_candidate"}
+        # no auth -> 401
+        self.assertEqual(
+            self.client.post("/v1/solver/round/internal/abort", json=body).status_code, 401
+        )
+        # shared-key header alone -> 401 (EIP-712 only on /internal/)
+        keyed = self.client.post(
+            "/v1/solver/round/internal/abort", json=body,
             headers={"x-solver-round-internal-key": "internal-secret"},
         )
-        self.assertEqual(authorized.status_code, 200)
-        self.assertEqual(authorized.json()["status"], RoundStatus.ABORTED.value)
-        self.assertEqual(authorized.json()["abort_reason"], "no_champion_candidate")
+        self.assertEqual(keyed.status_code, 401)
+        self.assertIn("eip-712", keyed.json()["detail"].lower())
 
     def test_abort_solver_round_endpoint(self):
         current = self.round_store.ensure_open_round(opened_epoch=42)
