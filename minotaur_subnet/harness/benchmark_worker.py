@@ -729,6 +729,60 @@ class BenchmarkWorker:
 
         return len(benchmarking)
 
+    async def score_image_diagnostic(self, image_tag: str) -> dict[str, Any]:
+        """Benchmark an ARBITRARY image through the EXACT challenger scoring path
+        and return its scorecard — WITHOUT a submission, a round, or any chance of
+        adoption. Diagnostic only (e.g. score a king-clone to test symmetry).
+
+        Mirrors ``run_once``'s per-submission setup byte-for-byte: same epoch/round
+        fork-pin, same intents corpus (synthetic + the current round's historical
+        scenarios), same champion reference-quote anchor, same ``_benchmark_submission``
+        call + ``_compute_avg_score``/``_results_to_details``. The only difference from
+        a real challenger is that the image is supplied directly and nothing is
+        persisted or made adoption-eligible.
+        """
+        if self._use_docker and self._simulator is None:
+            raise RuntimeError("real simulator not yet wired — cannot run diagnostic")
+        # Same deterministic fork-pin a real challenger gets this round.
+        self._apply_epoch_block_pin()
+        _pin_round_id: str | None = None
+        if self._round_store is not None:
+            _cur = self._round_store.get_current_round()
+            if _cur is not None:
+                _pin_round_id = _cur.round_id
+        self._apply_round_anchored_pin(_pin_round_id)  # raises ForkPinUnavailable if unsealed
+
+        intents = self._load_benchmark_intents()
+        if not intents:
+            raise RuntimeError("no active intents for benchmarking")
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+        if self._round_store is not None:
+            _cur = self._round_store.get_current_round()
+            if _cur is not None:
+                try:
+                    historical = self._load_historical_scenarios(_cur.round_id)
+                    if historical:
+                        intents.extend(historical)
+                except Exception as exc:
+                    logger.warning("[diagnostic] historical load failed: %s", exc)
+        reference_quotes = await self._build_reference_quotes(intents)
+
+        logger.info("[diagnostic] scoring image %s as a challenger (%d intents)", image_tag, len(intents))
+        results = await self._benchmark_submission(
+            image_tag, intents, score_fn, reference_quotes=reference_quotes,
+        )
+        avg = self._compute_avg_score(results)
+        details = self._results_to_details(results)
+        logger.info("[diagnostic] image %s scored %.4f (%d intents)", image_tag, avg, len(results))
+        return {
+            "image": image_tag,
+            "score": avg,
+            "intent_count": len(results),
+            "details": details,
+            "pin_round_id": _pin_round_id,
+        }
+
     async def _benchmark_submission(
         self,
         image_tag: str,
