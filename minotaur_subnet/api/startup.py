@@ -2340,16 +2340,17 @@ async def initialize(ctx: ServerContext) -> dict:
                 # Bind the leader's close-time submission snapshot to the close
                 # broadcast so followers reproduce the SAME pack hash. The leader
                 # awaits this broadcast before proposing, so the snapshot lands
-                # before the follower's pack-hash check. Default-off until fleet
-                # pack-hash parity is validated.
-                if _env_true("SUBMISSION_SNAPSHOT_SYNC", default=False):
-                    try:
-                        _subs = submissions.get_store().list_by_round(round_state.round_id)
-                        payload["submissions"] = [s.to_dict() for s in _subs]
-                    except Exception:
-                        logger.warning(
-                            "close payload: submission snapshot failed", exc_info=True,
-                        )
+                # before the follower's pack-hash check. ALWAYS ON — the
+                # SUBMISSION_SNAPSHOT_SYNC env gate was removed after fleet pack-hash
+                # parity was validated; the snapshot is required for cross-host
+                # determinism. Best-effort: a store hiccup must never break the broadcast.
+                try:
+                    _subs = submissions.get_store().list_by_round(round_state.round_id)
+                    payload["submissions"] = [s.to_dict() for s in _subs]
+                except Exception:
+                    logger.warning(
+                        "close payload: submission snapshot failed", exc_info=True,
+                    )
                 return payload
 
             def _certify_sync_payload(round_state) -> dict[str, object]:
