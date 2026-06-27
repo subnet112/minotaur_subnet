@@ -84,11 +84,13 @@ def _patch_derive(fake_w3, *, epoch_seconds=60, rpc="http://stub"):
 def test_derive_returns_canonical_pin(monkeypatch):
     monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)
     monkeypatch.delenv("ROUND_ANCHOR_CONFIRMATIONS", raising=False)
-    # epoch 100 * 60 = anchor_ts 6000; Base ~2s blocks -> pin = 3000.
+    # epoch 100, lookback 1 epoch -> anchor_ts (100-1)*60 = 5940; Base ~2s blocks
+    # -> pin = 2970. (Anchored one epoch back so the confirmation margin can bracket
+    # it by round close — see ROUND_ANCHOR_LOOKBACK_EPOCHS.)
     fake = _fake_web3(head=10_000, t0=0, spacing=2)
     p1, p2, p3 = _patch_derive(fake)
     with p1, p2, p3:
-        assert _derive_round_fork_pins(100) == {8453: 3000}
+        assert _derive_round_fork_pins(100) == {8453: 2970}
 
 
 def test_derive_defers_when_anchor_in_future(monkeypatch):
