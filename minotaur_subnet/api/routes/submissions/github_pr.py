@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -103,3 +104,51 @@ def resolve_pr(pr_number: int, *, fetch=_fetch_pr) -> dict:
         )
 
     return {"clone_url": clone_url, "head_sha": head_sha, "state": state, "base": base_full}
+
+
+def assess_pr_mergeability(
+    pr_number: int, *, fetch=_fetch_pr, _sleep=time.sleep,
+) -> tuple[bool, str | None]:
+    """Check whether a PR can actually be merged — for fail-fast feedback at submit.
+
+    Returns ``(ok, reason)``. ``ok`` is ``False`` with a miner-facing message when
+    the PR can't be merged — merge conflicts (usually a stale base after a newer
+    champion landed on main), behind main, or a draft — so we don't spend a
+    benchmark on a PR the leader's merge gate would later reject anyway.
+
+    GitHub computes ``mergeable`` ASYNCHRONOUSLY, so a freshly-pushed PR often
+    returns ``mergeable=null`` on the first read; we re-fetch once before deciding.
+    A persistent ``null``/``unknown`` (or any GitHub error) is treated as OK — we
+    never hard-block a submission on a transient/uncertain signal; the leader's
+    on-chain-certified merge gate remains the authoritative backstop.
+    ``fetch``/``_sleep`` are injectable for tests.
+    """
+    owner, repo = canonical_solver_repo()
+    for attempt in range(2):
+        try:
+            data = fetch(owner, repo, pr_number)
+        except Exception:
+            return True, None  # transient GitHub error → don't block; merge gate backstops
+        if data.get("draft"):
+            return False, (
+                f"PR #{pr_number} is a draft — mark it 'Ready for review', then resubmit."
+            )
+        mergeable = data.get("mergeable")
+        mstate = (data.get("mergeable_state") or "").lower()
+        if mergeable is False or mstate == "dirty":
+            return False, (
+                f"PR #{pr_number} has merge conflicts with main — a newer champion likely "
+                f"landed on main. Rebase your branch onto the current main and resubmit so "
+                f"we benchmark exactly what would be merged."
+            )
+        if mstate == "behind":
+            return False, (
+                f"PR #{pr_number} is behind main (the champion advanced since you opened it). "
+                f"Rebase onto the current main and resubmit — a stale PR can't be merged as-is."
+            )
+        if mergeable is None and attempt == 0:
+            # GitHub is still computing mergeability — give it a moment, then re-fetch once.
+            _sleep(2.0)
+            continue
+        return True, None
+    return True, None

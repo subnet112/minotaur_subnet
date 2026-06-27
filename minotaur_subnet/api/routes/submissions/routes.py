@@ -795,6 +795,17 @@ async def create_submission(
             detail="Invalid hotkey signature",
         )
 
+    # Fail-fast: reject a PR that can't actually be merged (merge conflicts /
+    # stale base after a newer champion landed / draft) with a clear message,
+    # rather than spend a benchmark on a PR the leader's merge gate would later
+    # reject. Authenticated above (hotkey sig), so this runs only for a real
+    # submitter. Transient/uncertain GitHub signals never block (see
+    # assess_pr_mergeability) — the on-chain-certified merge gate is the backstop.
+    from minotaur_subnet.api.routes.submissions.github_pr import assess_pr_mergeability
+    _merge_ok, _merge_reason = assess_pr_mergeability(body.pr_number)
+    if not _merge_ok:
+        raise HTTPException(status_code=409, detail=_merge_reason)
+
     # Check for duplicate submission. Store the RESOLVED fork clone_url + head SHA
     # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).
     try:
