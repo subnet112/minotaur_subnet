@@ -435,7 +435,7 @@ class TestEpochManager:
     """Epoch lifecycle: boundary detection → benchmark → champion selection."""
 
     def test_dethrone_margin(self, sub_store, orchestrator, app_store):
-        """Challenger must beat champion by 5% to be adopted."""
+        """Challenger must beat champion by the dethrone margin to be adopted."""
         bw = TestBenchmarkWorker(sub_store, orchestrator)
         epoch_mgr = EpochManager(
             benchmark_worker=bw,
