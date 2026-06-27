@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# owner/repo, GitHub's allowed character set for each segment.
+_REPO_FULL_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class SubmitRequest(BaseModel):
@@ -44,6 +48,53 @@ class SubmitRequest(BaseModel):
         ..., description="Signature proving hotkey ownership (base64-encoded)",
         min_length=1,
     )
+
+    # ── Private-submission path (opt-in) ────────────────────────────────────
+    # When both are present the PR lives in the miner's OWN private repo instead
+    # of the canonical public solver repo. The token is transport credential
+    # ONLY (it is not part of the signed message) and is used by the leader for
+    # the duration of this one submission: clone (Contents:Read), resolve the PR
+    # + post benchmark/error comments (Pull requests:Read+Write). It is never
+    # persisted and is purged when the submission reaches a terminal state. The
+    # winning code is published to canonical main on adoption (leak-on-champion).
+    private_repo: str | None = Field(
+        default=None,
+        description=(
+            "Full 'owner/repo' of the miner's PRIVATE solver repo. When set, "
+            "the submission uses the private path: pr_number/head_sha refer to a "
+            "PR in THIS repo, not the canonical solver repo. Requires repo_token."
+        ),
+        examples=["my-org/my-private-solver"],
+    )
+    repo_token: str | None = Field(
+        default=None,
+        description=(
+            "Fine-grained GitHub PAT scoped to private_repo, valid for this "
+            "submission only (Metadata:Read, Contents:Read, Pull requests:Read+Write). "
+            "Transport credential — NOT covered by the signature, never persisted, "
+            "purged on terminal state. Send over HTTPS only."
+        ),
+        min_length=1,
+    )
+
+    @model_validator(mode="after")
+    def _validate_private_pair(self) -> SubmitRequest:
+        """private_repo and repo_token are all-or-nothing; validate the repo shape."""
+        if bool(self.private_repo) != bool(self.repo_token):
+            raise ValueError(
+                "private_repo and repo_token must be provided together "
+                "(both for a private submission, or neither for the public path)"
+            )
+        if self.private_repo and not _REPO_FULL_RE.match(self.private_repo):
+            raise ValueError(
+                f"private_repo must be 'owner/repo', got {self.private_repo!r}"
+            )
+        return self
+
+    @property
+    def is_private(self) -> bool:
+        """True when this submission targets the miner's private repo."""
+        return bool(self.private_repo and self.repo_token)
 
 
 class SubmitResponse(BaseModel):
