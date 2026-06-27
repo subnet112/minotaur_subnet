@@ -829,7 +829,12 @@ def build_statuses(
                 s.my_uid_reported = health.get("my_uid")
                 s.my_last_update_block_cached = health.get("my_last_update_block")
                 s.block_loop_running = health.get("block_loop_running")
-                s.orderbook_stats = health.get("orderbook")
+                # NOTE: the daemon's `orderbook` is the block-loop's in-memory
+                # WORKING SET (~always empty — followers never run the loop, and
+                # even the leader only holds in-flight orders), so it reads 0 even
+                # when the store has orders. The OrderBook column is sourced below
+                # from the api's durable store count instead. We intentionally do
+                # NOT set s.orderbook_stats from the daemon here.
 
             # Live-solver state from the api /health (port 8080 on the
             # same host). Best-effort: api may not be exposed there, in
@@ -837,6 +842,12 @@ def build_statuses(
             api_health = (api_health_by_uid or {}).get(uid)
             if api_health is not None:
                 s.api_health = api_health
+                # OrderBook column = DURABLE persisted count from the api store
+                # (count_orders_by_status), not the daemon's live working set —
+                # this is what makes a leader-vs-follower order-sync drift visible.
+                # Absent/None → "—" (api unreachable, or a legacy image without the
+                # field); {} → "0" (api reachable, store empty).
+                s.orderbook_stats = api_health.get("orderbook")
                 s.live_solver_running = api_health.get("live_solver_running")
                 lsd = api_health.get("live_solver") or {}
                 s.live_solver_respawn_count = lsd.get("respawn_count")
@@ -1409,10 +1420,12 @@ def _fmt_last_emit(last_emit: dict | None, *, now: float) -> str:
 def _fmt_orderbook(stats: dict | None) -> str:
     """Render the validator's OrderBook stats (``status → count``).
 
-    ``—`` when the field is absent (older image / unreachable). ``0`` when
-    the daemon is up but holds no orders — the normal follower state, since
-    only the leader runs the block loop that fills the book. Otherwise a
-    compact ``status:count`` join, e.g. ``open:12 executed:3``.
+    Sourced from the api ``/health`` durable store count (all persisted
+    orders), NOT the daemon's in-memory working set. ``—`` when unavailable
+    (api ``:8080`` unreachable, or a legacy image without the field). ``0``
+    when the api is reachable but the store is empty (a follower that hasn't
+    synced the leader's order book, or simply no orders yet). Otherwise a
+    compact ``status:count`` join, e.g. ``filled:32 rejected:46``.
     """
     if stats is None:
         return "—"
@@ -1664,8 +1677,11 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
         "normal (a rate-limited retry between epochs). **Block loop**: ``✅ "
         "leader`` elected order-consensus leader, ``follower`` normal non-"
         "leader, ``⚠ phantom-leader`` daemon claims leadership the metagraph "
-        "election doesn't grant. **OrderBook**: live order counts by status "
-        "(`status:count`); ``0`` = up but empty (normal for followers)._"
+        "election doesn't grant. **OrderBook**: DURABLE persisted order counts "
+        "by status from the api `/health` store (`status:count`); ``—`` = api "
+        "`:8080` unreachable / legacy image; ``0`` = reachable but store empty "
+        "(follower not synced, or no orders). Leader vs. followers diverging here "
+        "flags an order-sync problem._"
     )
     return "\n".join(lines)
 
