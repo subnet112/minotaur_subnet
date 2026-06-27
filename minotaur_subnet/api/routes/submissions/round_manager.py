@@ -414,15 +414,17 @@ def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "decision_deadline_epoch": state.decision_deadline_epoch,
         "effective_epoch": state.effective_epoch,
     }
-    # Same close-time submission snapshot as the coordinator-loop close path
-    # (_close_sync_payload in startup.py), so the explicit /solver/round/close
-    # route also lets followers reproduce the pack hash. Default-off.
-    if _env_true("SUBMISSION_SNAPSHOT_SYNC", default=False):
-        try:
-            _subs = get_store().list_by_round(state.round_id)
-            payload["submissions"] = [s.to_dict() for s in _subs]
-        except Exception:
-            logger.warning("close payload: submission snapshot failed", exc_info=True)
+    # Bind the close-time submission snapshot to the close broadcast so followers
+    # reproduce the SAME benchmark pack hash (mirrors the coordinator-loop close
+    # path in startup.py). ALWAYS ON — the SUBMISSION_SNAPSHOT_SYNC env gate was
+    # removed after fleet pack-hash parity was validated; the snapshot is required
+    # for cross-host determinism. Best-effort: a store hiccup must never break the
+    # broadcast (followers then recompute from an empty set and abstain, not adopt).
+    try:
+        _subs = get_store().list_by_round(state.round_id)
+        payload["submissions"] = [s.to_dict() for s in _subs]
+    except Exception:
+        logger.warning("close payload: submission snapshot failed", exc_info=True)
     return payload
 
 

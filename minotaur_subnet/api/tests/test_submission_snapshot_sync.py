@@ -223,3 +223,19 @@ def test_sync_close_upserts_on_first_close(monkeypatch):
     out = rm._sync_close_solver_round_state(body)
     assert out is sentinel
     assert calls["upsert"] == 2 and calls["closed"] is True
+
+
+def test_close_payload_always_carries_snapshot(monkeypatch):
+    """The close-sync payload ALWAYS embeds the submission snapshot now — the
+    SUBMISSION_SNAPSHOT_SYNC env gate was removed (it's required for cross-host
+    pack-hash parity). No env is set here, yet the snapshot must be present."""
+    monkeypatch.delenv("SUBMISSION_SNAPSHOT_SYNC", raising=False)
+    fake_sub = SimpleNamespace(to_dict=lambda: {"submission_id": "sub_a", "round_id": "round-1"})
+    monkeypatch.setattr(rm, "get_store",
+                        lambda: SimpleNamespace(list_by_round=lambda rid: [fake_sub]))
+    state = SimpleNamespace(
+        round_id="round-1", close_epoch=1, benchmark_pack_hash="p", committee_block=1,
+        committee_hash="c", quorum_required=1, decision_deadline_epoch=2, effective_epoch=3,
+    )
+    payload = rm._close_round_sync_payload(state)
+    assert payload["submissions"] == [{"submission_id": "sub_a", "round_id": "round-1"}]
