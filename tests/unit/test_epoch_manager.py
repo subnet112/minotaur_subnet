@@ -165,6 +165,44 @@ def _make_mock_orchestrator():
     return orch, session
 
 
+def _make_certified_round(score: float = 0.94):
+    """Build a round_store with a certified finalist + matching submission store.
+
+    Returns ``(round_store, current_round, submission, store)`` ready for
+    ``activate_certified_round``. Mirrors test_activate_certified_round_adopts_finalist.
+    """
+    round_store = RoundStore()
+    current_round = round_store.ensure_open_round(opened_epoch=5)
+    round_store.close_current_round(
+        close_epoch=5, benchmark_pack_hash="pack-5",
+        committee_hash="committee-5", quorum_required=1,
+    )
+    sub = _make_submission(
+        submission_id="sub_certified", epoch=5,
+        round_id=current_round.round_id, score=score,
+    )
+    store = _make_store_with_subs(sub)
+    round_store.set_round_finalist(
+        current_round.round_id, submission_id="sub_certified",
+        image_id=sub.image_id, benchmark_score=sub.benchmark_score,
+    )
+    round_store.certify_round(
+        current_round.round_id,
+        ChampionCertificate(
+            round_id=current_round.round_id, committee_hash="committee-5",
+            candidate_submission_id="sub_certified", candidate_image_id=sub.image_id,
+            incumbent_image_id=None, benchmark_pack_hash="pack-5",
+            effective_epoch=6, quorum_required=1,
+            approvals=[ChampionApproval(
+                validator_id="0xabc", round_id=current_round.round_id,
+                candidate_submission_id="sub_certified", candidate_image_id=sub.image_id,
+                effective_epoch=6, signature="sig",
+            )],
+        ),
+    )
+    return round_store, current_round, sub, store
+
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
@@ -734,6 +772,67 @@ class TestEpochManager:
         assert store.get("sub_certified").status == SubmissionStatus.ADOPTED
         assert next_round.status == RoundStatus.OPEN
         block_loop.set_solver.assert_called_once_with(live_solver)
+
+    @pytest.mark.asyncio
+    async def test_follower_adopts_verified_cert_without_finalizing(self):
+        """A FOLLOWER adopts the quorum-certified champion on the verified
+        certificate WITHOUT running the leader-only finalization (attest + PR
+        merge): it must NOT call on_champion_adopted (a follower has no PAT — the
+        call would fail and wrongly block adoption), yet must still set the active
+        champion so its daemon emits the matching champion weights."""
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+        called = []
+
+        def merge_cb(submission, round_id, *, certificate):
+            called.append(round_id)
+            return False  # a follower running this (no PAT) fails — must be SKIPPED
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: False)  # this node is a FOLLOWER
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert called == []  # finalization skipped on the follower
+        assert result["champion_changed"] is True  # adopted on the verified cert
+        assert mgr.champion.submission_id == "sub_certified"
+        # active champion set → the daemon (#332) emits the matching champion weights
+        assert round_store.get_active_champion().submission_id == "sub_certified"
+        assert round_store.get_round(current_round.round_id).status == RoundStatus.ACTIVATED
+
+    @pytest.mark.asyncio
+    async def test_leader_runs_merge_gate_and_refuses_on_failure(self):
+        """The LEADER still runs the finalization gate; a failed attest/merge
+        UNCONDITIONALLY refuses adoption (champion unchanged, round aborted)."""
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+        called = []
+
+        def merge_cb(submission, round_id, *, certificate):
+            called.append(round_id)
+            return False  # attest/merge did not both succeed
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)  # this node is the LEADER
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert called == [current_round.round_id]  # finalization ran on the leader
+        assert result["champion_changed"] is False
+        assert result.get("abort_reason") == "merge_failed"
+        assert mgr.champion.submission_id != "sub_certified"  # NOT adopted
 
 
 class TestChampionInfo:

@@ -521,7 +521,20 @@ class EpochManager:
         # before any champion change takes effect. With no merge callback wired (e.g.
         # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
         merge_ok = True
-        if self._on_champion_adopted is not None:
+        # Finalization (on-chain attest + squash-merge the miner's PR) is the
+        # LEADER's job: it alone holds the solver-repo PAT and is the single
+        # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
+        # PAT (the callback would fail → merge_ok False → it would wrongly REFUSE
+        # to adopt and never earn the champion's weights) and duplicate writers
+        # would race. The follower already INDEPENDENTLY verified this certificate
+        # at certify time (every approval checked against the on-chain
+        # ValidatorRegistry + EIP-712 in _certify_solver_round_state), so it adopts
+        # the quorum-verified winner directly. Leadership is dynamic → check at call
+        # time. _is_leader unset (local testnet / single-node / tests) → treat as
+        # leader, preserving the original behavior.
+        _leader_check = getattr(self, "_is_leader", None)
+        _is_follower = _leader_check is not None and not _leader_check()
+        if self._on_champion_adopted is not None and not _is_follower:
             try:
                 cb_result = self._on_champion_adopted(
                     submission, round_id, certificate=certificate,
@@ -532,6 +545,12 @@ class EpochManager:
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
+        elif _is_follower:
+            logger.info(
+                "[merge-gate] round %s: follower adopts quorum-certified champion %s "
+                "on the verified certificate (leader owns attest + PR merge).",
+                round_id, certificate.candidate_submission_id,
+            )
 
         # A failed attest/merge ABORTS the adoption — UNCONDITIONALLY, by design (no
         # opt-out env var): no hot-swap, no weight emit, champion unchanged. A
