@@ -119,6 +119,10 @@ class PeerInfo:
     evm_address: str
     hotkey: str
     axon_url: str
+    # Advisory public API base advertised by the peer's /identity (unsigned).
+    # When set, peers route order-book pulls here instead of the axon→:8080
+    # port transform. None on peers that don't advertise it (older images).
+    api_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -346,4 +350,7 @@ async def _probe_one(
         evm_address=recovered,
         hotkey=identity.hotkey,
         axon_url=metagraph_peer.axon_url,
+        # Advisory, from the (verified) /identity payload. Not part of the
+        # signed binding, so it's a best-effort routing hint only.
+        api_url=getattr(identity, "api_url", None) or None,
     )

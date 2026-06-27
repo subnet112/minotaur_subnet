@@ -72,6 +72,12 @@ class ValidatorIdentity:
     expiry: int       # unix timestamp; verifier rejects if now > expiry
     nonce: str        # 0x-prefixed 32-byte hex; per-signature freshness
     signature: str    # 0x-prefixed 65-byte hex
+    # Advisory, UNSIGNED hint for this validator's public API base (e.g.
+    # https://api.example.com). Used only to route best-effort, re-validated
+    # order-book pulls when the daemon axon's host:port isn't the reachable API
+    # endpoint. Deliberately NOT part of the EIP-712 binding — it can be absent
+    # on older peers and never affects signature verification.
+    api_url: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +87,7 @@ class ValidatorIdentity:
             "expiry": self.expiry,
             "nonce": self.nonce,
             "signature": self.signature,
+            "api_url": self.api_url,
         }
 
     @classmethod
@@ -92,6 +99,7 @@ class ValidatorIdentity:
             expiry=int(data["expiry"]),
             nonce=str(data["nonce"]),
             signature=str(data["signature"]),
+            api_url=(str(data["api_url"]) if data.get("api_url") else None),
         )
 
 
@@ -126,6 +134,7 @@ def sign_identity(
     hotkey: str,
     axon_url: str,
     *,
+    api_url: str | None = None,
     ttl_seconds: int = 300,
     now: int | None = None,
     nonce: bytes | None = None,
@@ -136,6 +145,10 @@ def sign_identity(
         private_key: Hex (0x-prefixed) EVM private key.
         hotkey: Bittensor SS58 hotkey string.
         axon_url: HTTP URL this validator serves at (e.g. http://host:9100).
+        api_url: Optional public API base URL (e.g. https://api.example.com),
+            advisory and UNSIGNED — carried in the payload but not the EIP-712
+            binding. Lets operators advertise an API endpoint distinct from the
+            daemon axon for order-book sync routing.
         ttl_seconds: How long the signature is valid for. Short by default
             (5 min) so a stolen/replayed payload quickly becomes stale.
         now: Override for the current unix time (testing).
@@ -165,6 +178,7 @@ def sign_identity(
         nonce="0x" + nonce.hex(),
         signature=signed.signature.hex() if signed.signature.hex().startswith("0x")
                   else "0x" + signed.signature.hex(),
+        api_url=api_url,
     )
 
 
