@@ -195,6 +195,21 @@ class BenchmarkResult:
     revert_trace: dict[str, Any] | None = None
 
 
+@dataclass
+class _BenchmarkRuntime:
+    """One isolated execution unit for the benchmark scenario pool.
+
+    A solver session plus its dedicated read-proxy session id. K runtimes run
+    scenarios concurrently; each is fully isolated (own solver subprocess, own
+    proxy budget), so scores stay byte-identical and order-independent. K=1 (a
+    single runtime over the existing session) is byte-identical to the legacy
+    sequential loop. The simulator is shared and serializes on its own per-fork
+    lock — a safe, small serialized tail.
+    """
+    session: "SolverSession"
+    proxy_session_id: str | None = None
+
+
 # Type alias for the scoring callback
 ScoreFn = Any  # Callable[[str, ExecutionPlan, SimulationResult, IntentState], Awaitable[ScoreResult]]
 
@@ -1023,8 +1038,6 @@ async def run_benchmark(
             "to benchmark on fabricated mock simulation data."
         )
 
-    results: list[BenchmarkResult] = []
-
     # Initialize — pass RPC URLs so Docker solvers can query pool states
     init_config: dict[str, Any] = {
         "chain_ids": config.chain_ids,
@@ -1114,49 +1127,6 @@ async def run_benchmark(
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)
 
-    # Respawn budget: a per-scenario timeout/crash kills the solver process. We
-    # restart it and continue so the offending scenario scores 0 ALONE instead
-    # of cascade-truncating the rest of the run (which made the score depend on
-    # WHICH scenario was slow — RPC-latency-dependent, non-deterministic across
-    # hosts). Bounded so a pathologically-crashing solver can't loop forever.
-    max_respawns = max(4, len(intents))
-    respawns = 0
-    solver_dead = False
-    dead_reason = "skipped: solver unrecoverable"
-    # Hard per-RUN wall-clock ceiling. restart() resets the per-SESSION
-    # TOTAL_BENCHMARK_TIMEOUT, so without a run-level budget a pathologically slow
-    # solver (timing out + respawning every scenario) could run several-fold past
-    # 900s and disrupt round timing. Once the whole run exceeds the budget the
-    # remaining scenarios score 0 deterministically (a corpus-sized respawn count
-    # already bounds it; this restores the absolute ceiling the old per-session
-    # cap provided before respawn existed).
-    run_start = time.monotonic()
-    # Per-run budget for diagnostic revert traces (0 disables). Decremented as
-    # reverted cases are traced; bounds the extra scoring-path work.
-    trace_budget = _revert_trace_budget()
-
-    async def _respawn_session() -> bool:
-        """Restart + re-init the solver for the next scenario.
-
-        Returns True on success; False (→ solver_dead) when the relaunch closure
-        is missing, the respawn budget is exhausted, or relaunch/init throws.
-        """
-        nonlocal respawns
-        if session._relaunch is None or respawns >= max_respawns:
-            return False
-        try:
-            await session.restart()
-            await session.initialize(init_config)
-            await session.on_benchmark_start(len(intents))
-            respawns += 1
-            return True
-        except Exception as exc:
-            logger.error(
-                "[benchmark] solver respawn failed (%s); remaining scenarios "
-                "score 0", exc,
-            )
-            return False
-
     # Get metadata for logging
     try:
         meta = await session.metadata()
@@ -1170,252 +1140,25 @@ async def run_benchmark(
     # Signal benchmark start
     await session.on_benchmark_start(len(intents))
 
-    # Process each intent
-    for intent, state, snapshot in intents:
-        start = time.monotonic()
-        scenario_name = state.control_view().get("_scenario_name", "")
-        intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
-        br = BenchmarkResult(intent_id=intent_label)
-
-        if not solver_dead and (time.monotonic() - run_start) > TOTAL_BENCHMARK_TIMEOUT:
-            logger.warning(
-                "[benchmark] total run budget (%.0fs) exceeded; scoring remaining "
-                "scenarios 0", TOTAL_BENCHMARK_TIMEOUT,
-            )
-            solver_dead = True
-            dead_reason = "skipped: total run budget exceeded"
-
-        if solver_dead:
-            # Solver is unrecoverable (respawn budget exhausted / relaunch failed)
-            # or the run budget is spent. Score the remaining scenarios 0
-            # deterministically rather than truncate, so every validator produces
-            # the same full result set.
-            br.error = dead_reason
-            br.elapsed_ms = 0
-            results.append(br)
-            continue
-        need_respawn = False
-
-        # Champion BLIND SPOT. The reference pre-pass marked this scenario as one
-        # the CHAMPION could not quote (surfaced/logged there — the anti-masking
-        # guarantee). We do NOT zero it: instead each solver SELF-QUOTES, so a
-        # challenger that CAN quote + execute this order reveals a real capability
-        # the champion lacks. The self-quote still requires a real on-chain
-        # execution to score, so it can't fabricate capability — and the champion
-        # self-quotes the same way (it fails → scores 0), so the champion's 0 is
-        # the floor and any real execution here is unambiguous progress. On an
-        # order the champion can't process at all, any progress is good progress.
-        # (Under-quoting can inflate the MAGNITUDE of that progress, not its
-        # existence; capping the per-blind-spot contribution is a future guard for
-        # when champion ADOPTION is live, not for observe-only progress reveal.)
-        _ref = reference_quotes.get(intent_label)
-        if _ref and _ref.get(REFERENCE_QUOTE_FAILED_SENTINEL):
-            logger.warning(
-                "[champion-blind-spot] %s: champion could not quote; this solver "
-                "self-quotes to reveal capability (champion scores 0 here)",
-                intent_label,
-            )
-            _ref = None  # fall through to the self-quote path below
-
-        # Quote-at-benchmark: synthetic scenarios never ran a quote, so their
-        # on-chain intentParams omit the CoW `quoted_output` field and the
-        # deployed scoreIntent reverts. Populate the source:"quote" params from
-        # a REAL quote — exactly like the live get_quote path — so downstream
-        # _build_benchmark_intent_order emits the full (CoW) layout.
-        # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE
-        # it quotes/routes, so it reads the SAME state the simulator scores at:
-        # cross-host deterministic (the precondition for a deterministic compute
-        # budget) AND it stops the solver mispricing quotes against a different
-        # (drifting, per-host) block. No-op when the fork is already pinned.
-        # Gated + consensus-relevant — ships OFF, flips fleet-uniformly.
-        if (
-            _pin_solver_read_block_enabled()
-            and fork_block is not None
-            and simulator is not None
-            and state is not None
-            and getattr(state, "chain_id", None)
-        ):
-            try:
-                pin_fn = getattr(simulator, "pin_read_fork", None)
-                if pin_fn is not None:
-                    pin_fn(state.chain_id, fork_block)
-            except Exception as exc:  # noqa: BLE001 - never let a pin failure abort the run
-                logger.warning(
-                    "[pin-read-block] fork pin failed for chain %s @ %s: %s",
-                    getattr(state, "chain_id", "?"), fork_block, exc,
-                )
-
-        try:
-            # Keep quote-enrich inside the try: _enrich_state_with_quote swallows
-            # its own quote exceptions, but on an already-dead solver the next
-            # generate_plan raises SolverCrashedError — which the respawn path
-            # below recovers from instead of aborting the whole run.
-            state = await _enrich_state_with_quote(
-                session, intent, state, snapshot, _ref,
-            )
-
-            from minotaur_subnet.shared.types import TriggerType
-
-            is_auto = (
-                intent.config.trigger_type == TriggerType.AUTO_TRIGGERED
-            )
-
-            # For auto-triggered intents, check trigger first
-            if is_auto:
-                br.trigger_decision = await session.check_trigger(
-                    intent, state, snapshot,
-                )
-
-            # Deterministic per-scenario budget: reset the proxy session's spent
-            # budget to 0 so EACH generate_plan starts with a fresh budget B (a
-            # per-scenario cutoff, matching the per-scenario wall-clock it
-            # replaces). Best-effort + inert unless a proxy session is active AND
-            # the budget is enforced; a failed reset never aborts the run.
-            if (
-                _proxy_session_id is not None
-                and _read_proxy is not None
-                and budget_enforced()
-            ):
-                await reset_session(_read_proxy, _proxy_session_id)
-
-            # Generate plan
-            plan = await session.generate_plan(intent, state, snapshot)
-            br.plan = plan
-
-            # Score the plan if a scoring function is provided
-            if plan is not None and score_fn is not None:
-                try:
-                    # Use real Anvil simulation when available, fall back to mock.
-                    # Mock simulation results MUST NOT be used for champion ranking
-                    # — they fabricate passing scores (~5% above minimum) and can
-                    # be exploited to inflate benchmark results.
-                    used_mock = False
-                    fail_closed_miss = False
-                    if simulator is not None:
-                        try:
-                            token_balances = _build_token_balances(state)
-                            # Ensure the plan's metadata carries chain_id so the
-                            # MultiChainSimulator routes to the correct Anvil fork.
-                            # Without this, it defaults to chain 31337 (Ethereum).
-                            if state and state.chain_id and plan:
-                                if plan.metadata is None:
-                                    plan.metadata = {}
-                                if "chain_id" not in plan.metadata:
-                                    plan.metadata["chain_id"] = state.chain_id
-                            # Build intent_order so the simulator uses the
-                            # full scoreIntent contract path (proxy deploy,
-                            # token funding, plan execution, transfer capture)
-                            # instead of the bare interaction path.
-                            intent_order = _build_benchmark_intent_order(
-                                state, plan,
-                            ) if state and state.contract_address else None
-                            sim = await simulator.simulate(
-                                plan,
-                                contract_address=state.contract_address if state else None,
-                                intent_order=intent_order,
-                                token_balances=token_balances,
-                                fork_block=fork_block,
-                            )
-                            print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
-                            if require_real_sim and not sim.success:
-                                # Fail-closed: a real simulation that REVERTED
-                                # (success=False) means the plan could not
-                                # execute. Don't hand it to the scorer — a lenient
-                                # app JS scorer doesn't hard-gate on success and
-                                # could still pass it. Score 0, exactly like a
-                                # genuine on-chain revert.
-                                logger.warning(
-                                    "Simulation reverted for %s and "
-                                    "require_real_sim is set; scoring 0: %s",
-                                    intent.app_id, sim.error,
-                                )
-                                br.error = f"real_sim_reverted: {sim.error}"
-                                br.revert_reason = getattr(sim, "revert_reason", None)
-                                # Diagnostics only: capture a per-step trace so the
-                                # miner sees WHICH call reverted. Bounded per run;
-                                # never affects the score.
-                                if trace_budget > 0:
-                                    tr = _capture_revert_trace(simulator, plan, token_balances)
-                                    if tr is not None:
-                                        br.revert_trace = tr
-                                        trace_budget -= 1
-                                fail_closed_miss = True
-                        except Exception as sim_exc:
-                            if require_real_sim:
-                                # Fail-closed: do NOT fabricate a passing mock.
-                                # Leave the scenario at score 0 (the same outcome
-                                # as an on-chain revert) so a flaky Anvil can't be
-                                # laundered into a ~min*1.05 passing score.
-                                logger.warning(
-                                    "Anvil simulation failed for %s and "
-                                    "require_real_sim is set; scoring 0 (no mock "
-                                    "fallback): %s",
-                                    intent.app_id, sim_exc,
-                                )
-                                br.error = f"real_sim_unavailable: {sim_exc}"
-                                fail_closed_miss = True
-                            else:
-                                logger.warning(
-                                    "Anvil simulation failed for %s, falling back to mock: %s",
-                                    intent.app_id, sim_exc,
-                                )
-                                sim = _build_benchmark_simulation(plan, state)
-                                used_mock = True
-                    else:
-                        sim = _build_benchmark_simulation(plan, state)
-                        used_mock = True
-                    if not fail_closed_miss:
-                        br.mock_simulation = used_mock
-                        # Capture the unfakeable on-chain scoreIntent BPS (was dropped
-                        # here). Used by the opt-in on-chain-ranked adoption rule.
-                        br.on_chain_score = getattr(sim, "on_chain_score", None)
-                        score_result = await score_fn(
-                            intent.app_id, plan, sim, state,
-                        )
-                        br.plan_score = score_result.score
-                        br.score_breakdown = score_result.breakdown
-
-                        # Compute composite score for auto-triggered intents
-                        if is_auto and br.trigger_decision is not None:
-                            gt = trigger_ground_truth.get(intent.app_id)
-                            if gt is not None:
-                                trigger_correct = (br.trigger_decision == gt)
-                                br.trigger_score = 1.0 if trigger_correct else 0.0
-                                br.score = (
-                                    config.auto_trigger_weight * br.trigger_score
-                                    + config.plan_quality_weight * score_result.score
-                                )
-                            else:
-                                br.score = score_result.score
-                        else:
-                            br.score = score_result.score
-
-                except Exception as exc:
-                    logger.warning(
-                        "Scoring failed for %s: %s", intent.app_id, exc,
-                    )
-                    br.error = f"scoring_error: {exc}"
-
-        except SolverTimeoutError as exc:
-            # This scenario scores 0 (recorded in br.error). The timeout killed
-            # the process, so respawn below before the next scenario.
-            br.error = f"timeout: {exc}"
-            need_respawn = True
-        except SolverCrashedError as exc:
-            br.error = f"crashed: {exc}"
-            need_respawn = True
-        except Exception as exc:
-            br.error = f"error: {exc}"
-
-        br.elapsed_ms = int((time.monotonic() - start) * 1000)
-        results.append(br)
-
-        # A timeout/crash left the process dead — respawn so the NEXT scenario
-        # runs on a live solver instead of cascade-crashing + truncating the run.
-        # Only THIS scenario scored 0; the result set stays the full corpus. If
-        # the solver can't be recovered, mark it dead (loop scores the rest 0).
-        if need_respawn:
-            solver_dead = not await _respawn_session()
+    # Run all scenarios through the pool. K=1 (a single runtime over this
+    # session + its proxy + the shared simulator) is byte-identical to the
+    # legacy sequential loop; additional runtimes (provisioned by the caller
+    # — step 2b) shard the corpus concurrently. Scores are order-independent
+    # and written back by input index (see _run_scenarios).
+    runtimes = [_BenchmarkRuntime(session=session, proxy_session_id=_proxy_session_id)]
+    results = await _run_scenarios(
+        intents,
+        runtimes=runtimes,
+        simulator=simulator,
+        init_config=init_config,
+        read_proxy=_read_proxy,
+        config=config,
+        score_fn=score_fn,
+        fork_block=fork_block,
+        require_real_sim=require_real_sim,
+        reference_quotes=reference_quotes,
+        trigger_ground_truth=trigger_ground_truth,
+    )
 
     # Signal benchmark end with final scores
     summary = [
@@ -1432,6 +1175,397 @@ async def run_benchmark(
     if _proxy_session_id is not None and _read_proxy is not None:
         await close_session(_read_proxy, _proxy_session_id)
     return results
+
+
+async def _process_scenario(
+    intent: "AppIntentDefinition",
+    state: "IntentState",
+    snapshot: "MarketSnapshot",
+    *,
+    session: SolverSession,
+    simulator: Any | None,
+    proxy_session_id: str | None,
+    read_proxy: Any | None,
+    config: "BenchmarkConfig",
+    score_fn: ScoreFn | None,
+    fork_block: int | None,
+    require_real_sim: bool,
+    reference_quotes: dict[str, dict[str, str]],
+    trigger_ground_truth: dict[str, bool],
+    trace_budget: list[int],
+) -> tuple[BenchmarkResult, bool]:
+    """Run ONE benchmark scenario end-to-end on the given runtime.
+
+    Pure with respect to the scenario: takes its own ``session`` / ``simulator``
+    / ``proxy_session_id`` plus read-only config, and returns
+    ``(result, need_respawn)``. The ONLY shared mutable it touches is
+    ``trace_budget`` (a per-run, diagnostics-only counter that NEVER folds into
+    the score or the pack hash), so running scenarios concurrently across
+    isolated runtimes cannot change any consensus-relevant output. The body is
+    the legacy sequential loop body verbatim, so a single-runtime pool is
+    byte-identical to the old loop.
+    """
+    start = time.monotonic()
+    scenario_name = state.control_view().get("_scenario_name", "")
+    intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
+    br = BenchmarkResult(intent_id=intent_label)
+    need_respawn = False
+
+    # Champion BLIND SPOT. The reference pre-pass marked this scenario as one the
+    # CHAMPION could not quote. We do NOT zero it: each solver SELF-QUOTES, so a
+    # challenger that CAN quote + execute reveals a real capability the champion
+    # lacks. The champion self-quotes the same way (fails → 0), so its 0 is the
+    # floor and any real execution here is unambiguous progress.
+    _ref = reference_quotes.get(intent_label)
+    if _ref and _ref.get(REFERENCE_QUOTE_FAILED_SENTINEL):
+        logger.warning(
+            "[champion-blind-spot] %s: champion could not quote; this solver "
+            "self-quotes to reveal capability (champion scores 0 here)",
+            intent_label,
+        )
+        _ref = None  # fall through to the self-quote path below
+
+    # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE it
+    # quotes/routes, so it reads the SAME state the simulator scores at: cross-host
+    # deterministic AND it stops the solver mispricing quotes against a different
+    # (drifting, per-host) block. No-op when already pinned. Ships OFF, flips
+    # fleet-uniformly.
+    if (
+        _pin_solver_read_block_enabled()
+        and fork_block is not None
+        and simulator is not None
+        and state is not None
+        and getattr(state, "chain_id", None)
+    ):
+        try:
+            pin_fn = getattr(simulator, "pin_read_fork", None)
+            if pin_fn is not None:
+                pin_fn(state.chain_id, fork_block)
+        except Exception as exc:  # noqa: BLE001 - never let a pin failure abort the run
+            logger.warning(
+                "[pin-read-block] fork pin failed for chain %s @ %s: %s",
+                getattr(state, "chain_id", "?"), fork_block, exc,
+            )
+
+    try:
+        # Keep quote-enrich inside the try: _enrich_state_with_quote swallows its
+        # own quote exceptions, but on an already-dead solver the next
+        # generate_plan raises SolverCrashedError — which the respawn path
+        # recovers from instead of aborting the whole run.
+        state = await _enrich_state_with_quote(
+            session, intent, state, snapshot, _ref,
+        )
+
+        from minotaur_subnet.shared.types import TriggerType
+
+        is_auto = (
+            intent.config.trigger_type == TriggerType.AUTO_TRIGGERED
+        )
+
+        # For auto-triggered intents, check trigger first
+        if is_auto:
+            br.trigger_decision = await session.check_trigger(
+                intent, state, snapshot,
+            )
+
+        # Deterministic per-scenario budget: reset the proxy session's spent
+        # budget to 0 so EACH generate_plan starts with a fresh budget B.
+        # Best-effort + inert unless a proxy session is active AND the budget is
+        # enforced; a failed reset never aborts the run.
+        if (
+            proxy_session_id is not None
+            and read_proxy is not None
+            and budget_enforced()
+        ):
+            await reset_session(read_proxy, proxy_session_id)
+
+        # Generate plan
+        plan = await session.generate_plan(intent, state, snapshot)
+        br.plan = plan
+
+        # Score the plan if a scoring function is provided
+        if plan is not None and score_fn is not None:
+            try:
+                # Use real Anvil simulation when available, fall back to mock.
+                # Mock simulation results MUST NOT be used for champion ranking.
+                used_mock = False
+                fail_closed_miss = False
+                if simulator is not None:
+                    try:
+                        token_balances = _build_token_balances(state)
+                        # Ensure the plan's metadata carries chain_id so the
+                        # MultiChainSimulator routes to the correct Anvil fork.
+                        if state and state.chain_id and plan:
+                            if plan.metadata is None:
+                                plan.metadata = {}
+                            if "chain_id" not in plan.metadata:
+                                plan.metadata["chain_id"] = state.chain_id
+                        # Build intent_order so the simulator uses the full
+                        # scoreIntent contract path instead of the bare path.
+                        intent_order = _build_benchmark_intent_order(
+                            state, plan,
+                        ) if state and state.contract_address else None
+                        sim = await simulator.simulate(
+                            plan,
+                            contract_address=state.contract_address if state else None,
+                            intent_order=intent_order,
+                            token_balances=token_balances,
+                            fork_block=fork_block,
+                        )
+                        print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
+                        if require_real_sim and not sim.success:
+                            # Fail-closed: a real simulation that REVERTED means
+                            # the plan could not execute. Score 0, exactly like a
+                            # genuine on-chain revert.
+                            logger.warning(
+                                "Simulation reverted for %s and "
+                                "require_real_sim is set; scoring 0: %s",
+                                intent.app_id, sim.error,
+                            )
+                            br.error = f"real_sim_reverted: {sim.error}"
+                            br.revert_reason = getattr(sim, "revert_reason", None)
+                            # Diagnostics only: capture a per-step trace. Bounded
+                            # per run; never affects the score.
+                            if trace_budget[0] > 0:
+                                tr = _capture_revert_trace(simulator, plan, token_balances)
+                                if tr is not None:
+                                    br.revert_trace = tr
+                                    trace_budget[0] -= 1
+                            fail_closed_miss = True
+                    except Exception as sim_exc:
+                        if require_real_sim:
+                            # Fail-closed: do NOT fabricate a passing mock.
+                            logger.warning(
+                                "Anvil simulation failed for %s and "
+                                "require_real_sim is set; scoring 0 (no mock "
+                                "fallback): %s",
+                                intent.app_id, sim_exc,
+                            )
+                            br.error = f"real_sim_unavailable: {sim_exc}"
+                            fail_closed_miss = True
+                        else:
+                            logger.warning(
+                                "Anvil simulation failed for %s, falling back to mock: %s",
+                                intent.app_id, sim_exc,
+                            )
+                            sim = _build_benchmark_simulation(plan, state)
+                            used_mock = True
+                else:
+                    sim = _build_benchmark_simulation(plan, state)
+                    used_mock = True
+                if not fail_closed_miss:
+                    br.mock_simulation = used_mock
+                    # Capture the unfakeable on-chain scoreIntent BPS.
+                    br.on_chain_score = getattr(sim, "on_chain_score", None)
+                    score_result = await score_fn(
+                        intent.app_id, plan, sim, state,
+                    )
+                    br.plan_score = score_result.score
+                    br.score_breakdown = score_result.breakdown
+
+                    # Compute composite score for auto-triggered intents
+                    if is_auto and br.trigger_decision is not None:
+                        gt = trigger_ground_truth.get(intent.app_id)
+                        if gt is not None:
+                            trigger_correct = (br.trigger_decision == gt)
+                            br.trigger_score = 1.0 if trigger_correct else 0.0
+                            br.score = (
+                                config.auto_trigger_weight * br.trigger_score
+                                + config.plan_quality_weight * score_result.score
+                            )
+                        else:
+                            br.score = score_result.score
+                    else:
+                        br.score = score_result.score
+
+            except Exception as exc:
+                logger.warning(
+                    "Scoring failed for %s: %s", intent.app_id, exc,
+                )
+                br.error = f"scoring_error: {exc}"
+
+    except SolverTimeoutError as exc:
+        # This scenario scores 0 (recorded in br.error). The timeout killed the
+        # process, so the caller respawns before the next scenario.
+        br.error = f"timeout: {exc}"
+        need_respawn = True
+    except SolverCrashedError as exc:
+        br.error = f"crashed: {exc}"
+        need_respawn = True
+    except Exception as exc:
+        br.error = f"error: {exc}"
+
+    br.elapsed_ms = int((time.monotonic() - start) * 1000)
+    return br, need_respawn
+
+
+async def _scenario_pool_worker(
+    queue: "asyncio.Queue",
+    results: list[BenchmarkResult | None],
+    *,
+    runtime: _BenchmarkRuntime,
+    simulator: Any | None,
+    init_config: dict[str, Any],
+    intents_len: int,
+    run_start: float,
+    trace_budget: list[int],
+    max_respawns: int,
+    read_proxy: Any | None,
+    config: "BenchmarkConfig",
+    score_fn: ScoreFn | None,
+    fork_block: int | None,
+    require_real_sim: bool,
+    reference_quotes: dict[str, dict[str, str]],
+    trigger_ground_truth: dict[str, bool],
+) -> None:
+    """Drain the shared scenario queue on ONE isolated runtime.
+
+    Owns this runtime's respawn state (its own solver subprocess). Writes each
+    result back by its INPUT index, so the results list is in input order
+    regardless of completion order — the load-bearing invariant the
+    order-independence golden test guards. The run budget (TOTAL_BENCHMARK_TIMEOUT)
+    is a shared wall-clock backstop checked per-worker; it rarely trips (the
+    per-scenario RPC-read budget is the real cutoff), so its best-effort zero-fill
+    is not consensus-critical.
+    """
+    session = runtime.session
+    proxy_session_id = runtime.proxy_session_id
+    respawns = 0
+    solver_dead = False
+    dead_reason = "skipped: solver unrecoverable"
+
+    async def _respawn() -> bool:
+        """Restart + re-init this runtime's solver for the next scenario.
+
+        Returns True on success; False (→ solver_dead) when the relaunch closure
+        is missing, the respawn budget is exhausted, or relaunch/init throws.
+        """
+        nonlocal respawns
+        if session._relaunch is None or respawns >= max_respawns:
+            return False
+        try:
+            await session.restart()
+            await session.initialize(init_config)
+            await session.on_benchmark_start(intents_len)
+            respawns += 1
+            return True
+        except Exception as exc:
+            logger.error(
+                "[benchmark] solver respawn failed (%s); remaining scenarios "
+                "score 0", exc,
+            )
+            return False
+
+    while True:
+        try:
+            idx, intent, state, snapshot = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+
+        if not solver_dead and (time.monotonic() - run_start) > TOTAL_BENCHMARK_TIMEOUT:
+            logger.warning(
+                "[benchmark] total run budget (%.0fs) exceeded; scoring remaining "
+                "scenarios 0", TOTAL_BENCHMARK_TIMEOUT,
+            )
+            solver_dead = True
+            dead_reason = "skipped: total run budget exceeded"
+
+        if solver_dead:
+            # Solver unrecoverable or the run budget is spent. Score this scenario
+            # 0 deterministically (by index) rather than truncate.
+            scenario_name = state.control_view().get("_scenario_name", "")
+            intent_label = (
+                f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
+            )
+            br = BenchmarkResult(intent_id=intent_label)
+            br.error = dead_reason
+            br.elapsed_ms = 0
+            results[idx] = br
+            continue
+
+        br, need_respawn = await _process_scenario(
+            intent, state, snapshot,
+            session=session,
+            simulator=simulator,
+            proxy_session_id=proxy_session_id,
+            read_proxy=read_proxy,
+            config=config,
+            score_fn=score_fn,
+            fork_block=fork_block,
+            require_real_sim=require_real_sim,
+            reference_quotes=reference_quotes,
+            trigger_ground_truth=trigger_ground_truth,
+            trace_budget=trace_budget,
+        )
+        results[idx] = br
+
+        # A timeout/crash left the process dead — respawn so the NEXT scenario
+        # this worker pulls runs on a live solver. Only THIS scenario scored 0.
+        if need_respawn:
+            solver_dead = not await _respawn()
+
+
+async def _run_scenarios(
+    intents: list[tuple["AppIntentDefinition", "IntentState", "MarketSnapshot"]],
+    *,
+    runtimes: list[_BenchmarkRuntime],
+    simulator: Any | None,
+    init_config: dict[str, Any],
+    read_proxy: Any | None,
+    config: "BenchmarkConfig",
+    score_fn: ScoreFn | None,
+    fork_block: int | None,
+    require_real_sim: bool,
+    reference_quotes: dict[str, dict[str, str]],
+    trigger_ground_truth: dict[str, bool],
+) -> list[BenchmarkResult]:
+    """Run every scenario across ``len(runtimes)`` isolated runtimes concurrently.
+
+    Each scenario is independent and written back by input index, so the result
+    list is byte-identical and order-independent regardless of how many runtimes
+    drain the queue or in what order they finish (proven by
+    test_benchmark_order_independence + test_benchmark_pool). With a single
+    runtime this is byte-identical to the legacy sequential loop.
+    """
+    results: list[BenchmarkResult | None] = [None] * len(intents)
+    queue: "asyncio.Queue" = asyncio.Queue()
+    for i, (intent, state, snapshot) in enumerate(intents):
+        queue.put_nowait((i, intent, state, snapshot))
+
+    run_start = time.monotonic()
+    # Diagnostics-only revert-trace budget, shared across runtimes (a list so the
+    # workers decrement one counter). Best-effort: never folded into the score.
+    trace_budget = [_revert_trace_budget()]
+    # Per-runtime respawn ceiling (matches the legacy single-session bound).
+    max_respawns = max(4, len(intents))
+
+    await asyncio.gather(*[
+        _scenario_pool_worker(
+            queue, results,
+            runtime=rt,
+            simulator=simulator,
+            init_config=init_config,
+            intents_len=len(intents),
+            run_start=run_start,
+            trace_budget=trace_budget,
+            max_respawns=max_respawns,
+            read_proxy=read_proxy,
+            config=config,
+            score_fn=score_fn,
+            fork_block=fork_block,
+            require_real_sim=require_real_sim,
+            reference_quotes=reference_quotes,
+            trigger_ground_truth=trigger_ground_truth,
+        )
+        for rt in runtimes
+    ])
+
+    if any(br is None for br in results):
+        # Defensive: every index is dequeued exactly once + written. If not,
+        # fail loud rather than silently return a short/misaligned result set.
+        missing = [i for i, br in enumerate(results) if br is None]
+        raise RuntimeError(f"benchmark pool left scenarios unscored: {missing}")
+    return [br for br in results if br is not None]
 
 
 def _build_benchmark_intent_order(
