@@ -749,10 +749,14 @@ class RelayerService:
 
             # ── Quorum OK → attest on-chain + squash-merge ─────────────────
             submission_data = data.get("submission") or {}
+            _is_private = bool(submission_data.get("is_private", False))
             ns = types.SimpleNamespace(
                 submission_id=submission_data.get("submission_id", ""),
                 commit_hash=submission_data.get("commit_hash", ""),
                 pr_number=submission_data.get("pr_number"),
+                is_private=_is_private,
+                private_repo=submission_data.get("private_repo"),
+                repo_token=submission_data.get("repo_token"),
             )
             logger.info(
                 "Relayer: finalize-champion accepted (round=%s submission=%s signers=%d/%d "
