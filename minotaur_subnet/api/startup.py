@@ -1030,6 +1030,12 @@ async def initialize(ctx: ServerContext) -> dict:
         ctx.benchmark_task = asyncio.create_task(
             ctx.benchmark_worker.run_loop(interval=poll_interval),
         )
+        # Expose the worker to routes (diagnostic image-scoring endpoint).
+        try:
+            from minotaur_subnet.api.routes.submissions.state import set_benchmark_worker
+            set_benchmark_worker(ctx.benchmark_worker)
+        except Exception:
+            pass
         logger.info("Benchmark worker started (poll every %ds)", poll_interval)
 
     # ── relayer ──────────────────────────────────────────────────────────

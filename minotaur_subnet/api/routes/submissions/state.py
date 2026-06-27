@@ -23,6 +23,7 @@ _epoch_manager: Any = None
 _champion_consensus_manager: Any = None
 _champion_peer_network: Any = None
 _solver_round_epoch_provider: Any = None
+_benchmark_worker: Any = None
 _rate_limit_lock = threading.Lock()
 _rate_limit_buckets: dict[str, deque[float]] = {}
 _COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -117,6 +118,17 @@ def set_champion_peer_network(network: Any | None) -> None:
     """Override the champion peer network (for testing/server wiring)."""
     global _champion_peer_network
     _champion_peer_network = network
+
+
+def get_benchmark_worker() -> Any | None:
+    """Return the shared benchmark worker (leader only) if configured."""
+    return _benchmark_worker
+
+
+def set_benchmark_worker(worker: Any | None) -> None:
+    """Override the benchmark worker (server wiring / diagnostics)."""
+    global _benchmark_worker
+    _benchmark_worker = worker
 
 
 def get_solver_round_epoch_provider() -> Any | None:
