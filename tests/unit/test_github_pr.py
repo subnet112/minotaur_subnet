@@ -9,9 +9,11 @@ HEAD = "a" * 40
 FORK = "https://github.com/miner/minotaur-solver.git"
 
 
-def _pr(*, state="open", base=f"{OWNER}/{REPO}", head_sha=HEAD, clone_url=FORK, head_repo=True):
+def _pr(*, state="open", base=f"{OWNER}/{REPO}", head_sha=HEAD, clone_url=FORK, head_repo=True,
+        mergeable=True, mergeable_state="clean", draft=False):
     head = {"sha": head_sha, "repo": ({"clone_url": clone_url} if head_repo else None)}
-    return {"state": state, "base": {"repo": {"full_name": base}}, "head": head}
+    return {"state": state, "base": {"repo": {"full_name": base}}, "head": head,
+            "mergeable": mergeable, "mergeable_state": mergeable_state, "draft": draft}
 
 
 def _fetch(pr):
@@ -72,3 +74,87 @@ def test_resolve_wraps_fetch_errors():
 
     with pytest.raises(gp.PRResolutionError, match="could not fetch"):
         gp.resolve_pr(7, fetch=boom)
+
+
+# ── assess_pr_mergeability (fail-fast submit gate) ───────────────────────────
+
+
+def _no_sleep(_):  # don't actually sleep on the mergeable=null retry in tests
+    pass
+
+
+def test_mergeable_clean_ok():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(mergeable=True, mergeable_state="clean")), _sleep=_no_sleep,
+    )
+    assert ok and reason is None
+
+
+def test_mergeable_conflicts_rejected():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(mergeable=False, mergeable_state="dirty")), _sleep=_no_sleep,
+    )
+    assert not ok and "conflicts" in reason.lower()
+
+
+def test_dirty_state_rejected_even_when_mergeable_null():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(mergeable=None, mergeable_state="dirty")), _sleep=_no_sleep,
+    )
+    assert not ok and "conflicts" in reason.lower()
+
+
+def test_behind_main_rejected():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(mergeable=True, mergeable_state="behind")), _sleep=_no_sleep,
+    )
+    assert not ok and "behind" in reason.lower()
+
+
+def test_draft_rejected():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(draft=True)), _sleep=_no_sleep,
+    )
+    assert not ok and "draft" in reason.lower()
+
+
+def test_null_then_clean_retries_once_and_passes():
+    seq = [
+        _pr(mergeable=None, mergeable_state="unknown"),  # GitHub still computing
+        _pr(mergeable=True, mergeable_state="clean"),     # computed on re-fetch
+    ]
+    calls = {"n": 0}
+
+    def fetch(owner, repo, n):
+        out = seq[calls["n"]]
+        calls["n"] += 1
+        return out
+
+    ok, reason = gp.assess_pr_mergeability(7, fetch=fetch, _sleep=_no_sleep)
+    assert ok and reason is None
+    assert calls["n"] == 2  # retried exactly once
+
+
+def test_persistent_null_does_not_block():
+    ok, reason = gp.assess_pr_mergeability(
+        7, fetch=_fetch(_pr(mergeable=None, mergeable_state="unknown")), _sleep=_no_sleep,
+    )
+    assert ok and reason is None  # transient/uncertain → never hard-block
+
+
+def test_fetch_error_does_not_block():
+    def boom(owner, repo, n):
+        raise RuntimeError("github 502")
+
+    ok, reason = gp.assess_pr_mergeability(7, fetch=boom, _sleep=_no_sleep)
+    assert ok and reason is None  # the merge gate is the backstop, not this check
+
+
+def test_blocked_and_unstable_are_allowed():
+    # blocked (required reviews/checks) + unstable (failing non-required checks)
+    # are NOT merge-blockers for our leader-authority squash-merge → allow.
+    for st in ("blocked", "unstable", "clean", "has_hooks"):
+        ok, _ = gp.assess_pr_mergeability(
+            7, fetch=_fetch(_pr(mergeable=True, mergeable_state=st)), _sleep=_no_sleep,
+        )
+        assert ok, st
