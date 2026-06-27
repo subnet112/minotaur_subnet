@@ -37,6 +37,7 @@ from fastapi import HTTPException
 from minotaur_subnet.api.routes.submissions import routes as routes_module
 from minotaur_subnet.api.routes.submissions.routes import (
     _authorize_internal_round,
+    _authorize_internal_round_sync,
     _verify_internal_round_signature,
 )
 from minotaur_subnet.api.routes.submissions.round_manager import (
@@ -170,6 +171,50 @@ def test_authorize_accepts_signed_payload(monkeypatch, unlock_leader):
     # No shared key set, no REQUIRE flag — signature alone must authorize.
     req = _FakeRequest(body=signed)
     _run(_authorize_internal_round(req))  # must not raise
+
+
+# ── _authorize_internal_round_sync — cross-validator /internal/ receivers (EIP-712 ONLY)
+
+
+def test_sync_accepts_signed_payload(monkeypatch, unlock_leader):
+    """A leader-signed body authorizes the /internal/ receiver auth."""
+    monkeypatch.setattr(
+        "minotaur_subnet.consensus.validator_registry_cache.enforce_enabled",
+        lambda: False,
+    )
+    acct = Account.create()
+    net = _make_network_with_key(acct.key.hex())
+    signed = _sign_internal_round_payload(net, _representative_close_payload())
+    _run(_authorize_internal_round_sync(_FakeRequest(body=signed)))  # must not raise
+
+
+def test_sync_rejects_unsigned_even_with_shared_key(monkeypatch):
+    """No signature -> 401 EVEN with a matching shared key. The /internal/ receivers
+    have NO shared-key fallback (unlike the operator endpoints)."""
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "shared-secret")
+    req = _FakeRequest(
+        body=_representative_close_payload(),  # no proposer / proposer_signature
+        headers={"x-solver-round-internal-key": "shared-secret"},
+    )
+    with pytest.raises(HTTPException) as ei:
+        _run(_authorize_internal_round_sync(req))
+    assert ei.value.status_code == 401
+    assert "eip-712" in ei.value.detail.lower()
+
+
+def test_sync_rejects_invalid_signature(monkeypatch, unlock_leader):
+    """A present-but-invalid signature is a hard 401 (never falls through)."""
+    monkeypatch.setattr(
+        "minotaur_subnet.consensus.validator_registry_cache.enforce_enabled",
+        lambda: False,
+    )
+    body = _representative_close_payload()
+    body["proposer"] = Account.create().address
+    body["proposer_signature"] = "0x" + "00" * 65  # garbage sig
+    with pytest.raises(HTTPException) as ei:
+        _run(_authorize_internal_round_sync(_FakeRequest(body=body)))
+    assert ei.value.status_code == 401
+    assert "signature" in ei.value.detail.lower()
 
 
 # ── (2) canonical-string PARITY ──────────────────────────────────────────────

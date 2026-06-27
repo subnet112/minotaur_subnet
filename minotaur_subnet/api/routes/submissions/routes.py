@@ -292,6 +292,49 @@ async def _authorize_internal_round(request: Request) -> None:
     _require_internal_round_api_key(request)
 
 
+async def _authorize_internal_round_sync(request: Request) -> None:
+    """Auth for the cross-validator ``/internal/`` round-lifecycle RECEIVERS — EIP-712 ONLY.
+
+    The leader EIP-712-signs every coordinator broadcast (#337) and the follower
+    verifies it against the locked-leader / on-chain ValidatorRegistry, so a valid
+    ``proposer`` + ``proposer_signature`` is the SOLE accepted credential here. There
+    is NO legacy shared-key fallback: the shared secret never worked across
+    independent operators (each runs its own ``SOLVER_ROUND_INTERNAL_API_KEY``), which
+    is exactly why relying on it 401'd cross-operator round-sync (the responses=0 root
+    cause). The operator-facing ENTRY endpoints (``/solver/round/{close,certify,abort,
+    activate}``, used by the MCP tools + manual ops) keep the shared key via
+    ``_authorize_internal_round``.
+
+    A present-but-invalid signature is a hard 401 (never retryable as anything weaker).
+    Replay safety is as in ``_authorize_internal_round`` (epoch-unique round_ids +
+    idempotent handlers). Starlette caches the body, so ``await request.json()`` is safe.
+    """
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        raw = {}
+    has_sig = bool(
+        str(raw.get("proposer", "") or "").strip()
+        and str(raw.get("proposer_signature", "") or "").strip()
+    )
+    if not has_sig:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "internal round-sync requires an EIP-712 proposer signature "
+                "(no shared-key fallback)"
+            ),
+        )
+    err = _verify_internal_round_signature(raw)
+    if err is not None:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid round-lifecycle signature: {err}",
+        )
+
+
 # Per-signer, per-round rate limit state for champion proposals. Keyed by
 # (signer.lower(), round_id). Value is monotonic timestamp of last accepted.
 _CHAMPION_PROPOSAL_LAST_SEEN: dict[tuple[str, str], float] = {}
@@ -904,7 +947,7 @@ async def internal_close_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round close on this validator."""
-    await _authorize_internal_round(request)
+    await _authorize_internal_round_sync(request)
     closed = _sync_close_solver_round_state(body)
     return _round_state_to_response(closed)
 
@@ -915,7 +958,7 @@ async def internal_certify_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round certificate on this validator."""
-    await _authorize_internal_round(request)
+    await _authorize_internal_round_sync(request)
     certified = await _sync_certified_round_state(body)
     return _round_state_to_response(certified)
 
@@ -926,7 +969,7 @@ async def internal_abort_solver_round(
     request: Request,
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round abort on this validator."""
-    await _authorize_internal_round(request)
+    await _authorize_internal_round_sync(request)
     aborted = _sync_abort_solver_round_state(body)
     return _round_state_to_response(aborted)
 
@@ -1154,7 +1197,7 @@ async def internal_activate_solver_round(
     request: Request,
 ) -> dict[str, Any]:
     """Persist a leader-broadcast round activation on this validator."""
-    await _authorize_internal_round(request)
+    await _authorize_internal_round_sync(request)
     try:
         return await _activate_solver_round_state(body)
     except KeyError as exc:
