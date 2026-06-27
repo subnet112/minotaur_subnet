@@ -9,7 +9,7 @@ empty-champion case. These tests lock both properties.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -166,3 +166,76 @@ def test_refresh_does_not_flag_non_list_intents_mock_worker():
     mgr._benchmark_worker = MagicMock()  # _load_benchmark_intents() -> MagicMock (not a list)
     asyncio.run(mgr._refresh_incumbent_score())
     assert mgr._incumbent_refresh_failed is False
+
+
+def test_refresh_scores_incumbent_with_reference_quotes():
+    import asyncio
+    from minotaur_subnet.epoch.manager import ChampionInfo
+
+    real = SimpleNamespace(
+        submission_id="sub_real",
+        solver_name="x",
+        solver_version="1",
+        benchmark_score=0.7,
+        epoch=3,
+        image_tag="champ:1",
+        hotkey="5Real",
+        updated_at=0,
+        benchmark_details={"scorecard": {"app_onchain": {"dex": [7000]}}},
+    )
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(
+        submission_id="sub_real",
+        hotkey="5Real",
+        benchmark_score=0.7,
+        image_tag="champ:1",
+    )
+    mgr._sub_store.get.return_value = real
+    mgr._round_store.get_current_round.return_value = SimpleNamespace(round_id="round-1")
+
+    intents = [(SimpleNamespace(app_id="dex"), SimpleNamespace(chain_id=8453), None)]
+    reference_quotes = {"dex": {"quoted_output": "100"}}
+    seen: dict[str, object] = {}
+
+    bw = MagicMock()
+    bw._epoch_block_number = 123
+    bw._require_real_sim = True
+    bw._load_benchmark_intents.return_value = intents
+    bw._build_score_fn = AsyncMock(return_value=object())
+    bw._enrich_intents_with_manifests.side_effect = lambda x: x
+    bw._load_historical_scenarios.return_value = []
+    bw._build_reference_quotes = AsyncMock(return_value=reference_quotes)
+    bw._compute_avg_score.return_value = 0.52
+    bw._results_to_details.return_value = {
+        "scorecard": {"app_onchain": {"dex": [5200]}},
+    }
+
+    async def _benchmark_submission(image_tag, bench_intents, score_fn, *, reference_quotes=None):
+        seen["image_tag"] = image_tag
+        seen["reference_quotes"] = reference_quotes
+        return ["RESULTS"]
+
+    async def _memo_champion_bench(
+        *,
+        round_id,
+        image,
+        fork_block,
+        intents,
+        require_real_sim,
+        reference_quotes=None,
+        run,
+    ):
+        seen["memo_reference_quotes"] = reference_quotes
+        return await run()
+
+    bw._benchmark_submission = AsyncMock(side_effect=_benchmark_submission)
+    bw.memo_champion_bench = AsyncMock(side_effect=_memo_champion_bench)
+    mgr._benchmark_worker = bw
+
+    asyncio.run(mgr._refresh_incumbent_score())
+
+    assert mgr._champion.benchmark_score == 0.52
+    assert seen["image_tag"] == "champ:1"
+    assert seen["reference_quotes"] is reference_quotes
+    assert seen["memo_reference_quotes"] is reference_quotes
+    bw._build_reference_quotes.assert_awaited_once_with(intents, image_tag="champ:1")

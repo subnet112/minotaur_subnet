@@ -299,6 +299,28 @@ class BenchmarkWorker:
         parts = [f"{a}={self._loaded_js_hashes.get(a, '')}" for a in app_ids]
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
+    def _reference_quotes_fingerprint(
+        self,
+        reference_quotes: dict[str, dict[str, str]] | None,
+    ) -> str:
+        """Stable hash of the reference quote anchor used for a champion run.
+
+        Champion benchmark memoization is only valid when the quote anchor is the
+        same. A self-quoted champion run and a champion-reference-quoted run can
+        share the same round/image/fork/corpus/JS, but they are different scoring
+        computations and must not reuse one another.
+        """
+        if not reference_quotes:
+            return ""
+
+        parts: list[str] = []
+        for label in sorted(reference_quotes):
+            params = reference_quotes.get(label) or {}
+            parts.append(label)
+            for key in sorted(params):
+                parts.append(f"{key}={params[key]}")
+        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
     async def memo_champion_bench(
         self,
         *,
@@ -307,6 +329,7 @@ class BenchmarkWorker:
         fork_block: int | None,
         intents: list,
         require_real_sim: bool,
+        reference_quotes: dict[str, dict[str, str]] | None = None,
         run: Any,
     ) -> list[BenchmarkResult]:
         """Run (or reuse) the champion benchmark for this round, via the PROCESS-WIDE
@@ -315,11 +338,12 @@ class BenchmarkWorker:
 
         ``run`` is the caller's own async benchmark thunk (it owns session setup +
         exception semantics). Returns the cached result ONLY on an exact key match —
-        round_id, image, fork_block, real-sim, corpus fingerprint, AND scoring-JS
-        fingerprint — i.e. the identical deterministic computation, so a follower's
-        verdict and persisted score are unchanged. Disabled (always recompute) when
-        the flag is off, the key is incomplete (no round_id/image), or fork_block is
-        None — a None pin means live-head (dev), where reuse across blocks is unsafe.
+        round_id, image, fork_block, real-sim, corpus fingerprint, scoring-JS
+        fingerprint, AND reference-quote fingerprint — i.e. the identical
+        deterministic computation, so a follower's verdict and persisted score are
+        unchanged. Disabled (always recompute) when the flag is off, the key is
+        incomplete (no round_id/image), or fork_block is None — a None pin means
+        live-head (dev), where reuse across blocks is unsafe.
         """
         if (
             not _consolidate_champion_bench()
@@ -328,7 +352,9 @@ class BenchmarkWorker:
             return await run()
         key = (
             round_id, image, int(fork_block), bool(require_real_sim),
-            self._corpus_fingerprint(intents), self._loaded_js_fingerprint(intents),
+            self._corpus_fingerprint(intents),
+            self._loaded_js_fingerprint(intents),
+            self._reference_quotes_fingerprint(reference_quotes),
         )
         hit = _CHAMPION_BENCH_CACHE.get(key)
         if hit is not None:

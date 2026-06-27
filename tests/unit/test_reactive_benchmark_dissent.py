@@ -158,6 +158,10 @@ async def _run_dissent(
             BenchmarkWorker, "_load_historical_scenarios", return_value=[],
         ),
         patch.object(
+            BenchmarkWorker, "_build_reference_quotes",
+            new=AsyncMock(return_value={"dex": {"quoted_output": "1"}}),
+        ),
+        patch.object(
             BenchmarkWorker, "_compute_avg_score", new=fake_compute_avg,
         ),
         patch.object(
