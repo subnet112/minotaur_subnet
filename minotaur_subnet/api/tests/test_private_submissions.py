@@ -187,5 +187,113 @@ class TestCommentTarget(unittest.TestCase):
         self.assertIsNone(token)
 
 
+class _FakeGitHub:
+    """Records GitHub Git Data API calls and answers them, so we can exercise
+    publish_private_champion_when_certified without touching the network.
+
+    Routes by (METHOD, url-substring). Captures created blobs/tree/commit/PR and
+    the final squash-merge so tests can assert what was published.
+    """
+
+    def __init__(self):
+        self.calls = []          # (method, url, payload)
+        self.created_blobs = []   # canonical blob create payloads
+        self.created_tree = None  # canonical tree payload
+        self.merged = False
+        self.deleted_branch = False
+
+    def __call__(self, method, url, payload=None, *, token=None):
+        self.calls.append((method, url, payload))
+        # --- private repo reads (recursive tree + blobs) ---
+        if method == "GET" and "/git/trees/" in url and "me/solver" in url:
+            return 200, {"truncated": False, "tree": [
+                {"type": "blob", "path": "solver.py", "mode": "100644", "sha": "psolver"},
+                {"type": "blob", "path": ".github/workflows/evil.yml", "mode": "100644", "sha": "pevil"},
+            ]}
+        if method == "GET" and "/git/blobs/" in url and "me/solver" in url:
+            return 200, {"content": "Y29kZQ==", "encoding": "base64"}
+        # --- canonical reads ---
+        if method == "GET" and url.endswith("/git/ref/heads/main"):
+            return 200, {"object": {"sha": "MAINSHA"}}
+        if method == "GET" and "/git/commits/MAINSHA" in url:
+            return 200, {"tree": {"sha": "MAINTREE"}}
+        if method == "GET" and "/git/trees/MAINTREE" in url:
+            return 200, {"truncated": False, "tree": [
+                {"type": "blob", "path": ".github/workflows/ci.yml", "mode": "100644", "sha": "ghci"},
+                {"type": "blob", "path": "solver.py", "mode": "100644", "sha": "oldsolver"},
+            ]}
+        # --- canonical writes ---
+        if method == "POST" and url.endswith("/git/blobs"):
+            self.created_blobs.append(payload)
+            return 201, {"sha": "newblob" + str(len(self.created_blobs))}
+        if method == "POST" and url.endswith("/git/trees"):
+            self.created_tree = payload
+            return 201, {"sha": "NEWTREE"}
+        if method == "POST" and url.endswith("/git/commits"):
+            return 201, {"sha": "NEWCOMMIT"}
+        if method == "POST" and url.endswith("/git/refs"):
+            return 201, {}
+        if method == "POST" and url.endswith("/pulls"):
+            return 201, {"number": 999}
+        if method == "PUT" and url.endswith("/merge"):
+            self.merged = True
+            return 200, {}
+        if method == "DELETE" and "/git/refs/heads/" in url:
+            self.deleted_branch = True
+            return 204, None
+        raise AssertionError(f"unexpected GitHub call: {method} {url}")
+
+
+class TestPublishPrivateChampion(unittest.TestCase):
+    """publish_private_champion_when_certified — the relayer-side canonical publish."""
+
+    def _run(self, fake, *, cert_binds=True, resolved_head=_HEAD):
+        import minotaur_subnet.relayer.solver_repo as sr
+        from unittest import mock
+
+        with mock.patch.dict(
+            "os.environ",
+            {"SOLVER_REPO_URL": "https://github.com/subnet112/minotaur-solver",
+             "SOLVER_REPO_TOKEN": "ghp_canon"},
+        ), mock.patch.object(sr, "_github_api_request", fake), \
+             mock.patch.object(sr, "_onchain_cert_binds", lambda h, r: cert_binds), \
+             mock.patch(
+                 "minotaur_subnet.api.routes.submissions.github_pr.resolve_pr",
+                 lambda n, **kw: {"head_sha": resolved_head, "clone_url":
+                                  "https://github.com/me/solver.git", "state": "open",
+                                  "base": "me/solver"},
+             ):
+            return sr.publish_private_champion_when_certified(
+                3, _HEAD, "r1", private_repo="me/solver", repo_token="ghp_miner",
+            )
+
+    def test_happy_path_publishes_and_merges(self):
+        fake = _FakeGitHub()
+        ok = self._run(fake)
+        self.assertTrue(ok)
+        self.assertTrue(fake.merged)
+        # The new tree = the private solver.py + canonical's OWN .github (preserved),
+        # and the private .github/** is EXCLUDED (CI-disarm).
+        paths = {e["path"]: e["sha"] for e in fake.created_tree["tree"]}
+        self.assertIn("solver.py", paths)
+        self.assertEqual(paths["solver.py"], "newblob1")          # recreated from private
+        self.assertEqual(paths[".github/workflows/ci.yml"], "ghci")  # canonical's, verbatim
+        self.assertNotIn(".github/workflows/evil.yml", paths)     # private CI dropped
+        # Exactly one blob recreated (solver.py) — the private .github blob was skipped.
+        self.assertEqual(len(fake.created_blobs), 1)
+
+    def test_fail_closed_when_cert_does_not_bind(self):
+        fake = _FakeGitHub()
+        ok = self._run(fake, cert_binds=False)
+        self.assertFalse(ok)
+        self.assertFalse(fake.merged)
+
+    def test_fail_closed_on_head_drift(self):
+        fake = _FakeGitHub()
+        ok = self._run(fake, resolved_head="b" * 40)  # live head != certified head
+        self.assertFalse(ok)
+        self.assertFalse(fake.merged)
+
+
 if __name__ == "__main__":
     unittest.main()
