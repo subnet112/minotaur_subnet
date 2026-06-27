@@ -74,58 +74,99 @@ def is_real_miner_hotkey(hotkey: str | None) -> bool:
     return bool(value) and value != GENESIS_HOTKEY
 
 
-# Share of emission weight a real miner champion receives; the remainder burns
-# to the subnet owner. 0.05 means a 95% burn — a conservative ramp so a freshly-
-# adopted (or bad) champion earns only a bounded share until proven.
+# FLOOR share of emission weight real miner champions collectively receive; the
+# remainder burns to the subnet owner. 0.05 means a 95% burn at the floor — a
+# conservative ramp so a freshly-adopted (or bad) champion earns only a bounded
+# share until proven. The aggregate miner share scales ABOVE this floor with
+# trailing-24h order volume (see ``champion_miner_weight_fraction``).
 #
-# This is a HARDCODED CONSTANT, deliberately NOT an env knob: the weight split is
+# These are HARDCODED CONSTANTS, deliberately NOT env knobs: the weight split is
 # consensus-relevant and must be IDENTICAL across every validator, or different
-# operators (esp. third parties) would emit divergent weight vectors. Baking it
+# operators (esp. third parties) would emit divergent weight vectors. Baking them
 # into the image makes a change propagate uniformly via redeploy/Watchtower;
-# changing it means a code edit + release, by design.
-CHAMPION_MINER_WEIGHT_FRACTION = 0.05
+# changing them means a code edit + release, by design.
+CHAMPION_MINER_WEIGHT_FLOOR = 0.05
+# Backwards-compatible alias: the floor IS the default miner fraction (volume 0).
+CHAMPION_MINER_WEIGHT_FRACTION = CHAMPION_MINER_WEIGHT_FLOOR
+
+# Number of orders processed within the trailing 24h at which miners receive the
+# FULL emission (fraction 1.0). Between 0 and this the miner share ramps linearly
+# from the floor to 1.0. Like the floor, consensus-relevant and baked in.
+ORDERS_FOR_FULL_EMISSION = 1000
+
+
+def champion_miner_weight_fraction(orders_24h: int | float) -> float:
+    """Aggregate miner emission share given trailing-24h order volume.
+
+    Linear ramp: ``CHAMPION_MINER_WEIGHT_FLOOR`` (0.05) at 0 orders rising to
+    ``1.0`` (100% to miners, nothing burned) at ``ORDERS_FOR_FULL_EMISSION``
+    (1000) orders, then clamped at 1.0 beyond that. The floor is the minimum so a
+    quiet subnet still routes the conservative 5% to its champion. Negative or
+    non-numeric inputs degrade to the floor.
+    """
+    try:
+        orders = max(0.0, float(orders_24h))
+    except (TypeError, ValueError):
+        return CHAMPION_MINER_WEIGHT_FLOOR
+    progress = (
+        min(1.0, orders / ORDERS_FOR_FULL_EMISSION)
+        if ORDERS_FOR_FULL_EMISSION > 0
+        else 1.0
+    )
+    fraction = CHAMPION_MINER_WEIGHT_FLOOR + (1.0 - CHAMPION_MINER_WEIGHT_FLOOR) * progress
+    return min(1.0, max(CHAMPION_MINER_WEIGHT_FLOOR, fraction))
 
 
 def apply_champion_burn_ramp(
     miner_weights: dict[str, float],
     *,
     owner_hotkey: str | None = None,
+    miner_fraction: float | None = None,
 ) -> dict[str, float]:
     """Scale a (normalized) miner weight distribution so the miners collectively
-    receive ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05) of emission and the
-    remainder (0.95) burns to the subnet owner — the conservative champion ramp.
+    receive ``miner_fraction`` of emission and the remainder burns to the subnet
+    owner — the conservative champion ramp.
+
+    ``miner_fraction`` defaults to ``CHAMPION_MINER_WEIGHT_FLOOR`` (0.05, a 95%
+    burn). Callers scaling emission by order volume pass the value from
+    ``champion_miner_weight_fraction``; passing 1.0 routes the full emission to
+    miners with nothing burned. The function is idempotent in the fraction: an
+    already-ramped ``{champion: 0.05, owner: 0.95}`` mapping re-ramps cleanly to
+    a new split, so it can be safely re-applied at emission time.
 
     The relative split *among* miners is preserved; only their aggregate share is
     capped. Used by BOTH champion-weight paths (the daemon burn-fallback builder
-    below and the leader's ranked path in ``epoch/manager.py``) so the 95% burn
+    below and the leader's ranked path in ``epoch/manager.py``) so the burn
     applies however the distribution was built.
 
     Returns ``miner_weights`` unchanged only when there are no miners or the owner
     can't be resolved (nothing to burn to). The owner is *dropped* from the miner
     set before ramping — it is the burn target, never a competing miner — and the
     remaining miners are re-normalized so they still collectively receive exactly
-    ``CHAMPION_MINER_WEIGHT_FRACTION`` (a stray owner submission must not skip the
-    burn for the whole set).
+    ``miner_fraction`` (a stray owner submission must not skip the burn for the
+    whole set).
     """
     if not miner_weights:
         return miner_weights
+    fraction = CHAMPION_MINER_WEIGHT_FLOOR if miner_fraction is None else miner_fraction
+    fraction = min(1.0, max(0.0, float(fraction)))
     owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
     if not owner:
         # Fail LOUD: with no resolvable owner we cannot burn, so the miners would
-        # receive the FULL emission instead of the intended 0.05 — the exact thing
+        # receive the FULL emission instead of the intended share — the exact thing
         # this ramp exists to prevent. Surface it so an operator sets the owner.
         logger.warning(
             "Champion burn ramp SKIPPED: no subnet owner resolved (set "
             "SUBNET_OWNER_HOTKEY / OWNER_HOTKEY on the leader, or wire a chain "
             "fallback) — %d miner(s) would receive the FULL emission share "
             "instead of %.0f%%.",
-            len(miner_weights), CHAMPION_MINER_WEIGHT_FRACTION * 100,
+            len(miner_weights), fraction * 100,
         )
         return miner_weights
     # Drop the owner from the miner set BEFORE ramping. The owner is the burn
     # target, not a candidate miner; leaving it in made the old `owner in
     # miner_weights` guard skip the ramp entirely, so the whole set kept summing
-    # to 1.0 (no 0.95 burn) — one stray owner submission disabling the burn for
+    # to 1.0 (no burn) — one stray owner submission disabling the burn for
     # everyone. Re-normalize the remaining miners to preserve their relative split.
     miners = {hk: w for hk, w in miner_weights.items() if hk != owner}
     if not miners:
@@ -134,10 +175,8 @@ def apply_champion_burn_ramp(
     total = sum(miners.values())
     if total <= 0:
         return {owner: 1.0}
-    ramped = {
-        hk: (w / total) * CHAMPION_MINER_WEIGHT_FRACTION for hk, w in miners.items()
-    }
-    ramped[owner] = 1.0 - CHAMPION_MINER_WEIGHT_FRACTION
+    ramped = {hk: (w / total) * fraction for hk, w in miners.items()}
+    ramped[owner] = 1.0 - fraction
     return ramped
 
 
