@@ -150,6 +150,28 @@ def compute_deploy_hash(bytecode: str, constructor_args: Any) -> str:
     return "0x" + digest.hex()
 
 
+def compute_champion_finalize_hash(round_id: str, candidate_submission_id: str) -> str:
+    """Hash a champion-finalize request for the wrapper's ``plan_hash`` field.
+
+    The same wrapper protocol that protects ``POST /v1/submit-plan`` and
+    ``POST /deploy`` also protects ``POST /v1/finalize-champion``. There is no
+    plan here, so we repurpose the wrapper's bytes32 ``plan_hash`` field to bind
+    the (round_id, candidate_submission_id) pair — a captured wrapper signature
+    can't be replayed against a different round or a different submission.
+
+    Both the leader (``solver_repo.on_champion_adopted_via_relayer``) and the
+    relayer (``handle_finalize_champion``) compute this independently; they MUST
+    agree byte-for-byte.
+
+    Returns a 0x-prefixed 32-byte hex digest.
+    """
+    encoded = abi_encode(
+        ["string", "string"],
+        [str(round_id or ""), str(candidate_submission_id or "")],
+    )
+    return "0x" + keccak(encoded).hex()
+
+
 def is_wrapper_fresh(
     payload: WrapperPayload,
     *,

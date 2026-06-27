@@ -92,6 +92,50 @@ to land uncertified code. The remaining landable attacks are **not miner attacks
   + the `docker-publish` provenance gate. *Cross-cutting with the P1 work.*
 - **RPC trust/liveness**: the on-chain reads trust a public BT EVM RPC; pin/verify.
 
+## Update — finalization runs on the RELAYER, not the leader
+
+The merge gate above (`merge_miner_pr_when_certified` + `attest_champion_on_chain`)
+is unchanged, but it **no longer runs in the leader's process — it runs in the
+trusted relayer service.** In a decentralized fleet the leader rotates and may be a
+3rd party we don't control (and that must NOT hold `RELAYER_PRIVATE_KEY` /
+`SOLVER_REPO_TOKEN`). So:
+
+- The leader certifies the round (quorum), then **POSTs the `ChampionCertificate`**
+  to the relayer's `POST /v1/finalize-champion`
+  (`relayer/solver_repo.py::on_champion_adopted_via_relayer`) and gates its local
+  adoption on the boolean reply. The #326 adoption gate is byte-for-byte unchanged
+  (`EpochManager.on_champion_adopted` is now the relayer client). **Fail-closed:**
+  any error → False → round aborts `merge_failed` → never adopt on an unconfirmed merge.
+- The relayer **does not trust the leader**: it independently re-verifies the
+  validator quorum (`relayer/main.py::handle_finalize_champion`) — per-approval
+  EIP-712 verify against the SAME champion domain separator validators sign with
+  (`build_domain_separator(CHAMPION_CONSENSUS_CHAIN_ID, CHAMPION_REGISTRY_<chain>,
+  "MinotaurChampionConsensus", "1")`), intersect with the on-chain `ValidatorRegistry`,
+  require distinct authorized signers ≥ `quorum_required`, plus a leader-signed
+  anti-spam wrapper — then attests + squash-merges with ITS OWN keys. On-chain
+  `certify()` remains the ultimate quorum authority.
+- **PR feedback stays on the leader** (`on_champion_rejected_pr` /
+  `on_champion_finalist_pr`: benchmark-result + error comments, image GC). **The
+  leader KEEPS its `SOLVER_REPO_TOKEN`** for those; only attest+merge moved.
+- Wiring (`api/startup.py`): `_champion_merge_fn = on_champion_adopted_via_relayer`
+  when `RELAYER_URL` is set, else the legacy in-process `on_champion_adopted_pr`
+  (local testnet without a relayer).
+
+### Deploy checklist (relayer finalization)
+
+Apply in `platform/production/docker-compose.production.yml` (or equivalent env):
+
+1. **Relayer service env — ADD:**
+   - `SOLVER_REPO_TOKEN` — write-role PAT, for the squash-merge. *(Also stays on the leader for PR feedback.)*
+   - `SOLVER_REPO_URL` (+ `SOLVER_REPO_PATH` if used) — the merge-target repo.
+   - `CHAMPION_REGISTRY_964` — attest tx + the EIP-712 domain separator.
+   - `CHAMPION_CONSENSUS_CHAIN_ID=964` — domain separator (defaults to 964; set explicitly to match the leader).
+   - `VALIDATOR_REGISTRY_964` — so the relayer can read the authorized-validator set for the quorum check.
+   - (Already on the relayer: `RELAYER_PRIVATE_KEY`, `BITTENSOR_EVM_RPC_URL`.)
+2. **Leader (api) env:** keep `RELAYER_URL` (already set for order relay) + `VALIDATOR_PRIVATE_KEY` (signs the wrapper). **Do NOT remove `SOLVER_REPO_TOKEN` from the leader.**
+3. **Deploy api + relayer together** (same image): the leader only delegates when `RELAYER_URL` is set and fail-closes if the relayer lacks `/v1/finalize-champion`, so the relayer must have the endpoint before/with the leader cutover (else adoptions safely abort `merge_failed`).
+4. **Verify after deploy** on the next certified round: leader logs `Champion finalization: delegated to relayer at <url>`; relayer logs `finalize-champion accepted (… signers=N/Q) — attesting + merging` then `merge gate: PR #N squash-merged`; `ChampionRegistry.getLatestChampion()` binds the certified commit; the miner's PR shows MERGED.
+
 ## Activation checklist (before flipping `DISABLE_CHAMPION_ADOPTION=0`)
 
 1. Copy `champion-merge.yml.reference` → solver repo `.github/workflows/champion-merge.yml`
