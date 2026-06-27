@@ -481,7 +481,7 @@ Current performance (summary; the analyzer will pull full detail):
 - Miner's recent scores: {recent_scores}
 - Miner avg: {avg_score:.3f}   best: {best_score:.3f}   trend: {trend}
 - Champion score: {champion_score:.3f}
-- Target to overtake: {target_score:.3f} (champion + 5% margin)"""]
+- Target to overtake: {target_score:.3f} (champion + 1% margin)"""]
 
     if scenario_scores:
         sorted_scenarios = sorted(scenario_scores.items(), key=lambda x: x[1])
