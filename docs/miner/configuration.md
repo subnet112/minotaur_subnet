@@ -59,16 +59,15 @@ rejects the submission if the live head no longer matches `--head-sha`
 (force-push guard).
 
 `--private-repo` + `--repo-token` opt into the **private submission path**: your
-solver stays private through screening + benchmarking and you get the benchmark
-report on your private PR. With it, `--pr-number`/`--head-sha` refer to a PR in
-YOUR private repo. The PAT must be a fine-grained token scoped to that one repo
-with `Metadata:Read`, `Contents:Read`, `Pull requests:Read+Write`. Prefer the
-`MINER_REPO_TOKEN` env var over the flag to keep it out of shell history.
-
-> **Note:** a private submission is scored but **not yet adopted as champion** —
-> it earns no emissions. To win, resubmit publicly. See the
-> [quickstart](./quickstart.md#5b-optional-private-repo-submission-front-run-protection)
-> for the walkthrough and the current limitation.
+solver stays private through screening + benchmarking, you get the benchmark report
+on your private PR, and **if it wins it is published to canonical `main`** (you
+become champion — your code only goes public once you've already won). With it,
+`--pr-number`/`--head-sha` refer to a PR in YOUR private repo. The PAT must be a
+fine-grained token scoped to that one repo with `Metadata:Read`, `Contents:Read`,
+`Pull requests:Read+Write`. Prefer the `MINER_REPO_TOKEN` env var over the flag to
+keep it out of shell history. See the
+[quickstart](./quickstart.md#5b-optional-private-repo-submission-front-run-protection)
+for the full walkthrough.
 
 Defaults:
 
