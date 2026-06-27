@@ -29,9 +29,11 @@ from tests.unit.test_epoch_manager import (  # noqa: E402
 # ── dethrone margin ──────────────────────────────────────────────────────────
 
 
-def test_dethrone_margin_is_five_percent_single_source():
+def test_dethrone_margin_is_one_percent_single_source():
     # The single source of truth — every consumer imports this constant.
-    assert DETHRONE_MARGIN == 0.05
+    # Lowered 0.05 → 0.01 (#348): same-block scoring cancels per-pack difficulty,
+    # so the comparison noise is ~0 and 1% is not a noise floor.
+    assert DETHRONE_MARGIN == 0.01
 
 
 # ── round_store previous-champion persistence ────────────────────────────────
