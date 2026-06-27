@@ -253,7 +253,7 @@ def evaluate_adoption(
        scorecard is rejected outright. JS still ranks; this only vetoes. Runs
        only with a champion (after the genesis early return) and only in this
        (non-p2oc) branch, so it is symmetric across leader + followers.
-    4. Global improvement over the champion by the dethrone margin (default 5%)
+    4. Global improvement over the champion by the dethrone margin (default 1%)
 
     There is intentionally NO absolute global-score floor: the global JS score is
     a RELATIVE measure (anchored on the champion reference, ~0.5 == "matches the

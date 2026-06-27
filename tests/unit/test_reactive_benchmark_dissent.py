@@ -218,7 +218,7 @@ async def test_challenger_better_but_below_dethrone_margin_rejects():
 @pytest.mark.asyncio
 async def test_challenger_beats_margin_adopts():
     champ = 0.60
-    chal = champ * (1 + DETHRONE_MARGIN) + 0.01  # comfortably past the 5% margin
+    chal = champ * (1 + DETHRONE_MARGIN) + 0.01  # comfortably past the 1% margin
     verified, score = await _run_dissent(
         chal_avg=chal, champ_avg=champ,
         chal_card=_CARD_OK, champ_card=_CARD_OK,
