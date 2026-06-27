@@ -67,7 +67,7 @@ python -m minotaur_subnet.api.server --port 8080
 
 ## 4) Run the agent loop (recommended)
 
-Agent mode discovers active apps, generates strategies, tests them, and submits source code to `/v1/submissions/source`.
+Agent mode discovers active apps, generates strategies, tests them, commits them to a fork of the canonical solver repo, opens a PR, and submits that PR via `/v1/submissions` (the same PR-based path as the `submit` subcommand below).
 
 ```bash
 python -m minotaur_subnet.miner.main agent \
@@ -82,18 +82,21 @@ Current CLI subcommand:
 
 ```bash
 python -m minotaur_subnet.miner.main submit \
-  --repo-url https://github.com/youruser/my-solver \
-  --commit-hash <commit> \
+  --pr-number 42 \
+  --head-sha <40-char-head-sha> \
   --hotkey my-miner-hotkey \
-  --epoch 0 \
   --validator-url "$VALIDATOR_URL" \
   --poll
 ```
 
+`--pr-number` / `--head-sha` reference a PR you've opened against the canonical
+solver repo (`subnet112/minotaur-solver`). Fork it, edit `solver.py`, push, open
+a PR, then submit its number and head SHA.
+
 Notes:
 
 - `--hotkey` is the bittensor **hotkey name** (matches `--wallet.hotkey` in `btcli`), not the wallet name. The signed submission is verified against the metagraph by the API.
-- `--epoch` is optional — `submit` auto-detects it from the current open round (`GET /v1/solver/round`). The signed message is `{repo_url}:{commit_hash}:{round_id}`.
+- `--round-id` and `--epoch` are optional — `submit` auto-detects both from the current open round (`GET /v1/solver/round`). The signed message is `{pr_number}:{head_sha}:{round_id}`.
 - `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
 
 > **⚠️ Important — base your PR on the current `main`.** Every champion's solver is squash-merged to the solver repo's `main`, so `main` always holds the **current champion's code**. Your submission replaces `solver.py` *on top of the current `main`*. If your fork is based on an older `main` (e.g. from before the latest champion), your PR will conflict and **cannot be adopted even if it wins the benchmark**. After any champion change, **rebase your fork onto the latest `main` and resubmit**. When a new champion is elected the validator auto-closes the now-stale submission PRs with a rebase reminder — that's your cue to rebase and resubmit.
@@ -156,8 +159,8 @@ There is **no endpoint to score a solver on the production validators without su
 make testnet-up                                   # full stack on your machine
 export VALIDATOR_URL=http://localhost:8080        # your local validator/API
 python -m minotaur_subnet.miner.main submit \
-  --repo-url https://github.com/you/your-solver \
-  --commit-hash <sha> \
+  --pr-number <n> \
+  --head-sha <sha> \
   --hotkey <local-test-hotkey> \
   --validator-url "$VALIDATOR_URL"
 # then poll status as above
