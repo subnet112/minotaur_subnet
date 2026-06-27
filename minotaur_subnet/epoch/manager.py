@@ -906,87 +906,28 @@ class EpochManager:
         )
 
         try:
-            # Guard: the benchmark worker must have the real internal
-            # methods. Mock workers (from tests) don't, and calling
-            # MagicMock methods would corrupt the champion score.
-            if not callable(getattr(self._benchmark_worker, "_load_benchmark_intents", None)):
-                return
-
-            intents = self._benchmark_worker._load_benchmark_intents()
-            if not isinstance(intents, list):
-                return  # mock/degenerate worker (real worker returns a list) — test-compat, no flag
-            if not intents:
-                # Real worker returned an EMPTY corpus — e.g. all apps non-operational
-                # during a redeploy window (status DEPLOYING/PAUSED/RETIRED). The
-                # incumbent can't be re-benchmarked this round → STALE bar → abstain.
-                # (Mirrors the follower, which scores the champion on the same shared
-                # corpus and never reuses a stale stored number.)
-                self._incumbent_refresh_failed = True
-                return
-
-            score_fn = await self._benchmark_worker._build_score_fn(intents)
-            intents = self._benchmark_worker._enrich_intents_with_manifests(intents)
-
-            # Stage 2: append historical scenarios so incumbent is scored
-            # under the same conditions as challengers.
-            if self._round_store is not None and callable(
-                getattr(self._benchmark_worker, "_load_historical_scenarios", None)
-            ):
-                try:
-                    current_round = self._round_store.get_current_round()
-                    if current_round is not None:
-                        historical = self._benchmark_worker._load_historical_scenarios(
-                            current_round.round_id,
-                        )
-                        if isinstance(historical, list) and historical:
-                            intents.extend(historical)
-                except Exception:
-                    pass  # fall through with synthetic-only scenarios
-
-            # Champion run (the dethrone bar). Use the SAME champion reference
-            # quote anchor that challenger benchmarking uses; otherwise challengers
-            # are graded against the champion's quote while the incumbent bar is
-            # still self-quoted/stored, making "as good as champion" look like ~0.5.
+            # SYMMETRY FIX: score the incumbent through the IDENTICAL challenger path
+            # (_score_one_image) that run_once uses for challengers — same round-anchored
+            # fork-pin, same intents corpus, same champion reference anchor, same
+            # _benchmark_submission. The OLD incumbent path produced an inflated bar
+            # (king re-scored ~0.72 where king's OWN image scores ~0.47 as a challenger,
+            # empirically proven via the diagnostic endpoint), making the champion
+            # unbeatable by an equal solver. Notably the old path never applied
+            # _apply_round_anchored_pin; the shared path does. Routing both sides through
+            # ONE code path removes the asymmetry by construction.
             #
-            # Route through the per-round memo so a follower's quorum verdict
-            # (_independent_adopt_vote) can REUSE this exact champion result instead
-            # of re-benchmarking the champion a second time. The memo key includes
-            # the reference quote fingerprint, so self-quoted and anchored champion
-            # runs cannot collide.
-            reference_quotes = await self._benchmark_worker._build_reference_quotes(
-                intents,
-                image_tag=image_tag,
-            )
-            _memo_round_id = None
-            if self._round_store is not None:
-                try:
-                    _mcr = self._round_store.get_current_round()
-                    _memo_round_id = _mcr.round_id if _mcr is not None else None
-                except Exception:
-                    _memo_round_id = None
-
-            async def _run_champion_bench():
-                return await self._benchmark_worker._benchmark_submission(
-                    image_tag,
-                    intents,
-                    score_fn,
-                    reference_quotes=reference_quotes,
-                )
-
-            results = await self._benchmark_worker.memo_champion_bench(
-                round_id=_memo_round_id,
-                image=image_tag,
-                fork_block=getattr(self._benchmark_worker, "_epoch_block_number", None),
-                intents=intents,
-                require_real_sim=getattr(self._benchmark_worker, "_require_real_sim", False),
-                reference_quotes=reference_quotes,
-                run=_run_champion_bench,
-            )
-            if not isinstance(results, list):
-                self._incumbent_refresh_failed = True  # bad benchmark → stale bar
+            # Mock-worker guard (tests): a real/AsyncMock worker exposes an awaitable
+            # _score_one_image; a plain MagicMock worker doesn't (iscoroutinefunction
+            # is False) → skip without a stale flag, matching the old test-compat path.
+            _score_one = getattr(self._benchmark_worker, "_score_one_image", None)
+            if not inspect.iscoroutinefunction(_score_one):
                 return
-            fresh_score = self._benchmark_worker._compute_avg_score(results)
+            diag = await _score_one(image_tag, context="incumbent")
+            if not isinstance(diag, dict) or not isinstance(diag.get("score"), (int, float)):
+                return  # degenerate result — test-compat, no stale flag
 
+            fresh_score = float(diag["score"])
+            details = diag.get("details")
             old_score = self._champion.benchmark_score
             self._champion.benchmark_score = fresh_score
 
@@ -1000,42 +941,15 @@ class EpochManager:
                 self._sub_store.set_benchmark_result(
                     incumbent_sub.submission_id,
                     score=fresh_score,
-                    details=self._benchmark_worker._results_to_details(results),
+                    details=details,
                 )
 
             logger.info(
-                "Incumbent re-scored on champion reference anchor: %s %.4f → %.4f "
-                "(%d scenarios, %d reference quote entries)",
-                self._champion.submission_id, old_score, fresh_score, len(results),
-                len(reference_quotes),
+                "Incumbent re-scored via challenger path (symmetric bar): %s %.4f → %.4f "
+                "(%d scenarios)",
+                self._champion.submission_id, old_score, fresh_score,
+                diag.get("intent_count", 0),
             )
-
-            # ── CORRECTED reference-bar shadow (observe-only, REFQUOTE_SHADOW) ──
-            # fresh_score above is the PRODUCTION reference-anchored bar. Here we also
-            # score the incumbent SELF-QUOTED (reference_quotes=None) and log the delta.
-            # This is what the #340 shadow got WRONG: it reused the memoized champion
-            # result for both legs (no quote-anchor in the memo key) so delta was a
-            # false 0.0 — the basis on which #345 wrongly removed the fix. We avoid that
-            # two ways: (1) a DIRECT, un-memoized _benchmark_submission call for the
-            # self-quote leg, and (2) #353's reference-quote fingerprint already keys the
-            # memo by anchor. A large positive delta == the self-quote bar was flattering
-            # the incumbent (the F1 asymmetry #353 corrects). NEVER touches fresh_score,
-            # the stored bar, or the verdict; isolated try/except so it can't stale the bar.
-            if os.environ.get("REFQUOTE_SHADOW", "").strip().lower() in ("1", "true", "yes", "on"):
-                try:
-                    _self_results = await self._benchmark_worker._benchmark_submission(
-                        image_tag, intents, score_fn, reference_quotes=None,
-                    )
-                    if isinstance(_self_results, list):
-                        _self_score = self._benchmark_worker._compute_avg_score(_self_results)
-                        logger.info(
-                            "[refquote-shadow] incumbent %s: self_quote=%.4f "
-                            "reference_anchored=%.4f delta=%+.4f (%d ref entries) — OBSERVE ONLY",
-                            self._champion.submission_id, _self_score, fresh_score,
-                            _self_score - fresh_score, len(reference_quotes),
-                        )
-                except Exception as _shadow_exc:  # observe-only — must NEVER affect the bar
-                    logger.warning("[refquote-shadow] failed (observe-only): %s", _shadow_exc)
         except Exception:
             # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
             # _should_adopt abstains rather than deciding on the prior score.
