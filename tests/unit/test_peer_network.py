@@ -254,3 +254,38 @@ class TestValidatorPeerNetwork:
             timeout=30.0,
         )
         assert vpn.timeout == 30.0
+
+
+class TestPeerUrlSource:
+    """The peers property prefers a discovered peer's advertised api_url over
+    the axon→API port transform (the order-sync leader-URL fix)."""
+
+    def _net(self, discovered_peers):
+        from types import SimpleNamespace
+        return ValidatorPeerNetwork(
+            validator_id="0xSelf",
+            private_key="0x1234",
+            consensus=MagicMock(),
+            protocol_config=SimpleNamespace(peers=discovered_peers),
+            # mimic the prod axon(:9100) → api(:8080) transform
+            peer_url_transform=lambda axon: axon.replace(":9100", ":8080"),
+        )
+
+    def test_advertised_api_url_wins_over_transform(self):
+        from minotaur_subnet.consensus.peer_discovery import PeerInfo
+        vpn = self._net([
+            PeerInfo(evm_address="0xPeer1", hotkey="hk1",
+                     axon_url="http://1.2.3.4:9100",
+                     api_url="https://api.example.com"),
+        ])
+        urls = {p.validator_id: p.url for p in vpn.peers}
+        assert urls["0xPeer1"] == "https://api.example.com"
+
+    def test_falls_back_to_transform_without_api_url(self):
+        from minotaur_subnet.consensus.peer_discovery import PeerInfo
+        vpn = self._net([
+            PeerInfo(evm_address="0xPeer2", hotkey="hk2",
+                     axon_url="http://5.6.7.8:9100"),  # no api_url advertised
+        ])
+        urls = {p.validator_id: p.url for p in vpn.peers}
+        assert urls["0xPeer2"] == "http://5.6.7.8:8080"

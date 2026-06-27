@@ -1469,10 +1469,13 @@ class AppIntentsValidator:
             )
 
         from minotaur_subnet.consensus.identity import sign_identity
+        # Advisory public API base (see api/routes/identity.py) — optional.
+        api_url = os.environ.get("API_URL", "").strip() or None
         identity = sign_identity(
             self._consensus.private_key,
             self._metagraph_sync.my_hotkey,
             axon_url,
+            api_url=api_url,
         )
         return web.json_response(identity.to_dict())
 
