@@ -64,6 +64,14 @@ def round_anchored_pin_enabled() -> bool:
 ROUND_ANCHOR_CHAINS: tuple[int, ...] = (8453,)
 # Finality margin for the bracketing guard in find_pin_block (head - confirmations).
 ROUND_ANCHOR_CONFIRMATIONS: int = 12
+# Anchor the round's fork-pin this many epochs BEFORE the round's (close) epoch.
+# The pin needs a confirmed block (head - ROUND_ANCHOR_CONFIRMATIONS, ~24s on Base)
+# strictly AFTER the anchor; if the anchor sat at the close epoch (== the close
+# wall-clock), that finality margin is never satisfiable at close and the pin defers
+# forever (benchmark never runs → round aborts benchmarked=0). One epoch back
+# (= epoch_seconds, 60s) buries the anchor comfortably past the confirmation depth by
+# close, while staying a pure deterministic function of the epoch (no chain read).
+ROUND_ANCHOR_LOOKBACK_EPOCHS: int = 1
 
 
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:
@@ -79,6 +87,21 @@ def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:
     if epoch_seconds <= 0:
         raise ValueError("epoch_seconds must be > 0")
     return int(epoch) * int(epoch_seconds)
+
+
+def round_anchor_ts(epoch: int, epoch_seconds: int) -> int:
+    """Fork-pin anchor timestamp for a round — ``epoch_anchor_ts`` with the
+    confirmation-margin lookback applied.
+
+    Anchors ``ROUND_ANCHOR_LOOKBACK_EPOCHS`` epoch(s) before the round's (close)
+    epoch, so the anchor is already buried past ``ROUND_ANCHOR_CONFIRMATIONS`` by the
+    time the round closes — otherwise ``find_pin_block`` can never confirm-bracket an
+    anchor that sits at the close wall-clock, and the round defers indefinitely. Still
+    a pure function of ``(epoch, epoch_seconds)``: fleet-deterministic, no chain read.
+    Every pin-derivation / pack-hash site MUST use this (not the raw
+    ``epoch_anchor_ts``) so leader and followers compute the identical pin.
+    """
+    return epoch_anchor_ts(int(epoch) - ROUND_ANCHOR_LOOKBACK_EPOCHS, epoch_seconds)
 
 
 class ForkPinUnavailable(Exception):

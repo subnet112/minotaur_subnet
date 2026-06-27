@@ -189,11 +189,13 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         ROUND_ANCHOR_CONFIRMATIONS,
         ForkPinUnavailable,
         derive_fork_pins,
-        epoch_anchor_ts,
+        round_anchor_ts,
     )
 
     epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
-    anchor_ts = epoch_anchor_ts(anchor_epoch, epoch_seconds)
+    # round_anchor_ts (NOT epoch_anchor_ts): anchors one epoch back so the
+    # confirmation-margin can confirm-bracket the anchor by round close (#anchor-back).
+    anchor_ts = round_anchor_ts(anchor_epoch, epoch_seconds)
     chains = _round_anchor_chains()
     confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
