@@ -67,7 +67,7 @@ python -m minotaur_subnet.api.server --port 8080
 
 ## 4) Run the agent loop (recommended)
 
-Agent mode discovers active apps, generates strategies, tests them, and submits source code to `/v1/submissions/source`.
+Agent mode discovers active apps, generates strategies, tests them, commits them to a fork of the canonical solver repo, opens a PR, and submits that PR via `/v1/submissions` (the same PR-based path as the `submit` subcommand below).
 
 ```bash
 python -m minotaur_subnet.miner.main agent \
@@ -82,21 +82,70 @@ Current CLI subcommand:
 
 ```bash
 python -m minotaur_subnet.miner.main submit \
-  --repo-url https://github.com/youruser/my-solver \
-  --commit-hash <commit> \
+  --pr-number 42 \
+  --head-sha <40-char-head-sha> \
   --hotkey my-miner-hotkey \
-  --epoch 0 \
+  --validator-url "$VALIDATOR_URL" \
+  --poll
+```
+
+`--pr-number` / `--head-sha` reference a PR you've opened against the canonical
+solver repo (`subnet112/minotaur-solver`). Fork it, edit `solver.py`, push, open
+a PR, then submit its number and head SHA.
+
+Notes:
+
+- `--hotkey` is the bittensor **hotkey name** (matches `--wallet.hotkey` in `btcli`), not the wallet name. The signed submission is verified against the metagraph by the API.
+- `--round-id` and `--epoch` are optional — `submit` auto-detects both from the current open round (`GET /v1/solver/round`). The signed message is `{pr_number}:{head_sha}:{round_id}`.
+- `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
+
+> **⚠️ Important — base your PR on the current `main`.** Every champion's solver is squash-merged to the solver repo's `main`, so `main` always holds the **current champion's code**. Your submission replaces `solver.py` *on top of the current `main`*. If your fork is based on an older `main` (e.g. from before the latest champion), your PR will conflict and **cannot be adopted even if it wins the benchmark**. After any champion change, **rebase your fork onto the latest `main` and resubmit**. When a new champion is elected the validator auto-closes the now-stale submission PRs with a rebase reminder — that's your cue to rebase and resubmit.
+
+## 5b) Optional: private-repo submission (front-run protection)
+
+By default your PR is **public** on the canonical solver repo, so anyone can read
+your solver before you earn from it. The **private path** keeps your code private
+through screening + benchmarking — the validator clones it, scores it, and posts
+the benchmark report onto your private PR — and **publishes it to canonical `main`
+only if it wins** (leak-on-champion). So you develop and win without anyone seeing
+your code until you're already champion.
+
+How it works:
+
+1. Put your solver in your **own private GitHub repo** and open a PR there (a
+   branch → `main` PR in that private repo is fine).
+2. Create a **fine-grained PAT** scoped to **that one repo**, with exactly:
+   - **Metadata: Read** (mandatory baseline)
+   - **Contents: Read** — lets the validator clone your code
+   - **Pull requests: Read and write** — lets the validator read the PR and post
+     benchmark reports / errors back onto it
+   
+   No write access to your repo, nothing on the canonical repo, no admin scope.
+   Use a short expiry and revoke it after your submission is scored.
+3. Submit with `--private-repo` + the token (prefer the env var so it stays out
+   of your shell history):
+
+```bash
+export MINER_REPO_TOKEN=github_pat_xxxxx
+python -m minotaur_subnet.miner.main submit \
+  --pr-number 3 \
+  --head-sha <40-char-sha> \
+  --private-repo youruser/your-private-solver \
+  --hotkey my-miner-hotkey \
   --validator-url "$VALIDATOR_URL" \
   --poll
 ```
 
 Notes:
 
-- `--hotkey` is the bittensor **hotkey name** (matches `--wallet.hotkey` in `btcli`), not the wallet name. The signed submission is verified against the metagraph by the API.
-- `--epoch` is optional — `submit` auto-detects it from the current open round (`GET /v1/solver/round`). The signed message is `{repo_url}:{commit_hash}:{round_id}`.
-- `--validator-url` defaults to `http://localhost:9100` if omitted, which is wrong for both local dev (use `:8080`) and mainnet — always set it explicitly.
-
-> **⚠️ Important — base your PR on the current `main`.** Every champion's solver is squash-merged to the solver repo's `main`, so `main` always holds the **current champion's code**. Your submission replaces `solver.py` *on top of the current `main`*. If your fork is based on an older `main` (e.g. from before the latest champion), your PR will conflict and **cannot be adopted even if it wins the benchmark**. After any champion change, **rebase your fork onto the latest `main` and resubmit**. When a new champion is elected the validator auto-closes the now-stale submission PRs with a rebase reminder — that's your cue to rebase and resubmit.
+- The token is **transport only** — it is not part of the signed message, is sent
+  over HTTPS, is held in validator memory for this submission only, and is purged
+  when the submission reaches a terminal state. It is **never written to disk**.
+- The validator (leader) sees your private source while building/benchmarking — the
+  privacy guarantee is against **other miners and the public**, not the leader.
+- If your private solver wins, the validator publishes its source to canonical
+  `main` (preserving canonical CI) and you become champion — your code only becomes
+  public once you've already won. No need to resubmit publicly.
 
 ## 6) Optional: direct source submission (local/dev)
 
@@ -156,8 +205,8 @@ There is **no endpoint to score a solver on the production validators without su
 make testnet-up                                   # full stack on your machine
 export VALIDATOR_URL=http://localhost:8080        # your local validator/API
 python -m minotaur_subnet.miner.main submit \
-  --repo-url https://github.com/you/your-solver \
-  --commit-hash <sha> \
+  --pr-number <n> \
+  --head-sha <sha> \
   --hotkey <local-test-hotkey> \
   --validator-url "$VALIDATOR_URL"
 # then poll status as above

@@ -63,6 +63,12 @@ class Submission:
     hotkey: str
     round_id: str = ""
     pr_number: int | None = None         # Solver-repo PR number (PR-based submission)
+    # Private-submission path: PR lives in the miner's own private repo, cloned
+    # with a per-submission token. is_private/private_repo_full are persisted
+    # (non-secret, drive finalization dispatch + status); repo_token is the
+    # transient credential and is NEVER persisted (see _repo_token below).
+    is_private: bool = False
+    private_repo_full: str | None = None  # "owner/repo" of the miner's private repo
     status: SubmissionStatus = SubmissionStatus.QUEUED
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -104,6 +110,9 @@ class Submission:
             "hotkey": self.hotkey,
             "round_id": self.round_id,
             "pr_number": self.pr_number,
+            "is_private": self.is_private,
+            "private_repo_full": self.private_repo_full,
+            # NOTE: _repo_token is intentionally NEVER serialized.
             "status": self.status.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -128,6 +137,7 @@ class Submission:
             "status": self.status.value,
             "round_id": self.round_id,
             "pr_number": self.pr_number,
+            "is_private": self.is_private,
             "screening": self.screening,
             "image_tag": self.image_tag,
             "image_id": self.image_id,
@@ -177,6 +187,11 @@ class SubmissionStore:
         self._submissions: dict[str, Submission] = {}
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
+        # Per-submission private-repo PATs. Kept OUTSIDE _submissions (and never
+        # persisted) so the secret survives the reload-on-write in _write_guard,
+        # which rebuilds _submissions from disk. In-process only: unavailable to
+        # other workers / after a restart (the miner re-submits in that case).
+        self._tokens: dict[str, str] = {}
         self._persist_path = persist_path
         # Cross-process advisory lock lives in a sibling file that is never
         # rewritten — locking the data file itself would break, since each
@@ -205,6 +220,9 @@ class SubmissionStore:
         pr_number: int | None = None,
         max_per_round: int = 1,
         max_total_per_round: int = 0,
+        is_private: bool = False,
+        private_repo_full: str | None = None,
+        repo_token: str | None = None,
     ) -> Submission:
         """Create a new submission. Raises ValueError when a per-round cap is hit.
 
@@ -258,9 +276,14 @@ class SubmissionStore:
             hotkey=hotkey,
             round_id=resolved_round_id,
             pr_number=pr_number,
+            is_private=is_private,
+            private_repo_full=private_repo_full,
             created_at=now,
             updated_at=now,
         )
+        # Stash the secret in the reload-safe side map, never on the record.
+        if repo_token:
+            self._tokens[sub.submission_id] = repo_token
 
         self._submissions[sub.submission_id] = sub
         self._by_hotkey_round[round_key] = sub.submission_id
@@ -299,6 +322,8 @@ class SubmissionStore:
             hotkey=record.get("hotkey", ""),
             round_id=round_id,
             pr_number=record.get("pr_number"),
+            is_private=bool(record.get("is_private", False)),
+            private_repo_full=record.get("private_repo_full"),
             status=status,
             created_at=record.get("created_at", 0.0) or 0.0,
             updated_at=record.get("updated_at", 0.0) or 0.0,
@@ -482,6 +507,7 @@ class SubmissionStore:
         if not passed:
             sub.status = SubmissionStatus.REJECTED
             sub.rejection_reason = f"Stage {stage}: {error_code} — {details}"
+            self.purge_token(submission_id)  # terminal — drop the secret
 
         self._persist()
 
@@ -603,6 +629,7 @@ class SubmissionStore:
                 sub.rejection_reason
                 or f"Benchmark score {score:.4f} <= 0 (solver produced no valid plans)"
             )
+            self.purge_token(submission_id)  # terminal — drop the secret
         else:
             sub.status = SubmissionStatus.SCORED
         sub.updated_at = time.time()
@@ -618,6 +645,7 @@ class SubmissionStore:
         sub.status = SubmissionStatus.REJECTED
         sub.rejection_reason = reason
         sub.updated_at = time.time()
+        self.purge_token(submission_id)  # terminal — drop the secret
         self._persist()
 
     @_write_locked
@@ -644,6 +672,26 @@ class SubmissionStore:
         """Return the currently adopted champion submission, or None."""
         adopted = self.list_by_status(SubmissionStatus.ADOPTED)
         return adopted[0] if adopted else None
+
+    # ── Private-submission token handling (transient secret) ─────────────────
+
+    def get_repo_token(self, submission_id: str) -> str | None:
+        """Return the per-submission private-repo PAT, or None.
+
+        The token is in-memory only and never persisted, so it is unavailable
+        after a process restart (the miner re-submits in that case).
+        """
+        return self._tokens.get(submission_id)
+
+    def purge_token(self, submission_id: str) -> None:
+        """Drop the in-memory private-repo token once it is no longer needed.
+
+        Called when a submission reaches a terminal state (or after a successful
+        private-champion publish) to minimise how long the credential lives in
+        memory. Idempotent and never raises for an unknown id. No file lock /
+        persist needed — the token never touched disk.
+        """
+        self._tokens.pop(submission_id, None)
 
     # ── Cross-process write lock ─────────────────────────────────────────────
 
@@ -755,6 +803,8 @@ class SubmissionStore:
                     hotkey=d["hotkey"],
                     round_id=round_id,
                     pr_number=d.get("pr_number"),
+                    is_private=bool(d.get("is_private", False)),
+                    private_repo_full=d.get("private_repo_full"),
                     status=SubmissionStatus(d["status"]),
                     created_at=d.get("created_at", 0),
                     updated_at=d.get("updated_at", 0),

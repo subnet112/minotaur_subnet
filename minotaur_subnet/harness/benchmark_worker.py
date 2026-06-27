@@ -729,6 +729,70 @@ class BenchmarkWorker:
 
         return len(benchmarking)
 
+    async def _score_one_image(self, image_tag: str, *, context: str = "bench") -> dict[str, Any]:
+        """Benchmark ONE image through the EXACT challenger scoring path and return
+        its scorecard. SHARED by the incumbent re-score (_refresh_incumbent_score)
+        and the diagnostic endpoint, so the incumbent and challengers are scored by
+        IDENTICAL code — eliminating the incumbent self-quote inflation.
+
+        Mirrors ``run_once``'s per-submission setup: applies the SAME epoch/round
+        fork-pin a real challenger gets (the incumbent re-score historically did NOT
+        apply the round-anchored pin), builds the same intents corpus (synthetic +
+        the round's historical scenarios) and the same champion reference-quote
+        anchor, then runs the same ``_benchmark_submission`` + ``_compute_avg_score``
+        / ``_results_to_details``. Nothing is persisted or made adoption-eligible here
+        — the caller decides what to do with the returned score.
+
+        Raises ForkPinUnavailable when the round pin is unsealed (caller defers),
+        and RuntimeError when the simulator isn't wired / no active intents.
+        """
+        if self._use_docker and self._simulator is None:
+            raise RuntimeError("real simulator not yet wired — cannot score image")
+        # Same deterministic fork-pin a real challenger gets this round.
+        self._apply_epoch_block_pin()
+        _pin_round_id: str | None = None
+        if self._round_store is not None:
+            _cur = self._round_store.get_current_round()
+            if _cur is not None:
+                _pin_round_id = _cur.round_id
+        self._apply_round_anchored_pin(_pin_round_id)  # raises ForkPinUnavailable if unsealed
+
+        intents = self._load_benchmark_intents()
+        if not intents:
+            raise RuntimeError("no active intents for benchmarking")
+        score_fn = await self._build_score_fn(intents)
+        intents = self._enrich_intents_with_manifests(intents)
+        if self._round_store is not None:
+            _cur = self._round_store.get_current_round()
+            if _cur is not None:
+                try:
+                    historical = self._load_historical_scenarios(_cur.round_id)
+                    if historical:
+                        intents.extend(historical)
+                except Exception as exc:
+                    logger.warning("[%s] historical load failed: %s", context, exc)
+        reference_quotes = await self._build_reference_quotes(intents)
+
+        logger.info("[%s] scoring image %s via challenger path (%d intents)", context, image_tag, len(intents))
+        results = await self._benchmark_submission(
+            image_tag, intents, score_fn, reference_quotes=reference_quotes,
+        )
+        avg = self._compute_avg_score(results)
+        details = self._results_to_details(results)
+        logger.info("[%s] image %s scored %.4f (%d intents)", context, image_tag, avg, len(results))
+        return {
+            "image": image_tag,
+            "score": avg,
+            "intent_count": len(results),
+            "details": details,
+            "pin_round_id": _pin_round_id,
+        }
+
+    async def score_image_diagnostic(self, image_tag: str) -> dict[str, Any]:
+        """Endpoint wrapper: score an arbitrary image via the challenger path
+        (no submission, round, or adoption). Thin alias over ``_score_one_image``."""
+        return await self._score_one_image(image_tag, context="diagnostic")
+
     async def _benchmark_submission(
         self,
         image_tag: str,

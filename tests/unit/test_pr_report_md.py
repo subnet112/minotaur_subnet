@@ -145,7 +145,7 @@ def test_on_champion_rejected_pr_body_has_scores_and_trace():
     sub.pr_number = 11
     champ = {"per_intent": [{"intent_id": "b", "score": 0.8}]}
     captured = {}
-    with patch.object(sr, "comment_on_pr", lambda n, b: captured.update(n=n, body=b) or True), \
+    with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(n=n, body=b) or True), \
          patch.object(sr, "close_pr", lambda n: True), \
          patch.object(sr, "delete_candidate_image", lambda n: True):
         sr.on_champion_rejected_pr(sub, "did not beat the champion",
@@ -161,7 +161,7 @@ def test_on_champion_rejected_pr_falls_back_when_not_benchmarked():
                           status=SimpleNamespace(value="rejected"),
                           benchmark_score=None, benchmark_details=None, screening={})
     captured = {}
-    with patch.object(sr, "comment_on_pr", lambda n, b: captured.update(body=b) or True), \
+    with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(body=b) or True), \
          patch.object(sr, "close_pr", lambda n: True), \
          patch.object(sr, "delete_candidate_image", lambda n: True):
         sr.on_champion_rejected_pr(sub, "screening boom")
@@ -176,7 +176,7 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
     champ = {"per_intent": [{"intent_id": "a", "score": 0.5}]}
     captured = {}
     calls = {"close": 0, "gc": 0}
-    with patch.object(sr, "comment_on_pr", lambda n, b: captured.update(n=n, body=b) or True), \
+    with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(n=n, body=b) or True), \
          patch.object(sr, "close_pr", lambda n: calls.__setitem__("close", calls["close"] + 1) or True), \
          patch.object(sr, "delete_candidate_image",
                       lambda n: calls.__setitem__("gc", calls["gc"] + 1) or True):
@@ -192,7 +192,7 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
 
 def test_on_champion_finalist_pr_skips_without_pr_number():
     sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.9)  # no pr_number
-    with patch.object(sr, "comment_on_pr", lambda n, b: (_ for _ in ()).throw(AssertionError("posted"))):
+    with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: (_ for _ in ()).throw(AssertionError("posted"))):
         assert sr.on_champion_finalist_pr(sub, "selected as finalist") is False
 
 

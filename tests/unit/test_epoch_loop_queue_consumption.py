@@ -57,6 +57,10 @@ def _make_stub(*, queued=None, queued_source=None, burn_returns=None):
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,
     )
+    # The order-volume ramp runs inside _do_emit; stub it to a passthrough so
+    # these queue/burn-priority tests see the mapping unchanged. The ramp's own
+    # behavior is covered in test_weight_policy.
+    self_stub._scale_emission_by_order_volume = lambda mapping: mapping
     return self_stub
 
 
