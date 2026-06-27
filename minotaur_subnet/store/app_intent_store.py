@@ -830,6 +830,23 @@ class AppIntentStore:
             rows = conn.execute(query, params).fetchall()
         return {(r["status"] if r["status"] is not None else "unknown"): int(r["n"]) for r in rows}
 
+    def count_orders_since(self, cutoff_ts: float, app_id: str | None = None) -> int:
+        """Return the number of orders created since ``cutoff_ts`` (Unix seconds).
+
+        Counts every order that entered the system in the window — i.e. that
+        "went through" Minotaur — regardless of terminal status. Drives the
+        order-volume emission ramp (see ``champion_miner_weight_fraction``); the
+        ``created_at`` index keeps it a cheap COUNT even on a large orders table.
+        """
+        query = "SELECT COUNT(*) AS n FROM orders WHERE created_at > ?"
+        params: list[Any] = [float(cutoff_ts)]
+        if app_id:
+            query += " AND app_id=?"
+            params.append(app_id)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["n"]) if row and row["n"] is not None else 0
+
     # ── native bittensor permissions / executions ────────────────────────
 
     def save_native_permission(self, permission: NativeBittensorPermission) -> None:

@@ -17,11 +17,13 @@ service can be given a separate read-only HTTPS clone credential.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import tempfile
 import time
+import uuid
 from collections import deque
 from threading import Lock
 from typing import Any
@@ -38,6 +40,7 @@ from .models import (
     CertifyRoundRequest,
     ChampionConsensusProposalRequest,
     CloseRoundRequest,
+    DiagnosticScoreRequest,
     SolverChampionResponse,
     SolverRoundResponse,
     SolverRoundSummary,
@@ -50,6 +53,7 @@ from .models import (
 from .state import (
     _rate_limit_buckets,
     _rate_limit_lock,
+    get_benchmark_worker,
     get_champion_consensus_manager,
     get_round_store,
     get_store,
@@ -804,17 +808,37 @@ async def create_submission(
                 ),
             )
 
-    # Resolve the PR (host fixed to the canonical solver repo) -> fork clone_url +
-    # the live head SHA, and reject if the live head != the miner-signed head_sha
-    # (force-push / TOCTOU guard). The miner signs the exact commit it built.
+    # Private path: the PR lives in the miner's OWN private repo, resolved + cloned
+    # with the per-submission token. Public path is unchanged (canonical repo, env
+    # token). The token is transport only and is never signed/persisted.
+    _private = body.is_private
+    _owner_repo = None
+    if _private:
+        _owner, _repo = body.private_repo.split("/", 1)
+        _owner_repo = (_owner, _repo)
+
+    # Resolve the PR -> head clone_url + live head SHA, and reject if the live head
+    # != the miner-signed head_sha (force-push / TOCTOU guard). For the private
+    # path this fetch also exercises the token's repo read access (Metadata +
+    # Pull requests: Read); a bad/under-scoped token surfaces here as a 400.
     from minotaur_subnet.api.routes.submissions.github_pr import (
         PRResolutionError,
         resolve_pr,
     )
     try:
-        pr = resolve_pr(body.pr_number)
+        pr = resolve_pr(
+            body.pr_number,
+            owner_repo=_owner_repo,
+            token=(body.repo_token if _private else None),
+        )
     except PRResolutionError as exc:
-        raise HTTPException(status_code=400, detail=f"PR resolution failed: {exc}")
+        _hint = (
+            " (check the token can read this repo: Metadata:Read + "
+            "Pull requests:Read)" if _private else ""
+        )
+        raise HTTPException(
+            status_code=400, detail=f"PR resolution failed: {exc}{_hint}",
+        )
     if pr["head_sha"].lower() != body.head_sha.strip().lower():
         raise HTTPException(
             status_code=400,
@@ -845,12 +869,18 @@ async def create_submission(
     # submitter. Transient/uncertain GitHub signals never block (see
     # assess_pr_mergeability) — the on-chain-certified merge gate is the backstop.
     from minotaur_subnet.api.routes.submissions.github_pr import assess_pr_mergeability
-    _merge_ok, _merge_reason = assess_pr_mergeability(body.pr_number)
+    _merge_ok, _merge_reason = assess_pr_mergeability(
+        body.pr_number,
+        owner_repo=_owner_repo,
+        token=(body.repo_token if _private else None),
+    )
     if not _merge_ok:
         raise HTTPException(status_code=409, detail=_merge_reason)
 
-    # Check for duplicate submission. Store the RESOLVED fork clone_url + head SHA
+    # Check for duplicate submission. Store the RESOLVED clone_url + head SHA
     # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).
+    # For the private path also stash is_private/private_repo_full (persisted) and
+    # the per-submission token (in-memory only, purged on terminal state).
     try:
         sub = store.create(
             repo_url=pr["clone_url"],
@@ -861,6 +891,9 @@ async def create_submission(
             pr_number=body.pr_number,
             max_per_round=max_per_round,
             max_total_per_round=max_total,
+            is_private=_private,
+            private_repo_full=(body.private_repo if _private else None),
+            repo_token=(body.repo_token if _private else None),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -1390,3 +1423,58 @@ async def list_submissions(
         "count": len(subs),
         "submissions": [s.to_dict() for s in subs],
     }
+
+
+# ── Diagnostic: score an arbitrary image via the challenger path ─────────────
+# Operator-only (internal key). Benchmarks ANY image through the EXACT challenger
+# scoring path (champion reference anchor + round pin + corpus) with NO submission,
+# NO round, and NO chance of adoption. Used to settle scoring-symmetry questions —
+# e.g. score king's own image as a challenger and confirm it ties the incumbent.
+# Async job (a benchmark takes minutes): POST starts it, GET polls the result.
+
+_DIAGNOSTIC_RESULTS: dict[str, dict[str, Any]] = {}
+_DIAGNOSTIC_LOCK = Lock()
+
+
+@router.post("/internal/diagnostic/score-image")
+async def internal_diagnostic_score_image(body: DiagnosticScoreRequest, request: Request):
+    _require_internal_round_api_key(request)
+    worker = get_benchmark_worker()
+    if worker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Benchmark worker not available (diagnostic scoring is leader-only).",
+        )
+    job_id = f"diag_{uuid.uuid4().hex[:12]}"
+    with _DIAGNOSTIC_LOCK:
+        _DIAGNOSTIC_RESULTS[job_id] = {
+            "status": "running", "image": body.image, "label": body.label,
+        }
+
+    async def _run() -> None:
+        try:
+            res = await worker.score_image_diagnostic(body.image)
+            with _DIAGNOSTIC_LOCK:
+                _DIAGNOSTIC_RESULTS[job_id] = {"status": "done", "label": body.label, **res}
+        except Exception as exc:  # noqa: BLE001 — surface any failure to the poller
+            logger.exception("[diagnostic] score-image failed for %s: %s", body.image, exc)
+            with _DIAGNOSTIC_LOCK:
+                _DIAGNOSTIC_RESULTS[job_id] = {
+                    "status": "error", "image": body.image,
+                    "label": body.label, "error": str(exc),
+                }
+
+    asyncio.create_task(_run())
+    logger.info("[diagnostic] started score-image job %s for image %s (label=%s)",
+                job_id, body.image, body.label)
+    return {"job_id": job_id, "status": "running", "image": body.image}
+
+
+@router.get("/internal/diagnostic/score-image/{job_id}")
+async def internal_diagnostic_score_image_result(job_id: str, request: Request):
+    _require_internal_round_api_key(request)
+    with _DIAGNOSTIC_LOCK:
+        res = _DIAGNOSTIC_RESULTS.get(job_id)
+    if res is None:
+        raise HTTPException(status_code=404, detail="Unknown diagnostic job_id")
+    return res

@@ -52,6 +52,8 @@ async def submit_solver_git(
     validator_url: str = "http://localhost:9100",
     round_id: str | None = None,
     epoch: int | None = None,
+    private_repo: str | None = None,
+    repo_token: str | None = None,
 ) -> dict[str, Any]:
     """Submit a solver PR to the v1 submissions API (the PR-based fold).
 
@@ -136,6 +138,12 @@ async def submit_solver_git(
         "hotkey": keypair.ss58_address,
         "signature": signature_b64,
     }
+    # Private-repo path: the PR lives in the miner's own private repo and the
+    # validator clones it + comments with this per-submission token. Sent over
+    # HTTPS only (the token is transport, not part of the signed message above).
+    if private_repo and repo_token:
+        payload["private_repo"] = private_repo
+        payload["repo_token"] = repo_token
     headers: dict[str, str] = {}
     submissions_api_key = os.environ.get("SUBMISSIONS_API_KEY", "").strip()
     if submissions_api_key:
@@ -326,6 +334,22 @@ def main() -> None:
         "--poll", action="store_true",
         help="Poll submission status until terminal state",
     )
+    submit_parser.add_argument(
+        "--private-repo", default=None,
+        help=(
+            "owner/repo of your PRIVATE solver repo (opt-in private submission). "
+            "pr-number/head-sha then refer to a PR in THIS repo, not the canonical "
+            "solver repo. Requires a fine-grained PAT (see --repo-token)."
+        ),
+    )
+    submit_parser.add_argument(
+        "--repo-token", default=None,
+        help=(
+            "Fine-grained GitHub PAT for --private-repo, valid for this submission "
+            "only (Metadata:Read, Contents:Read, Pull requests:Read+Write). Prefer "
+            "the MINER_REPO_TOKEN env var to keep it out of shell history."
+        ),
+    )
 
     # status
     status_parser = subparsers.add_parser("status", help="Check submission status")
@@ -398,6 +422,9 @@ def main() -> None:
             validator_url=args.validator_url,
             round_id=args.round_id,
             epoch=args.epoch,
+            private_repo=args.private_repo,
+            # PAT: env wins (keeps it out of shell history), CLI flag as fallback.
+            repo_token=os.environ.get("MINER_REPO_TOKEN", "").strip() or args.repo_token,
         ))
         if args.poll and result.get("submission_id"):
             asyncio.run(poll_submission_status(

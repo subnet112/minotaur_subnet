@@ -198,7 +198,24 @@ def _safe_extract_tar(data: bytes, dest: str) -> bool:
         return False
 
 
-async def _clone_repo_sandboxed(repo_url: str, commit_hash: str, dest: str) -> bool:
+def _token_basic_auth(repo_url: str, token: str) -> str | None:
+    """base64('x-access-token:<PAT>') for a github.com private clone.
+
+    The per-submission GitHub PAT authenticates the clone as HTTP basic auth in
+    the ``x-access-token`` form GitHub accepts for tokens. Hard-gated to
+    github.com (resolve_pr already restricts the head clone_url to that host) so
+    a token can never be leaked to another host via a crafted URL.
+    """
+    host = (urlparse(repo_url).hostname or "").lower()
+    if host != "github.com":
+        logger.warning("Refusing token clone for non-github host %r", host)
+        return None
+    return base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+
+async def _clone_repo_sandboxed(
+    repo_url: str, commit_hash: str, dest: str, *, token: str | None = None,
+) -> bool:
     """Fetch a miner repo at ``commit_hash`` inside an ephemeral, hardened
     container and extract the result into ``dest``.
 
@@ -206,10 +223,15 @@ async def _clone_repo_sandboxed(repo_url: str, commit_hash: str, dest: str) -> b
     locked down: read-only rootfs with tmpfs scratch, all caps dropped, no new
     privileges, and pid/cpu/memory caps. Only a tar of the checked-out tree is
     streamed back over stdout; nothing from the repo executes here.
+
+    ``token`` (private path) authenticates the clone with the per-submission PAT;
+    otherwise the env-configured clone credentials apply (``_resolve_clone_basic_auth``).
     """
     image = os.environ.get("SUBMISSION_CLONE_IMAGE", "").strip() or DEFAULT_CLONE_IMAGE
     network = os.environ.get("SUBMISSION_CLONE_NETWORK", "").strip() or "bridge"
-    basic_auth = _resolve_clone_basic_auth(repo_url)
+    basic_auth = _token_basic_auth(repo_url, token) if token else _resolve_clone_basic_auth(repo_url)
+    if token and not basic_auth:
+        return False  # token clone requested but host disallowed — fail closed
 
     # git/tar progress -> stderr so stdout carries only the tarball. Repo URL and
     # commit arrive via env (referenced as "$REPO_URL"/"$COMMIT") so a hostile
@@ -276,7 +298,9 @@ async def _clone_repo_sandboxed(repo_url: str, commit_hash: str, dest: str) -> b
     return _safe_extract_tar(stdout, dest)
 
 
-async def _clone_repo(repo_url: str, commit_hash: str, dest: str) -> bool:
+async def _clone_repo(
+    repo_url: str, commit_hash: str, dest: str, *, token: str | None = None,
+) -> bool:
     """Clone a git repo at a specific commit.
 
     http(s) repos (the production path) are fetched in an ephemeral hardened
@@ -285,11 +309,14 @@ async def _clone_repo(repo_url: str, commit_hash: str, dest: str) -> bool:
     local-testnet stack — keep the in-process clone, which understands the
     host-foreign-ownership trust dance.
 
+    ``token`` (private path) is the per-submission GitHub PAT used to authenticate
+    the https clone of the miner's private repo.
+
     Returns True on success, False on failure.
     """
     scheme = (urlparse(repo_url).scheme or "").lower()
     if scheme in ("http", "https"):
-        return await _clone_repo_sandboxed(repo_url, commit_hash, dest)
+        return await _clone_repo_sandboxed(repo_url, commit_hash, dest, token=token)
     return await _clone_repo_in_process(repo_url, commit_hash, dest)
 
 
@@ -530,11 +557,17 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         logger.error("Submission %s not found for screening", submission_id)
         return
 
+    # Private submissions clone the miner's private repo with the per-submission
+    # PAT (in-memory only). None for the public path.
+    repo_token = store.get_repo_token(submission_id) if sub.is_private else None
+
     repo_dir = None
     try:
         # Clone the repo
         repo_dir = tempfile.mkdtemp(prefix=f"solver-{sub.commit_hash[:8]}-")
-        clone_ok = await _clone_repo(sub.repo_url, sub.commit_hash, repo_dir)
+        clone_ok = await _clone_repo(
+            sub.repo_url, sub.commit_hash, repo_dir, token=repo_token,
+        )
         if not clone_ok:
             store.reject(submission_id, "Failed to clone repository")
             return
@@ -699,6 +732,11 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             ):
                 from minotaur_subnet.relayer.solver_repo import on_champion_rejected_pr
                 reason = final.rejection_reason or "Screening rejected"
-                on_champion_rejected_pr(final, f"### ❌ Screening rejected\n\n{reason}")
+                # repo_token (captured above) survives the store's purge-on-reject
+                # so a private rejection can still comment on the private PR.
+                on_champion_rejected_pr(
+                    final, f"### ❌ Screening rejected\n\n{reason}",
+                    repo_token=repo_token,
+                )
         except Exception as exc:  # never let feedback break screening
             logger.warning("Screening reject-feedback failed for %s: %s", submission_id, exc)

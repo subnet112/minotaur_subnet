@@ -99,7 +99,7 @@ class TestCloneDispatch:
     async def test_https_uses_sandbox(self, monkeypatch):
         called = {}
 
-        async def fake_sb(u, c, d):
+        async def fake_sb(u, c, d, token=None):
             called["sandbox"] = (u, c, d)
             return True
 
@@ -116,7 +116,7 @@ class TestCloneDispatch:
     async def test_file_uses_in_process(self, monkeypatch):
         called = {}
 
-        async def fake_sb(u, c, d):
+        async def fake_sb(u, c, d, token=None):
             called["sandbox"] = True
             return True
 
