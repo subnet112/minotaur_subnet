@@ -966,6 +966,63 @@ def merge_miner_pr_when_certified(
     return False
 
 
+def _gh_json(method: str, url: str, payload: dict | None = None, *, token: str | None = None):
+    """``_github_api_request`` wrapper that returns ``(ok, json)``; ``ok`` is True
+    only on a 2xx. Never raises."""
+    status, body = _github_api_request(method, url, payload, token=token)
+    return (200 <= int(status or 0) < 300), body
+
+
+def _private_tree_blobs(
+    owner: str, repo: str, head_sha: str, token: str,
+) -> list[dict] | None:
+    """Return the miner private repo's tree at ``head_sha`` as a flat list of
+    blob entries ``{path, mode, sha}``, EXCLUDING anything under ``.github/``
+    (CI-disarm: a miner can never introduce/alter canonical CI). Returns None on
+    any API error or if GitHub truncated the tree (fail closed)."""
+    ok, body = _gh_json(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{head_sha}?recursive=1",
+        token=token,
+    )
+    if not ok or not isinstance(body, dict):
+        logger.error("publish: cannot read private tree %s/%s@%s", owner, repo, head_sha[:12])
+        return None
+    if body.get("truncated"):
+        logger.error("publish: private tree truncated (too large) — refusing")
+        return None
+    blobs = [
+        {"path": e["path"], "mode": e["mode"], "sha": e["sha"]}
+        for e in body.get("tree", [])
+        if e.get("type") == "blob" and not (e.get("path") or "").startswith(".github/")
+    ]
+    if not blobs:
+        logger.error("publish: private tree has no blobs — refusing")
+        return None
+    return blobs
+
+
+def _canonical_github_entries(
+    owner: str, repo: str, main_tree_sha: str, *, token: str | None,
+) -> list[dict] | None:
+    """Return canonical ``main``'s ``.github/**`` blob entries (``{path, mode,
+    type, sha}``) so they can be preserved verbatim in the published tree.
+    Returns None on API error; an empty list (no .github) is valid."""
+    ok, body = _gh_json(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{main_tree_sha}?recursive=1",
+        token=token,
+    )
+    if not ok or not isinstance(body, dict):
+        logger.error("publish: cannot read canonical tree %s", main_tree_sha[:12])
+        return None
+    return [
+        {"path": e["path"], "mode": e["mode"], "type": "blob", "sha": e["sha"]}
+        for e in body.get("tree", [])
+        if e.get("type") == "blob" and (e.get("path") or "").startswith(".github/")
+    ]
+
+
 def publish_private_champion_when_certified(
     pr_number: int,
     expected_head_sha: str,
@@ -974,31 +1031,209 @@ def publish_private_champion_when_certified(
     private_repo: str,
     repo_token: str,
 ) -> bool:
-    """Finalize a PRIVATE-submission champion onto canonical ``main``.
+    """Finalize a PRIVATE-submission champion onto canonical ``main`` (leak-on-win).
 
-    NOT YET SUPPORTED — always fails closed (returns False).
+    A private PR lives in the miner's own repo, so GitHub cannot cross-repo merge
+    it. Instead the relayer reconstructs the certified source on the canonical repo
+    via the GitHub **Git Data API** (no git CLI, no direct push) and merges it the
+    SAME way the public path merges a fork PR (PR + squash-merge with the
+    validator's own ``SOLVER_REPO_TOKEN``), so the protect-main ruleset is honored.
 
-    A private PR lives in the miner's own repo, so it cannot be cross-repo merged
-    like the public path. Re-committing its tree onto canonical produces a NEW
-    commit whose SHA differs from the certified head SHA — so neither the leader's
-    own on-chain cert check (``_onchain_cert_binds``) nor the ``protect-main``
-    ruleset's required ``verify-champion-cert`` status check would accept it, and a
-    direct push to protected ``main`` is forbidden by design
-    (see ``assert_solver_repo_token_not_admin`` and the module docstring).
+    Authority is identical to the public path: the on-chain quorum cert must bind
+    ``keccak(head_sha)`` (the cert's ``commit_hash`` IS the private head SHA, so
+    ``_onchain_cert_binds`` applies unchanged), and the followers independently
+    verified the candidate by pulling the certified image digest. Steps:
 
-    Landing a private champion therefore needs a cert/Action change that is out of
-    this repo's scope (the certificate + ``verify-champion-cert`` must recognise a
-    private champion's published commit). Until then this fails closed so a private
-    submission can never be adopted — the upstream selection path
-    (``EpochManager.evaluate_round``) already defers private finalists for the same
-    reason, so this is defense in depth and should not normally be reached.
+      1. Re-resolve the live head via the per-submission token; abort on drift off
+         ``expected_head_sha`` (TOCTOU).
+      2. Assert the on-chain quorum cert binds this head SHA (THE authority).
+      3. Read the private tree at the certified head (miner token), EXCLUDING
+         ``.github/**`` (CI-disarm).
+      4. Recreate every blob on canonical (canonical token), assemble a tree that
+         is the private source + canonical's own ``.github/**`` preserved verbatim,
+         commit it onto a fresh ``private-champion/<round>`` branch (parent = current
+         ``main``), open a PR, and squash-merge it pinned to the new commit.
+
+    FAIL-CLOSED: any error returns False (the caller's #326 gate then leaves the
+    champion unchanged), best-effort cleaning up the branch/PR it created.
     """
-    logger.warning(
-        "publish: private champion finalization not yet supported "
-        "(PR #%s, repo %s, head %s, round %s) — failing closed",
-        pr_number, private_repo, (expected_head_sha or "")[:12], round_id,
+    from minotaur_subnet.api.routes.submissions.github_pr import (
+        PRResolutionError,
+        resolve_pr,
     )
-    return False
+
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None or not pr_number:
+        logger.error("publish: no canonical owner/repo or pr_number")
+        return False
+    c_owner, c_repo = owner_repo
+    if "/" not in (private_repo or ""):
+        logger.error("publish: malformed private_repo %r", private_repo)
+        return False
+    p_owner, p_repo = private_repo.split("/", 1)
+
+    # 1) TOCTOU — re-resolve the authoritative live head with the miner token.
+    try:
+        resolved = resolve_pr(int(pr_number), owner_repo=(p_owner, p_repo), token=repo_token)
+    except PRResolutionError as exc:
+        logger.error("publish: PR #%s (%s) unresolvable: %s", pr_number, private_repo, exc)
+        return False
+    live_head = (resolved.get("head_sha") or "").strip().lower()
+    if not live_head:
+        logger.error("publish: PR #%s has no resolvable head SHA", pr_number)
+        return False
+    if expected_head_sha and live_head != expected_head_sha.strip().lower():
+        logger.error(
+            "publish: PR #%s head drifted (%s) off certified SHA (%s) — refusing",
+            pr_number, live_head, expected_head_sha.strip().lower(),
+        )
+        return False
+
+    # 2) THE authority: on-chain quorum cert must bind this exact head SHA (the
+    # cert's commit_hash is the private head SHA — same check as the public path).
+    if not _onchain_cert_binds(live_head, round_id):
+        logger.error(
+            "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
+            live_head, round_id,
+        )
+        return False
+
+    push_token = (
+        os.environ.get("SOLVER_REPO_PR_TOKEN") or os.environ.get("SOLVER_REPO_TOKEN") or ""
+    ).strip()
+    if not push_token:
+        logger.error("publish: no SOLVER_REPO_TOKEN to write canonical — refusing")
+        return False
+
+    # 3) Read the private source at the certified head (.github excluded).
+    blobs = _private_tree_blobs(p_owner, p_repo, live_head, repo_token)
+    if blobs is None:
+        return False
+
+    branch = f"private-champion/{(round_id or 'round').replace('/', '-')}-{live_head[:12]}"
+    created_ref = False
+    new_pr_number: int | None = None
+    try:
+        # Canonical main commit + tree (to preserve .github and parent the commit).
+        ok, ref_body = _gh_json(
+            "GET", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/ref/heads/main",
+            token=push_token,
+        )
+        if not ok or not isinstance(ref_body, dict):
+            logger.error("publish: cannot read canonical main ref"); return False
+        main_commit_sha = ((ref_body.get("object") or {}).get("sha") or "").strip()
+        ok, commit_body = _gh_json(
+            "GET",
+            f"https://api.github.com/repos/{c_owner}/{c_repo}/git/commits/{main_commit_sha}",
+            token=push_token,
+        )
+        if not ok or not isinstance(commit_body, dict):
+            logger.error("publish: cannot read canonical main commit"); return False
+        main_tree_sha = ((commit_body.get("tree") or {}).get("sha") or "").strip()
+
+        github_entries = _canonical_github_entries(c_owner, c_repo, main_tree_sha, token=push_token)
+        if github_entries is None:
+            return False
+
+        # 4) Recreate each private blob on canonical, building the new tree entries.
+        tree_entries: list[dict] = []
+        for b in blobs:
+            ok, blob = _gh_json(
+                "GET",
+                f"https://api.github.com/repos/{p_owner}/{p_repo}/git/blobs/{b['sha']}",
+                token=repo_token,
+            )
+            if not ok or not isinstance(blob, dict):
+                logger.error("publish: cannot read private blob %s", b["path"]); return False
+            ok, created = _gh_json(
+                "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/blobs",
+                {"content": blob.get("content", ""), "encoding": blob.get("encoding", "base64")},
+                token=push_token,
+            )
+            if not ok or not isinstance(created, dict) or not created.get("sha"):
+                logger.error("publish: cannot create canonical blob %s", b["path"]); return False
+            tree_entries.append(
+                {"path": b["path"], "mode": b["mode"], "type": "blob", "sha": created["sha"]}
+            )
+        # Preserve canonical .github/** verbatim — the miner's tree never touches CI.
+        tree_entries.extend(github_entries)
+
+        # Build tree (no base_tree → exact mirror: solver source + canonical .github).
+        ok, tree = _gh_json(
+            "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/trees",
+            {"tree": tree_entries}, token=push_token,
+        )
+        if not ok or not isinstance(tree, dict) or not tree.get("sha"):
+            logger.error("publish: cannot create canonical tree"); return False
+
+        # Commit (parent = current main), crediting the source.
+        msg = (
+            f"champion: private submission via PR #{pr_number} (round {round_id})\n\n"
+            f"source: {private_repo}@{live_head}\n"
+        )
+        ok, commit = _gh_json(
+            "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/commits",
+            {"message": msg, "tree": tree["sha"], "parents": [main_commit_sha]},
+            token=push_token,
+        )
+        if not ok or not isinstance(commit, dict) or not commit.get("sha"):
+            logger.error("publish: cannot create canonical commit"); return False
+        new_commit_sha = commit["sha"]
+
+        # Branch (deliberately NOT champion/* so the auto-merge Action ignores it).
+        ok, _ = _gh_json(
+            "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/refs",
+            {"ref": f"refs/heads/{branch}", "sha": new_commit_sha}, token=push_token,
+        )
+        if not ok:
+            # Maybe a stale ref from a previous attempt — force it to the new commit.
+            ok, _ = _gh_json(
+                "PATCH",
+                f"https://api.github.com/repos/{c_owner}/{c_repo}/git/refs/heads/{branch}",
+                {"sha": new_commit_sha, "force": True}, token=push_token,
+            )
+            if not ok:
+                logger.error("publish: cannot create/update branch %s", branch); return False
+        created_ref = True
+
+        # PR + squash-merge pinned to the new commit (same mechanism as public).
+        ok, pr = _gh_json(
+            "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/pulls",
+            {"title": f"champion: private round {round_id}", "head": branch, "base": "main", "body": msg},
+            token=push_token,
+        )
+        if not ok or not isinstance(pr, dict) or not pr.get("number"):
+            logger.error("publish: cannot open canonical PR for %s", branch); return False
+        new_pr_number = int(pr["number"])
+
+        ok, _ = _gh_json(
+            "PUT",
+            f"https://api.github.com/repos/{c_owner}/{c_repo}/pulls/{new_pr_number}/merge",
+            {"merge_method": "squash", "sha": new_commit_sha}, token=push_token,
+        )
+        if not ok:
+            logger.error("publish: squash-merge of PR #%s failed", new_pr_number); return False
+
+        logger.info(
+            "publish: PR #%s private champion published to %s/%s main "
+            "(source %s@%s, canonical PR #%s)",
+            pr_number, c_owner, c_repo, private_repo, live_head, new_pr_number,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — never raise into the finalize path
+        logger.error("publish: unexpected error: %s", exc)
+        return False
+    finally:
+        # Best-effort cleanup if we didn't land the merge (a successful squash-merge
+        # auto-deletes nothing; leave the merged branch for audit, only GC on failure).
+        if created_ref:
+            # If the merge succeeded GitHub leaves the branch; remove it either way
+            # to keep the canonical repo clean (the commit is on main regardless).
+            _gh_json(
+                "DELETE",
+                f"https://api.github.com/repos/{c_owner}/{c_repo}/git/refs/heads/{branch}",
+                token=push_token,
+            )
 
 
 def assert_solver_repo_token_not_admin() -> None:
