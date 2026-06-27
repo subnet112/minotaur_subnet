@@ -239,3 +239,86 @@ def test_refresh_scores_incumbent_with_reference_quotes():
     assert seen["reference_quotes"] is reference_quotes
     assert seen["memo_reference_quotes"] is reference_quotes
     bw._build_reference_quotes.assert_awaited_once_with(intents, image_tag="champ:1")
+
+
+# ── CORRECTED reference-bar shadow (REFQUOTE_SHADOW, observe-only) ──────────────
+# The production bar is the reference-anchored score (#353); the shadow ALSO scores
+# the incumbent SELF-QUOTED and logs the delta — the measurement the #340 shadow got
+# wrong (it reused the memoized champion result for both legs -> false delta=0).
+
+def _shadow_harness(calls, *, self_raises=False):
+    from minotaur_subnet.epoch.manager import ChampionInfo
+    real = SimpleNamespace(
+        submission_id="sub_real", solver_name="x", solver_version="1",
+        benchmark_score=0.7, epoch=3, image_tag="champ:1", hotkey="5Real", updated_at=0,
+        benchmark_details={"scorecard": {"app_onchain": {"dex": [7000]}}},
+    )
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(
+        submission_id="sub_real", hotkey="5Real", benchmark_score=0.7, image_tag="champ:1",
+    )
+    mgr._sub_store.get.return_value = real
+    mgr._round_store.get_current_round.return_value = SimpleNamespace(round_id="round-1")
+    intents = [(SimpleNamespace(app_id="dex"), SimpleNamespace(chain_id=8453), None)]
+    reference_quotes = {"dex": {"quoted_output": "100"}}
+    bw = MagicMock()
+    bw._epoch_block_number = 123
+    bw._require_real_sim = True
+    bw._load_benchmark_intents.return_value = intents
+    bw._build_score_fn = AsyncMock(return_value=object())
+    bw._enrich_intents_with_manifests.side_effect = lambda x: x
+    bw._load_historical_scenarios.return_value = []
+    bw._build_reference_quotes = AsyncMock(return_value=reference_quotes)
+    bw._results_to_details.return_value = {"scorecard": {}}
+
+    async def _bs(image_tag, bench_intents, score_fn, *, reference_quotes=None):
+        calls.append(reference_quotes)
+        if reference_quotes is None and self_raises:
+            raise RuntimeError("shadow boom")
+        return ["REF_RESULTS"] if reference_quotes else ["SELF_RESULTS"]
+
+    async def _memo(*, round_id, image, fork_block, intents, require_real_sim,
+                    reference_quotes=None, run):
+        return await run()
+
+    bw._benchmark_submission = AsyncMock(side_effect=_bs)
+    bw.memo_champion_bench = AsyncMock(side_effect=_memo)
+    # production reference-anchored -> 0.52 ; self-quote shadow leg -> 0.72
+    bw._compute_avg_score.side_effect = lambda r: 0.52 if r == ["REF_RESULTS"] else 0.72
+    mgr._benchmark_worker = bw
+    return mgr, reference_quotes
+
+
+def test_refquote_shadow_logs_delta_without_changing_bar(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("REFQUOTE_SHADOW", "1")
+    calls = []
+    mgr, ref = _shadow_harness(calls)
+    asyncio.run(mgr._refresh_incumbent_score())
+    # production reference-anchored bar is the STORED score; the shadow did NOT change it
+    assert mgr._champion.benchmark_score == 0.52
+    assert not getattr(mgr, "_incumbent_refresh_failed", False)
+    # both legs ran: production (reference quotes) AND the self-quote shadow (None)
+    assert ref in calls and None in calls
+
+
+def test_refquote_shadow_off_skips_self_quote(monkeypatch):
+    import asyncio
+    monkeypatch.delenv("REFQUOTE_SHADOW", raising=False)
+    calls = []
+    mgr, ref = _shadow_harness(calls)
+    asyncio.run(mgr._refresh_incumbent_score())
+    assert None not in calls  # no self-quote shadow leg when the env is off
+    assert mgr._champion.benchmark_score == 0.52
+
+
+def test_refquote_shadow_failure_isolated(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("REFQUOTE_SHADOW", "1")
+    calls = []
+    mgr, ref = _shadow_harness(calls, self_raises=True)
+    asyncio.run(mgr._refresh_incumbent_score())
+    # a shadow-leg failure must NEVER change the bar nor mark it stale
+    assert mgr._champion.benchmark_score == 0.52
+    assert not getattr(mgr, "_incumbent_refresh_failed", False)
+    assert None in calls  # the shadow leg was attempted
