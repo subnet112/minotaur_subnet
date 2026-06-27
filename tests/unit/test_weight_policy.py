@@ -4,10 +4,13 @@ from unittest.mock import MagicMock
 
 import minotaur_subnet.weight_policy as weight_policy
 from minotaur_subnet.weight_policy import (
+    CHAMPION_MINER_WEIGHT_FLOOR,
     CHAMPION_MINER_WEIGHT_FRACTION,
     GENESIS_HOTKEY,
+    ORDERS_FOR_FULL_EMISSION,
     apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
+    champion_miner_weight_fraction,
     lookup_subnet_owner_from_chain,
     resolve_subnet_owner_hotkey,
 )
@@ -226,3 +229,69 @@ def test_maybe_emit_recovers_after_owner_hotkey_set_late(monkeypatch):
 
     # Next tick must emit immediately (clock wasn't advanced by the empty call)
     assert tracker.maybe_emit(None) == {"5Gowner": 1.0}
+
+
+# ── order-volume emission ramp ────────────────────────────────────────────
+
+
+def test_fraction_at_zero_orders_is_floor():
+    assert champion_miner_weight_fraction(0) == CHAMPION_MINER_WEIGHT_FLOOR
+
+
+def test_fraction_at_full_volume_is_one():
+    assert champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION) == 1.0
+
+
+def test_fraction_clamped_above_full_volume():
+    assert champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION * 5) == 1.0
+
+
+def test_fraction_is_linear_at_midpoint():
+    # Halfway to full volume → halfway between floor and 1.0.
+    mid = champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION // 2)
+    expected = CHAMPION_MINER_WEIGHT_FLOOR + (1.0 - CHAMPION_MINER_WEIGHT_FLOOR) * 0.5
+    assert abs(mid - expected) < 1e-9
+
+
+def test_fraction_monotonic_increasing():
+    samples = [champion_miner_weight_fraction(n) for n in (0, 100, 250, 500, 750, 1000)]
+    assert samples == sorted(samples)
+    assert samples[0] == CHAMPION_MINER_WEIGHT_FLOOR
+    assert samples[-1] == 1.0
+
+
+def test_fraction_negative_and_garbage_degrade_to_floor():
+    assert champion_miner_weight_fraction(-50) == CHAMPION_MINER_WEIGHT_FLOOR
+    assert champion_miner_weight_fraction("not-a-number") == CHAMPION_MINER_WEIGHT_FLOOR
+
+
+def test_ramp_with_full_fraction_routes_everything_to_miner():
+    # 1.0 fraction → no burn; the champion takes the whole emission.
+    ramped = apply_champion_burn_ramp(
+        {"5Gminer": 1.0}, owner_hotkey="5Gowner", miner_fraction=1.0
+    )
+    assert ramped == {"5Gminer": 1.0, "5Gowner": 0.0}
+
+
+def test_ramp_is_idempotent_in_fraction():
+    # Re-ramping an already-floor-ramped mapping re-targets the aggregate share
+    # cleanly — the emission chokepoint relies on this.
+    floor = apply_champion_burn_ramp({"5Gminer": 1.0}, owner_hotkey="5Gowner")
+    assert floor == {"5Gminer": 0.05, "5Gowner": 0.95}
+    rescaled = apply_champion_burn_ramp(
+        floor, owner_hotkey="5Gowner", miner_fraction=0.5
+    )
+    assert abs(rescaled["5Gminer"] - 0.5) < 1e-9
+    assert abs(rescaled["5Gowner"] - 0.5) < 1e-9
+
+
+def test_ramp_partial_fraction_preserves_multi_miner_ratio():
+    ramped = apply_champion_burn_ramp(
+        {"m1": 0.6, "m2": 0.3, "m3": 0.1},
+        owner_hotkey="5Gowner",
+        miner_fraction=0.5,
+    )
+    assert abs(sum(ramped.values()) - 1.0) < 1e-9
+    assert abs(ramped["5Gowner"] - 0.5) < 1e-9
+    assert abs((ramped["m1"] + ramped["m2"] + ramped["m3"]) - 0.5) < 1e-9
+    assert abs(ramped["m1"] / ramped["m2"] - 2.0) < 1e-9  # 0.6/0.3 preserved
