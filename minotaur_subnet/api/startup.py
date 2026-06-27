@@ -2282,6 +2282,17 @@ async def initialize(ctx: ServerContext) -> dict:
                 if network is None or not network.peers:
                     return
                 try:
+                    # EIP-712 sign the lifecycle payload (#319) — the AUTOMATIC
+                    # coordinator loop was previously broadcasting UNSIGNED (only the
+                    # manual operator endpoints in round_manager signed), so followers
+                    # fell to the legacy shared-key path and 401'd across operators
+                    # (responses=0). Followers verify this signature against the
+                    # on-chain ValidatorRegistry / locked-leader, so a cross-operator
+                    # broadcast now authenticates without any shared secret.
+                    from minotaur_subnet.api.routes.submissions.round_manager import (
+                        _sign_internal_round_payload,
+                    )
+                    payload = _sign_internal_round_payload(network, payload)
                     responses = await network.broadcast_json(path, payload)
                     logger.info(
                         "Solver round %s sync broadcast: responses=%d path=%s",
