@@ -105,17 +105,10 @@ Notes:
 
 By default your PR is **public** on the canonical solver repo, so anyone can read
 your solver before you earn from it. The **private path** keeps your code private
-through screening + benchmarking: the validator clones it, scores it, and posts
-the benchmark report onto your private PR — so you can iterate without anyone
-seeing your code.
-
-> **⚠️ Current limitation — a private submission cannot yet become champion.**
-> Champion *adoption* for private submissions is not enabled yet: if your private
-> solver out-scores the champion, you'll get the full "you would win" report on
-> your private PR, but it is **not** adopted and earns **no emissions**. To claim
-> the championship today, **resubmit the same solver via the public path**. So the
-> private path is for **front-run-protected development/iteration**; public is how
-> you actually win. (Private champion landing is a planned follow-up.)
+through screening + benchmarking — the validator clones it, scores it, and posts
+the benchmark report onto your private PR — and **publishes it to canonical `main`
+only if it wins** (leak-on-champion). So you develop and win without anyone seeing
+your code until you're already champion.
 
 How it works:
 
@@ -150,9 +143,9 @@ Notes:
   when the submission reaches a terminal state. It is **never written to disk**.
 - The validator (leader) sees your private source while building/benchmarking — the
   privacy guarantee is against **other miners and the public**, not the leader.
-- A private submission is **scored but not adopted** (see the limitation above):
-  use it to develop and prove your score privately, then submit the winning solver
-  publicly to actually take the championship and earn emissions.
+- If your private solver wins, the validator publishes its source to canonical
+  `main` (preserving canonical CI) and you become champion — your code only becomes
+  public once you've already won. No need to resubmit publicly.
 
 ## 6) Optional: direct source submission (local/dev)
 
