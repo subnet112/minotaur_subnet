@@ -64,11 +64,18 @@ logger = logging.getLogger(__name__)
 # (the manager passes it to adopt_rule; champion_consensus, benchmark_worker, and
 # scoring_lab import it directly), so changing it here moves the bar everywhere —
 # leader and followers stay on an identical rule.
-# 0.05 == 5%: a deliberate minimum-detectable-effect margin that sits well above
-# the observed run-to-run benchmark noise (~1% same-code spread measured on the
-# prod-shadow vote), so champions don't churn on noise. (Was 0.005 / 0.5% — which
-# the prose had mislabeled "5%".)
-DETHRONE_MARGIN = 0.05
+# 0.01 == 1%. Champion and challenger are scored on the SAME round pack at the SAME
+# pinned fork block, so per-pack difficulty is COMMON-MODE and cancels in the
+# challenger-vs-champion comparison — the cross-round champion-score drift (~0.68–0.76)
+# is pack difficulty, NOT comparison noise. The same-pack run-to-run comparison noise
+# is ~0 (pinned fork #333; measured delta=0.0000 on the FIX-1 reference-vs-self shadow).
+# So this margin is not guarding run-to-run noise (the earlier "5% above ~1% noise"
+# rationale conflated absolute drift with comparison noise); it's a thin guard against
+# per-pack SAMPLING (a challenger better on this pack's order mix but not overall),
+# already damped by the ~62-scenario packs. Lowered so genuinely-close challengers
+# (e.g. +3.9%, which 5% rejected) can win; the per-app non-regression vetoes still
+# block solvers that are worse on any app. (History: 0.005 → 0.05 → 0.01.)
+DETHRONE_MARGIN = 0.01
 
 
 def _adoption_disabled() -> bool:
@@ -1060,7 +1067,7 @@ class EpochManager:
         1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — absolute sanity floor.
         2. Per-app non-regression: no champion-covered app may be dropped, and
            no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-        3. Global improvement over the champion by the dethrone margin (default 5%)
+        3. Global improvement over the champion by the dethrone margin (default 1%)
 
         There is no absolute global-score floor — the global JS score is relative
         to the champion reference, so the dethrone margin (beat the champion) is
