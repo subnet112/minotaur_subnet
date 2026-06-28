@@ -51,13 +51,33 @@ _GATE_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 # sim-to-sim / rounding jitter so noise alone never reads as a regression that
 # would veto adoption. Improvement is decided per order by strict inequality
 # OUTSIDE this band — there is no separate "beat by X%" aggregate gate here.
-RELATIVE_TOL = 0.005  # 0.5%
+#
+# Kept for docs / back-compat only: the verdict path now uses the EXACT-INTEGER
+# basis-points form below (no float in the decision).
+RELATIVE_TOL = 0.001  # 0.1%
 
-# A per-order shadow score at/below this is treated as "no value delivered"
-# (the order produced nothing for the receiver — a champion blind spot or a
-# challenger drop). 0.0 because the raw-output shadow JS returns 0 for a
-# below-min / no-output order.
-MIN_VALID_OUTPUT = 0.0
+# Integer basis-points form of the noise band — what the verdict actually uses.
+# 10 bps == 0.1% == RELATIVE_TOL. The per-order comparison cross-multiplies on
+# EXACT INTEGER wei (``chal * 10000`` vs ``champ * (10000 ± RELATIVE_TOL_BPS)``)
+# so there is ZERO float in the decision and zero rounding at the BPS boundary —
+# the verdict is bit-exact and host-deterministic. This matters once the
+# tolerance tightens toward the BPS noise floor and quorum > 1, where an IEEE-754
+# rounding difference between hosts could otherwise flip a boundary verdict.
+RELATIVE_TOL_BPS = 10
+
+# Basis-points denominator for the cross-multiplied comparison.
+_BPS = 10000
+
+# A per-order shadow output at/below this (EXACT integer wei) is treated as "no
+# value delivered" (the order produced nothing for the receiver — a champion
+# blind spot or a challenger drop). 0 because the raw-output shadow JS returns
+# "0" for a below-min / no-output order.
+MIN_VALID_OUTPUT = 0
+
+# DISPLAY-ONLY cap for the per-order ``ratio`` (chal/champ) emitted into logs and
+# ``/health``. The verdict NEVER depends on this float; the cap only stops a
+# champion that delivered a tiny amount from producing an absurd display number.
+SURPLUS_RATIO_CAP = 1000.0
 
 
 def relative_scoring_shadow_enabled() -> bool:
@@ -122,25 +142,69 @@ def _field(item: Any, name: str) -> Any:
     return getattr(item, name, None)
 
 
-def _has_value(score: float | None) -> bool:
-    """True when an order delivered a usable output (> MIN_VALID_OUTPUT)."""
-    return score is not None and score > MIN_VALID_OUTPUT
+def _parse_output(score: Any) -> int | None:
+    """Parse a per-order shadow output into EXACT integer wei.
+
+    The canonical carrier is a decimal STRING (the raw-output shadow JS emits
+    ``BigInt(...).toString()``), parsed with ``int(...)`` so amounts above 2^53
+    keep full precision — no ``float`` anywhere in the decision path. Returns
+    ``None`` for ``None`` / ``""`` / non-integer garbage so a bad row is treated
+    as "no value", never raised. Bare ``int`` is accepted as-is and a defensive
+    ``float`` collapses to its integer wei (legacy callers)."""
+    if score is None or isinstance(score, bool):
+        return None
+    if isinstance(score, int):
+        return score
+    if isinstance(score, float):
+        return int(score) if (score == score and score not in (float("inf"), float("-inf"))) else None
+    s = str(score).strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_ratio(chal_i: int, champ_i: int) -> float | None:
+    """DISPLAY-ONLY float ratio ``chal/champ`` for logs / ``/health``.
+
+    NEVER used in the verdict (that path is exact-integer). ``None`` when the
+    champion delivered nothing (avoids div-by-zero), capped at
+    :data:`SURPLUS_RATIO_CAP` so a tiny champion can't blow up the display."""
+    if champ_i <= 0:
+        return None
+    try:
+        r = float(chal_i) / float(champ_i)
+    except (OverflowError, ZeroDivisionError):
+        return None
+    if r > SURPLUS_RATIO_CAP:
+        r = SURPLUS_RATIO_CAP
+    return round(r, 6)
+
+
+def _has_value(score: Any) -> bool:
+    """True when an order delivered a usable output (parsed int > MIN_VALID_OUTPUT)."""
+    parsed = _parse_output(score)
+    return parsed is not None and parsed > MIN_VALID_OUTPUT
 
 
 def evaluate_relative_adoption(
     champion_results: list[Any],
     challenger_results: list[Any],
-    tol: float = RELATIVE_TOL,
+    tol_bps: int = RELATIVE_TOL_BPS,
 ) -> dict[str, Any]:
-    """Per-order relative adoption verdict — PURE.
+    """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
     Joins champion and challenger results by ``intent_id`` and, for each order,
-    compares the RAW delivered output (``shadow_score``). Verdicts:
+    compares the RAW delivered output (``shadow_score``, an exact decimal wei
+    STRING) as INTEGER wei. The verdict cross-multiplies the BPS band so there is
+    no ``float`` in the decision and no rounding at the boundary:
 
       * both deliver value:
-          - ``chal < champ*(1-tol)`` -> ``regression``
-          - ``chal > champ*(1+tol)`` -> ``win``
-          - else                     -> ``matched`` (inside the noise band)
+          - ``chal*10000 < champ*(10000-tol_bps)`` -> ``regression``
+          - ``chal*10000 > champ*(10000+tol_bps)`` -> ``win``
+          - else                                   -> ``matched`` (noise band)
       * champion blind (no value) & challenger delivers -> ``blind_spot_cover``
         (counts as a win — the challenger covers a case the champion can't)
       * champion delivers & challenger drops it (no value) -> ``dropped``
@@ -157,12 +221,12 @@ def evaluate_relative_adoption(
     objects (unit path) or ``per_intent`` dicts (report / manager path); both are
     read via :func:`_field`.
     """
-    champ_by: dict[str, float | None] = {}
+    champ_by: dict[str, Any] = {}
     for r in champion_results or []:
         iid = _field(r, "intent_id")
         if iid is not None:
             champ_by[iid] = _field(r, "shadow_score")
-    chal_by: dict[str, float | None] = {}
+    chal_by: dict[str, Any] = {}
     for r in challenger_results or []:
         iid = _field(r, "intent_id")
         if iid is not None:
@@ -173,18 +237,19 @@ def evaluate_relative_adoption(
     scenarios_compared = 0
 
     for iid in sorted(set(champ_by) | set(chal_by)):
-        champ_s = champ_by.get(iid)
-        chal_s = chal_by.get(iid)
-        champ_has = _has_value(champ_s)
-        chal_has = _has_value(chal_s)
+        champ_i = _parse_output(champ_by.get(iid))
+        chal_i = _parse_output(chal_by.get(iid))
+        champ_has = champ_i is not None and champ_i > MIN_VALID_OUTPUT
+        chal_has = chal_i is not None and chal_i > MIN_VALID_OUTPUT
         ratio: float | None = None
 
         if champ_has and chal_has:
-            ratio = chal_s / champ_s  # type: ignore[operator]
-            if chal_s < champ_s * (1.0 - tol):  # type: ignore[operator]
+            # EXACT-INTEGER verdict — cross-multiply the BPS band, no float.
+            ratio = _display_ratio(chal_i, champ_i)  # type: ignore[arg-type]
+            if chal_i * _BPS < champ_i * (_BPS - tol_bps):  # type: ignore[operator]
                 verdict = "regression"
                 n_regressions += 1
-            elif chal_s > champ_s * (1.0 + tol):  # type: ignore[operator]
+            elif chal_i * _BPS > champ_i * (_BPS + tol_bps):  # type: ignore[operator]
                 verdict = "win"
                 n_wins += 1
             else:
@@ -203,10 +268,13 @@ def evaluate_relative_adoption(
             verdict = "skip"
 
         per_order.append({
+            # champ/chal as EXACT DECIMAL STRINGS so JSON consumers (logs,
+            # /health) never lose precision above 2^53. None when absent. `ratio`
+            # is DISPLAY-ONLY (the verdict above is exact-integer).
             "intent_id": iid,
-            "champ": champ_s,
-            "chal": chal_s,
-            "ratio": round(ratio, 6) if ratio is not None else None,
+            "champ": None if champ_i is None else str(champ_i),
+            "chal": None if chal_i is None else str(chal_i),
+            "ratio": ratio,
             "verdict": verdict,
         })
 
