@@ -260,6 +260,13 @@ class BenchmarkWorker:
         self._validator_identity = validator_identity
         self._warned_env_pin_ignored = False  # one-shot WARN guard (P5 demotion)
         self._running = False
+        # Serializes run_once against concurrent callers — the background
+        # run_loop and the round-close evaluate_round both invoke run_once on
+        # this same instance. Without it they race: the per-submission
+        # idempotency guard loses a read-modify-write window and every
+        # challenger is benchmarked TWICE per round, doubling the
+        # _sim_lock-serialized sim work. Lazily bound to the running loop.
+        self._run_once_lock: asyncio.Lock | None = None
         # app_id -> sha256(js_code)[:16] currently loaded in this worker's
         # engine. Lets _build_score_fn hot-reload a developer's PUT /scoring on
         # the next benchmark run instead of caching the first-seen JS forever
@@ -500,8 +507,25 @@ class BenchmarkWorker:
     async def run_once(self) -> int:
         """Process all BENCHMARKING submissions in a single pass.
 
+        Serializes against concurrent callers: the background ``run_loop`` and
+        the round-close ``evaluate_round`` both invoke ``run_once`` on the same
+        worker. Holding a per-worker lock makes the second caller wait, then
+        re-enter on an already-SCORED set and no-op via the per-submission
+        idempotency guard — instead of racing and benchmarking every challenger
+        twice per round (which doubles the ``_sim_lock``-serialized sim work).
+
         Returns the number of submissions processed.
         """
+        lock = self._run_once_lock
+        if lock is None:
+            # Lazily create so the lock binds to the running event loop.
+            lock = self._run_once_lock = asyncio.Lock()
+        async with lock:
+            return await self._run_once_impl()
+
+    async def _run_once_impl(self) -> int:
+        """Single benchmarking pass. Caller MUST hold ``self._run_once_lock``
+        (entered via :meth:`run_once`)."""
         # Startup-race guard: the run_loop is started right after construction, but
         # startup wires the real simulator a bit LATER (ctx.benchmark_worker._simulator).
         # A docker benchmark that runs before the simulator is attached falls to the

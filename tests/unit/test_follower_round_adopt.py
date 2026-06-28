@@ -381,3 +381,58 @@ def test_sync_abort_never_adopts_unknown_round(fresh_store):
     assert current is not None
     assert current.round_id == "round-e1-n1"
     assert current.status == RoundStatus.OPEN
+
+
+def test_certify_prep_with_candidate_transitions_closed_to_certifying(fresh_store):
+    """REGRESSION: a follower accepting the leader's proposal. With the leader's candidate
+    (which the proposal endpoint now passes), prepare SKIPS evaluate_round and goes
+    CLOSED -> CERTIFYING. Without the candidate it ran the full evaluate flow — a no-op on
+    a follower (no benchmark worker, #385) — leaving the round CLOSED so the proposal gate
+    rejected it ('is closed; expected certifying') and the quorum could never form."""
+    import asyncio
+    import time as _time
+
+    from minotaur_subnet.harness.submission_store import (
+        SubmissionStore, Submission, SubmissionStatus,
+    )
+    from minotaur_subnet.api.routes.submissions.champion_consensus import (
+        _maybe_prepare_round_for_certification,
+    )
+
+    prev_store = getattr(state, "_store", None)
+    prev_mgr = getattr(state, "_epoch_manager", None)
+    try:
+        cand = Submission(
+            submission_id="sub_cand", repo_url="https://github.com/test/solver",
+            commit_hash="abc123", epoch=500, hotkey="5Gtest", round_id="round-e500-n1",
+            status=SubmissionStatus.SCORED, created_at=_time.time(), updated_at=_time.time(),
+            image_tag="solver:v1", image_id="sha256:" + "c" * 64, solver_name="top-miner",
+            solver_version="1.0.0", benchmark_score=0.48, benchmark_rank=1,
+            benchmark_details={"total_intents": 5},
+        )
+        sub_store = SubmissionStore()
+        sub_store._submissions["sub_cand"] = cand
+        state.set_store(sub_store)
+        state.set_epoch_manager(None)  # follower: evaluate can't/ won't run
+
+        fresh_store.ensure_open_round(opened_epoch=500)
+        fresh_store.close_current_round(
+            close_epoch=500, benchmark_pack_hash="pack",
+            committee_hash="0xc", quorum_required=2,
+        )
+
+        result = asyncio.run(
+            _maybe_prepare_round_for_certification(
+                "round-e500-n1",
+                candidate_submission_id="sub_cand",
+                close_epoch=500, benchmark_pack_hash="pack",
+                committee_hash="0xc", quorum_required=2,
+            )
+        )
+        # Transitioned to CERTIFYING with the leader's candidate — gate would now pass.
+        assert result.status == RoundStatus.CERTIFYING
+        assert result.finalist_submission_id == "sub_cand"
+    finally:
+        if prev_store is not None:
+            state.set_store(prev_store)
+        state.set_epoch_manager(prev_mgr)
