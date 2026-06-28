@@ -2656,9 +2656,21 @@ async def initialize(ctx: ServerContext) -> dict:
                         if current is not None and await _maybe_abort_expired_round(current):
                             continue
 
-                        if current is not None and current.status in (
-                            RoundStatus.CLOSED,
-                            RoundStatus.REPLAYING,
+                        # Only the LEADER drives evaluation (replay → certify/abort).
+                        # A non-leader (e.g. a third-party validator running the
+                        # coordinator) must follow the leader's synced outcome, not
+                        # evaluate independently — otherwise, with no benchmark worker, it
+                        # aborts the round locally and the fleet rejects the leader's
+                        # certification (ROUND_WRONG_STATE → fleet-abort, no quorum).
+                        # evaluate_round itself also no-ops for non-leaders (defense in
+                        # depth); skipping the branch here avoids a per-tick no-op + spam.
+                        if (
+                            current is not None
+                            and _is_solver_round_leader()
+                            and current.status in (
+                                RoundStatus.CLOSED,
+                                RoundStatus.REPLAYING,
+                            )
                         ):
                             if not _solver_round_epoch_reached(current.close_epoch):
                                 await asyncio.sleep(solver_round_poll_interval)
