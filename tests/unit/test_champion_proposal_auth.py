@@ -205,3 +205,60 @@ def test_rate_limit_segments_by_signer_and_round(monkeypatch):
     assert _champion_proposal_rate_limit_check(b3) is None
     # Now re-sending b1 immediately is blocked.
     assert _champion_proposal_rate_limit_check(b1) is not None
+
+
+# ── End-to-end sign → parse → verify (the real quorum path) ──────────────────
+# The tests above sign over body.model_dump() directly, so they CANNOT catch a
+# mismatch between the leader's signed payload (PeerNetwork raw dict) and the
+# verifier's canonical (model_dump). These exercise the real path.
+
+def _proposal(**ov):
+    from types import SimpleNamespace
+    base = dict(
+        round_id="round-1", committee_hash="committee", incumbent_image_id=None,
+        candidate_submission_id="sub_x", candidate_image_id="a" * 64,
+        benchmark_pack_hash="pack", shadow_case_log_hash=None, effective_epoch=6,
+        commit_hash="c" * 40, nonce=123, deadline=456,
+    )
+    base.update(ov)
+    return SimpleNamespace(**base)
+
+
+def _peer_net():
+    from eth_account import Account
+    from minotaur_subnet.consensus.peer_network import ValidatorPeerNetwork
+    acct = Account.create()
+    net = ValidatorPeerNetwork(validator_id=acct.address, private_key=acct.key.hex(),
+                               consensus=MagicMock(), peers=[])
+    return net, acct
+
+
+def test_champion_proposal_sign_then_model_parse_then_verify(monkeypatch, unlock_leader):
+    """REGRESSION: leader builds+signs via PeerNetwork, follower PARSES into the request
+    model and verifies. A non-model field in the signed payload (the old `timestamp`)
+    is dropped by model_dump on the verify side → signer mismatch. This is the exact
+    live quorum path; before the fix it failed with 'Signer mismatch'."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
+    monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
+    from minotaur_subnet.api.routes.submissions.models import ChampionConsensusProposalRequest
+
+    net, _acct = _peer_net()
+    payload = net._build_champion_proposal_payload(
+        _proposal(), close_epoch=7, quorum_required=2,
+        decision_deadline_epoch=8, committee_block=9,
+    )
+    assert payload.get("proposer_signature")            # the leader signed it
+    body = ChampionConsensusProposalRequest(**payload)   # the follower's parse (drops extras)
+    assert _verify_champion_proposal_signature(body) is None  # recovery == leader
+
+
+def test_champion_proposal_payload_has_no_non_model_fields():
+    """STRUCTURAL GUARD: every signed-payload key must be a request-model field, else
+    model_dump() drops it on verify and breaks the signature (the timestamp bug).
+    Prevents re-introducing a non-model field into the signed canonical."""
+    from minotaur_subnet.api.routes.submissions.models import ChampionConsensusProposalRequest
+
+    net, _acct = _peer_net()
+    payload = net._build_champion_proposal_payload(_proposal())
+    extra = set(payload) - set(ChampionConsensusProposalRequest.model_fields.keys())
+    assert not extra, f"signed payload has non-model fields (dropped on verify): {extra}"
