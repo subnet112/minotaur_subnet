@@ -1053,6 +1053,15 @@ async def solver_round_consensus_proposal(
             quorum_required=body.quorum_required,
             decision_deadline_epoch=body.decision_deadline_epoch,
             effective_epoch=body.effective_epoch,
+            # Pass the leader's candidate so prepare SKIPS evaluate_round and
+            # transitions the round straight to CERTIFYING with that candidate (same
+            # as the leader's own certify path). Without it, prepare runs the full
+            # evaluate flow — which is a no-op on a follower (no benchmark worker; see
+            # #385), leaving the round CLOSED so the gate below rejects the proposal
+            # ("is closed; expected certifying") and the quorum can never form. The
+            # proposal is leader-sig-verified (_verify_champion_proposal_signature)
+            # before this, so adopting the leader's candidate here is authorized.
+            candidate_submission_id=body.candidate_submission_id,
         )
     except HTTPException as exc:
         if exc.status_code == 404:
