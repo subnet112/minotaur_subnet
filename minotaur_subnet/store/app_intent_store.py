@@ -121,6 +121,10 @@ def _definition_from_dict(d: dict[str, Any]) -> AppIntentDefinition:
         version=d.get("version", "1.0.0"),
         intent_type=d["intent_type"],
         js_code=d.get("js_code", ""),
+        # SHADOW raw-output scoring JS; missing in pre-shadow rows -> None (the
+        # save side serializes it automatically via asdict, so this load is the
+        # only round-trip wiring needed and stays backward compatible).
+        shadow_js_code=d.get("shadow_js_code"),
         solidity_code=d.get("solidity_code"),
         config=config,
         deployer=d.get("deployer", ""),

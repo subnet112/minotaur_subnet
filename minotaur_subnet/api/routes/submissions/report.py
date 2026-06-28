@@ -158,6 +158,38 @@ def build_submission_report(
             "shadow_cases": 0,  # P3: real public/shadow split (inert until shadow ships)
         },
     }
+
+    # ── SHADOW (observe-only) relative per-order verdict ──
+    # Compare the challenger vs the champion per order on the RAW delivered output
+    # (per_intent[*].shadow_score) via the relative rule. Purely informational —
+    # added alongside the existing fields, removed nothing. Tolerates missing
+    # shadow_scores (then every order is "skip" and the verdict is reject/no-data).
+    try:
+        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+
+        champ_per_intent = (champion_details or {}).get("per_intent") or []
+        rel = evaluate_relative_adoption(champ_per_intent, per_intent)
+        report["shadow_relative"] = {
+            "adopt": rel["adopt"],
+            "reason": rel["reason"],
+            "n_wins": rel["n_wins"],
+            "n_regressions": rel["n_regressions"],
+            "n_blind_spots": rel["n_blind_spots"],
+            "n_matched": rel["n_matched"],
+            "scenarios_compared": rel["scenarios_compared"],
+            "per_order": [
+                {
+                    "intent_id": o["intent_id"],
+                    "champ": o["champ"],
+                    "chal": o["chal"],
+                    "verdict": o["verdict"],
+                }
+                for o in rel["per_order"]
+            ],
+        }
+    except Exception:  # observe-only — must never break the report
+        pass
+
     if rejected_in_screening:
         report["screening"] = screening
     return report

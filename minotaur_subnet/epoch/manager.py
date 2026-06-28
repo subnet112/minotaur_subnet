@@ -1126,6 +1126,30 @@ class EpochManager:
         )
         logger.info("adoption decision for %s: adopt=%s (%s)",
                     getattr(challenger, "submission_id", "?"), adopt, reason)
+
+        # SHADOW (observe-only) relative per-order adoption. Compute the NEW
+        # rule's verdict beside the live one, log whether they AGREE, and publish
+        # it on /health — changing NOTHING unless relative_scoring_active() flips
+        # the relative verdict authoritative. Never raises into the live path.
+        from minotaur_subnet.epoch.relative_scoring import (
+            relative_scoring_active,
+            relative_scoring_shadow_enabled,
+        )
+        if relative_scoring_shadow_enabled():
+            shadow = self._evaluate_shadow_per_order(challenger, live_adopt=adopt)
+            if (
+                shadow is not None
+                and shadow.get("scenarios_compared", 0) > 0
+                and relative_scoring_active()
+            ):
+                logger.warning(
+                    "[shadow-per-order-adoption] RELATIVE_SCORING_ENABLED is ON — "
+                    "relative verdict %s OVERRIDES live verdict %s for %s",
+                    "ADOPT" if shadow["adopt"] else "REJECT",
+                    "ADOPT" if adopt else "REJECT",
+                    getattr(challenger, "submission_id", "?"),
+                )
+                return bool(shadow["adopt"])
         return adopt
 
     def _should_adopt_onchain(self, challenger: Submission) -> bool:
@@ -1185,6 +1209,79 @@ class EpochManager:
             )
         except Exception as exc:  # observe-only — must never break the live decision
             logger.warning("[shadow-determinism] failed (ignored): %s", exc)
+
+    @staticmethod
+    def _per_intent(submission: Submission | None) -> list[dict[str, Any]]:
+        """Per-order benchmark rows (with ``shadow_score``) from a submission's
+        ``benchmark_details``. Empty list when absent — the relative rule then
+        sees no orders and abstains (adopt=False, scenarios_compared=0)."""
+        details = getattr(submission, "benchmark_details", None) or {}
+        rows = details.get("per_intent") if isinstance(details, dict) else None
+        return rows if isinstance(rows, list) else []
+
+    def _evaluate_shadow_per_order(
+        self, challenger: Submission, *, live_adopt: bool,
+    ) -> dict[str, Any] | None:
+        """Observe-only relative per-order adoption shadow (RELATIVE_SCORING_SHADOW).
+
+        Joins the freshly re-benched incumbent's and the challenger's per-order
+        RAW shadow outputs (``benchmark_details.per_intent[*].shadow_score``) via
+        the pure :func:`evaluate_relative_adoption`, logs the relative verdict +
+        whether it AGREES with the live aggregate decision, and publishes it on
+        ``/health`` (``ctx.last_shadow_per_order_vote``). Returns the verdict dict
+        (or None on error). Has NO effect on the live decision — the caller only
+        consults it when ``relative_scoring_active()`` is separately ON.
+        """
+        try:
+            from minotaur_subnet.epoch.relative_scoring import (
+                evaluate_relative_adoption,
+            )
+
+            incumbent_sub = (
+                self._sub_store.get(self._champion.submission_id)
+                if (self._sub_store and self._champion.submission_id)
+                else None
+            )
+            champ_rows = self._per_intent(incumbent_sub)
+            chal_rows = self._per_intent(challenger)
+            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+
+            agrees = bool(verdict["adopt"]) == bool(live_adopt)
+            logger.info(
+                "[shadow-per-order-adoption] challenger=%s relative=%s live=%s "
+                "agree=%s wins=%d regressions=%d blind_spots=%d matched=%d "
+                "compared=%d: %s",
+                getattr(challenger, "submission_id", "?"),
+                "ADOPT" if verdict["adopt"] else "REJECT",
+                "ADOPT" if live_adopt else "REJECT",
+                agrees,
+                verdict["n_wins"], verdict["n_regressions"],
+                verdict["n_blind_spots"], verdict["n_matched"],
+                verdict["scenarios_compared"], verdict["reason"],
+            )
+
+            vote = {
+                "candidate_id": getattr(challenger, "submission_id", None),
+                "relative_vote": "ADOPT" if verdict["adopt"] else "REJECT",
+                "live_vote": "ADOPT" if live_adopt else "REJECT",
+                "agree": agrees,
+                "n_wins": verdict["n_wins"],
+                "n_regressions": verdict["n_regressions"],
+                "n_blind_spots": verdict["n_blind_spots"],
+                "n_matched": verdict["n_matched"],
+                "scenarios_compared": verdict["scenarios_compared"],
+                "reason": verdict["reason"],
+                "per_order": verdict["per_order"],
+            }
+            try:
+                from minotaur_subnet.api.server_context import ctx
+                ctx.last_shadow_per_order_vote = dict(vote)
+            except Exception:  # observe-only — publishing must never break adoption
+                pass
+            return verdict
+        except Exception as exc:  # observe-only — must never break the live decision
+            logger.warning("[shadow-per-order-adoption] failed (ignored): %s", exc)
+            return None
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
         """Extract the scorecard from a submission's benchmark details."""
