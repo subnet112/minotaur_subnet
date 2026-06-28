@@ -822,6 +822,7 @@ class BenchmarkWorker:
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
                 reference_quotes=reference_quotes,
+                session_factory=lambda: orch.start_docker(image_tag),
             )
             return results
         finally:
@@ -846,6 +847,7 @@ class BenchmarkWorker:
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
                 reference_quotes=reference_quotes,
+                session_factory=lambda: orch.start_subprocess(solver_path),
             )
             return results
         finally:
@@ -1452,6 +1454,7 @@ class BenchmarkWorker:
                     simulator=self._simulator, require_real_sim=_require_real_sim,
                     fork_block=self._epoch_block_number,
                     reference_quotes=reference_quotes,
+                    session_factory=lambda: orch.start_docker(image),
                 )
             finally:
                 await sess.shutdown()

@@ -38,7 +38,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from minotaur_subnet.shared.types import (
     AppIntentDefinition,
@@ -208,6 +208,10 @@ class _BenchmarkRuntime:
     """
     session: "SolverSession"
     proxy_session_id: str | None = None
+    # The per-runtime init_config (with THIS runtime's proxy rpc_urls), so a
+    # mid-run respawn re-initializes through the same proxy/budget — never
+    # another runtime's.
+    init_config: "dict[str, Any] | None" = None
 
 
 # Type alias for the scoring callback
@@ -967,6 +971,80 @@ def _pin_solver_read_block_enabled() -> bool:
     )
 
 
+# Proxy registry cap (rpc_budget_proxy.proxy.MAX_SESSIONS) minus one — the hard
+# ceiling on concurrent benchmark runtimes, since each runtime opens one proxy
+# session. The practical recommendation is far lower (2-4); see BENCHMARK_CONCURRENCY.
+_BENCHMARK_MAX_CONCURRENCY = 63
+
+
+def _benchmark_concurrency() -> int:
+    """Number of isolated solver runtimes to shard the benchmark corpus across.
+
+    The benchmark is network-latency-bound (solver quoting + pinned RPC reads on a
+    ~90%-idle CPU), so K runtimes run scenarios concurrently for roughly K x on that
+    segment. Default ``1`` = the byte-identical legacy single-runtime path — the
+    KILL-SWITCH: set ``BENCHMARK_CONCURRENCY=1`` (or unset) to instantly revert with
+    zero code change.
+
+    Per-VALIDATOR, NOT consensus: K is never folded into ``benchmark_pack_hash`` (scores
+    are order-independent and written back by input index), so a fleet running mixed K
+    computes identical pack hashes and identical scores — no fleet coordination needed.
+    Clamped to ``[1, _BENCHMARK_MAX_CONCURRENCY]`` (the proxy registry cap).
+    """
+    raw = os.environ.get("BENCHMARK_CONCURRENCY", "1").strip()
+    try:
+        k = int(raw)
+    except ValueError:
+        return 1
+    return max(1, min(k, _BENCHMARK_MAX_CONCURRENCY))
+
+
+async def _provision_extra_runtime(
+    sess: "SolverSession",
+    *,
+    base_rpc_map: dict[int, str],
+    pin_blocks: dict[str, int] | None,
+    read_proxy: Any | None,
+    fork_block: int | None,
+    init_config_base: dict[str, Any],
+    intents_len: int,
+) -> tuple["_BenchmarkRuntime", str | None]:
+    """Provision one ADDITIONAL benchmark runtime (only when BENCHMARK_CONCURRENCY > 1).
+
+    Mirrors the primary session's setup so every runtime reads the SAME pinned state
+    with its OWN isolated budget — the determinism requirement: each runtime opens its
+    own block-pin proxy session (distinct id, since ``id(sess)`` differs per session,
+    SAME ``pin_blocks``/budget), routes its reads through it, then initializes the solver
+    and signals benchmark start. The per-session ``init_config`` is stored on the runtime
+    so a mid-run respawn re-initializes through the SAME proxy (never another runtime's
+    budget). Raises on proxy/init failure; the caller degrades gracefully to fewer
+    runtimes and shuts the failed session down.
+    """
+    proxy_session_id: str | None = None
+    rpc_map = dict(base_rpc_map)
+    init_config = dict(init_config_base)
+    if read_proxy is not None and pin_blocks:
+        proxy_session_id = f"bench-{id(sess):x}-{fork_block}"
+        rec = await open_session(read_proxy, proxy_session_id, pin_blocks)
+        for cid in list(rpc_map):
+            if cid in read_proxy.chain_ids and cid in CHAIN_NAMES:
+                rpc_map[cid] = proxy_rpc_url(read_proxy, proxy_session_id, cid)
+        logger.info(
+            "[benchmark] solver reads routed via block-pin proxy session=%s pinned=%s",
+            proxy_session_id, rec.get("blocks"),
+        )
+    if rpc_map:
+        init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
+    await sess.initialize(init_config)
+    await sess.on_benchmark_start(intents_len)
+    return (
+        _BenchmarkRuntime(
+            session=sess, proxy_session_id=proxy_session_id, init_config=init_config,
+        ),
+        proxy_session_id,
+    )
+
+
 async def run_benchmark(
     session: SolverSession,
     intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -977,6 +1055,8 @@ async def run_benchmark(
     fork_block: int | None = None,
     require_real_sim: bool = False,
     reference_quotes: dict[str, dict[str, str]] | None = None,
+    session_factory: "Callable[[], Awaitable[SolverSession]] | None" = None,
+    session_count: int | None = None,
 ) -> list[BenchmarkResult]:
     """Run a complete benchmark against a solver session.
 
@@ -1048,6 +1128,9 @@ async def run_benchmark(
     # pools → false "No route" → corrupt scores) — so when real simulation is
     # required, FAIL LOUD rather than score on degraded data.
     rpc_map = build_rpc_url_map(config.chain_ids)
+    # Pre-proxy snapshot — extra runtimes (K>1) re-route this base map through
+    # their own proxy sessions (the primary session mutates rpc_map in place below).
+    base_rpc_map = dict(rpc_map)
     missing_rpc = [c for c in config.chain_ids if c not in rpc_map]
     if missing_rpc:
         msg = (
@@ -1066,6 +1149,7 @@ async def run_benchmark(
     # the timeout + cross-host non-determinism source). Inert unless set.
     _read_proxy = read_proxy_config()
     _proxy_session_id: str | None = None
+    pin_blocks: dict[str, int] | None = None
     # Safety net (closes the silent-anvil determinism channel): the proxy IS the
     # deterministic read path. If it's configured but we have no fork_block to pin to,
     # refuse to benchmark via the raw, un-pinned anvil — defer LOUD rather than silently
@@ -1123,6 +1207,9 @@ async def run_benchmark(
                 rec.get("blocks"),
             )
 
+    # Snapshot init_config BEFORE the primary session's proxy rpc_urls are added —
+    # extra runtimes (K>1) each route through their OWN proxy session.
+    init_config_base = dict(init_config)
     if rpc_map:
         init_config["rpc_urls"] = {str(k): v for k, v in rpc_map.items()}
     await session.initialize(init_config)
@@ -1140,40 +1227,91 @@ async def run_benchmark(
     # Signal benchmark start
     await session.on_benchmark_start(len(intents))
 
-    # Run all scenarios through the pool. K=1 (a single runtime over this
-    # session + its proxy + the shared simulator) is byte-identical to the
-    # legacy sequential loop; additional runtimes (provisioned by the caller
-    # — step 2b) shard the corpus concurrently. Scores are order-independent
-    # and written back by input index (see _run_scenarios).
-    runtimes = [_BenchmarkRuntime(session=session, proxy_session_id=_proxy_session_id)]
-    results = await _run_scenarios(
-        intents,
-        runtimes=runtimes,
-        simulator=simulator,
-        init_config=init_config,
-        read_proxy=_read_proxy,
-        config=config,
-        score_fn=score_fn,
-        fork_block=fork_block,
-        require_real_sim=require_real_sim,
-        reference_quotes=reference_quotes,
-        trigger_ground_truth=trigger_ground_truth,
-    )
-
-    # Signal benchmark end with final scores
-    summary = [
-        {"intent_id": r.intent_id, "score": r.score, "elapsed_ms": r.elapsed_ms}
-        for r in results
+    # The primary runtime (the caller's session + its proxy). K=1 (default) runs ONLY
+    # this one — byte-identical to the legacy sequential loop. K>1 provisions K-1
+    # ADDITIONAL isolated runtimes (own solver subprocess + own proxy session + own
+    # budget) and shards the corpus across them; scores stay order-independent and are
+    # written back by input index, and K is NOT folded into the pack hash, so a fleet on
+    # mixed K computes identical scores. See _benchmark_concurrency / BENCHMARK_CONCURRENCY.
+    runtimes = [
+        _BenchmarkRuntime(
+            session=session, proxy_session_id=_proxy_session_id, init_config=init_config,
+        )
     ]
-    try:
-        await session.on_benchmark_end(summary)
-    except (SolverTimeoutError, SolverCrashedError):
-        pass
+    proxy_ids: list[str | None] = [_proxy_session_id]
+    spawned_sessions: list[SolverSession] = []
+    effective_k = session_count if session_count is not None else _benchmark_concurrency()
+    effective_k = max(1, min(effective_k, _BENCHMARK_MAX_CONCURRENCY))
+    if effective_k > 1 and session_factory is None:
+        logger.warning(
+            "[benchmark] BENCHMARK_CONCURRENCY=%d but no session_factory provided; "
+            "running a single runtime", effective_k,
+        )
+    elif effective_k > 1:
+        try:
+            for _ in range(effective_k - 1):
+                extra = await session_factory()
+                spawned_sessions.append(extra)
+                rt, pid = await _provision_extra_runtime(
+                    extra,
+                    base_rpc_map=base_rpc_map,
+                    pin_blocks=pin_blocks,
+                    read_proxy=_read_proxy,
+                    fork_block=fork_block,
+                    init_config_base=init_config_base,
+                    intents_len=len(intents),
+                )
+                runtimes.append(rt)
+                proxy_ids.append(pid)
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully, never abort the run
+            logger.error(
+                "[benchmark] failed to provision an extra runtime (%s); continuing "
+                "with %d runtime(s)", exc, len(runtimes),
+            )
+        if len(runtimes) > 1:
+            logger.info(
+                "[benchmark] scenario pool: %d concurrent runtimes (BENCHMARK_CONCURRENCY)",
+                len(runtimes),
+            )
 
-    # Close the block-pin proxy session (best-effort; the proxy also caps its
-    # registry so an exception-path skip can't leak unboundedly).
-    if _proxy_session_id is not None and _read_proxy is not None:
-        await close_session(_read_proxy, _proxy_session_id)
+    try:
+        results = await _run_scenarios(
+            intents,
+            runtimes=runtimes,
+            simulator=simulator,
+            init_config=init_config,
+            read_proxy=_read_proxy,
+            config=config,
+            score_fn=score_fn,
+            fork_block=fork_block,
+            require_real_sim=require_real_sim,
+            reference_quotes=reference_quotes,
+            trigger_ground_truth=trigger_ground_truth,
+        )
+
+        # Signal benchmark end with final scores (on each runtime's session).
+        summary = [
+            {"intent_id": r.intent_id, "score": r.score, "elapsed_ms": r.elapsed_ms}
+            for r in results
+        ]
+        for rt in runtimes:
+            try:
+                await rt.session.on_benchmark_end(summary)
+            except (SolverTimeoutError, SolverCrashedError):
+                pass
+    finally:
+        # Close every proxy session (best-effort) and shut down the sessions THIS call
+        # spawned (the caller still owns the primary `session`).
+        for pid in proxy_ids:
+            if pid is not None and _read_proxy is not None:
+                try:
+                    await close_session(_read_proxy, pid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[benchmark] proxy close failed for %s: %s", pid, exc)
+        if spawned_sessions:
+            await asyncio.gather(
+                *(s.shutdown() for s in spawned_sessions), return_exceptions=True,
+            )
     return results
 
 
@@ -1445,7 +1583,7 @@ async def _scenario_pool_worker(
             return False
         try:
             await session.restart()
-            await session.initialize(init_config)
+            await session.initialize(runtime.init_config or init_config)
             await session.on_benchmark_start(intents_len)
             respawns += 1
             return True
