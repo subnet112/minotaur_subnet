@@ -328,6 +328,17 @@ class UpdateScoringRequest(BaseModel):
     deadline: int = Field(0, description="Unix-seconds expiry the signature was signed with.")
 
 
+class UpdateShadowScoringRequest(BaseModel):
+    new_js_code: str = Field(..., description="New SHADOW (observe-only) raw-output JS scoring source")
+    caller: str = Field("", description="Deprecated, ignored. Authorization is by `signature`.")
+    signature: str = Field("", description="EIP-712 developer-auth signature from the app's deployer "
+                           "(required if a deployer was set). Same binding as update_scoring "
+                           "(action=update_scoring, app_id, keccak(new_js_code), nonce, deadline).")
+    nonce: int = Field(0, description="Deployer's next developer-auth nonce (GET /apps/{id}/auth-nonce). "
+                       "Must equal last_consumed + 1; consumed once on success.")
+    deadline: int = Field(0, description="Unix-seconds expiry the signature was signed with.")
+
+
 class DeployRequest(BaseModel):
     """Optional body for POST /apps/{id}/deploy. When the payment fields are set,
     the deploy is treated as payment-backed (a public/3rd-party deploy) and
@@ -535,6 +546,27 @@ def update_scoring(
     ``_require_admin``).
     """
     return _tools.update_scoring(
+        _store(), app_id, body.new_js_code,
+        caller=body.caller,
+        signature=body.signature,
+        nonce=body.nonce,
+        deadline=body.deadline,
+    )
+
+
+@router.put("/apps/{app_id}/scoring-shadow", dependencies=[Depends(_require_admin)])
+def update_shadow_scoring(
+    app_id: str,
+    body: UpdateShadowScoringRequest,
+) -> dict[str, Any]:
+    """Set the SHADOW (observe-only) raw-output scoring JS for an App Intent.
+
+    Mirrors ``PUT /apps/{app_id}/scoring`` (same admin + deployer-auth shape) but
+    writes ``shadow_js_code``, which validators run ALONGSIDE the live JS. It
+    changes nothing about live scoring or adoption until RELATIVE_SCORING_ENABLED
+    is flipped on. Requires X-Admin-Key unless in LOCAL_TESTNET dev mode.
+    """
+    return _tools.update_shadow_scoring(
         _store(), app_id, body.new_js_code,
         caller=body.caller,
         signature=body.signature,

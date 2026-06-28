@@ -189,6 +189,11 @@ class BenchmarkResult:
     error: str | None = None
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
+    # SHADOW (observe-only) raw delivered output from the parallel shadow JS run
+    # (relative_scoring). None when shadow scoring is off or the app has no
+    # shadow_js_code; 0.0 when the order delivered nothing / fell below min. NEVER
+    # feeds the live score — additive only.
+    shadow_score: float | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
@@ -1500,6 +1505,11 @@ async def _process_scenario(
                     )
                     br.plan_score = score_result.score
                     br.score_breakdown = score_result.breakdown
+                    # SHADOW (observe-only): the dual-load score_fn attaches the
+                    # raw-output shadow score to the returned ScoreResult when
+                    # relative-scoring shadow is on + the app has shadow JS;
+                    # absent otherwise -> stays None. Never affects br.score.
+                    br.shadow_score = getattr(score_result, "shadow_score", None)
 
                     # Compute composite score for auto-triggered intents
                     if is_auto and br.trigger_decision is not None:
