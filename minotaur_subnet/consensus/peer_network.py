@@ -478,7 +478,12 @@ class ValidatorPeerNetwork:
             "nonce": int(getattr(proposal, "nonce", 0) or 0),
             "deadline": int(getattr(proposal, "deadline", 0) or 0),
             "proposer": self.validator_id,
-            "timestamp": time.time(),
+            # NB: every key here MUST be a field of ChampionConsensusProposalRequest.
+            # The follower verifies the signature over body.model_dump() (model fields
+            # only), so any extra key would be in the SIGNED canonical here but DROPPED
+            # on the verify side → signer mismatch. A non-deterministic `timestamp` here
+            # made the recovered signer wrong AND varying per attempt, so followers
+            # rejected every champion proposal (quorum could never be reached). Removed.
         }
 
         # Sign the canonical JSON of the payload so peers can verify the
