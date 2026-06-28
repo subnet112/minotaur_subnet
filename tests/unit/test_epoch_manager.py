@@ -700,6 +700,49 @@ class TestEpochManager:
         assert mgr.champion.submission_id is None
 
     @pytest.mark.asyncio
+    async def test_evaluate_round_is_noop_on_follower(self):
+        """A non-leader must NOT evaluate/transition a round — it follows the leader's
+        synced outcome. Same setup as the finalist test (a winnable closed round), but
+        as a FOLLOWER evaluate_round is a no-op: the round stays CLOSED, no finalist, no
+        abort. Regression for the fleet-wide bug where third-party validators ran the
+        coordinator (default ON) with no benchmark worker → aborted every round locally
+        ('no_champion_candidate') → the fleet rejected the leader's cert (ROUND_WRONG_STATE
+        → fleet-abort) and quorum never formed."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=4)
+        round_store.close_current_round(
+            close_epoch=4,
+            benchmark_pack_hash="pack-4",
+            committee_hash="committee-4",
+            quorum_required=2,
+        )
+        sub = _make_submission(
+            submission_id="sub_finalist",
+            epoch=4,
+            round_id=current_round.round_id,
+            score=0.93,
+        )
+        store = _make_store_with_subs(sub)
+        worker = _make_mock_benchmark_worker()
+
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+        mgr.set_leader_check(lambda: False)  # this node is a FOLLOWER
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        updated_round = round_store.get_round(current_round.round_id)
+        # No status transition (would have gone CERTIFYING as leader); follow the sync.
+        assert updated_round.status == RoundStatus.CLOSED
+        assert result["status_after"] == RoundStatus.CLOSED.value
+        assert result["finalist_submission_id"] is None
+        assert result["abort_reason"] is None
+        assert updated_round.abort_reason is None
+
+    @pytest.mark.asyncio
     async def test_activate_certified_round_adopts_finalist(self):
         """Certified finalists activate only through the explicit activation path."""
         round_store = RoundStore()
