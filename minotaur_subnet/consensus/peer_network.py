@@ -83,6 +83,14 @@ class ValidatorPeerNetwork:
         self._default_headers = dict(default_headers or {})
         self._peer_url_transform = peer_url_transform
         self._session: aiohttp.ClientSession | None = None
+        # Result summary of the most recent champion-proposal broadcast, read by
+        # the coordinator's cert handler for restart recovery: when the reachable
+        # fleet rejects with ROUND_WRONG_STATE (the round they hold is aborted —
+        # e.g. the leader replayed a round the fleet moved past after a restart),
+        # the leader accepts that verdict and advances instead of looping the
+        # doomed cert until the deadline. Shape: {"round_id": str, "approvals":
+        # int, "dissent_codes": list[str], "fleet_aborted": bool}.
+        self.last_champion_broadcast: dict[str, Any] | None = None
 
     @property
     def private_key(self) -> str:
@@ -331,9 +339,13 @@ class ValidatorPeerNetwork:
             committee_block=committee_block,
         )
 
+        dissent_codes: list[str] = []
+
         async def _send_with_peer(peer: PeerEndpoint) -> tuple[PeerEndpoint, ChampionApproval | Exception | None]:
             try:
-                result = await self._send_champion_proposal(peer, payload, path=path)
+                result = await self._send_champion_proposal(
+                    peer, payload, path=path, dissent_sink=dissent_codes,
+                )
                 return peer, result
             except Exception as exc:  # pragma: no cover - defensive
                 return peer, exc
@@ -358,9 +370,29 @@ class ValidatorPeerNetwork:
             if collector is not None:
                 collector.receive_approval(result)
 
+        # Restart-recovery signal: the reachable fleet rejected this proposal AND
+        # every rejection was ROUND_WRONG_STATE — i.e. the round the fleet holds is
+        # aborted, so the leader is out of sync (it replayed a round the fleet moved
+        # past). Conservative: requires zero approvals and that EVERY responding peer
+        # said ROUND_WRONG_STATE (a single different reason → real disagreement, not a
+        # stale round → don't trip). Network errors aren't dissents, so they never
+        # set this. The coordinator reads it to abort + advance instead of looping.
+        from minotaur_subnet.consensus.dissent import RejectionCode
+        fleet_aborted = (
+            not approvals
+            and bool(dissent_codes)
+            and all(c == RejectionCode.ROUND_WRONG_STATE.value for c in dissent_codes)
+        )
+        self.last_champion_broadcast = {
+            "round_id": str(getattr(proposal, "round_id", "")),
+            "approvals": len(approvals),
+            "dissent_codes": dissent_codes,
+            "fleet_aborted": fleet_aborted,
+        }
         logger.info(
-            "Champion broadcast complete: %d/%d approvals collected",
+            "Champion broadcast complete: %d/%d approvals collected%s",
             len(approvals), len(peers),
+            " — fleet reports round aborted" if fleet_aborted else "",
         )
         return approvals
 
@@ -478,7 +510,12 @@ class ValidatorPeerNetwork:
             "nonce": int(getattr(proposal, "nonce", 0) or 0),
             "deadline": int(getattr(proposal, "deadline", 0) or 0),
             "proposer": self.validator_id,
-            "timestamp": time.time(),
+            # NB: every key here MUST be a field of ChampionConsensusProposalRequest.
+            # The follower verifies the signature over body.model_dump() (model fields
+            # only), so any extra key would be in the SIGNED canonical here but DROPPED
+            # on the verify side → signer mismatch. A non-deterministic `timestamp` here
+            # made the recovered signer wrong AND varying per attempt, so followers
+            # rejected every champion proposal (quorum could never be reached). Removed.
         }
 
         # Sign the canonical JSON of the payload so peers can verify the
@@ -612,8 +649,14 @@ class ValidatorPeerNetwork:
         payload: dict[str, Any],
         *,
         path: str,
+        dissent_sink: list[str] | None = None,
     ) -> ChampionApproval | None:
-        """Send a champion certification proposal to a single peer."""
+        """Send a champion certification proposal to a single peer.
+
+        ``dissent_sink``: when provided, the peer's rejection ``reason_code`` is
+        appended on a dissent so the broadcaster can tell whether the fleet
+        rejected because their round is in the wrong state (aborted).
+        """
         url = f"{peer.url.rstrip('/')}/{path.lstrip('/')}"
         try:
             async with self._session.post(  # type: ignore[union-attr]
@@ -654,6 +697,8 @@ class ValidatorPeerNetwork:
                         subject_id=round_id_for_log,
                         reason=reason_text,
                     )
+                    if dissent_sink is not None:
+                        dissent_sink.append(str(getattr(code, "value", code)))
                     return None
 
                 data = await resp.json()
@@ -662,13 +707,16 @@ class ValidatorPeerNetwork:
                         "Peer %s declined champion certification: %s",
                         peer.validator_id[:10], data.get("reason", "unknown"),
                     )
+                    _declined_code = data.get("reason_code") or RejectionCode.UNKNOWN
                     record_dissent(
                         peer_id=peer.validator_id,
-                        code=data.get("reason_code") or RejectionCode.UNKNOWN,
+                        code=_declined_code,
                         subject_kind="round",
                         subject_id=round_id_for_log,
                         reason=str(data.get("reason", "")),
                     )
+                    if dissent_sink is not None:
+                        dissent_sink.append(str(getattr(_declined_code, "value", _declined_code)))
                     return None
 
                 return ChampionApproval(

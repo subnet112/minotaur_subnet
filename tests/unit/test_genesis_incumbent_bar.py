@@ -210,6 +210,49 @@ def test_refresh_scores_incumbent_via_challenger_path():
     assert args[0] == "sub_real" and kw["score"] == 0.52
 
 
+def test_refresh_prefers_pullable_digest_over_local_screening_tag():
+    """REGRESSION: the local `solver-<sha>:screening` tag is host-local and gets pruned,
+    after which the per-round incumbent re-benchmark crashes (image not found / not
+    pullable) → STALE bar → the leader abstains and NO challenger can ever dethrone the
+    champion. The re-score must prefer the PULLABLE image_digest so docker re-fetches the
+    identical image on any host and the bar stays current."""
+    import asyncio
+    from minotaur_subnet.epoch.manager import ChampionInfo
+
+    DIGEST = "ghcr.io/subnet112/minotaur-solver@sha256:" + "a" * 64
+    real = SimpleNamespace(
+        submission_id="sub_real", solver_name="x", solver_version="1",
+        benchmark_score=0.7, epoch=3,
+        image_tag="solver-deadbeef:screening",   # host-local, prunable
+        image_digest=DIGEST,                      # content-addressed, pullable
+        hotkey="5Real", updated_at=0,
+        benchmark_details={"scorecard": {"app_onchain": {"dex": [7000]}}},
+    )
+    mgr = _mgr(genesis=None)
+    mgr._champion = ChampionInfo(
+        submission_id="sub_real", hotkey="5Real", benchmark_score=0.7,
+        image_tag="solver-deadbeef:screening",
+    )
+    mgr._sub_store.get.return_value = real
+    mgr._round_store.get_current_round.return_value = SimpleNamespace(round_id="round-1")
+    seen: dict[str, object] = {}
+
+    async def _score_one_image(image_tag, *, context="bench"):
+        seen["image_tag"] = image_tag
+        return {"image": image_tag, "score": 0.52, "intent_count": 12,
+                "details": {"scorecard": {"app_onchain": {"dex": [5200]}}}}
+
+    bw = MagicMock()
+    bw._score_one_image = AsyncMock(side_effect=_score_one_image)
+    mgr._benchmark_worker = bw
+
+    asyncio.run(mgr._refresh_incumbent_score())
+
+    assert seen["image_tag"] == DIGEST                 # pullable digest, NOT the local tag
+    assert mgr._champion.benchmark_score == 0.52
+    assert not getattr(mgr, "_incumbent_refresh_failed", False)
+
+
 # (The REFQUOTE_SHADOW observe-only shadow was superseded by the symmetry fix:
 # the incumbent is now scored via the identical challenger path, so there is no
 # self-quote leg to compare. Verify the fix live with the diagnostic endpoint.)

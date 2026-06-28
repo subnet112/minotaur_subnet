@@ -886,7 +886,16 @@ class EpochManager:
             self._incumbent_refresh_failed = True
             return
 
-        image_tag = incumbent_sub.image_tag
+        # Prefer the PULLABLE pushed manifest digest (repo@sha256:…) over the local
+        # {{.Id}} screening tag. The `solver-<sha>:screening` tag is host-local and
+        # built only during screening — it gets pruned over time, after which the
+        # per-round incumbent re-benchmark crashes ("Unable to find image … locally,
+        # pull access denied") → STALE bar → the leader abstains and NO challenger can
+        # EVER dethrone the champion (an equal-or-better solver is silently rejected).
+        # The image_digest is content-addressed and pullable on any host, so docker
+        # re-fetches the (identical) image and the bar stays current. Falls back to the
+        # local tag for genesis/older champions that never recorded a digest.
+        image_tag = getattr(incumbent_sub, "image_digest", None) or incumbent_sub.image_tag
         if not image_tag:
             # Genesis/builtin champion: no submission image. Re-benchmark it via
             # the configured genesis solver image so the champion BAR is current
