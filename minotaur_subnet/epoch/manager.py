@@ -380,6 +380,22 @@ class EpochManager:
             "error": None,
         }
 
+        # PROTOCOL: only the leader evaluates a closed round. evaluate_round transitions
+        # the round (replay → certify/abort), and on a NON-leader — e.g. a third-party
+        # validator that runs the coordinator (ENABLE_SOLVER_ROUND_COORDINATOR defaults
+        # ON) but has no benchmark worker — _find_champion sees no scores, so it aborts
+        # the round LOCALLY ("no_champion_candidate"). That diverges from the leader and
+        # makes the whole fleet reject the leader's certification: every round dies
+        # ROUND_WRONG_STATE → fleet-abort, the quorum never forms, and no champion can be
+        # dethroned at quorum>1. Non-leaders instead FOLLOW the leader's synced outcome
+        # (close/certify/abort via the /internal/* round sync) and re-benchmark reactively
+        # to vote on the leader's proposal — so a non-leader must NOT mutate round status
+        # here. _is_leader unset (local testnet / single-node / tests) → treat as leader,
+        # preserving original behavior.
+        _leader_check = getattr(self, "_is_leader", None)
+        if _leader_check is not None and not _leader_check():
+            return result  # status unchanged — defer to the leader's round sync
+
         if round_state.status == RoundStatus.CLOSED:
             round_state = self._round_store.set_round_status(
                 round_id,
