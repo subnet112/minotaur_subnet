@@ -2547,19 +2547,54 @@ async def initialize(ctx: ServerContext) -> dict:
                     "Attempting certification: round=%s finalist=%s",
                     current.round_id, current.finalist_submission_id,
                 )
-                certified = await submissions._certify_solver_round_state(
-                    submissions.CertifyRoundRequest(
-                        round_id=current.round_id,
-                        candidate_submission_id=current.finalist_submission_id,
-                        candidate_image_id=current.finalist_image_id,
-                        committee_hash=current.committee_hash,
-                        benchmark_pack_hash=current.benchmark_pack_hash,
-                        shadow_case_log_hash=current.shadow_case_log_hash,
-                        effective_epoch=current.effective_epoch or _boundary_epoch_for_round(current),
-                        quorum_required=current.quorum_required or 0,
-                        approvals=[],
+                from fastapi import HTTPException as _HTTPException
+                try:
+                    certified = await submissions._certify_solver_round_state(
+                        submissions.CertifyRoundRequest(
+                            round_id=current.round_id,
+                            candidate_submission_id=current.finalist_submission_id,
+                            candidate_image_id=current.finalist_image_id,
+                            committee_hash=current.committee_hash,
+                            benchmark_pack_hash=current.benchmark_pack_hash,
+                            shadow_case_log_hash=current.shadow_case_log_hash,
+                            effective_epoch=current.effective_epoch or _boundary_epoch_for_round(current),
+                            quorum_required=current.quorum_required or 0,
+                            approvals=[],
+                        )
                     )
-                )
+                except _HTTPException:
+                    # RESTART RECOVERY: a restart can leave the leader replaying a round
+                    # the fleet already aborted; it then loops this doomed cert until the
+                    # round's deadline (wasting the whole window). If the reachable fleet
+                    # rejected the proposal because their round is aborted (ROUND_WRONG_STATE
+                    # on every responder — surfaced via the peer network), accept that
+                    # verdict: abort locally + advance to a fresh round immediately, instead
+                    # of re-certifying a round the fleet has moved past.
+                    _net = submissions.get_champion_peer_network()
+                    _lb = getattr(_net, "last_champion_broadcast", None) if _net is not None else None
+                    if (
+                        _lb is not None
+                        and _lb.get("round_id") == current.round_id
+                        and _lb.get("fleet_aborted")
+                    ):
+                        logger.warning(
+                            "Fleet reports round %s aborted (leader out of sync after restart) "
+                            "— aborting locally + advancing instead of re-certifying",
+                            current.round_id,
+                        )
+                        aborted = submissions._abort_solver_round_state(
+                            submissions.AbortRoundRequest(
+                                round_id=current.round_id,
+                                reason="fleet_aborted_after_restart",
+                            )
+                        )
+                        await _broadcast_round_sync(
+                            "/v1/solver/round/internal/abort",
+                            _abort_sync_payload(aborted),
+                            label="abort",
+                        )
+                        return True
+                    raise
                 logger.info(
                     "Solver round certified by leader: round=%s effective_epoch=%s approvals=%s",
                     certified.round_id,
