@@ -375,6 +375,11 @@ def health() -> dict:
         data["round_anchor"] = dict(ctx.round_anchor_parity)
     if ctx.last_independent_vote:
         data["independent_vote"] = dict(ctx.last_independent_vote)
+    # SHADOW (observe-only) relative per-order adoption verdict for the latest
+    # challenger + whether it agrees with the live decision. Absent until the
+    # first evaluation; observe-only unless RELATIVE_SCORING_ENABLED is on.
+    if ctx.last_shadow_per_order_vote:
+        data["shadow_per_order_vote"] = dict(ctx.last_shadow_per_order_vote)
     if ctx.last_champion_quorum:
         data["champion_quorum"] = dict(ctx.last_champion_quorum)
     # Durable order counts from the persistent store (NOT the daemon's in-memory

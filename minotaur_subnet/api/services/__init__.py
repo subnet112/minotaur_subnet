@@ -64,6 +64,7 @@ from .app_service import (  # noqa: F401
     list_minotaur_subnet,
     get_app_status,
     update_scoring,
+    update_shadow_scoring,
     get_app_manifest,
     build_intent_params_hex_from_manifest,
 )

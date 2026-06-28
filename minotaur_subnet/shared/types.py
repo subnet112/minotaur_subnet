@@ -663,6 +663,10 @@ class AppIntentDefinition:
     version: str                             # Semantic version
     intent_type: str                         # "swap", "limit_order", "rebalance", etc.
     js_code: str                             # JS scoring function source
+    # SHADOW (observe-only) raw-output scoring JS, run ALONGSIDE js_code by the
+    # validator when relative_scoring_shadow_enabled(). None/absent = no shadow
+    # scoring for this app (purely additive; never affects the live js_code path).
+    shadow_js_code: str | None = None
     solidity_code: str | None = None         # On-chain contract source (optional for MVP)
     config: AppIntentConfig = field(default_factory=AppIntentConfig)
     deployer: str = ""                       # Address of deployer

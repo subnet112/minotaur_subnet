@@ -653,6 +653,110 @@ def update_scoring(
     return result
 
 
+def update_shadow_scoring(
+    store: AppIntentStore,
+    app_id: str,
+    new_js_code: str,
+    caller: str = "",
+    signature: str = "",
+    nonce: int = 0,
+    deadline: int = 0,
+) -> dict[str, Any]:
+    """Set the SHADOW (observe-only) raw-output scoring JS for an App Intent.
+
+    Mirrors :func:`update_scoring`'s auth/validation shape, but writes
+    ``shadow_js_code`` instead of ``js_code`` and does NOT bump the version or
+    touch the manifest/config — the shadow scorer runs ALONGSIDE the live one and
+    must never alter live behaviour. Validators load it when
+    ``relative_scoring_shadow_enabled()`` and score it in parallel; until
+    ``relative_scoring_active()`` it changes nothing about adoption.
+    """
+    if not app_id:
+        return {"error": "app_id is required"}
+    if not new_js_code or not new_js_code.strip():
+        return {"error": "new_js_code must be non-empty"}
+
+    new_js_code = new_js_code.strip()
+    validation_warnings: list[str] = []
+
+    # ── pre-flight JS validation (same as update_scoring) ──
+    try:
+        import asyncio
+        from minotaur_subnet.engine.validation import validate_js_code as _validate_js
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    js_validation = pool.submit(
+                        lambda: asyncio.run(_validate_js(new_js_code))
+                    ).result()
+            else:
+                js_validation = loop.run_until_complete(_validate_js(new_js_code))
+        except RuntimeError:
+            js_validation = asyncio.run(_validate_js(new_js_code))
+
+        if not js_validation.valid:
+            return {
+                "error": "JS validation failed",
+                "validation_errors": js_validation.errors,
+                "validation_warnings": js_validation.warnings,
+            }
+        validation_warnings.extend(js_validation.warnings)
+    except Exception as exc:
+        logger.warning("Pre-flight shadow JS validation skipped: %s", exc)
+
+    definition = store.get_app(app_id)
+    if definition is None:
+        return {"error": f"App not found: {app_id}"}
+
+    # Authorization: identical to update_scoring — a deployer-set app requires the
+    # deployer's EIP-712 developer-auth signature (single-use nonce) binding the
+    # shadow code hash. Reuses the update_scoring action so no new signed action
+    # type is introduced for this minimal observe-only endpoint.
+    if definition.deployer:
+        from minotaur_subnet.api.services import developer_auth
+
+        deployer_addr = definition.deployer.strip().lower()
+        ok, err = developer_auth.verify_developer_auth(
+            expected_deployer=deployer_addr,
+            action=developer_auth.ACTION_UPDATE_SCORING,
+            app_id=app_id,
+            params_hash=developer_auth.params_hash(new_js_code.encode()),
+            nonce=nonce,
+            deadline=deadline,
+            signature=signature,
+        )
+        if not ok:
+            return {"error": f"Unauthorized: {err}"}
+        consumed, cerr = store.consume_developer_nonce(app_id, deployer_addr, nonce)
+        if not consumed:
+            return {"error": f"Unauthorized: {cerr}"}
+
+    new_hash = _sha256(new_js_code)
+    if definition.shadow_js_code and _sha256(definition.shadow_js_code) == new_hash:
+        return {
+            "app_id": app_id,
+            "shadow_js_code_hash": new_hash,
+            "status": "unchanged",
+            "message": "New shadow code is identical to the current shadow version.",
+        }
+
+    definition.shadow_js_code = new_js_code
+    store.save_app(definition)
+
+    result = {
+        "app_id": app_id,
+        "shadow_js_code_hash": new_hash,
+        "status": "updated",
+        "message": "Shadow scoring JS updated (observe-only; runs alongside live JS).",
+    }
+    if validation_warnings:
+        result["validation_warnings"] = validation_warnings
+    return result
+
+
 async def validate_app_intent_code(
     js_code: str,
     solidity_code: str = "",
