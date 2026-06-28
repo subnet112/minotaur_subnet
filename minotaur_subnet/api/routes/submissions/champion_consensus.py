@@ -687,10 +687,27 @@ def _build_champion_proposal_for_round(
     # (legacy) when no digest was pushed. Peers receive the leader's resolved value
     # via candidate_image_id, so the whole quorum signs the same D.
     from minotaur_subnet.harness.image_transport import bare_hex, is_bare_digest
-    _candidate_digest = bare_hex(getattr(candidate, "image_digest", None))
+    # Resolve the on-chain candidateImageId. Order:
+    #   1. an already-bare value passed by the caller (a follower reconstructing the
+    #      leader's authoritative bare digest to verify the signature) — use verbatim;
+    #   2. the candidate's REAL pushed GHCR manifest digest (bare 64-hex) — what the
+    #      quorum>1 gate + followers' pull-by-digest require;
+    #   3. else the RAW local id (candidate_image_id / image_id / finalist_image_id) —
+    #      legacy, fine at quorum<=1 where the single leader benchmarks locally, and
+    #      correctly REJECTED by the quorum>1 gate below (it isn't pull-able cross-host).
+    # Critical: the local ids are NOT run through bare_hex — turning a "sha256:<id>" into
+    # a bare hex would pass the gate with a non-pullable id and defeat its purpose.
+    # Why this matters: the leader's coordinator passes the PREFIXED local image id
+    # (finalist_image_id = "sha256:<hex>") as candidate_image_id, so the old
+    # `candidate_image_id or _candidate_digest or ...` left the prefix in place and the
+    # quorum>1 gate `is_bare_digest(...)` wrongly fired "no pushed image digest" — blocking
+    # EVERY multi-validator certification even when a valid pushed digest existed. Preferring
+    # the real digest (2) over the passed prefixed id fixes it.
+    _passed_bare = candidate_image_id if is_bare_digest(candidate_image_id or "") else None
     resolved_image_id = (
-        candidate_image_id
-        or _candidate_digest
+        _passed_bare
+        or bare_hex(getattr(candidate, "image_digest", None))
+        or candidate_image_id
         or candidate.image_id
         or round_state.finalist_image_id
     )
