@@ -43,6 +43,13 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `BASE_UPSTREAM_RPC_URL` | -- | Upstream Base RPC, same role as `ETH_UPSTREAM_RPC_URL` for the Base fork. |
 | `BITTENSOR_EVM_UPSTREAM_RPC_URL` | -- | Upstream BT EVM RPC, same role for the BT EVM fork. Defaults to the public `https://lite.chain.opentensor.ai` (rate-limited per source IP). A self-hosted subtensor node serves the EVM JSON-RPC on the same port as its substrate RPC (Frontier is built into the binary); if you set `SUBTENSOR_URL=ws://your-subtensor:9944` you can typically set this to `http://your-subtensor:9944` against the same host. Use `http`/`https` here — Anvil's `--fork-url` does HTTP polling, not WS. |
 
+### Benchmark Performance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_CONCURRENCY` | `1` | Number of isolated solver runtimes to shard each benchmark across (the scenario pool). `1` (default) is the byte-identical sequential path — the **kill-switch**: leave/set at `1` to instantly revert with no code change. K>1 runs scenarios concurrently for roughly K× on the network-latency-bound segment (rounds are ~90% CPU-idle), each runtime fully isolated (own solver container + own block-pin proxy session + own read budget). **Per-validator, NOT consensus** — K is never folded into the benchmark pack hash, so a fleet running mixed K computes identical scores (no coordination needed). Each runtime costs ~1 solver container (≈4 GB / 2 CPU); the practical ceiling is upstream archive-RPC concurrency, not validator RAM. Recommended **2–4**; hard-clamped to `[1, 63]`. Roll out by bumping one validator, confirming byte-identical scores vs a `K=1` peer + faster wall-clock, then the fleet. |
+| `RPC_PROXY_UPSTREAM_MAX_CONCURRENCY` | `24` | (block-pin proxy server) Max concurrent upstream connections the proxy opens to the archive RPC. Bounds the read storm at high `BENCHMARK_CONCURRENCY` so the provider isn't rate-limited into per-validator timeouts (a non-determinism source). Tune to your RPC tier; ≈ K × a few reads per scenario. |
+
 ### Consensus and Signing
 
 | Variable | Default | Description |
