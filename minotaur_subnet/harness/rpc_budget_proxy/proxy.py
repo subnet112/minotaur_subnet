@@ -57,7 +57,7 @@ import logging
 import os
 from typing import Any
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 from .cost_table import batch_cost, request_cost
 from .rewrite_table import rewrite_single
@@ -83,6 +83,14 @@ MAX_SESSIONS = 64
 # solver. This is a transport timeout, NOT the deterministic budget — it never
 # affects metering; it only governs how an unreachable upstream is reported.
 UPSTREAM_TIMEOUT_SECONDS = 30
+# Bound the proxy's concurrent upstream connections. At BENCHMARK_CONCURRENCY=K, K
+# solver runtimes each issue several concurrent reads; without a cap the proxy can
+# storm the archive provider into rate-limit timeouts — which vary per-validator and
+# would reintroduce non-determinism. Default 24 (~K=4 x a few reads); tune to the RPC tier.
+try:
+    UPSTREAM_MAX_CONCURRENCY = max(1, int(os.environ.get('RPC_PROXY_UPSTREAM_MAX_CONCURRENCY', '24')))
+except ValueError:
+    UPSTREAM_MAX_CONCURRENCY = 24
 
 
 class Session:
@@ -199,7 +207,8 @@ class BudgetProxy:
 
     async def _on_startup(self, _app: web.Application) -> None:
         self._client = ClientSession(
-            timeout=ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
+            timeout=ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS),
+            connector=TCPConnector(limit=UPSTREAM_MAX_CONCURRENCY),
         )
         logger.info(
             "rpc_budget_proxy started: chains=%s default_chain=%s mode=%s budget=%d",
