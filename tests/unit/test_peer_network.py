@@ -289,3 +289,74 @@ class TestPeerUrlSource:
         ])
         urls = {p.validator_id: p.url for p in vpn.peers}
         assert urls["0xPeer2"] == "http://5.6.7.8:8080"
+
+
+# ── Restart recovery: fleet-aborted detection in champion broadcast ──────────
+# After a restart the leader can replay a round the fleet already aborted, then
+# loop a doomed cert until the deadline. broadcast_champion_proposal now exposes
+# `last_champion_broadcast["fleet_aborted"]` so the coordinator can abort+advance.
+
+import asyncio as _asyncio
+from types import SimpleNamespace as _SNS
+from unittest.mock import AsyncMock as _AsyncMock
+
+from minotaur_subnet.consensus.peer_network import ValidatorPeerNetwork as _VPN, PeerEndpoint as _PE
+
+
+def _champ_vpn(monkeypatch, send_impl):
+    peers = [_PE(validator_id="0xp1", url="http://p1:9100"),
+             _PE(validator_id="0xp2", url="http://p2:9100")]
+    vpn = _VPN(validator_id="0xself", private_key="", consensus=None, peers=peers)
+    vpn._session = _SNS(closed=False)                      # skip real start()/HTTP
+    monkeypatch.setattr(vpn, "start", _AsyncMock())
+    monkeypatch.setattr(vpn, "_build_champion_proposal_payload",
+                        lambda *a, **k: {"round_id": "round-1"})
+    monkeypatch.setattr(vpn, "_send_champion_proposal", send_impl)
+    return vpn
+
+
+def test_broadcast_fleet_aborted_when_all_responders_round_wrong_state(monkeypatch):
+    async def _send(peer, payload, *, path, dissent_sink=None):
+        if dissent_sink is not None:
+            dissent_sink.append("ROUND_WRONG_STATE")   # the fleet holds an aborted round
+        return None
+    vpn = _champ_vpn(monkeypatch, _send)
+    approvals = _asyncio.run(vpn.broadcast_champion_proposal(_SNS(round_id="round-1")))
+    assert approvals == []
+    assert vpn.last_champion_broadcast["fleet_aborted"] is True
+    assert vpn.last_champion_broadcast["round_id"] == "round-1"
+
+
+def test_broadcast_not_fleet_aborted_when_an_approval_exists(monkeypatch):
+    async def _send(peer, payload, *, path, dissent_sink=None):
+        if peer.validator_id == "0xp1":
+            return object()                              # an approval
+        if dissent_sink is not None:
+            dissent_sink.append("ROUND_WRONG_STATE")
+        return None
+    vpn = _champ_vpn(monkeypatch, _send)
+    approvals = _asyncio.run(vpn.broadcast_champion_proposal(_SNS(round_id="round-1")))
+    assert len(approvals) == 1
+    assert vpn.last_champion_broadcast["fleet_aborted"] is False
+
+
+def test_broadcast_not_fleet_aborted_on_mixed_dissents(monkeypatch):
+    codes = iter(["ROUND_WRONG_STATE", "SCORE_BELOW_THRESHOLD"])
+    async def _send(peer, payload, *, path, dissent_sink=None):
+        if dissent_sink is not None:
+            dissent_sink.append(next(codes))             # one wrong-state, one real disagreement
+        return None
+    vpn = _champ_vpn(monkeypatch, _send)
+    _asyncio.run(vpn.broadcast_champion_proposal(_SNS(round_id="round-1")))
+    # a non-stale dissent reason means real disagreement, not a stale round → don't trip
+    assert vpn.last_champion_broadcast["fleet_aborted"] is False
+
+
+def test_broadcast_not_fleet_aborted_on_network_errors_only(monkeypatch):
+    async def _send(peer, payload, *, path, dissent_sink=None):
+        raise ConnectionError("peer down")               # network error, not a dissent
+    vpn = _champ_vpn(monkeypatch, _send)
+    _asyncio.run(vpn.broadcast_champion_proposal(_SNS(round_id="round-1")))
+    # unreachable peers are not dissents → no fleet-aborted verdict
+    assert vpn.last_champion_broadcast["fleet_aborted"] is False
+    assert vpn.last_champion_broadcast["dissent_codes"] == []
