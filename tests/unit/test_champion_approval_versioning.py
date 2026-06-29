@@ -263,3 +263,61 @@ class TestVerifyApprovalEnvelopeOnly:
         # was produced over nonce=11 -> recovery yields a different address.
         forged_approval = dataclasses.replace(approval, nonce=999)
         assert verifier.verify_approval(forged_approval) is False
+
+
+# ── Cert-broadcast round-trip: the v2 fields MUST be propagated in the sync
+#    payload or the follower rebuilds a divergent proposal and rejects the cert ──
+
+
+class TestCertBroadcastPropagatesV2Fields:
+    """Regression for the champion cert-broadcast v2-field propagation bug.
+
+    The leader signs the proposal with a wall-clock ``nonce``/``deadline``. The
+    ``/certify`` broadcast (``_certify_sync_payload``) must carry
+    ``commit_hash``/``nonce``/``deadline`` at the TOP level so a follower rebuilds
+    the IDENTICAL proposal (``_build_champion_proposal_for_round`` passes them as
+    ``*_override``). When the payload omits them, the follower stamps its OWN
+    wall-clock nonce/deadline -> the digest diverges -> ``verify_approval`` rejects
+    the leader's approval ("Invalid champion approvals from validators: [leader]")
+    and the best-effort quorum is stranded at leader-only. This reproduces both
+    the bug and the fix.
+    """
+
+    @staticmethod
+    def _follower_rebuild(signed: ChampionProposal, payload: dict) -> ChampionProposal:
+        """Rebuild as the follower's certify handler does: legacy fields are
+        consistent (committee/candidate/epoch from round_state + body); the v2
+        fields come from the payload override, or — ABSENT (the pre-fix bug) —
+        the follower's OWN wall-clock. Mirrors
+        ``nonce_override or int(time.time()*1000)`` in the builder."""
+        import time
+
+        return dataclasses.replace(
+            signed,
+            # commit_hash absent -> candidate's git SHA (deterministic, still matches)
+            commit_hash=payload.get("commit_hash") or signed.commit_hash,
+            # nonce/deadline absent -> the follower's own wall-clock (DIVERGES)
+            nonce=int(payload.get("nonce") or int(time.time() * 1000)),
+            deadline=int(payload.get("deadline") or (int(time.time()) + 3600)),
+        )
+
+    def test_payload_carrying_v2_fields_verifies(self, signer, verifier):
+        """FIX: leader broadcasts nonce/deadline/commit_hash -> follower rebuilds
+        the identical proposal -> the leader's approval verifies."""
+        signed = _proposal(commit_hash="0x" + "7a" * 32, nonce=1_726_000_000_123, deadline=1_726_003_600)
+        approval = signer.sign_approval(signed)
+        payload = {
+            "commit_hash": signed.commit_hash,
+            "nonce": signed.nonce,
+            "deadline": signed.deadline,
+        }
+        rebuilt = self._follower_rebuild(signed, payload)
+        assert verifier.verify_approval(approval, rebuilt) is True
+
+    def test_payload_missing_v2_fields_fails(self, signer, verifier):
+        """BUG: pre-fix broadcast omits the v2 fields -> follower stamps its own
+        wall-clock nonce -> digest diverges -> the leader's approval is rejected."""
+        signed = _proposal(commit_hash="0x" + "7a" * 32, nonce=1_726_000_000_123, deadline=1_726_003_600)
+        approval = signer.sign_approval(signed)
+        rebuilt = self._follower_rebuild(signed, payload={})  # nothing propagated
+        assert verifier.verify_approval(approval, rebuilt) is False
