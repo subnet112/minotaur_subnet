@@ -1954,6 +1954,23 @@ async def initialize(ctx: ServerContext) -> dict:
                 _solver_round_epoch_health(ctx),
             )
 
+            # Auto-scale the decision-deadline window with the slate size: the leader
+            # benchmarks challengers SERIALLY (#387), so close→adopt grows ~linearly
+            # with the submission count. window = max(BASE + n_submissions*PER_SUB,
+            # SOLVER_ROUND_DECISION_EPOCHS). The fixed value above becomes the FLOOR.
+            try:
+                solver_round_decision_base_epochs = int(
+                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "10").strip() or "10",
+                )
+            except ValueError:
+                solver_round_decision_base_epochs = 10
+            try:
+                solver_round_decision_per_sub_epochs = int(
+                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "4").strip() or "4",
+                )
+            except ValueError:
+                solver_round_decision_per_sub_epochs = 4
+
             def _round_open_elapsed(current_round) -> float:
                 return max(0.0, time.time() - float(current_round.created_at or time.time()))
 
@@ -2534,6 +2551,30 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
+                # Auto-scale the decision window with this round's slate: the serial
+                # benchmark (#387) runs close→adopt in ~linear time with the submission
+                # count, so a fixed window aborts contested rounds the instant the leader
+                # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
+                # it (keep ACTIVATION_DELAY >= the effective decision window).
+                try:
+                    _n_subs = len(submissions.get_store().list_by_round(current.round_id))
+                except Exception:
+                    _n_subs = 0
+                _decision_window = submissions.autoscaled_decision_window(
+                    _n_subs,
+                    base_epochs=solver_round_decision_base_epochs,
+                    per_sub_epochs=solver_round_decision_per_sub_epochs,
+                    floor_epochs=solver_round_decision_epochs,
+                )
+                _activation_delay = max(
+                    solver_round_activation_delay_epochs, _decision_window + 2
+                )
+                logger.info(
+                    "Decision window auto-scaled: round=%s submissions=%d window=%d "
+                    "(floor=%d) activation=%d",
+                    current.round_id, _n_subs, _decision_window,
+                    solver_round_decision_epochs, _activation_delay,
+                )
                 closed = submissions._close_solver_round_state(
                     submissions.CloseRoundRequest(
                         round_id=current.round_id,
@@ -2547,8 +2588,8 @@ async def initialize(ctx: ServerContext) -> dict:
                         ),
                         committee_hash=committee_hash,
                         quorum_required=quorum_required,
-                        decision_deadline_epoch=close_epoch + max(1, solver_round_decision_epochs),
-                        effective_epoch=close_epoch + max(1, solver_round_activation_delay_epochs),
+                        decision_deadline_epoch=close_epoch + max(1, _decision_window),
+                        effective_epoch=close_epoch + max(1, _activation_delay),
                     )
                 )
                 logger.info(

@@ -436,6 +436,30 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
     return _close_solver_round_state(body)
 
 
+def autoscaled_decision_window(
+    n_submissions: int,
+    *,
+    base_epochs: int,
+    per_sub_epochs: int,
+    floor_epochs: int,
+) -> int:
+    """Auto-scale the round's decision-deadline window with the slate size.
+
+    The leader benchmarks challengers SERIALLY on the shared sim (#387), so the
+    close→adopt time grows ~linearly with the submission count. A FIXED window
+    silently aborts contested rounds the instant the leader votes adopt
+    (certification_deadline_elapsed) once the slate is large enough — the
+    deadline-abort that loses clean dethrones. Scale the window with the slate (fixed
+    ``base_epochs`` overhead + ``per_sub_epochs`` serial cost per submission), floored
+    at ``floor_epochs`` (= SOLVER_ROUND_DECISION_EPOCHS) so small rounds keep their
+    existing margin. The leader computes + broadcasts the resulting deadline, so
+    followers inherit the identical value.
+    """
+    n = max(0, int(n_submissions))
+    scaled = int(base_epochs) + n * int(per_sub_epochs)
+    return max(scaled, int(floor_epochs))
+
+
 def _round_certification_deadline_elapsed(round_state: RoundState) -> bool:
     """Return whether the round can no longer be certified."""
     if round_state.certificate is not None:
