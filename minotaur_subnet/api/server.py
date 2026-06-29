@@ -378,8 +378,8 @@ def health() -> dict:
     # Relative per-order adoption verdict for the latest challenger — the
     # AUTHORITATIVE leader decision (relative rule is the sole adoption path).
     # Absent until the first evaluation. Key kept for backward compatibility.
-    if ctx.last_shadow_per_order_vote:
-        data["shadow_per_order_vote"] = dict(ctx.last_shadow_per_order_vote)
+    if ctx.last_per_order_adoption_vote:
+        data["per_order_adoption_vote"] = dict(ctx.last_per_order_adoption_vote)
     if ctx.last_champion_quorum:
         data["champion_quorum"] = dict(ctx.last_champion_quorum)
     # Durable order counts from the persistent store (NOT the daemon's in-memory

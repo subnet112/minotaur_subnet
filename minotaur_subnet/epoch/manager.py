@@ -680,12 +680,6 @@ class EpochManager:
             kwargs["champion_score"] = self._champion.benchmark_score
         if "dethrone_margin" in params:
             kwargs["dethrone_margin"] = self._dethrone_margin
-        if "champion_details" in params and self._champion.submission_id:
-            try:
-                champ_sub = self._sub_store.get(self._champion.submission_id)
-                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
-            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
-                pass
         # Private submissions: the report must post to the miner's PRIVATE repo,
         # which needs the per-submission token. Fetch it from the (same-process)
         # store; None for public submissions → the callback falls back to canonical.
@@ -732,12 +726,6 @@ class EpochManager:
             kwargs["champion_score"] = self._champion.benchmark_score
         if "dethrone_margin" in params:
             kwargs["dethrone_margin"] = self._dethrone_margin
-        if "champion_details" in params and self._champion.submission_id:
-            try:
-                champ_sub = self._sub_store.get(self._champion.submission_id)
-                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
-            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
-                pass
         # Private submissions: report must post to the miner's PRIVATE repo (needs
         # the per-submission token). None for public → callback uses canonical.
         if "repo_token" in params:
@@ -1168,9 +1156,8 @@ class EpochManager:
         delivered outputs (``benchmark_details.per_intent[*].shadow_score``, sourced
         from the LIVE raw-output scorer's ``metadata.raw_output``) via the pure
         :func:`evaluate_relative_adoption`, logs the verdict, and publishes it on
-        ``/health`` (``ctx.last_shadow_per_order_vote`` — field name kept to avoid
-        rippling the health surface). Returns the verdict dict, or ``None`` on error
-        so the caller ABSTAINS (never adopts on uncertainty).
+        ``/health`` as ``per_order_adoption_vote``. Returns the verdict dict, or
+        ``None`` on error so the caller ABSTAINS (never adopts on uncertainty).
 
         Relies on ``_refresh_incumbent_score`` having persisted the champion's FRESH
         same-round per_intent back to its submission record (display-path fix), so
@@ -1213,7 +1200,7 @@ class EpochManager:
             }
             try:
                 from minotaur_subnet.api.server_context import ctx
-                ctx.last_shadow_per_order_vote = dict(vote)
+                ctx.last_per_order_adoption_vote = dict(vote)
             except Exception:  # publishing must never break adoption
                 pass
             return verdict
@@ -1233,7 +1220,7 @@ class EpochManager:
         cross-fork against the champion's latest (later, different-pin) record.
 
         This reads the SAME stored champion rows the authoritative
-        :meth:`_evaluate_shadow_per_order` reads, so the displayed counts agree
+        :meth:`_evaluate_per_order_adoption` reads, so the displayed counts agree
         with the live verdict by construction. Fully best-effort: a competitor /
         champion lacking ``shadow_score`` rows is skipped (no block → the report
         shows pending), and any failure is swallowed — a display computation must

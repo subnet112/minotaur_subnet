@@ -72,14 +72,17 @@ def _sub(per_intent, *, sid="sub-1", score=0.9, status="scored", relative=None):
     )
 
 
-def _build_report(sub, champ_details):
+def _build_report(sub, champ_details=None):
+    # ``champ_details`` is intentionally NOT forwarded: the cross-fork per-order
+    # surfaces (per_case / shadow_relative) were removed, so the only per-order
+    # block is the submission's OWN stored same-pin ``relative``. The arg is kept
+    # to narrate "even with a champion record present, there is no recompute".
     return build_submission_report(
         sub,
         champion_score=0.9,
         threshold=0.5,
         dethrone_margin=0.01,
         reason=None,
-        champion_details=champ_details,
     )
 
 
@@ -96,10 +99,11 @@ def test_report_reads_stored_same_pin_counts():
     assert rpt["relative"]["better"] == 2
     assert rpt["relative"]["verdict"] == "dethrone"
     assert rpt["reason_relative"].startswith("adopted")
-    # Legacy fields still present (additive, cleanup deferred).
+    # Legacy aggregate scalar still present (additive).
     assert rpt["aggregate"]["your_score"] == 0.9
-    # The observe-only shadow block predates this PR and is still present.
-    assert "shadow_relative" in rpt
+    # The cross-fork per-order surfaces (shadow_relative / per_case) were removed.
+    assert "shadow_relative" not in rpt
+    assert "per_case" not in rpt
 
 
 def test_report_relative_is_stored_not_cross_fork_recompute():
@@ -116,9 +120,9 @@ def test_report_relative_is_stored_not_cross_fork_recompute():
 
 
 def test_report_no_stored_relative_omits_block():
-    """No STORED relative block → the block is omitted (pending). Even though the
-    submission AND the passed champion_details both carry shadow_score rows (a
-    cross-fork recompute WOULD produce a block), there is no fallback."""
+    """No STORED relative block → the block is omitted (pending). There is NO
+    cross-fork recompute against the champion record (that surface was removed),
+    so even with shadow_score rows on both sides the block stays absent."""
     rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
     assert rpt["scoring_mode"] == "relative"  # mode always emitted (no flag)
     assert "relative" not in rpt             # no stored counts → graceful omit
