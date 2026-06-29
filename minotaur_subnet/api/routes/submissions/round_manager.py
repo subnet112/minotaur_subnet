@@ -224,6 +224,52 @@ def _sync_round_incumbent_from_submission_store(
     return snapshot
 
 
+def _round_relative_extra(state: RoundState) -> dict[str, Any]:
+    """Additive relative fields for the round response — ONLY when the relative
+    rule is authoritative (``RELATIVE_SCORING_ENABLED``).
+
+    Returns ``{}`` when the flag is OFF (default), so the round response is
+    byte-for-byte unchanged — this is the single gate that flips the whole
+    relative API surface on. When ON, returns ``{"scoring_mode": "relative"}`` plus,
+    for the round's finalist, a ``finalist_relative`` count block vs the current
+    champion (``{better, worse, matched, new, compared, verdict, per_order}``) and a
+    derived ``reason_relative`` display string. The legacy ``finalist_score`` /
+    ``abort_reason`` are left untouched. Omits the count block (no error) when the
+    finalist or champion lacks shadow_score rows.
+    """
+    try:
+        from minotaur_subnet.epoch.relative_scoring import (
+            relative_counts_for_submissions,
+            relative_reason,
+            relative_scoring_active,
+        )
+
+        if not relative_scoring_active():
+            return {}
+        extra: dict[str, Any] = {"scoring_mode": "relative"}
+        if not state.finalist_submission_id:
+            return extra
+        store = get_store()
+        finalist = store.get(state.finalist_submission_id)
+        champ_snap = get_round_store().get_active_champion()
+        champ_sub = (
+            store.get(champ_snap.submission_id)
+            if champ_snap and champ_snap.submission_id
+            else None
+        )
+        counts = relative_counts_for_submissions(finalist, champ_sub)
+        if counts is not None:
+            extra["finalist_relative"] = counts
+            rel_reason = relative_reason(
+                counts, candidate_id=state.finalist_submission_id,
+            )
+            if rel_reason:
+                extra["reason_relative"] = rel_reason
+        return extra
+    except Exception:  # additive surface — never break the round response
+        return {}
+
+
 def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
     certificate = state.certificate
     return SolverRoundResponse(
@@ -253,6 +299,8 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         ),
         certificate_quorum_required=certificate.quorum_required if certificate else None,
         certificate_approvals=len(certificate.approvals) if certificate else 0,
+        # Additive relative fields — empty (no-op) unless RELATIVE_SCORING_ENABLED.
+        **_round_relative_extra(state),
     )
 
 

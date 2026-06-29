@@ -449,7 +449,7 @@ def get_app_status(
     else:
         status = AppStatus.DRAFT.value
 
-    return {
+    result: dict[str, Any] = {
         "app_id": app_id,
         "name": definition.name,
         "status": status,
@@ -481,6 +481,24 @@ def get_app_status(
             for cid, d in deployments.items()
         },
     }
+
+    # When the relative rule is AUTHORITATIVE, flip ``scoring_mode`` so the
+    # dashboard knows the saturated ``champion_score`` is no longer the headline
+    # metric and to read the per-submission relative COUNTS surfaced on the
+    # submission-status (report) and solver-round endpoints. Additive + gated on
+    # the SAME flag as the live scoring: when the flag is OFF (default) this dict
+    # is byte-for-byte unchanged — no ``scoring_mode`` key is added. The champion
+    # is the relative baseline, so there is no challenger to count against here;
+    # the per-submission relative blocks live on the endpoints that carry a
+    # challenger + the champion.
+    try:
+        from minotaur_subnet.epoch.relative_scoring import relative_scoring_active
+
+        if relative_scoring_active():
+            result["scoring_mode"] = "relative"
+    except Exception:
+        pass
+    return result
 
 
 def update_scoring(

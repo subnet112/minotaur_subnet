@@ -190,6 +190,34 @@ def build_submission_report(
     except Exception:  # observe-only — must never break the report
         pass
 
+    # ── AUTHORITATIVE relative counts (RELATIVE_SCORING_ENABLED) ──
+    # When the relative rule is live, ALSO surface the COUNT shape
+    # (better/worse/matched/new + verdict) that replaces the saturated score, and
+    # flip ``scoring_mode`` to "relative". Additive + gated on the SAME flag as the
+    # live scoring: every legacy field (your_score, champion_score, per_case
+    # deltas) and the shadow_relative block above are byte-for-byte untouched when
+    # the flag is OFF. The relative block is omitted (no error) when either side
+    # lacks shadow_score rows.
+    try:
+        from minotaur_subnet.epoch.relative_scoring import (
+            has_shadow_rows,
+            relative_counts,
+            relative_reason,
+            relative_scoring_active,
+        )
+
+        if relative_scoring_active():
+            report["scoring_mode"] = "relative"
+            champ_rows = (champion_details or {}).get("per_intent") or []
+            if has_shadow_rows(per_intent) and has_shadow_rows(champ_rows):
+                counts = relative_counts(champ_rows, per_intent)
+                report["relative"] = counts
+                rel_reason = relative_reason(counts, candidate_id=getattr(sub, "submission_id", None))
+                if rel_reason:
+                    report["reason_relative"] = rel_reason
+    except Exception:  # additive surface — must never break the report
+        pass
+
     if rejected_in_screening:
         report["screening"] = screening
     return report
