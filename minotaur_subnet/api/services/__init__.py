@@ -72,7 +72,6 @@ from .app_service import (  # noqa: F401
 from .order_service import (  # noqa: F401
     dry_run_order,
     ensure_token_approval,
-    build_swap_intent_params_hex,
     sign_user_order_for_managed_wallet,
     compute_intent_selector,
     _extract_manifest_safely,
