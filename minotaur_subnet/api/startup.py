@@ -990,7 +990,13 @@ async def initialize(ctx: ServerContext) -> dict:
         logger.error("[read-proxy] manager raised (continuing startup): %s", exc)
 
     # ── benchmark worker ─────────────────────────────────────────────────
-    sub_store = None
+    # ALWAYS wire the submission store: the EpochManager needs it to ACTIVATE a certified
+    # round (load the champion's submission for the hot-swap), independent of whether this
+    # node runs the benchmark worker. A FOLLOWER runs the worker disabled but still
+    # activates leader-broadcast certs — without the store its EpochManager._sub_store is
+    # None and activate_certified_round raises "submission_store is required for certified
+    # activation", silently stranding the follower on burn.
+    sub_store = submissions.get_store()
     benchmark_worker_enabled = os.environ.get(
         "ENABLE_BENCHMARK_WORKER", "",
     ).lower() in ("1", "true", "yes")
@@ -1000,7 +1006,6 @@ async def initialize(ctx: ServerContext) -> dict:
     if benchmark_worker_enabled:
         from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 
-        sub_store = submissions.get_store()
         submissions._sync_round_incumbent_from_submission_store(round_store, sub_store)
         current_round = round_store.get_current_round()
         if current_round is None:
