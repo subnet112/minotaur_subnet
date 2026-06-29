@@ -1102,7 +1102,7 @@ class EpochManager:
             self._champion.benchmark_score = fresh_score
 
             # Display-path + adoption consistency (#FIX): ALWAYS persist this round's
-            # FRESH re-bench (score + per_intent, incl. shadow_score) back to the
+            # FRESH re-bench (score + per_intent, incl. raw_output) back to the
             # champion's submission record. The relative adoption rule
             # (_evaluate_per_order_adoption) and the same-pin display persist
             # (_persist_round_relative_counts, which reads the champion's STORED
@@ -1289,7 +1289,7 @@ class EpochManager:
 
     @staticmethod
     def _per_intent(submission: Submission | None) -> list[dict[str, Any]]:
-        """Per-order benchmark rows (with ``shadow_score``) from a submission's
+        """Per-order benchmark rows (with ``raw_output``) from a submission's
         ``benchmark_details``. Empty list when absent — the relative rule then
         sees no orders and abstains (adopt=False, scenarios_compared=0)."""
         details = getattr(submission, "benchmark_details", None) or {}
@@ -1302,7 +1302,7 @@ class EpochManager:
         """Relative per-order adoption verdict — the SOLE adoption decision.
 
         Joins the freshly re-benched incumbent's and the challenger's per-order RAW
-        delivered outputs (``benchmark_details.per_intent[*].shadow_score``, sourced
+        delivered outputs (``benchmark_details.per_intent[*].raw_output``, sourced
         from the LIVE raw-output scorer's ``metadata.raw_output``) via the pure
         :func:`evaluate_relative_adoption`, logs the verdict, and publishes it on
         ``/health`` as ``per_order_adoption_vote``. Returns the verdict dict, or
@@ -1371,26 +1371,26 @@ class EpochManager:
         This reads the SAME stored champion rows the authoritative
         :meth:`_evaluate_per_order_adoption` reads, so the displayed counts agree
         with the live verdict by construction. Fully best-effort: a competitor /
-        champion lacking ``shadow_score`` rows is skipped (no block → the report
+        champion lacking raw-output rows is skipped (no block → the report
         shows pending), and any failure is swallowed — a display computation must
         never break round evaluation.
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
-                has_shadow_rows,
+                has_raw_output_rows,
                 relative_counts,
             )
 
             if self._sub_store is None or not self._champion.submission_id:
                 return
             champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
-            if not has_shadow_rows(champ_rows):
+            if not has_raw_output_rows(champ_rows):
                 return
             for competitor in self._sub_store.list_by_round(round_id):
                 if competitor.submission_id == self._champion.submission_id:
                     continue
                 comp_rows = self._per_intent(competitor)
-                if not has_shadow_rows(comp_rows):
+                if not has_raw_output_rows(comp_rows):
                     continue
                 try:
                     counts = relative_counts(champ_rows, comp_rows)

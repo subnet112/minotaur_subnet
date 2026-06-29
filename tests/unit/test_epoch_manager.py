@@ -133,7 +133,7 @@ def _make_submission(
         benchmark_details={
             "total_intents": 5,
             # The relative per-order rule decides adoption on the RAW delivered
-            # output (shadow_score), not the aggregate score. Derive a single
+            # output (raw_output), not the aggregate score. Derive a single
             # proportional order from `score` so a higher-scoring challenger WINS,
             # an equal one MATCHES, and a lower one REGRESSES — the same ordering
             # these fixtures relied on under the legacy aggregate rule.
@@ -141,7 +141,7 @@ def _make_submission(
                 {
                     "intent_id": "o1",
                     "score": score,
-                    "shadow_score": str(int(round(score * 1_000_000))),
+                    "raw_output": str(int(round(score * 1_000_000))),
                 },
             ],
         },
@@ -765,13 +765,13 @@ class TestEpochManager:
         is left untouched, and a competitor without shadow rows is skipped."""
         champ = _make_submission(submission_id="champ", round_id="round-e1-n0")
         champ.benchmark_details = {"per_intent": [
-            {"intent_id": "o1", "shadow_score": "100"},
-            {"intent_id": "o2", "shadow_score": "200"},
+            {"intent_id": "o1", "raw_output": "100"},
+            {"intent_id": "o2", "raw_output": "200"},
         ]}
         chal = _make_submission(submission_id="chal", round_id="round-e1-n1")
         chal.benchmark_details = {"per_intent": [
-            {"intent_id": "o1", "shadow_score": "120"},
-            {"intent_id": "o2", "shadow_score": "250"},
+            {"intent_id": "o1", "raw_output": "120"},
+            {"intent_id": "o2", "raw_output": "250"},
         ]}
         # No shadow rows → must be skipped (no relative block written).
         no_shadow = _make_submission(submission_id="noshadow", round_id="round-e1-n1")

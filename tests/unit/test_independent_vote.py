@@ -4,7 +4,7 @@
 shared corpus and applies the AUTHORITATIVE relative per-order rule
 (`evaluate_relative_adoption`) — the IDENTICAL rule the leader runs — returning an
 independent ADOPT/REJECT vote. These tests drive it with the REAL rule and
-controlled per-order RAW outputs (shadow_score), plus the conservative
+controlled per-order RAW outputs (raw_output), plus the conservative
 champion-unresolvable guard and the bootstrap carve-out.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ _PRESENT = object()  # sentinel: a champion submission exists
 
 def _results(*pairs):
     """Per-order BenchmarkResults carrying intent_id + RAW output (decimal str)."""
-    return [BenchmarkResult(intent_id=iid, shadow_score=sc) for iid, sc in pairs]
+    return [BenchmarkResult(intent_id=iid, raw_output=sc) for iid, sc in pairs]
 
 
 class _Worker:

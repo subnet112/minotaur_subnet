@@ -502,7 +502,7 @@ async def _independent_adopt_vote(
     champ_score = worker._compute_avg_score(champ_results)
     # AUTHORITATIVE relative per-order verdict — IDENTICAL to the leader's
     # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
-    # Joins champion vs challenger BenchmarkResults by intent_id on shadow_score (the
+    # Joins champion vs challenger BenchmarkResults by intent_id on raw_output (the
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
     verdict = evaluate_relative_adoption(champ_results, chal_results)
     adopt = bool(verdict["adopt"])

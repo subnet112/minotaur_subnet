@@ -41,8 +41,8 @@ def test_build_scorecard_keys_app_scores_by_bare_app_id():
 
 
 def _per_intent(pairs):
-    """Per-order rows with RAW delivered output (shadow_score, decimal str)."""
-    return [{"intent_id": iid, "shadow_score": sc} for iid, sc in pairs]
+    """Per-order rows with RAW delivered output (raw_output, decimal str)."""
+    return [{"intent_id": iid, "raw_output": sc} for iid, sc in pairs]
 
 
 def _mgr(champ_per_intent) -> EpochManager:
