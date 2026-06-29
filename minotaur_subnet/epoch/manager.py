@@ -29,7 +29,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
 from minotaur_subnet.harness.submission_store import (
     Submission,
     SubmissionStatus,
@@ -327,18 +326,17 @@ class EpochManager:
                 if next_round is not None:
                     result["next_round_id"] = next_round.round_id
         else:
+            reject_reason = getattr(self, "_last_adopt_reason", None) or "did not beat the champion"
             logger.info(
-                "Challenger score %.4f does not beat champion %.4f by %.3g%% margin",
-                new_champion_sub.benchmark_score or 0,
-                self._champion.benchmark_score,
-                self._dethrone_margin * 100,
+                "Challenger %s not adopted (relative per-order rule): %s",
+                getattr(new_champion_sub, "submission_id", "?"), reject_reason,
             )
-            self._notify_champion_rejected(new_champion_sub, "did not beat the champion")
+            self._notify_champion_rejected(new_champion_sub, reject_reason)
             next_round = self._complete_round(
                 current_round,
                 epoch,
                 activated=False,
-                abort_reason="dethrone_margin_not_met",
+                abort_reason=reject_reason,
             )
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
@@ -442,16 +440,20 @@ class EpochManager:
         # measured without ever adopting.
         self._record_would_be_vote(finalist)
         if not self._meets_adoption_criteria(finalist):
+            # Relative-rule reject reason (e.g. "reject: N regression(s)/drop(s)" /
+            # "reject: no win (challenger only matched the champion)"), not the
+            # obsolete saturated "dethrone_margin_not_met".
+            reject_reason = getattr(self, "_last_adopt_reason", None) or "did not beat the champion"
             next_round = self._complete_round(
                 round_state,
                 epoch,
                 activated=False,
-                abort_reason="dethrone_margin_not_met",
+                abort_reason=reject_reason,
             )
             # Mirror the reject onto the challenger's PR (comment + close + GC).
-            self._notify_champion_rejected(finalist, "did not beat the champion")
+            self._notify_champion_rejected(finalist, reject_reason)
             result["status_after"] = RoundStatus.ABORTED.value
-            result["abort_reason"] = "dethrone_margin_not_met"
+            result["abort_reason"] = reject_reason
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
@@ -987,42 +989,60 @@ class EpochManager:
     def _record_would_be_vote(self, challenger: Submission) -> None:
         """Publish this leader's INDEPENDENT would-be adopt vote (observability).
 
-        Computed via the shared rule and recorded REGARDLESS of
-        DISABLE_CHAMPION_ADOPTION, so the fleet quorum can be observed with adoption
+        Computed via the AUTHORITATIVE relative per-order rule
+        (:func:`evaluate_relative_adoption`) — the IDENTICAL rule the followers
+        publish (``champion_consensus._independent_adopt_vote``) and the leader's
+        own live decision (:meth:`_meets_adoption_criteria`) — so the leader's
+        published vote now MATCHES the followers' (both relative), not the old
+        saturated quote-anchored number. Recorded REGARDLESS of
+        DISABLE_CHAMPION_ADOPTION so the fleet quorum can be observed with adoption
         OFF. Best-effort and side-effect-free — never affects the live decision.
 
+        OBSERVABILITY ONLY: the recorded vote flows solely to
+        ``ctx.last_independent_vote`` -> the ``/health`` ``independent_vote`` field.
+        It is NEVER signed into the quorum certificate nor consumed by the consensus
+        decision (the signed follower vote is the RETURN value of
+        ``_independent_adopt_vote``; the leader's real verdict is
+        ``_meets_adoption_criteria``).
+
         Gated by the fleet-uniform observability default (CHALLENGER_QUORUM_MODE,
-        DEFAULT ON; break-glass {0,false,no,off}). Uses the single helper so the
-        leader's would-be vote and the follower's vote default-publish identically —
-        the empirical fleet test needs no per-validator config.
+        DEFAULT ON; break-glass {0,false,no,off}).
         """
         from minotaur_subnet.harness.benchmark_worker import _challenger_quorum_mode
 
         if not _challenger_quorum_mode():
             return
         try:
-            challenger_score = challenger.benchmark_score or 0
-            champion_score = self._champion.benchmark_score or 0
-            adopt, reason = evaluate_adoption(
-                challenger_score=challenger_score,
-                champion_score=champion_score,
-                challenger_scorecard=self._get_scorecard(challenger),
-                champion_scorecard=self._get_incumbent_scorecard(),
-                dethrone_margin=self._dethrone_margin,
-                has_champion=bool(self._champion.submission_id),
+            from minotaur_subnet.epoch.relative_scoring import (
+                evaluate_relative_adoption,
             )
+
+            incumbent_sub = (
+                self._sub_store.get(self._champion.submission_id)
+                if (self._sub_store and self._champion.submission_id)
+                else None
+            )
+            champ_rows = self._per_intent(incumbent_sub)
+            chal_rows = self._per_intent(challenger)
+            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            adopt = bool(verdict["adopt"])
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
                 "role": "leader",
                 "vote": "ADOPT" if adopt else "REJECT",
-                "chal_score": round(float(challenger_score), 4),
-                "champ_score": round(float(champion_score), 4),
-                "reason": reason,
+                "n_wins": verdict["n_wins"],
+                "n_regressions": verdict["n_regressions"],
+                "n_blind_spots": verdict["n_blind_spots"],
+                "n_matched": verdict["n_matched"],
+                "scenarios_compared": verdict["scenarios_compared"],
+                "reason": verdict["reason"],
             }
             logger.info(
-                "[independent-vote] role=leader candidate=%s vote=%s chal_score=%.4f "
-                "champ_score=%.4f: %s",
-                vote["candidate_id"], vote["vote"], challenger_score, champion_score, reason,
+                "[independent-vote] role=leader candidate=%s vote=%s wins=%d "
+                "regressions=%d blind_spots=%d matched=%d compared=%d: %s",
+                vote["candidate_id"], vote["vote"], verdict["n_wins"],
+                verdict["n_regressions"], verdict["n_blind_spots"],
+                verdict["n_matched"], verdict["scenarios_compared"], verdict["reason"],
             )
             if self._vote_recorder is not None:
                 self._vote_recorder(vote)
@@ -1032,22 +1052,19 @@ class EpochManager:
     def _should_adopt(self, challenger: Submission) -> bool:
         """Check if the challenger should replace the current champion.
 
-        Enforces (via the shared ``evaluate_adoption`` rule):
-        1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — absolute sanity floor.
-        2. Per-app non-regression: no champion-covered app may be dropped, and
-           no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-        3. Global improvement over the champion by the dethrone margin (default 1%)
-
-        There is no absolute global-score floor — the global JS score is relative
-        to the champion reference, so the dethrone margin (beat the champion) is
-        the operative gate. The "user got their minimum outcome" 0.5 lives in the
-        separate per-order on-chain ``scoreIntent`` gate, not adoption.
+        Delegates the verdict to :meth:`_meets_adoption_criteria` — the SOLE
+        adoption rule is the relative per-order rule
+        (:func:`evaluate_relative_adoption`): the challenger must beat-or-match the
+        freshly re-benched champion on EVERY order's RAW delivered output and
+        strictly win at least one. Adds the synchronous-path
+        ``DISABLE_CHAMPION_ADOPTION`` freeze (that path commits immediately).
         """
         # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
         # BEFORE the disable gate so the shadow tally sees it with adoption off.
         self._record_would_be_vote(challenger)
 
         if _adoption_disabled():
+            self._last_adopt_reason = "adoption disabled (DISABLE_CHAMPION_ADOPTION)"
             logger.warning(
                 "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — %s scored but NOT "
                 "adopted; champion unchanged. Unset the flag to resume adoption.",
@@ -1073,8 +1090,14 @@ class EpochManager:
         The synchronous standalone path (``process_epoch``) uses ``_should_adopt``
         instead, which keeps the freeze check because it commits immediately.
         """
+        # Record the human reason for the verdict (relative vocabulary) so the
+        # round-abort label + PR-reject message reflect WHY (no challenger delivered
+        # more / N regressions), not the obsolete "dethrone_margin_not_met".
+        self._last_adopt_reason = None
+
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
+            self._last_adopt_reason = "same submission as champion"
             return False
 
         # Fail-closed stale-bar guard: if an incumbent EXISTS but could not be
@@ -1087,6 +1110,7 @@ class EpochManager:
         # getattr default False: a manager built via __new__ (tests) or never run
         # through a refresh has not had a failed refresh -> not stale.
         if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
+            self._last_adopt_reason = "stale incumbent bar (re-benchmark failed)"
             logger.warning(
                 "[abstain] incumbent %s could not be freshly re-benchmarked this "
                 "round — abstaining (refusing to adopt %s against a stale bar)",
@@ -1099,6 +1123,7 @@ class EpochManager:
         # (no comparable per-order data) abstain — never adopt on uncertainty.
         verdict = self._evaluate_per_order_adoption(challenger)
         if verdict is None:
+            self._last_adopt_reason = "no comparable per-order data"
             logger.warning(
                 "adoption decision for %s: ABSTAIN (relative per-order verdict "
                 "unavailable — no comparable per-order data)",
@@ -1106,6 +1131,7 @@ class EpochManager:
             )
             return False
         adopt = bool(verdict["adopt"])
+        self._last_adopt_reason = verdict["reason"]
         logger.info(
             "adoption decision for %s: adopt=%s (relative per-order: %s)",
             getattr(challenger, "submission_id", "?"), adopt, verdict["reason"],

@@ -183,42 +183,60 @@ class AdoptRule:
 
 
 class CurrentAdoptRule(AdoptRule):
-    """Today's gate, verbatim. PORTS_TO: epoch/manager.py:_should_adopt."""
+    """Offline-lab AGGREGATE adoption approximation (sweepable proxy).
+
+    NOTE: production's AUTHORITATIVE rule is now the PER-ORDER relative rule
+    (``epoch/relative_scoring.evaluate_relative_adoption``): adopt iff the
+    challenger beats-or-matches the champion on EVERY order's RAW delivered output
+    and strictly wins at least one. The lab operates on aggregate SCORECARDS
+    (per-app means), not per-order shadow rows, so it cannot express that per-order
+    rule faithfully. This keeps a SELF-CONTAINED aggregate check — per-app floor +
+    per-app non-regression + dethrone margin — purely as an offline parameter-sweep
+    proxy. It is NOT the production verdict and intentionally does not consult any
+    on-chain gate (that legacy veto was removed with the relative cutover).
+    """
 
     name = "current"
 
     def evaluate(self, champ_card, chal_card, champ_oc, chal_oc, cfg, champ_qa=None, chal_qa=None) -> tuple[bool, StageRecord]:
         t0 = time.monotonic()
-        # Drive the floors by passing an explicit config to the SAME pure rule the
-        # production gate runs (evaluate_adoption). Production never passes a config
-        # (it always uses the fleet-uniform code constants), so the lab is the only
-        # caller that sweeps these — and it does so WITHOUT mutating process env, so a
-        # sweep value can never leak into a live validator's rule.
-        from minotaur_subnet.epoch.adopt_rule import _AdoptRuleConfig, evaluate_adoption
-        lab_config = _AdoptRuleConfig(
-            per_app_min_score=cfg.per_app_min_score,
-            max_app_regression=cfg.max_app_regression,
-            onchain_max_regression=cfg.max_app_regression,
-        )
-        adopt, _reason = evaluate_adoption(
-            challenger_score=chal_card.global_score,
-            champion_score=champ_card.global_score,
-            challenger_scorecard=chal_card.to_dict(),
-            champion_scorecard=champ_card.to_dict(),
-            dethrone_margin=cfg.dethrone_margin,
-            has_champion=True,
-            config=lab_config,
-        )
+        per_app_min = cfg.per_app_min_score
+        max_regression = cfg.max_app_regression
+        margin = cfg.dethrone_margin
+        chal_apps = chal_card.app_scores or {}
+        champ_apps = champ_card.app_scores or {}
+
+        adopt = True
+        reason = "adopt"
+        # (1) per-app sanity floor
+        for app_id, s in chal_apps.items():
+            if s < per_app_min:
+                adopt, reason = False, f"app {app_id} below per-app min {per_app_min}"
+                break
+        # (2) per-app non-regression vs the champion
+        if adopt:
+            for app_id, inc in champ_apps.items():
+                ch = chal_apps.get(app_id)
+                if ch is None:
+                    adopt, reason = False, f"drops app {app_id}"
+                    break
+                if inc > 0 and ch < inc * (1 - max_regression):
+                    adopt, reason = False, f"regresses on {app_id}"
+                    break
+        # (3) aggregate dethrone margin
+        if adopt and chal_card.global_score < champ_card.global_score * (1 + margin):
+            adopt, reason = False, "below dethrone margin"
+
         rec = StageRecord(
             stage="adopt", scenario="(all)", ok=True,
-            summary=f"rule=current -> {'ADOPT' if adopt else 'REJECT'}",
+            summary=f"rule=current(aggregate-proxy) -> {'ADOPT' if adopt else 'REJECT'}",
             inputs={"champion_global": round(champ_card.global_score, 6),
                     "challenger_global": round(chal_card.global_score, 6),
                     "dethrone_margin": cfg.dethrone_margin,
                     "max_app_regression": cfg.max_app_regression},
-            outputs={"adopt": adopt},
-            meta={"ports_to": "epoch/manager.py:_should_adopt",
-                  "note": "on_chain_score is NOT consulted by the current contest"},
+            outputs={"adopt": adopt, "reason": reason},
+            meta={"ports_to": "epoch/relative_scoring.py:evaluate_relative_adoption",
+                  "note": "offline aggregate proxy; production is the per-order relative rule"},
             duration_ms=_ms(t0),
         )
         return adopt, rec
