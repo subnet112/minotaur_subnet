@@ -327,6 +327,10 @@ function buildSandbox(contextExtras) {
         isNaN,
         isFinite,
         Number,
+        // Exact arbitrary-precision integers — required by raw-output shadow
+        // scoring to sum token wei (1e18..1e22+) above Number's 2^53 safe limit
+        // without IEEE-754 precision loss. Pure built-in, no host access.
+        BigInt,
         String,
         Boolean,
         Array,

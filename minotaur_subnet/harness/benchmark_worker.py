@@ -979,9 +979,14 @@ class BenchmarkWorker:
                     shadow = await engine.score(
                         f"{app_id}:shadow", plan, simulation, state,
                     )
+                    # raw_output is an EXACT DECIMAL WEI STRING from the shadow JS
+                    # (BigInt -> .toString()). Store it verbatim — no float()
+                    # conversion, which would reintroduce IEEE-754 precision loss
+                    # above 2^53. _results_to_details copies this string straight
+                    # into per_intent, and the relative rule parses it with int().
                     raw = (shadow.metadata or {}).get("raw_output")
                     result.shadow_score = (
-                        float(raw) if isinstance(raw, (int, float)) else None
+                        str(raw) if (raw is not None and str(raw) != "") else None
                     )
                 except Exception as exc:  # observe-only — never break live scoring
                     logger.warning(
