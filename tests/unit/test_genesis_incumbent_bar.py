@@ -205,9 +205,13 @@ def test_refresh_scores_incumbent_via_challenger_path():
     assert seen["image_tag"] == "champ:1"             # scored the incumbent's own image
     assert seen["context"] == "incumbent"
     assert not getattr(mgr, "_incumbent_refresh_failed", False)
-    # persisted the refreshed score + details for the incumbent submission
+    # Display-path fix (#FIX): the FRESH same-round re-bench (score AND per_intent /
+    # scorecard details) is persisted back to the champion submission record, so the
+    # relative adoption rule and the report path both compare against the SAME
+    # same-round reference. Assert BOTH score and details match the re-bench output.
     args, kw = mgr._sub_store.set_benchmark_result.call_args
     assert args[0] == "sub_real" and kw["score"] == 0.52
+    assert kw["details"] == {"scorecard": {"app_onchain": {"dex": [5200]}}}
 
 
 def test_refresh_prefers_pullable_digest_over_local_screening_tag():

@@ -9,8 +9,9 @@ fleet never diverge on a stale champion bar.
 These cases complement test_adoption_gate_p0.py::test_abstains_when_incumbent_bar_is_stale,
 which covers stale+incumbent and fresh+incumbent but NOT the bootstrap
 (no-incumbent) branch the guard explicitly carves out. Here we monkeypatch the
-shared ``evaluate_adoption`` rule to a constant ADOPT so the stale-bar guard is
-the *only* thing that can return False — isolating the guard under test.
+relative per-order verdict (``_evaluate_per_order_adoption``) to a constant ADOPT
+so the stale-bar guard is the *only* thing that can return False — isolating the
+guard under test.
 """
 
 import types
@@ -48,11 +49,15 @@ def _challenger(score: float = 0.9):
 
 @pytest.fixture
 def force_adopt(monkeypatch):
-    """Force the shared adoption rule to ADOPT so the ONLY thing that can return
-    False from _should_adopt is the stale-bar guard under test."""
+    """Force the relative per-order verdict to ADOPT so the ONLY thing that can
+    return False from _should_adopt is the stale-bar guard under test."""
     monkeypatch.setattr(
-        manager_mod, "evaluate_adoption",
-        lambda **kwargs: (True, "forced-adopt-for-test"),
+        EpochManager, "_evaluate_per_order_adoption",
+        lambda self, challenger: {
+            "adopt": True, "reason": "forced-adopt-for-test",
+            "n_wins": 1, "n_regressions": 0, "n_blind_spots": 0,
+            "n_matched": 0, "scenarios_compared": 1,
+        },
     )
 
 
@@ -60,9 +65,6 @@ def force_adopt(monkeypatch):
 def _no_freeze(monkeypatch):
     """Ensure the DISABLE_CHAMPION_ADOPTION freeze isn't what returns False."""
     monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
-    # Also keep ADOPT_RULE on the default "current" path so the forced
-    # evaluate_adoption (not the p2oc branch) is what would otherwise decide.
-    monkeypatch.setattr(manager_mod, "ADOPT_RULE", "current", raising=False)
 
 
 def test_stale_incumbent_abstains_even_for_a_winner(force_adopt):

@@ -324,7 +324,7 @@ async def _reactive_benchmark_candidate(
     )
 
     # Determinism-comparable signals: the JS local_score alone can't be diffed
-    # against the leader's on-chain-ranked (p2oc / SHADOW_DETERMINISM) numbers.
+    # against the leader's on-chain scoreIntent numbers.
     # Log the per-app on-chain scoreIntent means so operators can grep-compare
     # leader vs follower for the same candidate + pinned block across the fleet.
     try:
@@ -382,11 +382,14 @@ async def _independent_adopt_vote(
 
     Benchmarks the CURRENT champion on the SAME ``intents`` the challenger was just
     scored on — the single round-seeded corpus that is identical on every validator
-    — and applies the shared ``evaluate_adoption`` rule, so the vote is this
-    validator's own judgement (challenger beats champion), not reproduction of the
-    leader's number. Because the corpus is shared, a concentrated improvement is
-    visible to the whole fleet and the quorum of YES verdicts is meaningful.
-    Returns ``(adopt, chal_score)``.
+    — and applies the AUTHORITATIVE relative per-order rule
+    (:func:`evaluate_relative_adoption`), the IDENTICAL rule the leader runs
+    (``EpochManager._meets_adoption_criteria``), so the vote is this validator's own
+    per-order judgement (challenger beats-or-matches the champion on every order's
+    RAW delivered output and strictly wins at least one), NOT reproduction of the
+    leader's aggregate number. Because the corpus is shared and the rule is
+    fleet-uniform, the quorum of YES verdicts is meaningful. Returns
+    ``(adopt, chal_score)``.
 
     Conservative on uncertainty: if the champion image can't be resolved, or its
     benchmark needs a real simulator and none is available, vote REJECT rather than
@@ -399,10 +402,8 @@ async def _independent_adopt_vote(
         require_real_sim_default,
         run_benchmark,
     )
-    from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
-    from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
-    chal_card = worker._build_scorecard(chal_results).to_dict()
     # has_champion mirrors the leader EXACTLY: adopted champion, active-champion
     # snapshot, OR a SCORED genesis with a usable score (genesis-as-bar, #242 — the
     # first champion must BEAT genesis). The leader seeds self._champion from the
@@ -413,22 +414,19 @@ async def _independent_adopt_vote(
     champ_image = worker._resolve_champion_image()
 
     if not has_champion:
-        # BOOTSTRAP (has_champion=False): no incumbent to dethrone. Match the leader
-        # — adopt a first champion that clears the absolute floor (no margin). MUST
-        # NOT auto-reject here: that would deadlock the very first adoption.
-        adopt, reason = evaluate_adoption(
-            challenger_score=chal_score,
-            champion_score=0.0,
-            challenger_scorecard=chal_card,
-            champion_scorecard={},
-            dethrone_margin=DETHRONE_MARGIN,
-            has_champion=False,
-        )
+        # BOOTSTRAP (has_champion=False): no incumbent to dethrone. The relative rule
+        # with an empty champion treats every value-delivering challenger order as a
+        # blind-spot cover, so a first champion that delivers value on ANY order
+        # adopts (no incumbent benchmark). MUST NOT auto-reject: that would deadlock
+        # the very first adoption.
+        verdict = evaluate_relative_adoption([], chal_results)
+        adopt = bool(verdict["adopt"])
         logger.info(
             "[independent-vote] role=follower candidate=%s round=%s vote=%s "
-            "chal_score=%.4f champ=BOOTSTRAP(no incumbent): %s",
+            "chal_score=%.4f champ=BOOTSTRAP(no incumbent) wins=%d blind_spots=%d: %s",
             candidate.submission_id, round_id,
-            "ADOPT" if adopt else "REJECT", chal_score, reason,
+            "ADOPT" if adopt else "REJECT", chal_score,
+            verdict["n_wins"], verdict["n_blind_spots"], verdict["reason"],
         )
         try:
             from minotaur_subnet.api.server_context import ctx
@@ -436,7 +434,7 @@ async def _independent_adopt_vote(
                 "candidate_id": candidate.submission_id, "role": "follower",
                 "vote": "ADOPT" if adopt else "REJECT",
                 "chal_score": round(float(chal_score), 4), "champ_score": None,
-                "round_id": round_id, "reason": reason,
+                "round_id": round_id, "reason": verdict["reason"],
             }
         except Exception:  # observe-only — must never break verification
             pass
@@ -498,32 +496,29 @@ async def _independent_adopt_vote(
         )
         return False, chal_score
 
+    # champ_score is for logging only now (the AUTHORITATIVE verdict is per-order on
+    # the RAW delivered output, NOT the aggregate JS score).
     champ_score = worker._compute_avg_score(champ_results)
-    champ_card = worker._build_scorecard(champ_results).to_dict()
-    # Use the SAME margin source the leader's EpochManager uses (the DETHRONE_MARGIN
-    # constant — see routes.py EpochManager construction) so leader and follower
-    # apply an identical bar; do not diverge via a follower-only env override.
-    margin = DETHRONE_MARGIN
-    adopt, reason = evaluate_adoption(
-        challenger_score=chal_score,
-        champion_score=champ_score,
-        challenger_scorecard=chal_card,
-        champion_scorecard=champ_card,
-        dethrone_margin=margin,
-        has_champion=True,
-    )
+    # AUTHORITATIVE relative per-order verdict — IDENTICAL to the leader's
+    # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
+    # Joins champion vs challenger BenchmarkResults by intent_id on shadow_score (the
+    # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
+    verdict = evaluate_relative_adoption(champ_results, chal_results)
+    adopt = bool(verdict["adopt"])
     logger.info(
         "[independent-vote] role=follower candidate=%s round=%s vote=%s chal_score=%.4f "
-        "champ_score=%.4f fork_block=%s: %s",
+        "champ_score=%.4f fork_block=%s wins=%d regressions=%d blind_spots=%d "
+        "compared=%d: %s",
         candidate.submission_id,
         round_id,
         "ADOPT" if adopt else "REJECT",
         chal_score,
         champ_score,
         worker._epoch_block_number,
-        reason,
+        verdict["n_wins"], verdict["n_regressions"], verdict["n_blind_spots"],
+        verdict["scenarios_compared"], verdict["reason"],
     )
-    # Publish for the fleet shadow tally (/health independent_vote). Best-effort.
+    # Publish for the fleet tally (/health independent_vote). Best-effort.
     try:
         from minotaur_subnet.api.server_context import ctx
         ctx.last_independent_vote = {
@@ -533,7 +528,7 @@ async def _independent_adopt_vote(
             "chal_score": round(float(chal_score), 4),
             "champ_score": round(float(champ_score), 4),
             "round_id": round_id,
-            "reason": reason,
+            "reason": verdict["reason"],
         }
     except Exception:  # observe-only — must never break verification
         pass

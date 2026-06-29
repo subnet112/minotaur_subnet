@@ -417,7 +417,8 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
     Two validators that derive the same pin AND read the same block hash are
     forking byte-identical chain state, so their on-chain sims are deterministic;
     a hash mismatch means their upstream RPCs disagree (reorg / archive
-    inconsistency) and ``ADOPT_RULE=p2oc`` must NOT be flipped. Unlike the pack
+    inconsistency), so their on-chain sims would diverge and could split the
+    adoption verdict across the fleet. Unlike the pack
     hash, this needs no corpus flag, so it is comparable across the fleet by
     polling /health alone. One ``eth_getBlockByNumber`` per chain against the
     same live upstream RPC the pin derivation uses, bounded timeout, best-effort
@@ -2097,6 +2098,22 @@ async def initialize(ctx: ServerContext) -> dict:
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
+
+            # Boot-restore: relaunch the live ORDER solver onto the adopted
+            # champion's certified digest. The EpochManager restored champion
+            # METADATA above, but the block loop booted its live solver from the
+            # genesis / FORCE_SOLVER_IMAGE image — without this, a restart
+            # silently serves real orders on a non-champion solver (a stale
+            # :latest), e.g. emitting outdated multi-hop calldata that reverts.
+            # No-ops under FORCE_SOLVER_IMAGE / genesis (operator pin preserved).
+            try:
+                await ctx.epoch_manager.ensure_live_solver_matches_champion()
+            except Exception:
+                logger.error(
+                    "Boot-restore of the champion live solver raised — continuing; "
+                    "live solver may be non-champion until the next adoption",
+                    exc_info=True,
+                )
 
             solver_round_hotkey = _resolve_solver_round_hotkey()
             solver_round_force_leader = _env_true("FORCE_LEADER", default=False)
