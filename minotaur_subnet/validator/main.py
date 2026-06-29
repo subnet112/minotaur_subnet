@@ -1130,7 +1130,7 @@ class AppIntentsValidator:
 
         At 0 orders the miner share stays at the conservative floor (5%, the
         incoming mappings are already built at the floor — this is a no-op); it
-        ramps linearly to 100% at ``ORDERS_FOR_FULL_EMISSION`` (1000) orders.
+        ramps linearly to 100% at ``ORDERS_FOR_FULL_EMISSION`` (5000) orders.
         ``apply_champion_burn_ramp`` is idempotent in the fraction, so re-ramping
         an already-floor-ramped mapping just re-targets the aggregate share while
         preserving the relative split among miners and the owner burn target.
