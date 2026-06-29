@@ -92,7 +92,7 @@ CHAMPION_MINER_WEIGHT_FRACTION = CHAMPION_MINER_WEIGHT_FLOOR
 # Number of orders processed within the trailing 24h at which miners receive the
 # FULL emission (fraction 1.0). Between 0 and this the miner share ramps linearly
 # from the floor to 1.0. Like the floor, consensus-relevant and baked in.
-ORDERS_FOR_FULL_EMISSION = 1000
+ORDERS_FOR_FULL_EMISSION = 5000
 
 
 def champion_miner_weight_fraction(orders_24h: int | float) -> float:
@@ -100,7 +100,7 @@ def champion_miner_weight_fraction(orders_24h: int | float) -> float:
 
     Linear ramp: ``CHAMPION_MINER_WEIGHT_FLOOR`` (0.05) at 0 orders rising to
     ``1.0`` (100% to miners, nothing burned) at ``ORDERS_FOR_FULL_EMISSION``
-    (1000) orders, then clamped at 1.0 beyond that. The floor is the minimum so a
+    (5000) orders, then clamped at 1.0 beyond that. The floor is the minimum so a
     quiet subnet still routes the conservative 5% to its champion. Negative or
     non-numeric inputs degrade to the floor.
     """
