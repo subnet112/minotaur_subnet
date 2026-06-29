@@ -1015,9 +1015,10 @@ async def reattest_current_champion(request: Request) -> dict:
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/close", _close_payload,
     )
+    _certify_payload = _certify_round_sync_payload(state)
+    _certify_payload["force"] = True  # bypass the (long-elapsed) certification deadline
     await _broadcast_internal_round_sync(
-        "/v1/solver/round/internal/certify",
-        _certify_round_sync_payload(state),
+        "/v1/solver/round/internal/certify", _certify_payload,
     )
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/activate",
