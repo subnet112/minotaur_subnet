@@ -382,6 +382,11 @@ def health() -> dict:
         data["per_order_adoption_vote"] = dict(ctx.last_per_order_adoption_vote)
     if ctx.last_champion_quorum:
         data["champion_quorum"] = dict(ctx.last_champion_quorum)
+    # Observe-only shadow verdict beside the real tally — "would the fleet certify
+    # at SHADOW_CHAMPION_QUORUM_BPS (default 60%)?" Additive; absent on legacy images
+    # / when the shadow gate is off / before the first harvest. Never affects adoption.
+    if ctx.last_shadow_champion_quorum:
+        data["shadow_champion_quorum"] = dict(ctx.last_shadow_champion_quorum)
     # Durable order counts from the persistent store (NOT the daemon's in-memory
     # IntentOrderBook, which is only the block-loop's live working set — empty on
     # followers, and ~empty even on the leader whenever no orders are in flight).

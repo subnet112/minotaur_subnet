@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from fastapi import HTTPException
@@ -824,6 +825,140 @@ def _build_champion_approval_from_payload(
     )
 
 
+# ── Shadow champion-quorum (observe-only) ─────────────────────────────────────
+# Followers ALREADY run a full reactive benchmark + independent verify + sign when
+# they receive a champion proposal, but at the live quorum of 1 the leader
+# self-certifies and never asks them. This block re-broadcasts the SAME proposal
+# AFTER the real certificate is committed — with collector=None, so the harvested
+# approvals can NEVER reach the live consensus _pending / certificate at ANY
+# quorum — and computes "would the fleet have certified at SHADOW_CHAMPION_QUORUM_BPS
+# (default 6000 = 60%)?" purely for /health + logs. It NEVER touches the live
+# decision. Mirrors the ROUND_ANCHOR_SHADOW / ROUND_ANCHOR_PARITY ship-dark convention.
+_SHADOW_CHAMPION_QUORUM_BPS_DEFAULT = 6000
+_SHADOW_QUORUM_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def shadow_champion_quorum_enabled() -> bool:
+    """SHADOW_CHAMPION_QUORUM master gate — DEFAULT ON (observe-only). Disable with
+    one of {0,false,no,off}. Read at call time. Pure observability: it only toggles
+    the post-cert harvest + logging and NEVER feeds the real quorum/certificate."""
+    raw = os.environ.get("SHADOW_CHAMPION_QUORUM")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _SHADOW_QUORUM_OFF_VALUES
+
+
+def shadow_champion_quorum_bps() -> int:
+    """Hypothetical quorum threshold (bps) the shadow verdict is computed against.
+    DEFAULT 6000 (=60%). Observe-only override knob — applied ONLY to the
+    collected-approval count for /health + logs; never routed to
+    ``consensus_manager.quorum_bps`` or ``propose()``."""
+    try:
+        return int(os.environ.get("SHADOW_CHAMPION_QUORUM_BPS", str(_SHADOW_CHAMPION_QUORUM_BPS_DEFAULT)))
+    except (TypeError, ValueError):
+        return _SHADOW_CHAMPION_QUORUM_BPS_DEFAULT
+
+
+def _shadow_quorum_required(n: int, bps: int) -> int:
+    """Approvals needed at *bps* over *n* validators. SAME integer ceil-div as
+    ``ChampionConsensusManager.quorum_required`` — kept in lock-step (no float,
+    host-deterministic). Observe-only; never used for the live decision."""
+    return max(1, (n * bps + 9999) // 10000)
+
+
+def _shadow_request_timeout() -> float:
+    """Per-peer POST timeout (s) for the shadow broadcast. Long by default (300s):
+    a follower runs a full reactive benchmark before it signs, far longer than the
+    ~30s the real broadcast uses."""
+    try:
+        return float(os.environ.get("SHADOW_CHAMPION_QUORUM_TIMEOUT_S", "300"))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+async def _run_shadow_champion_quorum(
+    proposal: Any, leader_result: Any, consensus_manager: Any,
+    peer_network: Any, round_state: Any,
+) -> None:
+    """Post-cert, observe-only: would the fleet certify at SHADOW_CHAMPION_QUORUM_BPS?
+
+    Re-broadcasts the SAME proposal with ``collector=None`` (read-only — the
+    returned approvals NEVER touch the live consensus state) and a long per-request
+    timeout so followers can finish their reactive benchmark and return a signed
+    approval. Publishes the verdict to ``ctx.last_shadow_champion_quorum`` + logs one
+    diffable line. Swallows everything — must never affect the already-committed cert.
+    """
+    try:
+        try:
+            follower_approvals = await peer_network.broadcast_champion_proposal(
+                proposal,
+                collector=None,  # read-only: cannot reach the live certificate
+                close_epoch=round_state.close_epoch,
+                quorum_required=consensus_manager.quorum_required,
+                decision_deadline_epoch=round_state.decision_deadline_epoch,
+                committee_block=round_state.committee_block,
+                request_timeout=_shadow_request_timeout(),
+            )
+        except asyncio.CancelledError:
+            follower_approvals = []
+        except Exception:
+            follower_approvals = []
+        # Unique signers: the leader's own approval ∪ followers, deduped by lc id.
+        signers: dict[str, str] = {}
+        for a in (getattr(leader_result, "approvals", None) or []):
+            try:
+                signers[a.validator_id.lower()] = a.validator_id
+            except Exception:
+                pass
+        for a in (follower_approvals or []):
+            try:
+                signers[a.validator_id.lower()] = a.validator_id
+            except Exception:
+                pass
+        collected = len(signers)
+        # Same denominator as the live quorum (on-chain count, else validator set).
+        n = 0
+        pc = getattr(consensus_manager, "protocol_config", None)
+        if pc is not None:
+            n = getattr(pc, "on_chain_validator_count", 0) or 0
+        if n == 0:
+            try:
+                n = len(consensus_manager.validators)
+            except Exception:
+                n = 0
+        bps = shadow_champion_quorum_bps()
+        required = _shadow_quorum_required(n, bps)
+        reached = collected >= required
+        live_reached = bool(getattr(leader_result, "reached", False))
+        rec = {
+            "round_id": proposal.round_id,
+            "candidate_submission_id": proposal.candidate_submission_id,
+            "candidate_image_id": proposal.candidate_image_id,
+            "shadow_bps": bps,
+            "collected": collected,
+            "shadow_quorum_required": required,
+            "reached": reached,
+            "validator_count": n,
+            "signers": list(signers.values()),
+            "live_reached": live_reached,
+            "agree_with_live": reached == live_reached,
+        }
+        try:
+            from minotaur_subnet.api.server_context import ctx
+            ctx.last_shadow_champion_quorum = rec
+        except Exception:
+            pass
+        logger.info(
+            "[champion-shadow-quorum] round=%s candidate=%s n=%d bps=%d collected=%d "
+            "shadow_required=%d shadow_reached=%s live_reached=%s agree=%s signers=%s",
+            proposal.round_id, proposal.candidate_submission_id, n, bps, collected,
+            required, reached, live_reached, (reached == live_reached),
+            [s[:10] for s in signers.values()],
+        )
+    except Exception:  # observe-only — must never raise
+        pass
+
+
 async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
     """Internal helper to certify a round without HTTP context."""
     round_store = get_round_store()
@@ -979,6 +1114,20 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                 ),
             )
         certificate = result.certificate
+
+        # Shadow champion-quorum (observe-only): now that the real certificate is in
+        # hand, re-broadcast the SAME proposal to harvest follower approvals and
+        # compute the "would 60% have certified?" verdict for /health + logs.
+        # create_task is non-blocking, so certify_round below runs first; the shadow
+        # uses collector=None so harvested approvals can never reach the live
+        # certificate. Gated (default-on), swallow-all — strictly observability.
+        if shadow_champion_quorum_enabled() and peer_network is not None:
+            try:
+                asyncio.create_task(_run_shadow_champion_quorum(
+                    proposal, result, consensus_manager, peer_network, round_state,
+                ))
+            except Exception:  # observe-only — must never break certification
+                pass
 
     return round_store.certify_round(body.round_id, certificate)
 

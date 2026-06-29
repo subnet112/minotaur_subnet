@@ -1474,6 +1474,26 @@ def _fmt_champion_consensus(cc: dict | None) -> str:
     return base
 
 
+def _fmt_shadow_quorum(sq: dict | None) -> str:
+    """Render the observe-only ``shadow_champion_quorum`` verdict compactly.
+
+    ``—`` when absent (legacy image / shadow gate off / no harvest yet), else
+    ``{collected}/{required} @{bps}bps {OK|no}`` — "would the fleet have certified
+    at the shadow threshold?" — with a ⚠diverges marker when the shadow verdict
+    disagrees with the live cert.
+    """
+    if not sq:
+        return "—"
+    collected = sq.get("collected")
+    required = sq.get("shadow_quorum_required")
+    bps = sq.get("shadow_bps")
+    verdict = "OK" if sq.get("reached") else "no"
+    base = f"{collected}/{required} @{bps}bps {verdict}"
+    if sq.get("agree_with_live") is False:
+        base += " ⚠diverges"
+    return base
+
+
 def _fmt_registry_view(cc: dict | None) -> str:
     """Render champion_consensus.registry_view — the on-chain count + block +
     refresh freshness the node is acting on.
@@ -1662,6 +1682,7 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
             ("Solver-round role", [(s.api_health or {}).get("solver_round_role") or "—" for s in api]),
             ("Current round", [_fmt_solver_round((s.api_health or {}).get("solver_round")) for s in api]),
             ("Champion consensus", [_fmt_champion_consensus((s.api_health or {}).get("champion_consensus")) for s in api]),
+            ("Shadow quorum", [_fmt_shadow_quorum((s.api_health or {}).get("shadow_champion_quorum")) for s in api]),
             ("Registry view", [_fmt_registry_view((s.api_health or {}).get("champion_consensus")) for s in api]),
         ]
         _table(api_rows, api_cols)
