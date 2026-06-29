@@ -45,6 +45,25 @@ def canonical_solver_repo() -> tuple[str, str]:
     return DEFAULT_SOLVER_REPO
 
 
+def github_owner_from_url(url: str | None) -> str | None:
+    """Extract the GitHub account (owner login) from a clone/repo URL, lowercased.
+
+    ``https://github.com/<owner>/<repo>(.git)`` (and the ``git@``/``ssh://`` forms)
+    → ``owner``. Returns None for a non-github or inline (``source://``) URL.
+    Lowercased because GitHub logins are case-insensitive — so ``Alice`` and
+    ``alice`` dedup as one account. Used to key the per-(account, round) cap on the
+    resolved PR head-repo owner.
+    """
+    u = (url or "").strip()
+    for prefix in ("https://github.com/", "git@github.com:", "ssh://git@github.com/"):
+        if u.startswith(prefix):
+            path = u[len(prefix):].removesuffix(".git")
+            parts = path.split("/")
+            if parts and parts[0]:
+                return parts[0].lower()
+    return None
+
+
 def _github_headers(token: str | None = None) -> dict[str, str]:
     """Auth headers for the GitHub API.
 
