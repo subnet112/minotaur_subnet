@@ -280,8 +280,12 @@ class AppIntentsValidator:
         # Follower app catalog sync (optional)
         leader_api_url: str = "",
         app_sync_poll_interval: float = 60.0,
-        # Local champion source for weight emission (read-only; the api writes it)
-        round_store_path: str | None = None,
+        # The champion for weight emission is read from THIS node's CO-LOCATED API
+        # (GET /v1/solver/champion) — the single source of truth that ran the
+        # benchmark/consensus and adopted. NEVER from chain or the public leader, so a 3rd
+        # party can't free-ride on a published answer. Default targets the compose service
+        # name; override with CHAMPION_API_URL for a non-standard topology.
+        champion_api_url: str = "http://api:8080",
     ) -> None:
         self.store = store
         self.port = port
@@ -293,26 +297,20 @@ class AppIntentsValidator:
             or os.environ.get("OWNER_HOTKEY", ""),
         )
 
-        # Read-only handle on THIS validator's round store so the epoch loop can
-        # weight the champion IT locally adopted (written by its own api). The
-        # champion is NEVER read from chain — every validator must independently
-        # know the champion (it did the benchmark/consensus work), so a 3rd party
-        # can't free-ride by copying a published answer.
-        self._champion_round_store = None
-        try:
-            from minotaur_subnet.harness.round_store import RoundStore
+        # Champion source for weight emission: THIS node's co-located API's single source
+        # of truth (GET /v1/solver/champion), read with a bounded last-known-good memo so a
+        # transient API restart never flips a standing champion to 100% burn. The validator
+        # holds NO champion state of its own — see docs/architecture/state-consolidation.md.
+        from minotaur_subnet.validator.champion_client import ChampionResolver
 
-            _rs_path = (round_store_path or "").strip()
-            if _rs_path:
-                self._champion_round_store = RoundStore(persist_path=Path(_rs_path))
-                logger.info("Weight emission champion source: round store %s", _rs_path)
-            else:
-                logger.warning(
-                    "No round_store_path — weight emission can't see the local "
-                    "champion and will burn 100%% to owner until one is wired",
-                )
-        except Exception as exc:
-            logger.warning("Local champion round store unavailable for weights: %s", exc)
+        self._champion_resolver = ChampionResolver(
+            champion_api_url, memo_ttl_seconds=max(2.0 * float(epoch_seconds), 600.0),
+        )
+        self._champion_source = "init"
+        logger.info(
+            "Weight emission champion: co-located API %s (GET /v1/solver/champion)",
+            champion_api_url,
+        )
         self.orderbook = IntentOrderBook()
 
         # Shared bridge registry for quote/solve paths.
@@ -1030,23 +1028,19 @@ class AppIntentsValidator:
             except Exception as exc:
                 logger.error("Rescan error: %s", exc)
 
-    def _local_champion_hotkey(self) -> str | None:
-        """Hotkey of THIS validator's locally-adopted champion, or None before a
-        real miner champion exists. Read from the local round store (written by
-        this validator's own api when it adopted) — never from chain. Drives the
-        0.05/0.95 champion burn ramp so a standing champion keeps its share every
-        epoch, including rounds with no new submissions; None ⇒ 100% burn."""
-        rs = self._champion_round_store
-        if rs is None:
-            return None
-        try:
-            from minotaur_subnet.weight_policy import is_real_miner_hotkey
+    async def _local_champion_hotkey(self) -> str | None:
+        """Hotkey of the current champion for the 0.05/0.95 burn ramp; None ⇒ 100% burn.
 
-            hotkey = (rs.get_active_champion().hotkey or "").strip()
-            return hotkey if is_real_miner_hotkey(hotkey) else None
-        except Exception as exc:
-            logger.warning("Could not read local champion for weights: %s", exc)
-            return None
+        Read from THIS node's co-located API (GET /v1/solver/champion) — the single source
+        of truth that ran the benchmark/consensus and adopted — with a bounded
+        last-known-good memo so a transient API restart never flips a standing champion to
+        100% burn. Never read from chain or the public leader (anti-free-ride). See
+        docs/architecture/state-consolidation.md."""
+        import time
+
+        hotkey, src = await self._champion_resolver.resolve(time.monotonic())
+        self._champion_source = src  # 'api' | 'memo' | 'none' — surfaced on /health
+        return hotkey
 
     async def _epoch_loop(self) -> None:
         """Periodically emit weights — single source of chain set_weights calls.
@@ -1097,11 +1091,22 @@ class AppIntentsValidator:
                 await self._do_emit(queued, source=source)
                 continue
 
-            # Priority 2: burn fallback via ChampionWeights. Refresh the champion
-            # from the LOCAL round store first so a standing champion keeps its
-            # 0.05 every epoch (even in rounds with no new PRs) instead of silently
-            # reverting to a 100% burn. None ⇒ genesis/no champion ⇒ burn.
-            self._champion_miner_id = self._local_champion_hotkey()
+            # Priority 2: burn fallback via ChampionWeights. Resolve the champion from
+            # the co-located API. CRITICAL distinction: a None hotkey from a DEFINITIVE
+            # API read (source 'api') means "no champion adopted" ⇒ burning to owner is
+            # the correct bootstrap state. A None from an UNRESOLVED read (source
+            # 'none'/'init', or a memo with no hotkey) means "we don't KNOW the champion
+            # yet" — e.g. the heavier API not ready right after a watchtower CO-restart, or
+            # an outage past the memo TTL. Burning out of IGNORANCE would collapse the
+            # standing champion's emission for a full ~1300s commit-reveal window. So SKIP:
+            # the validator's PRIOR on-chain weights (already weighting the champion)
+            # persist until the API answers, and we retry on the next 5s tick. This
+            # restores the old local-file read's "instant at startup, tolerant of API
+            # outages" safety without holding any champion state. See
+            # docs/architecture/state-consolidation.md.
+            self._champion_miner_id = await self._local_champion_hotkey()
+            if self._champion_miner_id is None and self._champion_source != "api":
+                continue
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights:
                 await self._do_emit(epoch_weights, source="burn_fallback")
@@ -1321,6 +1326,20 @@ class AppIntentsValidator:
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
             "weights_emitter_configured": self._weights_emitter is not None,
+            # Champion observability (state-consolidation): where the champion was resolved
+            # (api/memo/none) and whether we emit the champion ramp vs 100% burn — so a
+            # validator burning a REAL champion can no longer present as healthy (the old
+            # blindspot where only last_emit.uids_attempted 1-vs-2 revealed it).
+            "champion_source": self._champion_source,
+            "champion_hotkey": self._champion_miner_id,
+            # champion = weighting a real champion; burn = DEFINITIVE no-champion (source
+            # 'api') => owner burn; hold = champion UNRESOLVED (api unreachable) => we SKIP
+            # emitting so the prior on-chain weights persist (never a burn out of ignorance).
+            "emission_mode": (
+                "champion" if self._champion_miner_id
+                else "burn" if self._champion_source == "api"
+                else "hold"
+            ),
             "owner_hotkey_resolved": bool(self.weights.owner_hotkey),
             "my_uid": sync_state.my_uid if sync_state is not None else None,
             "my_last_update_block": sync_state.my_last_update_block if sync_state is not None else None,
@@ -1662,28 +1681,12 @@ def main() -> None:
     validator_hotkey_ss58 = os.environ.get("VALIDATOR_HOTKEY_SS58", "").strip()
     validator_key = args.validator_key or os.environ.get("VALIDATOR_PRIVATE_KEY", "")
 
-    store_path = Path(args.store_path) if args.store_path else None
+    # Resolve the app catalog path the SAME way the API does (APP_INTENTS_STORE_PATH env)
+    # with the --store-path CLI arg as a fallback, so a node's api + validator never resolve
+    # the shared SQLite store differently. SQLite-backed (cross-process safe).
+    _app_store_path = os.environ.get("APP_INTENTS_STORE_PATH", "").strip() or args.store_path
+    store_path = Path(_app_store_path) if _app_store_path else None
     store = AppIntentStore(store_path=store_path)
-
-    # Round store written by this validator's api (shared /data volume) — the
-    # local champion source for weight emission. Prefer the explicit env; else
-    # the conventional sibling of the app store.
-    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
-    if not round_store_path and store_path is not None:
-        round_store_path = str(store_path.parent / "solver_rounds.json")
-    if not round_store_path:
-        # A FOLLOWER's validator may not pass --store-path, leaving the champion source
-        # UNSET → _champion_round_store is None → the weight emitter's burn-fallback finds
-        # no champion → 100% burn even AFTER the API adopts (the live symptom: emit
-        # source=burn_fallback, uids_attempted=1). Fall back to the API's mounted volume
-        # (the /data the API persists solver_rounds.json to under #430) so the burn-fallback
-        # reads the SAME champion the API wrote (get_active_champion re-reads on mtime, so it
-        # picks up adoption live). is_dir() guards a node with no shared volume → stays unset,
-        # prior behavior, no regression.
-        _app = os.environ.get("APP_INTENTS_STORE_PATH", "").strip()
-        _data_dir = Path(_app).parent if _app else Path("/data")
-        if _data_dir.is_dir():
-            round_store_path = str(_data_dir / "solver_rounds.json")
 
     contract_address = os.environ.get("SWAP_APP_ADDRESS", "") or os.environ.get("APP_INTENT_BASE_31337", "")
     if not contract_address:
@@ -1747,7 +1750,10 @@ def main() -> None:
         contract_address=contract_address,
         leader_api_url=leader_api_url,
         app_sync_poll_interval=args.app_sync_interval,
-        round_store_path=round_store_path,
+        # The champion is resolved from THIS node's co-located API (default http://api:8080);
+        # override CHAMPION_API_URL only for a non-standard topology. MUST be the operator's
+        # OWN co-located API — never the public leader (anti-free-ride).
+        champion_api_url=os.environ.get("CHAMPION_API_URL", "").strip() or "http://api:8080",
     )
     asyncio.run(validator.start())
 
