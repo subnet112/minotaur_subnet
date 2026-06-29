@@ -1,10 +1,24 @@
 """Score tracker — monitors per-app performance and identifies improvement targets.
 
-Tracks execution scores from the validator, detects underperforming apps,
-and provides feedback for LLM-driven strategy improvement.
+Tracks per-app feedback from the validator, detects underperforming apps, and
+provides feedback for LLM-driven strategy improvement.
 
-Miners always work to improve — there is no "good enough" score. The goal
-is to become champion by beating the incumbent by the dethrone margin (5%).
+Post relative-cutover the validator's JS ``score`` is a 0/1 VALIDITY sentinel
+(the authoritative delivered quality lives elsewhere), so the legacy 0..1
+``avg_score`` quality number is meaningless (≈saturated). The authoritative
+improvement signal is now the per-submission RELATIVE COUNTS the API serves on
+the submission-status ``report.relative`` block:
+``{better, worse, matched, new, compared, verdict}`` — how the miner's latest
+submission compares to the champion PER ORDER. ``headroom`` is therefore the
+fraction of comparable orders NOT yet beating the champion
+(``(compared - better) / compared``), and ``trend`` is the change in the
+``better/compared`` ratio across recent rounds. When no counts are available
+(legacy/old submissions, or benched before the cutover) the tracker falls back
+to an ``avg_score``-derived headroom (unit-robust: it accepts both the legacy
+0..1 form and the new on-chain BPS form), so it never crashes on missing data.
+
+Miners always work to improve — there is no "good enough". The goal is to
+become champion by beating the incumbent on every order (relative dethrone).
 
 Improvement target reasons:
 - no_strategy: App has no strategy at all (new app discovered)
@@ -40,6 +54,15 @@ class ScoreFeedback:
     # Last pre-submission scoring result (includes revert reasons)
     last_score: float = 0.0
     last_score_message: str = ""
+    # Relative counts vs the champion (the authoritative post-cutover signal).
+    # ``relative`` is the {better, worse, matched, new, compared, verdict} block
+    # from the submission-status ``report.relative``; None when unavailable.
+    relative: dict[str, Any] | None = None
+    verdict: str = ""        # "dethrone" | "matched" | "behind" | ""
+    scoring_mode: str = ""   # "relative" when the API reports counts
+    # Fraction of comparable orders NOT yet beating the champion (0..1). The
+    # counts-based replacement for the old ``1.0 - avg_score`` headroom.
+    relative_headroom: float = 1.0
 
 
 @dataclass
@@ -88,6 +111,7 @@ class ScoreTracker:
                 total_executions, avg_score, best_score, recent_scores,
                 quote_stats, champion_score, scenario_scores.
         """
+        prev = self._stats.get(app_id, {})
         self._stats[app_id] = {
             "total_executions": stats.get("total_executions", 0),
             "avg_score": stats.get("avg_score", 0.0),
@@ -96,8 +120,62 @@ class ScoreTracker:
             "quote_stats": stats.get("quote_stats", {}),
             "champion_score": stats.get("champion_score", 0.0),
             "scenario_scores": stats.get("scenario_scores", {}),
+            "scoring_mode": stats.get("scoring_mode", prev.get("scoring_mode", "")),
+            # Relative counts live on the submission report (a different endpoint),
+            # not on /status — carry forward whatever was last set so a /status
+            # refresh doesn't wipe the authoritative signal.
+            "relative": prev.get("relative"),
+            "relative_history": prev.get("relative_history", []),
             "updated_at": time.time(),
         }
+
+    def set_relative_counts(
+        self,
+        app_id: str,
+        counts: dict[str, Any] | None,
+        scoring_mode: str = "relative",
+    ) -> None:
+        """Store the per-submission relative COUNTS vs the champion.
+
+        Fed from the loop's benchmark-feedback poll, which reads
+        ``report.relative`` ({better, worse, matched, new, compared, verdict})
+        off the submission-status endpoint. This is the authoritative
+        post-cutover improvement signal that replaces the saturated 0..1 score.
+        Appends the ``better/compared`` ratio to a rolling history so the trend
+        can be computed across rounds. A None/empty ``counts`` is tolerated
+        (graceful no-op on the history) so legacy/old submissions don't crash.
+        """
+        st = self._stats.setdefault(app_id, {})
+        st["scoring_mode"] = scoring_mode or st.get("scoring_mode", "")
+        if not counts:
+            st["relative"] = None
+            return
+        st["relative"] = dict(counts)
+        compared = int(counts.get("compared", 0) or 0)
+        better = int(counts.get("better", 0) or 0)
+        ratio = (better / compared) if compared > 0 else 0.0
+        hist = st.setdefault("relative_history", [])
+        hist.append(ratio)
+        st["relative_history"] = hist[-10:]
+
+    @staticmethod
+    def _headroom(stats: dict[str, Any]) -> float:
+        """Fraction (0..1) of comparable orders NOT yet beating the champion.
+
+        Counts-first: ``(compared - better) / compared`` when relative counts
+        are present. Falls back to an ``avg_score``-derived headroom when they
+        aren't — unit-robust so it works whether ``avg_score`` is the legacy
+        0..1 quality number or the new on-chain BPS value (>1.0 ⇒ BPS).
+        """
+        rel = stats.get("relative")
+        if rel and int(rel.get("compared", 0) or 0) > 0:
+            compared = int(rel["compared"])
+            better = int(rel.get("better", 0) or 0)
+            return max(0.0, (compared - better) / compared)
+        avg = float(stats.get("avg_score") or 0.0)
+        if avg > 1.0:  # on-chain BPS units (0..10000)
+            return max(0.0, min(1.0, (10000.0 - avg) / 10000.0))
+        return max(0.0, 1.0 - avg)
 
     def set_last_score_feedback(self, app_id: str, score: float, message: str) -> None:
         """Store the last scoring result for feedback to the LLM."""
@@ -125,7 +203,11 @@ class ScoreTracker:
         Priority ordering:
         1. Apps with no strategy (priority 10.0)
         2. Apps with coverage gaps from quote failures (priority = headroom + 0.5 boost)
-        3. All apps with strategies (priority = 1.0 - avg_score = headroom)
+        3. All apps with strategies (priority = headroom)
+
+        ``headroom`` is counts-based — the fraction of orders NOT yet beating
+        the champion (``(compared - better) / compared``) — falling back to an
+        ``avg_score``-derived value when no relative counts are available yet.
 
         Miners always have work — there's no score at which improvement stops.
         A cooldown prevents re-targeting the same app too quickly.
@@ -157,7 +239,7 @@ class ScoreTracker:
             if self._in_cooldown(app_id, now):
                 continue
 
-            headroom = 1.0 - avg_score
+            headroom = self._headroom(stats)
 
             # Coverage gap gets a priority boost
             if self._has_coverage_gap(stats):
@@ -211,11 +293,24 @@ class ScoreTracker:
         avg = stats.get("avg_score", 0.0)
         best = stats.get("best_score", 0.0)
 
-        trend = self._compute_trend(recent)
+        # Trend is counts-based when relative history exists (change in the
+        # better/compared ratio); else fall back to the recent-score trend.
+        rel_history = stats.get("relative_history", [])
+        if len(rel_history) >= 2:
+            trend = self._compute_trend(rel_history)
+        else:
+            trend = self._compute_trend(recent)
 
-        # Champion target
-        champion_score = stats.get("champion_score", 0.0)
-        target_score = champion_score * 1.05  # dethrone margin
+        # Champion target: the champion has NO absolute score post-cutover (it is
+        # the relative baseline; the API serves champion_score as null/0), so the
+        # numeric ``target_score`` is vestigial — the real bar is "beat the champion
+        # on every order" (verdict == dethrone). Kept defensively for back-compat.
+        champion_score = float(stats.get("champion_score") or 0.0)
+        target_score = champion_score * 1.05  # dethrone margin (legacy display)
+
+        # Relative counts vs the champion (authoritative post-cutover signal).
+        relative = stats.get("relative")
+        verdict = (relative or {}).get("verdict", "") if relative else ""
 
         # Quote demand signals
         qs = stats.get("quote_stats", {})
@@ -238,18 +333,29 @@ class ScoreTracker:
             recent_quote_errors=qs.get("recent_errors", [])[-10:],
             last_score=stats.get("last_pre_submission_score", 0.0),
             last_score_message=stats.get("last_pre_submission_message", ""),
+            relative=relative,
+            verdict=verdict,
+            scoring_mode=stats.get("scoring_mode", ""),
+            relative_headroom=self._headroom(stats),
         )
 
     def _compute_trend(self, scores: list[float]) -> str:
-        """Compute score trend from recent scores."""
+        """Compute a trend from a recent series (scores OR better/compared ratios).
+
+        Compares the mean of the older half vs the newer half. The threshold is
+        proportional with a 0.05 floor so the same logic works on a 0..1 series
+        (ratios, legacy scores) and on an on-chain BPS series (0..10000) without
+        a BPS delta of a few points reading as a swing.
+        """
         if len(scores) < 4:
             return "stable"
         mid = len(scores) // 2
         first_half = sum(scores[:mid]) / mid
         second_half = sum(scores[mid:]) / (len(scores) - mid)
         diff = second_half - first_half
-        if diff > 0.05:
+        threshold = max(0.05, abs(first_half) * 0.05)
+        if diff > threshold:
             return "improving"
-        elif diff < -0.05:
+        elif diff < -threshold:
             return "declining"
         return "stable"

@@ -606,13 +606,25 @@ class AgentLoop:
         except Exception as exc:
             logger.warning("Failed to sync champion code: %s", exc)
 
-    def _current_best_score(self) -> float:
-        """Best score across all apps this miner has strategies for."""
+    def _current_progress_signal(self) -> float:
+        """Counts-based progress signal for the cost gate (0..1).
+
+        Post relative-cutover the validator's 0..1 ``best_score`` is a saturated
+        validity sentinel, useless as a progress measure. The real signal is the
+        best ``better/compared`` ratio across this miner's apps — the fraction of
+        orders our latest submission beats the champion on. Rises as we improve,
+        so the gate's plateau/stagnation deltas (on a 0..1 ratio) stay meaningful.
+        Falls back to 0.0 when no relative counts are available yet (fresh miner
+        or benched before the cutover) — which keeps the TOP_RANKED rule's
+        ``my_best > 0`` guard from wrongly skipping a miner with no signal.
+        """
         best = 0.0
         for stats in self.score_tracker._stats.values():
-            s = float(stats.get("best_score") or 0.0)
-            if s > best:
-                best = s
+            rel = stats.get("relative")
+            if rel and int(rel.get("compared", 0) or 0) > 0:
+                ratio = int(rel.get("better", 0) or 0) / int(rel["compared"])
+                if ratio > best:
+                    best = ratio
         return best
 
     async def _evaluate_cost_gate(self, app_ids: list[str]):
@@ -630,10 +642,13 @@ class AgentLoop:
             logger.debug("cost-gate: champion fetch failed (%s); failing open", exc)
             return GateDecision(should_run=True)
 
-        my_best = self._current_best_score()
+        my_best = self._current_progress_signal()
 
-        # "top rival" = max score across other miners' submissions for the
-        # apps we care about. Approximated from champion_score when listed.
+        # "top rival" had no relative analog after the cutover: the champion has
+        # no absolute score (champion_score is null/0), and the API serves no
+        # per-rival relative ratio. So the score-comparison half of the rank
+        # rules is inert (top_rival stays 0) and "a rival is ahead" is detected
+        # purely via new_submissions_since_ours below — which still works.
         top_rival = 0.0
         for app_id in app_ids:
             stats = self.score_tracker._stats.get(app_id, {})
@@ -692,8 +707,9 @@ class AgentLoop:
                 self.miner_id, gate_decision.reason, gate_decision.detail,
             )
             self.metrics.record_skip(gate_decision.reason)
-            # Still update plateau bookkeeping with our current best score
-            best = self._current_best_score()
+            # Still update plateau bookkeeping with our current progress signal
+            # (counts-based: fraction of orders beating the champion).
+            best = self._current_progress_signal()
             self.metrics.record_score(best)
             self.cost_gate.record_cycle(
                 best_score=best,
@@ -793,10 +809,16 @@ class AgentLoop:
             # Local-best ratchet: any pre-sim mean above the prior local
             # best gets snapshotted regardless of the submission gate.
             # Lets Claude roll back to its highest WIP later.
+            #
+            # NOTE: the pre-sim mean ``score`` is now a saturated validity
+            # sentinel (the live JS scorer clamps to [0,1] as valid/invalid), so
+            # it is NO LONGER fed to the cost gate's stagnation window — that
+            # would false-trip on a constant ≈1.0. Stagnation is now counts-based
+            # and recorded once per benchmarked submission in
+            # _poll_benchmark_feedback. The ratchet still uses the sentinel only
+            # as a "did this WIP produce a valid plan" snapshot heuristic.
             if not all_transient:
                 self._maybe_record_local_best(target.app_id, score, code)
-                # Stagnation tracking: only count real (non-transient) runs
-                self.cost_gate.record_pre_sim_score(score)
 
             # Always save WIP — keeps Claude's hypothesis on disk so the
             # next improve cycle iterates on the same attempt instead of
@@ -918,8 +940,9 @@ class AgentLoop:
                     sub_id, submitted_apps=set(self._cycle_cleared_apps),
                 )
 
-        # 8. Record this cycle's result for cost-gate + metrics
-        best = self._current_best_score()
+        # 8. Record this cycle's result for cost-gate + metrics. The progress
+        # signal is counts-based (better/compared) — see _current_progress_signal.
+        best = self._current_progress_signal()
         self.metrics.record_score(best)
         self.cost_gate.record_cycle(
             best_score=best,
@@ -962,17 +985,41 @@ class AgentLoop:
                 scorecard = details.get("scorecard", {})
                 per_intent = details.get("per_intent", [])
 
-                # Build a feedback message from the per-app scores
+                # Authoritative post-cutover signal: the per-submission RELATIVE
+                # COUNTS vs the champion ({better, worse, matched, new, compared,
+                # verdict}), served on the submission-status ``report.relative``.
+                # The 0..1 benchmark_score / app_scores are now saturated validity
+                # sentinels, so they only tell us valid vs failed — the counts tell
+                # us whether we actually beat the champion.
+                report = data.get("report") or {}
+                relative = report.get("relative")
+                scoring_mode = report.get("scoring_mode", "")
+                reason_relative = report.get("reason_relative")
+
+                # Build a feedback message. app_score is a 0/≈1 validity sentinel
+                # now, so label it valid vs failed (not a quality grade).
                 lines = [f"Docker benchmark score: {score:.4f}"]
+                if relative:
+                    lines.append(
+                        "Relative vs champion: "
+                        f"better={relative.get('better', 0)} "
+                        f"worse={relative.get('worse', 0)} "
+                        f"matched={relative.get('matched', 0)} "
+                        f"new={relative.get('new', 0)} "
+                        f"compared={relative.get('compared', 0)} "
+                        f"verdict={relative.get('verdict', '?')}"
+                    )
+                    if reason_relative:
+                        lines.append(f"  {reason_relative}")
                 app_scores = scorecard.get("app_scores", {})
                 for app_key, app_score in app_scores.items():
-                    status_str = "OK" if app_score > 0.5 else "FAILED" if app_score == 0 else "LOW"
+                    status_str = "VALID" if app_score > 0 else "INVALID"
                     lines.append(f"  {app_key}: {app_score:.3f} ({status_str})")
 
-                # Find failed scenarios
+                # Find invalid (no-value) scenarios
                 failed = [pi for pi in per_intent if pi.get("score", 0) == 0]
                 if failed:
-                    lines.append("Failed scenarios:")
+                    lines.append("Invalid scenarios:")
                     for pi in failed:
                         lines.append(f"  {pi.get('intent_id', '?')}: score=0 error={pi.get('error', 'none')}")
 
@@ -994,6 +1041,22 @@ class AgentLoop:
                     self.score_tracker.set_last_score_feedback(
                         app_id, score, feedback_msg,
                     )
+                    # Feed the authoritative relative counts to the tracker so
+                    # priority/trend/feedback are counts-based, not score-based.
+                    # The counts are submission-wide (champion-vs-challenger over
+                    # all orders), so the same block is attached to each app.
+                    if scoring_mode or relative is not None:
+                        self.score_tracker.set_relative_counts(
+                            app_id, relative, scoring_mode or "relative",
+                        )
+
+                # Stagnation tracking is counts-based now: record the
+                # better/compared ratio (fraction of orders beating the champion)
+                # once per benchmarked submission. A flat ratio across K
+                # submissions ⇒ Claude is churning, not improving.
+                if relative and int(relative.get("compared", 0) or 0) > 0:
+                    _ratio = int(relative.get("better", 0) or 0) / int(relative["compared"])
+                    self.cost_gate.record_pre_sim_score(_ratio)
 
                 # Ratchet the gate floor on validator-confirmed score.
                 # We use the validator's benchmark_score (not pre-sim)
