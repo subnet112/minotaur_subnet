@@ -99,20 +99,6 @@ async def _demo(cfg: LabConfig) -> None:
     _print_solver(champ); _print_solver(chal2)
     adopt, rec = compare(champ, chal2, cfg); _print_adopt(rec)
 
-    # P2 preview — on-chain floor catches a JS-passing-but-low-on-chain challenger
-    print("\n" + "─" * 80 + "\nP2 PREVIEW — same JS scores, but challenger fails the on-chain floor on dexB")
-    p2cfg = LabConfig(**{**cfg.__dict__, "adopt_rule": "p2", "on_chain_floor": 5000})
-    chal3 = await run_solver("challenger (1.5x JS, but dexB on-chain=3000)", scenarios,
-                             FakeBackend({s.name: Fill.at_ratio(
-                                 s, 1.5, gas_used=150_000,
-                                 on_chain_score=(3000 if s.app_id == "dexB" else 7000)) for s in scenarios}),
-                             engine, p2cfg)
-    _print_solver(champ, floor=5000); _print_solver(chal3, floor=5000)
-    adopt_cur, rec_cur = compare(champ, chal3, LabConfig(**{**cfg.__dict__, "adopt_rule": "current"}))
-    adopt_p2, rec_p2 = compare(champ, chal3, p2cfg)
-    print(f"\n  current rule -> {'ADOPT' if adopt_cur else 'REJECT'}   (ignores on_chain_score)")
-    print(f"  p2 rule      -> {'ADOPT' if adopt_p2 else 'REJECT'}   :: {rec_p2.summary}")
-
 
 # ── JSON-driven run (fake or fork) ───────────────────────────────────────────
 async def _run_file(path: str, cfg: LabConfig, json_out: str | None) -> None:
@@ -179,7 +165,7 @@ def main() -> None:
     pr.add_argument("--scenarios", required=True)
     pr.add_argument("--scorer", default=DEFAULT_DEX_SCORER)
     pr.add_argument("--sim", choices=["fake", "fork"], default="fake")
-    pr.add_argument("--rule", choices=["current", "p2", "p2ref", "p2oc"], default="current")
+    pr.add_argument("--rule", choices=["current"], default="current")
     pr.add_argument("--on-chain-floor", type=int, default=None)
     pr.add_argument("--max-extra-sandbag", type=float, default=None)
     pr.add_argument("--margin", type=float, default=None)
@@ -201,7 +187,7 @@ def main() -> None:
     pb.add_argument("--app-id", default=None, help="on-chain bytes32 appId to resolve via AppRegistry")
     pb.add_argument("--genesis-image", default=DEFAULT_GENESIS_IMAGE)
     pb.add_argument("--candidate", default=None, help="path to a candidate solver.py (else the example candidate)")
-    pb.add_argument("--rule", choices=["current", "p2", "p2ref", "p2oc"], default="current")
+    pb.add_argument("--rule", choices=["current"], default="current")
     pb.add_argument("--on-chain-floor", type=int, default=None)
     pb.add_argument("--margin", type=float, default=None)
     pb.add_argument("--limit", type=int, default=None, help="cap number of scenarios (quick smoke runs)")

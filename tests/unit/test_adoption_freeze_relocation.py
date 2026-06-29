@@ -57,12 +57,12 @@ def test_meets_criteria_ignores_freeze(monkeypatch):
     m._champion = SimpleNamespace(submission_id="champ", benchmark_score=0.5)
     m._incumbent_refresh_failed = False
     m._dethrone_margin = 0.05
-    m._get_scorecard = MagicMock(return_value={})
-    m._get_incumbent_scorecard = MagicMock(return_value={})
-    monkeypatch.setattr(manager_mod, "ADOPT_RULE", "current")
-    monkeypatch.setattr(manager_mod, "evaluate_adoption", lambda **kw: (True, "beats champ"))
+    # The relative per-order rule is the sole decision; force it ADOPT here.
+    m._evaluate_per_order_adoption = MagicMock(return_value={
+        "adopt": True, "reason": "beats champ", "n_wins": 1, "n_regressions": 0,
+        "n_blind_spots": 0, "n_matched": 0, "scenarios_compared": 1,
+    })
     monkeypatch.setenv("DISABLE_CHAMPION_ADOPTION", "1")  # set, but must be ignored here
-    monkeypatch.delenv("SHADOW_DETERMINISM", raising=False)
     assert m._meets_adoption_criteria(_chal()) is True
 
 
