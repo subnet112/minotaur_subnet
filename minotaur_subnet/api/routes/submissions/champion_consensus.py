@@ -1013,7 +1013,12 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                 "expected certifying"
             ),
         )
-    if _round_certification_deadline_elapsed(round_state):
+    # The operator force-sync (emergency reattach) bypasses the certification deadline:
+    # re-installing a STANDING champion whose decision window has long elapsed is the
+    # whole point — the round was certified at the time, this just re-broadcasts it so a
+    # follower that lost the round re-adopts. body.force is the same operator override
+    # already used to certify a non-finalist candidate.
+    if not body.force and _round_certification_deadline_elapsed(round_state):
         raise HTTPException(
             status_code=409,
             detail=(

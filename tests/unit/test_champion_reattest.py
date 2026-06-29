@@ -129,9 +129,11 @@ async def test_reattest_broadcasts_current_champion(monkeypatch):
     # close re-installs the round even if the follower has moved past it
     assert by_path["/v1/solver/round/internal/close"]["force"] is True
     assert by_path["/v1/solver/round/internal/close"]["round_id"] == "round-x"
-    # certify still carries the v2 EIP-712 fields (the original #417 fix)
+    # certify carries the v2 EIP-712 fields (the #417 fix) + force=True to bypass the
+    # long-elapsed certification deadline of the standing champion's old round
     assert by_path["/v1/solver/round/internal/certify"]["nonce"] == ap.nonce != 0
     assert by_path["/v1/solver/round/internal/certify"]["candidate_submission_id"] == "sub-final"
+    assert by_path["/v1/solver/round/internal/certify"]["force"] is True
     # activate drives adoption with champion_changed=True
     assert by_path["/v1/solver/round/internal/activate"]["champion_changed"] is True
     assert by_path["/v1/solver/round/internal/activate"]["round_id"] == "round-x"
