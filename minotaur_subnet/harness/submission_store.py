@@ -636,6 +636,31 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
+    def merge_benchmark_details(
+        self,
+        submission_id: str,
+        extra: dict[str, Any],
+    ) -> None:
+        """Merge ``extra`` keys into a submission's ``benchmark_details`` in place,
+        WITHOUT touching its score, rank, or status.
+
+        Unlike :meth:`set_benchmark_result` (which replaces the whole details blob
+        and flips status to SCORED/REJECTED), this only adds/overwrites the named
+        top-level keys, preserving ``per_intent`` / ``scorecard`` / everything else.
+        Used to attach the DISPLAY-ONLY same-pin ``relative`` count block computed
+        at round evaluation; it must never mutate the authoritative score/status.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        details = dict(sub.benchmark_details or {})
+        details.update(extra)
+        sub.benchmark_details = details
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
     def reject(self, submission_id: str, reason: str) -> None:
         """Reject a submission with a reason."""
         self._maybe_reload()

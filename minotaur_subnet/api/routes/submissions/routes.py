@@ -1381,6 +1381,13 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
             champ_sub = store.get(champ.submission_id)
             if champ_sub is not None:
                 champion_score = champ_sub.benchmark_score
+                # The champion's LATEST details — used ONLY by the legacy per-case
+                # head-to-head and the observe-only shadow_relative block (both
+                # pre-existing, both knowingly cross-fork). The AUTHORITATIVE
+                # ``relative`` count block does NOT consume this: it reads the
+                # submission's own same-pin ``benchmark_details["relative"]``
+                # (persisted at round evaluation), so it never fabricates
+                # wins/regressions from this later, different-pin champion record.
                 champion_details = getattr(champ_sub, "benchmark_details", None)
 
         # The report's absolute "too low" floor is the surviving per-app sanity

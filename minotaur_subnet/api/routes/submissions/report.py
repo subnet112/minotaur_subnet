@@ -196,23 +196,32 @@ def build_submission_report(
     # flip ``scoring_mode`` to "relative". Additive + gated on the SAME flag as the
     # live scoring: every legacy field (your_score, champion_score, per_case
     # deltas) and the shadow_relative block above are byte-for-byte untouched when
-    # the flag is OFF. The relative block is omitted (no error) when either side
-    # lacks shadow_score rows.
+    # the flag is OFF.
+    #
+    # SAME-PIN: the counts are READ from this submission's OWN persisted
+    # ``benchmark_details["relative"]`` — computed at round evaluation against the
+    # champion re-benched in this submission's round at the SAME fork-pin (see
+    # ``EpochManager._persist_round_relative_counts``). We deliberately do NOT
+    # recompute here against the champion's LATEST ``benchmark_details``: that
+    # champion record was re-benched in a DIFFERENT (later) round at a different
+    # Base block, so a cross-fork recompute fabricates wins/regressions from ETH
+    # price drift. When no stored block exists (benched before this shipped, no
+    # shadow rows, or a non-leader that never evaluated the round) the relative
+    # block is omitted (pending) — never a cross-fork fallback.
     try:
         from minotaur_subnet.epoch.relative_scoring import (
-            has_shadow_rows,
-            relative_counts,
             relative_reason,
             relative_scoring_active,
         )
 
         if relative_scoring_active():
             report["scoring_mode"] = "relative"
-            champ_rows = (champion_details or {}).get("per_intent") or []
-            if has_shadow_rows(per_intent) and has_shadow_rows(champ_rows):
-                counts = relative_counts(champ_rows, per_intent)
-                report["relative"] = counts
-                rel_reason = relative_reason(counts, candidate_id=getattr(sub, "submission_id", None))
+            stored_rel = details.get("relative") if isinstance(details, dict) else None
+            if isinstance(stored_rel, dict):
+                report["relative"] = stored_rel
+                rel_reason = relative_reason(
+                    stored_rel, candidate_id=getattr(sub, "submission_id", None),
+                )
                 if rel_reason:
                     report["reason_relative"] = rel_reason
     except Exception:  # additive surface — must never break the report

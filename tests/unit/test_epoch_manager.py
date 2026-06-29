@@ -742,6 +742,54 @@ class TestEpochManager:
         assert result["abort_reason"] is None
         assert updated_round.abort_reason is None
 
+    def test_persist_round_relative_counts_is_same_pin(self, monkeypatch):
+        """DISPLAY: _persist_round_relative_counts writes each competitor's SAME-PIN
+        relative counts (vs the re-benched champion) onto its own
+        benchmark_details['relative'], tagged with the round_id. The champion record
+        is left untouched, and a competitor without shadow rows is skipped."""
+        monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+        champ = _make_submission(submission_id="champ", round_id="round-e1-n0")
+        champ.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "shadow_score": "100"},
+            {"intent_id": "o2", "shadow_score": "200"},
+        ]}
+        chal = _make_submission(submission_id="chal", round_id="round-e1-n1")
+        chal.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "shadow_score": "120"},
+            {"intent_id": "o2", "shadow_score": "250"},
+        ]}
+        # No shadow rows → must be skipped (no relative block written).
+        no_shadow = _make_submission(submission_id="noshadow", round_id="round-e1-n1")
+        no_shadow.benchmark_details = {"per_intent": [{"intent_id": "o1", "score": 0.9}]}
+        store = _make_store_with_subs(champ, chal, no_shadow)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+
+        mgr._persist_round_relative_counts("round-e1-n1")
+
+        rel = store.get("chal").benchmark_details["relative"]
+        assert rel["better"] == 2 and rel["worse"] == 0
+        assert rel["verdict"] == "dethrone"
+        assert rel["round_id"] == "round-e1-n1"
+        # Champion + no-shadow competitor untouched.
+        assert "relative" not in store.get("champ").benchmark_details
+        assert "relative" not in store.get("noshadow").benchmark_details
+
+    def test_persist_round_relative_counts_off_is_noop(self, monkeypatch):
+        """Flag OFF (default): the persist pass writes nothing — no relative block."""
+        monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
+        champ = _make_submission(submission_id="champ", round_id="round-e1-n0")
+        champ.benchmark_details = {"per_intent": [{"intent_id": "o1", "shadow_score": "100"}]}
+        chal = _make_submission(submission_id="chal", round_id="round-e1-n1")
+        chal.benchmark_details = {"per_intent": [{"intent_id": "o1", "shadow_score": "120"}]}
+        store = _make_store_with_subs(champ, chal)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+
+        mgr._persist_round_relative_counts("round-e1-n1")
+
+        assert "relative" not in store.get("chal").benchmark_details
+
     @pytest.mark.asyncio
     async def test_activate_certified_round_adopts_finalist(self):
         """Certified finalists activate only through the explicit activation path."""
