@@ -62,6 +62,40 @@ def _is_user_signature_fault(error: str | None) -> bool:
     return any(m in e for m in _USER_SIG_FAULT_MARKERS)
 
 
+# Revert signatures of a USER-side FUNDS fault at settlement: the user does not
+# actually hold (or has not approved) the input token, so executeIntent's
+# safeTransferFrom(user, proxy, amount) — or the wTAO fee pull — reverts. Like a
+# signature fault this is NOT the solver's fault: the SCORING FORK FABRICATES the
+# user's balance (blockloop/simulation deals the declared amount + max allowance),
+# so a balance-less / impossible order still passes JS + on-chain sim scoring +
+# quorum. Without this, an attacker spamming impossible orders would debit the
+# blameless champion's solver stats. Covers the OpenZeppelin v4 ERC20/SafeERC20
+# revert strings and the v5 custom error names.
+_USER_FUNDS_FAULT_MARKERS = (
+    "transfer amount exceeds balance",     # OZ v4 ERC20 (input-token transferFrom)
+    "transfer amount exceeds allowance",   # OZ v4 ERC20 (no/insufficient approval)
+    "erc20: insufficient allowance",       # OZ v4 ERC20
+    "erc20insufficientbalance",            # OZ v5 custom error
+    "erc20insufficientallowance",          # OZ v5 custom error
+)
+
+
+def _is_user_fund_fault(error: str | None) -> bool:
+    """True if a settlement revert is the USER failing to hold/approve the input
+    token (or fee) — not a solver fault. Blameless to the miner (#229)."""
+    if not error:
+        return False
+    e = error.lower()
+    return any(m in e for m in _USER_FUNDS_FAULT_MARKERS)
+
+
+def _is_user_fault(error: str | None) -> bool:
+    """True if a settlement revert is attributable to the USER (bad signature OR
+    insufficient input-token balance/allowance) rather than the solver. The
+    blameless miner is not debited for either (#229)."""
+    return _is_user_signature_fault(error) or _is_user_fund_fault(error)
+
+
 class OrderProcessor:
     """Processes a single order through the full execution pipeline.
 
@@ -570,15 +604,19 @@ class OrderProcessor:
         # passed scoring + quorum, the user's sig was invalid — from a solver fault.
         # The order is REJECTED either way (it didn't fill), but a user-fault revert
         # does NOT debit the blameless miner's execution stats.
-        user_fault = _is_user_signature_fault(submit_result.error)
+        if _is_user_signature_fault(submit_result.error):
+            reject_error = f"User signature rejected at settlement: {submit_result.error}"
+        elif _is_user_fund_fault(submit_result.error):
+            reject_error = (
+                "User cannot fund order (insufficient input-token balance/"
+                f"allowance) at settlement: {submit_result.error}"
+            )
+        else:
+            reject_error = f"Relayer submission failed: {submit_result.error}"
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.REJECTED,
-            error=(
-                f"User signature rejected at settlement: {submit_result.error}"
-                if user_fault
-                else f"Relayer submission failed: {submit_result.error}"
-            ),
+            error=reject_error,
         )
         self.order_persistence.sync(order.order_id)
         # Record the on-chain delivered-quality BPS (not the JS sentinel).
@@ -591,19 +629,22 @@ class OrderProcessor:
         ``score`` is the on-chain scoreIntent BPS (0..10000) — the delivered
         quality the app stats now track — not the legacy JS 0..1 score.
 
-        A USER signature fault at settlement is NOT debited to the solver: the plan
-        passed JS scoring, on-chain sim scoring, and the validator quorum — the
-        user's order signature was invalid, which is entirely upstream of the
-        solver. The order is still REJECTED (handled by the caller); it just isn't
-        counted as a solver failure. Solver-attributable reverts still count.
+        A USER fault at settlement is NOT debited to the solver: the plan passed
+        JS scoring, on-chain sim scoring, and the validator quorum, and the revert
+        is entirely upstream of the solver — either an invalid order signature OR
+        the user not actually holding/approving the input token (the scoring fork
+        fabricates the balance, so a balance-less order still scores as doable).
+        The order is still REJECTED (handled by the caller); it just isn't counted
+        as a solver failure, so an attacker can't spam impossible orders to tank an
+        honest miner. Solver-attributable reverts still count.
         """
         if submit_result.success:
             self.app_store.record_execution(order.app_id, score, success=True)
             return
-        if _is_user_signature_fault(submit_result.error):
+        if _is_user_fault(submit_result.error):
             logger.warning(
-                "Order %s settlement reverted on a USER signature fault (%s) — NOT "
-                "debiting the solver (blameless miner, #229)",
+                "Order %s settlement reverted on a USER fault (%s) — NOT debiting "
+                "the solver (blameless miner, #229)",
                 order.order_id, (submit_result.error or "")[:80],
             )
             return
