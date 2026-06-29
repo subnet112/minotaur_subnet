@@ -159,8 +159,15 @@ async def test_harvest_swallows_broadcast_error(monkeypatch):
 
 # ── follower provenance + gate ───────────────────────────────────────────────
 
-def test_follower_weight_adopt_default_off(monkeypatch):
+def test_follower_weight_adopt_default_on(monkeypatch):
+    # Default ON — third-party validators won't set env vars; shipping the code enables it.
     monkeypatch.delenv("FOLLOWER_CHAMPION_WEIGHT_ADOPT", raising=False)
+    assert _follower_weight_adopt_enabled() is True
+
+
+@pytest.mark.parametrize("v", ["0", "false", "no", "off", "Off"])
+def test_follower_weight_adopt_off_values(monkeypatch, v):
+    monkeypatch.setenv("FOLLOWER_CHAMPION_WEIGHT_ADOPT", v)
     assert _follower_weight_adopt_enabled() is False
 
 
@@ -171,20 +178,25 @@ def test_follower_weight_adopt_on_values(monkeypatch, v):
 
 
 def test_round_state_self_verified_roundtrips():
-    st = RoundState(round_id="r", self_verified=True)
-    assert RoundState.from_dict(st.to_dict()).self_verified is True
-    # default is False (no accidental verification)
-    assert RoundState.from_dict(RoundState(round_id="r2").to_dict()).self_verified is False
+    st = RoundState(round_id="r", self_verified=True, self_verified_submission_id="sub_A")
+    rt = RoundState.from_dict(st.to_dict())
+    assert rt.self_verified is True
+    assert rt.self_verified_submission_id == "sub_A"  # candidate-bound
+    # default is False / None (no accidental verification)
+    blank = RoundState.from_dict(RoundState(round_id="r2").to_dict())
+    assert blank.self_verified is False
+    assert blank.self_verified_submission_id is None
 
 
-def test_mark_self_verified_persists(tmp_path):
+def test_mark_self_verified_binds_candidate_and_persists(tmp_path):
     path = tmp_path / "rounds.json"
     store = RoundStore(persist_path=path)
     store.ensure_open_round(opened_epoch=1)
     rid = store.get_current_round().round_id
-    assert store.get_round(rid).self_verified is False
-    store.mark_self_verified(rid)
+    assert store.get_round(rid).self_verified_submission_id is None
+    store.mark_self_verified(rid, "sub_A")
     assert store.get_round(rid).self_verified is True
+    assert store.get_round(rid).self_verified_submission_id == "sub_A"
     # survives a reload from disk (separate store on the same path)
     reloaded = RoundStore(persist_path=path)
-    assert reloaded.get_round(rid).self_verified is True
+    assert reloaded.get_round(rid).self_verified_submission_id == "sub_A"

@@ -1206,7 +1206,9 @@ async def solver_round_consensus_proposal(
             # never on the blind-sign branch (_can_benchmark False) and never for
             # builtin. Best-effort — must never fail the approval.
             try:
-                get_round_store().mark_self_verified(round_state.round_id)
+                get_round_store().mark_self_verified(
+                    round_state.round_id, _candidate.submission_id,
+                )
             except Exception:
                 pass
         except Exception as exc:

@@ -229,6 +229,12 @@ class RoundState:
     # (FOLLOWER_CHAMPION_WEIGHT_ADOPT) — a follower must only weight a champion it
     # itself verified. See epoch/manager.activate_certified_round.
     self_verified: bool = False
+    # The submission_id this node actually re-benchmarked + verified (set together with
+    # self_verified). The follower self-adopt gate requires this to MATCH the
+    # certificate's candidate, so a round that proposed A (which the follower verified)
+    # but later certifies a DIFFERENT candidate B can never make the follower weight B
+    # it never benchmarked (closes the quorum>1 propose-A / certify-B gap).
+    self_verified_submission_id: str | None = None
 
     def accepting_submissions(self) -> bool:
         return self.status == RoundStatus.OPEN
@@ -268,6 +274,7 @@ class RoundState:
             "effective_epoch": self.effective_epoch,
             "abort_reason": self.abort_reason,
             "self_verified": self.self_verified,
+            "self_verified_submission_id": self.self_verified_submission_id,
         }
 
     @classmethod
@@ -299,6 +306,7 @@ class RoundState:
             effective_epoch=raw.get("effective_epoch"),
             abort_reason=raw.get("abort_reason"),
             self_verified=bool(raw.get("self_verified")),
+            self_verified_submission_id=raw.get("self_verified_submission_id"),
         )
 
 
@@ -620,16 +628,19 @@ class RoundStore:
         self._record(state)
         return copy.deepcopy(state)
 
-    def mark_self_verified(self, round_id: str) -> RoundState:
+    def mark_self_verified(self, round_id: str, submission_id: str | None = None) -> RoundState:
         """Record that THIS node independently re-benchmarked the round's candidate
-        and its OWN verdict agreed (the reactive-benchmark APPROVE path — never a
-        blind-sign or builtin). Persisted so it survives the sign→activate gap; read
-        at activate time to gate follower self-adoption of champion weights. Idempotent."""
+        (``submission_id``) and its OWN verdict agreed (the reactive-benchmark APPROVE
+        path — never a blind-sign or builtin). Binds the verification to the specific
+        candidate so the activate gate can require it to match the certified candidate.
+        Persisted so it survives the sign→activate gap; read at activate time to gate
+        follower self-adoption of champion weights. Idempotent."""
         self._maybe_reload()
         state = self._rounds.get(round_id)
         if state is None:
             raise KeyError(f"Round not found: {round_id}")
         state.self_verified = True
+        state.self_verified_submission_id = submission_id
         state.updated_at = time.time()
         self._persist()
         return copy.deepcopy(state)

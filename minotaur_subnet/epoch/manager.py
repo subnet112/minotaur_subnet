@@ -88,16 +88,22 @@ def _adoption_disabled() -> bool:
 
 
 def _follower_weight_adopt_enabled() -> bool:
-    """Ship-dark gate (DEFAULT OFF): when ``FOLLOWER_CHAMPION_WEIGHT_ADOPT`` is set, a
-    FOLLOWER that independently re-benchmarked + verified a quorum-certified champion
-    self-adopts it locally so its weight emitter stops 100% burn-to-owner and emits the
-    champion share. Default OFF => followers stay at burn (byte-identical to today). The
-    ONLY flag that moves real on-chain weights; read at call time so an operator can flip
-    it per-follower without a restart.
+    """DEFAULT ON: a FOLLOWER that INDEPENDENTLY re-benchmarked + verified a
+    quorum-certified champion self-adopts it locally so its weight emitter emits the
+    champion share instead of 100% burn-to-owner. Default ON because third-party
+    validators won't set env vars themselves — shipping the code IS the enablement.
+    Disable per-node with ``FOLLOWER_CHAMPION_WEIGHT_ADOPT`` in {0,false,no,off}. Read at
+    call time so it can be toggled without a restart.
+
+    Safety does NOT rest on this flag: a follower only ever weights a champion it
+    ITSELF verified this round (``round_state.self_verified``, never blind-sign/builtin)
+    that is a real-miner hotkey, and the leader is never affected (definite-leader
+    guard). See ``activate_certified_round``.
     """
-    return os.environ.get("FOLLOWER_CHAMPION_WEIGHT_ADOPT", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    raw = os.environ.get("FOLLOWER_CHAMPION_WEIGHT_ADOPT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
@@ -637,11 +643,12 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
-        # ── Follower champion-weight gate (ship-dark) ────────────────────────
+        # ── Follower champion-weight gate ────────────────────────────────────
         # The leader adopts unconditionally (it ran the merge callback / is the single
         # on-chain writer). A NON-leader only adopts + weights a champion it
-        # INDEPENDENTLY re-benchmarked (round_state.self_verified) and only when the
-        # operator opted that follower in (FOLLOWER_CHAMPION_WEIGHT_ADOPT, default OFF).
+        # INDEPENDENTLY re-benchmarked (round_state.self_verified) — gated by
+        # FOLLOWER_CHAMPION_WEIGHT_ADOPT (DEFAULT ON; disable per-node with an
+        # off-value). Safety rests on self_verified + real-hotkey, NOT on the flag.
         # Fails CLOSED: any node that is not a DEFINITE leader and isn't a gated,
         # self-verified follower advances WITHOUT changing the champion (stays
         # burn-to-owner). This also closes the ambiguous-leadership fall-through
@@ -652,7 +659,14 @@ class EpochManager:
             or (self._on_champion_adopted is not None and not _is_follower)
         )
         if not _definite_leader:
-            _self_verified = bool(getattr(round_state, "self_verified", False))
+            # Candidate-bound: the follower must have verified THE candidate being
+            # certified (not merely "some candidate this round") — closes the
+            # propose-A / certify-B gap at quorum>1.
+            _self_verified = (
+                getattr(round_state, "self_verified_submission_id", None) is not None
+                and round_state.self_verified_submission_id
+                == certificate.candidate_submission_id
+            )
             _real = is_real_miner_hotkey(getattr(submission, "hotkey", "") or "")
             if not (_follower_weight_adopt_enabled() and _self_verified and _real):
                 logger.info(
