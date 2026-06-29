@@ -1,9 +1,9 @@
 """Pure, reusable champion-adoption decision rule.
 
 This module holds the per-validator champion-adoption rule body extracted from
-``EpochManager._should_adopt`` / ``_should_adopt_onchain`` as a PURE function so
-the *exact same* decision can be made by the leader and, independently, by
-followers (champion-consensus re-validation) without duplicating the logic.
+``EpochManager._should_adopt`` as a PURE function so the *exact same* decision
+can be made by the leader and, independently, by followers (champion-consensus
+re-validation) without duplicating the logic.
 
 The function mirrors the rule body EXACTLY — everything AFTER the
 adoption-disabled / same-submission / shadow preamble (those stay in
@@ -18,11 +18,10 @@ adoption quorum — exactly the split the round-anchored pin (#246/#247) and
 ``DETHRONE_MARGIN`` already foreclose by being code. So they are constants here
 (the single source of truth), NOT envs a 3rd-party validator would never set:
 
-    PER_APP_MIN_SCORE      = 0.3   per-app score floor (current + p2oc rules)
+    PER_APP_MIN_SCORE      = 0.3   per-app score floor (current rule)
     MAX_APP_REGRESSION     = 0.10  per-app non-regression / catastrophe veto
     ONCHAIN_MAX_REGRESSION = 0.10  on-chain HARD-VETO non-regression band
-    ONCHAIN_FLOOR_BPS      = None  on-chain admission floor (off, both rules)
-    ADOPT_RULE             = current  ranking rule (p2oc gated to a code flip)
+    ONCHAIN_FLOOR_BPS      = None  on-chain admission floor (off)
 
 It returns ``(adopt, reason)`` where ``reason`` is a human-readable string in
 every branch (for logging by the caller).
@@ -32,9 +31,8 @@ unfakeable on-chain HARD VETO (``_evaluate_onchain_gate``): a challenger whose
 benchmark plans revert / run on a fabricated mock (on-chain score None) or
 regress vs the champion's on-chain ``scoreIntent`` cannot be adopted on JS score
 alone. The veto runs only when there IS a champion (after the genesis early
-return) and only in the current branch (p2oc has its own on-chain ranking). It
-is symmetric across leader + followers because they all route through this one
-pure function.
+return). It is symmetric across leader + followers because they all route
+through this one pure function.
 """
 
 from __future__ import annotations
@@ -55,15 +53,10 @@ logger = logging.getLogger(__name__)
 # ``CHAMPION_MINER_WEIGHT_FRACTION``, ``EPOCH_SECONDS`` and the round-anchored fork
 # pin (consensus/round_anchor.py) are constants. Change here = move the bar fleet-
 # wide in one place.
-PER_APP_MIN_SCORE: float = 0.3          # per-app sanity floor (current + p2oc)
+PER_APP_MIN_SCORE: float = 0.3          # per-app sanity floor (current rule)
 MAX_APP_REGRESSION: float = 0.10        # per-app JS non-regression / catastrophe veto
 ONCHAIN_MAX_REGRESSION: float = 0.10    # on-chain HARD-VETO non-regression band
 ONCHAIN_FLOOR_BPS: "int | None" = None  # on-chain admission floor (off; one value, not per-node)
-# Ranking rule. Pinned to "current" in code: p2oc is a DIFFERENT ranking (on-chain
-# surplus) and MUST NOT go live until the cross-machine determinism gate passes —
-# one node on p2oc and the rest on current is a guaranteed split. Flipping the rule
-# is a deliberate CODE change here, never a per-validator env.
-ADOPT_RULE: str = "current"
 
 
 @dataclass(frozen=True)
@@ -81,7 +74,6 @@ class _AdoptRuleConfig:
     max_app_regression: float = MAX_APP_REGRESSION
     onchain_max_regression: float = ONCHAIN_MAX_REGRESSION
     onchain_floor_bps: "int | None" = ONCHAIN_FLOOR_BPS
-    adopt_rule: str = ADOPT_RULE
 
 
 DEFAULT_ADOPT_RULE_CONFIG = _AdoptRuleConfig()
@@ -144,84 +136,6 @@ def _evaluate_onchain_gate(
     return True, None
 
 
-def _evaluate_onchain(
-    *,
-    challenger_scorecard: dict | None,
-    champion_scorecard: dict | None,
-    dethrone_margin: float,
-    has_champion: bool,
-    config: _AdoptRuleConfig,
-) -> tuple[bool, str]:
-    """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — port of the lab's
-    P2OcAdoptRule. Ranks the dethrone on the unfakeable on-chain OUTPUT surplus
-    (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the gas-polluted JS
-    score, so a more-output-but-more-gas challenger (which the JS path rejects) is
-    adoptable, while a gas-gaming challenger that delivers less is not. Keeps the
-    vetoes: per-app sanity floor (PER_APP_MIN_SCORE), on-chain admission floor
-    (ONCHAIN_FLOOR_BPS), app-coverage drop, and a JS no-catastrophic-regression
-    guard (MAX_APP_REGRESSION). The same-submission short-circuit in
-    ``_should_adopt`` already ran (the absolute global-min floor was removed —
-    adoption is governed by the dethrone margin + the per-app floor, not an
-    absolute global number).
-    """
-    # Per-app sanity floor — applies to the genesis (no-champion) case too, so a
-    # garbage first champion can't self-adopt under p2oc (mirrors the current rule).
-    per_app_min = config.per_app_min_score
-    for app_id, app_score in (challenger_scorecard or {}).get("app_scores", {}).items():
-        if app_score < per_app_min:
-            return False, (
-                f"Challenger app {app_id} score {app_score:.3f} below "
-                f"per-app minimum {per_app_min:.3f}"
-            )
-
-    if not has_champion:
-        return True, "p2oc adopt: no champion yet (genesis)"  # no champion yet (genesis)
-
-    champ_card = champion_scorecard or {}
-    chal_card = challenger_scorecard or {}
-    champ_apps = champ_card.get("app_scores", {})
-    chal_apps = chal_card.get("app_scores", {})
-    champ_oc = champ_card.get("app_onchain", {})
-    chal_oc = chal_card.get("app_onchain", {})
-    max_regression = config.max_app_regression
-    floor = config.onchain_floor_bps
-
-    oc_surpluses: list[float] = []
-    for app, inc in champ_apps.items():
-        ch = chal_apps.get(app)
-        # (veto 1) on-chain admission floor on the challenger's every scenario
-        if floor is not None:
-            all_pass, min_bps, n_missing = _onchain_pass(chal_oc.get(app, []), floor)
-            if not all_pass:
-                return False, (
-                    f"p2oc reject {app}: on-chain floor fail "
-                    f"(min={min_bps} missing={n_missing})"
-                )
-        # (veto 2) dropping a champion-covered app is a hard regression
-        if ch is None:
-            return False, f"p2oc reject {app}: dropped by challenger"
-        # rank input: on-chain output surplus (only when both means are present)
-        co = _app_onchain_mean(champ_oc.get(app, []))
-        cco = _app_onchain_mean(chal_oc.get(app, []))
-        if co is not None and cco is not None:
-            oc_surpluses.append(cco - co)
-        elif co is not None and cco is None:
-            return False, f"p2oc reject {app}: challenger produced no on-chain score"
-        # (veto 3) JS no-CATASTROPHIC-regression — a gas-blowup safety net only
-        if inc > 0 and ch < inc * (1 - max_regression):
-            return False, f"p2oc reject {app}: JS regress {inc:.3f}->{ch:.3f}"
-
-    # rank: mean per-app on-chain BPS surplus / 10000 must beat the dethrone margin
-    net_bps = sum(oc_surpluses) / len(oc_surpluses) if oc_surpluses else 0.0
-    net = net_bps / 10000.0
-    if net <= dethrone_margin:
-        return False, (
-            f"p2oc reject: net on-chain surplus {net_bps:+.1f} BPS "
-            f"<= margin {dethrone_margin:.4f}"
-        )
-    return True, f"p2oc ADOPT: net on-chain surplus {net_bps:+.1f} BPS"
-
-
 def evaluate_adoption(
     *,
     challenger_score: float,
@@ -239,11 +153,10 @@ def evaluate_adoption(
     in ``EpochManager``). The thresholds come from ``config`` — production passes
     nothing, so they are the fleet-uniform CODE CONSTANTS
     (:data:`DEFAULT_ADOPT_RULE_CONFIG`: ``PER_APP_MIN_SCORE``,
-    ``MAX_APP_REGRESSION``, ``ONCHAIN_MAX_REGRESSION``, ``ONCHAIN_FLOOR_BPS``,
-    ``ADOPT_RULE``); only the offline scoring-lab passes an explicit override.
-    Dispatches ``config.adopt_rule == "p2oc"`` to the on-chain-surplus variant.
+    ``MAX_APP_REGRESSION``, ``ONCHAIN_MAX_REGRESSION``, ``ONCHAIN_FLOOR_BPS``);
+    only the offline scoring-lab passes an explicit override.
 
-    Enforces (default "current" rule):
+    Enforces:
     1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — the absolute sanity floor.
     2. Per-app non-regression: no champion-covered app may be dropped, and
        no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
@@ -251,8 +164,8 @@ def evaluate_adoption(
        challenger's plans must validly EXECUTE on-chain (not revert / mock ->
        None) and not regress beyond ONCHAIN_MAX_REGRESSION. A mock-simulation
        scorecard is rejected outright. JS still ranks; this only vetoes. Runs
-       only with a champion (after the genesis early return) and only in this
-       (non-p2oc) branch, so it is symmetric across leader + followers.
+       only with a champion (after the genesis early return), so it is symmetric
+       across leader + followers.
     4. Global improvement over the champion by the dethrone margin (default 1%)
 
     There is intentionally NO absolute global-score floor: the global JS score is
@@ -268,21 +181,6 @@ def evaluate_adoption(
     """
     per_app_min = config.per_app_min_score
     max_regression = config.max_app_regression
-
-    # On-chain co-ranked dethrone (code-gated). Default "current" falls through to the
-    # JS logic below, byte-for-byte unchanged. config.adopt_rule=="p2oc" ranks the
-    # dethrone on the unfakeable on-chain OUTPUT surplus instead of the gas-polluted
-    # JS score. MUST NOT be enabled live until the cross-machine determinism gate
-    # passes — and it is a code constant, never a per-validator env, so it can only
-    # be flipped fleet-wide.
-    if config.adopt_rule == "p2oc":
-        return _evaluate_onchain(
-            challenger_scorecard=challenger_scorecard,
-            champion_scorecard=champion_scorecard,
-            dethrone_margin=dethrone_margin,
-            has_champion=has_champion,
-            config=config,
-        )
 
     # Belt-and-suspenders: a challenger benchmarked on the fabricated mock
     # simulator (require_real_sim off + no Anvil) has unfakeable on-chain scores

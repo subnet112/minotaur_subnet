@@ -1,13 +1,12 @@
-"""Port A — on-chain co-ranked adoption in production (ADOPT_RULE=p2oc).
+"""On-chain score plumbing into the adoption scorecard.
 
-Covers the three-step plumb (BenchmarkResult.on_chain_score -> scorecard.app_onchain
--> _should_adopt_onchain) and the gated dispatch. Default (ADOPT_RULE unset/current)
-must leave _should_adopt byte-for-byte unchanged.
+Covers the live plumb of the unfakeable on-chain ``scoreIntent``:
+``SimulationResult.on_chain_score`` -> ``BenchmarkResult.on_chain_score`` ->
+per-app ``scorecard.app_onchain`` (consumed by the current rule's on-chain HARD
+VETO, ``adopt_rule._evaluate_onchain_gate``).
 """
 import asyncio
-import types
 
-from minotaur_subnet.epoch.manager import EpochManager
 from minotaur_subnet.harness.benchmark_worker import BenchmarkScorecard, BenchmarkWorker
 from minotaur_subnet.harness.orchestrator import (
     BenchmarkConfig,
@@ -70,124 +69,3 @@ def test_build_scorecard_aggregates_app_onchain():
 def test_scorecard_app_onchain_round_trips():
     c = BenchmarkScorecard(app_onchain={"app_A": [6800, None, 7100]})
     assert BenchmarkScorecard.from_dict(c.to_dict()).app_onchain == {"app_A": [6800, None, 7100]}
-
-
-# ── plumb step 3: _should_adopt_onchain + the gated dispatch ──
-
-def _mgr(margin=0.005, champ_id="champ"):
-    mgr = EpochManager.__new__(EpochManager)
-    mgr._champion = types.SimpleNamespace(submission_id=champ_id, benchmark_score=0.6)
-    mgr._dethrone_margin = margin
-    return mgr
-
-
-def _chal(score=0.6):
-    return types.SimpleNamespace(submission_id="chal", benchmark_score=score)
-
-
-def _cards(mgr, champ, chal):
-    mgr._get_incumbent_scorecard = lambda: champ
-    mgr._get_scorecard = lambda sub: chal
-
-
-def _card(js, oc):
-    return {"app_scores": js, "app_onchain": oc}
-
-
-def test_dispatch_default_is_current_rule(monkeypatch):
-    monkeypatch.delenv("ADOPT_RULE", raising=False)
-    mgr = _mgr()
-    mgr._should_adopt_onchain = lambda c: (_ for _ in ()).throw(AssertionError("p2oc must not run"))
-    _cards(mgr, _card({"A": 0.6}, {"A": [5000]}), _card({"A": 0.7}, {"A": [5000]}))
-    # default path = JS logic; the p2oc method must never be entered
-    assert mgr._should_adopt(_chal(0.7)) is True
-
-
-def test_dispatch_routes_to_p2oc_when_enabled(monkeypatch):
-    # ADOPT_RULE is now a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE),
-    # imported into the manager namespace — not a per-validator env. Flipping the
-    # rule is a code change, so the test patches the constant the dispatch reads.
-    monkeypatch.setattr("minotaur_subnet.epoch.manager.ADOPT_RULE", "p2oc")
-    mgr = _mgr()
-    mgr._should_adopt_onchain = lambda c: "ROUTED"
-    _cards(mgr, _card({"A": 0.6}, {"A": [5000]}), _card({"A": 0.7}, {"A": [5000]}))
-    assert mgr._should_adopt(_chal(0.7)) == "ROUTED"
-
-
-def test_p2oc_adopts_more_output_even_with_lower_js():
-    # The case the JS path REJECTS: challenger delivers more output (+120 BPS) but
-    # lower JS (more gas). On-chain ranking adopts it.
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.54}, {"A": [5000]}), _card({"A": 0.53}, {"A": [5120]}))
-    assert mgr._should_adopt_onchain(_chal(0.53)) is True
-
-
-def test_p2oc_rejects_less_output():
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.54}, {"A": [5100]}), _card({"A": 0.55}, {"A": [5020]}))
-    assert mgr._should_adopt_onchain(_chal(0.55)) is False
-
-
-def test_p2oc_rejects_below_margin():
-    mgr = _mgr()  # +30 BPS < 50 BPS margin
-    _cards(mgr, _card({"A": 0.5}, {"A": [5000]}), _card({"A": 0.5}, {"A": [5030]}))
-    assert mgr._should_adopt_onchain(_chal()) is False
-
-
-def test_p2oc_rejects_dropped_app():
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.5, "B": 0.5}, {"A": [5000], "B": [5000]}), _card({"A": 0.9}, {"A": [6000]}))
-    assert mgr._should_adopt_onchain(_chal(0.9)) is False
-
-
-def test_p2oc_rejects_missing_onchain_on_covered_app():
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.5}, {"A": [5000]}), _card({"A": 0.6}, {"A": [None]}))
-    assert mgr._should_adopt_onchain(_chal()) is False
-
-
-def test_p2oc_floor_veto(monkeypatch):
-    monkeypatch.setenv("ONCHAIN_FLOOR_BPS", "5000")
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.5}, {"A": [5000]}), _card({"A": 0.9}, {"A": [4000]}))
-    assert mgr._should_adopt_onchain(_chal(0.9)) is False
-
-
-def test_p2oc_js_catastrophic_regression_veto():
-    mgr = _mgr()  # huge on-chain gain but JS collapses >10%
-    _cards(mgr, _card({"A": 0.60}, {"A": [5000]}), _card({"A": 0.50}, {"A": [5500]}))
-    assert mgr._should_adopt_onchain(_chal(0.50)) is False
-
-
-def test_p2oc_adopts_genesis_when_no_champion():
-    mgr = _mgr(champ_id="")  # no champion yet
-    assert mgr._should_adopt_onchain(_chal()) is True
-
-
-# ── shadow-determinism (observe-only) ────────────────────────────────────────
-
-def _shadow_mgr():
-    mgr = _mgr()
-    _cards(mgr, _card({"A": 0.6}, {"A": [5000]}), _card({"A": 0.7}, {"A": [5100]}))
-    return mgr
-
-
-def test_shadow_off_by_default_not_invoked(monkeypatch):
-    monkeypatch.delenv("SHADOW_DETERMINISM", raising=False)
-    mgr = _shadow_mgr()
-    mgr._log_shadow_determinism = lambda *a: (_ for _ in ()).throw(AssertionError("shadow ran"))
-    assert mgr._should_adopt(_chal(0.7)) is True  # current rule adopts; shadow NOT invoked
-
-
-def test_shadow_on_logs_without_changing_decision(monkeypatch):
-    monkeypatch.setenv("SHADOW_DETERMINISM", "1")
-    calls = []
-    mgr = _shadow_mgr()
-    mgr._log_shadow_determinism = lambda *a: calls.append(a)
-    assert mgr._should_adopt(_chal(0.7)) is True  # live decision UNCHANGED
-    assert len(calls) == 1                          # but the shadow WAS invoked
-
-
-def test_shadow_log_never_raises_on_empty_cards():
-    mgr = _mgr()
-    mgr._log_shadow_determinism(_chal(), {}, {})  # observe-only must not raise

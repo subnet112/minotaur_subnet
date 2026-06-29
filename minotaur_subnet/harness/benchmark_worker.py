@@ -89,8 +89,8 @@ class BenchmarkScorecard:
     global_score: float = 0.0
     app_scores: dict[str, float] = field(default_factory=dict)
     # Per-app on-chain scoreIntent BPS (one list entry per scenario; None when the
-    # sim didn't yield a score). The unfakeable output signal the on-chain-ranked
-    # adoption rule (ADOPT_RULE=p2oc) ranks on. Populated only when a real sim runs.
+    # sim didn't yield a score). The unfakeable output signal the current adoption
+    # rule's on-chain HARD VETO consumes. Populated only when a real sim runs.
     app_onchain: dict[str, list[int | None]] = field(default_factory=dict)
     scenario_scores: dict[str, float] = field(default_factory=dict)
     failures: int = 0

@@ -324,7 +324,7 @@ async def _reactive_benchmark_candidate(
     )
 
     # Determinism-comparable signals: the JS local_score alone can't be diffed
-    # against the leader's on-chain-ranked (p2oc / SHADOW_DETERMINISM) numbers.
+    # against the leader's on-chain scoreIntent numbers.
     # Log the per-app on-chain scoreIntent means so operators can grep-compare
     # leader vs follower for the same candidate + pinned block across the fleet.
     try:
