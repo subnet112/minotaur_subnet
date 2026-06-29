@@ -179,7 +179,7 @@ def _make_mock_orchestrator():
     return orch, session
 
 
-def _make_certified_round(score: float = 0.94):
+def _make_certified_round(score: float = 0.94, quorum: int = 1):
     """Build a round_store with a certified finalist + matching submission store.
 
     Returns ``(round_store, current_round, submission, store)`` ready for
@@ -189,7 +189,7 @@ def _make_certified_round(score: float = 0.94):
     current_round = round_store.ensure_open_round(opened_epoch=5)
     round_store.close_current_round(
         close_epoch=5, benchmark_pack_hash="pack-5",
-        committee_hash="committee-5", quorum_required=1,
+        committee_hash="committee-5", quorum_required=quorum,
     )
     sub = _make_submission(
         submission_id="sub_certified", epoch=5,
@@ -206,7 +206,7 @@ def _make_certified_round(score: float = 0.94):
             round_id=current_round.round_id, committee_hash="committee-5",
             candidate_submission_id="sub_certified", candidate_image_id=sub.image_id,
             incumbent_image_id=None, benchmark_pack_hash="pack-5",
-            effective_epoch=6, quorum_required=1,
+            effective_epoch=6, quorum_required=quorum,
             approvals=[ChampionApproval(
                 validator_id="0xabc", round_id=current_round.round_id,
                 candidate_submission_id="sub_certified", candidate_image_id=sub.image_id,
@@ -926,6 +926,84 @@ class TestEpochManager:
         assert result["abort_reason"] == "leader_merge_failed"
         assert result.get("next_round_id")                          # advanced — not stranded
         assert not round_store.get_active_champion().submission_id   # burn-to-owner
+
+    @pytest.mark.asyncio
+    async def test_follower_adopts_at_quorum1_without_self_verify(self):
+        """Quorum-1 trust: at quorum<=1 a follower adopts the leader's SIGNED champion
+        WITHOUT independently self-verifying it (it cannot reproduce the leader's pack
+        at q=1). Without this every follower burns the champion miner's emissions while
+        the leader certs alone. NOTE: NO mark_self_verified() — adoption rides on trust."""
+        round_store, current_round, _sub, store = _make_certified_round()  # quorum_required=1
+        block_loop = _make_mock_block_loop()
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=lambda *a, **k: True,
+        )
+        mgr.set_leader_check(lambda: False)  # FOLLOWER, deliberately NOT self-verified
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result["champion_changed"] is True  # adopted on quorum<=1 leader-trust
+        assert round_store.get_active_champion().submission_id == "sub_certified"
+        assert round_store.get_round(current_round.round_id).status == RoundStatus.ACTIVATED
+
+    @pytest.mark.asyncio
+    async def test_follower_quorum1_trust_can_be_disabled(self, monkeypatch):
+        """FOLLOWER_TRUST_LEADER_QUORUM1=off restores the strict self_verify gate even at
+        quorum=1 — a follower that did NOT self-verify burns."""
+        monkeypatch.setenv("FOLLOWER_TRUST_LEADER_QUORUM1", "off")
+        round_store, current_round, _sub, store = _make_certified_round()  # quorum_required=1
+        block_loop = _make_mock_block_loop()
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=lambda *a, **k: True,
+        )
+        mgr.set_leader_check(lambda: False)  # FOLLOWER, not self-verified
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("champion_changed") is not True          # gated -> burn
+        assert not round_store.get_active_champion().submission_id
+
+    @pytest.mark.asyncio
+    async def test_follower_quorum_gt1_trust_is_inert(self):
+        """At quorum>1 the q1-trust is INERT: a follower that did NOT self-verify still
+        burns — the independent decentralized check always stands above quorum 1."""
+        round_store, current_round, _sub, store = _make_certified_round(quorum=2)
+        block_loop = _make_mock_block_loop()
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=lambda *a, **k: True,
+        )
+        mgr.set_leader_check(lambda: False)  # FOLLOWER, not self-verified
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("champion_changed") is not True          # q>1 + no verify -> burn
+        assert not round_store.get_active_champion().submission_id
+
+    def test_trust_leader_quorum1_flag_default_on(self, monkeypatch):
+        from minotaur_subnet.epoch.manager import _follower_trust_leader_quorum1_enabled
+        monkeypatch.delenv("FOLLOWER_TRUST_LEADER_QUORUM1", raising=False)
+        assert _follower_trust_leader_quorum1_enabled() is True
+
+    @pytest.mark.parametrize("v", ["0", "false", "no", "off", "OFF"])
+    def test_trust_leader_quorum1_flag_off_values(self, monkeypatch, v):
+        from minotaur_subnet.epoch.manager import _follower_trust_leader_quorum1_enabled
+        monkeypatch.setenv("FOLLOWER_TRUST_LEADER_QUORUM1", v)
+        assert _follower_trust_leader_quorum1_enabled() is False
 
     @pytest.mark.asyncio
     async def test_follower_reset_unadopts_submission_store_durably(self):
