@@ -2,8 +2,14 @@
 
 A NEW way to decide adoption: instead of comparing two aggregate JS scores,
 compare the challenger and champion **per order** on the RAW delivered output
-(the amount the receiver actually got), and adopt only when the challenger
-beats or matches the champion on every order AND strictly wins at least one.
+(the amount the receiver actually got), and adopt on a BOUNDED-REGRESSION,
+NET-BETTER (Pareto-lite) rule: a challenger may adopt while regressing some
+orders, but ONLY if (1) no order is cut by more than the hard ``FLOOR_BPS`` (1%)
+floor, (2) it drops no order the champion serves, and (3) it is NET better on
+breadth — wins (incl. blind-spot covers) exceed the tolerated (<=1%) regressions
+by at least ``DETHRONE_WIN_MARGIN``. (The earlier rule rejected on ANY per-order
+regression; this loosens that to "small regressions are tolerated and netted,
+but >1% cuts and dropped orders are hard vetoes".)
 
 **SHADOW by default.** Two independent gates, read at call time (no restart):
 
@@ -64,6 +70,29 @@ RELATIVE_TOL = 0.001  # 0.1%
 # tolerance tightens toward the BPS noise floor and quorum > 1, where an IEEE-754
 # rounding difference between hosts could otherwise flip a boundary verdict.
 RELATIVE_TOL_BPS = 10
+
+# ── bounded-regression dethrone floor (CODE constants — NEVER env-read) ───────
+#
+# These two govern the BOUNDED-REGRESSION, NET-BETTER dethrone verdict and are
+# CONSENSUS-CRITICAL, so they are fleet-uniform CODE constants — deliberately NOT
+# read from the environment. An env-gated dethrone bound would let a validator
+# who never sets it decide adoption by a DIFFERENT rule and split consensus; the
+# only safe form is a hard-coded constant every validator compiles identically.
+#
+# FLOOR_BPS — HARD per-order regression cap. An order whose challenger output is
+# MORE than this much LESS than the champion's (exact-integer:
+# ``chal*10000 < champ*(10000 - FLOOR_BPS)``) is CATASTROPHIC and a HARD VETO on
+# adoption regardless of how many other orders win. 100 bps == 1.0%. Regressions
+# within this floor (>10-bps noise band, <=1%) are TOLERATED and netted against
+# wins. Cross-multiplied on exact integer wei — bit-exact, no float — like
+# RELATIVE_TOL_BPS, so a boundary cut on a 1e21-wei order is host-deterministic.
+FLOOR_BPS = 100  # 1.0% hard per-order regression cap
+
+# DETHRONE_WIN_MARGIN — net-win requirement. Wins (incl. blind-spot covers) must
+# EXCEED the tolerated (<=1%) regressions by at least this many orders, i.e. the
+# challenger must be NET better on breadth, not merely break even. 1 == "strictly
+# net positive by one order".
+DETHRONE_WIN_MARGIN = 1
 
 # Basis-points denominator for the cross-multiplied comparison.
 _BPS = 10000
@@ -205,17 +234,26 @@ def evaluate_relative_adoption(
           - ``chal*10000 < champ*(10000-tol_bps)`` -> ``regression``
           - ``chal*10000 > champ*(10000+tol_bps)`` -> ``win``
           - else                                   -> ``matched`` (noise band)
+          - a ``regression`` cut by MORE than ``FLOOR_BPS`` (1%) is ALSO counted
+            ``n_catastrophic`` (the >1% subset of ``n_regressions``)
       * champion blind (no value) & challenger delivers -> ``blind_spot_cover``
         (counts as a win — the challenger covers a case the champion can't)
       * champion delivers & challenger drops it (no value) -> ``dropped``
-        (counts as a regression — the challenger lost a case the champion had)
+        (counted in ``n_dropped`` — a HARD VETO, NOT netted against wins)
       * neither delivers value -> ``skip`` (nothing to compare)
 
-    Adopt iff NO order regressed/dropped AND at least one order is a win or a
-    blind-spot cover. (A challenger that merely ties everywhere does not adopt —
-    same "must strictly improve something" spirit as the dethrone margin, but
-    enforced per order on real delivered output rather than on the blended JS
-    score.)
+    Adopt on a BOUNDED-REGRESSION, NET-BETTER rule (all exact-integer)::
+
+        adopt = (n_catastrophic == 0)                # (1) no order cut > 1% (hard floor)
+                and (n_dropped == 0)                 # (2) drop no champion-served order
+                and ((n_wins + n_blind_spots)        # (3) NET better on breadth
+                     >= n_regressions + DETHRONE_WIN_MARGIN)
+
+    Blind-spot covers count on the wins side of the net (covering new orders is
+    rewarded). A >1% per-order cut (catastrophic) and a dropped order are each a
+    HARD VETO that no number of wins can override. When ``adopt`` holds,
+    ``n_catastrophic == 0`` so every counted regression is the tolerated
+    <=1% kind.
 
     ``champion_results`` / ``challenger_results`` may be ``BenchmarkResult``
     objects (unit path) or ``per_intent`` dicts (report / manager path); both are
@@ -234,6 +272,7 @@ def evaluate_relative_adoption(
 
     per_order: list[dict[str, Any]] = []
     n_wins = n_regressions = n_blind_spots = n_matched = 0
+    n_catastrophic = n_dropped = 0
     scenarios_compared = 0
 
     for iid in sorted(set(champ_by) | set(chal_by)):
@@ -249,6 +288,11 @@ def evaluate_relative_adoption(
             if chal_i * _BPS < champ_i * (_BPS - tol_bps):  # type: ignore[operator]
                 verdict = "regression"
                 n_regressions += 1
+                # CATASTROPHIC: cut by MORE than the 1% hard floor. A SUBSET of
+                # n_regressions (every catastrophic order is also a regression).
+                # Exact-integer cross-multiply, no float — bit-exact at boundary.
+                if chal_i * _BPS < champ_i * (_BPS - FLOOR_BPS):  # type: ignore[operator]
+                    n_catastrophic += 1
             elif chal_i * _BPS > champ_i * (_BPS + tol_bps):  # type: ignore[operator]
                 verdict = "win"
                 n_wins += 1
@@ -261,8 +305,11 @@ def evaluate_relative_adoption(
             n_blind_spots += 1
             scenarios_compared += 1
         elif champ_has and not chal_has:
+            # Challenger produced nothing on an order the champion serves: a
+            # DROPPED order. Counted separately (NOT folded into n_regressions)
+            # because it is a HARD VETO, never netted against wins.
             verdict = "dropped"
-            n_regressions += 1
+            n_dropped += 1
             scenarios_compared += 1
         else:
             verdict = "skip"
@@ -278,15 +325,28 @@ def evaluate_relative_adoption(
             "verdict": verdict,
         })
 
-    adopt = (n_regressions == 0) and (n_wins + n_blind_spots >= 1)
-    if n_regressions > 0:
-        reason = f"reject: {n_regressions} regression(s)/drop(s)"
-    elif n_wins + n_blind_spots == 0:
-        reason = "reject: no win (challenger only matched the champion)"
+    # BOUNDED-REGRESSION, NET-BETTER (Pareto-lite) verdict — all exact-integer.
+    net_better = n_wins + n_blind_spots
+    adopt = (
+        n_catastrophic == 0                                   # (1) no order cut > 1% (hard floor)
+        and n_dropped == 0                                    # (2) drop no champion-served order
+        and net_better >= n_regressions + DETHRONE_WIN_MARGIN  # (3) net better on breadth
+    )
+    if n_catastrophic > 0:
+        reason = f"reject: {n_catastrophic} order(s) cut >1% (hard floor)"
+    elif n_dropped > 0:
+        reason = f"reject: dropped {n_dropped} order(s) the champion serves"
+    elif adopt:
+        reason = (
+            f"dethrone: {net_better} better, {n_regressions} minor regression(s) "
+            f"within 1% floor (net +{net_better - n_regressions})"
+        )
+    elif net_better == 0 and n_regressions == 0:
+        reason = "matched: no order better or worse"
     else:
         reason = (
-            f"adopt: {n_wins} win(s), {n_blind_spots} blind-spot cover(s), "
-            f"0 regressions over {scenarios_compared} order(s)"
+            f"reject: net better {net_better} <= regressions {n_regressions} "
+            f"+ margin {DETHRONE_WIN_MARGIN}"
         )
 
     return {
@@ -295,6 +355,8 @@ def evaluate_relative_adoption(
         "per_order": per_order,
         "n_wins": n_wins,
         "n_regressions": n_regressions,
+        "n_catastrophic": n_catastrophic,
+        "n_dropped": n_dropped,
         "n_blind_spots": n_blind_spots,
         "n_matched": n_matched,
         "scenarios_compared": scenarios_compared,
@@ -322,18 +384,17 @@ def relative_counts(
 
       * ``better``   = wins + blind-spot covers (orders the challenger delivers
                        MORE on, including ones the champion can't serve at all).
-      * ``worse``    = regressions. The decision impl FOLDS a dropped order
-                       (champion delivered, challenger produced nothing) into
-                       ``n_regressions``, so a dropped order correctly counts as
-                       worse here.
+      * ``worse``    = regressions + dropped orders (orders the challenger
+                       delivers LESS on, plus champion-served orders it produced
+                       nothing for). Both count as worse here.
       * ``matched``  = orders inside the ±``tol_bps`` noise band (neither better nor worse).
       * ``new``      = blind-spot covers — a SUBSET of ``better``: orders the
                        champion delivered nothing on that the challenger covers.
       * ``compared`` = better + worse + matched (orders actually comparable;
                        skips — neither side delivered — are excluded).
-      * ``verdict``  = ``dethrone`` when the relative rule adopts, ``matched`` when
-                       nothing is better or worse, else ``behind`` (any regression
-                       is ``behind`` regardless of how many wins it has).
+      * ``verdict``  = ``dethrone`` when the bounded-regression rule adopts,
+                       ``matched`` when nothing is better or worse, else
+                       ``behind`` (net-insufficient, a >1% cut, or a dropped order).
 
     Re-exposes ``per_order`` unchanged. Same duck-typed inputs as
     :func:`evaluate_relative_adoption` (``BenchmarkResult`` objects or stored
@@ -341,7 +402,7 @@ def relative_counts(
     """
     res = evaluate_relative_adoption(champion_results, challenger_results, tol_bps=tol_bps)
     better = res["n_wins"] + res["n_blind_spots"]
-    worse = res["n_regressions"]
+    worse = res["n_regressions"] + res["n_dropped"]
     matched = res["n_matched"]
     new = res["n_blind_spots"]
     compared = better + worse + matched
@@ -406,10 +467,13 @@ def relative_reason(
 ) -> str | None:
     """Phrase a round reason in relative vocabulary from a counts dict — PURE.
 
-      * ``dethrone`` -> ``"adopted <id>: better on N order(s), 0 regressions"``.
-      * otherwise    -> ``"no challenger delivered more on any order
-                          (N matched / M regressed)"``.
+      * ``dethrone`` -> ``"adopted <id>: net better — N better / M worse
+                          (regressions within 1% floor)"``.
+      * otherwise    -> ``"not adopted: N better / M worse / K matched"``.
 
+    Phrases the counts honestly under the bounded-regression rule: a dethrone may
+    carry within-floor regressions, and a non-dethrone challenger may still be
+    better on some orders (just not net-enough / or it tripped a hard veto).
     Returns ``None`` when there are no counts (nothing to phrase). This is a
     DISPLAY-only derivation: callers attach it as a separate ``reason_relative``
     field and never mutate the stored legacy ``abort_reason``.
@@ -418,8 +482,11 @@ def relative_reason(
         return None
     if counts.get("verdict") == "dethrone":
         who = f" {candidate_id}" if candidate_id else ""
-        return f"adopted{who}: better on {counts['better']} order(s), 0 regressions"
+        return (
+            f"adopted{who}: net better — {counts['better']} better / "
+            f"{counts['worse']} worse (regressions within 1% floor)"
+        )
     return (
-        "no challenger delivered more on any order "
-        f"({counts['matched']} matched / {counts['worse']} regressed)"
+        f"not adopted: {counts['better']} better / {counts['worse']} worse / "
+        f"{counts['matched']} matched"
     )
