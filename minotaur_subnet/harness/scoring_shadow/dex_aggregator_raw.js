@@ -8,8 +8,8 @@
 // validity guard, config/manifest/validate) is identical so it slots into the
 // same JsExecutionEngine and benchmark corpus.
 //
-//   score = outputAmount        (raw tokens delivered to the receiver)
-//   valid = outputAmount >= min (the slippage guard; below-min => score 0)
+//   raw_output = sum of output tokens delivered to the receiver (EXACT wei)
+//   valid      = raw_output >= min (the slippage guard; below-min => invalid)
 //
 // Operators upload this (or their own raw-output variant) via
 //   PUT /apps/{app_id}/scoring-shadow
@@ -17,10 +17,14 @@
 // each BenchmarkResult.shadow_score. The relative rule (epoch/relative_scoring.py)
 // then compares challenger vs champion per order on this raw output.
 //
-// NOTE ON UNITS: the engine's score parser clamps `score` to [0, 1], so the
-// authoritative raw value is ALSO published in `metadata.raw_output` (unclamped);
-// the dual-load path reads it from there. `valid` here reflects the JS's own
-// min-output guard (the engine's dict parser does not propagate it).
+// EXACT-INTEGER WEI: output amounts are token wei (1e18..1e22+), well above JS's
+// 2^53 safe-integer limit, so they are summed as BigInt — NOT parseFloat/double —
+// and published as an EXACT DECIMAL STRING in `metadata.raw_output`. This makes
+// the per-order comparison bit-exact and host-deterministic (no IEEE-754 rounding
+// at the BPS boundary). The engine's score parser clamps `score` to [0, 1], so
+// `score` here is only a bounded validity SENTINEL (1 valid / 0 invalid) — the
+// authoritative value is the `metadata.raw_output` string, which the dual-load
+// path reads. `valid` reflects the JS's own min-output guard.
 // =============================================================================
 
 var config = {
@@ -31,6 +35,21 @@ var config = {
 
 function runtimeParams(state) {
   return state.typed_context || state.raw_params || state.rawParams || {};
+}
+
+// Parse a token amount as EXACT integer wei (BigInt). Amounts arrive as exact
+// decimal strings; this guards each conversion so a non-integer / garbage amount
+// is SKIPPED (returns null), never thrown — a single bad transfer can't break
+// the observe-only shadow score.
+function toBigIntAmount(v) {
+  if (v === null || v === undefined) return null;
+  var s = String(v).trim();
+  if (!/^[0-9]+$/.test(s)) return null; // non-negative integer wei only
+  try {
+    return BigInt(s);
+  } catch (e) {
+    return null;
+  }
 }
 
 var manifest = {
@@ -68,7 +87,7 @@ function score(plan, state, context) {
       score: 0,
       valid: false,
       reason: "Simulation failed: " + (sim.error || "unknown"),
-      metadata: { raw_output: 0 },
+      metadata: { raw_output: "0" },
     };
   }
 
@@ -85,59 +104,71 @@ function score(plan, state, context) {
   var gasUsed = sim.gas_used || sim.gasUsed || 0;
 
   if (transfers.length === 0) {
-    return { score: 0, valid: false, reason: "No token transfers detected", metadata: { raw_output: 0 } };
+    return { score: 0, valid: false, reason: "No token transfers detected", metadata: { raw_output: "0" } };
   }
 
   // Sum the output-token transfers delivered to the receiver (or the app, which
-  // delivers in _checkIntent) — IDENTICAL output-extraction logic to the live JS.
-  var outputAmount = 0;
+  // delivers in _checkIntent) — IDENTICAL output-extraction logic to the live JS,
+  // but summed as EXACT integer wei (BigInt) so token amounts above 2^53 are not
+  // rounded by IEEE-754. A garbage/non-integer amount is skipped, not thrown.
+  var total = BigInt(0);
   for (var i = 0; i < transfers.length; i++) {
     var t = transfers[i];
     var toAddr = (t.to_addr || t.to || "").toLowerCase();
     var tokenAddr = (t.token || t.token_address || "").toLowerCase();
     if (tokenAddr === tokenOut && (toAddr === receiver || toAddr === appAddr)) {
-      outputAmount += parseFloat(t.amount || t.value || "0");
+      var amt = toBigIntAmount(t.amount !== undefined && t.amount !== null ? t.amount : t.value);
+      if (amt !== null) {
+        total += amt;
+      }
     }
   }
 
-  if (outputAmount === 0) {
+  if (total === BigInt(0)) {
     return {
       score: 0,
       valid: false,
       reason: "No output tokens received by receiver",
-      metadata: { raw_output: 0 },
+      metadata: { raw_output: "0" },
     };
   }
 
   // 4. Validity guard: the swap must clear the slippage-guard min if one is set —
-  //    SAME `output < min => {score:0, valid:false}` guard as the live scorer.
-  var minOut = parseFloat(minAmountOut);
-  if (minOut > 0 && outputAmount < minOut) {
+  //    SAME `output < min => invalid` guard as the live scorer, as a BigInt
+  //    comparison (no float).
+  var minOut = toBigIntAmount(minAmountOut);
+  if (minOut === null) minOut = BigInt(0);
+  if (minOut > BigInt(0) && total < minOut) {
     return {
       score: 0,
       valid: false,
-      reason:
-        "Output below minimum: " + outputAmount.toFixed(0) + " < " + minOut.toFixed(0),
-      metadata: { raw_output: 0, output_amount: outputAmount, min_amount_out: minOut },
+      reason: "Output below minimum: " + total.toString() + " < " + minOut.toString(),
+      metadata: {
+        raw_output: "0",
+        output_amount: total.toString(),
+        min_amount_out: minOut.toString(),
+      },
     };
   }
 
-  // 5. SHADOW SCORE = the RAW delivered output. No quote anchor, no gas term, no
-  //    [0,1] clamp, no weighting — just what the receiver actually got.
+  // 5. SHADOW SCORE carrier = metadata.raw_output, the RAW delivered output as an
+  //    EXACT DECIMAL WEI STRING. No quote anchor, no gas term, no weighting — just
+  //    what the receiver actually got. `score` is only a bounded validity sentinel
+  //    (1 valid) because the engine clamps it to [0, 1]; the relative rule reads
+  //    metadata.raw_output, not `score`.
   return {
-    score: outputAmount,
+    score: 1,
     valid: true,
-    reason: "Raw output delivered: " + outputAmount.toFixed(0) + " (min=" + minOut.toFixed(0) + " gas=" + gasUsed + ")",
+    reason: "Raw output delivered: " + total.toString() + " (min=" + minOut.toString() + " gas=" + gasUsed + ")",
     breakdown: {
-      raw_output: outputAmount,
-      min_amount_out: minOut,
+      min_amount_out: minOut.toString(),
       gas_used: gasUsed,
       num_transfers: transfers.length,
     },
     metadata: {
-      raw_output: outputAmount,
-      output_amount: outputAmount,
-      min_amount_out: minOut,
+      raw_output: total.toString(),
+      output_amount: total.toString(),
+      min_amount_out: minOut.toString(),
     },
   };
 }

@@ -190,10 +190,11 @@ class BenchmarkResult:
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
     # SHADOW (observe-only) raw delivered output from the parallel shadow JS run
-    # (relative_scoring). None when shadow scoring is off or the app has no
-    # shadow_js_code; 0.0 when the order delivered nothing / fell below min. NEVER
-    # feeds the live score — additive only.
-    shadow_score: float | None = None
+    # (relative_scoring). An EXACT DECIMAL WEI STRING (not a float) so token
+    # amounts above 2^53 keep full precision end-to-end. None when shadow scoring
+    # is off or the app has no shadow_js_code; "0" when the order delivered nothing
+    # / fell below min. NEVER feeds the live score — additive only.
+    shadow_score: str | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
