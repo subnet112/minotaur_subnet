@@ -581,6 +581,28 @@ def _max_submissions_per_round() -> int:
         return 1
 
 
+def _max_submissions_per_owner_per_round() -> int:
+    """Per-(github-account, round) submission cap — sybil-limits a miner that
+    spreads ONE GitHub account across multiple hotkeys/PRs in a single round.
+
+    The account is the head-repo owner, derived from the resolved PR clone_url —
+    known + GitHub-validated for every PR submission (the private path also proves
+    token read access to it). Inline-source submissions carry no GitHub identity
+    and are therefore exempt. Configurable via
+    ``SUBMISSIONS_MAX_PER_OWNER_PER_ROUND`` (default 1); a value <= 0 disables it.
+    Operator-local admission control at the leader gateway, like the per-hotkey cap.
+
+    Note: GitHub accounts are cheaper to mint than registered hotkeys, so this is
+    defense-in-depth on top of the per-hotkey cap — it raises the cost of the
+    same-source-N-times pattern, not an absolute sybil guarantee.
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_PER_OWNER_PER_ROUND", "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+
 def _max_submissions_per_round_total() -> int:
     """Round-wide submission cap across ALL miners — bounds the per-round
     benchmark batch (first-come; the rest retry next round).
@@ -862,6 +884,28 @@ async def create_submission(
             detail="Invalid hotkey signature",
         )
 
+    # Per-(github-account, round) cap — anti-sybil dedup. The account is the
+    # resolved PR head-repo owner (same for public forks and the private path);
+    # this collapses one GitHub account spread across multiple hotkeys/PRs to the
+    # cap, which the per-hotkey cap alone can't catch. Checked post-auth (so it
+    # never leaks per-account counts to an unauthenticated probe) and before the
+    # mergeability GitHub call. The store re-checks atomically inside create() as
+    # the TOCTOU backstop.
+    from minotaur_subnet.api.routes.submissions.github_pr import github_owner_from_url
+    _github_owner = github_owner_from_url(pr["clone_url"])
+    max_per_owner = _max_submissions_per_owner_per_round()
+    if _github_owner and max_per_owner > 0:
+        owner_already = store.count_by_owner_round(_github_owner, current_round.round_id)
+        if owner_already >= max_per_owner:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"GitHub account '{_github_owner}' has already submitted "
+                    f"{owner_already} time(s) for round {current_round.round_id} "
+                    f"(max {max_per_owner} per round per account); try again next round."
+                ),
+            )
+
     # Fail-fast: reject a PR that can't actually be merged (merge conflicts /
     # stale base after a newer champion landed / draft) with a clear message,
     # rather than spend a benchmark on a PR the leader's merge gate would later
@@ -894,6 +938,8 @@ async def create_submission(
             is_private=_private,
             private_repo_full=(body.private_repo if _private else None),
             repo_token=(body.repo_token if _private else None),
+            github_owner=_github_owner,
+            max_per_owner_per_round=max_per_owner,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
