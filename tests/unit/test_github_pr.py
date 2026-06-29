@@ -20,6 +20,18 @@ def _fetch(pr):
     return lambda owner, repo, n: pr
 
 
+def test_github_owner_from_url():
+    # Owner extracted + lowercased from the clone/repo URL forms; None for non-github.
+    assert gp.github_owner_from_url("https://github.com/Miner/fork.git") == "miner"
+    assert gp.github_owner_from_url("https://github.com/Alice/solver") == "alice"
+    assert gp.github_owner_from_url("git@github.com:Bob/repo.git") == "bob"
+    assert gp.github_owner_from_url("ssh://git@github.com/Carol/r") == "carol"
+    assert gp.github_owner_from_url("source://inline") is None
+    assert gp.github_owner_from_url("https://gitlab.com/x/y") is None
+    assert gp.github_owner_from_url("") is None
+    assert gp.github_owner_from_url(None) is None
+
+
 def test_canonical_repo_default(monkeypatch):
     monkeypatch.delenv("SOLVER_REPO_URL", raising=False)
     assert gp.canonical_solver_repo() == (OWNER, REPO)
