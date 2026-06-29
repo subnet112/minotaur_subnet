@@ -29,13 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from minotaur_subnet.epoch.adopt_rule import (
-    ADOPT_RULE,
-    DEFAULT_ADOPT_RULE_CONFIG,
-    _app_onchain_mean,
-    _evaluate_onchain,
-    evaluate_adoption,
-)
+from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
 from minotaur_subnet.harness.submission_store import (
     Submission,
     SubmissionStatus,
@@ -958,9 +952,9 @@ class EpochManager:
 
             # Persist the refreshed score + details. Also persist when the stored
             # scorecard predates the on-chain plumbing (no app_onchain) so the
-            # on-chain-ranked rule has the champion's per-app on-chain means even
-            # when the JS score is unchanged — otherwise p2oc would reject a
-            # legitimate challenger for lack of a champion baseline.
+            # current rule's on-chain HARD VETO has the champion's per-app on-chain
+            # means even when the JS score is unchanged — otherwise the veto would
+            # lack a champion baseline and silently skip the app.
             _stored = self._get_incumbent_scorecard() or {}
             if self._sub_store and (fresh_score != old_score or not _stored.get("app_onchain")):
                 self._sub_store.set_benchmark_result(
@@ -1096,23 +1090,8 @@ class EpochManager:
             )
             return False
 
-        # On-chain co-ranked dethrone (code-gated). Default "current" falls through to
-        # the shared pure rule below. ADOPT_RULE=="p2oc" ranks the dethrone on the
-        # unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score. It is
-        # a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE), not a per-validator env,
-        # and MUST NOT be enabled live until the cross-machine determinism gate passes.
-        if ADOPT_RULE == "p2oc":
-            return self._should_adopt_onchain(challenger)
-
         challenger_scorecard = self._get_scorecard(challenger)
         incumbent_scorecard = self._get_incumbent_scorecard()
-
-        # SHADOW (observe-only): while the live decision uses the current rule, log
-        # what the on-chain-ranked rule WOULD decide + the on-chain surplus, so the
-        # fleet can compare these determinism-critical signals across machines WITHOUT
-        # affecting any actual adoption. Default off. Never raises into the live path.
-        if os.environ.get("SHADOW_DETERMINISM", "").strip().lower() in ("1", "true", "yes", "on"):
-            self._log_shadow_determinism(challenger, challenger_scorecard, incumbent_scorecard)
 
         # Delegate the rule body to the pure, shared decision function so the leader
         # and followers make the identical decision.
@@ -1151,64 +1130,6 @@ class EpochManager:
                 )
                 return bool(shadow["adopt"])
         return adopt
-
-    def _should_adopt_onchain(self, challenger: Submission) -> bool:
-        """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — thin wrapper over the pure
-        ``adopt_rule._evaluate_onchain``. Ranks the dethrone on the unfakeable on-chain
-        OUTPUT surplus (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the
-        gas-polluted JS score. Kept as a method so direct callers (e.g.
-        ``_log_shadow_determinism``) and existing tests keep working; the
-        same-submission short-circuit in ``_should_adopt`` already ran.
-        """
-        adopt, reason = _evaluate_onchain(
-            challenger_scorecard=self._get_scorecard(challenger),
-            champion_scorecard=self._get_incumbent_scorecard(),
-            dethrone_margin=self._dethrone_margin,
-            has_champion=bool(self._champion.submission_id),
-            config=DEFAULT_ADOPT_RULE_CONFIG,
-        )
-        logger.info("p2oc decision for %s: adopt=%s (%s)",
-                    getattr(challenger, "submission_id", "?"), adopt, reason)
-        return adopt
-
-    def _log_shadow_determinism(self, challenger: Submission, chal_card, champ_card) -> None:
-        """Observe-only shadow of the on-chain-ranked decision (SHADOW_DETERMINISM).
-
-        Logs, per challenger, the on-chain-ranked (p2oc) verdict + the net on-chain
-        output surplus + the per-app champion/challenger on-chain means — the exact
-        determinism-critical signals. Operators across the fleet can compare these
-        (same challenger + same pinned block -> same numbers, or consensus would split
-        if enabled). Has NO effect on the live adoption decision and never raises into
-        it. For the numbers to be comparable across validators they must benchmark at
-        the SAME pinned block (the fork-pin keystone); on the prod lead alone it still
-        surfaces p2oc's behavior on real challengers.
-        """
-        try:
-            chal_card = chal_card or {}
-            champ_card = champ_card or {}
-            champ_apps = champ_card.get("app_scores", {})
-            champ_oc = champ_card.get("app_onchain", {})
-            chal_oc = chal_card.get("app_onchain", {})
-            surpluses: list[float] = []
-            per_app: dict[str, float] = {}
-            for app in champ_apps:
-                co = _app_onchain_mean(champ_oc.get(app, []))
-                cco = _app_onchain_mean(chal_oc.get(app, []))
-                if co is not None and cco is not None:
-                    per_app[app] = round(cco - co, 1)
-                    surpluses.append(cco - co)
-            net_bps = (sum(surpluses) / len(surpluses)) if surpluses else 0.0
-            would_adopt = self._should_adopt_onchain(challenger)
-            logger.info(
-                "[shadow-determinism] challenger=%s p2oc_verdict=%s net_onchain_bps=%+.1f "
-                "per_app_surplus=%s champion_onchain=%s challenger_onchain=%s",
-                challenger.submission_id, "ADOPT" if would_adopt else "REJECT", net_bps,
-                per_app,
-                {a: _app_onchain_mean(v) for a, v in champ_oc.items()},
-                {a: _app_onchain_mean(v) for a, v in chal_oc.items()},
-            )
-        except Exception as exc:  # observe-only — must never break the live decision
-            logger.warning("[shadow-determinism] failed (ignored): %s", exc)
 
     @staticmethod
     def _per_intent(submission: Submission | None) -> list[dict[str, Any]]:

@@ -2,11 +2,10 @@
 
 evaluate_adoption is the per-validator adoption decision body extracted from
 EpochManager._should_adopt so the leader and followers make the identical
-decision. These tests cover both the default "current" JS rule and the
-p2oc on-chain-surplus rule. The thresholds/rule are fleet-uniform CODE CONSTANTS
-(adopt_rule._AdoptRuleConfig), so the p2oc / floor tests drive them by passing an
-explicit ``config=`` — NOT via env (the env knobs were removed so a 3rd-party
-validator can't split the fleet).
+decision. These tests cover the default "current" JS rule and its on-chain HARD
+VETO. The thresholds are fleet-uniform CODE CONSTANTS
+(adopt_rule._AdoptRuleConfig) — NOT env (the env knobs were removed so a
+3rd-party validator can't split the fleet).
 """
 
 from __future__ import annotations
@@ -14,17 +13,10 @@ from __future__ import annotations
 import pytest
 
 from minotaur_subnet.epoch.adopt_rule import (
-    _AdoptRuleConfig,
     _app_onchain_mean,
     _onchain_pass,
     evaluate_adoption,
 )
-
-
-def _p2oc_cfg(*, onchain_floor_bps: "int | None" = None) -> _AdoptRuleConfig:
-    """The fleet-default config with the rule switched to p2oc (and an optional
-    on-chain admission floor), as the offline lab would pass it — no env mutation."""
-    return _AdoptRuleConfig(adopt_rule="p2oc", onchain_floor_bps=onchain_floor_bps)
 
 
 def _card(js: dict, oc: dict | None = None) -> dict:
@@ -289,123 +281,6 @@ def test_mock_simulation_count_reject():
     )
     assert adopt is False
     assert "mock simulation" in reason
-
-
-def test_onchain_veto_not_run_under_p2oc():
-    # The current-rule on-chain veto must NOT run under the p2oc rule: that path
-    # has its own on-chain ranking. Here the challenger reverts on-chain
-    # (None,None) which would VETO under current, but p2oc handles it via its own
-    # "produced no on-chain score" reject (different reason string), proving the
-    # current-rule veto code did not execute.
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.9,
-        champion_score=0.6,
-        challenger_scorecard=_card({"A": 0.9}, {"A": [None, None]}),
-        champion_scorecard=_card({"A": 0.6}, {"A": [5000, 5000]}),
-        dethrone_margin=0.005,
-        has_champion=True,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is False
-    assert "p2oc reject" in reason
-    assert "no valid on-chain score" not in reason
-
-
-# ── p2oc on-chain-surplus rule (config.adopt_rule == "p2oc") ─────────────────
-
-
-def test_p2oc_adopt_when_surplus_above_margin():
-    # Challenger delivers +120 BPS on-chain (1.2% / 10000 = 0.012 > 0.005 margin)
-    # even though its JS score is lower (more gas). On-chain ranking adopts it.
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.53,
-        champion_score=0.54,
-        challenger_scorecard=_card({"A": 0.53}, {"A": [5120]}),
-        champion_scorecard=_card({"A": 0.54}, {"A": [5000]}),
-        dethrone_margin=0.005,
-        has_champion=True,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is True
-    assert "ADOPT" in reason
-
-
-def test_p2oc_reject_when_surplus_at_or_below_margin():
-    # +30 BPS surplus (0.003) <= 0.005 margin -> reject.
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.55,
-        champion_score=0.55,
-        challenger_scorecard=_card({"A": 0.55}, {"A": [5030]}),
-        champion_scorecard=_card({"A": 0.55}, {"A": [5000]}),
-        dethrone_margin=0.005,
-        has_champion=True,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is False
-    assert "surplus" in reason and "margin" in reason
-
-
-def test_p2oc_reject_on_floor_fail():
-    # Challenger's on-chain score (4000) is below the admission floor (5000).
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.9,
-        champion_score=0.5,
-        challenger_scorecard=_card({"A": 0.9}, {"A": [4000]}),
-        champion_scorecard=_card({"A": 0.5}, {"A": [5000]}),
-        dethrone_margin=0.005,
-        has_champion=True,
-        config=_p2oc_cfg(onchain_floor_bps=5000),
-    )
-    assert adopt is False
-    assert "on-chain floor fail" in reason
-
-
-def test_p2oc_no_absolute_global_floor():
-    # The global-score floor was purged, so a sub-floor challenger reaches the
-    # p2oc dispatch and is judged by p2oc's own rule (here it rejects on JS
-    # regression) — NOT blocked by an absolute floor.
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.4,
-        champion_score=0.5,
-        challenger_scorecard=_card({"A": 0.4}, {"A": [9000]}),
-        champion_scorecard=_card({"A": 0.5}, {"A": [5000]}),
-        dethrone_margin=0.05,
-        has_champion=True,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is False
-    assert "p2oc" in reason
-
-
-def test_p2oc_genesis_adopt():
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.6,
-        champion_score=0.0,
-        challenger_scorecard=_card({"A": 0.6}, {"A": [5000]}),
-        champion_scorecard=None,
-        dethrone_margin=0.005,
-        has_champion=False,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is True
-    assert "genesis" in reason
-
-
-def test_p2oc_genesis_rejects_below_per_app_floor():
-    # Purging the absolute global floor must NOT open the p2oc genesis path: the
-    # per-app sanity floor now also guards it, so a garbage first champion can't
-    # self-adopt under the p2oc rule (matches the default rule).
-    adopt, reason = evaluate_adoption(
-        challenger_score=0.05,
-        champion_score=0.0,
-        challenger_scorecard=_card({"A": 0.05}, {"A": [100]}),  # below per-app 0.3
-        champion_scorecard=None,
-        dethrone_margin=0.05,
-        has_champion=False,
-        config=_p2oc_cfg(),
-    )
-    assert adopt is False
-    assert "per-app minimum" in reason
 
 
 # ── moved module helpers ─────────────────────────────────────────────────────

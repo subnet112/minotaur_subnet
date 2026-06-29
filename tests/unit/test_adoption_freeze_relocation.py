@@ -59,10 +59,8 @@ def test_meets_criteria_ignores_freeze(monkeypatch):
     m._dethrone_margin = 0.05
     m._get_scorecard = MagicMock(return_value={})
     m._get_incumbent_scorecard = MagicMock(return_value={})
-    monkeypatch.setattr(manager_mod, "ADOPT_RULE", "current")
     monkeypatch.setattr(manager_mod, "evaluate_adoption", lambda **kw: (True, "beats champ"))
     monkeypatch.setenv("DISABLE_CHAMPION_ADOPTION", "1")  # set, but must be ignored here
-    monkeypatch.delenv("SHADOW_DETERMINISM", raising=False)
     assert m._meets_adoption_criteria(_chal()) is True
 
 

@@ -60,9 +60,6 @@ def force_adopt(monkeypatch):
 def _no_freeze(monkeypatch):
     """Ensure the DISABLE_CHAMPION_ADOPTION freeze isn't what returns False."""
     monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
-    # Also keep ADOPT_RULE on the default "current" path so the forced
-    # evaluate_adoption (not the p2oc branch) is what would otherwise decide.
-    monkeypatch.setattr(manager_mod, "ADOPT_RULE", "current", raising=False)
 
 
 def test_stale_incumbent_abstains_even_for_a_winner(force_adopt):
