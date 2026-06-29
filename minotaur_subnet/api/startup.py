@@ -2380,10 +2380,15 @@ async def initialize(ctx: ServerContext) -> dict:
 
             def _certify_sync_payload(round_state) -> dict[str, object]:
                 certificate = round_state.certificate
-                approvals = [
-                    approval.to_dict()
-                    for approval in (certificate.approvals if certificate is not None else [])
-                ]
+                cert_approvals = certificate.approvals if certificate is not None else []
+                approvals = [approval.to_dict() for approval in cert_approvals]
+                # v2 EIP-712 digest fields (commit_hash/nonce/deadline) MUST ride at
+                # the TOP level so a follower rebuilds the proposal with the leader's
+                # SIGNED values, not its own wall-clock. Without them the follower's
+                # digest diverges → verify_approval fails ("Invalid champion approvals")
+                # → the quorum is stranded leader-only. Sourced from the leader's own
+                # signed approval (every signer signs the SAME proposal nonce/deadline).
+                _lead = cert_approvals[0] if cert_approvals else None
                 return {
                     "round_id": round_state.round_id,
                     "candidate_submission_id": round_state.finalist_submission_id,
@@ -2393,6 +2398,9 @@ async def initialize(ctx: ServerContext) -> dict:
                     "shadow_case_log_hash": round_state.shadow_case_log_hash,
                     "effective_epoch": round_state.effective_epoch or 0,
                     "quorum_required": round_state.quorum_required or 0,
+                    "commit_hash": getattr(_lead, "commit_hash", None),
+                    "nonce": int(getattr(_lead, "nonce", 0) or 0),
+                    "deadline": int(getattr(_lead, "deadline", 0) or 0),
                     "approvals": approvals,
                 }
 
