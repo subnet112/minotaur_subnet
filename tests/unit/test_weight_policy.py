@@ -254,7 +254,11 @@ def test_fraction_is_linear_at_midpoint():
 
 
 def test_fraction_monotonic_increasing():
-    samples = [champion_miner_weight_fraction(n) for n in (0, 100, 250, 500, 750, 1000)]
+    # Sample points across the ramp, bar-agnostic so this holds at any
+    # ORDERS_FOR_FULL_EMISSION: floor at 0, full at the bar, monotonic between.
+    full = ORDERS_FOR_FULL_EMISSION
+    points = (0, full // 10, full // 4, full // 2, (full * 3) // 4, full)
+    samples = [champion_miner_weight_fraction(n) for n in points]
     assert samples == sorted(samples)
     assert samples[0] == CHAMPION_MINER_WEIGHT_FLOOR
     assert samples[-1] == 1.0
