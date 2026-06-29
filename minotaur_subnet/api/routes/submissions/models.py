@@ -155,11 +155,9 @@ class SourceSubmitRequest(BaseModel):
 
 class SolverRoundResponse(BaseModel):
     # ``extra="allow"`` lets the round-state builder ATTACH the additive relative
-    # fields (``scoring_mode``, ``finalist_relative``, ``reason_relative``) ONLY
-    # when ``relative_scoring_active()`` — they are passed as constructor extras
-    # and serialized. When the flag is OFF no extras are passed, so the response is
-    # byte-for-byte identical to before (declared fields only). See
-    # round_manager._round_relative_extra.
+    # fields (``scoring_mode``, ``finalist_relative``, ``reason_relative``) — the
+    # relative rule is the sole adoption path, so these are always passed as
+    # constructor extras and serialized. See round_manager._round_relative_extra.
     model_config = ConfigDict(extra="allow")
 
     round_id: str

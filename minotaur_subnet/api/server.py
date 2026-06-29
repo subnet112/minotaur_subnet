@@ -375,9 +375,9 @@ def health() -> dict:
         data["round_anchor"] = dict(ctx.round_anchor_parity)
     if ctx.last_independent_vote:
         data["independent_vote"] = dict(ctx.last_independent_vote)
-    # SHADOW (observe-only) relative per-order adoption verdict for the latest
-    # challenger + whether it agrees with the live decision. Absent until the
-    # first evaluation; observe-only unless RELATIVE_SCORING_ENABLED is on.
+    # Relative per-order adoption verdict for the latest challenger — the
+    # AUTHORITATIVE leader decision (relative rule is the sole adoption path).
+    # Absent until the first evaluation. Key kept for backward compatibility.
     if ctx.last_shadow_per_order_vote:
         data["shadow_per_order_vote"] = dict(ctx.last_shadow_per_order_vote)
     if ctx.last_champion_quorum:

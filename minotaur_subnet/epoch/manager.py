@@ -950,13 +950,18 @@ class EpochManager:
             old_score = self._champion.benchmark_score
             self._champion.benchmark_score = fresh_score
 
-            # Persist the refreshed score + details. Also persist when the stored
-            # scorecard predates the on-chain plumbing (no app_onchain) so the
-            # current rule's on-chain HARD VETO has the champion's per-app on-chain
-            # means even when the JS score is unchanged — otherwise the veto would
-            # lack a champion baseline and silently skip the app.
-            _stored = self._get_incumbent_scorecard() or {}
-            if self._sub_store and (fresh_score != old_score or not _stored.get("app_onchain")):
+            # Display-path + adoption consistency (#FIX): ALWAYS persist this round's
+            # FRESH re-bench (score + per_intent, incl. shadow_score) back to the
+            # champion's submission record. The relative adoption rule
+            # (_evaluate_per_order_adoption) and the report path
+            # (relative_counts_for_submissions, which reads store.get_champion()
+            # .benchmark_details) BOTH join against the champion's STORED per_intent;
+            # persisting the same-round re-bench guarantees they compare the
+            # challenger against the SAME same-round/same-fork reference the adoption
+            # used — instead of a stale bench from a different round/fork (which
+            # produced transient wrong counts on the frontend). Persist whenever we
+            # have fresh details so a JS-unchanged round still refreshes the rows.
+            if self._sub_store and details is not None:
                 self._sub_store.set_benchmark_result(
                     incumbent_sub.submission_id,
                     score=fresh_score,
@@ -1053,21 +1058,21 @@ class EpochManager:
         return self._meets_adoption_criteria(challenger)
 
     def _meets_adoption_criteria(self, challenger: Submission) -> bool:
-        """The PURE adoption verdict — challenger beats the champion per the shared
-        ``evaluate_adoption`` rule.
+        """The PURE adoption verdict — the relative per-order rule is the SOLE
+        decision: the challenger must beat-or-match the freshly re-benched champion
+        on EVERY order's RAW delivered output and strictly win at least one
+        (``evaluate_relative_adoption``). This is the IDENTICAL rule the followers
+        run (``champion_consensus._independent_adopt_vote``), so the leader and the
+        fleet decide alike.
 
         Does NOT consult ``DISABLE_CHAMPION_ADOPTION``: the freeze is enforced at the
         COMMIT boundary (``activate_certified_round``), so the consensus pipeline can
         broadcast + collect a would-be quorum observe-only under the freeze and the
-        fleet's cross-host agreement can be measured without ever adopting. This is
-        the identical rule body the followers run, so leader and fleet decide alike.
+        fleet's cross-host agreement can be measured without ever adopting.
 
         The synchronous standalone path (``process_epoch``) uses ``_should_adopt``
         instead, which keeps the freeze check because it commits immediately.
         """
-        challenger_score = challenger.benchmark_score or 0
-        champion_score = self._champion.benchmark_score or 0
-
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
             return False
@@ -1075,10 +1080,10 @@ class EpochManager:
         # Fail-closed stale-bar guard: if an incumbent EXISTS but could not be
         # freshly re-benchmarked this round (_refresh_incumbent_score hit an
         # unresolvable-image / bad-results / benchmark-error path), the champion bar
-        # is STALE — ABSTAIN rather than decide adoption on an outdated number. This
-        # mirrors the follower's conservative REJECT (champion_consensus), so the
-        # leader and fleet never diverge on a stale bar. (No incumbent => not stale,
-        # bootstrap proceeds.)
+        # is STALE — ABSTAIN rather than decide adoption on an outdated per-order
+        # set. This mirrors the follower's conservative REJECT (champion_consensus),
+        # so the leader and fleet never diverge on a stale bar. (No incumbent =>
+        # not stale, bootstrap proceeds.)
         # getattr default False: a manager built via __new__ (tests) or never run
         # through a refresh has not had a failed refresh -> not stale.
         if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
@@ -1090,45 +1095,21 @@ class EpochManager:
             )
             return False
 
-        challenger_scorecard = self._get_scorecard(challenger)
-        incumbent_scorecard = self._get_incumbent_scorecard()
-
-        # Delegate the rule body to the pure, shared decision function so the leader
-        # and followers make the identical decision.
-        adopt, reason = evaluate_adoption(
-            challenger_score=challenger_score,
-            champion_score=champion_score,
-            challenger_scorecard=challenger_scorecard,
-            champion_scorecard=incumbent_scorecard,
-            dethrone_margin=self._dethrone_margin,
-            has_champion=bool(self._champion.submission_id),
+        # The relative per-order rule is the SOLE adoption decision. On any error
+        # (no comparable per-order data) abstain — never adopt on uncertainty.
+        verdict = self._evaluate_per_order_adoption(challenger)
+        if verdict is None:
+            logger.warning(
+                "adoption decision for %s: ABSTAIN (relative per-order verdict "
+                "unavailable — no comparable per-order data)",
+                getattr(challenger, "submission_id", "?"),
+            )
+            return False
+        adopt = bool(verdict["adopt"])
+        logger.info(
+            "adoption decision for %s: adopt=%s (relative per-order: %s)",
+            getattr(challenger, "submission_id", "?"), adopt, verdict["reason"],
         )
-        logger.info("adoption decision for %s: adopt=%s (%s)",
-                    getattr(challenger, "submission_id", "?"), adopt, reason)
-
-        # SHADOW (observe-only) relative per-order adoption. Compute the NEW
-        # rule's verdict beside the live one, log whether they AGREE, and publish
-        # it on /health — changing NOTHING unless relative_scoring_active() flips
-        # the relative verdict authoritative. Never raises into the live path.
-        from minotaur_subnet.epoch.relative_scoring import (
-            relative_scoring_active,
-            relative_scoring_shadow_enabled,
-        )
-        if relative_scoring_shadow_enabled():
-            shadow = self._evaluate_shadow_per_order(challenger, live_adopt=adopt)
-            if (
-                shadow is not None
-                and shadow.get("scenarios_compared", 0) > 0
-                and relative_scoring_active()
-            ):
-                logger.warning(
-                    "[shadow-per-order-adoption] RELATIVE_SCORING_ENABLED is ON — "
-                    "relative verdict %s OVERRIDES live verdict %s for %s",
-                    "ADOPT" if shadow["adopt"] else "REJECT",
-                    "ADOPT" if adopt else "REJECT",
-                    getattr(challenger, "submission_id", "?"),
-                )
-                return bool(shadow["adopt"])
         return adopt
 
     @staticmethod
@@ -1140,18 +1121,22 @@ class EpochManager:
         rows = details.get("per_intent") if isinstance(details, dict) else None
         return rows if isinstance(rows, list) else []
 
-    def _evaluate_shadow_per_order(
-        self, challenger: Submission, *, live_adopt: bool,
+    def _evaluate_per_order_adoption(
+        self, challenger: Submission,
     ) -> dict[str, Any] | None:
-        """Observe-only relative per-order adoption shadow (RELATIVE_SCORING_SHADOW).
+        """Relative per-order adoption verdict — the SOLE adoption decision.
 
-        Joins the freshly re-benched incumbent's and the challenger's per-order
-        RAW shadow outputs (``benchmark_details.per_intent[*].shadow_score``) via
-        the pure :func:`evaluate_relative_adoption`, logs the relative verdict +
-        whether it AGREES with the live aggregate decision, and publishes it on
-        ``/health`` (``ctx.last_shadow_per_order_vote``). Returns the verdict dict
-        (or None on error). Has NO effect on the live decision — the caller only
-        consults it when ``relative_scoring_active()`` is separately ON.
+        Joins the freshly re-benched incumbent's and the challenger's per-order RAW
+        delivered outputs (``benchmark_details.per_intent[*].shadow_score``, sourced
+        from the LIVE raw-output scorer's ``metadata.raw_output``) via the pure
+        :func:`evaluate_relative_adoption`, logs the verdict, and publishes it on
+        ``/health`` (``ctx.last_shadow_per_order_vote`` — field name kept to avoid
+        rippling the health surface). Returns the verdict dict, or ``None`` on error
+        so the caller ABSTAINS (never adopts on uncertainty).
+
+        Relies on ``_refresh_incumbent_score`` having persisted the champion's FRESH
+        same-round per_intent back to its submission record (display-path fix), so
+        ``champ_rows`` is the same-round reference the challenger was scored against.
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
@@ -1167,15 +1152,11 @@ class EpochManager:
             chal_rows = self._per_intent(challenger)
             verdict = evaluate_relative_adoption(champ_rows, chal_rows)
 
-            agrees = bool(verdict["adopt"]) == bool(live_adopt)
             logger.info(
-                "[shadow-per-order-adoption] challenger=%s relative=%s live=%s "
-                "agree=%s wins=%d regressions=%d blind_spots=%d matched=%d "
-                "compared=%d: %s",
+                "[per-order-adoption] challenger=%s verdict=%s wins=%d regressions=%d "
+                "blind_spots=%d matched=%d compared=%d: %s",
                 getattr(challenger, "submission_id", "?"),
                 "ADOPT" if verdict["adopt"] else "REJECT",
-                "ADOPT" if live_adopt else "REJECT",
-                agrees,
                 verdict["n_wins"], verdict["n_regressions"],
                 verdict["n_blind_spots"], verdict["n_matched"],
                 verdict["scenarios_compared"], verdict["reason"],
@@ -1183,9 +1164,7 @@ class EpochManager:
 
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
-                "relative_vote": "ADOPT" if verdict["adopt"] else "REJECT",
-                "live_vote": "ADOPT" if live_adopt else "REJECT",
-                "agree": agrees,
+                "vote": "ADOPT" if verdict["adopt"] else "REJECT",
                 "n_wins": verdict["n_wins"],
                 "n_regressions": verdict["n_regressions"],
                 "n_blind_spots": verdict["n_blind_spots"],
@@ -1197,11 +1176,11 @@ class EpochManager:
             try:
                 from minotaur_subnet.api.server_context import ctx
                 ctx.last_shadow_per_order_vote = dict(vote)
-            except Exception:  # observe-only — publishing must never break adoption
+            except Exception:  # publishing must never break adoption
                 pass
             return verdict
-        except Exception as exc:  # observe-only — must never break the live decision
-            logger.warning("[shadow-per-order-adoption] failed (ignored): %s", exc)
+        except Exception as exc:  # must never crash the decision — abstain instead
+            logger.warning("[per-order-adoption] failed (ignored): %s", exc)
             return None
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:

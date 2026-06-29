@@ -273,11 +273,6 @@ class BenchmarkWorker:
         # (the shared BlockLoop engine already hot-reloads this way; this worker
         # keeps its own engine, so it needs the same hash-diff).
         self._loaded_js_hashes: dict[str, str] = {}
-        # app_id -> sha256(shadow_js_code)[:16] loaded under the composite
-        # "<app_id>:shadow" engine key. Tracked SEPARATELY from _loaded_js_hashes
-        # so a shadow-JS update never triggers a live reload (and vice-versa).
-        # SHADOW/observe-only path — see epoch/relative_scoring.py.
-        self._loaded_shadow_js_hashes: dict[str, str] = {}
 
     def _corpus_fingerprint(self, intents: list) -> str:
         """Stable hash of the corpus IDENTITY (ordered scenario labels), using the
@@ -924,44 +919,6 @@ class BenchmarkWorker:
                     intent_def.app_id, old, js_hash,
                 )
 
-        # SHADOW (observe-only): when relative-scoring shadow is enabled AND an
-        # app ships shadow_js_code, ALSO load it under the composite engine key
-        # "<app_id>:shadow" (the engine's _intents dict is arbitrary-string-keyed)
-        # so the same (plan, sim, state) can be scored by the raw-output shadow
-        # scorer alongside the live one. Tracked via _loaded_shadow_js_hashes so a
-        # shadow update never reloads the live JS. Manifest/scenario expansion uses
-        # the bare app_id key ONLY, so the shadow load never expands the corpus.
-        from minotaur_subnet.epoch.relative_scoring import (
-            relative_scoring_shadow_enabled,
-        )
-
-        shadow_app_ids: set[str] = set()
-        if relative_scoring_shadow_enabled():
-            for intent_def, _, _ in intents:
-                shadow_js = getattr(intent_def, "shadow_js_code", None)
-                if not shadow_js or len(shadow_js.strip()) < 20:
-                    continue
-                shadow_key = f"{intent_def.app_id}:shadow"
-                shadow_hash = hashlib.sha256(shadow_js.encode()).hexdigest()[:16]
-                if self._loaded_shadow_js_hashes.get(intent_def.app_id) != shadow_hash:
-                    try:
-                        await engine.load_intent(shadow_key, shadow_js)
-                        old_sh = self._loaded_shadow_js_hashes.get(intent_def.app_id)
-                        self._loaded_shadow_js_hashes[intent_def.app_id] = shadow_hash
-                        if old_sh is not None:
-                            logger.info(
-                                "[benchmark][shadow] hot-reloaded shadow JS for app %s "
-                                "(hash %s -> %s)",
-                                intent_def.app_id, old_sh, shadow_hash,
-                            )
-                    except Exception as exc:  # observe-only — never block live scoring
-                        logger.warning(
-                            "[benchmark][shadow] failed to load shadow JS for app %s "
-                            "(ignored): %s", intent_def.app_id, exc,
-                        )
-                        continue
-                shadow_app_ids.add(intent_def.app_id)
-
         async def score_fn(
             app_id: str,
             plan: ExecutionPlan,
@@ -969,30 +926,23 @@ class BenchmarkWorker:
             state: IntentState,
         ) -> ScoreResult:
             result = await engine.score(app_id, plan, simulation, state)
-            # SHADOW (observe-only): score the SAME inputs with the raw-output
-            # shadow JS and stash the raw delivered output on the result so the
-            # orchestrator can copy it onto BenchmarkResult.shadow_score. The
-            # engine clamps `score` to [0,1], so read the unclamped raw value from
-            # metadata.raw_output. The live `result.score` is untouched.
-            if app_id in shadow_app_ids:
-                try:
-                    shadow = await engine.score(
-                        f"{app_id}:shadow", plan, simulation, state,
-                    )
-                    # raw_output is an EXACT DECIMAL WEI STRING from the shadow JS
-                    # (BigInt -> .toString()). Store it verbatim — no float()
-                    # conversion, which would reintroduce IEEE-754 precision loss
-                    # above 2^53. _results_to_details copies this string straight
-                    # into per_intent, and the relative rule parses it with int().
-                    raw = (shadow.metadata or {}).get("raw_output")
-                    result.shadow_score = (
-                        str(raw) if (raw is not None and str(raw) != "") else None
-                    )
-                except Exception as exc:  # observe-only — never break live scoring
-                    logger.warning(
-                        "[benchmark][shadow] shadow score failed for %s (ignored): %s",
-                        app_id, exc,
-                    )
+            # Relative per-order scoring source: the RAW delivered output now comes
+            # from the LIVE scorer's own result metadata (metadata.raw_output), set
+            # by the raw-output scorer an operator PUTs into the LIVE js_code slot at
+            # cutover (PUT /apps/{id}/scoring). (Previously this was a SEPARATE shadow
+            # slot dual-loaded under "<app_id>:shadow"; that slot is gone — we read
+            # the live slot directly.) The engine clamps `score` to [0,1], so the
+            # authoritative unclamped value is metadata.raw_output: an EXACT DECIMAL
+            # WEI STRING (BigInt -> .toString()) stored VERBATIM — no float(), which
+            # would reintroduce IEEE-754 precision loss above 2^53. The orchestrator
+            # copies result.shadow_score onto BenchmarkResult.shadow_score and
+            # _results_to_details into per_intent[*].shadow_score; the relative rule
+            # parses it with int(). None/"" when the live scorer emits no raw_output
+            # (e.g. the pre-cutover quote-anchored scorer) -> no per-order signal.
+            raw = (result.metadata or {}).get("raw_output")
+            result.shadow_score = (
+                str(raw) if (raw is not None and str(raw) != "") else None
+            )
             return result
 
         return score_fn
@@ -1977,10 +1927,12 @@ class BenchmarkWorker:
                     "plan_score": r.plan_score,
                     "trigger_score": r.trigger_score,
                     "on_chain_score": getattr(r, "on_chain_score", None),
-                    # SHADOW (observe-only): raw delivered output from the
-                    # parallel shadow JS run; None when shadow scoring is off /
-                    # no shadow_js_code. Carries the per-order signal the relative
-                    # rule consumes; never read by the live adoption gate.
+                    # RAW delivered output from the LIVE raw-output scorer's
+                    # metadata.raw_output (see _build_score_fn); an EXACT DECIMAL WEI
+                    # STRING, or None when the live scorer emits no raw_output. This
+                    # is the per-order signal the relative adoption rule consumes
+                    # (field name kept as shadow_score to avoid rippling the API
+                    # counts shape). Never feeds the legacy aggregate `score`.
                     "shadow_score": getattr(r, "shadow_score", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
