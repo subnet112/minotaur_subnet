@@ -1062,7 +1062,7 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
             _build_champion_approval_from_payload(approval, proposal=proposal)
             for approval in body.approvals
         ]
-        if consensus_manager is not None:
+        if consensus_manager is not None and not body.force:
             invalid = [
                 approval.validator_id
                 for approval in approvals
@@ -1073,6 +1073,21 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                     status_code=409,
                     detail=f"Invalid champion approvals from validators: {sorted(invalid)}",
                 )
+        elif body.force:
+            # Operator force-sync (emergency reattach): bypass per-approval signature
+            # verification. Re-installing a STANDING champion from an OLD round means the
+            # follower cannot perfectly reconstruct the leader's signed proposal (it does
+            # not carry every signed field), so the digest — and the recovered signer —
+            # diverge even on a legitimate cert. Trust here rests on the internal-key auth
+            # (only the leader/operator can broadcast this) + the quorum<=1 leader being
+            # the sole on-chain authority. Logged loudly for audit. NEVER reached off the
+            # force path (force defaults False), so the normal dethrone flow still fully
+            # verifies signatures.
+            logger.warning(
+                "[force-sync] round %s: BYPASSING per-approval signature verification "
+                "for %d approval(s) (operator force-adopt of the standing champion).",
+                body.round_id, len(approvals),
+            )
         if quorum_required > 0 and len(approvals) < quorum_required:
             raise HTTPException(
                 status_code=409,
