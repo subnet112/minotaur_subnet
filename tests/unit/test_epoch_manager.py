@@ -887,6 +887,9 @@ class TestEpochManager:
             runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
         )
         mgr.set_leader_check(lambda: False)  # this node is a FOLLOWER
+        # The follower self-adopts only a champion IT independently verified
+        # (candidate-bound provenance) — mark this round's candidate as self-verified.
+        round_store.mark_self_verified(current_round.round_id, "sub_certified")
 
         result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
 
@@ -896,6 +899,59 @@ class TestEpochManager:
         # active champion set → the daemon (#332) emits the matching champion weights
         assert round_store.get_active_champion().submission_id == "sub_certified"
         assert round_store.get_round(current_round.round_id).status == RoundStatus.ACTIVATED
+
+    @pytest.mark.asyncio
+    async def test_follower_refuses_when_leader_merge_failed(self):
+        """FIX #4: a follower must NOT weight a champion the leader REFUSED to finalize
+        (leader_champion_changed=False) even when it verified the image — but it MUST
+        still advance (open the next round), never stranded in CERTIFIED."""
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=lambda *a, **k: True,
+        )
+        mgr.set_leader_check(lambda: False)  # FOLLOWER
+        round_store.mark_self_verified(current_round.round_id, "sub_certified")
+
+        result = await mgr.activate_certified_round(
+            current_round.round_id, epoch=6, leader_champion_changed=False,
+        )
+
+        assert result.get("champion_changed") is not True          # NOT adopted
+        assert result["abort_reason"] == "leader_merge_failed"
+        assert result.get("next_round_id")                          # advanced — not stranded
+        assert not round_store.get_active_champion().submission_id   # burn-to-owner
+
+    @pytest.mark.asyncio
+    async def test_follower_reset_unadopts_submission_store_durably(self):
+        """FIX #2: reverting a follower self-adopt must un-adopt in the SUBMISSION store
+        too, else _sync_round_incumbent_from_submission_store / boot resurrect it."""
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=lambda *a, **k: True,
+        )
+        mgr.set_leader_check(lambda: False)  # FOLLOWER
+        round_store.mark_self_verified(current_round.round_id, "sub_certified")
+        await mgr.activate_certified_round(current_round.round_id, epoch=6)
+        assert store.get_champion() is not None  # adopted in the submission store
+
+        mgr._reset_self_adopted_champion_to_burn()
+
+        # Durably reverted across ALL three resurrection sources:
+        assert store.get_champion() is None                          # submission store
+        assert not round_store.get_active_champion().submission_id   # round store
+        assert not mgr.champion.submission_id                        # in-memory
 
     @pytest.mark.asyncio
     async def test_leader_runs_merge_gate_and_refuses_on_failure(self):

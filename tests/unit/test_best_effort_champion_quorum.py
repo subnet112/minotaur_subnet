@@ -25,6 +25,10 @@ from minotaur_subnet.api.routes.submissions.champion_consensus import (  # noqa:
 )
 from minotaur_subnet.epoch.manager import _follower_weight_adopt_enabled  # noqa: E402
 from minotaur_subnet.harness.round_store import RoundState, RoundStore  # noqa: E402
+from minotaur_subnet.api.routes.submissions.round_manager import (  # noqa: E402
+    _activate_round_sync_payload,
+)
+from minotaur_subnet.api.routes.submissions.models import ActivateRoundRequest  # noqa: E402
 
 
 # ── leader monitor gate ─────────────────────────────────────────────────────
@@ -186,6 +190,28 @@ def test_round_state_self_verified_roundtrips():
     blank = RoundState.from_dict(RoundState(round_id="r2").to_dict())
     assert blank.self_verified is False
     assert blank.self_verified_submission_id is None
+
+
+# ── #4 champion_changed plumbing (follower refuses a leader-rejected champion) ──
+
+def test_activate_sync_payload_carries_champion_changed():
+    body = ActivateRoundRequest(round_id="r", activation_epoch=5)
+    # explicit leader outcome is carried (True adopts, False => follower refuses)
+    assert _activate_round_sync_payload(body, True)["champion_changed"] is True
+    assert _activate_round_sync_payload(body, False)["champion_changed"] is False
+    # None + body has none => field OMITTED (old-follower-safe; never strands)
+    assert "champion_changed" not in _activate_round_sync_payload(body, None)
+    # falls back to the body value when not supplied explicitly
+    body2 = ActivateRoundRequest(round_id="r", activation_epoch=5, champion_changed=False)
+    assert _activate_round_sync_payload(body2)["champion_changed"] is False
+
+
+def test_activate_round_request_parses_champion_changed():
+    # absent => None (mixed-version: follower keeps legacy adopt, never stranded)
+    assert ActivateRoundRequest(round_id="r", activation_epoch=1).champion_changed is None
+    assert ActivateRoundRequest(
+        round_id="r", activation_epoch=1, champion_changed=False,
+    ).champion_changed is False
 
 
 def test_mark_self_verified_binds_candidate_and_persists(tmp_path):

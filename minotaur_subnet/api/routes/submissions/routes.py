@@ -1274,7 +1274,9 @@ async def activate_solver_round(
         raise HTTPException(status_code=409, detail=str(exc))
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/activate",
-        _activate_round_sync_payload(body),
+        # Carry the leader's own adopt outcome so followers refuse to weight a champion
+        # the leader's merge-gate rejected (parity with the autonomous coordinator path).
+        _activate_round_sync_payload(body, result.get("champion_changed")),
     )
     return result
 

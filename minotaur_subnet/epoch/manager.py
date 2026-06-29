@@ -508,7 +508,9 @@ class EpochManager:
         self._notify_champion_finalist(finalist, "selected as finalist")
         return result
 
-    async def activate_certified_round(self, round_id: str, *, epoch: int) -> dict[str, Any]:
+    async def activate_certified_round(
+        self, round_id: str, *, epoch: int, leader_champion_changed: bool | None = None,
+    ) -> dict[str, Any]:
         """Activate a previously certified round finalist."""
         if self._round_store is None:
             raise ValueError("round_store is required for certified activation")
@@ -668,23 +670,30 @@ class EpochManager:
                 == certificate.candidate_submission_id
             )
             _real = is_real_miner_hotkey(getattr(submission, "hotkey", "") or "")
-            if not (_follower_weight_adopt_enabled() and _self_verified and _real):
+            # The leader signals whether IT finalized (champion_changed). On an EXPLICIT
+            # False (leader merge_failed / refused to finalize), the follower must NOT
+            # weight a champion the leader rejected (no on-chain provenance) — refuse +
+            # advance. None = absent field (old leader): preserve legacy adopt logic so a
+            # new follower against an old leader is never stranded (mixed-version bridge).
+            _leader_refused = leader_champion_changed is False
+            if _leader_refused or not (_follower_weight_adopt_enabled() and _self_verified and _real):
+                _reason = "leader_merge_failed" if _leader_refused else "follower_adopt_gated"
                 logger.info(
                     "[follower-adopt] round %s: NOT self-adopting champion %s "
-                    "(opt_in=%s self_verified=%s real_hotkey=%s) — champion/weights "
-                    "unchanged (burn-to-owner).",
-                    round_id, certificate.candidate_submission_id,
+                    "(reason=%s opt_in=%s self_verified=%s real_hotkey=%s leader_changed=%s) "
+                    "— champion/weights unchanged (burn-to-owner).",
+                    round_id, certificate.candidate_submission_id, _reason,
                     _follower_weight_adopt_enabled(), _self_verified, _real,
+                    leader_champion_changed,
                 )
-                # Rollback: if a PRIOR self-adopt left a real champion-of-record and we
-                # are now NOT adopting (flag flipped off / no longer verified), clear it
-                # so the daemon reverts to burn rather than weighting a stale champion.
+                # Rollback: if a PRIOR self-adopt left a real champion-of-record and we are
+                # now NOT adopting (flag off / not verified / leader refused), durably
+                # revert so the daemon burns rather than weighting a stale/rejected champion.
                 self._reset_self_adopted_champion_to_burn()
                 next_round = self._complete_round(
-                    round_state, epoch, activated=False,
-                    abort_reason="follower_adopt_gated",
+                    round_state, epoch, activated=False, abort_reason=_reason,
                 )
-                result["abort_reason"] = "follower_adopt_gated"
+                result["abort_reason"] = _reason
                 if next_round is not None:
                     result["next_round_id"] = next_round.round_id
                 return result
@@ -715,23 +724,44 @@ class EpochManager:
         return result
 
     def _reset_self_adopted_champion_to_burn(self) -> None:
-        """Follower rollback: if a prior self-adopt left a real-miner champion-of-record,
-        clear it (empty/genesis snapshot) so the daemon's is_real_miner_hotkey check
-        fails and weights revert to 100% burn-to-owner. No-op when nothing real is
-        recorded. Only ever called on the follower-gated path (never the leader), so it
-        cannot clear a leader's legitimately-adopted champion. Best-effort; never raises."""
+        """Follower rollback: DURABLY revert a prior self-adopt back to 100% burn-to-owner.
+
+        ⚠️ MUST only be called from the ``not _definite_leader`` branch of
+        activate_certified_round — it has NO internal leader guard, so a stray caller
+        could un-adopt a LEADER's legitimate champion. The champion has THREE resurrection
+        sources that must all be closed or the next API touch / boot / same-call
+        open_next_round silently brings it back: (1) round_store._active_champion (the
+        daemon reads this), (2) the submission store's ADOPTED champion (the reconcile +
+        boot + _get_incumbent_snapshot fallback re-derive from it), (3) the in-memory
+        self._champion (the same-call _get_incumbent_snapshot / weights fallback). Clear
+        all three. Best-effort; never raises into activation."""
         try:
-            if self._round_store is None:
-                return
-            current = self._round_store.get_active_champion()
-            if current is not None and is_real_miner_hotkey(getattr(current, "hotkey", "") or ""):
-                self._round_store.set_active_champion(ChampionSnapshot(), sync_open_round=False)
-                logger.info(
-                    "[follower-adopt] reset self-adopted champion-of-record to "
-                    "burn-to-owner (opted out / no longer verified).",
-                )
+            # (1) round-store active champion — immediate effect (daemon reads this).
+            if self._round_store is not None:
+                current = self._round_store.get_active_champion()
+                if current is not None and is_real_miner_hotkey(getattr(current, "hotkey", "") or ""):
+                    self._round_store.set_active_champion(ChampionSnapshot(), sync_open_round=False)
+            # (2) DURABLE: un-adopt in the submission store so the route-driven reconcile,
+            # boot restore, and the same-call open_next_round fallback cannot resurrect it.
+            # Flip ADOPTED→SCORED — the exact pre-adopt state adopt() restores a displaced
+            # champion to; @_write_locked + _persist => survives restart + visible to the daemon.
+            if self._sub_store is not None:
+                champ = self._sub_store.get_champion()
+                if champ is not None and is_real_miner_hotkey(getattr(champ, "hotkey", "") or ""):
+                    self._sub_store.update_status(champ.submission_id, SubmissionStatus.SCORED)
+            # (3) in-memory ChampionInfo — closes the same-call _get_incumbent_snapshot /
+            # _build_weights_mapping fallback that would otherwise re-seed the next round.
+            self._champion = ChampionInfo()
+            logger.info(
+                "[follower-adopt] reverted self-adopted champion to burn-to-owner "
+                "(round-store + submission-store + in-memory) — opted out / leader refused / "
+                "no longer verified.",
+            )
         except Exception as exc:  # best-effort — must never break activation
-            logger.warning("[follower-adopt] champion reset failed: %s", exc)
+            # A swallowed failure here resurrects the champion (the original bug) — log LOUD.
+            logger.error(
+                "[follower-adopt] revert-to-burn FAILED — champion may resurrect: %s", exc,
+            )
 
     def set_leader_check(self, is_leader: Any) -> None:
         """Wire the leader predicate (callable → bool). When set, only the leader
