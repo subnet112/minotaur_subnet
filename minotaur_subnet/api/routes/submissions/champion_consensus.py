@@ -1030,6 +1030,16 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
         benchmark_pack_hash=body.benchmark_pack_hash,
         shadow_case_log_hash=body.shadow_case_log_hash,
         effective_epoch=body.effective_epoch,
+        # v2 EIP-712 digest fields from the leader's SIGNED payload. A follower
+        # verifying the leader's approval must rebuild the proposal with the
+        # leader's nonce/deadline/commit_hash — otherwise it stamps its own
+        # wall-clock, the digest diverges, and the signature recovers a wrong
+        # address ("Invalid champion approvals"). `or None`: the leader's OWN cert
+        # call carries the unset default (0) so the builder computes its own nonce,
+        # leaving the leader's signing path unchanged (nonce is wall-clock-ms, never 0).
+        commit_hash_override=body.commit_hash,
+        nonce_override=body.nonce or None,
+        deadline_override=body.deadline or None,
     )
     quorum_required = body.quorum_required or default_quorum
     consensus_manager = get_champion_consensus_manager()

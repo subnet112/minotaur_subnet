@@ -25,6 +25,17 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Serialize publishes PER REF so two overlapping builds can't race the shared
+# floating tag (:latest on develop, :stable on main). Without this, the
+# later-FINISHING build wins the tag — which can be an OLDER commit if an earlier
+# build runs long. cancel-in-progress cancels an in-flight build when a newer push
+# to the same ref arrives, so only the latest commit's image ever lands on the tag.
+# Per-ref group (main / develop / each v-tag isolated) so they never cancel across
+# release lines.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   # Hyphen, not the underscored repo name — GHCR auto-link to the
