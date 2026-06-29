@@ -222,6 +222,13 @@ class RoundState:
     certificate: ChampionCertificate | None = None
     effective_epoch: int | None = None
     abort_reason: str | None = None
+    # Set True ONLY when THIS node independently re-benchmarked the round's
+    # candidate and its own verdict agreed (the reactive-benchmark APPROVE path),
+    # never on a blind-sign or builtin. Persisted so it survives the sign→activate
+    # gap. Read at activate time to gate follower self-adoption of champion weights
+    # (FOLLOWER_CHAMPION_WEIGHT_ADOPT) — a follower must only weight a champion it
+    # itself verified. See epoch/manager.activate_certified_round.
+    self_verified: bool = False
 
     def accepting_submissions(self) -> bool:
         return self.status == RoundStatus.OPEN
@@ -260,6 +267,7 @@ class RoundState:
             "certificate": self.certificate.to_dict() if self.certificate else None,
             "effective_epoch": self.effective_epoch,
             "abort_reason": self.abort_reason,
+            "self_verified": self.self_verified,
         }
 
     @classmethod
@@ -290,6 +298,7 @@ class RoundState:
             certificate=ChampionCertificate.from_dict(raw.get("certificate")),
             effective_epoch=raw.get("effective_epoch"),
             abort_reason=raw.get("abort_reason"),
+            self_verified=bool(raw.get("self_verified")),
         )
 
 
@@ -609,6 +618,20 @@ class RoundStore:
         state.updated_at = time.time()
         self._persist()
         self._record(state)
+        return copy.deepcopy(state)
+
+    def mark_self_verified(self, round_id: str) -> RoundState:
+        """Record that THIS node independently re-benchmarked the round's candidate
+        and its OWN verdict agreed (the reactive-benchmark APPROVE path — never a
+        blind-sign or builtin). Persisted so it survives the sign→activate gap; read
+        at activate time to gate follower self-adoption of champion weights. Idempotent."""
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.self_verified = True
+        state.updated_at = time.time()
+        self._persist()
         return copy.deepcopy(state)
 
     def _get_current_round_ref(self) -> RoundState | None:

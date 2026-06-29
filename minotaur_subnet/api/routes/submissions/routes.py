@@ -1200,6 +1200,15 @@ async def solver_round_consensus_proposal(
                     ),
                     "reason_code": RejectionCode.BENCHMARK_MISMATCH.value,
                 }
+            # This node INDEPENDENTLY re-benchmarked the candidate and its own verdict
+            # AGREED — record provenance (persisted) so the follower's activate-time
+            # gate knows it may self-adopt the champion for weights. Set ONLY here:
+            # never on the blind-sign branch (_can_benchmark False) and never for
+            # builtin. Best-effort — must never fail the approval.
+            try:
+                get_round_store().mark_self_verified(round_state.round_id)
+            except Exception:
+                pass
         except Exception as exc:
             logger.exception(
                 "Reactive benchmark failed for %s: %s",
