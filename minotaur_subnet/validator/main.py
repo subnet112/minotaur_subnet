@@ -1671,6 +1671,19 @@ def main() -> None:
     round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
     if not round_store_path and store_path is not None:
         round_store_path = str(store_path.parent / "solver_rounds.json")
+    if not round_store_path:
+        # A FOLLOWER's validator may not pass --store-path, leaving the champion source
+        # UNSET → _champion_round_store is None → the weight emitter's burn-fallback finds
+        # no champion → 100% burn even AFTER the API adopts (the live symptom: emit
+        # source=burn_fallback, uids_attempted=1). Fall back to the API's mounted volume
+        # (the /data the API persists solver_rounds.json to under #430) so the burn-fallback
+        # reads the SAME champion the API wrote (get_active_champion re-reads on mtime, so it
+        # picks up adoption live). is_dir() guards a node with no shared volume → stays unset,
+        # prior behavior, no regression.
+        _app = os.environ.get("APP_INTENTS_STORE_PATH", "").strip()
+        _data_dir = Path(_app).parent if _app else Path("/data")
+        if _data_dir.is_dir():
+            round_store_path = str(_data_dir / "solver_rounds.json")
 
     contract_address = os.environ.get("SWAP_APP_ADDRESS", "") or os.environ.get("APP_INTENT_BASE_31337", "")
     if not contract_address:
