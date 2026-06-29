@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 
@@ -76,16 +76,29 @@ class ValidatorAppCatalogSync:
     def __init__(
         self,
         store: AppIntentStore,
-        leader_url: str,
+        leader_url: "str | Callable[[], str | None]",
         poll_interval: float = 60.0,
         request_timeout: float = 15.0,
+        is_follower: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
-        self.leader_url = leader_url.rstrip("/")
+        # ``leader_url`` may be a fixed string (validator process: LEADER_API_URL set)
+        # OR a resolver callable (API process: resolves the CURRENT leader from the
+        # metagraph each tick, so a leadership change is picked up without a restart).
+        # ``is_follower`` gates the API usage OFF on the leader, which owns the catalog
+        # natively and must never self-sync.
+        self._leader_src = leader_url
+        self._is_follower = is_follower
         self.poll_interval = poll_interval
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
         self._stopped = False
         self._task: asyncio.Task | None = None
+
+    def _resolve_leader_url(self) -> str | None:
+        """Resolve the current leader URL (fixed string or resolver callable)."""
+        src = self._leader_src
+        url = src() if callable(src) else src
+        return url.rstrip("/") if url else None
 
     async def start(self) -> None:
         """Run an initial sync, then start the background poll loop."""
@@ -93,8 +106,7 @@ class ValidatorAppCatalogSync:
             await self.sync_once()
         except Exception as exc:
             logger.warning(
-                "Initial catalog sync from %s failed: %s (will retry on tick)",
-                self.leader_url, exc,
+                "Initial app catalog sync failed: %s (will retry on tick)", exc,
             )
         self._task = asyncio.create_task(self._run_loop())
 
@@ -121,7 +133,14 @@ class ValidatorAppCatalogSync:
 
     async def sync_once(self) -> tuple[int, int]:
         """Pull the catalog and upsert changes. Returns (apps_updated, deployments_updated)."""
-        list_url = f"{self.leader_url}/v1/apps/"
+        # Gate (API usage): the leader owns the catalog natively — never self-sync.
+        if self._is_follower is not None and not self._is_follower():
+            return (0, 0)
+        leader_url = self._resolve_leader_url()
+        if not leader_url:
+            # Leader not resolvable yet (e.g. metagraph not synced) — retry next tick.
+            return (0, 0)
+        list_url = f"{leader_url}/v1/apps/"
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
             async with session.get(list_url) as resp:
                 if resp.status != 200:
@@ -137,7 +156,7 @@ class ValidatorAppCatalogSync:
                 app_id = app_summary.get("app_id")
                 if not app_id:
                     continue
-                status_url = f"{self.leader_url}/v1/apps/{app_id}/status"
+                status_url = f"{leader_url}/v1/apps/{app_id}/status"
                 try:
                     async with session.get(status_url) as resp:
                         if resp.status != 200:
@@ -158,7 +177,7 @@ class ValidatorAppCatalogSync:
         if apps_updated or deployments_updated:
             logger.info(
                 "App catalog sync: %d app(s) + %d deployment(s) updated from %s",
-                apps_updated, deployments_updated, self.leader_url,
+                apps_updated, deployments_updated, leader_url,
             )
         return apps_updated, deployments_updated
 
