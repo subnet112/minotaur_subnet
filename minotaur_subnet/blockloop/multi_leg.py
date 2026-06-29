@@ -74,6 +74,11 @@ class MultiLegOrchestrator:
         from minotaur_subnet.shared.types import MultiLegPlan, LegPlan, ExecutionPlan
 
         completed_legs: list[LegPlan] = []
+        # Best on-chain delivered-quality BPS seen across legs — recorded into
+        # app stats at the end (post relative-cutover stats are BPS, not 0..1).
+        # The per-leg ``score`` passed to consensus/relayer below is the JS-style
+        # value and is intentionally left unchanged (out of this PR's scope).
+        best_leg_oc: int | None = None
 
         for leg in multi_leg_plan.forward_legs:
             leg_label = f"leg {leg.leg_index} (chain {leg.chain_id})"
@@ -228,6 +233,11 @@ class MultiLegOrchestrator:
                 simulation = build_mock_simulation(leg_plan, order.params)
                 logger.debug("[MULTI-LEG] %s: %s using mock simulation", order.order_id, leg_label)
 
+            # Carry the best on-chain BPS for the stats recording at the end.
+            _leg_oc = getattr(simulation, "on_chain_score", None)
+            if _leg_oc is not None and (best_leg_oc is None or _leg_oc > best_leg_oc):
+                best_leg_oc = _leg_oc
+
             # Score via JS engine
             app = self.app_store.get_app(order.app_id)
             state = IntentState(
@@ -338,7 +348,11 @@ class MultiLegOrchestrator:
             tx_hash=submit_result.tx_hash if completed_legs else None,
         )
         self._sync(order.order_id)
-        self.app_store.record_execution(order.app_id, 0.6, success=True)
+        # Record the on-chain delivered-quality BPS (0..10000), not a 0..1 score.
+        # Multi-leg/bridge sims may not produce an on-chain score; fall back to 0.
+        self.app_store.record_execution(
+            order.app_id, best_leg_oc if best_leg_oc is not None else 0, success=True,
+        )
         return True
 
     async def _execute_rollback(

@@ -21,6 +21,11 @@ def monitor_app(
     Returns the best recent scores, recent execution history, and
     per-solver performance statistics.
 
+    Post relative-cutover the underlying ``record_execution`` stores the
+    on-chain scoreIntent BPS (0..10000, delivered quality), so ``best_scores``
+    and ``avg_score`` here are in BPS — NOT the saturated JS 0..1 sentinel that
+    would otherwise pin every stat at ≈1.0.
+
     Args:
         app_id: The app to monitor.
 

@@ -933,7 +933,15 @@ class AppIntentStore:
     def record_execution(
         self, app_id: str, score: float, success: bool
     ) -> None:
-        """Record an execution event for statistics."""
+        """Record an execution event for statistics.
+
+        Post relative-cutover, callers (the block loop) pass the on-chain
+        scoreIntent BPS (0..10000) here — the delivered-quality signal — NOT the
+        legacy JS 0..1 score (which is now a validity sentinel). So ``avg_score``
+        / ``best_score`` / ``recent_scores`` exposed by ``get_stats`` are in BPS
+        units. The store is unit-agnostic — it records whatever it's given — so
+        this stays a pure storage method.
+        """
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:

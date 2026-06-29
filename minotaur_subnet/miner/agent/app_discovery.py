@@ -133,15 +133,21 @@ class AppDiscovery:
                         logger.warning("GET %s returned %d", url, resp.status)
                         return {}
                     data = await resp.json()
-                    # Normalize to the format ScoreTracker expects
+                    # Normalize to the format ScoreTracker expects. Post-cutover
+                    # avg_score/best_score are on-chain BPS (delivered quality) and
+                    # champion_score is null (the champion is the relative baseline);
+                    # the authoritative per-submission signal is the relative COUNTS
+                    # the loop reads off the submission-status report. ``scoring_mode``
+                    # tells the tracker the API is in relative mode.
                     return {
                         "total_executions": data.get("execution_count", 0),
                         "avg_score": data.get("avg_score", 0.0),
                         "best_score": data.get("best_score", 0.0),
                         "recent_scores": data.get("recent_scores", []),
                         "quote_stats": data.get("quote_stats", {}),
-                        "champion_score": data.get("champion_score", 0.0),
+                        "champion_score": data.get("champion_score") or 0.0,
                         "scenario_scores": data.get("scenario_scores", {}),
+                        "scoring_mode": data.get("scoring_mode", ""),
                     }
         except aiohttp.ClientError as exc:
             logger.warning("Failed to fetch scores for %s: %s", app_id, exc)
