@@ -29,12 +29,40 @@ _rate_limit_buckets: dict[str, deque[float]] = {}
 _COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 
+def _default_persist_path(filename: str) -> str | None:
+    """Default a store's persistence onto a persistent volume so it survives container
+    restarts (e.g. a watchtower image recreate) WITHOUT each operator having to set an
+    env. Otherwise a follower's in-memory round/submission store is wiped on every
+    update and it can no longer adopt the standing champion — it 404s its own rounds and
+    falls back to 100% burn. Prefers the app store's configured volume
+    (``APP_INTENTS_STORE_PATH`` dir, which the leader already sets), falls back to the
+    conventional ``/data`` mount, and returns None when neither is a writable directory
+    — preserving the prior in-memory behavior on nodes with no persistent volume (no
+    regression)."""
+    from pathlib import Path
+
+    candidates = []
+    _app_store = os.environ.get("APP_INTENTS_STORE_PATH")
+    if _app_store:
+        candidates.append(Path(_app_store).parent)
+    candidates.append(Path("/data"))
+    for _dir in candidates:
+        try:
+            if _dir.is_dir() and os.access(_dir, os.W_OK):
+                return str(_dir / filename)
+        except OSError:
+            continue
+    return None
+
+
 def get_store() -> SubmissionStore:
     """Get or create the submission store singleton."""
     global _store
     if _store is None:
         from pathlib import Path
-        persist_path = os.environ.get("SUBMISSION_STORE_PATH")
+        persist_path = os.environ.get("SUBMISSION_STORE_PATH") or _default_persist_path(
+            "submissions.json"
+        )
         _store = SubmissionStore(
             persist_path=Path(persist_path) if persist_path else None,
         )
@@ -66,7 +94,9 @@ def get_round_store() -> RoundStore:
     if _round_store is None:
         from pathlib import Path
 
-        persist_path = os.environ.get("SOLVER_ROUND_STORE_PATH")
+        persist_path = os.environ.get("SOLVER_ROUND_STORE_PATH") or _default_persist_path(
+            "solver_rounds.json"
+        )
         _round_store = RoundStore(
             persist_path=Path(persist_path) if persist_path else None,
             record_sink=_round_history_sink,
