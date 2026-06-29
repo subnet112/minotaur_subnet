@@ -376,46 +376,49 @@ class OrderProcessor:
                 self.app_store.record_execution(order.app_id, 0.0, success=False)
                 return False
 
-        # Score via JS engine
+        # Score via JS engine. Post relative-cutover the JS ``score`` is a 0/1
+        # VALIDITY sentinel (1 valid / 0 invalid), NOT a quality grade. It is
+        # kept for the orderbook telemetry field and the consensus/relayer
+        # proposal (both unchanged), but it is NO LONGER a quality gate.
         score_result = await self.plan_scorer.score(
             order.app_id, app, plan, simulation, state,
         )
         score = score_result.score if score_result else 0.0
 
-        # Track best score even if below threshold
-        current_best = order.best_score or 0.0
-        new_best = max(current_best, score)
+        # On-chain scoreIntent BPS (0..10000) is the real delivered-quality
+        # signal and the authoritative accept/reject gate below. ``stat_bps`` is
+        # what we record into app stats / order best_score (delivered quality),
+        # NOT the saturated JS sentinel. A None on-chain score (contract didn't
+        # bless the plan) records 0 BPS.
+        on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
+        oc_score = simulation.on_chain_score
+        stat_bps = oc_score if oc_score is not None else 0
+
+        # Track best on-chain score for this order, even if it later rejects.
+        current_best = order.best_score or 0
+        new_best = max(current_best, stat_bps)
 
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.SCORED,
             score=score,
             best_score=new_best,
+            on_chain_score=oc_score,
         )
         self.order_persistence.sync(order.order_id)
 
-        # Check JS score threshold — per-app if configured, else global (SCR-7)
-        js_threshold = app.config.score_threshold if app.config else self.score_threshold
-        if score < js_threshold:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.REJECTED,
-                error=f"Score {score:.4f} below threshold {js_threshold}",
-            )
-            self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
-            return False
+        # JS quality-threshold gate RETIRED (relative-cutover): with the JS score
+        # now a validity sentinel, a 0..1 ``score_threshold`` comparison is dead
+        # (it would pass every valid plan). The on-chain scoreIntent gate below is
+        # the SOLE authoritative accept/reject. ``app.config.score_threshold`` is
+        # left inert. (self.score_threshold kept on the ctor for back-compat.)
 
-        # On-chain score gate — dual scoring (SCR-5, SCR-6, VAL-10)
-        on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
-        oc_score = simulation.on_chain_score
-        if oc_score is not None:
-            self.orderbook.update_order(order.order_id, on_chain_score=oc_score)
+        # On-chain score gate — authoritative accept/reject (SCR-5, SCR-6, VAL-10).
         # Fail-closed (DEFAULT ON fleet-wide): a deployed contract must yield a
         # passing on-chain score. None means scoreIntent returned valid=False (plan
         # breaks an on-chain invariant) or was unreadable — the contract did NOT
-        # bless the plan, so don't relay it on the JS score alone. Leader + follower
-        # share onchain_score_fail_closed() so they gate identically (break-glass:
+        # bless the plan, so don't relay it. Leader + follower share
+        # onchain_score_fail_closed() so they gate identically (break-glass:
         # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
             self.orderbook.update_order(
@@ -424,7 +427,7 @@ class OrderProcessor:
                 error="On-chain score unavailable — contract returned invalid or unreadable (dual-scoring fail-closed)",
             )
             self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
+            self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
         if oc_score is not None and oc_score < on_chain_threshold:
             self.orderbook.update_order(
@@ -436,7 +439,7 @@ class OrderProcessor:
                 ),
             )
             self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
+            self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
 
         # Phase 2: Consensus (with optional peer broadcast)
@@ -559,7 +562,8 @@ class OrderProcessor:
                         status=OrderStatus.OPEN,
                     )
             self.order_persistence.sync(order.order_id)
-            self._record_settlement_stats(order, score, submit_result)
+            # Record the on-chain delivered-quality BPS (not the JS sentinel).
+            self._record_settlement_stats(order, stat_bps, submit_result)
             return True
 
         # Settlement reverted. Distinguish a USER signature fault (#229) — the plan
@@ -577,11 +581,15 @@ class OrderProcessor:
             ),
         )
         self.order_persistence.sync(order.order_id)
-        self._record_settlement_stats(order, score, submit_result)
+        # Record the on-chain delivered-quality BPS (not the JS sentinel).
+        self._record_settlement_stats(order, stat_bps, submit_result)
         return False
 
     def _record_settlement_stats(self, order: Order, score: float, submit_result: Any) -> None:
         """Record execution stats for a settled order (#229 blameless miner).
+
+        ``score`` is the on-chain scoreIntent BPS (0..10000) — the delivered
+        quality the app stats now track — not the legacy JS 0..1 score.
 
         A USER signature fault at settlement is NOT debited to the solver: the plan
         passed JS scoring, on-chain sim scoring, and the validator quorum — the

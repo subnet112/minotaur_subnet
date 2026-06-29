@@ -1,9 +1,8 @@
-"""Unit tests for the SHADOW relative per-order scoring path.
+"""Unit tests for the relative per-order scoring rule (the sole adoption path).
 
-Covers the two env gates (defaults + overrides) and the pure
-``evaluate_relative_adoption`` decision across the full verdict matrix, on EXACT
-INTEGER wei (shadow_score is a decimal STRING; the verdict cross-multiplies the
-10-bps band with no float).
+Covers the pure ``evaluate_relative_adoption`` decision across the full verdict
+matrix, on EXACT INTEGER wei (shadow_score is a decimal STRING; the verdict
+cross-multiplies the 10-bps band with no float).
 """
 
 from __future__ import annotations
@@ -15,8 +14,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from types import SimpleNamespace
-
 from minotaur_subnet.epoch.relative_scoring import (
     MIN_VALID_OUTPUT,
     RELATIVE_TOL,
@@ -24,10 +21,7 @@ from minotaur_subnet.epoch.relative_scoring import (
     evaluate_relative_adoption,
     has_shadow_rows,
     relative_counts,
-    relative_counts_for_submissions,
     relative_reason,
-    relative_scoring_active,
-    relative_scoring_shadow_enabled,
 )
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
 
@@ -35,44 +29,6 @@ from minotaur_subnet.harness.orchestrator import BenchmarkResult
 def _r(intent_id: str, shadow_score):
     """A real BenchmarkResult carrying only intent_id + shadow_score (decimal str)."""
     return BenchmarkResult(intent_id=intent_id, shadow_score=shadow_score)
-
-
-# ── env gates ────────────────────────────────────────────────────────────────
-
-
-def test_shadow_gate_defaults_on(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_SHADOW", raising=False)
-    assert relative_scoring_shadow_enabled() is True
-
-
-def test_shadow_gate_off_values(monkeypatch):
-    for val in ("0", "false", "no", "off", "OFF", "False"):
-        monkeypatch.setenv("RELATIVE_SCORING_SHADOW", val)
-        assert relative_scoring_shadow_enabled() is False, val
-
-
-def test_shadow_gate_garbage_stays_on(monkeypatch):
-    # Anything that is not an explicit off-value keeps the observe-only path ON.
-    monkeypatch.setenv("RELATIVE_SCORING_SHADOW", "yes")
-    assert relative_scoring_shadow_enabled() is True
-    monkeypatch.setenv("RELATIVE_SCORING_SHADOW", "garbage")
-    assert relative_scoring_shadow_enabled() is True
-
-
-def test_active_gate_defaults_off(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
-    assert relative_scoring_active() is False
-
-
-def test_active_gate_on_values(monkeypatch):
-    for val in ("1", "true", "yes", "on", "ON", "Yes"):
-        monkeypatch.setenv("RELATIVE_SCORING_ENABLED", val)
-        assert relative_scoring_active() is True, val
-
-
-def test_active_gate_garbage_stays_off(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "maybe")
-    assert relative_scoring_active() is False
 
 
 def test_tol_bps_matches_relative_tol():
@@ -320,42 +276,6 @@ def test_counts_compared_excludes_skips():
     c = relative_counts(champ, chal)
     assert c["compared"] == 1
     assert c["verdict"] == "dethrone"
-
-
-# ── relative_counts_for_submissions (reads benchmark_details) ─────────────────
-
-
-def _sub(per_intent):
-    return SimpleNamespace(
-        submission_id="sub-x",
-        benchmark_details={"per_intent": per_intent},
-    )
-
-
-def test_for_submissions_clean_win():
-    champ = _sub([{"intent_id": "o1", "shadow_score": "100"}])
-    chal = _sub([{"intent_id": "o1", "shadow_score": "150"}])
-    c = relative_counts_for_submissions(chal, champ)
-    assert c is not None
-    assert c["better"] == 1
-    assert c["verdict"] == "dethrone"
-
-
-def test_for_submissions_no_shadow_rows_returns_none():
-    # Champion benched before shadow existed: rows present but no shadow_score.
-    champ = _sub([{"intent_id": "o1", "score": 0.9}])  # no shadow_score key
-    chal = _sub([{"intent_id": "o1", "shadow_score": "150"}])
-    assert relative_counts_for_submissions(chal, champ) is None
-    # Symmetric: challenger missing shadow rows.
-    champ2 = _sub([{"intent_id": "o1", "shadow_score": "100"}])
-    chal2 = _sub([{"intent_id": "o1", "score": 0.9}])
-    assert relative_counts_for_submissions(chal2, champ2) is None
-
-
-def test_for_submissions_missing_submission_returns_none():
-    champ = _sub([{"intent_id": "o1", "shadow_score": "100"}])
-    assert relative_counts_for_submissions(None, champ) is None
-    assert relative_counts_for_submissions(champ, None) is None
 
 
 def test_has_shadow_rows():

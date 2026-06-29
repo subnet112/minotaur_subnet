@@ -190,13 +190,12 @@ def build_submission_report(
     except Exception:  # observe-only — must never break the report
         pass
 
-    # ── AUTHORITATIVE relative counts (RELATIVE_SCORING_ENABLED) ──
-    # When the relative rule is live, ALSO surface the COUNT shape
+    # ── AUTHORITATIVE relative counts ──
+    # The relative rule is the sole adoption path, so ALWAYS surface the COUNT shape
     # (better/worse/matched/new + verdict) that replaces the saturated score, and
-    # flip ``scoring_mode`` to "relative". Additive + gated on the SAME flag as the
-    # live scoring: every legacy field (your_score, champion_score, per_case
-    # deltas) and the shadow_relative block above are byte-for-byte untouched when
-    # the flag is OFF.
+    # set ``scoring_mode`` to "relative". The legacy fields (your_score,
+    # champion_score, per_case deltas) and the shadow_relative block above are kept
+    # additively (cleanup deferred).
     #
     # SAME-PIN: the counts are READ from this submission's OWN persisted
     # ``benchmark_details["relative"]`` — computed at round evaluation against the
@@ -211,19 +210,17 @@ def build_submission_report(
     try:
         from minotaur_subnet.epoch.relative_scoring import (
             relative_reason,
-            relative_scoring_active,
         )
 
-        if relative_scoring_active():
-            report["scoring_mode"] = "relative"
-            stored_rel = details.get("relative") if isinstance(details, dict) else None
-            if isinstance(stored_rel, dict):
-                report["relative"] = stored_rel
-                rel_reason = relative_reason(
-                    stored_rel, candidate_id=getattr(sub, "submission_id", None),
-                )
-                if rel_reason:
-                    report["reason_relative"] = rel_reason
+        report["scoring_mode"] = "relative"
+        stored_rel = details.get("relative") if isinstance(details, dict) else None
+        if isinstance(stored_rel, dict):
+            report["relative"] = stored_rel
+            rel_reason = relative_reason(
+                stored_rel, candidate_id=getattr(sub, "submission_id", None),
+            )
+            if rel_reason:
+                report["reason_relative"] = rel_reason
     except Exception:  # additive surface — must never break the report
         pass
 

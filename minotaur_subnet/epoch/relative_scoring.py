@@ -1,45 +1,30 @@
-"""Relative per-order scoring — SHADOW (observe-only) decision path.
+"""Relative per-order scoring — the SOLE champion-adoption decision rule.
 
-A NEW way to decide adoption: instead of comparing two aggregate JS scores,
-compare the challenger and champion **per order** on the RAW delivered output
-(the amount the receiver actually got), and adopt only when the challenger
-beats or matches the champion on every order AND strictly wins at least one.
+Instead of comparing two aggregate JS scores, compare the challenger and champion
+**per order** on the RAW delivered output (the amount the receiver actually got in
+the simulation — ground-truth delivery, not a solver claim), and adopt only when
+the challenger beats or matches the champion on every order AND strictly wins at
+least one. Because raw_output is the simulated delivered amount, this rule is
+anti-gaming by construction (the adoption-side on-chain scoreIntent gate it
+replaced was redundant with it).
 
-**SHADOW by default.** Two independent gates, read at call time (no restart):
+This is now ALWAYS ON and AUTHORITATIVE — there is no flag and no shadow slot. The
+leader (``EpochManager._meets_adoption_criteria``) and every follower
+(``champion_consensus._independent_adopt_vote``) route through this one rule, so the
+adoption decision is fleet-uniform by construction. The per-order RAW output is
+sourced from the LIVE scorer's ``metadata.raw_output`` (the raw-output scorer an
+operator PUTs into the live ``js_code`` slot at cutover), threaded onto
+``BenchmarkResult.shadow_score`` / ``per_intent[*].shadow_score`` (field name kept
+to avoid rippling the API counts shape).
 
-  * ``relative_scoring_shadow_enabled()`` — **DEFAULT ON.** When on, the
-    validator ALSO computes this relative decision every round and LOGS it
-    beside the real one. It changes nothing about live behaviour; it is pure
-    extra computation + logging so the fleet can compare the two rules on real
-    challengers before trusting the new one.
-  * ``relative_scoring_active()`` — **DEFAULT OFF.** When on, the relative
-    decision becomes AUTHORITATIVE (replaces the live aggregate verdict). This
-    is the one-line flip after the shadow data proves the rule out.
-
-The split mirrors the existing ``SHADOW_DETERMINISM`` observe-then-activate
-pattern: ship the new rule dark, watch it agree, then flip it on fleet-wide.
-
-This module is PURE: env reads + a stateless decision function. No I/O, no
-benchmark compute, no imports from the heavy harness path (it duck-types the
-result objects on ``intent_id`` / ``shadow_score``), so it stays trivially
-testable and import-light.
+This module is PURE: a stateless decision function over result objects, duck-typed
+on ``intent_id`` / ``shadow_score`` (no imports from the heavy harness path), so it
+stays trivially testable and import-light.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
-
-# Explicit disable values for the DEFAULT-ON shadow gate. Anything else
-# (including unset, empty, or garbage) is treated as ENABLED — same convention
-# as ``round_anchor.round_anchored_pin_enabled``: a typo can never silently turn
-# the (harmless, observe-only) shadow computation off.
-_GATE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
-
-# Explicit enable values for the DEFAULT-OFF activation gate. Only these turn the
-# relative decision authoritative; anything else (including unset) stays OFF, so
-# the live aggregate rule keeps deciding until an operator deliberately flips it.
-_GATE_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 # ── tuning constants ─────────────────────────────────────────────────────────
@@ -78,56 +63,6 @@ MIN_VALID_OUTPUT = 0
 # ``/health``. The verdict NEVER depends on this float; the cap only stops a
 # champion that delivered a tiny amount from producing an absurd display number.
 SURPLUS_RATIO_CAP = 1000.0
-
-
-def relative_scoring_shadow_enabled() -> bool:
-    """Observe-only relative-scoring shadow gate. **DEFAULT ON.**
-
-    Purpose: while live, ALSO compute the relative per-order adoption decision +
-    the raw-output shadow score, and LOG them beside the real decision, so the
-    fleet can compare the new rule against the live one on real challengers
-    WITHOUT affecting any adoption, weight, or consensus output.
-
-    Consensus-relevance: NONE while it is shadow — it only adds computation and
-    log lines; the live scoring and live adoption verdict are byte-for-byte
-    unchanged. (It becomes consensus-relevant only once
-    ``relative_scoring_active()`` is flipped on, which is a separate gate.)
-
-    Read at call time (``os.environ.get``) so it can be toggled via compose
-    without a code change or restart, exactly like the other fleet gates.
-
-    Emergency override only: set ``RELATIVE_SCORING_SHADOW`` to one of
-    ``{0, false, no, off}`` (case-insensitive) to disable the extra computation
-    fleet-wide. Unset / any other value = enabled. This is the single place the
-    default lives.
-    """
-    raw = os.environ.get("RELATIVE_SCORING_SHADOW")
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _GATE_OFF_VALUES
-
-
-def relative_scoring_active() -> bool:
-    """Make the relative per-order decision AUTHORITATIVE. **DEFAULT OFF.**
-
-    Purpose: the one-line activation switch. When on, the shadow relative verdict
-    REPLACES the live aggregate ``evaluate_adoption`` verdict as the adopt/reject
-    decision for the round. Until then the relative rule is observe-only.
-
-    Consensus-relevance: HIGH once enabled — it changes which challenger is
-    adopted, so (like every other adoption-rule constant) it must be flipped
-    fleet-uniformly. It defaults OFF so a single validator can never diverge by
-    accident; turning it on is a deliberate, coordinated operator action.
-
-    Read at call time (``os.environ.get``) so the flip needs no restart.
-
-    Enable only by setting ``RELATIVE_SCORING_ENABLED`` to one of
-    ``{1, true, yes, on}`` (case-insensitive). Unset / any other value = OFF.
-    """
-    raw = os.environ.get("RELATIVE_SCORING_ENABLED")
-    if raw is None:
-        return False
-    return raw.strip().lower() in _GATE_ON_VALUES
 
 
 # ── pure per-order decision ──────────────────────────────────────────────────
@@ -303,11 +238,10 @@ def evaluate_relative_adoption(
 
 # ── count-shape mapping (API report surface) ─────────────────────────────────
 #
-# When the relative rule is AUTHORITATIVE the API stops reporting a single
-# saturated score and instead reports each submission as a RELATIVE COUNT vs the
-# current champion. These pure helpers map the per-order verdict above onto that
-# count shape and back from stored submissions, so every API surface can flip on
-# the SAME ``relative_scoring_active()`` gate.
+# The relative rule is authoritative, so the API reports each submission as a
+# RELATIVE COUNT vs the current champion instead of a single saturated score.
+# These pure helpers map the per-order verdict above onto that count shape and back
+# from stored submissions; every API surface emits the relative block always.
 
 
 def relative_counts(
@@ -361,13 +295,6 @@ def relative_counts(
     }
 
 
-def _submission_per_intent(submission: Any) -> list[Any]:
-    """Per-order rows (``benchmark_details.per_intent``) off a submission, or []."""
-    details = getattr(submission, "benchmark_details", None) or {}
-    rows = details.get("per_intent") if isinstance(details, dict) else None
-    return rows if isinstance(rows, list) else []
-
-
 def has_shadow_rows(rows: list[Any] | None) -> bool:
     """True when at least one per-order row carries a non-None ``shadow_score``.
 
@@ -376,27 +303,6 @@ def has_shadow_rows(rows: list[Any] | None) -> bool:
     a misleading all-skip one).
     """
     return any(_field(r, "shadow_score") is not None for r in rows or [])
-
-
-def relative_counts_for_submissions(
-    challenger_submission: Any,
-    champion_submission: Any,
-    tol_bps: int = RELATIVE_TOL_BPS,
-) -> dict[str, Any] | None:
-    """Relative counts for a CHALLENGER submission vs the CHAMPION submission.
-
-    Reads each submission's ``benchmark_details.per_intent`` shadow_score rows and
-    delegates to :func:`relative_counts`. Returns ``None`` (graceful omit, never an
-    error) when either side has no shadow_score rows — so a submission scored
-    before shadow existed simply carries no relative block.
-    """
-    if challenger_submission is None or champion_submission is None:
-        return None
-    champ_rows = _submission_per_intent(champion_submission)
-    chal_rows = _submission_per_intent(challenger_submission)
-    if not has_shadow_rows(champ_rows) or not has_shadow_rows(chal_rows):
-        return None
-    return relative_counts(champ_rows, chal_rows, tol_bps=tol_bps)
 
 
 def relative_reason(

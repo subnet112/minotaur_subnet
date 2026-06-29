@@ -417,7 +417,8 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
     Two validators that derive the same pin AND read the same block hash are
     forking byte-identical chain state, so their on-chain sims are deterministic;
     a hash mismatch means their upstream RPCs disagree (reorg / archive
-    inconsistency) and ``ADOPT_RULE=p2oc`` must NOT be flipped. Unlike the pack
+    inconsistency), so their on-chain sims would diverge and could split the
+    adoption verdict across the fleet. Unlike the pack
     hash, this needs no corpus flag, so it is comparable across the fleet by
     polling /health alone. One ``eth_getBlockByNumber`` per chain against the
     same live upstream RPC the pin derivation uses, bounded timeout, best-effort
