@@ -2310,6 +2310,31 @@ async def initialize(ctx: ServerContext) -> dict:
             except Exception:
                 logger.warning("Order-book sync not started", exc_info=True)
 
+            # App-catalog sync — followers pull the leader's apps + manifests so their
+            # benchmark pack hash matches the leader's. Without it ctx.store.list_apps()
+            # stays EMPTY on a follower, _build_solver_round_benchmark_pack_hash hashes
+            # 0 apps + 0 scenarios, and EVERY champion cert is rejected
+            # PACK_HASH_MISMATCH (followers never adopt). Mirrors the order-sync above
+            # (same metagraph leader-resolution + follower gate) but run IN THE API
+            # process, where ctx.store actually feeds the pack hash. The validator-process
+            # ValidatorAppCatalogSync only fires when LEADER_API_URL is set, which the
+            # auto-resolving fleet does not configure.
+            try:
+                from minotaur_subnet.validator.app_sync import ValidatorAppCatalogSync
+                _app_sync = ValidatorAppCatalogSync(
+                    store=ctx.store,
+                    leader_url=_resolve_leader_api_url,
+                    is_follower=(
+                        lambda: ctx.solver_round_metagraph_sync is not None
+                        and not _is_solver_round_leader()
+                    ),
+                    poll_interval=60.0,
+                )
+                ctx.app_sync_task = asyncio.create_task(_app_sync.start())
+                logger.info("App-catalog sync loop started (followers pull the leader's apps)")
+            except Exception:
+                logger.warning("App-catalog sync not started", exc_info=True)
+
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
                 network = submissions.get_champion_peer_network()
