@@ -974,6 +974,49 @@ async def certify_solver_round(
     return _round_state_to_response(certified)
 
 
+@router.post("/solver/champion/reattest")
+async def reattest_current_champion(request: Request) -> dict:
+    """Force-resync the fleet to the CURRENT certified champion.
+
+    Re-broadcasts the existing champion certificate to all peer validators, so a
+    follower that missed the original election (it was down, or running a build with
+    the broken cert broadcast) re-runs its reactive benchmark, verifies the now
+    round-tripping EIP-712 digest, and switches from full burn to champion-weight.
+    Re-sends the EXISTING signed certificate — idempotent, mutates no local state, and
+    a harmless no-op on a node with no peers. An operator "force-sync the fleet" lever
+    for incident recovery, not just champion adoption. Run it on the leader.
+    """
+    await _authorize_internal_round(request)
+    store = get_round_store()
+    champ = store.get_active_champion()
+    rid = getattr(champ, "activated_round_id", None)
+    if not rid:
+        raise HTTPException(status_code=404, detail="no active champion to re-attest")
+    state = store.get_round(rid)
+    if state is None or state.certificate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"certified round {rid} for champion "
+                f"{getattr(champ, 'submission_id', None)} not found or carries no certificate"
+            ),
+        )
+    approvals = len(state.certificate.approvals)
+    await _broadcast_internal_round_sync(
+        "/v1/solver/round/internal/certify",
+        _certify_round_sync_payload(state),
+    )
+    logger.info(
+        "[champion-reattest] re-broadcast champion %s (round=%s, %d approval(s)) to peers",
+        getattr(champ, "submission_id", None), rid, approvals,
+    )
+    return {
+        "reattested_submission_id": getattr(champ, "submission_id", None),
+        "round_id": rid,
+        "approvals": approvals,
+    }
+
+
 @router.post("/solver/round/internal/close", response_model=SolverRoundResponse)
 async def internal_close_solver_round(
     body: CloseRoundRequest,
