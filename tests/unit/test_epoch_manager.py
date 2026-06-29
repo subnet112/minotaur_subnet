@@ -130,7 +130,21 @@ def _make_submission(
         solver_version="1.0.0",
         benchmark_score=score,
         benchmark_rank=1,
-        benchmark_details={"total_intents": 5},
+        benchmark_details={
+            "total_intents": 5,
+            # The relative per-order rule decides adoption on the RAW delivered
+            # output (shadow_score), not the aggregate score. Derive a single
+            # proportional order from `score` so a higher-scoring challenger WINS,
+            # an equal one MATCHES, and a lower one REGRESSES — the same ordering
+            # these fixtures relied on under the legacy aggregate rule.
+            "per_intent": [
+                {
+                    "intent_id": "o1",
+                    "score": score,
+                    "shadow_score": str(int(round(score * 1_000_000))),
+                },
+            ],
+        },
     )
 
 
@@ -249,15 +263,17 @@ class TestEpochManager:
 
     @pytest.mark.asyncio
     async def test_dethrone_margin_enforced(self):
-        """Challenger must beat champion by >0.5% to be adopted."""
+        """A challenger within the relative noise band (±0.1%) only MATCHES the
+        champion per order — no strict win — so it is NOT adopted."""
         # Set up existing champion at 0.80
         old_sub = _make_submission(
             submission_id="sub_old", epoch=1, score=0.80,
             solver_name="old-solver",
         )
-        # New challenger at 0.802 (0.25% better, not enough for 0.5% margin)
+        # New challenger at 0.8005 (+0.0625%, inside the ±0.1% per-order noise band
+        # -> "matched", not a win) -> not adopted.
         new_sub = _make_submission(
-            submission_id="sub_new", epoch=2, score=0.802,
+            submission_id="sub_new", epoch=2, score=0.8005,
             solver_name="new-solver",
         )
         store = _make_store_with_subs(old_sub, new_sub)

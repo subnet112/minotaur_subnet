@@ -482,22 +482,14 @@ def get_app_status(
         },
     }
 
-    # When the relative rule is AUTHORITATIVE, flip ``scoring_mode`` so the
-    # dashboard knows the saturated ``champion_score`` is no longer the headline
-    # metric and to read the per-submission relative COUNTS surfaced on the
-    # submission-status (report) and solver-round endpoints. Additive + gated on
-    # the SAME flag as the live scoring: when the flag is OFF (default) this dict
-    # is byte-for-byte unchanged — no ``scoring_mode`` key is added. The champion
-    # is the relative baseline, so there is no challenger to count against here;
-    # the per-submission relative blocks live on the endpoints that carry a
-    # challenger + the champion.
-    try:
-        from minotaur_subnet.epoch.relative_scoring import relative_scoring_active
-
-        if relative_scoring_active():
-            result["scoring_mode"] = "relative"
-    except Exception:
-        pass
+    # The relative rule is the sole adoption path, so always mark ``scoring_mode``
+    # "relative" — the dashboard knows the saturated ``champion_score`` is no longer
+    # the headline metric and reads the per-submission relative COUNTS surfaced on
+    # the submission-status (report) and solver-round endpoints. The champion is the
+    # relative baseline, so there is no challenger to count against here; the
+    # per-submission relative blocks live on the endpoints that carry a challenger +
+    # the champion.
+    result["scoring_mode"] = "relative"
     return result
 
 
@@ -665,110 +657,6 @@ def update_scoring(
         "version": new_version,
         "status": "updated",
         "message": "JS scoring code updated. Validators will receive the new code on next sync.",
-    }
-    if validation_warnings:
-        result["validation_warnings"] = validation_warnings
-    return result
-
-
-def update_shadow_scoring(
-    store: AppIntentStore,
-    app_id: str,
-    new_js_code: str,
-    caller: str = "",
-    signature: str = "",
-    nonce: int = 0,
-    deadline: int = 0,
-) -> dict[str, Any]:
-    """Set the SHADOW (observe-only) raw-output scoring JS for an App Intent.
-
-    Mirrors :func:`update_scoring`'s auth/validation shape, but writes
-    ``shadow_js_code`` instead of ``js_code`` and does NOT bump the version or
-    touch the manifest/config — the shadow scorer runs ALONGSIDE the live one and
-    must never alter live behaviour. Validators load it when
-    ``relative_scoring_shadow_enabled()`` and score it in parallel; until
-    ``relative_scoring_active()`` it changes nothing about adoption.
-    """
-    if not app_id:
-        return {"error": "app_id is required"}
-    if not new_js_code or not new_js_code.strip():
-        return {"error": "new_js_code must be non-empty"}
-
-    new_js_code = new_js_code.strip()
-    validation_warnings: list[str] = []
-
-    # ── pre-flight JS validation (same as update_scoring) ──
-    try:
-        import asyncio
-        from minotaur_subnet.engine.validation import validate_js_code as _validate_js
-
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    js_validation = pool.submit(
-                        lambda: asyncio.run(_validate_js(new_js_code))
-                    ).result()
-            else:
-                js_validation = loop.run_until_complete(_validate_js(new_js_code))
-        except RuntimeError:
-            js_validation = asyncio.run(_validate_js(new_js_code))
-
-        if not js_validation.valid:
-            return {
-                "error": "JS validation failed",
-                "validation_errors": js_validation.errors,
-                "validation_warnings": js_validation.warnings,
-            }
-        validation_warnings.extend(js_validation.warnings)
-    except Exception as exc:
-        logger.warning("Pre-flight shadow JS validation skipped: %s", exc)
-
-    definition = store.get_app(app_id)
-    if definition is None:
-        return {"error": f"App not found: {app_id}"}
-
-    # Authorization: identical to update_scoring — a deployer-set app requires the
-    # deployer's EIP-712 developer-auth signature (single-use nonce) binding the
-    # shadow code hash. Reuses the update_scoring action so no new signed action
-    # type is introduced for this minimal observe-only endpoint.
-    if definition.deployer:
-        from minotaur_subnet.api.services import developer_auth
-
-        deployer_addr = definition.deployer.strip().lower()
-        ok, err = developer_auth.verify_developer_auth(
-            expected_deployer=deployer_addr,
-            action=developer_auth.ACTION_UPDATE_SCORING,
-            app_id=app_id,
-            params_hash=developer_auth.params_hash(new_js_code.encode()),
-            nonce=nonce,
-            deadline=deadline,
-            signature=signature,
-        )
-        if not ok:
-            return {"error": f"Unauthorized: {err}"}
-        consumed, cerr = store.consume_developer_nonce(app_id, deployer_addr, nonce)
-        if not consumed:
-            return {"error": f"Unauthorized: {cerr}"}
-
-    new_hash = _sha256(new_js_code)
-    if definition.shadow_js_code and _sha256(definition.shadow_js_code) == new_hash:
-        return {
-            "app_id": app_id,
-            "shadow_js_code_hash": new_hash,
-            "status": "unchanged",
-            "message": "New shadow code is identical to the current shadow version.",
-        }
-
-    definition.shadow_js_code = new_js_code
-    store.save_app(definition)
-
-    result = {
-        "app_id": app_id,
-        "shadow_js_code_hash": new_hash,
-        "status": "updated",
-        "message": "Shadow scoring JS updated (observe-only; runs alongside live JS).",
     }
     if validation_warnings:
         result["validation_warnings"] = validation_warnings

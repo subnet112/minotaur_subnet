@@ -1,8 +1,11 @@
-"""Dual-load of the shadow scorer in BenchmarkWorker._build_score_fn, and the
-raw-output behaviour of the committed dex_aggregator_raw.js shadow scorer.
+"""Source of the relative per-order signal in BenchmarkWorker._build_score_fn, and
+the raw-output behaviour of the committed dex_aggregator_raw.js scorer.
 
-The dual-load tests use a fake engine (no Node needed). The raw-JS test loads the
-real shadow scorer into a JsExecutionEngine and is skipped when Node is absent.
+Post-cutover the relative rule reads the RAW delivered output from the LIVE
+scorer's own result metadata (metadata.raw_output) — there is no separate shadow
+slot. The score_fn tests use a fake engine (no Node needed). The raw-JS test loads
+the real raw-output scorer into a JsExecutionEngine and is skipped when Node is
+absent.
 """
 
 from __future__ import annotations
@@ -36,14 +39,14 @@ from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 from minotaur_subnet.harness.submission_store import SubmissionStore
 
 _LIVE_JS = "function score(p,s,c){ return { score: 0.5 }; } // live padding xxxxxxxx"
-_SHADOW_JS = "function score(p,s,c){ return { score: 1 }; } // shadow padding xxxxxxxx"
 
 
 class _FakeEngine:
-    """Records load_intent calls; returns a raw_output metadata for the shadow key."""
+    """Records load_intent calls; the LIVE scorer surfaces metadata.raw_output."""
 
-    def __init__(self):
+    def __init__(self, *, raw_output: str | None = "2500"):
         self.loaded: dict[str, str] = {}
+        self._raw_output = raw_output
 
     async def load_intent(self, app_id: str, js_code: str) -> None:
         self.loaded[app_id] = js_code
@@ -55,18 +58,17 @@ class _FakeEngine:
         return {}
 
     async def score(self, app_id, plan, simulation, state) -> ScoreResult:
-        if app_id.endswith(":shadow"):
-            # Engine clamps `score` to [0,1]; the unclamped raw output lives in
-            # metadata.raw_output as an EXACT DECIMAL WEI STRING — exactly what
-            # the dual-load path reads and stores verbatim (no float()).
-            return ScoreResult(score=1.0, valid=True, metadata={"raw_output": "2500"})
-        return ScoreResult(score=0.5, valid=True)
+        # The LIVE raw-output scorer surfaces the raw delivered output in
+        # metadata.raw_output as an EXACT DECIMAL WEI STRING — exactly what the
+        # score_fn reads and stores verbatim (no float()). Engine clamps `score`.
+        meta = {"raw_output": self._raw_output} if self._raw_output is not None else {}
+        return ScoreResult(score=0.5, valid=True, metadata=meta)
 
 
-def _intent(app_id="app", *, shadow: str | None):
+def _intent(app_id="app"):
     return AppIntentDefinition(
         app_id=app_id, name="A", version="1.0.0", intent_type="swap",
-        js_code=_LIVE_JS, shadow_js_code=shadow,
+        js_code=_LIVE_JS,
         config=AppIntentConfig(supported_chains=[1], trigger_type=TriggerType.USER_TRIGGERED),
     )
 
@@ -87,43 +89,40 @@ def _plan():
     )
 
 
-async def test_dual_load_attaches_shadow_score_when_on(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_SHADOW", raising=False)  # default ON
-    eng = _FakeEngine()
+async def test_score_fn_attaches_shadow_score_from_live_metadata():
+    # The LIVE scorer (js_code) is the raw-output scorer post-cutover; its result
+    # carries metadata.raw_output, which the score_fn threads onto shadow_score.
+    eng = _FakeEngine(raw_output="2500")
     worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
-    score_fn = await worker._build_score_fn([(_intent(shadow=_SHADOW_JS), _state(), _snap())])
+    score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
 
-    # Both the live and the composite ":shadow" keys are loaded.
+    # Only the LIVE key is loaded — there is no separate ":shadow" slot anymore.
     assert "app" in eng.loaded
-    assert "app:shadow" in eng.loaded
+    assert "app:shadow" not in eng.loaded
 
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
-    assert res.score == 0.5  # live score untouched
+    assert res.score == 0.5  # clamped live score untouched
     # raw output attached as an EXACT decimal STRING (not a float).
     assert getattr(res, "shadow_score", None) == "2500"
     assert isinstance(res.shadow_score, str)
 
 
-async def test_dual_load_noop_when_shadow_disabled(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_SHADOW", "0")  # emergency override OFF
-    eng = _FakeEngine()
+async def test_score_fn_none_when_live_emits_no_raw_output():
+    # Pre-cutover scorer (no raw_output in metadata) -> shadow_score stays None.
+    eng = _FakeEngine(raw_output=None)
     worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
-    score_fn = await worker._build_score_fn([(_intent(shadow=_SHADOW_JS), _state(), _snap())])
-
-    assert "app" in eng.loaded
-    assert "app:shadow" not in eng.loaded  # shadow never loaded when gate off
+    score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
 
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
-    assert getattr(res, "shadow_score", None) is None  # additive: stays None
+    assert getattr(res, "shadow_score", None) is None
 
 
-async def test_dual_load_noop_when_no_shadow_js(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_SHADOW", raising=False)  # default ON
-    eng = _FakeEngine()
+async def test_score_fn_none_when_raw_output_empty_string():
+    # An empty-string raw_output is treated as "no signal" (None), not "0".
+    eng = _FakeEngine(raw_output="")
     worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
-    score_fn = await worker._build_score_fn([(_intent(shadow=None), _state(), _snap())])
+    score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
 
-    assert "app:shadow" not in eng.loaded  # nothing to load
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
     assert getattr(res, "shadow_score", None) is None
 

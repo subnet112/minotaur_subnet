@@ -189,11 +189,12 @@ class BenchmarkResult:
     error: str | None = None
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
-    # SHADOW (observe-only) raw delivered output from the parallel shadow JS run
-    # (relative_scoring). An EXACT DECIMAL WEI STRING (not a float) so token
-    # amounts above 2^53 keep full precision end-to-end. None when shadow scoring
-    # is off or the app has no shadow_js_code; "0" when the order delivered nothing
-    # / fell below min. NEVER feeds the live score — additive only.
+    # RAW delivered output from the LIVE raw-output scorer's metadata.raw_output
+    # (relative_scoring; field name kept). An EXACT DECIMAL WEI STRING (not a float)
+    # so token amounts above 2^53 keep full precision end-to-end. None when the live
+    # scorer emits no raw_output (pre-cutover scorer); "0" when the order delivered
+    # nothing / fell below min. The per-order signal the relative adoption rule
+    # consumes; NEVER feeds the aggregate `score`.
     shadow_score: str | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
@@ -1506,10 +1507,10 @@ async def _process_scenario(
                     )
                     br.plan_score = score_result.score
                     br.score_breakdown = score_result.breakdown
-                    # SHADOW (observe-only): the dual-load score_fn attaches the
-                    # raw-output shadow score to the returned ScoreResult when
-                    # relative-scoring shadow is on + the app has shadow JS;
-                    # absent otherwise -> stays None. Never affects br.score.
+                    # The score_fn attaches the RAW delivered output (the LIVE
+                    # raw-output scorer's metadata.raw_output) to the returned
+                    # ScoreResult; absent (pre-cutover scorer) -> stays None. The
+                    # relative adoption rule consumes it; never affects br.score.
                     br.shadow_score = getattr(score_result, "shadow_score", None)
 
                     # Compute composite score for auto-triggered intents

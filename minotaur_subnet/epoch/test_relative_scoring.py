@@ -1,9 +1,8 @@
-"""Unit tests for the SHADOW relative per-order scoring path.
+"""Unit tests for the relative per-order scoring rule (the sole adoption path).
 
-Covers the two env gates (defaults + overrides) and the pure
-``evaluate_relative_adoption`` decision across the full verdict matrix, on EXACT
-INTEGER wei (shadow_score is a decimal STRING; the verdict cross-multiplies the
-10-bps band with no float).
+Covers the pure ``evaluate_relative_adoption`` decision across the full verdict
+matrix, on EXACT INTEGER wei (shadow_score is a decimal STRING; the verdict
+cross-multiplies the 10-bps band with no float).
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ from minotaur_subnet.epoch.relative_scoring import (
     relative_counts,
     relative_counts_for_submissions,
     relative_reason,
-    relative_scoring_active,
-    relative_scoring_shadow_enabled,
 )
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
 
@@ -35,44 +32,6 @@ from minotaur_subnet.harness.orchestrator import BenchmarkResult
 def _r(intent_id: str, shadow_score):
     """A real BenchmarkResult carrying only intent_id + shadow_score (decimal str)."""
     return BenchmarkResult(intent_id=intent_id, shadow_score=shadow_score)
-
-
-# ── env gates ────────────────────────────────────────────────────────────────
-
-
-def test_shadow_gate_defaults_on(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_SHADOW", raising=False)
-    assert relative_scoring_shadow_enabled() is True
-
-
-def test_shadow_gate_off_values(monkeypatch):
-    for val in ("0", "false", "no", "off", "OFF", "False"):
-        monkeypatch.setenv("RELATIVE_SCORING_SHADOW", val)
-        assert relative_scoring_shadow_enabled() is False, val
-
-
-def test_shadow_gate_garbage_stays_on(monkeypatch):
-    # Anything that is not an explicit off-value keeps the observe-only path ON.
-    monkeypatch.setenv("RELATIVE_SCORING_SHADOW", "yes")
-    assert relative_scoring_shadow_enabled() is True
-    monkeypatch.setenv("RELATIVE_SCORING_SHADOW", "garbage")
-    assert relative_scoring_shadow_enabled() is True
-
-
-def test_active_gate_defaults_off(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
-    assert relative_scoring_active() is False
-
-
-def test_active_gate_on_values(monkeypatch):
-    for val in ("1", "true", "yes", "on", "ON", "Yes"):
-        monkeypatch.setenv("RELATIVE_SCORING_ENABLED", val)
-        assert relative_scoring_active() is True, val
-
-
-def test_active_gate_garbage_stays_off(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "maybe")
-    assert relative_scoring_active() is False
 
 
 def test_tol_bps_matches_relative_tol():

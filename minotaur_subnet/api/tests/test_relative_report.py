@@ -1,11 +1,10 @@
-"""Gating tests for the additive RELATIVE-COUNT API surface.
+"""Tests for the AUTHORITATIVE relative-count API surface.
 
-The relative report block self-activates on the SAME flag as the live scoring
-(``RELATIVE_SCORING_ENABLED`` -> ``relative_scoring_active()``). These tests pin
-the safety invariant: with the flag OFF (default) every response is byte-for-byte
-unchanged (no ``scoring_mode`` / ``relative`` / ``finalist_relative`` keys); with
-it ON the relative block + ``scoring_mode`` appear. A submission with no
-shadow_score rows gets the mode marker but no relative block (graceful omit).
+The relative rule is the sole adoption path, so the relative block + ``scoring_mode``
+are ALWAYS emitted (no flag). These tests pin: the report / round response / app
+status always carry ``scoring_mode == "relative"`` and the relative count block when
+both sides have shadow_score rows; the count block is gracefully omitted (no error)
+when either side lacks shadow_score rows.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ from minotaur_subnet.harness.round_store import RoundState, RoundStatus  # noqa:
 
 # ── fixtures / helpers ───────────────────────────────────────────────────────
 
-# shadow_score is an EXACT INTEGER DECIMAL STRING (#395), not a float.
+# shadow_score is an EXACT INTEGER DECIMAL STRING, not a float.
 _CHAMP_INTENT = [
     {"intent_id": "o1", "score": 0.90, "shadow_score": "100"},
     {"intent_id": "o2", "score": 0.80, "shadow_score": "200"},
@@ -65,26 +64,10 @@ def _build_report(sub, champ_details):
     )
 
 
-# ── report.py: per-submission relative block ─────────────────────────────────
+# ── report.py: per-submission relative block (always on) ─────────────────────
 
 
-def test_report_off_is_unchanged(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
-    rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
-    assert rpt is not None
-    assert "scoring_mode" not in rpt
-    assert "relative" not in rpt
-    assert "reason_relative" not in rpt
-    # Legacy fields intact.
-    assert rpt["aggregate"]["your_score"] == 0.9
-    assert "per_case" in rpt
-    # The pre-existing observe-only shadow block is still present (it predates
-    # this PR and is flag-independent).
-    assert "shadow_relative" in rpt
-
-
-def test_report_on_adds_relative_counts(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+def test_report_always_emits_relative_counts():
     rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
     assert rpt["scoring_mode"] == "relative"
     rel = rpt["relative"]
@@ -94,18 +77,19 @@ def test_report_on_adds_relative_counts(monkeypatch):
     assert rpt["reason_relative"].startswith("adopted")
     # Legacy fields still present (additive, cleanup deferred).
     assert rpt["aggregate"]["your_score"] == 0.9
+    # The observe-only shadow block predates this PR and is still present.
+    assert "shadow_relative" in rpt
 
 
-def test_report_on_no_shadow_rows_omits_block(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
-    # Champion benched before shadow existed: rows but no shadow_score.
+def test_report_no_shadow_rows_omits_block():
+    # Champion benched before the cutover: rows but no shadow_score.
     champ = {"per_intent": [{"intent_id": "o1", "score": 0.9}]}
     rpt = _build_report(_sub(_CHAL_INTENT), champ)
-    assert rpt["scoring_mode"] == "relative"  # mode flips on the flag
+    assert rpt["scoring_mode"] == "relative"  # mode always set
     assert "relative" not in rpt             # but no counts (graceful omit)
 
 
-# ── round response: finalist relative block ──────────────────────────────────
+# ── round response: finalist relative block (always on) ──────────────────────
 
 
 def _wire_round_stores(monkeypatch, finalist_intent, champ_intent):
@@ -131,20 +115,7 @@ def _round_state():
     )
 
 
-def test_round_response_off_byte_for_byte(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
-    resp = round_manager._round_state_to_response(_round_state())
-    dumped = resp.model_dump()
-    # Exactly the declared fields — no extras leaked in.
-    assert set(dumped) == set(SolverRoundResponse.model_fields)
-    assert "scoring_mode" not in dumped
-    assert "finalist_relative" not in dumped
-    # Legacy finalist_score untouched.
-    assert dumped["finalist_score"] == 0.95
-
-
-def test_round_response_on_attaches_finalist_relative(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+def test_round_response_attaches_finalist_relative(monkeypatch):
     _wire_round_stores(monkeypatch, _CHAL_INTENT, _CHAMP_INTENT)
     resp = round_manager._round_state_to_response(_round_state())
     dumped = resp.model_dump()
@@ -154,10 +125,12 @@ def test_round_response_on_attaches_finalist_relative(monkeypatch):
     assert dumped["reason_relative"].startswith("adopted fin-1")
     # Legacy finalist_score still present (not replaced).
     assert dumped["finalist_score"] == 0.95
+    # The ONLY keys beyond the declared model fields are the relative extras.
+    extras = set(dumped) - set(SolverRoundResponse.model_fields)
+    assert extras == {"scoring_mode", "finalist_relative", "reason_relative"}
 
 
-def test_round_response_on_no_shadow_rows_omits_block(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+def test_round_response_no_shadow_rows_omits_block(monkeypatch):
     _wire_round_stores(
         monkeypatch,
         [{"intent_id": "o1", "score": 0.9}],   # finalist: no shadow rows
@@ -169,8 +142,7 @@ def test_round_response_on_no_shadow_rows_omits_block(monkeypatch):
     assert "finalist_relative" not in dumped
 
 
-def test_round_response_on_no_finalist_marks_mode_only(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+def test_round_response_no_finalist_marks_mode_only():
     state = RoundState(round_id="round-e1-n1", status=RoundStatus.OPEN, opened_epoch=1)
     resp = round_manager._round_state_to_response(state)
     dumped = resp.model_dump()
@@ -178,7 +150,7 @@ def test_round_response_on_no_finalist_marks_mode_only(monkeypatch):
     assert "finalist_relative" not in dumped
 
 
-# ── get_app_status: scoring_mode marker ──────────────────────────────────────
+# ── get_app_status: scoring_mode marker (always on) ──────────────────────────
 
 
 def _seed_app() -> str:
@@ -198,18 +170,7 @@ def _seed_app() -> str:
     return app_id
 
 
-def test_app_status_off_has_no_scoring_mode(monkeypatch):
-    monkeypatch.delenv("RELATIVE_SCORING_ENABLED", raising=False)
-    from minotaur_subnet.api.server import app
-    client = TestClient(app, raise_server_exceptions=False)
-    app_id = _seed_app()
-    data = client.get(f"/v1/apps/{app_id}/status").json()
-    assert "scoring_mode" not in data
-    assert "champion_score" in data  # legacy field intact
-
-
-def test_app_status_on_flips_scoring_mode(monkeypatch):
-    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+def test_app_status_marks_scoring_mode():
     from minotaur_subnet.api.server import app
     client = TestClient(app, raise_server_exceptions=False)
     app_id = _seed_app()
