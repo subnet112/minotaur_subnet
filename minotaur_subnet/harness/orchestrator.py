@@ -1448,7 +1448,7 @@ async def _process_scenario(
                         # Build intent_order so the simulator uses the full
                         # scoreIntent contract path instead of the bare path.
                         intent_order = _build_benchmark_intent_order(
-                            state, plan,
+                            state, plan, getattr(intent, "manifest", None),
                         ) if state and state.contract_address else None
                         sim = await simulator.simulate(
                             plan,
@@ -1718,9 +1718,24 @@ async def _run_scenarios(
     return [br for br in results if br is not None]
 
 
+class _ManifestShim:
+    """Adapt a raw manifest dict to the encoder's ``js_engine.get_manifest`` API
+    so the benchmark can reuse the generic manifest-driven encoder without a
+    full app store / JS engine in scope."""
+
+    __slots__ = ("_m",)
+
+    def __init__(self, manifest: dict[str, Any] | None):
+        self._m = manifest
+
+    def get_manifest(self, _app_id):
+        return self._m
+
+
 def _build_benchmark_intent_order(
     state: IntentState,
     plan: ExecutionPlan,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Build an intent_order dict for benchmark simulation.
 
@@ -1744,19 +1759,26 @@ def _build_benchmark_intent_order(
     if submitted_by == "0x0000000000000000000000000000000000000001":
         submitted_by = _ANVIL_DEFAULT_ACCOUNT
 
-    # Build ABI-encoded intentParams (same as submit-order endpoint)
+    # Build ABI-encoded intentParams via the SAME generic, manifest-driven
+    # encoder the submit-order endpoint uses (one encoder for every app). The
+    # benchmarked intent's manifest drives the field layout.
+    fn_name = control.get("_intent_function", "swap")
     intent_params_hex = ""
     try:
-        from minotaur_subnet.api.services.order_service import build_swap_intent_params_hex
+        from minotaur_subnet.api.services.app_service import (
+            build_intent_params_hex_from_manifest,
+        )
         # Use the Anvil-friendly submitted_by already computed above
         # (not the scenario's dummy receiver which may be address(1))
         bench_params = {**params, "receiver": submitted_by}
-        hex_result = build_swap_intent_params_hex(bench_params, submitted_by)
+        hex_result = build_intent_params_hex_from_manifest(
+            None, _ManifestShim(manifest), "benchmark", fn_name, bench_params, submitted_by,
+        ) if manifest else None
         if hex_result:
             intent_params_hex = hex_result
             print(f"[BENCHMARK] Built intent_params_hex: {len(hex_result)} chars for {submitted_by[:10]}", flush=True)
         else:
-            print(f"[BENCHMARK] build_swap_intent_params_hex returned None. params keys: {list(bench_params.keys())}", flush=True)
+            print(f"[BENCHMARK] intentParams encoding returned None (manifest={'present' if manifest else 'MISSING'}). params keys: {list(bench_params.keys())}", flush=True)
     except Exception as exc:
         print(f"[BENCHMARK] _build_benchmark_intent_order encoding FAILED: {exc}", flush=True)
 
@@ -1765,7 +1787,6 @@ def _build_benchmark_intent_order(
 
     # Resolve intent selector
     from eth_hash.auto import keccak as _keccak
-    fn_name = control.get("_intent_function", "swap")
     _KNOWN_SIGS = {
         "swap": "swap(address,address,uint256,uint256,address)",
         "execute": "swap(address,address,uint256,uint256,address)",
