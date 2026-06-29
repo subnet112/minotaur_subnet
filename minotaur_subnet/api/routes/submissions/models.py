@@ -271,6 +271,16 @@ class CertifyRoundRequest(BaseModel):
     shadow_case_log_hash: str | None = None
     effective_epoch: int = Field(..., ge=0)
     quorum_required: int = Field(0, ge=0)
+    # v2 EIP-712 digest fields from the leader's SIGNED proposal. MUST be declared so
+    # the /certify broadcast can carry the leader's signed commit_hash/nonce/deadline to
+    # a follower — otherwise Pydantic drops them (default extra="ignore") and
+    # _certify_solver_round_state's body.commit_hash/nonce/deadline raise AttributeError
+    # (and a follower would rebuild the proposal with its OWN wall-clock nonce → the
+    # digest diverges → "Invalid champion approvals" → quorum stranded leader-only).
+    # Mirrors ChampionConsensusProposalRequest's v2 fields.
+    commit_hash: str | None = None
+    nonce: int = 0
+    deadline: int = 0
     approvals: list[ChampionApprovalPayload] = Field(default_factory=list)
     # Operator override for the public certify endpoint: certify a candidate
     # that is NOT the round's rule-selected finalist (and not genesis/builtin).
