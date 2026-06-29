@@ -95,6 +95,36 @@ class NonceManager:
             self._nonces.clear()
 
 
+class _DryRunRevert(Exception):
+    """A pre-broadcast gas estimate proved the executeIntent tx would REVERT.
+
+    Carries the revert reason so the relayer can fail the order with a clear
+    status instead of broadcasting a guaranteed-to-revert tx and burning gas —
+    the balance-less / fund-then-withdraw order-spam griefing vector.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _is_execution_revert(exc: BaseException) -> bool:
+    """True iff *exc* (from estimate_gas / eth_call) is a deterministic EXECUTION
+    revert — the call ran in the EVM and reverted — as opposed to a transient RPC
+    error (timeout, disconnect) or a relayer gas-funds error. web3 raises
+    ``ContractLogicError`` ONLY on an execution revert; a bare 'execution
+    reverted' RPC string is also matched. Transient / gas-funds errors are NOT
+    reverts, so a flaky node never falsely fails a legitimate order.
+    """
+    try:
+        from web3.exceptions import ContractLogicError
+        if isinstance(exc, ContractLogicError):
+            return True
+    except Exception:
+        pass
+    return "execution reverted" in str(exc).lower()
+
+
 class EvmRelayer(RelayerBase):
     """Real EVM relayer that submits transactions on-chain.
 
@@ -157,6 +187,30 @@ class EvmRelayer(RelayerBase):
             return int(estimate * _GAS_ESTIMATE_MULTIPLIER)
         except Exception:
             return 2_000_000  # Fallback
+
+    def _dry_run_or_raise(self, w3: Any, tx: dict) -> int:
+        """Pre-broadcast DRY RUN of the executeIntent call.
+
+        Returns the gas limit (estimate × margin) when the tx would succeed.
+        Raises :class:`_DryRunRevert` (with the reason) when it would REVERT on
+        execution — the caller must NOT broadcast it: that burns relayer gas on a
+        guaranteed revert. The scoring fork fabricates the user's balance, so a
+        balance-less / impossible order still scores as doable and reaches here;
+        without this gate an attacker can spam such orders to drain our gas.
+        Falls back to the 2M default ONLY on a TRANSIENT estimate error so a
+        flaky RPC never falsely fails a legitimate order.
+        """
+        try:
+            estimate = w3.eth.estimate_gas(tx)
+            return int(estimate * _GAS_ESTIMATE_MULTIPLIER)
+        except Exception as exc:
+            if not _is_execution_revert(exc):
+                logger.warning(
+                    "[RELAYER] gas estimate transient failure (fallback 2M, will "
+                    "broadcast): %s", exc,
+                )
+                return 2_000_000
+            raise _DryRunRevert(str(exc)) from exc
 
     def _get_gas_price(self, w3: Any, attempt: int = 0) -> int:
         """Get current gas price with bump for retries."""
@@ -358,12 +412,30 @@ class EvmRelayer(RelayerBase):
                         if ix.value and str(ix.value) != "0"
                     )
 
-                    gas_limit = self._estimate_gas(w3, {
-                        "from": config.relayer_wallet,
-                        "to": app_address,
-                        "value": tx_value,
-                        "data": call_fn._encode_transaction_data(),
-                    })
+                    # Pre-broadcast DRY RUN: a tx that would revert (most commonly
+                    # the user cannot fund the swap — the scoring fork fabricates
+                    # balances, so a balance-less order still scores as doable) is
+                    # NEVER broadcast. Stops an attacker spamming impossible orders
+                    # to burn relayer gas, and fails the order with a clear status
+                    # instead of a silent post-broadcast on-chain revert.
+                    try:
+                        gas_limit = self._dry_run_or_raise(w3, {
+                            "from": config.relayer_wallet,
+                            "to": app_address,
+                            "value": tx_value,
+                            "data": call_fn._encode_transaction_data(),
+                        })
+                    except _DryRunRevert as _dr:
+                        logger.warning(
+                            "[RELAYER] pre-broadcast dry-run REVERTED for order %s — "
+                            "NOT broadcasting (0 gas spent): %s",
+                            getattr(order, "order_id", "?"), _dr.reason[:200],
+                        )
+                        return SubmitResult(
+                            success=False,
+                            chain_id=chain_id,
+                            error=f"pre-broadcast dry-run reverted: {_dr.reason}",
+                        )
 
                     # Protocol-fee gas-price cap. Bound the bid so the relayer
                     # can never pay more than the locked, validator-certified
