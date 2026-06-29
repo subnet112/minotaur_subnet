@@ -106,6 +106,24 @@ def _follower_weight_adopt_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _follower_trust_leader_quorum1_enabled() -> bool:
+    """DEFAULT ON: at quorum<=1, a follower adopts the leader's SIGNED champion WITHOUT
+    independently re-benchmarking it. At quorum=1 the leader self-certifies as the sole
+    on-chain authority, and a follower CANNOT reproduce the leader's benchmark pack
+    (apps/orders/fork-pins drift across the close->certify boundary) — so requiring
+    self_verify there just makes every follower burn the champion miner's emissions
+    while the leader certs alone, which rewards no one. Adoption is still gated by the
+    leader's EIP-712 signature (verify_approval, checked upstream), a real-miner hotkey,
+    and the leader's finalize signal (not _leader_refused). INERT at quorum>1, where the
+    independent self_verify check always stands. Disable per-node with
+    ``FOLLOWER_TRUST_LEADER_QUORUM1`` in {0,false,no,off}. Read at call time.
+    """
+    raw = os.environ.get("FOLLOWER_TRUST_LEADER_QUORUM1")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 async def _resolve_image_id_via_docker(image_tag: str) -> str | None:
     """Return the local sha256 image_id for *image_tag*, or None on error.
 
@@ -676,15 +694,26 @@ class EpochManager:
             # advance. None = absent field (old leader): preserve legacy adopt logic so a
             # new follower against an old leader is never stranded (mixed-version bridge).
             _leader_refused = leader_champion_changed is False
-            if _leader_refused or not (_follower_weight_adopt_enabled() and _self_verified and _real):
+            # Quorum-1 trust (see _follower_trust_leader_quorum1_enabled): at quorum<=1
+            # the leader self-certifies as the sole on-chain writer and the follower
+            # cannot reproduce its benchmark pack, so it adopts the leader's SIGNED
+            # champion (verify_approval already passed upstream) WITHOUT the independent
+            # self_verify. INERT at quorum>1, where self_verify always stands.
+            _quorum = int(getattr(certificate, "quorum_required", 0) or 0)
+            _trust_q1 = _quorum <= 1 and _follower_trust_leader_quorum1_enabled()
+            _verified_or_trusted = _self_verified or _trust_q1
+            if _leader_refused or not (
+                _follower_weight_adopt_enabled() and _verified_or_trusted and _real
+            ):
                 _reason = "leader_merge_failed" if _leader_refused else "follower_adopt_gated"
                 logger.info(
                     "[follower-adopt] round %s: NOT self-adopting champion %s "
-                    "(reason=%s opt_in=%s self_verified=%s real_hotkey=%s leader_changed=%s) "
-                    "— champion/weights unchanged (burn-to-owner).",
+                    "(reason=%s opt_in=%s self_verified=%s trust_q1=%s quorum=%s "
+                    "real_hotkey=%s leader_changed=%s) — champion/weights unchanged "
+                    "(burn-to-owner).",
                     round_id, certificate.candidate_submission_id, _reason,
-                    _follower_weight_adopt_enabled(), _self_verified, _real,
-                    leader_champion_changed,
+                    _follower_weight_adopt_enabled(), _self_verified, _trust_q1, _quorum,
+                    _real, leader_champion_changed,
                 )
                 # Rollback: if a PRIOR self-adopt left a real champion-of-record and we are
                 # now NOT adopting (flag off / not verified / leader refused), durably
@@ -698,9 +727,10 @@ class EpochManager:
                     result["next_round_id"] = next_round.round_id
                 return result
             logger.info(
-                "[follower-adopt] round %s: self-adopting verified champion %s "
-                "(FOLLOWER_CHAMPION_WEIGHT_ADOPT on) — emitting champion weights.",
+                "[follower-adopt] round %s: adopting champion %s (%s) — emitting "
+                "champion weights.",
                 round_id, certificate.candidate_submission_id,
+                "self-verified" if _self_verified else "quorum<=1 leader-trust",
             )
 
         await self._hot_swap(submission, effective_epoch, round_id=round_id)
