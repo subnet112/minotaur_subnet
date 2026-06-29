@@ -44,12 +44,31 @@ _CHAL_INTENT = [
 ]
 
 
-def _sub(per_intent, *, sid="sub-1", score=0.9, status="scored"):
+# A STORED same-pin relative block, as persisted onto a competitor's
+# benchmark_details["relative"] by EpochManager._persist_round_relative_counts at
+# round evaluation (champion@A vs competitor@A — same fork-pin).
+_STORED_DETHRONE = {
+    "better": 2, "worse": 0, "matched": 0, "new": 0, "compared": 2,
+    "verdict": "dethrone", "per_order": [], "round_id": "round-e1-n1",
+}
+# A stored block that disagrees with what a cross-fork recompute of the fixtures
+# below WOULD produce (those fixtures recompute to better=2/dethrone). Used to
+# prove the read side surfaces the STORED block verbatim, never a recompute.
+_STORED_MATCHED = {
+    "better": 0, "worse": 0, "matched": 2, "new": 0, "compared": 2,
+    "verdict": "matched", "per_order": [], "round_id": "round-e1-n1",
+}
+
+
+def _sub(per_intent, *, sid="sub-1", score=0.9, status="scored", relative=None):
+    details = {"per_intent": per_intent, "scorecard": {}}
+    if relative is not None:
+        details["relative"] = relative
     return SimpleNamespace(
         submission_id=sid,
         status=status,
         benchmark_score=score,
-        benchmark_details={"per_intent": per_intent, "scorecard": {}},
+        benchmark_details=details,
         screening={},
     )
 
@@ -83,42 +102,56 @@ def test_report_off_is_unchanged(monkeypatch):
     assert "shadow_relative" in rpt
 
 
-def test_report_on_adds_relative_counts(monkeypatch):
+def test_report_on_reads_stored_same_pin_counts(monkeypatch):
     monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
-    rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
+    rpt = _build_report(
+        _sub(_CHAL_INTENT, relative=_STORED_DETHRONE), {"per_intent": _CHAMP_INTENT},
+    )
     assert rpt["scoring_mode"] == "relative"
-    rel = rpt["relative"]
-    assert rel["better"] == 2
-    assert rel["worse"] == 0
-    assert rel["verdict"] == "dethrone"
+    # Surfaced verbatim from the submission's OWN stored same-pin block.
+    assert rpt["relative"] is _STORED_DETHRONE
+    assert rpt["relative"]["better"] == 2
+    assert rpt["relative"]["verdict"] == "dethrone"
     assert rpt["reason_relative"].startswith("adopted")
     # Legacy fields still present (additive, cleanup deferred).
     assert rpt["aggregate"]["your_score"] == 0.9
 
 
-def test_report_on_no_shadow_rows_omits_block(monkeypatch):
+def test_report_relative_is_stored_not_cross_fork_recompute(monkeypatch):
+    """The relative block is READ from the stored same-pin counts, NEVER recomputed
+    cross-fork against the champion's latest details. Proof: the stored block says
+    'matched' while a cross-fork recompute of these fixtures (chal 120/250 vs champ
+    100/200) would say better=2/dethrone — the report MUST show the stored block."""
     monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
-    # Champion benched before shadow existed: rows but no shadow_score.
-    champ = {"per_intent": [{"intent_id": "o1", "score": 0.9}]}
-    rpt = _build_report(_sub(_CHAL_INTENT), champ)
+    rpt = _build_report(
+        _sub(_CHAL_INTENT, relative=_STORED_MATCHED), {"per_intent": _CHAMP_INTENT},
+    )
+    assert rpt["relative"] == _STORED_MATCHED
+    assert rpt["relative"]["verdict"] == "matched"
+    assert rpt["relative"]["better"] == 0  # NOT the 2 a cross-fork recompute gives
+
+
+def test_report_on_no_stored_relative_omits_block(monkeypatch):
+    """No STORED relative block → the block is omitted (pending). Even though the
+    submission AND the passed champion_details both carry shadow_score rows (a
+    cross-fork recompute WOULD produce a block), there is no fallback."""
+    monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
+    rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
     assert rpt["scoring_mode"] == "relative"  # mode flips on the flag
-    assert "relative" not in rpt             # but no counts (graceful omit)
+    assert "relative" not in rpt             # no stored counts → graceful omit
+    assert "reason_relative" not in rpt
 
 
 # ── round response: finalist relative block ──────────────────────────────────
 
 
-def _wire_round_stores(monkeypatch, finalist_intent, champ_intent):
-    finalist = _sub(finalist_intent, sid="fin-1")
-    champ = _sub(champ_intent, sid="champ-1")
-    fake_store = SimpleNamespace(
-        get=lambda sid: {"fin-1": finalist, "champ-1": champ}.get(sid)
-    )
-    fake_round_store = SimpleNamespace(
-        get_active_champion=lambda: SimpleNamespace(submission_id="champ-1")
-    )
+def _wire_round_stores(monkeypatch, *, finalist_relative=None):
+    """Wire a fake store whose finalist carries (or lacks) a STORED relative block.
+    The round response now READS the finalist's own ``benchmark_details['relative']``
+    (same-pin, persisted at evaluation) — it never recomputes against the champion."""
+    finalist = _sub(_CHAL_INTENT, sid="fin-1", relative=finalist_relative)
+    fake_store = SimpleNamespace(get=lambda sid: {"fin-1": finalist}.get(sid))
     monkeypatch.setattr(round_manager, "get_store", lambda: fake_store)
-    monkeypatch.setattr(round_manager, "get_round_store", lambda: fake_round_store)
 
 
 def _round_state():
@@ -145,7 +178,7 @@ def test_round_response_off_byte_for_byte(monkeypatch):
 
 def test_round_response_on_attaches_finalist_relative(monkeypatch):
     monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
-    _wire_round_stores(monkeypatch, _CHAL_INTENT, _CHAMP_INTENT)
+    _wire_round_stores(monkeypatch, finalist_relative=_STORED_DETHRONE)
     resp = round_manager._round_state_to_response(_round_state())
     dumped = resp.model_dump()
     assert dumped["scoring_mode"] == "relative"
@@ -156,13 +189,9 @@ def test_round_response_on_attaches_finalist_relative(monkeypatch):
     assert dumped["finalist_score"] == 0.95
 
 
-def test_round_response_on_no_shadow_rows_omits_block(monkeypatch):
+def test_round_response_on_no_stored_relative_omits_block(monkeypatch):
     monkeypatch.setenv("RELATIVE_SCORING_ENABLED", "1")
-    _wire_round_stores(
-        monkeypatch,
-        [{"intent_id": "o1", "score": 0.9}],   # finalist: no shadow rows
-        _CHAMP_INTENT,
-    )
+    _wire_round_stores(monkeypatch, finalist_relative=None)  # finalist has no stored block
     resp = round_manager._round_state_to_response(_round_state())
     dumped = resp.model_dump()
     assert dumped["scoring_mode"] == "relative"

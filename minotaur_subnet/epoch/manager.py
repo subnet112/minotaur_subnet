@@ -440,6 +440,14 @@ class EpochManager:
         # easier scenarios) impossible to beat.
         await self._refresh_incumbent_score()
 
+        # DISPLAY-ONLY: persist each competitor's SAME-PIN relative counts vs the
+        # just-refreshed champion (champion@this-round-pin). The API report/round
+        # response then READ these stored counts instead of recomputing them
+        # cross-fork against the champion's latest (different-pin) record. Gated on
+        # relative_scoring_active() and fully best-effort — it must never affect the
+        # authoritative verdict below.
+        self._persist_round_relative_counts(round_id)
+
         # Record the leader's would-be vote (observability), then proceed on the
         # PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced at the
         # COMMIT boundary (activate_certified_round), NOT here — so under the freeze
@@ -1282,6 +1290,59 @@ class EpochManager:
         except Exception as exc:  # observe-only — must never break the live decision
             logger.warning("[shadow-per-order-adoption] failed (ignored): %s", exc)
             return None
+
+    def _persist_round_relative_counts(self, round_id: str) -> None:
+        """DISPLAY-ONLY: persist same-pin relative counts for each competitor.
+
+        Call AFTER :meth:`_refresh_incumbent_score` (which re-benches the champion
+        at THIS round's pin and persists its fresh ``per_intent``). For every
+        competitor benched this round at the SAME pin, compute its relative counts
+        vs that same-pin champion ``per_intent`` and persist them onto the
+        competitor's ``benchmark_details["relative"]`` (tagged with ``round_id``),
+        so the API surfaces correct same-pin counts instead of recomputing them
+        cross-fork against the champion's latest (later, different-pin) record.
+
+        This reads the SAME stored champion rows the authoritative
+        :meth:`_evaluate_shadow_per_order` reads, so the displayed counts agree
+        with the live verdict by construction. Gated on ``relative_scoring_active``
+        and fully best-effort: a competitor / champion lacking ``shadow_score``
+        rows is skipped (no block → the report shows pending), and any failure is
+        swallowed — a display computation must never break round evaluation.
+        """
+        try:
+            from minotaur_subnet.epoch.relative_scoring import (
+                has_shadow_rows,
+                relative_counts,
+                relative_scoring_active,
+            )
+
+            if not relative_scoring_active():
+                return
+            if self._sub_store is None or not self._champion.submission_id:
+                return
+            champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
+            if not has_shadow_rows(champ_rows):
+                return
+            for competitor in self._sub_store.list_by_round(round_id):
+                if competitor.submission_id == self._champion.submission_id:
+                    continue
+                comp_rows = self._per_intent(competitor)
+                if not has_shadow_rows(comp_rows):
+                    continue
+                try:
+                    counts = relative_counts(champ_rows, comp_rows)
+                    counts["round_id"] = round_id
+                    self._sub_store.merge_benchmark_details(
+                        competitor.submission_id, {"relative": counts},
+                    )
+                except Exception:
+                    logger.debug(
+                        "relative-counts persist failed for %s",
+                        getattr(competitor, "submission_id", "?"),
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.debug("relative-counts persist pass failed for round %s", round_id, exc_info=True)
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
         """Extract the scorecard from a submission's benchmark details."""
