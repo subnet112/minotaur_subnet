@@ -436,6 +436,30 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
     return _close_solver_round_state(body)
 
 
+def autoscaled_decision_window(
+    n_submissions: int,
+    *,
+    base_epochs: int,
+    per_sub_epochs: int,
+    floor_epochs: int,
+) -> int:
+    """Auto-scale the round's decision-deadline window with the slate size.
+
+    The leader benchmarks challengers SERIALLY on the shared sim (#387), so the
+    close→adopt time grows ~linearly with the submission count. A FIXED window
+    silently aborts contested rounds the instant the leader votes adopt
+    (certification_deadline_elapsed) once the slate is large enough — the
+    deadline-abort that loses clean dethrones. Scale the window with the slate (fixed
+    ``base_epochs`` overhead + ``per_sub_epochs`` serial cost per submission), floored
+    at ``floor_epochs`` (= SOLVER_ROUND_DECISION_EPOCHS) so small rounds keep their
+    existing margin. The leader computes + broadcasts the resulting deadline, so
+    followers inherit the identical value.
+    """
+    n = max(0, int(n_submissions))
+    scaled = int(base_epochs) + n * int(per_sub_epochs)
+    return max(scaled, int(floor_epochs))
+
+
 def _round_certification_deadline_elapsed(round_state: RoundState) -> bool:
     """Return whether the round can no longer be certified."""
     if round_state.certificate is not None:
@@ -472,8 +496,21 @@ def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
 
 
 def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
-    """Serialize a certified round for peer sync."""
+    """Serialize a certified round for the /internal/certify broadcast.
+
+    Canonical builder shared by the operator certify endpoint and the champion
+    re-attest endpoint (and byte-for-byte equal to the automated coordinator's
+    ``_certify_sync_payload`` in startup.py). It MUST carry the v2 EIP-712 digest
+    fields (commit_hash/nonce/deadline) at the TOP level — sourced from the leader's
+    own signed approval, since every signer signs the SAME proposal tuple — or a
+    follower rebuilds the proposal with its OWN wall-clock nonce, the digest diverges,
+    and verify_approval rejects the cert ("Invalid champion approvals"). This is the
+    #414/#417 regression; omitting the fields here was the residual operator-path gap.
+    Approvals use ``approval.to_dict()`` so the per-approval v2 fields ride along too.
+    """
     certificate = state.certificate
+    cert_approvals = certificate.approvals if certificate is not None else []
+    _lead = cert_approvals[0] if cert_approvals else None
     return {
         "round_id": state.round_id,
         "candidate_submission_id": state.finalist_submission_id,
@@ -483,21 +520,10 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "shadow_case_log_hash": state.shadow_case_log_hash,
         "effective_epoch": state.effective_epoch or 0,
         "quorum_required": state.quorum_required or 0,
-        "approvals": [
-            {
-                "validator_id": approval.validator_id,
-                "timestamp": approval.timestamp,
-                "signature": approval.signature,
-                "committee_hash": approval.committee_hash,
-                "incumbent_image_id": approval.incumbent_image_id,
-                "candidate_submission_id": approval.candidate_submission_id,
-                "candidate_image_id": approval.candidate_image_id,
-                "benchmark_pack_hash": approval.benchmark_pack_hash,
-                "shadow_case_log_hash": approval.shadow_case_log_hash,
-                "effective_epoch": approval.effective_epoch,
-            }
-            for approval in (certificate.approvals if certificate is not None else [])
-        ],
+        "commit_hash": getattr(_lead, "commit_hash", None),
+        "nonce": int(getattr(_lead, "nonce", 0) or 0),
+        "deadline": int(getattr(_lead, "deadline", 0) or 0),
+        "approvals": [approval.to_dict() for approval in cert_approvals],
     }
 
 

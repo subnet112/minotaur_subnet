@@ -53,7 +53,10 @@ def monitor_app(
         "recent_executions": {
             "total": stats["total_executions"],
             "successful": stats["successful_executions"],
+            # avg_score blends in failures (~0 BPS); avg_success_score is the avg
+            # quality of SUCCESSFUL fills only. Both in on-chain BPS (0..10000).
             "avg_score": round(stats["avg_score"], 4),
+            "avg_success_score": round(stats["avg_success_score"], 4),
             "last_triggered": stats["last_triggered"],
         },
         "solver_stats": {
