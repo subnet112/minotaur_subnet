@@ -410,15 +410,17 @@ def get_app_status(
     stats = store.get_stats(app_id)
     quote_stats = store.get_quote_stats(app_id)
 
-    # Champion score and per-scenario breakdown from submission store
-    champion_score = 0.0
+    # Per-scenario breakdown from the champion's submission. Post relative-cutover
+    # the champion has NO absolute score — it is the relative baseline every
+    # challenger is measured against per order — so ``champion_score`` is null
+    # (was a saturated benchmark_score). The per-scenario entries are kept for
+    # display but are JS validity sentinels now, not quality grades.
     scenario_scores: dict[str, float] = {}
     try:
         from minotaur_subnet.api.routes.submissions import get_store as _get_sub_store
         sub_store = _get_sub_store()
         champion = sub_store.get_champion()
         if champion is not None:
-            champion_score = champion.benchmark_score or 0.0
             details = champion.benchmark_details or {}
             for entry in details.get("per_intent", []):
                 intent_id = entry.get("intent_id", "")
@@ -449,7 +451,7 @@ def get_app_status(
     else:
         status = AppStatus.DRAFT.value
 
-    return {
+    result: dict[str, Any] = {
         "app_id": app_id,
         "name": definition.name,
         "status": status,
@@ -462,7 +464,8 @@ def get_app_status(
         "last_triggered": stats["last_triggered"],
         "recent_scores": stats.get("recent_scores", []),
         "quote_stats": quote_stats,
-        "champion_score": round(champion_score, 4),
+        # Null: the champion is the relative baseline, not a numeric score to beat.
+        "champion_score": None,
         "scenario_scores": scenario_scores,
         # Primary deployment
         "deployment": {
@@ -481,6 +484,16 @@ def get_app_status(
             for cid, d in deployments.items()
         },
     }
+
+    # The relative rule is the sole adoption path, so always mark ``scoring_mode``
+    # "relative" — the dashboard knows the saturated ``champion_score`` is no longer
+    # the headline metric and reads the per-submission relative COUNTS surfaced on
+    # the submission-status (report) and solver-round endpoints. The champion is the
+    # relative baseline, so there is no challenger to count against here; the
+    # per-submission relative blocks live on the endpoints that carry a challenger +
+    # the champion.
+    result["scoring_mode"] = "relative"
+    return result
 
 
 def update_scoring(

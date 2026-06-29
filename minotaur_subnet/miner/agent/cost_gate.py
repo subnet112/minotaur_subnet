@@ -41,8 +41,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATE_FILE = "cost_gate_state.json"
 
 # Env-var defaults. Set per-miner via compose.
+#
+# The plateau/stagnation deltas are deltas on the COUNTS-BASED PROGRESS RATIO
+# the loop now feeds in — ``better/compared`` (fraction of orders the miner's
+# latest submission beats the champion on), a [0,1] number. They were 0..1
+# JS-score deltas before the relative-cutover; because the progress ratio is
+# also [0,1] the same thresholds carry over unchanged (a 0.5% / 1% move in the
+# fraction of orders won). See loop._current_progress_signal.
 DEFAULT_PLATEAU_K = 5
-DEFAULT_PLATEAU_MIN_DELTA = 0.005          # 0.5% improvement required to reset
+DEFAULT_PLATEAU_MIN_DELTA = 0.005          # +0.5% of orders-won required to reset
 DEFAULT_PLATEAU_COOLDOWN_SECONDS = 4 * 3600  # 4h
 DEFAULT_TOKEN_BUDGET_PER_DAY = 100_000
 
@@ -55,10 +62,12 @@ DEFAULT_TOKEN_BUDGET_PER_DAY = 100_000
 DEFAULT_NO_PROGRESS_BREAKER_SECONDS = 3 * 24 * 3600  # 3 days
 DEFAULT_NO_PROGRESS_COOLDOWN_SECONDS = 24 * 3600     # 24h cooldown when triggered
 
-# Stagnation detector: if pre-sim mean has stayed within +/- this delta
-# across the last K real (non-transient) Claude runs, the miner is
-# churning — Claude is iterating but not exploring new ground. Trigger a
-# long cooldown so we don't bleed budget on a stuck hypothesis.
+# Stagnation detector: if the relative-progress ratio (better/compared) has
+# stayed within +/- this delta across the last K benchmarked submissions, the
+# miner is churning — Claude is iterating but not winning more orders. Trigger
+# a long cooldown so we don't bleed budget on a stuck hypothesis. (Pre-cutover
+# this tracked the pre-sim 0..1 score mean; that's now a saturated validity
+# sentinel, so the loop feeds the counts ratio instead — same [0,1] delta.)
 DEFAULT_STAGNATION_WINDOW = 5
 DEFAULT_STAGNATION_DELTA = 0.01
 DEFAULT_STAGNATION_COOLDOWN_SECONDS = 12 * 3600  # 12h
@@ -153,12 +162,14 @@ class CostGate:
             self.state.token_budget_used = 0
 
     def record_pre_sim_score(self, mean_score: float) -> None:
-        """Append a pre-sim mean score to the stagnation window.
+        """Append a relative-progress ratio to the stagnation window.
 
-        Only call this for *real* Claude runs — runs where the pre-sim
-        actually exercised the strategy. Skip for transient-failure
-        cycles (Anvil unavailable) since those tell us nothing about
-        whether Claude is exploring new ground.
+        Post relative-cutover this receives the ``better/compared`` ratio
+        (fraction of orders beating the champion) once per benchmarked
+        submission — NOT the old pre-sim 0..1 score mean, which is now a
+        saturated validity sentinel. A flat ratio across K submissions ⇒ Claude
+        is churning, not winning more orders. The arg name is kept for API
+        stability. (Skip transient-failure cycles — they tell us nothing.)
         """
         self.state.recent_pre_sim_scores.append(float(mean_score))
         # Cap window
@@ -181,7 +192,9 @@ class CostGate:
     def record_cycle(self, *, best_score: float, submitted: bool) -> None:
         """Update plateau + submission state after a cycle finishes.
 
-        ``best_score`` is this miner's best observed score this cycle.
+        ``best_score`` is this miner's progress signal this cycle — post-cutover
+        the counts-based ``better/compared`` ratio (best across apps), a [0,1]
+        number, NOT a JS quality score. Arg name kept for API stability.
         ``submitted`` is True if the cycle actually POSTed a submission.
         """
         delta = best_score - self.state.last_observed_score
@@ -236,9 +249,13 @@ class CostGate:
 
         Args:
           champion: dict from ``GET /v1/solver/champion`` or None.
-          my_best_score: our best score across our strategies.
-          top_rival_score: best score across non-us submissions in the
-                           current round.
+          my_best_score: our progress signal — post-cutover the counts-based
+                         ``better/compared`` ratio (fraction of orders beating
+                         the champion), [0,1]. 0 when we have no relative signal.
+          top_rival_score: best rival progress; inert post-cutover (no per-rival
+                           relative ratio is served, so the loop passes 0) — the
+                           "rival is ahead" case is detected via
+                           new_submissions_since_ours instead.
           new_submissions_since_ours: count of submissions from any miner
                                       created after our latest submission.
         """

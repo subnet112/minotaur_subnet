@@ -149,6 +149,9 @@ class TestTick:
 
 
 class TestScoreThreshold:
+    # NOTE: the JS quality-threshold gate is retired post relative-cutover (the
+    # JS score is a validity sentinel now); the authoritative accept/reject is
+    # the on-chain scoreIntent gate. This lenient test is kept as a smoke check.
     @pytest.mark.asyncio
     async def test_high_threshold_rejects(self, temp_store, app_def):
         temp_store.save_app(app_def)
@@ -514,21 +517,29 @@ class TestOrderPersistence:
 
     @pytest.mark.asyncio
     async def test_order_persisted_after_rejection(self, temp_store, app_def):
+        # The JS quality-threshold gate is retired post relative-cutover, so a
+        # rejection is forced via the authoritative on-chain gate: a deployed
+        # contract whose scoreIntent comes back below the BPS threshold.
         temp_store.save_app(app_def)
         temp_store.save_deployment(DeploymentResult(
             app_id="test_app", status=AppStatus.ACTIVE,
+            contract_address="0x" + "ab" * 20,
         ))
         ob = IntentOrderBook()
+        mock_sim = AsyncMock()
+        mock_sim.simulate = AsyncMock(return_value=SimulationResult(
+            success=True, gas_used=100000, on_chain_score=3000,  # below 5000 BPS
+        ))
         loop = BlockLoop(
             orderbook=ob,
             app_store=temp_store,
             relayer=MockRelayer(),
-            score_threshold=0.99,  # Very high to force rejection
+            simulator=mock_sim,
         )
         ob.submit(
             app_id="test_app",
             intent_function="execute",
-            params={},
+            params={"input_token": "WETH", "output_token": "USDC", "input_amount": "1000"},
             submitted_by="0xuser",
         )
         await loop.tick()
@@ -709,12 +720,23 @@ def test_onchain_score_fail_closed_flag(monkeypatch):
 
 
 class TestPerAppScoreThreshold:
-    """Tests for per-app JS score threshold (SCR-7)."""
+    """Per-app JS score threshold (SCR-7) is RETIRED post relative-cutover.
+
+    The JS score is a 0/1 validity sentinel now, so the configurable 0..1
+    threshold no longer gates. These tests still pass but the accept/reject is
+    driven by the on-chain gate (a contract + no/None on-chain score fails
+    closed; a None score under the break-glass fail-open is accepted), NOT by
+    ``config.score_threshold``, which is inert.
+    """
 
     @pytest.mark.asyncio
     async def test_per_app_threshold_used(self, temp_store, app_def):
-        """App with high per-app threshold should reject mock-scored orders."""
-        app_def.config.score_threshold = 0.95  # Higher than mock score (~0.75)
+        """Contract present + no on-chain score ⇒ on-chain fail-closed rejects.
+
+        (Was: high per-app JS threshold rejects a mock-scored order — that gate
+        is retired; the rejection now comes from the on-chain fail-closed gate.)
+        """
+        app_def.config.score_threshold = 0.95  # inert (retired JS gate)
         temp_store.save_app(app_def)
         temp_store.save_deployment(DeploymentResult(
             app_id="test_app", status=AppStatus.ACTIVE,
@@ -734,17 +756,21 @@ class TestPerAppScoreThreshold:
             submitted_by="0xuser",
         )
         result = await loop.tick()
-        # Mock score ~0.75 < per-app 0.95, should reject
+        # No simulator ⇒ on_chain_score None + contract present ⇒ fail-closed rejects.
         assert result.orders_rejected == 1
 
     @pytest.mark.asyncio
     async def test_low_per_app_threshold_accepts(self, temp_store, app_def, monkeypatch):
-        """App with low per-app threshold should accept mock-scored orders."""
-        # Mock simulator yields no on-chain score; the dual-scoring gate now fails
-        # CLOSED by default, so use the break-glass to test the per-app threshold in
-        # isolation (the on-chain gate has its own dedicated tests above).
+        """Break-glass fail-open + no on-chain score ⇒ order is accepted.
+
+        (Was: low per-app JS threshold accepts a mock-scored order — that gate is
+        retired; with the JS gate gone and the on-chain gate fail-OPEN here, the
+        order rides through.)
+        """
+        # Mock simulator yields no on-chain score; the on-chain gate fails CLOSED
+        # by default, so use the break-glass fail-open to let the order through.
         monkeypatch.setenv("ONCHAIN_SCORE_FAIL_CLOSED", "0")
-        app_def.config.score_threshold = 0.1  # Lower than mock score
+        app_def.config.score_threshold = 0.1  # inert (retired JS gate)
         temp_store.save_app(app_def)
         temp_store.save_deployment(DeploymentResult(
             app_id="test_app", status=AppStatus.ACTIVE,

@@ -29,13 +29,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from minotaur_subnet.epoch.adopt_rule import (
-    ADOPT_RULE,
-    DEFAULT_ADOPT_RULE_CONFIG,
-    _app_onchain_mean,
-    _evaluate_onchain,
-    evaluate_adoption,
-)
 from minotaur_subnet.harness.submission_store import (
     Submission,
     SubmissionStatus,
@@ -211,6 +204,11 @@ class EpochManager:
         self._last_emit_state: dict | None = None
 
         restored = self._restore_active_champion_submission()
+        # Champion submission recovered at boot (or None). Used by
+        # ensure_live_solver_matches_champion() to relaunch the live ORDER solver
+        # onto the adopted champion after a restart — the restore below only
+        # rebuilds champion METADATA, not the running solver.
+        self._restored_champion_submission = restored
         if restored is not None:
             restored_snapshot = (
                 self._round_store.get_active_champion()
@@ -333,18 +331,17 @@ class EpochManager:
                 if next_round is not None:
                     result["next_round_id"] = next_round.round_id
         else:
+            reject_reason = getattr(self, "_last_adopt_reason", None) or "did not beat the champion"
             logger.info(
-                "Challenger score %.4f does not beat champion %.4f by %.3g%% margin",
-                new_champion_sub.benchmark_score or 0,
-                self._champion.benchmark_score,
-                self._dethrone_margin * 100,
+                "Challenger %s not adopted (relative per-order rule): %s",
+                getattr(new_champion_sub, "submission_id", "?"), reject_reason,
             )
-            self._notify_champion_rejected(new_champion_sub, "did not beat the champion")
+            self._notify_champion_rejected(new_champion_sub, reject_reason)
             next_round = self._complete_round(
                 current_round,
                 epoch,
                 activated=False,
-                abort_reason="dethrone_margin_not_met",
+                abort_reason=reject_reason,
             )
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
@@ -440,6 +437,13 @@ class EpochManager:
         # easier scenarios) impossible to beat.
         await self._refresh_incumbent_score()
 
+        # DISPLAY-ONLY: persist each competitor's SAME-PIN relative counts vs the
+        # just-refreshed champion (champion@this-round-pin). The API report/round
+        # response then READ these stored counts instead of recomputing them
+        # cross-fork against the champion's latest (different-pin) record. Fully
+        # best-effort — it must never affect the authoritative verdict below.
+        self._persist_round_relative_counts(round_id)
+
         # Record the leader's would-be vote (observability), then proceed on the
         # PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced at the
         # COMMIT boundary (activate_certified_round), NOT here — so under the freeze
@@ -448,16 +452,20 @@ class EpochManager:
         # measured without ever adopting.
         self._record_would_be_vote(finalist)
         if not self._meets_adoption_criteria(finalist):
+            # Relative-rule reject reason (e.g. "reject: N regression(s)/drop(s)" /
+            # "reject: no win (challenger only matched the champion)"), not the
+            # obsolete saturated "dethrone_margin_not_met".
+            reject_reason = getattr(self, "_last_adopt_reason", None) or "did not beat the champion"
             next_round = self._complete_round(
                 round_state,
                 epoch,
                 activated=False,
-                abort_reason="dethrone_margin_not_met",
+                abort_reason=reject_reason,
             )
             # Mirror the reject onto the challenger's PR (comment + close + GC).
-            self._notify_champion_rejected(finalist, "did not beat the champion")
+            self._notify_champion_rejected(finalist, reject_reason)
             result["status_after"] = RoundStatus.ABORTED.value
-            result["abort_reason"] = "dethrone_margin_not_met"
+            result["abort_reason"] = reject_reason
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
@@ -672,12 +680,6 @@ class EpochManager:
             kwargs["champion_score"] = self._champion.benchmark_score
         if "dethrone_margin" in params:
             kwargs["dethrone_margin"] = self._dethrone_margin
-        if "champion_details" in params and self._champion.submission_id:
-            try:
-                champ_sub = self._sub_store.get(self._champion.submission_id)
-                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
-            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
-                pass
         # Private submissions: the report must post to the miner's PRIVATE repo,
         # which needs the per-submission token. Fetch it from the (same-process)
         # store; None for public submissions → the callback falls back to canonical.
@@ -724,12 +726,6 @@ class EpochManager:
             kwargs["champion_score"] = self._champion.benchmark_score
         if "dethrone_margin" in params:
             kwargs["dethrone_margin"] = self._dethrone_margin
-        if "champion_details" in params and self._champion.submission_id:
-            try:
-                champ_sub = self._sub_store.get(self._champion.submission_id)
-                kwargs["champion_details"] = getattr(champ_sub, "benchmark_details", None)
-            except Exception:  # noqa: BLE001 — feedback enrichment must not break the path
-                pass
         # Private submissions: report must post to the miner's PRIVATE repo (needs
         # the per-submission token). None for public → callback uses canonical.
         if "repo_token" in params:
@@ -956,13 +952,18 @@ class EpochManager:
             old_score = self._champion.benchmark_score
             self._champion.benchmark_score = fresh_score
 
-            # Persist the refreshed score + details. Also persist when the stored
-            # scorecard predates the on-chain plumbing (no app_onchain) so the
-            # on-chain-ranked rule has the champion's per-app on-chain means even
-            # when the JS score is unchanged — otherwise p2oc would reject a
-            # legitimate challenger for lack of a champion baseline.
-            _stored = self._get_incumbent_scorecard() or {}
-            if self._sub_store and (fresh_score != old_score or not _stored.get("app_onchain")):
+            # Display-path + adoption consistency (#FIX): ALWAYS persist this round's
+            # FRESH re-bench (score + per_intent, incl. shadow_score) back to the
+            # champion's submission record. The relative adoption rule
+            # (_evaluate_per_order_adoption) and the same-pin display persist
+            # (_persist_round_relative_counts, which reads the champion's STORED
+            # per_intent) BOTH join against the champion's STORED per_intent;
+            # persisting the same-round re-bench guarantees they compare the
+            # challenger against the SAME same-round/same-fork reference the adoption
+            # used — instead of a stale bench from a different round/fork (which
+            # produced transient wrong counts on the frontend). Persist whenever we
+            # have fresh details so a JS-unchanged round still refreshes the rows.
+            if self._sub_store and details is not None:
                 self._sub_store.set_benchmark_result(
                     incumbent_sub.submission_id,
                     score=fresh_score,
@@ -988,42 +989,60 @@ class EpochManager:
     def _record_would_be_vote(self, challenger: Submission) -> None:
         """Publish this leader's INDEPENDENT would-be adopt vote (observability).
 
-        Computed via the shared rule and recorded REGARDLESS of
-        DISABLE_CHAMPION_ADOPTION, so the fleet quorum can be observed with adoption
+        Computed via the AUTHORITATIVE relative per-order rule
+        (:func:`evaluate_relative_adoption`) — the IDENTICAL rule the followers
+        publish (``champion_consensus._independent_adopt_vote``) and the leader's
+        own live decision (:meth:`_meets_adoption_criteria`) — so the leader's
+        published vote now MATCHES the followers' (both relative), not the old
+        saturated quote-anchored number. Recorded REGARDLESS of
+        DISABLE_CHAMPION_ADOPTION so the fleet quorum can be observed with adoption
         OFF. Best-effort and side-effect-free — never affects the live decision.
 
+        OBSERVABILITY ONLY: the recorded vote flows solely to
+        ``ctx.last_independent_vote`` -> the ``/health`` ``independent_vote`` field.
+        It is NEVER signed into the quorum certificate nor consumed by the consensus
+        decision (the signed follower vote is the RETURN value of
+        ``_independent_adopt_vote``; the leader's real verdict is
+        ``_meets_adoption_criteria``).
+
         Gated by the fleet-uniform observability default (CHALLENGER_QUORUM_MODE,
-        DEFAULT ON; break-glass {0,false,no,off}). Uses the single helper so the
-        leader's would-be vote and the follower's vote default-publish identically —
-        the empirical fleet test needs no per-validator config.
+        DEFAULT ON; break-glass {0,false,no,off}).
         """
         from minotaur_subnet.harness.benchmark_worker import _challenger_quorum_mode
 
         if not _challenger_quorum_mode():
             return
         try:
-            challenger_score = challenger.benchmark_score or 0
-            champion_score = self._champion.benchmark_score or 0
-            adopt, reason = evaluate_adoption(
-                challenger_score=challenger_score,
-                champion_score=champion_score,
-                challenger_scorecard=self._get_scorecard(challenger),
-                champion_scorecard=self._get_incumbent_scorecard(),
-                dethrone_margin=self._dethrone_margin,
-                has_champion=bool(self._champion.submission_id),
+            from minotaur_subnet.epoch.relative_scoring import (
+                evaluate_relative_adoption,
             )
+
+            incumbent_sub = (
+                self._sub_store.get(self._champion.submission_id)
+                if (self._sub_store and self._champion.submission_id)
+                else None
+            )
+            champ_rows = self._per_intent(incumbent_sub)
+            chal_rows = self._per_intent(challenger)
+            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            adopt = bool(verdict["adopt"])
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
                 "role": "leader",
                 "vote": "ADOPT" if adopt else "REJECT",
-                "chal_score": round(float(challenger_score), 4),
-                "champ_score": round(float(champion_score), 4),
-                "reason": reason,
+                "n_wins": verdict["n_wins"],
+                "n_regressions": verdict["n_regressions"],
+                "n_blind_spots": verdict["n_blind_spots"],
+                "n_matched": verdict["n_matched"],
+                "scenarios_compared": verdict["scenarios_compared"],
+                "reason": verdict["reason"],
             }
             logger.info(
-                "[independent-vote] role=leader candidate=%s vote=%s chal_score=%.4f "
-                "champ_score=%.4f: %s",
-                vote["candidate_id"], vote["vote"], challenger_score, champion_score, reason,
+                "[independent-vote] role=leader candidate=%s vote=%s wins=%d "
+                "regressions=%d blind_spots=%d matched=%d compared=%d: %s",
+                vote["candidate_id"], vote["vote"], verdict["n_wins"],
+                verdict["n_regressions"], verdict["n_blind_spots"],
+                verdict["n_matched"], verdict["scenarios_compared"], verdict["reason"],
             )
             if self._vote_recorder is not None:
                 self._vote_recorder(vote)
@@ -1033,22 +1052,19 @@ class EpochManager:
     def _should_adopt(self, challenger: Submission) -> bool:
         """Check if the challenger should replace the current champion.
 
-        Enforces (via the shared ``evaluate_adoption`` rule):
-        1. Per-app minimum (PER_APP_MIN_SCORE, default 0.3) — absolute sanity floor.
-        2. Per-app non-regression: no champion-covered app may be dropped, and
-           no app the champion solves may drop more than MAX_APP_REGRESSION (10%)
-        3. Global improvement over the champion by the dethrone margin (default 1%)
-
-        There is no absolute global-score floor — the global JS score is relative
-        to the champion reference, so the dethrone margin (beat the champion) is
-        the operative gate. The "user got their minimum outcome" 0.5 lives in the
-        separate per-order on-chain ``scoreIntent`` gate, not adoption.
+        Delegates the verdict to :meth:`_meets_adoption_criteria` — the SOLE
+        adoption rule is the relative per-order rule
+        (:func:`evaluate_relative_adoption`): the challenger must beat-or-match the
+        freshly re-benched champion on EVERY order's RAW delivered output and
+        strictly win at least one. Adds the synchronous-path
+        ``DISABLE_CHAMPION_ADOPTION`` freeze (that path commits immediately).
         """
         # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
         # BEFORE the disable gate so the shadow tally sees it with adoption off.
         self._record_would_be_vote(challenger)
 
         if _adoption_disabled():
+            self._last_adopt_reason = "adoption disabled (DISABLE_CHAMPION_ADOPTION)"
             logger.warning(
                 "[no-adopt] DISABLE_CHAMPION_ADOPTION is set — %s scored but NOT "
                 "adopted; champion unchanged. Unset the flag to resume adoption.",
@@ -1059,35 +1075,42 @@ class EpochManager:
         return self._meets_adoption_criteria(challenger)
 
     def _meets_adoption_criteria(self, challenger: Submission) -> bool:
-        """The PURE adoption verdict — challenger beats the champion per the shared
-        ``evaluate_adoption`` rule.
+        """The PURE adoption verdict — the relative per-order rule is the SOLE
+        decision: the challenger must beat-or-match the freshly re-benched champion
+        on EVERY order's RAW delivered output and strictly win at least one
+        (``evaluate_relative_adoption``). This is the IDENTICAL rule the followers
+        run (``champion_consensus._independent_adopt_vote``), so the leader and the
+        fleet decide alike.
 
         Does NOT consult ``DISABLE_CHAMPION_ADOPTION``: the freeze is enforced at the
         COMMIT boundary (``activate_certified_round``), so the consensus pipeline can
         broadcast + collect a would-be quorum observe-only under the freeze and the
-        fleet's cross-host agreement can be measured without ever adopting. This is
-        the identical rule body the followers run, so leader and fleet decide alike.
+        fleet's cross-host agreement can be measured without ever adopting.
 
         The synchronous standalone path (``process_epoch``) uses ``_should_adopt``
         instead, which keeps the freeze check because it commits immediately.
         """
-        challenger_score = challenger.benchmark_score or 0
-        champion_score = self._champion.benchmark_score or 0
+        # Record the human reason for the verdict (relative vocabulary) so the
+        # round-abort label + PR-reject message reflect WHY (no challenger delivered
+        # more / N regressions), not the obsolete "dethrone_margin_not_met".
+        self._last_adopt_reason = None
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
+            self._last_adopt_reason = "same submission as champion"
             return False
 
         # Fail-closed stale-bar guard: if an incumbent EXISTS but could not be
         # freshly re-benchmarked this round (_refresh_incumbent_score hit an
         # unresolvable-image / bad-results / benchmark-error path), the champion bar
-        # is STALE — ABSTAIN rather than decide adoption on an outdated number. This
-        # mirrors the follower's conservative REJECT (champion_consensus), so the
-        # leader and fleet never diverge on a stale bar. (No incumbent => not stale,
-        # bootstrap proceeds.)
+        # is STALE — ABSTAIN rather than decide adoption on an outdated per-order
+        # set. This mirrors the follower's conservative REJECT (champion_consensus),
+        # so the leader and fleet never diverge on a stale bar. (No incumbent =>
+        # not stale, bootstrap proceeds.)
         # getattr default False: a manager built via __new__ (tests) or never run
         # through a refresh has not had a failed refresh -> not stale.
         if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
+            self._last_adopt_reason = "stale incumbent bar (re-benchmark failed)"
             logger.warning(
                 "[abstain] incumbent %s could not be freshly re-benchmarked this "
                 "round — abstaining (refusing to adopt %s against a stale bar)",
@@ -1096,95 +1119,144 @@ class EpochManager:
             )
             return False
 
-        # On-chain co-ranked dethrone (code-gated). Default "current" falls through to
-        # the shared pure rule below. ADOPT_RULE=="p2oc" ranks the dethrone on the
-        # unfakeable on-chain OUTPUT surplus instead of the gas-polluted JS score. It is
-        # a fleet-uniform CODE constant (adopt_rule.ADOPT_RULE), not a per-validator env,
-        # and MUST NOT be enabled live until the cross-machine determinism gate passes.
-        if ADOPT_RULE == "p2oc":
-            return self._should_adopt_onchain(challenger)
-
-        challenger_scorecard = self._get_scorecard(challenger)
-        incumbent_scorecard = self._get_incumbent_scorecard()
-
-        # SHADOW (observe-only): while the live decision uses the current rule, log
-        # what the on-chain-ranked rule WOULD decide + the on-chain surplus, so the
-        # fleet can compare these determinism-critical signals across machines WITHOUT
-        # affecting any actual adoption. Default off. Never raises into the live path.
-        if os.environ.get("SHADOW_DETERMINISM", "").strip().lower() in ("1", "true", "yes", "on"):
-            self._log_shadow_determinism(challenger, challenger_scorecard, incumbent_scorecard)
-
-        # Delegate the rule body to the pure, shared decision function so the leader
-        # and followers make the identical decision.
-        adopt, reason = evaluate_adoption(
-            challenger_score=challenger_score,
-            champion_score=champion_score,
-            challenger_scorecard=challenger_scorecard,
-            champion_scorecard=incumbent_scorecard,
-            dethrone_margin=self._dethrone_margin,
-            has_champion=bool(self._champion.submission_id),
+        # The relative per-order rule is the SOLE adoption decision. On any error
+        # (no comparable per-order data) abstain — never adopt on uncertainty.
+        verdict = self._evaluate_per_order_adoption(challenger)
+        if verdict is None:
+            self._last_adopt_reason = "no comparable per-order data"
+            logger.warning(
+                "adoption decision for %s: ABSTAIN (relative per-order verdict "
+                "unavailable — no comparable per-order data)",
+                getattr(challenger, "submission_id", "?"),
+            )
+            return False
+        adopt = bool(verdict["adopt"])
+        self._last_adopt_reason = verdict["reason"]
+        logger.info(
+            "adoption decision for %s: adopt=%s (relative per-order: %s)",
+            getattr(challenger, "submission_id", "?"), adopt, verdict["reason"],
         )
-        logger.info("adoption decision for %s: adopt=%s (%s)",
-                    getattr(challenger, "submission_id", "?"), adopt, reason)
         return adopt
 
-    def _should_adopt_onchain(self, challenger: Submission) -> bool:
-        """On-chain co-ranked dethrone (ADOPT_RULE=p2oc) — thin wrapper over the pure
-        ``adopt_rule._evaluate_onchain``. Ranks the dethrone on the unfakeable on-chain
-        OUTPUT surplus (Δ scoreIntent BPS / 10000 > dethrone margin) instead of the
-        gas-polluted JS score. Kept as a method so direct callers (e.g.
-        ``_log_shadow_determinism``) and existing tests keep working; the
-        same-submission short-circuit in ``_should_adopt`` already ran.
-        """
-        adopt, reason = _evaluate_onchain(
-            challenger_scorecard=self._get_scorecard(challenger),
-            champion_scorecard=self._get_incumbent_scorecard(),
-            dethrone_margin=self._dethrone_margin,
-            has_champion=bool(self._champion.submission_id),
-            config=DEFAULT_ADOPT_RULE_CONFIG,
-        )
-        logger.info("p2oc decision for %s: adopt=%s (%s)",
-                    getattr(challenger, "submission_id", "?"), adopt, reason)
-        return adopt
+    @staticmethod
+    def _per_intent(submission: Submission | None) -> list[dict[str, Any]]:
+        """Per-order benchmark rows (with ``shadow_score``) from a submission's
+        ``benchmark_details``. Empty list when absent — the relative rule then
+        sees no orders and abstains (adopt=False, scenarios_compared=0)."""
+        details = getattr(submission, "benchmark_details", None) or {}
+        rows = details.get("per_intent") if isinstance(details, dict) else None
+        return rows if isinstance(rows, list) else []
 
-    def _log_shadow_determinism(self, challenger: Submission, chal_card, champ_card) -> None:
-        """Observe-only shadow of the on-chain-ranked decision (SHADOW_DETERMINISM).
+    def _evaluate_per_order_adoption(
+        self, challenger: Submission,
+    ) -> dict[str, Any] | None:
+        """Relative per-order adoption verdict — the SOLE adoption decision.
 
-        Logs, per challenger, the on-chain-ranked (p2oc) verdict + the net on-chain
-        output surplus + the per-app champion/challenger on-chain means — the exact
-        determinism-critical signals. Operators across the fleet can compare these
-        (same challenger + same pinned block -> same numbers, or consensus would split
-        if enabled). Has NO effect on the live adoption decision and never raises into
-        it. For the numbers to be comparable across validators they must benchmark at
-        the SAME pinned block (the fork-pin keystone); on the prod lead alone it still
-        surfaces p2oc's behavior on real challengers.
+        Joins the freshly re-benched incumbent's and the challenger's per-order RAW
+        delivered outputs (``benchmark_details.per_intent[*].shadow_score``, sourced
+        from the LIVE raw-output scorer's ``metadata.raw_output``) via the pure
+        :func:`evaluate_relative_adoption`, logs the verdict, and publishes it on
+        ``/health`` as ``per_order_adoption_vote``. Returns the verdict dict, or
+        ``None`` on error so the caller ABSTAINS (never adopts on uncertainty).
+
+        Relies on ``_refresh_incumbent_score`` having persisted the champion's FRESH
+        same-round per_intent back to its submission record (display-path fix), so
+        ``champ_rows`` is the same-round reference the challenger was scored against.
         """
         try:
-            chal_card = chal_card or {}
-            champ_card = champ_card or {}
-            champ_apps = champ_card.get("app_scores", {})
-            champ_oc = champ_card.get("app_onchain", {})
-            chal_oc = chal_card.get("app_onchain", {})
-            surpluses: list[float] = []
-            per_app: dict[str, float] = {}
-            for app in champ_apps:
-                co = _app_onchain_mean(champ_oc.get(app, []))
-                cco = _app_onchain_mean(chal_oc.get(app, []))
-                if co is not None and cco is not None:
-                    per_app[app] = round(cco - co, 1)
-                    surpluses.append(cco - co)
-            net_bps = (sum(surpluses) / len(surpluses)) if surpluses else 0.0
-            would_adopt = self._should_adopt_onchain(challenger)
-            logger.info(
-                "[shadow-determinism] challenger=%s p2oc_verdict=%s net_onchain_bps=%+.1f "
-                "per_app_surplus=%s champion_onchain=%s challenger_onchain=%s",
-                challenger.submission_id, "ADOPT" if would_adopt else "REJECT", net_bps,
-                per_app,
-                {a: _app_onchain_mean(v) for a, v in champ_oc.items()},
-                {a: _app_onchain_mean(v) for a, v in chal_oc.items()},
+            from minotaur_subnet.epoch.relative_scoring import (
+                evaluate_relative_adoption,
             )
-        except Exception as exc:  # observe-only — must never break the live decision
-            logger.warning("[shadow-determinism] failed (ignored): %s", exc)
+
+            incumbent_sub = (
+                self._sub_store.get(self._champion.submission_id)
+                if (self._sub_store and self._champion.submission_id)
+                else None
+            )
+            champ_rows = self._per_intent(incumbent_sub)
+            chal_rows = self._per_intent(challenger)
+            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+
+            logger.info(
+                "[per-order-adoption] challenger=%s verdict=%s wins=%d regressions=%d "
+                "blind_spots=%d matched=%d compared=%d: %s",
+                getattr(challenger, "submission_id", "?"),
+                "ADOPT" if verdict["adopt"] else "REJECT",
+                verdict["n_wins"], verdict["n_regressions"],
+                verdict["n_blind_spots"], verdict["n_matched"],
+                verdict["scenarios_compared"], verdict["reason"],
+            )
+
+            vote = {
+                "candidate_id": getattr(challenger, "submission_id", None),
+                "vote": "ADOPT" if verdict["adopt"] else "REJECT",
+                "n_wins": verdict["n_wins"],
+                "n_regressions": verdict["n_regressions"],
+                "n_blind_spots": verdict["n_blind_spots"],
+                "n_matched": verdict["n_matched"],
+                "scenarios_compared": verdict["scenarios_compared"],
+                "reason": verdict["reason"],
+                "per_order": verdict["per_order"],
+            }
+            try:
+                from minotaur_subnet.api.server_context import ctx
+                ctx.last_per_order_adoption_vote = dict(vote)
+            except Exception:  # publishing must never break adoption
+                pass
+            return verdict
+        except Exception as exc:  # must never crash the decision — abstain instead
+            logger.warning("[per-order-adoption] failed (ignored): %s", exc)
+            return None
+
+    def _persist_round_relative_counts(self, round_id: str) -> None:
+        """DISPLAY-ONLY: persist same-pin relative counts for each competitor.
+
+        Call AFTER :meth:`_refresh_incumbent_score` (which re-benches the champion
+        at THIS round's pin and persists its fresh ``per_intent``). For every
+        competitor benched this round at the SAME pin, compute its relative counts
+        vs that same-pin champion ``per_intent`` and persist them onto the
+        competitor's ``benchmark_details["relative"]`` (tagged with ``round_id``),
+        so the API surfaces correct same-pin counts instead of recomputing them
+        cross-fork against the champion's latest (later, different-pin) record.
+
+        This reads the SAME stored champion rows the authoritative
+        :meth:`_evaluate_per_order_adoption` reads, so the displayed counts agree
+        with the live verdict by construction. Fully best-effort: a competitor /
+        champion lacking ``shadow_score`` rows is skipped (no block → the report
+        shows pending), and any failure is swallowed — a display computation must
+        never break round evaluation.
+        """
+        try:
+            from minotaur_subnet.epoch.relative_scoring import (
+                has_shadow_rows,
+                relative_counts,
+            )
+
+            if self._sub_store is None or not self._champion.submission_id:
+                return
+            champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
+            if not has_shadow_rows(champ_rows):
+                return
+            for competitor in self._sub_store.list_by_round(round_id):
+                if competitor.submission_id == self._champion.submission_id:
+                    continue
+                comp_rows = self._per_intent(competitor)
+                if not has_shadow_rows(comp_rows):
+                    continue
+                try:
+                    counts = relative_counts(champ_rows, comp_rows)
+                    counts["round_id"] = round_id
+                    self._sub_store.merge_benchmark_details(
+                        competitor.submission_id, {"relative": counts},
+                    )
+                except Exception:
+                    logger.debug(
+                        "relative-counts persist failed for %s",
+                        getattr(competitor, "submission_id", "?"),
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.debug("relative-counts persist pass failed for round %s", round_id, exc_info=True)
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
         """Extract the scorecard from a submission's benchmark details."""
@@ -1331,6 +1403,67 @@ class EpochManager:
         # Hot-swap in block loop
         if self._block_loop and new_runtime is not None:
             self._block_loop.set_solver(new_runtime)
+
+    async def ensure_live_solver_matches_champion(self) -> bool:
+        """Boot-restore the live ORDER solver onto the currently-adopted champion.
+
+        ``__init__`` (via ``_restore_active_champion_submission``) recovers the
+        champion METADATA after a restart, but the block loop boots its live
+        solver from the genesis / ``FORCE_SOLVER_IMAGE`` image. Without this the
+        running solver silently stays a NON-champion image (e.g. a stale
+        ``:latest``) while ``/solver/champion`` and weights report the adopted
+        champion — exactly the split that made a real multi-hop order revert
+        (the boot solver emitted outdated SwapRouter calldata). This relaunches
+        the live solver to match the champion-of-record.
+
+        Reuses the runtime builder, which pulls the portable ``<repo>@sha256:D``
+        champion digest — content-addressed, so it also works on a fresh node /
+        new leader that never benchmarked the champion locally. It is a
+        deliberate no-op (builder returns ``None``) under ``FORCE_SOLVER_IMAGE``
+        or when hot-swap is disabled, preserving the operator break-glass pin.
+
+        FAILS LOUD: if the champion runtime cannot be built it logs ERROR rather
+        than silently leaving a non-champion solver serving orders. Returns True
+        iff the live solver was swapped onto the champion.
+        """
+        if self._runtime_builder is None or self._block_loop is None:
+            return False
+        sub = self._restored_champion_submission
+        if sub is None or not is_real_miner_hotkey(sub.hotkey):
+            # No persisted real champion → the genesis / forced boot solver is
+            # the correct live solver; nothing to restore.
+            return False
+        epoch = self._champion.epoch_adopted or sub.epoch
+        try:
+            new_runtime = self._runtime_builder(sub, epoch)
+            if inspect.isawaitable(new_runtime):
+                new_runtime = await new_runtime
+        except Exception:
+            logger.error(
+                "[boot-restore] FAILED to build the live solver for adopted champion "
+                "%s — the live ORDER solver remains the boot (genesis/forced) image and "
+                "may serve orders on a NON-champion solver until the next adoption. "
+                "Stopgap: set FORCE_SOLVER_IMAGE to the certified champion digest.",
+                sub.submission_id, exc_info=True,
+            )
+            return False
+        if new_runtime is None:
+            # Builder declined: FORCE_SOLVER_IMAGE active or hot-swap disabled —
+            # an intentional no-op (the operator pin / policy keeps the boot solver).
+            logger.info(
+                "[boot-restore] champion %s NOT swapped into the live solver "
+                "(FORCE_SOLVER_IMAGE / hot-swap-disabled) — boot solver kept.",
+                sub.submission_id,
+            )
+            return False
+        self._current_session = new_runtime
+        self._block_loop.set_solver(new_runtime)
+        logger.info(
+            "[boot-restore] live ORDER solver relaunched onto adopted champion "
+            "%s (%s v%s) after restart",
+            sub.submission_id, sub.solver_name, sub.solver_version,
+        )
+        return True
 
     async def revert_to_previous_champion(
         self,

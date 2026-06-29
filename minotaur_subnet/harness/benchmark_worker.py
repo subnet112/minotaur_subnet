@@ -89,8 +89,8 @@ class BenchmarkScorecard:
     global_score: float = 0.0
     app_scores: dict[str, float] = field(default_factory=dict)
     # Per-app on-chain scoreIntent BPS (one list entry per scenario; None when the
-    # sim didn't yield a score). The unfakeable output signal the on-chain-ranked
-    # adoption rule (ADOPT_RULE=p2oc) ranks on. Populated only when a real sim runs.
+    # sim didn't yield a score). The unfakeable output signal the current adoption
+    # rule's on-chain HARD VETO consumes. Populated only when a real sim runs.
     app_onchain: dict[str, list[int | None]] = field(default_factory=dict)
     scenario_scores: dict[str, float] = field(default_factory=dict)
     failures: int = 0
@@ -925,7 +925,25 @@ class BenchmarkWorker:
             simulation: SimulationResult,
             state: IntentState,
         ) -> ScoreResult:
-            return await engine.score(app_id, plan, simulation, state)
+            result = await engine.score(app_id, plan, simulation, state)
+            # Relative per-order scoring source: the RAW delivered output now comes
+            # from the LIVE scorer's own result metadata (metadata.raw_output), set
+            # by the raw-output scorer an operator PUTs into the LIVE js_code slot at
+            # cutover (PUT /apps/{id}/scoring). (Previously this was a SEPARATE shadow
+            # slot dual-loaded under "<app_id>:shadow"; that slot is gone — we read
+            # the live slot directly.) The engine clamps `score` to [0,1], so the
+            # authoritative unclamped value is metadata.raw_output: an EXACT DECIMAL
+            # WEI STRING (BigInt -> .toString()) stored VERBATIM — no float(), which
+            # would reintroduce IEEE-754 precision loss above 2^53. The orchestrator
+            # copies result.shadow_score onto BenchmarkResult.shadow_score and
+            # _results_to_details into per_intent[*].shadow_score; the relative rule
+            # parses it with int(). None/"" when the live scorer emits no raw_output
+            # (e.g. the pre-cutover quote-anchored scorer) -> no per-order signal.
+            raw = (result.metadata or {}).get("raw_output")
+            result.shadow_score = (
+                str(raw) if (raw is not None and str(raw) != "") else None
+            )
+            return result
 
         return score_fn
 
@@ -1413,8 +1431,10 @@ class BenchmarkWorker:
         Benchmarks the REAL reference champion — the adopted champion, or the
         official genesis solver when none is adopted (``_resolve_champion_image``,
         the same store-backed resolution scoring uses) — and ``challenger_image``
-        on THIS validator's own diverse Stage-2 subset, then applies the shared
-        ``evaluate_adoption`` rule. Returns + publishes this validator's vote.
+        on THIS validator's own diverse Stage-2 subset, then applies the
+        AUTHORITATIVE relative per-order rule
+        (:func:`evaluate_relative_adoption`) — the IDENTICAL rule the leader + every
+        follower run. Returns + publishes this validator's vote.
 
         The reference is resolved from the store, NOT an injectable env, so a
         miner can't point the vote at a weak/own reference to look better.
@@ -1431,8 +1451,7 @@ class BenchmarkWorker:
             require_real_sim_default,
             run_benchmark,
         )
-        from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
-        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
         champ_image = self._resolve_champion_image()
         if not champ_image:
@@ -1489,32 +1508,36 @@ class BenchmarkWorker:
         except RealSimulationUnavailable:
             return {"error": "real simulator unavailable"}
 
+        # champ_score / chal_score are the aggregate JS means — LOGGING/DISPLAY only
+        # now; the AUTHORITATIVE verdict is the per-order relative rule over the RAW
+        # delivered output (shadow_score), IDENTICAL to the leader + followers.
         champ_score = self._compute_avg_score(champ_results)
         chal_score = self._compute_avg_score(chal_results)
-        adopt, reason = evaluate_adoption(
-            challenger_score=chal_score,
-            champion_score=champ_score,
-            challenger_scorecard=self._build_scorecard(chal_results).to_dict(),
-            champion_scorecard=self._build_scorecard(champ_results).to_dict(),
-            dethrone_margin=DETHRONE_MARGIN,
-            has_champion=True,
-        )
+        verdict = evaluate_relative_adoption(champ_results, chal_results)
+        adopt = bool(verdict["adopt"])
+        reason = verdict["reason"]
         vote = {
             "candidate_id": challenger_image,
             "role": "shadow",
             "vote": "ADOPT" if adopt else "REJECT",
             "chal_score": round(float(chal_score), 4),
             "champ_score": round(float(champ_score), 4),
+            "n_wins": verdict["n_wins"],
+            "n_regressions": verdict["n_regressions"],
+            "n_blind_spots": verdict["n_blind_spots"],
+            "n_matched": verdict["n_matched"],
+            "scenarios_compared": verdict["scenarios_compared"],
             "champion_image": champ_image,
             "validator_id": self._validator_identity,
             "round_id": round_id,
             "reason": reason,
         }
         logger.info(
-            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s "
-            "champ_score=%.4f chal_score=%.4f: %s",
+            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s wins=%d "
+            "regressions=%d compared=%d: %s",
             self._validator_identity, champ_image, challenger_image,
-            vote["vote"], champ_score, chal_score, reason,
+            vote["vote"], verdict["n_wins"], verdict["n_regressions"],
+            verdict["scenarios_compared"], reason,
         )
         try:
             from minotaur_subnet.api.server_context import ctx
@@ -1909,6 +1932,13 @@ class BenchmarkWorker:
                     "plan_score": r.plan_score,
                     "trigger_score": r.trigger_score,
                     "on_chain_score": getattr(r, "on_chain_score", None),
+                    # RAW delivered output from the LIVE raw-output scorer's
+                    # metadata.raw_output (see _build_score_fn); an EXACT DECIMAL WEI
+                    # STRING, or None when the live scorer emits no raw_output. This
+                    # is the per-order signal the relative adoption rule consumes
+                    # (field name kept as shadow_score to avoid rippling the API
+                    # counts shape). Never feeds the legacy aggregate `score`.
+                    "shadow_score": getattr(r, "shadow_score", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
                     "revert_reason": getattr(r, "revert_reason", None),

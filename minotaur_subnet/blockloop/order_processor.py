@@ -62,6 +62,40 @@ def _is_user_signature_fault(error: str | None) -> bool:
     return any(m in e for m in _USER_SIG_FAULT_MARKERS)
 
 
+# Revert signatures of a USER-side FUNDS fault at settlement: the user does not
+# actually hold (or has not approved) the input token, so executeIntent's
+# safeTransferFrom(user, proxy, amount) — or the wTAO fee pull — reverts. Like a
+# signature fault this is NOT the solver's fault: the SCORING FORK FABRICATES the
+# user's balance (blockloop/simulation deals the declared amount + max allowance),
+# so a balance-less / impossible order still passes JS + on-chain sim scoring +
+# quorum. Without this, an attacker spamming impossible orders would debit the
+# blameless champion's solver stats. Covers the OpenZeppelin v4 ERC20/SafeERC20
+# revert strings and the v5 custom error names.
+_USER_FUNDS_FAULT_MARKERS = (
+    "transfer amount exceeds balance",     # OZ v4 ERC20 (input-token transferFrom)
+    "transfer amount exceeds allowance",   # OZ v4 ERC20 (no/insufficient approval)
+    "erc20: insufficient allowance",       # OZ v4 ERC20
+    "erc20insufficientbalance",            # OZ v5 custom error
+    "erc20insufficientallowance",          # OZ v5 custom error
+)
+
+
+def _is_user_fund_fault(error: str | None) -> bool:
+    """True if a settlement revert is the USER failing to hold/approve the input
+    token (or fee) — not a solver fault. Blameless to the miner (#229)."""
+    if not error:
+        return False
+    e = error.lower()
+    return any(m in e for m in _USER_FUNDS_FAULT_MARKERS)
+
+
+def _is_user_fault(error: str | None) -> bool:
+    """True if a settlement revert is attributable to the USER (bad signature OR
+    insufficient input-token balance/allowance) rather than the solver. The
+    blameless miner is not debited for either (#229)."""
+    return _is_user_signature_fault(error) or _is_user_fund_fault(error)
+
+
 class OrderProcessor:
     """Processes a single order through the full execution pipeline.
 
@@ -376,46 +410,49 @@ class OrderProcessor:
                 self.app_store.record_execution(order.app_id, 0.0, success=False)
                 return False
 
-        # Score via JS engine
+        # Score via JS engine. Post relative-cutover the JS ``score`` is a 0/1
+        # VALIDITY sentinel (1 valid / 0 invalid), NOT a quality grade. It is
+        # kept for the orderbook telemetry field and the consensus/relayer
+        # proposal (both unchanged), but it is NO LONGER a quality gate.
         score_result = await self.plan_scorer.score(
             order.app_id, app, plan, simulation, state,
         )
         score = score_result.score if score_result else 0.0
 
-        # Track best score even if below threshold
-        current_best = order.best_score or 0.0
-        new_best = max(current_best, score)
+        # On-chain scoreIntent BPS (0..10000) is the real delivered-quality
+        # signal and the authoritative accept/reject gate below. ``stat_bps`` is
+        # what we record into app stats / order best_score (delivered quality),
+        # NOT the saturated JS sentinel. A None on-chain score (contract didn't
+        # bless the plan) records 0 BPS.
+        on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
+        oc_score = simulation.on_chain_score
+        stat_bps = oc_score if oc_score is not None else 0
+
+        # Track best on-chain score for this order, even if it later rejects.
+        current_best = order.best_score or 0
+        new_best = max(current_best, stat_bps)
 
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.SCORED,
             score=score,
             best_score=new_best,
+            on_chain_score=oc_score,
         )
         self.order_persistence.sync(order.order_id)
 
-        # Check JS score threshold — per-app if configured, else global (SCR-7)
-        js_threshold = app.config.score_threshold if app.config else self.score_threshold
-        if score < js_threshold:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.REJECTED,
-                error=f"Score {score:.4f} below threshold {js_threshold}",
-            )
-            self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
-            return False
+        # JS quality-threshold gate RETIRED (relative-cutover): with the JS score
+        # now a validity sentinel, a 0..1 ``score_threshold`` comparison is dead
+        # (it would pass every valid plan). The on-chain scoreIntent gate below is
+        # the SOLE authoritative accept/reject. ``app.config.score_threshold`` is
+        # left inert. (self.score_threshold kept on the ctor for back-compat.)
 
-        # On-chain score gate — dual scoring (SCR-5, SCR-6, VAL-10)
-        on_chain_threshold = app.config.on_chain_threshold  # default 5000 BPS
-        oc_score = simulation.on_chain_score
-        if oc_score is not None:
-            self.orderbook.update_order(order.order_id, on_chain_score=oc_score)
+        # On-chain score gate — authoritative accept/reject (SCR-5, SCR-6, VAL-10).
         # Fail-closed (DEFAULT ON fleet-wide): a deployed contract must yield a
         # passing on-chain score. None means scoreIntent returned valid=False (plan
         # breaks an on-chain invariant) or was unreadable — the contract did NOT
-        # bless the plan, so don't relay it on the JS score alone. Leader + follower
-        # share onchain_score_fail_closed() so they gate identically (break-glass:
+        # bless the plan, so don't relay it. Leader + follower share
+        # onchain_score_fail_closed() so they gate identically (break-glass:
         # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
             self.orderbook.update_order(
@@ -424,7 +461,7 @@ class OrderProcessor:
                 error="On-chain score unavailable — contract returned invalid or unreadable (dual-scoring fail-closed)",
             )
             self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
+            self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
         if oc_score is not None and oc_score < on_chain_threshold:
             self.orderbook.update_order(
@@ -436,7 +473,7 @@ class OrderProcessor:
                 ),
             )
             self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, score, success=False)
+            self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
 
         # Phase 2: Consensus (with optional peer broadcast)
@@ -559,43 +596,55 @@ class OrderProcessor:
                         status=OrderStatus.OPEN,
                     )
             self.order_persistence.sync(order.order_id)
-            self._record_settlement_stats(order, score, submit_result)
+            # Record the on-chain delivered-quality BPS (not the JS sentinel).
+            self._record_settlement_stats(order, stat_bps, submit_result)
             return True
 
         # Settlement reverted. Distinguish a USER signature fault (#229) — the plan
         # passed scoring + quorum, the user's sig was invalid — from a solver fault.
         # The order is REJECTED either way (it didn't fill), but a user-fault revert
         # does NOT debit the blameless miner's execution stats.
-        user_fault = _is_user_signature_fault(submit_result.error)
+        if _is_user_signature_fault(submit_result.error):
+            reject_error = f"User signature rejected at settlement: {submit_result.error}"
+        elif _is_user_fund_fault(submit_result.error):
+            reject_error = (
+                "User cannot fund order (insufficient input-token balance/"
+                f"allowance) at settlement: {submit_result.error}"
+            )
+        else:
+            reject_error = f"Relayer submission failed: {submit_result.error}"
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.REJECTED,
-            error=(
-                f"User signature rejected at settlement: {submit_result.error}"
-                if user_fault
-                else f"Relayer submission failed: {submit_result.error}"
-            ),
+            error=reject_error,
         )
         self.order_persistence.sync(order.order_id)
-        self._record_settlement_stats(order, score, submit_result)
+        # Record the on-chain delivered-quality BPS (not the JS sentinel).
+        self._record_settlement_stats(order, stat_bps, submit_result)
         return False
 
     def _record_settlement_stats(self, order: Order, score: float, submit_result: Any) -> None:
         """Record execution stats for a settled order (#229 blameless miner).
 
-        A USER signature fault at settlement is NOT debited to the solver: the plan
-        passed JS scoring, on-chain sim scoring, and the validator quorum — the
-        user's order signature was invalid, which is entirely upstream of the
-        solver. The order is still REJECTED (handled by the caller); it just isn't
-        counted as a solver failure. Solver-attributable reverts still count.
+        ``score`` is the on-chain scoreIntent BPS (0..10000) — the delivered
+        quality the app stats now track — not the legacy JS 0..1 score.
+
+        A USER fault at settlement is NOT debited to the solver: the plan passed
+        JS scoring, on-chain sim scoring, and the validator quorum, and the revert
+        is entirely upstream of the solver — either an invalid order signature OR
+        the user not actually holding/approving the input token (the scoring fork
+        fabricates the balance, so a balance-less order still scores as doable).
+        The order is still REJECTED (handled by the caller); it just isn't counted
+        as a solver failure, so an attacker can't spam impossible orders to tank an
+        honest miner. Solver-attributable reverts still count.
         """
         if submit_result.success:
             self.app_store.record_execution(order.app_id, score, success=True)
             return
-        if _is_user_signature_fault(submit_result.error):
+        if _is_user_fault(submit_result.error):
             logger.warning(
-                "Order %s settlement reverted on a USER signature fault (%s) — NOT "
-                "debiting the solver (blameless miner, #229)",
+                "Order %s settlement reverted on a USER fault (%s) — NOT debiting "
+                "the solver (blameless miner, #229)",
                 order.order_id, (submit_result.error or "")[:80],
             )
             return

@@ -444,5 +444,8 @@ class ClaudeRunner:
             recent_quote_errors=feedback.recent_quote_errors,
             last_score=feedback.last_score,
             last_score_message=feedback.last_score_message,
+            relative=feedback.relative,
+            verdict=feedback.verdict,
+            relative_headroom=feedback.relative_headroom,
         )
         return self.run(task, app_context.app_id)

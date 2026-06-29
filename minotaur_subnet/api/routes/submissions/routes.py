@@ -1375,13 +1375,11 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
         champion_score: float | None = None
-        champion_details: dict[str, Any] | None = None
         champ = get_round_store().get_active_champion()
         if champ is not None and champ.submission_id:
             champ_sub = store.get(champ.submission_id)
             if champ_sub is not None:
                 champion_score = champ_sub.benchmark_score
-                champion_details = getattr(champ_sub, "benchmark_details", None)
 
         # The report's absolute "too low" floor is the surviving per-app sanity
         # floor (PER_APP_MIN_SCORE) — the absolute GLOBAL floor was purged. The
@@ -1401,7 +1399,6 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
             threshold=threshold,
             dethrone_margin=DETHRONE_MARGIN,
             reason=reason,
-            champion_details=champion_details,
         )
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)

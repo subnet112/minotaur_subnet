@@ -1,7 +1,11 @@
-"""Tests for the PR benchmark-report markdown: the builder's champion join +
-revert-trace passthrough, the renderer (champion column, Δ ordering, trace
-<details>), the relayer enrichment, the manager wiring, and the orchestrator's
-revert-trace capture helpers."""
+"""Tests for the PR benchmark-report markdown: the renderer (aggregate scalars +
+same-pin per-order ``relative`` summary), the relayer enrichment, the manager
+wiring, and the orchestrator's revert-trace capture helpers.
+
+The cross-fork per-order surfaces (the ``per_case`` champion head-to-head and the
+observe-only ``shadow_relative`` block, plus the per-step revert-trace rendering
+that lived inside the per_case table) were removed — per-order detail is now the
+same-pin ``relative`` count block alone."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,106 +18,50 @@ from minotaur_subnet.harness import orchestrator as orch
 from minotaur_subnet.relayer import solver_repo as sr
 
 
-def _sub(per_intent, *, score=0.7, status="scored"):
+def _sub(per_intent, *, score=0.7, status="scored", relative=None):
+    details = {"per_intent": per_intent}
+    if relative is not None:
+        details["relative"] = relative
     return SimpleNamespace(
         submission_id="sub_x",
         status=SimpleNamespace(value=status),
         benchmark_score=score,
-        benchmark_details={"per_intent": per_intent},
+        benchmark_details=details,
         screening={},
     )
 
 
-_TRACE = {
-    "summary": "reverted at step 2/2: Too little received",
-    "total_gas": 120000,
-    "interactions": [
-        {"index": 0, "target": "0xTok", "fn": "approve(address,uint256)", "status": "ok", "gas_used": 46000},
-        {"index": 1, "target": "0xRtr", "fn": "exactInputSingle(...)", "status": "reverted",
-         "revert_reason": 'Error("Too little received")', "gas_used": 0},
-    ],
-}
-
-
-# ── builder: champion join + revert_trace passthrough ────────────────────────
-
-def test_build_joins_champion_per_case_and_delta():
-    sub = _sub([
-        {"intent_id": "a", "score": 0.9, "on_chain_score": 9800},
-        {"intent_id": "b", "score": 0.1, "on_chain_score": 0},
-    ])
-    champ = {"per_intent": [
-        {"intent_id": "a", "score": 0.95, "on_chain_score": 9900},
-        {"intent_id": "b", "score": 0.80, "on_chain_score": 9000},
-    ]}
-    rep = build_submission_report(sub, champion_score=0.85, threshold=0.3,
-                                  dethrone_margin=0.05, reason="x", champion_details=champ)
-    by = {c["case"]: c for c in rep["per_case"]}
-    assert by["a"]["champion"]["js"] == 0.95
-    assert by["b"]["delta"] == round(0.1 - 0.80, 6)
-
-
-def test_build_without_champion_details_has_no_champion_key():
-    sub = _sub([{"intent_id": "a", "score": 0.9}])
-    rep = build_submission_report(sub, champion_score=None, threshold=0.3,
-                                  dethrone_margin=0.05, reason=None)
-    assert "champion" not in rep["per_case"][0]
-
-
-def test_build_passes_revert_trace_through():
-    sub = _sub([{"intent_id": "b", "score": 0.1, "revert_trace": _TRACE,
-                 "revert_reason": "boom"}])
-    rep = build_submission_report(sub, champion_score=None, threshold=0.3,
-                                  dethrone_margin=0.05, reason=None)
-    assert rep["per_case"][0]["your"]["revert_trace"] == _TRACE
-
-
 # ── renderer ─────────────────────────────────────────────────────────────────
 
-def test_render_champion_columns_and_delta_ordering():
-    sub = _sub([
-        {"intent_id": "a", "score": 0.9, "on_chain_score": 9800},
-        {"intent_id": "b", "score": 0.1, "on_chain_score": 0, "revert_reason": 'Error("x")'},
-    ])
-    champ = {"per_intent": [
-        {"intent_id": "a", "score": 0.95}, {"intent_id": "b", "score": 0.80},
-    ]}
+def test_render_empty_and_aggregate_scalars():
+    assert render_report_md(None) == ""
+    sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.7)
     rep = build_submission_report(sub, champion_score=0.85, threshold=0.3,
-                                  dethrone_margin=0.05, reason="did not beat the champion",
-                                  champion_details=champ)
+                                  dethrone_margin=0.05, reason="did not beat the champion")
     md = render_report_md(rep, submission_id="sub_x")
-    assert "| Case | You | Champion | Δ | On-chain (bps) | Result |" in md
-    # Biggest regression (b, Δ=-0.70) is listed before a (Δ=-0.05).
-    assert md.index("`b`") < md.index("`a`")
+    assert "**Your score:**" in md and "**Champion:**" in md
     assert "did not beat the champion" in md
-    assert 'Error("x")' in md  # revert reason shown, and the row is ❌
 
 
-def test_render_revert_trace_details_block():
-    sub = _sub([{"intent_id": "b", "score": 0.1, "revert_reason": "boom", "revert_trace": _TRACE}])
+def test_render_relative_summary_and_pipe_escaping():
+    # The same-pin relative block renders a per-order summary; the verdict cell is
+    # markdown-escaped (pipes).
+    rel = {"better": 2, "worse": 0, "matched": 1, "new": 0, "verdict": "a|b"}
+    sub = _sub([{"intent_id": "a", "score": 0.9}], relative=rel)
     rep = build_submission_report(sub, champion_score=None, threshold=0.3,
                                   dethrone_margin=0.05, reason="r")
     md = render_report_md(rep)
-    assert "<details><summary>🔬" in md and "</details>" in md
-    assert "exactInputSingle(...)" in md
-    assert "reverted: Error(\"Too little received\")" in md
+    assert "Per-order vs champion (same-pin)" in md
+    assert "2 better" in md and "1 matched" in md
+    assert "a\\|b" in md  # verdict cell escaped
 
 
-def test_render_revert_reads_as_fail_not_pass():
-    # passed (js>=threshold) but reverted on-chain → ❌, not ✅.
-    sub = _sub([{"intent_id": "b", "score": 0.5, "revert_reason": "boom"}])
+def test_render_note_when_no_relative_block():
+    sub = _sub([{"intent_id": "a", "score": 0.9}])  # no stored relative block
     rep = build_submission_report(sub, champion_score=None, threshold=0.3,
                                   dethrone_margin=0.05, reason="r")
-    row = [ln for ln in render_report_md(rep).splitlines() if "`b`" in ln][0]
-    assert "❌" in row and "✅" not in row
-
-
-def test_render_pipe_escaping_and_empty():
-    assert render_report_md(None) == ""
-    sub = _sub([{"intent_id": "swap-a|b", "score": 0.5}])
-    rep = build_submission_report(sub, champion_score=None, threshold=0.3,
-                                  dethrone_margin=0.05, reason="r")
-    assert "swap-a\\|b" in render_report_md(rep)
+    md = render_report_md(rep)
+    assert "`relative` block" in md  # points the miner at the status endpoint
 
 
 def test_render_adopted_header():
@@ -140,20 +88,18 @@ def test_build_and_render_won_header():
 
 # ── relayer enrichment ───────────────────────────────────────────────────────
 
-def test_on_champion_rejected_pr_body_has_scores_and_trace():
-    sub = _sub([{"intent_id": "b", "score": 0.1, "revert_reason": "boom", "revert_trace": _TRACE}])
+def test_on_champion_rejected_pr_body_has_scores():
+    sub = _sub([{"intent_id": "b", "score": 0.1, "revert_reason": "boom"}])
     sub.pr_number = 11
-    champ = {"per_intent": [{"intent_id": "b", "score": 0.8}]}
     captured = {}
     with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(n=n, body=b) or True), \
          patch.object(sr, "close_pr", lambda n: True), \
          patch.object(sr, "delete_candidate_image", lambda n: True):
         sr.on_champion_rejected_pr(sub, "did not beat the champion",
-                                   champion_score=0.85, dethrone_margin=0.05,
-                                   champion_details=champ)
+                                   champion_score=0.85, dethrone_margin=0.05)
     body = captured["body"]
     assert "Your score" in body and "Champion" in body
-    assert "<details><summary>🔬" in body
+    assert "did not beat the champion" in body
 
 
 def test_on_champion_rejected_pr_falls_back_when_not_benchmarked():
@@ -173,7 +119,6 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
     # PR or GC the image (the PR stays open for the cert-gated merge).
     sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
     sub.pr_number = 22
-    champ = {"per_intent": [{"intent_id": "a", "score": 0.5}]}
     captured = {}
     calls = {"close": 0, "gc": 0}
     with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(n=n, body=b) or True), \
@@ -181,8 +126,7 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
          patch.object(sr, "delete_candidate_image",
                       lambda n: calls.__setitem__("gc", calls["gc"] + 1) or True):
         result = sr.on_champion_finalist_pr(sub, "selected as finalist",
-                                            champion_score=0.5, dethrone_margin=0.05,
-                                            champion_details=champ)
+                                            champion_score=0.5, dethrone_margin=0.05)
     assert result is True
     assert captured["n"] == 22
     assert "🏆 Beat the champion" in captured["body"]
@@ -202,21 +146,20 @@ def test_manager_forwards_champion_context():
     from minotaur_subnet.epoch.manager import EpochManager
     rec = {}
 
-    def cb(submission, reason, *, champion_score=None, dethrone_margin=None, champion_details=None):
-        rec.update(champion_score=champion_score, dethrone_margin=dethrone_margin,
-                   champion_details=champion_details)
+    # The cross-fork champion_details surface was removed; the manager forwards
+    # only the scalar champion context the callback declares.
+    def cb(submission, reason, *, champion_score=None, dethrone_margin=None):
+        rec.update(champion_score=champion_score, dethrone_margin=dethrone_margin)
 
-    champ_sub = SimpleNamespace(benchmark_details={"per_intent": [{"intent_id": "b", "score": 0.8}]})
     fake_self = SimpleNamespace(
         _on_champion_rejected=cb,
         _champion=SimpleNamespace(benchmark_score=0.85, submission_id="champ1"),
         _dethrone_margin=0.05,
-        _sub_store=SimpleNamespace(get=lambda sid: champ_sub),
+        _sub_store=SimpleNamespace(get=lambda sid: None),
         _is_leader=lambda: True,
     )
     EpochManager._notify_champion_rejected(fake_self, SimpleNamespace(pr_number=11), "lost")
-    assert rec == {"champion_score": 0.85, "dethrone_margin": 0.05,
-                   "champion_details": champ_sub.benchmark_details}
+    assert rec == {"champion_score": 0.85, "dethrone_margin": 0.05}
 
 
 def test_manager_legacy_two_arg_callback_still_works():

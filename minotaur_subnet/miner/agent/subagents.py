@@ -113,8 +113,12 @@ diagnosis of what needs to improve and why.
    what scenarios exist or which chains they target.** Do not infer
    from names — `WETH_to_USDC` appears on both chain 1 and chain 8453
    as distinct scenarios; check `scenario["chains"]` explicitly.
-3. `get_score_feedback(app_id)` — the champion's per-scenario scores.
-   The scenarios where the champion underperforms are your opportunity.
+3. `get_score_feedback(app_id)` — recent trend + stats. NOTE post relative-
+   cutover the 0..1 JS score is a validity sentinel, not a quality grade: the
+   real bar is the RELATIVE per-order rule (beat the champion's delivered output
+   on every order, strictly win ≥1). The orders where the champion delivers the
+   LEAST output are your opportunity — out-deliver it there without regressing
+   anywhere.
 4. `list_orders(app_id)` — **sample recent filled orders**. The live
    benchmark replays historical filled orders as Stage 2; if the
    strategy fails on those replays, the global score tanks regardless
@@ -136,11 +140,11 @@ A single markdown diagnosis with this structure:
 ## Current strategy summary
 One paragraph.
 
-## Failing scenarios (by priority)
-1. <scenario_name> — champion_score: 0.X, chain: <id>
+## Orders we don't yet beat (by priority)
+1. <scenario_name> — champion still delivers more (or we tie), chain: <id>
    - likely cause: ...
    - verified-by: <tool call or manifest field you checked, not "I'm guessing">
-   - concrete hypothesis: ...
+   - concrete hypothesis to out-deliver the champion here: ...
 2. ...
 
 ## Historical-order risk

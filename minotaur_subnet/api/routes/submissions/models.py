@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # owner/repo, GitHub's allowed character set for each segment.
 _REPO_FULL_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -154,6 +154,12 @@ class SourceSubmitRequest(BaseModel):
 
 
 class SolverRoundResponse(BaseModel):
+    # ``extra="allow"`` lets the round-state builder ATTACH the additive relative
+    # fields (``scoring_mode``, ``finalist_relative``, ``reason_relative``) — the
+    # relative rule is the sole adoption path, so these are always passed as
+    # constructor extras and serialized. See round_manager._round_relative_extra.
+    model_config = ConfigDict(extra="allow")
+
     round_id: str
     status: str
     accepting_submissions: bool

@@ -49,6 +49,11 @@ class ServerContext:
     # This validator's latest independent ADOPT/REJECT vote on a candidate,
     # published on /health for the fleet shadow tally (poll, group by candidate).
     last_independent_vote: dict = field(default_factory=dict)
+    # Relative per-order adoption verdict for the latest evaluated challenger: the
+    # AUTHORITATIVE rule's ADOPT/REJECT + per-order breakdown (this IS the leader's
+    # adoption decision; the relative rule is the sole adoption path). Published on
+    # /health as ``per_order_adoption_vote``; empty until the first evaluation.
+    last_per_order_adoption_vote: dict = field(default_factory=dict)
     # Leader's latest would-be champion quorum tally (collected/quorum/signers),
     # published on /health. Populated by the certify path on every round —
     # including under DISABLE_CHAMPION_ADOPTION, where the full consensus runs but
