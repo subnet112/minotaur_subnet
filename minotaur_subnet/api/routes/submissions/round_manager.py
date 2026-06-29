@@ -472,8 +472,21 @@ def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
 
 
 def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
-    """Serialize a certified round for peer sync."""
+    """Serialize a certified round for the /internal/certify broadcast.
+
+    Canonical builder shared by the operator certify endpoint and the champion
+    re-attest endpoint (and byte-for-byte equal to the automated coordinator's
+    ``_certify_sync_payload`` in startup.py). It MUST carry the v2 EIP-712 digest
+    fields (commit_hash/nonce/deadline) at the TOP level — sourced from the leader's
+    own signed approval, since every signer signs the SAME proposal tuple — or a
+    follower rebuilds the proposal with its OWN wall-clock nonce, the digest diverges,
+    and verify_approval rejects the cert ("Invalid champion approvals"). This is the
+    #414/#417 regression; omitting the fields here was the residual operator-path gap.
+    Approvals use ``approval.to_dict()`` so the per-approval v2 fields ride along too.
+    """
     certificate = state.certificate
+    cert_approvals = certificate.approvals if certificate is not None else []
+    _lead = cert_approvals[0] if cert_approvals else None
     return {
         "round_id": state.round_id,
         "candidate_submission_id": state.finalist_submission_id,
@@ -483,21 +496,10 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "shadow_case_log_hash": state.shadow_case_log_hash,
         "effective_epoch": state.effective_epoch or 0,
         "quorum_required": state.quorum_required or 0,
-        "approvals": [
-            {
-                "validator_id": approval.validator_id,
-                "timestamp": approval.timestamp,
-                "signature": approval.signature,
-                "committee_hash": approval.committee_hash,
-                "incumbent_image_id": approval.incumbent_image_id,
-                "candidate_submission_id": approval.candidate_submission_id,
-                "candidate_image_id": approval.candidate_image_id,
-                "benchmark_pack_hash": approval.benchmark_pack_hash,
-                "shadow_case_log_hash": approval.shadow_case_log_hash,
-                "effective_epoch": approval.effective_epoch,
-            }
-            for approval in (certificate.approvals if certificate is not None else [])
-        ],
+        "commit_hash": getattr(_lead, "commit_hash", None),
+        "nonce": int(getattr(_lead, "nonce", 0) or 0),
+        "deadline": int(getattr(_lead, "deadline", 0) or 0),
+        "approvals": [approval.to_dict() for approval in cert_approvals],
     }
 
 
