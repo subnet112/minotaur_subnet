@@ -26,7 +26,7 @@
 
 ## Overview
 
-Miners on Minotaur compete by writing the best **Solving Engine** — code that generates optimal execution plans for App Intents. The Solving Engine is a single engine that handles all Apps across the entire network. Validators run the winning solver in sandboxed Docker containers, benchmark it against active intents, and adopt the highest-scoring version.
+Miners on Minotaur compete by writing the best **Solving Engine** — code that generates optimal execution plans for App Intents. The Solving Engine is a single engine that handles all Apps across the entire network. Validators run the winning solver in sandboxed Docker containers, benchmark it against active intents, and adopt a challenger that **delivers strictly more than the current champion** (see [Benchmarking](#benchmarking)).
 
 The competition surface is the `IntentSolver` abstract base class. Miners extend it, package their code in a Docker image, and submit it. Validators screen the submission (3 stages), benchmark it against the current champion, and adopt it if it scores better.
 
@@ -435,8 +435,22 @@ After passing screening, solvers enter the benchmarking phase where they compete
 - The **champion** is the currently active solver used for live order processing
 - A new submission is the **challenger**
 - Both are benchmarked against the same set of active intents
-- The challenger must beat the champion's average score by a **0.5% dethrone margin** to be adopted
-- Scores come from the JS scoring engine: `score(plan, state, context)` returns 0.0-1.0
+- Scoring is **relative (reference-bar)**: the challenger is compared to the champion **per order**, not by an absolute number. The champion is the baseline — it has no score of its own.
+
+### Relative (reference-bar) scoring
+
+There is no absolute 0–1 score and no fixed percentage margin. For every order in the benchmark set the challenger's result is compared to the champion's at the **same block pin**:
+
+| Per-order outcome | Meaning |
+|-------------------|---------|
+| `win` | challenger delivered **more** (beyond the ±0.1% / 10 bps tie band) |
+| `regression` | challenger delivered **less** (beyond the band) |
+| `matched` | within the ±0.1% band (effectively tied) |
+| `blind_spot_cover` | champion can't serve this order at all; the challenger can (counts as a win) |
+| `dropped` | champion serves it; the challenger produced nothing (counts as a regression) |
+| `skip` | neither side produced comparable output |
+
+The challenger **dethrones** the champion only with **zero regressions/drops and at least one strict win or blind-spot cover** (verdict `dethrone`). Matching everywhere is rejected (`matched`); any regression makes it `behind`. The comparison is exact-integer (cross-multiplied wei), so the verdict is identical on every validator.
 
 ### Scoring Pipeline
 
@@ -444,11 +458,8 @@ For each intent in the benchmark set:
 
 1. Solver generates an `ExecutionPlan` via `generate_plan()`
 2. Plan is simulated on an Anvil fork (captures token transfers, gas usage, state changes)
-3. JS scoring engine evaluates: `score(plan, state, context)` where:
-   - `plan` = the `ExecutionPlan` dict
-   - `state` = flattened `IntentState` (with `extra` fields merged)
-   - `context` = full context including `context.simulation` (token transfers, gas used, state changes), `context.state`, `context.oracle`
-4. Score is recorded (0.0-1.0)
+3. The app's JS module runs `score(plan, state, context)`. For `DexAggregatorApp` it returns a **validity sentinel** plus the **raw delivered output** (exact wei to the recipient) in `metadata.raw_output` — the real per-order signal the relative comparison uses. (`context` carries `context.simulation` token transfers / gas / state changes, `context.state`, `context.oracle`.)
+4. The challenger's per-order output is compared to the champion's (above). Because adoption is on **real delivered assets**, not quoted amounts, a solver cannot win by under- or over-quoting.
 
 ### Timeouts
 

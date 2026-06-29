@@ -176,7 +176,7 @@ Pipeline:
 4. Benchmarking
 5. Ranking + champion adoption
 
-A challenger must beat the current champion by **0.5%** (`DETHRONE_MARGIN = 0.005`) to dethrone.
+Adoption is **relative (reference-bar)**: the challenger is compared to the champion **per order** at the same pin (`win` / `regression` / `matched` within a ±0.1% / 10 bps band, plus `blind_spot_cover` and `dropped`) and dethrones only with **zero regressions/drops and at least one strict win or blind-spot cover**. There is no absolute score or fixed percentage margin.
 
 ### Source-based (`POST /v1/submissions/source`)
 

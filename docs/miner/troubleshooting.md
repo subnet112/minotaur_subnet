@@ -60,8 +60,8 @@ docker run --rm --network=none --read-only --tmpfs=/tmp:size=64m --memory=2g --c
 
 `/v1/submissions/source` skips screening and goes straight to benchmarking. If not adopted:
 
-- score may be lower than champion
-- challenger must beat champion by at least 0.5% (`DETHRONE_MARGIN = 0.005`)
+- the challenger only matched the champion (no strict win) — matching everywhere is rejected
+- the challenger regressed or dropped at least one order — any regression makes the verdict `behind` (it needs **zero** regressions/drops and ≥1 win/blind-spot cover to dethrone)
 
 Use status endpoint to inspect:
 

@@ -14,7 +14,7 @@ Validators perform six core functions:
 
 1. **Run the Solving Engine** -- Execute miner-submitted solver code to generate execution plans for user orders in the Intent OrderBook.
 2. **Simulate on Anvil forks** -- Plans are executed on Ethereum mainnet forks via Anvil, using snapshot/revert isolation so no real state is modified.
-3. **Dual scoring** -- Every plan is scored twice. The JavaScript score (from the app's JS scoring module, range 0.0--1.0) and the on-chain score (from contract simulation on the Anvil fork) must both exceed the configured threshold.
+3. **Dual scoring** -- Every plan passes two layers: the app's JS module (validity + the real per-order result it emits, e.g. raw delivered output) and the on-chain `scoreIntent` gate. Champion adoption then compares challenger-vs-champion **per order** (relative reference-bar), not by an absolute number.
 4. **N-of-M consensus** -- The leader validator proposes plans; follower validators independently re-simulate, re-score, and sign EIP-712 approvals. Exact score match is not required -- followers sign if both scores pass their threshold.
 5. **Weight emission** -- Champion-takes-all model. The miner who submitted the currently active (best-performing) solver receives 100% of emissions via `set_weights()`.
 6. **Accept miner solver submissions** -- Validate incoming solver code, screen it through three stages, benchmark performance, and adopt the champion solver.
@@ -53,10 +53,10 @@ Every execution plan is scored at two layers:
 
 | Layer | Where it runs | What it checks |
 |-------|---------------|----------------|
-| **JavaScript** | Validator Node.js sandbox | App-defined scoring logic via `score(plan, state, context)`. Reads simulation data including token transfers, gas usage, and state changes. Score range: 0.0--1.0. |
+| **JavaScript** | Validator Node.js sandbox | App-defined module via `score(plan, state, context)`. Reads simulation data (token transfers, gas, state changes) and emits the real per-order result the relative comparison uses — for `DexAggregatorApp`, a validity sentinel plus the **raw delivered output** (exact wei) in `metadata.raw_output`. |
 | **Solidity** | Anvil fork (simulated on-chain) | Contract-enforced invariants, user signature verification, validator quorum checks. Executed via ephemeral proxy (`CREATE2`) for state isolation. |
 
-Both scores must independently exceed the threshold. This prevents any single layer from being bypassed.
+Both layers must pass. Champion adoption is then **relative**: the challenger's per-order result is compared to the champion's at the same pin (more delivered = better; dethrone needs zero regressions/drops and ≥1 strict win or blind-spot cover), not measured against an absolute threshold.
 
 ### Intent OrderBook
 
