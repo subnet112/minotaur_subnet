@@ -501,12 +501,23 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
     }
 
 
-def _activate_round_sync_payload(body: ActivateRoundRequest) -> dict[str, Any]:
-    """Serialize an activation request for peer sync."""
-    return {
+def _activate_round_sync_payload(
+    body: ActivateRoundRequest, champion_changed: bool | None = None,
+) -> dict[str, Any]:
+    """Serialize an activation request for peer sync.
+
+    ``champion_changed`` carries the LEADER's adopt outcome so a follower can refuse to
+    weight a champion the leader did NOT finalize (merge_failed). Sourced from the
+    leader's activate result at the call site; falls back to the request body. Omitted
+    entirely when unknown (None) so an old follower stays on legacy behavior."""
+    payload: dict[str, Any] = {
         "round_id": body.round_id,
         "activation_epoch": body.activation_epoch,
     }
+    cc = champion_changed if champion_changed is not None else body.champion_changed
+    if cc is not None:
+        payload["champion_changed"] = bool(cc)
+    return payload
 
 
 def _abort_round_sync_payload(state: RoundState) -> dict[str, Any]:
@@ -581,4 +592,5 @@ async def _activate_solver_round_state(body: ActivateRoundRequest) -> dict[str, 
     return await manager.activate_certified_round(
         body.round_id,
         epoch=body.activation_epoch,
+        leader_champion_changed=body.champion_changed,
     )
