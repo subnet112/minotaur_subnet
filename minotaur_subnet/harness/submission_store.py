@@ -69,6 +69,11 @@ class Submission:
     # transient credential and is NEVER persisted (see _repo_token below).
     is_private: bool = False
     private_repo_full: str | None = None  # "owner/repo" of the miner's private repo
+    # Head-repo GitHub account (lowercased owner login), derived from the resolved
+    # PR clone_url. The anti-sybil key for the per-(account, round) cap: a miner
+    # spreading one GitHub account across multiple hotkeys/PRs still collapses to
+    # one account here. None for inline-source submissions (no GitHub identity).
+    github_owner: str | None = None
     status: SubmissionStatus = SubmissionStatus.QUEUED
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -112,6 +117,7 @@ class Submission:
             "pr_number": self.pr_number,
             "is_private": self.is_private,
             "private_repo_full": self.private_repo_full,
+            "github_owner": self.github_owner,
             # NOTE: _repo_token is intentionally NEVER serialized.
             "status": self.status.value,
             "created_at": self.created_at,
@@ -223,6 +229,8 @@ class SubmissionStore:
         is_private: bool = False,
         private_repo_full: str | None = None,
         repo_token: str | None = None,
+        github_owner: str | None = None,
+        max_per_owner_per_round: int = 0,
     ) -> Submission:
         """Create a new submission. Raises ValueError when a per-round cap is hit.
 
@@ -236,9 +244,16 @@ class SubmissionStore:
 
         ``max_total_per_round`` caps the TOTAL submissions for the round across
         ALL miners (first-come, rest retry next round) — bounds the per-round
-        benchmark batch. Default 0 = unlimited. Both checks run atomically here
-        as the backstop against a TOCTOU race between the route's pre-check and
-        the insert. Counts are over ALL statuses.
+        benchmark batch. Default 0 = unlimited.
+
+        ``max_per_owner_per_round`` caps submissions per ``github_owner`` (the
+        head-repo GitHub account) for the round, across ALL hotkeys — the anti-sybil
+        dedup that the per-hotkey cap can't provide (one account spread over many
+        hotkeys). Default 0 = disabled; skipped when ``github_owner`` is unset
+        (inline-source). Case-insensitive.
+
+        All three checks run atomically here as the backstop against a TOCTOU race
+        between the route's pre-check and the insert. Counts are over ALL statuses.
         """
         self._maybe_reload()
         resolved_round_id = (round_id or "").strip() or self._legacy_round_id(epoch)
@@ -254,6 +269,24 @@ class SubmissionStore:
                     f"Miner {hotkey[:12]}... already submitted {existing_count} "
                     f"time(s) for round {resolved_round_id} "
                     f"(max {max_per_round} per round)"
+                )
+        # Per-(github-account, round) cap — the anti-sybil backstop. Counts ALL of
+        # this GitHub account's submissions for the round REGARDLESS of hotkey, so a
+        # miner spreading one account across N hotkeys still collapses to the cap.
+        # Case-insensitive (GitHub logins are). Skipped when the owner is unknown
+        # (inline-source) or the cap is disabled.
+        owner_key = (github_owner or "").lower()
+        if owner_key and max_per_owner_per_round > 0:
+            owner_count = sum(
+                1 for s in self._submissions.values()
+                if (s.github_owner or "").lower() == owner_key
+                and s.round_id == resolved_round_id
+            )
+            if owner_count >= max_per_owner_per_round:
+                raise ValueError(
+                    f"GitHub account {owner_key!r} already submitted {owner_count} "
+                    f"time(s) for round {resolved_round_id} "
+                    f"(max {max_per_owner_per_round} per round per account)"
                 )
         if max_total_per_round > 0:
             round_total = sum(
@@ -278,6 +311,7 @@ class SubmissionStore:
             pr_number=pr_number,
             is_private=is_private,
             private_repo_full=private_repo_full,
+            github_owner=(github_owner or None),
             created_at=now,
             updated_at=now,
         )
@@ -324,6 +358,7 @@ class SubmissionStore:
             pr_number=record.get("pr_number"),
             is_private=bool(record.get("is_private", False)),
             private_repo_full=record.get("private_repo_full"),
+            github_owner=record.get("github_owner"),
             status=status,
             created_at=record.get("created_at", 0.0) or 0.0,
             updated_at=record.get("updated_at", 0.0) or 0.0,
@@ -421,6 +456,21 @@ class SubmissionStore:
         return sum(
             1 for s in self._submissions.values()
             if s.hotkey == hotkey and s.round_id == round_id
+        )
+
+    def count_by_owner_round(self, github_owner: str, round_id: str) -> int:
+        """Number of submissions for ``round_id`` made by ``github_owner`` — the
+        head-repo GitHub account — across ALL hotkeys. The submission gate reads
+        this to enforce the per-account cap BEFORE any expensive work. Case-
+        insensitive (GitHub logins are), so ``Alice`` and ``alice`` count as one.
+        An empty/None owner returns 0 (inline-source has no GitHub identity)."""
+        self._maybe_reload()
+        owner = (github_owner or "").lower()
+        if not owner:
+            return 0
+        return sum(
+            1 for s in self._submissions.values()
+            if (s.github_owner or "").lower() == owner and s.round_id == round_id
         )
 
     def count_by_round(self, round_id: str) -> int:
@@ -830,6 +880,7 @@ class SubmissionStore:
                     pr_number=d.get("pr_number"),
                     is_private=bool(d.get("is_private", False)),
                     private_repo_full=d.get("private_repo_full"),
+                    github_owner=d.get("github_owner"),
                     status=SubmissionStatus(d["status"]),
                     created_at=d.get("created_at", 0),
                     updated_at=d.get("updated_at", 0),
