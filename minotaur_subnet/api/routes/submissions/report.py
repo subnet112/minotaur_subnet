@@ -173,7 +173,6 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         return ""
     outcome = report.get("outcome") or "scored"
     reason = report.get("reason")
-    agg = report.get("aggregate") or {}
 
     if outcome == "adopted":
         header = "### ✅ Adopted as champion"
@@ -187,18 +186,10 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         header += f" — {reason}"
     lines = [header, ""]
 
-    # Aggregate vs champion.
-    your = agg.get("your_score")
-    if your is not None or agg.get("champion_score") is not None:
-        seg = [f"**Your score:** {_num(your)}"]
-        if agg.get("champion_score") is not None:
-            seg.append(f"**Champion:** {_num(agg.get('champion_score'))}")
-        if agg.get("score_to_beat") is not None:
-            seg.append(f"**To beat:** {_num(agg.get('score_to_beat'))}")
-        if agg.get("gap") is not None:
-            g = agg.get("gap")
-            seg.append(f"**Gap:** {'+' if g >= 0 else ''}{_num(g)}")
-        lines += [" · ".join(seg), ""]
+    # NOTE: the legacy aggregate "Your score / Champion / To beat / Gap" line was
+    # removed — under raw-output scoring the JS `score` is a [0,1] validity
+    # SENTINEL (~1.0), so an aggregate scalar is meaningless. The honest signal is
+    # the same-pin per-order relative counts below.
 
     # Per-order detail is the same-pin ``relative`` count block (machine-readable
     # via the status endpoint). The earlier cross-fork per-case table was removed:

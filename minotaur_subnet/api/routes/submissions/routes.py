@@ -1200,6 +1200,17 @@ async def solver_round_consensus_proposal(
                     ),
                     "reason_code": RejectionCode.BENCHMARK_MISMATCH.value,
                 }
+            # This node INDEPENDENTLY re-benchmarked the candidate and its own verdict
+            # AGREED — record provenance (persisted) so the follower's activate-time
+            # gate knows it may self-adopt the champion for weights. Set ONLY here:
+            # never on the blind-sign branch (_can_benchmark False) and never for
+            # builtin. Best-effort — must never fail the approval.
+            try:
+                get_round_store().mark_self_verified(
+                    round_state.round_id, _candidate.submission_id,
+                )
+            except Exception:
+                pass
         except Exception as exc:
             logger.exception(
                 "Reactive benchmark failed for %s: %s",
@@ -1263,7 +1274,9 @@ async def activate_solver_round(
         raise HTTPException(status_code=409, detail=str(exc))
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/activate",
-        _activate_round_sync_payload(body),
+        # Carry the leader's own adopt outcome so followers refuse to weight a champion
+        # the leader's merge-gate rejected (parity with the autonomous coordinator path).
+        _activate_round_sync_payload(body, result.get("champion_changed")),
     )
     return result
 
@@ -1411,8 +1424,17 @@ async def list_submissions(
     round_id: str | None = None,
     epoch: int | None = None,
     hotkey: str | None = None,
+    include_details: bool = False,
 ) -> dict[str, Any]:
-    """List submissions, optionally filtered by round, epoch, and/or hotkey."""
+    """List submissions, optionally filtered by round, epoch, and/or hotkey.
+
+    The heavy per-submission ``benchmark_details`` blob is OMITTED by default.
+    It is the per-scenario benchmark dump and dominates the list payload — ~800
+    submissions ship ~16 MB, ~100% of which is ``benchmark_details``, even though
+    list consumers (e.g. the dashboard's /miners page, polled every 15s) only
+    read the light fields. Pass ``include_details=true`` to keep it, or fetch a
+    single submission's full report via ``GET /v1/submissions/{id}/status``.
+    """
     store = get_store()
 
     if round_id is not None:
@@ -1425,9 +1447,15 @@ async def list_submissions(
     if hotkey:
         subs = [s for s in subs if s.hotkey == hotkey]
 
+    def _shape(s: Any) -> dict[str, Any]:
+        d = s.to_dict()
+        if not include_details:
+            d.pop("benchmark_details", None)
+        return d
+
     return {
         "count": len(subs),
-        "submissions": [s.to_dict() for s in subs],
+        "submissions": [_shape(s) for s in subs],
     }
 
 

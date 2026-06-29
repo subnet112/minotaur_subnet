@@ -829,7 +829,15 @@ def build_intent_params_hex_from_manifest(
         for field in intent_spec.params:
             vtype = field.value_type
             val = params.get(field.name)
-            # 'receiver' conventionally defaults to the order submitter.
+            # Apply the manifest-declared default for any omitted field. This is
+            # how an app expresses a non-zero default (e.g. a swap app declaring
+            # `unwrap_output` default true) WITHOUT the daemon hardcoding any
+            # app-specific field name or value — the schema owns the policy.
+            if val is None and getattr(field, "default", None) is not None:
+                val = field.default
+            # 'receiver' conventionally defaults to the order's submitter — a
+            # universal intent semantic (every order has an owner), not app
+            # logic. Can't be a static manifest default since it's per-order.
             if val is None and field.name == "receiver":
                 val = submitted_by
             abi_types.append(vtype)

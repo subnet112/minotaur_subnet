@@ -286,6 +286,11 @@ class CertifyRoundRequest(BaseModel):
 class ActivateRoundRequest(BaseModel):
     round_id: str
     activation_epoch: int = Field(..., ge=0)
+    # The leader's adopt outcome: True if the leader finalized (adopted) the champion,
+    # False if it refused (merge_failed). A follower self-adopts weights only when this
+    # is not explicitly False. None = absent (old leader / staggered rollout) => the
+    # follower keeps legacy behavior, never stranded. Signed as part of the payload.
+    champion_changed: bool | None = None
     # Leader EIP-712 signature over the canonical JSON of this sync payload
     # (with proposer_signature stripped). Empty during the staggered rollout.
     proposer: str = ""

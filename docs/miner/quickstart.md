@@ -188,10 +188,10 @@ Common statuses:
 Once `submit` returns, the API queues your solver for evaluation. The lifecycle on the validator/API side:
 
 1. **Screening (seconds–minutes)**: three stages run in sequence. Most failures show up here — Docker build errors, missing `SOLVER_CLASS`, banned imports.
-2. **Benchmarking (minutes)**: the benchmark worker runs your solver against the active scenario suite for each live App. Each scenario produces a score; your final score is the aggregate.
-3. **Champion comparison**: if your aggregate exceeds the current champion by at least `DETHRONE_MARGIN` (currently 0.5%), you become the new champion.
+2. **Benchmarking (minutes)**: the benchmark worker runs your solver against the active scenario suite for each live App. Each order produces a real result — for swaps, the raw delivered output in wei.
+3. **Champion comparison (relative reference-bar)**: your result is compared to the champion **per order** — `win` / `regression` / `matched` within a ±0.1% (10 bps) band, plus `blind_spot_cover` and `dropped`. You dethrone the champion only with **zero regressions/drops and at least one strict win or blind-spot cover**. There is no absolute score or fixed percentage margin.
 4. **Adoption**: champion adoption requires N-of-M validator signatures via champion-certification consensus (separate from order consensus). This typically completes in seconds once the leader proposes the new champion.
-5. **Weight emission**: the active champion's submitter gets 100% of the miner emission weight on the next subtensor epoch (~60s). Champion-takes-all.
+5. **Weight emission**: the active champion's submitter earns a share of miner emission weight that **scales with network usage** — a 5% floor (95% burns to the subnet owner) at low volume, ramping linearly to 100% at 1,000 orders in the trailing 24h — applied on the next subtensor epoch (~60s).
 
 Wall-clock times depend on the live network's queue depth. On a quiet network, screening + benchmarking takes 1–3 minutes. During a benchmark spike (multiple submissions queued), it can stretch to 10+ minutes.
 

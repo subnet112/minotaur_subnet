@@ -75,7 +75,7 @@ During the initial training phase, we collect real auctions from multiple swap a
 ### High-level Flow
 
 1. **Ingestion:** Users or Agents submit intents to the OrderBook (signed).
-2. **Solver competition:** Miners provide and continuously update their Solving Engine software. The highest-scoring engine becomes the Champion and runs across all validators.
+2. **Solver competition:** Miners provide and continuously update their Solving Engine software. A challenger that **delivers strictly more than the current Champion** (relative reference-bar scoring — compared per order, zero regressions, ≥1 strict win) becomes the new Champion and runs across all validators.
 3. **Execution & Simulation:** The Leader Validator takes the pending orders and generates execution plans using the Champion's engine.
 4. **Scoring:** The Leader simulates the plans on Anvil. The plan must pass both the JS scoring module and the on-chain constraint score. 
 5. **Consensus:** The Leader broadcasts the plan. Follower Validators re-simulate and sign if it passes the dual-score.
