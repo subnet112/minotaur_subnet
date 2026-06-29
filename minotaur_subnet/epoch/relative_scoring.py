@@ -299,3 +299,127 @@ def evaluate_relative_adoption(
         "n_matched": n_matched,
         "scenarios_compared": scenarios_compared,
     }
+
+
+# ── count-shape mapping (API report surface) ─────────────────────────────────
+#
+# When the relative rule is AUTHORITATIVE the API stops reporting a single
+# saturated score and instead reports each submission as a RELATIVE COUNT vs the
+# current champion. These pure helpers map the per-order verdict above onto that
+# count shape and back from stored submissions, so every API surface can flip on
+# the SAME ``relative_scoring_active()`` gate.
+
+
+def relative_counts(
+    champion_results: list[Any],
+    challenger_results: list[Any],
+    tol_bps: int = RELATIVE_TOL_BPS,
+) -> dict[str, Any]:
+    """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
+
+    Reports a challenger as a RELATIVE COUNT vs the champion instead of one
+    saturated score:
+
+      * ``better``   = wins + blind-spot covers (orders the challenger delivers
+                       MORE on, including ones the champion can't serve at all).
+      * ``worse``    = regressions. The decision impl FOLDS a dropped order
+                       (champion delivered, challenger produced nothing) into
+                       ``n_regressions``, so a dropped order correctly counts as
+                       worse here.
+      * ``matched``  = orders inside the ±``tol_bps`` noise band (neither better nor worse).
+      * ``new``      = blind-spot covers — a SUBSET of ``better``: orders the
+                       champion delivered nothing on that the challenger covers.
+      * ``compared`` = better + worse + matched (orders actually comparable;
+                       skips — neither side delivered — are excluded).
+      * ``verdict``  = ``dethrone`` when the relative rule adopts, ``matched`` when
+                       nothing is better or worse, else ``behind`` (any regression
+                       is ``behind`` regardless of how many wins it has).
+
+    Re-exposes ``per_order`` unchanged. Same duck-typed inputs as
+    :func:`evaluate_relative_adoption` (``BenchmarkResult`` objects or stored
+    ``per_intent`` dicts).
+    """
+    res = evaluate_relative_adoption(champion_results, challenger_results, tol_bps=tol_bps)
+    better = res["n_wins"] + res["n_blind_spots"]
+    worse = res["n_regressions"]
+    matched = res["n_matched"]
+    new = res["n_blind_spots"]
+    compared = better + worse + matched
+    verdict = (
+        "dethrone"
+        if res["adopt"]
+        else ("matched" if (better == 0 and worse == 0) else "behind")
+    )
+    return {
+        "better": better,
+        "worse": worse,
+        "matched": matched,
+        "new": new,
+        "compared": compared,
+        "verdict": verdict,
+        "per_order": res["per_order"],
+    }
+
+
+def _submission_per_intent(submission: Any) -> list[Any]:
+    """Per-order rows (``benchmark_details.per_intent``) off a submission, or []."""
+    details = getattr(submission, "benchmark_details", None) or {}
+    rows = details.get("per_intent") if isinstance(details, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def has_shadow_rows(rows: list[Any] | None) -> bool:
+    """True when at least one per-order row carries a non-None ``shadow_score``.
+
+    Used to gate the relative block: a submission benched BEFORE the shadow path
+    existed has no ``shadow_score`` rows, so it gets no relative block (rather than
+    a misleading all-skip one).
+    """
+    return any(_field(r, "shadow_score") is not None for r in rows or [])
+
+
+def relative_counts_for_submissions(
+    challenger_submission: Any,
+    champion_submission: Any,
+    tol_bps: int = RELATIVE_TOL_BPS,
+) -> dict[str, Any] | None:
+    """Relative counts for a CHALLENGER submission vs the CHAMPION submission.
+
+    Reads each submission's ``benchmark_details.per_intent`` shadow_score rows and
+    delegates to :func:`relative_counts`. Returns ``None`` (graceful omit, never an
+    error) when either side has no shadow_score rows — so a submission scored
+    before shadow existed simply carries no relative block.
+    """
+    if challenger_submission is None or champion_submission is None:
+        return None
+    champ_rows = _submission_per_intent(champion_submission)
+    chal_rows = _submission_per_intent(challenger_submission)
+    if not has_shadow_rows(champ_rows) or not has_shadow_rows(chal_rows):
+        return None
+    return relative_counts(champ_rows, chal_rows, tol_bps=tol_bps)
+
+
+def relative_reason(
+    counts: dict[str, Any] | None,
+    *,
+    candidate_id: str | None = None,
+) -> str | None:
+    """Phrase a round reason in relative vocabulary from a counts dict — PURE.
+
+      * ``dethrone`` -> ``"adopted <id>: better on N order(s), 0 regressions"``.
+      * otherwise    -> ``"no challenger delivered more on any order
+                          (N matched / M regressed)"``.
+
+    Returns ``None`` when there are no counts (nothing to phrase). This is a
+    DISPLAY-only derivation: callers attach it as a separate ``reason_relative``
+    field and never mutate the stored legacy ``abort_reason``.
+    """
+    if not counts:
+        return None
+    if counts.get("verdict") == "dethrone":
+        who = f" {candidate_id}" if candidate_id else ""
+        return f"adopted{who}: better on {counts['better']} order(s), 0 regressions"
+    return (
+        "no challenger delivered more on any order "
+        f"({counts['matched']} matched / {counts['worse']} regressed)"
+    )
