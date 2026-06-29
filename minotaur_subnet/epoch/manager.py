@@ -211,6 +211,11 @@ class EpochManager:
         self._last_emit_state: dict | None = None
 
         restored = self._restore_active_champion_submission()
+        # Champion submission recovered at boot (or None). Used by
+        # ensure_live_solver_matches_champion() to relaunch the live ORDER solver
+        # onto the adopted champion after a restart — the restore below only
+        # rebuilds champion METADATA, not the running solver.
+        self._restored_champion_submission = restored
         if restored is not None:
             restored_snapshot = (
                 self._round_store.get_active_champion()
@@ -1489,6 +1494,67 @@ class EpochManager:
         # Hot-swap in block loop
         if self._block_loop and new_runtime is not None:
             self._block_loop.set_solver(new_runtime)
+
+    async def ensure_live_solver_matches_champion(self) -> bool:
+        """Boot-restore the live ORDER solver onto the currently-adopted champion.
+
+        ``__init__`` (via ``_restore_active_champion_submission``) recovers the
+        champion METADATA after a restart, but the block loop boots its live
+        solver from the genesis / ``FORCE_SOLVER_IMAGE`` image. Without this the
+        running solver silently stays a NON-champion image (e.g. a stale
+        ``:latest``) while ``/solver/champion`` and weights report the adopted
+        champion — exactly the split that made a real multi-hop order revert
+        (the boot solver emitted outdated SwapRouter calldata). This relaunches
+        the live solver to match the champion-of-record.
+
+        Reuses the runtime builder, which pulls the portable ``<repo>@sha256:D``
+        champion digest — content-addressed, so it also works on a fresh node /
+        new leader that never benchmarked the champion locally. It is a
+        deliberate no-op (builder returns ``None``) under ``FORCE_SOLVER_IMAGE``
+        or when hot-swap is disabled, preserving the operator break-glass pin.
+
+        FAILS LOUD: if the champion runtime cannot be built it logs ERROR rather
+        than silently leaving a non-champion solver serving orders. Returns True
+        iff the live solver was swapped onto the champion.
+        """
+        if self._runtime_builder is None or self._block_loop is None:
+            return False
+        sub = self._restored_champion_submission
+        if sub is None or not is_real_miner_hotkey(sub.hotkey):
+            # No persisted real champion → the genesis / forced boot solver is
+            # the correct live solver; nothing to restore.
+            return False
+        epoch = self._champion.epoch_adopted or sub.epoch
+        try:
+            new_runtime = self._runtime_builder(sub, epoch)
+            if inspect.isawaitable(new_runtime):
+                new_runtime = await new_runtime
+        except Exception:
+            logger.error(
+                "[boot-restore] FAILED to build the live solver for adopted champion "
+                "%s — the live ORDER solver remains the boot (genesis/forced) image and "
+                "may serve orders on a NON-champion solver until the next adoption. "
+                "Stopgap: set FORCE_SOLVER_IMAGE to the certified champion digest.",
+                sub.submission_id, exc_info=True,
+            )
+            return False
+        if new_runtime is None:
+            # Builder declined: FORCE_SOLVER_IMAGE active or hot-swap disabled —
+            # an intentional no-op (the operator pin / policy keeps the boot solver).
+            logger.info(
+                "[boot-restore] champion %s NOT swapped into the live solver "
+                "(FORCE_SOLVER_IMAGE / hot-swap-disabled) — boot solver kept.",
+                sub.submission_id,
+            )
+            return False
+        self._current_session = new_runtime
+        self._block_loop.set_solver(new_runtime)
+        logger.info(
+            "[boot-restore] live ORDER solver relaunched onto adopted champion "
+            "%s (%s v%s) after restart",
+            sub.submission_id, sub.solver_name, sub.solver_version,
+        )
+        return True
 
     async def revert_to_previous_champion(
         self,
