@@ -192,6 +192,33 @@ def test_manager_leader_gate_blocks_follower():
     assert seen == {}  # follower posts nothing
 
 
+def test_manager_refetches_submission_so_report_has_relative_counts():
+    """The notify path re-reads the submission from the store, so the report
+    carries the same-pin relative counts persisted earlier in the eval pass —
+    the object handed in is stale (predates the persist merge)."""
+    from minotaur_subnet.epoch.manager import EpochManager
+    rec = {}
+
+    def cb(submission, reason, *, champion_score=None, dethrone_margin=None):
+        rec["details"] = getattr(submission, "benchmark_details", None)
+
+    stale = SimpleNamespace(pr_number=11, submission_id="sub_x", benchmark_details={})
+    fresh = SimpleNamespace(
+        pr_number=11, submission_id="sub_x",
+        benchmark_details={"relative": {"better": 4, "worse": 0, "verdict": "dethrone"}},
+    )
+    fake_self = SimpleNamespace(
+        _on_champion_finalist=cb,
+        _champion=SimpleNamespace(benchmark_score=0.9, submission_id="champ1"),
+        _dethrone_margin=0.05,
+        _sub_store=SimpleNamespace(get=lambda sid: fresh if sid == "sub_x" else None),
+        _is_leader=lambda: True,
+    )
+    EpochManager._notify_champion_finalist(fake_self, stale, "selected as finalist")
+    # callback saw the FRESH submission (with the relative block), not the stale {}.
+    assert rec["details"] == {"relative": {"better": 4, "worse": 0, "verdict": "dethrone"}}
+
+
 # ── orchestrator: revert-trace capture helpers ───────────────────────────────
 
 class _FakeAnvil:

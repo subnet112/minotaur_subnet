@@ -690,6 +690,18 @@ class EpochManager:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        # Fresh read so the report carries the relative counts persisted above
+        # (the object handed in predates that merge → otherwise no relative block,
+        # and the report falls back to the bare "see status endpoint" note).
+        try:
+            _sid = getattr(submission, "submission_id", "") or ""
+            _store = getattr(self, "_sub_store", None)
+            if _sid and _store is not None:
+                _fresh = _store.get(_sid)
+                if _fresh is not None:
+                    submission = _fresh
+        except Exception:
+            pass
         try:
             self._on_champion_rejected(submission, reason, **kwargs)
         except Exception as exc:
@@ -735,6 +747,18 @@ class EpochManager:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        # Fresh read so the report carries the relative counts persisted above
+        # (the object handed in predates that merge → otherwise no relative block,
+        # and the report falls back to the bare "see status endpoint" note).
+        try:
+            _sid = getattr(submission, "submission_id", "") or ""
+            _store = getattr(self, "_sub_store", None)
+            if _sid and _store is not None:
+                _fresh = _store.get(_sid)
+                if _fresh is not None:
+                    submission = _fresh
+        except Exception:
+            pass
         try:
             self._on_champion_finalist(submission, reason, **kwargs)
         except Exception as exc:
