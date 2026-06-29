@@ -1308,6 +1308,30 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertEqual(data["count"], 0)
         self.assertEqual(data["submissions"], [])
 
+    def test_list_omits_benchmark_details_by_default(self):
+        """The heavy benchmark_details blob is stripped from the list by default
+        (it dominated the payload — ~16 MB for ~800 subs) but stays available via
+        ?include_details=true and on the single-submission status endpoint."""
+        sub = self.store.create(
+            repo_url="https://github.com/a/s", commit_hash="aaaa123",
+            epoch=42, hotkey="miner_aaaa", round_id="round-e42-n1",
+        )
+        sub.benchmark_details = {"per_intent": [{"intent_id": "x", "score": 1}], "huge": "blob"}
+
+        # Default: omitted, but the light fields the dashboard uses remain.
+        data = self.client.get("/v1/submissions").json()
+        self.assertEqual(data["count"], 1)
+        row = data["submissions"][0]
+        self.assertNotIn("benchmark_details", row)
+        self.assertEqual(row["round_id"], "round-e42-n1")
+        self.assertEqual(row["submission_id"], sub.submission_id)
+
+        # Opt-in: present and intact.
+        data = self.client.get("/v1/submissions?include_details=true").json()
+        self.assertEqual(
+            data["submissions"][0]["benchmark_details"], sub.benchmark_details
+        )
+
     def test_list_submissions_by_epoch(self):
         self.store.create(
             repo_url="https://github.com/a/s", commit_hash="aaaa123",
