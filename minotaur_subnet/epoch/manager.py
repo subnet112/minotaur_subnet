@@ -698,7 +698,10 @@ class EpochManager:
             _store = getattr(self, "_sub_store", None)
             if _sid and _store is not None:
                 _fresh = _store.get(_sid)
-                if _fresh is not None:
+                # Only adopt a fresh object that is genuinely THIS submission — a
+                # mock/loose store can return a non-matching object; keep the
+                # original then (the reaper path passes a Mock store).
+                if _fresh is not None and getattr(_fresh, "submission_id", None) == _sid:
                     submission = _fresh
         except Exception:
             pass
@@ -755,7 +758,10 @@ class EpochManager:
             _store = getattr(self, "_sub_store", None)
             if _sid and _store is not None:
                 _fresh = _store.get(_sid)
-                if _fresh is not None:
+                # Only adopt a fresh object that is genuinely THIS submission — a
+                # mock/loose store can return a non-matching object; keep the
+                # original then (the reaper path passes a Mock store).
+                if _fresh is not None and getattr(_fresh, "submission_id", None) == _sid:
                     submission = _fresh
         except Exception:
             pass
