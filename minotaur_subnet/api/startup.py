@@ -2396,11 +2396,20 @@ async def initialize(ctx: ServerContext) -> dict:
                     "approvals": approvals,
                 }
 
-            def _activate_sync_payload(round_id: str, activation_epoch: int) -> dict[str, object]:
-                return {
+            def _activate_sync_payload(
+                round_id: str, activation_epoch: int,
+                champion_changed: bool | None = None,
+            ) -> dict[str, object]:
+                payload: dict[str, object] = {
                     "round_id": round_id,
                     "activation_epoch": activation_epoch,
                 }
+                # Carry the leader's adopt outcome so a follower refuses to weight a
+                # champion the leader did NOT finalize (merge_failed). Omitted when
+                # unknown so old followers stay on legacy behavior. Signed with the body.
+                if champion_changed is not None:
+                    payload["champion_changed"] = bool(champion_changed)
+                return payload
 
             def _abort_sync_payload(round_state) -> dict[str, object]:
                 return {
@@ -2646,7 +2655,10 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 await _broadcast_round_sync(
                     "/v1/solver/round/internal/activate",
-                    _activate_sync_payload(current.round_id, activation_epoch),
+                    _activate_sync_payload(
+                        current.round_id, activation_epoch,
+                        bool(result.get("champion_changed")),
+                    ),
                     label="activate",
                 )
                 return True
