@@ -2099,6 +2099,22 @@ async def initialize(ctx: ServerContext) -> dict:
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
 
+            # Boot-restore: relaunch the live ORDER solver onto the adopted
+            # champion's certified digest. The EpochManager restored champion
+            # METADATA above, but the block loop booted its live solver from the
+            # genesis / FORCE_SOLVER_IMAGE image — without this, a restart
+            # silently serves real orders on a non-champion solver (a stale
+            # :latest), e.g. emitting outdated multi-hop calldata that reverts.
+            # No-ops under FORCE_SOLVER_IMAGE / genesis (operator pin preserved).
+            try:
+                await ctx.epoch_manager.ensure_live_solver_matches_champion()
+            except Exception:
+                logger.error(
+                    "Boot-restore of the champion live solver raised — continuing; "
+                    "live solver may be non-champion until the next adoption",
+                    exc_info=True,
+                )
+
             solver_round_hotkey = _resolve_solver_round_hotkey()
             solver_round_force_leader = _env_true("FORCE_LEADER", default=False)
             if (
