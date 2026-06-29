@@ -1,9 +1,11 @@
-"""On-chain score plumbing into the adoption scorecard.
+"""On-chain score plumbing into the benchmark scorecard.
 
 Covers the live plumb of the unfakeable on-chain ``scoreIntent``:
 ``SimulationResult.on_chain_score`` -> ``BenchmarkResult.on_chain_score`` ->
-per-app ``scorecard.app_onchain`` (consumed by the current rule's on-chain HARD
-VETO, ``adopt_rule._evaluate_onchain_gate``).
+per-app ``scorecard.app_onchain``. NOTE: the legacy on-chain HARD-VETO adoption
+gate that consumed this (``adopt_rule._evaluate_onchain_gate``) was removed with
+the relative cutover; the scorecard field is still built + round-tripped (and used
+for determinism logging), which is what these tests pin.
 """
 import asyncio
 

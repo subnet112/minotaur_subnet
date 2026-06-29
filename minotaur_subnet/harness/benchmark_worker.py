@@ -1431,8 +1431,10 @@ class BenchmarkWorker:
         Benchmarks the REAL reference champion — the adopted champion, or the
         official genesis solver when none is adopted (``_resolve_champion_image``,
         the same store-backed resolution scoring uses) — and ``challenger_image``
-        on THIS validator's own diverse Stage-2 subset, then applies the shared
-        ``evaluate_adoption`` rule. Returns + publishes this validator's vote.
+        on THIS validator's own diverse Stage-2 subset, then applies the
+        AUTHORITATIVE relative per-order rule
+        (:func:`evaluate_relative_adoption`) — the IDENTICAL rule the leader + every
+        follower run. Returns + publishes this validator's vote.
 
         The reference is resolved from the store, NOT an injectable env, so a
         miner can't point the vote at a weak/own reference to look better.
@@ -1449,8 +1451,7 @@ class BenchmarkWorker:
             require_real_sim_default,
             run_benchmark,
         )
-        from minotaur_subnet.epoch.adopt_rule import evaluate_adoption
-        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
+        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
         champ_image = self._resolve_champion_image()
         if not champ_image:
@@ -1507,32 +1508,36 @@ class BenchmarkWorker:
         except RealSimulationUnavailable:
             return {"error": "real simulator unavailable"}
 
+        # champ_score / chal_score are the aggregate JS means — LOGGING/DISPLAY only
+        # now; the AUTHORITATIVE verdict is the per-order relative rule over the RAW
+        # delivered output (shadow_score), IDENTICAL to the leader + followers.
         champ_score = self._compute_avg_score(champ_results)
         chal_score = self._compute_avg_score(chal_results)
-        adopt, reason = evaluate_adoption(
-            challenger_score=chal_score,
-            champion_score=champ_score,
-            challenger_scorecard=self._build_scorecard(chal_results).to_dict(),
-            champion_scorecard=self._build_scorecard(champ_results).to_dict(),
-            dethrone_margin=DETHRONE_MARGIN,
-            has_champion=True,
-        )
+        verdict = evaluate_relative_adoption(champ_results, chal_results)
+        adopt = bool(verdict["adopt"])
+        reason = verdict["reason"]
         vote = {
             "candidate_id": challenger_image,
             "role": "shadow",
             "vote": "ADOPT" if adopt else "REJECT",
             "chal_score": round(float(chal_score), 4),
             "champ_score": round(float(champ_score), 4),
+            "n_wins": verdict["n_wins"],
+            "n_regressions": verdict["n_regressions"],
+            "n_blind_spots": verdict["n_blind_spots"],
+            "n_matched": verdict["n_matched"],
+            "scenarios_compared": verdict["scenarios_compared"],
             "champion_image": champ_image,
             "validator_id": self._validator_identity,
             "round_id": round_id,
             "reason": reason,
         }
         logger.info(
-            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s "
-            "champ_score=%.4f chal_score=%.4f: %s",
+            "[shadow-vote] validator=%s champ=%s chal=%s vote=%s wins=%d "
+            "regressions=%d compared=%d: %s",
             self._validator_identity, champ_image, challenger_image,
-            vote["vote"], champ_score, chal_score, reason,
+            vote["vote"], verdict["n_wins"], verdict["n_regressions"],
+            verdict["scenarios_compared"], reason,
         )
         try:
             from minotaur_subnet.api.server_context import ctx
