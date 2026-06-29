@@ -60,11 +60,12 @@ class ServerContext:
     # the commit is blocked at activation — so the fleet's cross-host agreement is
     # observable with adoption frozen. Never reflects an actual adoption.
     last_champion_quorum: dict = field(default_factory=dict)
-    # Leader's latest SHADOW champion-quorum verdict — "would the fleet certify at
-    # SHADOW_CHAMPION_QUORUM_BPS (default 6000/60%)?" Observe-only, computed
-    # post-cert over harvested follower approvals; NEVER affects the live decision.
-    # Empty until the first shadow harvest (only when SHADOW_CHAMPION_QUORUM enabled).
-    last_shadow_champion_quorum: dict = field(default_factory=dict)
+    # Leader's latest BEST-EFFORT champion-quorum tally — which validators approved the
+    # certified champion vs which are missing (n-of-target). Monitor-only, computed
+    # post-cert over harvested follower approvals; NEVER affects the live decision (the
+    # leader certs at the floor=1). Empty until the first harvest (only when
+    # BEST_EFFORT_CHAMPION_QUORUM enabled).
+    last_best_effort_champion_quorum: dict = field(default_factory=dict)
 
     # ── champion-consensus ProtocolConfig ────────────────────────────────
     # Created at startup pointed at BT EVM ValidatorRegistry (for the
