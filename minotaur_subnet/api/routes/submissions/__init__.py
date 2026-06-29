@@ -45,6 +45,7 @@ from .round_manager import (  # noqa: F401
     _abort_solver_round_state,
     _close_solver_round_state,
     _sync_round_incumbent_from_submission_store,
+    autoscaled_decision_window,
 )
 
 # Champion consensus functions (used by server.py)

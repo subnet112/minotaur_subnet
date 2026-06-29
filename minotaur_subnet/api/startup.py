@@ -1954,6 +1954,23 @@ async def initialize(ctx: ServerContext) -> dict:
                 _solver_round_epoch_health(ctx),
             )
 
+            # Auto-scale the decision-deadline window with the slate size: the leader
+            # benchmarks challengers SERIALLY (#387), so close→adopt grows ~linearly
+            # with the submission count. window = max(BASE + n_submissions*PER_SUB,
+            # SOLVER_ROUND_DECISION_EPOCHS). The fixed value above becomes the FLOOR.
+            try:
+                solver_round_decision_base_epochs = int(
+                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "10").strip() or "10",
+                )
+            except ValueError:
+                solver_round_decision_base_epochs = 10
+            try:
+                solver_round_decision_per_sub_epochs = int(
+                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "4").strip() or "4",
+                )
+            except ValueError:
+                solver_round_decision_per_sub_epochs = 4
+
             def _round_open_elapsed(current_round) -> float:
                 return max(0.0, time.time() - float(current_round.created_at or time.time()))
 
@@ -2293,6 +2310,31 @@ async def initialize(ctx: ServerContext) -> dict:
             except Exception:
                 logger.warning("Order-book sync not started", exc_info=True)
 
+            # App-catalog sync — followers pull the leader's apps + manifests so their
+            # benchmark pack hash matches the leader's. Without it ctx.store.list_apps()
+            # stays EMPTY on a follower, _build_solver_round_benchmark_pack_hash hashes
+            # 0 apps + 0 scenarios, and EVERY champion cert is rejected
+            # PACK_HASH_MISMATCH (followers never adopt). Mirrors the order-sync above
+            # (same metagraph leader-resolution + follower gate) but run IN THE API
+            # process, where ctx.store actually feeds the pack hash. The validator-process
+            # ValidatorAppCatalogSync only fires when LEADER_API_URL is set, which the
+            # auto-resolving fleet does not configure.
+            try:
+                from minotaur_subnet.validator.app_sync import ValidatorAppCatalogSync
+                _app_sync = ValidatorAppCatalogSync(
+                    store=ctx.store,
+                    leader_url=_resolve_leader_api_url,
+                    is_follower=(
+                        lambda: ctx.solver_round_metagraph_sync is not None
+                        and not _is_solver_round_leader()
+                    ),
+                    poll_interval=60.0,
+                )
+                ctx.app_sync_task = asyncio.create_task(_app_sync.start())
+                logger.info("App-catalog sync loop started (followers pull the leader's apps)")
+            except Exception:
+                logger.warning("App-catalog sync not started", exc_info=True)
+
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
                 network = submissions.get_champion_peer_network()
@@ -2534,6 +2576,30 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
+                # Auto-scale the decision window with this round's slate: the serial
+                # benchmark (#387) runs close→adopt in ~linear time with the submission
+                # count, so a fixed window aborts contested rounds the instant the leader
+                # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
+                # it (keep ACTIVATION_DELAY >= the effective decision window).
+                try:
+                    _n_subs = len(submissions.get_store().list_by_round(current.round_id))
+                except Exception:
+                    _n_subs = 0
+                _decision_window = submissions.autoscaled_decision_window(
+                    _n_subs,
+                    base_epochs=solver_round_decision_base_epochs,
+                    per_sub_epochs=solver_round_decision_per_sub_epochs,
+                    floor_epochs=solver_round_decision_epochs,
+                )
+                _activation_delay = max(
+                    solver_round_activation_delay_epochs, _decision_window + 2
+                )
+                logger.info(
+                    "Decision window auto-scaled: round=%s submissions=%d window=%d "
+                    "(floor=%d) activation=%d",
+                    current.round_id, _n_subs, _decision_window,
+                    solver_round_decision_epochs, _activation_delay,
+                )
                 closed = submissions._close_solver_round_state(
                     submissions.CloseRoundRequest(
                         round_id=current.round_id,
@@ -2547,8 +2613,8 @@ async def initialize(ctx: ServerContext) -> dict:
                         ),
                         committee_hash=committee_hash,
                         quorum_required=quorum_required,
-                        decision_deadline_epoch=close_epoch + max(1, solver_round_decision_epochs),
-                        effective_epoch=close_epoch + max(1, solver_round_activation_delay_epochs),
+                        decision_deadline_epoch=close_epoch + max(1, _decision_window),
+                        effective_epoch=close_epoch + max(1, _activation_delay),
                     )
                 )
                 logger.info(
