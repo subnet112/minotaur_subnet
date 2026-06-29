@@ -1474,6 +1474,32 @@ def _fmt_champion_consensus(cc: dict | None) -> str:
     return base
 
 
+def _fmt_best_effort_quorum(bq: dict | None) -> str:
+    """Render the monitor-only ``best_effort_champion_quorum`` tally compactly.
+
+    ``—`` when absent (legacy image / gate off / no harvest yet), else
+    ``{approved}/{validators} approved (target {req}@{bps}bps {OK|short}) missing=[..]``
+    — how many validators approved the certified champion vs the broadcast/monitor
+    target. A 3rd-party down/disagreeing shows in ``missing``; the champion still certs
+    at the floor. A ⚠ marks a breached floor (live quorum > 1, deadlock risk).
+    """
+    if not bq:
+        return "—"
+    approved = bq.get("collected")
+    n = bq.get("validator_count")
+    req = bq.get("target_required")
+    bps = bq.get("target_bps")
+    verdict = "OK" if bq.get("would_reach_at_target") else "short"
+    base = f"{approved}/{n} (target {req}@{bps}bps {verdict})"
+    missing = bq.get("missing") or []
+    if missing:
+        base += f" missing=[{','.join(m[:8] for m in missing)}]"
+    lq = bq.get("live_quorum_required")
+    if isinstance(lq, int) and lq > 1:
+        base += " ⚠floor-breached"
+    return base
+
+
 def _fmt_registry_view(cc: dict | None) -> str:
     """Render champion_consensus.registry_view — the on-chain count + block +
     refresh freshness the node is acting on.
@@ -1662,6 +1688,7 @@ def _render_health_detail_table(statuses: list[ValidatorStatus]) -> str:
             ("Solver-round role", [(s.api_health or {}).get("solver_round_role") or "—" for s in api]),
             ("Current round", [_fmt_solver_round((s.api_health or {}).get("solver_round")) for s in api]),
             ("Champion consensus", [_fmt_champion_consensus((s.api_health or {}).get("champion_consensus")) for s in api]),
+            ("Champion quorum (best-effort)", [_fmt_best_effort_quorum((s.api_health or {}).get("best_effort_champion_quorum")) for s in api]),
             ("Registry view", [_fmt_registry_view((s.api_health or {}).get("champion_consensus")) for s in api]),
         ]
         _table(api_rows, api_cols)

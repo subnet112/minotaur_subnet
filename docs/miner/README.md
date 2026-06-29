@@ -19,7 +19,7 @@ Typical loop:
 1. Build/iterate on strategies (often via `RoutingSolver`).
 2. Submit candidate solver code.
 3. Validator/API benchmark worker scores submissions against active app scenarios.
-4. Best scorer can be adopted as champion if it clears the dethrone margin.
+4. A challenger that **delivers strictly more than the champion** per order (zero regressions, ≥1 win/blind-spot cover) can be adopted as champion.
 5. Champion solver is loaded into block loop execution.
 
 ## Submission paths
@@ -42,6 +42,6 @@ Typical loop:
 
 ## Champion/challenger model
 
-- Submissions are benchmarked and ranked by score.
-- A challenger must exceed the current champion by `DETHRONE_MARGIN` (currently 0.5%).
+- Submissions are compared to the champion **per order** (relative reference-bar) — the champion is the baseline, with no score of its own.
+- A challenger must **deliver strictly more than the champion**: zero per-order regressions or drops, and at least one strict win or blind-spot cover (within a ±0.1% / 10 bps tie band). Matching everywhere is rejected.
 - On adoption, block loop hot-swaps to the new solver.

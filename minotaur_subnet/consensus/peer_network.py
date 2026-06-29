@@ -321,9 +321,16 @@ class ValidatorPeerNetwork:
         quorum_required: int | None = None,
         decision_deadline_epoch: int | None = None,
         committee_block: int | None = None,
+        request_timeout: float | None = None,
         path: str = "/v1/solver/round/consensus/proposal",
     ) -> list[ChampionApproval]:
-        """Broadcast a champion certification proposal to validator peers."""
+        """Broadcast a champion certification proposal to validator peers.
+
+        ``request_timeout`` (seconds) overrides the per-POST timeout for this
+        broadcast only — used by the observe-only shadow-quorum harvest, where
+        followers run a full reactive benchmark (minutes) before signing, far
+        longer than the default session timeout. ``None`` keeps the session default.
+        """
         peers = self.peers
         if not peers:
             return []
@@ -343,9 +350,12 @@ class ValidatorPeerNetwork:
 
         async def _send_with_peer(peer: PeerEndpoint) -> tuple[PeerEndpoint, ChampionApproval | Exception | None]:
             try:
-                result = await self._send_champion_proposal(
-                    peer, payload, path=path, dissent_sink=dissent_codes,
-                )
+                # Only thread request_timeout when explicitly set (the shadow
+                # harvest), so the real broadcast call is byte-identical to before.
+                _champ_kw: dict[str, Any] = {"path": path, "dissent_sink": dissent_codes}
+                if request_timeout is not None:
+                    _champ_kw["request_timeout"] = request_timeout
+                result = await self._send_champion_proposal(peer, payload, **_champ_kw)
                 return peer, result
             except Exception as exc:  # pragma: no cover - defensive
                 return peer, exc
@@ -650,6 +660,7 @@ class ValidatorPeerNetwork:
         *,
         path: str,
         dissent_sink: list[str] | None = None,
+        request_timeout: float | None = None,
     ) -> ChampionApproval | None:
         """Send a champion certification proposal to a single peer.
 
@@ -659,10 +670,15 @@ class ValidatorPeerNetwork:
         """
         url = f"{peer.url.rstrip('/')}/{path.lstrip('/')}"
         try:
+            _to = (
+                aiohttp.ClientTimeout(total=request_timeout)
+                if request_timeout is not None else None
+            )
             async with self._session.post(  # type: ignore[union-attr]
                 url,
                 json=payload,
                 headers=self._request_headers(),
+                **({"timeout": _to} if _to is not None else {}),
             ) as resp:
                 from minotaur_subnet.consensus.dissent import (
                     RejectionCode, record_dissent,

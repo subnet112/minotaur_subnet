@@ -14,7 +14,7 @@ my-solver/
 └── README.md         # Description of your solver's approach
 ```
 
-The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it beats the current champion by at least 0.5% (`DETHRONE_MARGIN = 0.005`).
+The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it **delivers strictly more than the current champion** under the relative reference-bar rule (per-order: zero regressions/drops and at least one strict win or blind-spot cover).
 
 ## Dockerfile Requirements
 
@@ -239,9 +239,10 @@ Plans are scored by each app's JS scoring function (`score(plan, state, context)
 
 ### Champion/Challenger Model
 
-- The currently active solver is the **champion**.
+- The currently active solver is the **champion** — the relative-scoring **baseline** (no score of its own).
 - A new submission is a **challenger**.
-- The challenger must beat the champion's average score by at least **0.5%** to be adopted.
+- Each order is compared champion-vs-challenger at the same pin → `win` / `regression` / `matched` (within a ±0.1% / 10 bps tie band), plus `blind_spot_cover` (challenger serves an order the champion can't → win) and `dropped` (the reverse → regression).
+- The challenger **dethrones** only with **zero regressions/drops and at least one strict win or blind-spot cover**. Matching everywhere is rejected; any regression makes the verdict `behind`.
 - Once adopted, the challenger becomes the new champion and processes real orders.
 
 ### Auto-Triggered Intents

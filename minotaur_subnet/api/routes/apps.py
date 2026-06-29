@@ -816,7 +816,6 @@ async def score_plan(
     # It gets seeded with input_amount of input_token and a blanket allowance
     # to the app contract, exactly like AppIntentBase's pull-funding flow.
     from minotaur_subnet.api.services import (
-        build_swap_intent_params_hex,
         build_intent_params_hex_from_manifest,
         compute_intent_selector,
     )
@@ -838,16 +837,13 @@ async def score_plan(
     if _input_token and _amount_wei > 0:
         token_balances = {_input_token: _amount_wei}
     if contract_address:
-        # Ensure a min_output_amount so the swap encoder doesn't bail;
-        # 0 is fine for a dry-run simulation.
-        dry_params = dict(params)
-        dry_params.setdefault("min_output_amount", "0")
-        intent_params_hex = build_swap_intent_params_hex(dry_params, _TEST_USER)
-        if not intent_params_hex:
-            intent_params_hex = build_intent_params_hex_from_manifest(
-                s, _js_engine, app_id,
-                body.intent_function, dry_params, _TEST_USER,
-            )
+        # Generic, manifest-driven encoding — omitted fields (incl. any the
+        # quote would normally supply) fall back to the manifest/type default,
+        # which is fine for a dry-run simulation.
+        intent_params_hex = build_intent_params_hex_from_manifest(
+            s, _js_engine, app_id,
+            body.intent_function, dict(params), _TEST_USER,
+        )
         intent_selector = compute_intent_selector(
             s, _js_engine, app_id, body.intent_function,
         ) or ""

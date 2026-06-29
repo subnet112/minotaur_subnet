@@ -28,10 +28,10 @@ Every plan must pass two independent scoring layers:
 
 | Layer | Location | Purpose |
 |-------|----------|---------|
-| **JavaScript** | Validator (off-chain) | `score(plan, state, context)` returns 0.0-1.0 |
-| **Solidity** | On-chain (`AppIntentBase`) | Enforces invariants, returns numeric score |
+| **JavaScript** | Validator (off-chain) | `score(plan, state, context)` validates the plan and emits the real per-order result (for swaps, the raw delivered output in wei) |
+| **Solidity** | On-chain (`AppIntentBase`) | Enforces invariants, gates execution via `scoreIntent` |
 
-Both scores must exceed the app's threshold for a plan to be approved.
+Both layers must pass. Champions are then chosen by **relative reference-bar scoring** — a challenger is compared to the current champion **per order** (more delivered = better), not against an absolute number.
 
 ### Consensus
 
@@ -172,7 +172,7 @@ current `DexAggregatorApp` ABI and execution path.
 
 ## Current Status
 
-Minotaur is in **Alpha** on Bittensor Subnet 112 (NETUID `112`) with real mainnet execution. The flagship `DexAggregatorApp` is live on **Base**; Bittensor EVM and Ethereum follow within Phase 4. Permissionless App deployment opens in Phase 6 (Jun 23, 2026); cross-chain settlement opens in Phase 5 (Jun 9, 2026). At Alpha launch only **5% of miner emissions** are enabled, ramping as the network proves out (champion-takes-all, `DETHRONE_MARGIN = 0.005`). See [`ROADMAP.md`](../ROADMAP.md) for the phase-by-phase plan.
+Minotaur is in **Alpha** on Bittensor Subnet 112 (NETUID `112`) with real mainnet execution. The flagship `DexAggregatorApp` is live on **Base**; Bittensor EVM and Ethereum follow within Phase 4. Permissionless App deployment opens in Phase 6 (Jun 23, 2026); cross-chain settlement opens in Phase 5 (Jun 9, 2026). The champion miner's emission share **scales with network usage** — a **5% floor** (95% burns to the subnet owner) at low volume, ramping linearly to **100%** at **1,000 orders in the trailing 24h**. A challenger is adopted by **relative reference-bar scoring**: it must out-deliver the champion per order (zero regressions, ≥1 strict win), not beat an absolute score. See [`ROADMAP.md`](../ROADMAP.md) for the phase-by-phase plan.
 
 ## Getting Help
 

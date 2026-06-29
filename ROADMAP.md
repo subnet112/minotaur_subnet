@@ -77,9 +77,10 @@ solver code. First external participants onboard and sync.
 
 Connected to Bittensor. Validators and miners register on Subnet 112,
 weight setting begins. Bootstrap test miners retire — independent miners
-compete for champion. **Miner emissions are gated to 5% at Alpha launch
-and ramp as the network proves stable** (champion-takes-all, dethrone
-margin `0.005`).
+compete for champion. **Miner emissions ramp with network usage** — a 5%
+floor at low volume, scaling linearly to 100% at 1,000 orders in the
+trailing 24h — and champions are chosen by relative reference-bar scoring
+(a challenger must out-deliver the champion per order, with no regressions).
 
 `Weight Setting` `5% Emission Ramp` `Independent Miners` `Independent Validators`
 
