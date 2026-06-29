@@ -447,26 +447,17 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
         if permit_params:
             req.params = {**req.params, **permit_params}
 
-        # Build ABI-encoded intentParams for on-chain execution.
-        # Swap intents use the fixed 11-field layout that DexAggregator._swap
-        # expects; the generic manifest encoder only emits fields the caller
-        # sent, which silently truncates the layout. Never fall back for swap.
-        intent_hex = _svc.build_swap_intent_params_hex(req.params, ia.address)
-        if not intent_hex and (req.intent_function or "").lower() == "swap":
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Swap intents require input_token, output_token, "
-                    "input_amount, and min_output_amount. Ensure the frontend "
-                    "passes min_output_amount derived from the quote."
-                ),
-            )
-        if not intent_hex:
-            # Generic manifest-based encoding for non-swap intents (DCA, yield, etc.)
-            intent_hex = _svc.build_intent_params_hex_from_manifest(
-                _app_store, _js_engine, app_id,
-                req.intent_function, req.params, ia.address,
-            )
+        # Build ABI-encoded intentParams for on-chain execution. ONE encoder for
+        # every app, no app names: the generic, manifest-driven encoder lays out
+        # exactly the fields THIS app's manifest declares for THIS intent
+        # function (full fixed-width tuple, omitted fields filled from the
+        # manifest/type default). Returns None only when the app has no usable
+        # manifest/param spec — nothing to encode — in which case we leave
+        # intent_params_hex unset, same as any app.
+        intent_hex = _svc.build_intent_params_hex_from_manifest(
+            _app_store, _js_engine, app_id,
+            req.intent_function, req.params, ia.address,
+        )
         if intent_hex:
             req.params["intent_params_hex"] = intent_hex
         # Set app_address and intent_selector for the relayer encoder

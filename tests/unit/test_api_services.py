@@ -114,64 +114,6 @@ def test_compute_intent_selector_prefers_loaded_manifest(tmp_path):
     assert selector == "d5bcb9b5"
 
 
-def test_build_swap_intent_params_hex_matches_dex_aggregator_layout():
-    params_hex = services.build_swap_intent_params_hex(
-        params={
-            "input_token": "0x" + "11" * 20,
-            "output_token": "0x" + "22" * 20,
-            "input_amount": "123",
-            "min_output_amount": "100",
-            "receiver": "0x" + "33" * 20,
-            "permit_deadline": "999",
-            "permit_v": "27",
-            "permit_r": "0x" + "44" * 32,
-            "permit_s": "0x" + "55" * 32,
-        },
-        submitted_by="0x" + "aa" * 20,
-    )
-
-    assert params_hex is not None
-
-    decoded = abi_decode(
-        ["address", "address", "uint256", "uint256", "address",
-         "uint256", "uint8", "bytes32", "bytes32"],
-        bytes.fromhex(params_hex),
-    )
-
-    assert decoded[0].lower() == "0x" + "11" * 20
-    assert decoded[1].lower() == "0x" + "22" * 20
-    assert decoded[2] == 123
-    assert decoded[3] == 100
-    assert decoded[4].lower() == "0x" + "33" * 20
-    assert decoded[5] == 999
-    assert decoded[6] == 27
-    assert decoded[7] == bytes.fromhex("44" * 32)
-    assert decoded[8] == bytes.fromhex("55" * 32)
-
-
-def test_build_swap_intent_params_hex_accepts_recipient_alias():
-    params_hex = services.build_swap_intent_params_hex(
-        params={
-            "input_token": "0x" + "11" * 20,
-            "output_token": "0x" + "22" * 20,
-            "input_amount": "123",
-            "min_output_amount": "100",
-            "recipient": "0x" + "33" * 20,
-        },
-        submitted_by="0x" + "aa" * 20,
-    )
-
-    assert params_hex is not None
-
-    decoded = abi_decode(
-        ["address", "address", "uint256", "uint256", "address",
-         "uint256", "uint8", "bytes32", "bytes32"],
-        bytes.fromhex(params_hex),
-    )
-
-    assert decoded[4].lower() == "0x" + "33" * 20
-
-
 def test_validate_app_intent_code_reports_manifest_semantic_errors():
     manifest = {
         "manifest_version": "v3-draft",
