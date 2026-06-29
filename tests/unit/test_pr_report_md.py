@@ -33,14 +33,16 @@ def _sub(per_intent, *, score=0.7, status="scored", relative=None):
 
 # ── renderer ─────────────────────────────────────────────────────────────────
 
-def test_render_empty_and_aggregate_scalars():
+def test_render_drops_aggregate_scalars():
+    # The legacy aggregate "Your score / Champion" line is removed — under raw-output
+    # scoring the JS `score` is a [0,1] validity sentinel, so a scalar is meaningless.
     assert render_report_md(None) == ""
     sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.7)
     rep = build_submission_report(sub, champion_score=0.85, threshold=0.3,
                                   dethrone_margin=0.05, reason="did not beat the champion")
     md = render_report_md(rep, submission_id="sub_x")
-    assert "**Your score:**" in md and "**Champion:**" in md
-    assert "did not beat the champion" in md
+    assert "**Your score:**" not in md and "**Champion:**" not in md
+    assert "did not beat the champion" in md  # reason still shown in the header
 
 
 def test_render_relative_summary_and_pipe_escaping():
@@ -98,7 +100,7 @@ def test_on_champion_rejected_pr_body_has_scores():
         sr.on_champion_rejected_pr(sub, "did not beat the champion",
                                    champion_score=0.85, dethrone_margin=0.05)
     body = captured["body"]
-    assert "Your score" in body and "Champion" in body
+    assert "Your score" not in body and "Champion" not in body  # aggregate line dropped
     assert "did not beat the champion" in body
 
 
@@ -130,7 +132,7 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
     assert result is True
     assert captured["n"] == 22
     assert "🏆 Beat the champion" in captured["body"]
-    assert "Your score" in captured["body"]
+    assert "Your score" not in captured["body"]  # aggregate line dropped
     assert calls == {"close": 0, "gc": 0}  # PR stays open; image not GC'd
 
 
