@@ -952,13 +952,23 @@ class AppIntentStore:
                     "total_executions": 0,
                     "successful_executions": 0,
                     "total_score": 0.0,
+                    "successful_score": 0.0,
                     "best_score": 0.0,
                     "last_triggered": 0.0,
                     "recent_scores": [],
                 }
+                # Migrate pre-existing rows: seed the successful-only score sum
+                # from total_score so the lifetime average stays consistent with
+                # the lifetime ``successful_executions`` count. Hard failures
+                # record 0.0, so total_score ≈ the successful sum already; the
+                # small bias from rejected-but-scored attempts dilutes as new
+                # fills accumulate. Done once, before this execution is added.
+                if "successful_score" not in stats:
+                    stats["successful_score"] = float(stats.get("total_score", 0.0))
                 stats["total_executions"] += 1
                 if success:
                     stats["successful_executions"] += 1
+                    stats["successful_score"] += score
                 stats["total_score"] += score
                 stats["best_score"] = max(stats["best_score"], score)
                 stats["last_triggered"] = time.time()
@@ -983,11 +993,21 @@ class AppIntentStore:
             ).fetchone()
         stats = json.loads(row["data"]) if row else {}
         total = stats.get("total_executions", 0)
+        successful = stats.get("successful_executions", 0)
+        # successful-only score sum; fall back to total_score for un-migrated rows
+        # (hard failures contribute 0.0, so total_score ≈ the successful sum).
+        successful_score = stats.get("successful_score", stats.get("total_score", 0.0))
         return {
             "total_executions": total,
-            "successful_executions": stats.get("successful_executions", 0),
+            "successful_executions": successful,
             "avg_score": (
                 stats["total_score"] / total if total > 0 else 0.0
+            ),
+            # Avg delivered quality over SUCCESSFUL (filled) executions only — the
+            # "how good were the fills" signal, separate from the success-blended
+            # ``avg_score`` (which folds in the ~0-scored failures).
+            "avg_success_score": (
+                successful_score / successful if successful > 0 else 0.0
             ),
             "best_score": stats.get("best_score", 0.0),
             "last_triggered": stats.get("last_triggered", 0.0),
