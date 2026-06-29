@@ -1002,18 +1002,41 @@ async def reattest_current_champion(request: Request) -> dict:
             ),
         )
     approvals = len(state.certificate.approvals)
+    # EMERGENCY FORCE-SYNC ("remind him + make him accept"): re-send the WHOLE round so a
+    # follower that never saw it — or pruned it on a restart — can re-adopt the standing
+    # champion instead of 404-ing the bare cert. Three ordered broadcasts:
+    #   1) close (force=True): upsert the round state + submission snapshot, bypassing the
+    #      adopt-if-behind staleness guard (the champion round is OLDER than the follower's
+    #      current round, so normal sync would refuse it);
+    #   2) certify: the signed certificate (verify_approval still round-trips — not blind);
+    #   3) activate: drive adoption now (q1-trust) instead of waiting for a leader tick.
+    _close_payload = _close_round_sync_payload(state)
+    _close_payload["force"] = True
+    await _broadcast_internal_round_sync(
+        "/v1/solver/round/internal/close", _close_payload,
+    )
     await _broadcast_internal_round_sync(
         "/v1/solver/round/internal/certify",
         _certify_round_sync_payload(state),
     )
+    await _broadcast_internal_round_sync(
+        "/v1/solver/round/internal/activate",
+        {
+            "round_id": state.round_id,
+            "activation_epoch": state.effective_epoch or state.close_epoch,
+            "champion_changed": True,
+        },
+    )
     logger.info(
-        "[champion-reattest] re-broadcast champion %s (round=%s, %d approval(s)) to peers",
+        "[champion-reattest] FORCE-synced champion %s (round=%s, %d approval(s)): "
+        "close+certify+activate broadcast to peers",
         getattr(champ, "submission_id", None), rid, approvals,
     )
     return {
         "reattested_submission_id": getattr(champ, "submission_id", None),
         "round_id": rid,
         "approvals": approvals,
+        "forced": True,
     }
 
 

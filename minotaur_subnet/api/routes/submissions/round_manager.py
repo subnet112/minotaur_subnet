@@ -70,6 +70,7 @@ def _adopt_leader_round_if_behind(
     *,
     status: RoundStatus,
     incumbent: ChampionSnapshot | None = None,
+    force: bool = False,
     **field_updates: Any,
 ) -> bool:
     """Adopt the leader's round verbatim when this follower is behind.
@@ -100,20 +101,25 @@ def _adopt_leader_round_if_behind(
     leader_epoch = _parse_round_opened_epoch(round_id)
     if leader_epoch is None:
         return False
-    current = round_store.get_current_round()
-    if current is not None:
-        if current.round_id != round_id and leader_epoch <= current.opened_epoch:
-            # Older-or-equal than what we already track = stale/replay; do NOT adopt.
-            return False
-    else:
-        # Cold start (no current round): refuse a replayed ancient broadcast that
-        # would pin us behind rounds we already know about. Accept only when the
-        # store is truly empty OR the leader is at/ahead of our newest round.
-        known = round_store.list_rounds()
-        if known:
-            max_epoch = max(r.opened_epoch for r in known)
-            if leader_epoch < max_epoch:
+    # The operator force-sync ("emergency reattach") DELIBERATELY bypasses these
+    # staleness guards to re-install an OLDER champion round the follower has moved past
+    # — the whole point is to remind it of a round it no longer tracks so it re-adopts
+    # the standing champion. Authenticated upstream by _authorize_internal_round.
+    if not force:
+        current = round_store.get_current_round()
+        if current is not None:
+            if current.round_id != round_id and leader_epoch <= current.opened_epoch:
+                # Older-or-equal than what we already track = stale/replay; do NOT adopt.
                 return False
+        else:
+            # Cold start (no current round): refuse a replayed ancient broadcast that
+            # would pin us behind rounds we already know about. Accept only when the
+            # store is truly empty OR the leader is at/ahead of our newest round.
+            known = round_store.list_rounds()
+            if known:
+                max_epoch = max(r.opened_epoch for r in known)
+                if leader_epoch < max_epoch:
+                    return False
     round_store.adopt_round(
         round_id=round_id,
         opened_epoch=leader_epoch,
@@ -422,6 +428,7 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
     if _adopt_leader_round_if_behind(
         body.round_id,
         status=RoundStatus.CLOSED,
+        force=bool(getattr(body, "force", False)),
         close_epoch=body.close_epoch,
         benchmark_pack_hash=body.benchmark_pack_hash,
         committee_block=body.committee_block,

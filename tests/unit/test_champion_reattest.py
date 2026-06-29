@@ -60,6 +60,9 @@ def _state(approval):
         shadow_case_log_hash="0x" + "ef" * 32,
         effective_epoch=43,
         quorum_required=1,
+        close_epoch=42,
+        committee_block=100,
+        decision_deadline_epoch=60,
         certificate=SimpleNamespace(approvals=[approval]),
     )
 
@@ -95,14 +98,13 @@ class TestCanonicalCertifyPayload:
 async def test_reattest_broadcasts_current_champion(monkeypatch):
     from minotaur_subnet.api.routes.submissions import routes as R
 
-    captured = {}
+    calls = []
 
     async def _auth(_req):
         return None
 
     async def _bcast(path, payload):
-        captured["path"] = path
-        captured["payload"] = payload
+        calls.append((path, payload))
 
     ap = _approval()
     state = _state(ap)
@@ -117,14 +119,27 @@ async def test_reattest_broadcasts_current_champion(monkeypatch):
 
     resp = await R.reattest_current_champion(SimpleNamespace())
 
-    # re-broadcast lands on the internal certify path, carrying the v2 fields (the fix)
-    assert captured["path"] == "/v1/solver/round/internal/certify"
-    assert captured["payload"]["nonce"] == ap.nonce != 0
-    assert captured["payload"]["candidate_submission_id"] == "sub-final"
+    # Force-sync the WHOLE round, in order: close(force) -> certify(v2) -> activate.
+    assert [p for p, _ in calls] == [
+        "/v1/solver/round/internal/close",
+        "/v1/solver/round/internal/certify",
+        "/v1/solver/round/internal/activate",
+    ]
+    by_path = {p: pl for p, pl in calls}
+    # close re-installs the round even if the follower has moved past it
+    assert by_path["/v1/solver/round/internal/close"]["force"] is True
+    assert by_path["/v1/solver/round/internal/close"]["round_id"] == "round-x"
+    # certify still carries the v2 EIP-712 fields (the original #417 fix)
+    assert by_path["/v1/solver/round/internal/certify"]["nonce"] == ap.nonce != 0
+    assert by_path["/v1/solver/round/internal/certify"]["candidate_submission_id"] == "sub-final"
+    # activate drives adoption with champion_changed=True
+    assert by_path["/v1/solver/round/internal/activate"]["champion_changed"] is True
+    assert by_path["/v1/solver/round/internal/activate"]["round_id"] == "round-x"
     assert resp == {
         "reattested_submission_id": "sub-final",
         "round_id": "round-x",
         "approvals": 1,
+        "forced": True,
     }
 
 
