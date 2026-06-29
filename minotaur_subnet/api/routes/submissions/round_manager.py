@@ -225,16 +225,14 @@ def _sync_round_incumbent_from_submission_store(
 
 
 def _round_relative_extra(state: RoundState) -> dict[str, Any]:
-    """Additive relative fields for the round response — ONLY when the relative
-    rule is authoritative (``RELATIVE_SCORING_ENABLED``).
+    """Additive relative fields for the round response.
 
-    Returns ``{}`` when the flag is OFF (default), so the round response is
-    byte-for-byte unchanged — this is the single gate that flips the whole
-    relative API surface on. When ON, returns ``{"scoring_mode": "relative"}`` plus,
-    for the round's finalist, a ``finalist_relative`` count block vs the current
-    champion (``{better, worse, matched, new, compared, verdict, per_order}``) and a
-    derived ``reason_relative`` display string. The legacy ``finalist_score`` /
-    ``abort_reason`` are left untouched.
+    The relative rule is the sole adoption path, so this always returns
+    ``{"scoring_mode": "relative"}`` plus, for the round's finalist, a
+    ``finalist_relative`` count block vs the current champion
+    (``{better, worse, matched, new, compared, verdict, per_order}``) and a derived
+    ``reason_relative`` display string. The legacy ``finalist_score`` /
+    ``abort_reason`` are left untouched (cleanup deferred).
 
     SAME-PIN: the counts are READ from the finalist's OWN persisted
     ``benchmark_details["relative"]`` — computed at round evaluation against the
@@ -247,11 +245,8 @@ def _round_relative_extra(state: RoundState) -> dict[str, Any]:
     try:
         from minotaur_subnet.epoch.relative_scoring import (
             relative_reason,
-            relative_scoring_active,
         )
 
-        if not relative_scoring_active():
-            return {}
         extra: dict[str, Any] = {"scoring_mode": "relative"}
         if not state.finalist_submission_id:
             return extra
@@ -299,7 +294,7 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         ),
         certificate_quorum_required=certificate.quorum_required if certificate else None,
         certificate_approvals=len(certificate.approvals) if certificate else 0,
-        # Additive relative fields — empty (no-op) unless RELATIVE_SCORING_ENABLED.
+        # Additive relative fields (always emitted — relative is the sole rule).
         **_round_relative_extra(state),
     )
 

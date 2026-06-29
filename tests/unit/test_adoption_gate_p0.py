@@ -2,13 +2,15 @@
 
 Locks in:
 - BenchmarkWorker._build_scorecard keys app_scores by the BARE app_id
-  (not "<app_id>:<scenario>"), so the adoption gate compares true per-app quality.
-- EpochManager._should_adopt rejects a challenger that DROPS a champion-covered app.
-- The dethrone-margin baseline is the champion's actual score, not max(score, floor)
-  — a degraded (sub-floor) champion is no longer over-protected.
+  (not "<app_id>:<scenario>") — the per-app grouping the scorecard still exposes.
+- EpochManager._should_adopt routes through the AUTHORITATIVE relative per-order
+  rule: it REJECTS a challenger that drops/regresses an order the champion served,
+  and ADOPTS one that strictly wins an order with no regression.
+- The stale-bar guard still abstains when the incumbent bar could not be refreshed.
 """
 
 import types
+from unittest.mock import MagicMock
 
 from minotaur_subnet.epoch.manager import EpochManager
 from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
@@ -38,56 +40,71 @@ def test_build_scorecard_keys_app_scores_by_bare_app_id():
     assert card.scenario_scores["app_A:hist:ord_9"] == 0.4
 
 
-def _mgr(champion_score: float, dethrone_margin: float = 0.005) -> EpochManager:
+def _per_intent(pairs):
+    """Per-order rows with RAW delivered output (shadow_score, decimal str)."""
+    return [{"intent_id": iid, "shadow_score": sc} for iid, sc in pairs]
+
+
+def _mgr(champ_per_intent) -> EpochManager:
+    """Bare manager whose stored champion submission carries ``champ_per_intent``
+    (the freshly re-benched per-order RAW outputs the relative rule joins against)."""
     mgr = EpochManager.__new__(EpochManager)
-    mgr._champion = types.SimpleNamespace(submission_id="champ", benchmark_score=champion_score)
-    mgr._dethrone_margin = dethrone_margin
+    mgr._champion = types.SimpleNamespace(submission_id="champ", benchmark_score=0.6)
+    mgr._dethrone_margin = 0.005
+    mgr._incumbent_refresh_failed = False
+    champ_sub = types.SimpleNamespace(
+        submission_id="champ",
+        benchmark_details={"per_intent": champ_per_intent},
+    )
+    sub_store = MagicMock()
+    sub_store.get.return_value = champ_sub
+    mgr._sub_store = sub_store
+    # Observe-only would-be vote is exercised elsewhere; no-op it here.
+    mgr._record_would_be_vote = lambda challenger: None
     return mgr
 
 
-def _challenger(score: float):
-    return types.SimpleNamespace(submission_id="chal", benchmark_score=score)
+def _challenger(chal_per_intent, score: float = 0.7):
+    return types.SimpleNamespace(
+        submission_id="chal",
+        benchmark_score=score,
+        benchmark_details={"per_intent": chal_per_intent},
+    )
 
 
-def test_should_adopt_rejects_dropping_a_champion_covered_app():
-    mgr = _mgr(champion_score=0.6)
-    mgr._get_incumbent_scorecard = lambda: {"app_scores": {"app_A": 0.6, "app_B": 0.6}}
-    mgr._get_scorecard = lambda sub: {"app_scores": {"app_A": 0.9}}  # app_B dropped
-
-    # Globally higher (0.9 > 0.6) but drops app_B → must NOT adopt.
-    assert mgr._should_adopt(_challenger(0.9)) is False
-
-
-def test_should_adopt_accepts_strict_per_app_improvement():
-    mgr = _mgr(champion_score=0.6)
-    mgr._get_incumbent_scorecard = lambda: {"app_scores": {"app_A": 0.6, "app_B": 0.6}}
-    mgr._get_scorecard = lambda sub: {"app_scores": {"app_A": 0.7, "app_B": 0.7}}
-
-    assert mgr._should_adopt(_challenger(0.7)) is True
+def test_should_adopt_rejects_dropping_a_champion_covered_order():
+    # Champion delivered on o2; the challenger drops it (0) -> regression -> REJECT,
+    # even though it strictly wins o1.
+    mgr = _mgr(_per_intent([("o1", "100"), ("o2", "200")]))
+    chal = _challenger(_per_intent([("o1", "150"), ("o2", "0")]))
+    assert mgr._should_adopt(chal) is False
 
 
-def test_dethrone_baseline_is_not_floored_for_a_degraded_champion():
-    # Champion degraded to 0.3 (below MIN_CHAMPION_SCORE=0.5). A 0.5 challenger
-    # that improves the app should win. With the old max(score, 0.5) floor the
-    # required bar was 0.5*1.005 and the 0.5 challenger was wrongly rejected.
-    mgr = _mgr(champion_score=0.3)
-    mgr._get_incumbent_scorecard = lambda: {"app_scores": {"app_X": 0.3}}
-    mgr._get_scorecard = lambda sub: {"app_scores": {"app_X": 0.5}}
+def test_should_adopt_accepts_strict_per_order_improvement():
+    # Challenger delivers strictly more on every order -> ADOPT.
+    mgr = _mgr(_per_intent([("o1", "100"), ("o2", "100")]))
+    chal = _challenger(_per_intent([("o1", "120"), ("o2", "130")]))
+    assert mgr._should_adopt(chal) is True
 
-    assert mgr._should_adopt(_challenger(0.5)) is True
+
+def test_should_adopt_rejects_when_only_matched():
+    # Challenger ties the champion on every order (within the noise band) -> no win
+    # -> not adopted (the relative rule requires a strict per-order improvement).
+    mgr = _mgr(_per_intent([("o1", "1000")]))
+    chal = _challenger(_per_intent([("o1", "1000")]))
+    assert mgr._should_adopt(chal) is False
 
 
 def test_abstains_when_incumbent_bar_is_stale():
     # Stale-bar guard (#242): an incumbent exists but could NOT be freshly
     # re-benchmarked this round (_refresh_incumbent_score failed) -> ABSTAIN, even
-    # for a clear improvement, mirroring the follower's conservative REJECT so the
+    # for a clear per-order win, mirroring the follower's conservative REJECT so the
     # leader and fleet never diverge on a stale champion bar.
-    mgr = _mgr(champion_score=0.6)
-    mgr._get_incumbent_scorecard = lambda: {"app_scores": {"app_A": 0.6, "app_B": 0.6}}
-    mgr._get_scorecard = lambda sub: {"app_scores": {"app_A": 0.7, "app_B": 0.7}}
+    mgr = _mgr(_per_intent([("o1", "100")]))
+    chal = _challenger(_per_intent([("o1", "200")]))  # a clear per-order win
 
     mgr._incumbent_refresh_failed = False
-    assert mgr._should_adopt(_challenger(0.7)) is True  # fresh bar -> adopts
+    assert mgr._should_adopt(chal) is True   # fresh bar -> adopts
 
     mgr._incumbent_refresh_failed = True
-    assert mgr._should_adopt(_challenger(0.7)) is False  # stale bar -> abstain
+    assert mgr._should_adopt(chal) is False  # stale bar -> abstain

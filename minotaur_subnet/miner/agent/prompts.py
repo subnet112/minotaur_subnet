@@ -454,22 +454,37 @@ def build_improve_task(
     recent_quote_errors: list[str] | None = None,
     last_score: float = 0.0,
     last_score_message: str = "",
+    relative: dict | None = None,
+    verdict: str = "",
+    relative_headroom: float = 1.0,
 ) -> str:
     """Build a task prompt for improving an existing strategy via Claude CLI.
 
     Args:
         app_id: The app identifier.
-        avg_score: Current average score.
-        best_score: Current best score.
-        trend: Score trend (improving/declining/stable).
+        avg_score: Current average score (post-cutover: on-chain BPS, not 0..1).
+        best_score: Current best score (post-cutover: on-chain BPS).
+        trend: Trend (improving/declining/stable) of the better/compared ratio.
         recent_scores: Recent score values.
-        champion_score: Current champion's benchmark score.
-        target_score: Score needed to dethrone champion (champion * 1.05).
+        champion_score: Vestigial — the champion has no absolute score now (it's
+            the relative baseline). Kept for back-compat display only.
+        target_score: Vestigial dethrone target; the real bar is the relative
+            verdict (beat the champion on every order).
         scenario_scores: Per-scenario scores from champion's benchmark.
         quote_failure_rate: Fraction of quotes that failed (0.0-1.0).
         recent_quote_errors: Recent quote error strings.
+        relative: Per-submission RELATIVE COUNTS vs the champion
+            ({better, worse, matched, new, compared, verdict}) — the
+            authoritative head-to-head signal. None until first benched.
+        verdict: "dethrone" | "matched" | "behind" from the relative counts.
+        relative_headroom: Fraction of orders NOT yet beating the champion.
     """
-    sections = [f"""\
+    # Post relative-cutover the adoption bar is the RELATIVE per-order verdict
+    # (beat the champion on every order, strictly win ≥1), not a numeric score.
+    # Lead with the counts when we have them; the 0..1 score numbers are now
+    # saturated validity sentinels so they're shown only as secondary context.
+    if relative:
+        head = f"""\
 You are the **root miner agent** for Minotaur. An existing strategy for
 app `{app_id}` is live. Your job is to produce an improved `strategy.py`
 by orchestrating the specialised sub-agents — you do NOT analyse or
@@ -477,15 +492,32 @@ write code yourself.
 
 Strategy file path: `{app_id}/strategy.py`
 
-Current performance (summary; the analyzer will pull full detail):
-- Miner's recent scores: {recent_scores}
-- Miner avg: {avg_score:.3f}   best: {best_score:.3f}   trend: {trend}
-- Champion score: {champion_score:.3f}
-- Target to overtake: {target_score:.3f} (champion + 1% margin)"""]
+Standing vs the champion (RELATIVE per-order counts — the adoption bar):
+- better={relative.get('better', 0)}  worse={relative.get('worse', 0)}  \
+matched={relative.get('matched', 0)}  new(blind-spot covers)={relative.get('new', 0)}  \
+compared={relative.get('compared', 0)}
+- verdict: {verdict or relative.get('verdict', '?')}  \
+(headroom: {relative_headroom:.0%} of orders not yet beating the champion)
+- To ADOPT you must beat the champion on EVERY order (0 'worse') AND strictly
+  win at least one — matching everywhere is NOT enough. Trend of orders-won: {trend}."""
+    else:
+        head = f"""\
+You are the **root miner agent** for Minotaur. An existing strategy for
+app `{app_id}` is live. Your job is to produce an improved `strategy.py`
+by orchestrating the specialised sub-agents — you do NOT analyse or
+write code yourself.
+
+Strategy file path: `{app_id}/strategy.py`
+
+No relative counts yet (not benched since the cutover). The adoption bar is
+the RELATIVE per-order rule: beat the current champion on every order and
+strictly win at least one. Secondary context (saturated validity sentinels,
+not quality grades): recent={recent_scores}, trend={trend}."""
+    sections = [head]
 
     if scenario_scores:
         sorted_scenarios = sorted(scenario_scores.items(), key=lambda x: x[1])
-        lines = ["", "Per-scenario champion scores (lowest first — where the headroom is):"]
+        lines = ["", "Per-scenario champion outputs (lowest first — likely where you can win):"]
         for scenario_id, score in sorted_scenarios[:8]:
             label = scenario_id.split(":", 1)[-1] if ":" in scenario_id else scenario_id
             lines.append(f"  - {label}: {score:.3f}")
@@ -508,21 +540,23 @@ Current performance (summary; the analyzer will pull full detail):
 ## Orchestration plan
 
 1. **Delegate to `analyzer`**: ask it to read `{app_id}/strategy.py`
-   plus the scenario scores above and produce a prioritised diagnosis.
-   Pass along: the champion score ({champion_score:.3f}), the target
-   ({target_score:.3f}), and any recent quote errors.
+   plus the scenario outputs above and produce a prioritised diagnosis of
+   which orders the champion still beats us on (the 'worse'/'matched' orders
+   are the targets). Pass along any recent quote errors.
 2. **Delegate to `strategy-writer`**: pass the analyzer's diagnosis +
    strategy file path. It edits the file and verifies structural
    validity with `test_strategy`.
 3. **Delegate to `benchmark-runner`**: it runs `score_strategy_all` and
-   reports aggregate + per-scenario scores.
-4. **Decide**:
-   - If aggregate ≥ target and no scenario regressed below 0.4: DONE.
-   - If aggregate improved but not to target, and you still have budget
-     left: feed the benchmark report back to `analyzer` for one more
-     iteration (step 2 → 3).
+   reports per-scenario delivered outputs.
+4. **Decide** (relative per-order rule — there is no aggregate score bar):
+   - If you out-deliver the champion on at least one order and regress on
+     NONE (no order delivers strictly less than the champion's): DONE.
+   - If you still lose/tie on some orders and have budget left: feed the
+     report back to `analyzer` for one more iteration (step 2 → 3),
+     targeting the orders where the champion still delivers more.
    - Hard cap: max 2 write+benchmark iterations.
-5. Report a short summary: final aggregate, which scenarios moved.
+5. Report a short summary: which orders now out-deliver the champion, which
+   still lose/tie.
 
 ## Constraints
 - You do NOT call MCP tools yourself. Sub-agents have them.

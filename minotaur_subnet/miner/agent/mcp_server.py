@@ -305,7 +305,11 @@ def get_app_solidity(app_id: str) -> dict:
     name="get_app_scores",
     description=(
         "Get execution statistics for an app: total_executions, avg_score, "
-        "best_score, recent_scores. Use this to understand current performance."
+        "best_score, recent_scores. NOTE: post relative-scoring cutover these "
+        "are on-chain delivered-quality BPS (0..10000), and the JS 0..1 score is "
+        "a validity sentinel — the head-to-head 'am I beating the champion' signal "
+        "lives in the per-submission relative COUNTS (better/worse/matched/new) on "
+        "GET /v1/submissions/{id}/status, not here."
     ),
 )
 def get_app_scores(app_id: str) -> dict:
@@ -323,6 +327,7 @@ def get_app_scores(app_id: str) -> dict:
         "avg_score": data.get("avg_score", 0.0),
         "best_score": data.get("best_score", 0.0),
         "recent_scores": data.get("recent_scores", []),
+        "scoring_mode": data.get("scoring_mode", ""),
     }
 
 
@@ -988,6 +993,9 @@ def get_score_feedback(app_id: str) -> dict:
         "recent_scores": data.get("recent_scores", []),
     }
 
+    # Trend over the recent series. Threshold is proportional with a 0.05 floor
+    # so it works whether recent_scores are legacy 0..1 values or post-cutover
+    # on-chain BPS (0..10000) — a few-BPS wobble must not read as a swing.
     recent = stats.get("recent_scores", [])
     trend = "stable"
     if len(recent) >= 4:
@@ -995,9 +1003,10 @@ def get_score_feedback(app_id: str) -> dict:
         first_half = sum(recent[:mid]) / mid
         second_half = sum(recent[mid:]) / (len(recent) - mid)
         diff = second_half - first_half
-        if diff > 0.05:
+        threshold = max(0.05, abs(first_half) * 0.05)
+        if diff > threshold:
             trend = "improving"
-        elif diff < -0.05:
+        elif diff < -threshold:
             trend = "declining"
 
     return {
@@ -1007,6 +1016,7 @@ def get_score_feedback(app_id: str) -> dict:
         "recent_scores": recent[-10:],
         "total_executions": stats.get("total_executions", 0),
         "trend": trend,
+        "scoring_mode": data.get("scoring_mode", ""),
     }
 
 

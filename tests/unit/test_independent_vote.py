@@ -1,9 +1,11 @@
 """Follower independent adopt-vote (CHALLENGER_QUORUM_MODE).
 
 `_independent_adopt_vote` benchmarks the CURRENT champion on this follower's own
-(diverse) intents and applies the shared `evaluate_adoption` rule, returning an
+shared corpus and applies the AUTHORITATIVE relative per-order rule
+(`evaluate_relative_adoption`) — the IDENTICAL rule the leader runs — returning an
 independent ADOPT/REJECT vote. These tests drive it with the REAL rule and
-controlled scorecards/scores, plus the conservative champion-unresolvable guard.
+controlled per-order RAW outputs (shadow_score), plus the conservative
+champion-unresolvable guard and the bootstrap carve-out.
 """
 from __future__ import annotations
 
@@ -12,26 +14,24 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from minotaur_subnet.api.routes.submissions import champion_consensus as cc
-
-
-class _Card:
-    def __init__(self, d):
-        self._d = d
-
-    def to_dict(self):
-        return self._d
+from minotaur_subnet.harness.orchestrator import BenchmarkResult
 
 
 _PRESENT = object()  # sentinel: a champion submission exists
 
 
-class _Worker:
-    """Stand-in for BenchmarkWorker: serves champion submission/image + scores."""
+def _results(*pairs):
+    """Per-order BenchmarkResults carrying intent_id + RAW output (decimal str)."""
+    return [BenchmarkResult(intent_id=iid, shadow_score=sc) for iid, sc in pairs]
 
-    def __init__(self, *, champ_image, chal_card, champ_card, champ_score, champ_sub=_PRESENT):
+
+class _Worker:
+    """Stand-in for BenchmarkWorker: serves champion submission/image + champion
+    per-order results (the relative rule joins them against the challenger's)."""
+
+    def __init__(self, *, champ_image, champ_results, champ_score=0.0, champ_sub=_PRESENT):
         self._champ_image = champ_image
-        self._chal_card = chal_card
-        self._champ_card = champ_card
+        self._champ_results = champ_results
         self._champ_score = champ_score
         self._epoch_block_number = 123
         # The champion SUBMISSION (or None for true bootstrap). Defaults to present
@@ -44,11 +44,8 @@ class _Worker:
     def _resolve_champion_image(self):
         return self._champ_image
 
-    def _compute_avg_score(self, results):  # only called for the champion run
+    def _compute_avg_score(self, results):  # logging only now
         return self._champ_score
-
-    def _build_scorecard(self, results):
-        return _Card(self._champ_card if results == "CHAMP_RESULTS" else self._chal_card)
 
     async def memo_champion_bench(
         self,
@@ -61,10 +58,9 @@ class _Worker:
         reference_quotes=None,
         run,
     ):
-        # Pass-through stub matching BenchmarkWorker.memo_champion_bench's keyword-only
-        # surface; the memo itself is covered by test_champion_bench_memo.py, so here we
-        # just run the caller's thunk (== flag-off behavior).
-        return await run()
+        # Return the champion per-order results directly (a cache-hit-shaped stub);
+        # the memo itself is covered by test_champion_bench_memo.py.
+        return self._champ_results
 
 
 class _Session:
@@ -77,107 +73,64 @@ class _Orch:
         return _Session()
 
 
-async def _fake_run_benchmark(*a, **k):
-    return "CHAMP_RESULTS"
-
-
-def _vote(worker, chal_score, monkeypatch):
-    for k in (
-        "ADOPT_RULE", "MIN_CHAMPION_SCORE", "PER_APP_MIN_SCORE",
-        "MAX_APP_REGRESSION", "ONCHAIN_FLOOR_BPS",
-    ):
-        monkeypatch.delenv(k, raising=False)
+def _vote(worker, chal_results, chal_score, monkeypatch):
     cand = SimpleNamespace(submission_id="sub_test")
     intents = [(SimpleNamespace(app_id="dex"), SimpleNamespace(chain_id=8453), None)]
     with patch(
         "minotaur_subnet.harness.orchestrator.SolverOrchestrator", _Orch
-    ), patch(
-        "minotaur_subnet.harness.orchestrator.run_benchmark", _fake_run_benchmark
     ):
         return asyncio.run(
             cc._independent_adopt_vote(
                 worker=worker, intents=intents, score_fn=None, simulator=object(),
-                chal_results="CHAL_RESULTS", chal_score=chal_score,
+                chal_results=chal_results, chal_score=chal_score,
                 candidate=cand, round_id="r1",
             )
         )
 
 
 def test_adopts_clear_improvement(monkeypatch):
-    w = _Worker(
-        champ_image="champ:img",
-        chal_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
-        champ_card={"app_scores": {"dex": 0.5}, "app_onchain": {}},
-        champ_score=0.5,
-    )
-    adopt, score = _vote(w, 0.9, monkeypatch)
+    # Challenger delivers strictly more on every order -> 2 wins, 0 regressions.
+    w = _Worker(champ_image="champ:img", champ_results=_results(("o1", "100"), ("o2", "200")))
+    adopt, score = _vote(w, _results(("o1", "120"), ("o2", "250")), 0.9, monkeypatch)
     assert adopt is True and score == 0.9
 
 
 def test_rejects_regression(monkeypatch):
-    # Challenger drops the app's score below the champion (well past the margin).
-    w = _Worker(
-        champ_image="champ:img",
-        chal_card={"app_scores": {"dex": 0.5}, "app_onchain": {}},
-        champ_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
-        champ_score=0.9,
-    )
-    adopt, _ = _vote(w, 0.5, monkeypatch)
+    # Challenger delivers less on an order the champion served -> regression veto.
+    w = _Worker(champ_image="champ:img", champ_results=_results(("o1", "200")))
+    adopt, _ = _vote(w, _results(("o1", "100")), 0.5, monkeypatch)
     assert adopt is False
 
 
-def test_rejects_within_margin(monkeypatch):
-    # Challenger barely above champion but not by the dethrone margin -> REJECT.
-    w = _Worker(
-        champ_image="champ:img",
-        chal_card={"app_scores": {"dex": 0.701}, "app_onchain": {}},
-        champ_card={"app_scores": {"dex": 0.70}, "app_onchain": {}},
-        champ_score=0.70,
-    )
-    adopt, _ = _vote(w, 0.701, monkeypatch)  # 0.701 < 0.70 * 1.005 = 0.7035
+def test_rejects_when_only_matched(monkeypatch):
+    # Challenger ties the champion everywhere (within the noise band) -> no win -> REJECT.
+    w = _Worker(champ_image="champ:img", champ_results=_results(("o1", "1000")))
+    adopt, _ = _vote(w, _results(("o1", "1000")), 0.7, monkeypatch)
     assert adopt is False
 
 
 def test_rejects_when_champion_exists_but_image_unresolvable(monkeypatch):
     # has_champion=True (a champion submission exists) but its image can't resolve
-    # -> can't benchmark the incumbent to prove the margin -> conservative REJECT.
-    w = _Worker(
-        champ_sub=_PRESENT,
-        champ_image=None,
-        chal_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
-        champ_card={},
-        champ_score=0.0,
-    )
-    adopt, score = _vote(w, 0.9, monkeypatch)
+    # -> can't benchmark the incumbent to prove improvement -> conservative REJECT.
+    w = _Worker(champ_sub=_PRESENT, champ_image=None, champ_results=[])
+    adopt, score = _vote(w, _results(("o1", "120")), 0.9, monkeypatch)
     assert adopt is False and score == 0.9
 
 
 def test_bootstrap_adopts_first_champion_when_no_incumbent(monkeypatch):
     # True bootstrap: no champion submission AT ALL -> has_champion=False, matching
-    # the leader. A challenger that clears the absolute floor is ADOPTED (no margin,
-    # no incumbent benchmark) — NOT auto-rejected (which would deadlock first adoption).
-    w = _Worker(
-        champ_sub=None,
-        champ_image=None,
-        chal_card={"app_scores": {"dex": 0.9}, "app_onchain": {}},
-        champ_card={},
-        champ_score=0.0,
-    )
-    adopt, score = _vote(w, 0.9, monkeypatch)
+    # the leader. A challenger that delivers value on any order is ADOPTED (no
+    # incumbent to dethrone) — NOT auto-rejected (which would deadlock first adoption).
+    w = _Worker(champ_sub=None, champ_image=None, champ_results=[])
+    adopt, score = _vote(w, _results(("o1", "120")), 0.9, monkeypatch)
     assert adopt is True and score == 0.9
 
 
-def test_bootstrap_rejects_first_champion_below_floor(monkeypatch):
-    # Bootstrap but the challenger fails the absolute per-app floor -> REJECT even
-    # with no incumbent (the floor still applies).
-    w = _Worker(
-        champ_sub=None,
-        champ_image=None,
-        chal_card={"app_scores": {"dex": 0.1}, "app_onchain": {}},
-        champ_card={},
-        champ_score=0.0,
-    )
-    adopt, _ = _vote(w, 0.1, monkeypatch)
+def test_bootstrap_rejects_when_challenger_delivers_nothing(monkeypatch):
+    # Bootstrap but the challenger delivers no value on any order -> nothing to
+    # adopt -> REJECT even with no incumbent.
+    w = _Worker(champ_sub=None, champ_image=None, champ_results=[])
+    adopt, _ = _vote(w, _results(("o1", "0")), 0.1, monkeypatch)
     assert adopt is False
 
 

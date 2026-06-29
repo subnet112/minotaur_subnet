@@ -490,14 +490,14 @@ def _render_report_body(
     reason: str,
     champion_score: float | None,
     dethrone_margin: float | None,
-    champion_details: dict | None = None,
     *,
     won: bool = False,
 ) -> str:
     """PR-comment body for a champion-consensus outcome: the full scored benchmark
-    report when the submission was benchmarked (with the champion per-case
-    comparison and any revert traces), else the concise reason. ``won=True`` renders
-    it as a win (header + fallback), otherwise as a rejection. Never raises."""
+    report when the submission was benchmarked (the aggregate-vs-champion scalars
+    plus the same-pin per-order ``relative`` count summary), else the concise
+    reason. ``won=True`` renders it as a win (header + fallback), otherwise as a
+    rejection. Never raises."""
     fallback = (
         f"### 🏆 Beat the champion\n\n{reason}" if won
         else f"### ❌ Submission rejected\n\n{reason}"
@@ -516,7 +516,6 @@ def _render_report_body(
             threshold=PER_APP_MIN_SCORE,
             dethrone_margin=(dethrone_margin if dethrone_margin is not None else DETHRONE_MARGIN),
             reason=reason,
-            champion_details=champion_details,
             won=won,
         )
         if not report:
@@ -524,7 +523,7 @@ def _render_report_body(
         # Only enrich when there's real benchmark detail to show; a screening or
         # otherwise-empty report falls back to the concise message.
         agg = report.get("aggregate") or {}
-        if not (report.get("per_case") or agg.get("your_score") is not None):
+        if not (agg.get("your_score") is not None or report.get("relative")):
             return fallback
         md = render_report_md(report, submission_id=getattr(submission, "submission_id", None))
         return md or fallback
@@ -558,7 +557,6 @@ def on_champion_rejected_pr(
     *,
     champion_score: float | None = None,
     dethrone_margin: float | None = None,
-    champion_details: dict | None = None,
     repo_token: str | None = None,
 ) -> bool:
     """REJECT path: comment the reason + scored report on the miner's PR and GC the
@@ -567,10 +565,9 @@ def on_champion_rejected_pr(
     iterate on the same PR. Mirrors the off-chain quorum's reject decision onto the
     PR. Usable while adoption is frozen — pure miner feedback, no chain writes.
 
-    When ``report_md`` isn't supplied, builds the full per-case benchmark report
-    (your score vs the champion per case, the dethrone gap, every case
-    worst-first, and per-step revert traces) from the submission, given
-    ``champion_score`` / ``dethrone_margin`` / ``champion_details``."""
+    When ``report_md`` isn't supplied, builds the scored benchmark report (the
+    aggregate-vs-champion scalars plus the same-pin per-order ``relative`` count
+    summary) from the submission, given ``champion_score`` / ``dethrone_margin``."""
     pr_number = getattr(submission, "pr_number", None)
     if not pr_number:
         logger.info(
@@ -579,7 +576,7 @@ def on_champion_rejected_pr(
         )
         return False
     body = report_md or _render_report_body(
-        submission, reason, champion_score, dethrone_margin, champion_details,
+        submission, reason, champion_score, dethrone_margin,
     )
     _owner_repo, _tok = _pr_comment_target(submission, repo_token)
     commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
@@ -601,7 +598,6 @@ def on_champion_finalist_pr(
     *,
     champion_score: float | None = None,
     dethrone_margin: float | None = None,
-    champion_details: dict | None = None,
     repo_token: str | None = None,
 ) -> bool:
     """WIN path: comment the full scored report on a WINNING candidate's PR so
@@ -612,10 +608,9 @@ def on_champion_finalist_pr(
     the dethrone margin) onto the miner's PR. Unlike the reject path, this only
     comments — no ``close_pr`` and no candidate-image GC.
 
-    When ``report_md`` isn't supplied, builds the full per-case benchmark report
-    (your score vs the champion per case, the dethrone gap, every case
-    worst-first, and per-step revert traces) from the submission, given
-    ``champion_score`` / ``dethrone_margin`` / ``champion_details``."""
+    When ``report_md`` isn't supplied, builds the scored benchmark report (the
+    aggregate-vs-champion scalars plus the same-pin per-order ``relative`` count
+    summary) from the submission, given ``champion_score`` / ``dethrone_margin``."""
     pr_number = getattr(submission, "pr_number", None)
     if not pr_number:
         logger.info(
@@ -624,7 +619,7 @@ def on_champion_finalist_pr(
         )
         return False
     body = report_md or _render_report_body(
-        submission, reason, champion_score, dethrone_margin, champion_details,
+        submission, reason, champion_score, dethrone_margin,
         won=True,
     )
     _owner_repo, _tok = _pr_comment_target(submission, repo_token)

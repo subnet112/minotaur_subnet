@@ -1,8 +1,9 @@
-"""P1: submission feedback report — pure assembly tests.
+"""Submission feedback report — pure assembly tests.
 
-Covers outcome classification, the aggregate-vs-champion math, per-case mapping
-(JS + on-chain + pass/fail + worst-first), the in-flight (None) case, and that
-P1 leaks no champion per-case data.
+Covers outcome classification, the aggregate-vs-champion math, and the
+in-flight (None) case. Per-order detail now lives solely in the same-pin
+``relative`` block (see test_relative_report.py); the cross-fork ``per_case`` /
+``shadow_relative`` surfaces were removed.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def test_inflight_returns_none():
 # ── scored, not adopted ───────────────────────────────────────────────────────
 
 
-def test_scored_not_adopted_aggregate_and_cases():
+def test_scored_not_adopted_aggregate():
     r = _report(_sub("scored", 0.594, _DETAILS), reason="dethrone_margin_not_met")
     assert r["outcome"] == "scored_not_adopted"
     assert r["reason"] == "dethrone_margin_not_met"
@@ -67,28 +68,12 @@ def test_scored_not_adopted_aggregate_and_cases():
     assert agg["score_to_beat"] == round(0.62 * 1.005, 6)   # 0.6231
     assert agg["gap"] == round(0.594 - 0.62 * 1.005, 6)     # negative
     assert agg["gap"] < 0
-    # per-case
-    assert len(r["per_case"]) == 3
-    first = next(c for c in r["per_case"] if c["case"] == "WETH_to_USDC")
-    assert first["your"]["js"] == 0.65
-    assert first["your"]["on_chain"] == 5027
-    assert first["your"]["passed"] is True
-    # worst-first: the 0.0 case leads
-    assert r["worst_cases"][0] == "BAD"
-    assert r["coverage"]["public_cases"] == 3
-    assert r["coverage"]["shadow_cases"] == 0
-
-
-def test_per_case_passed_flag_uses_threshold():
-    r = _report(_sub("scored", 0.594, _DETAILS))
-    by = {c["case"]: c["your"]["passed"] for c in r["per_case"]}
-    assert by == {"WETH_to_USDC": True, "USDC_to_WETH": True, "BAD": False}
-
-
-def test_p1_leaks_no_champion_per_case():
-    r = _report(_sub("scored", 0.594, _DETAILS))
-    for c in r["per_case"]:
-        assert set(c.keys()) == {"case", "your"}   # no "champion" block in P1
+    # The cross-fork per-order surfaces were removed; per-order detail is the
+    # same-pin ``relative`` block alone (absent here — no stored block).
+    assert "per_case" not in r
+    assert "worst_cases" not in r
+    assert "coverage" not in r
+    assert r["scoring_mode"] == "relative"
 
 
 # ── other outcomes ────────────────────────────────────────────────────────────
@@ -122,34 +107,3 @@ def test_no_champion_means_no_score_to_beat():
     assert r["aggregate"]["score_to_beat"] is None
     assert r["aggregate"]["gap"] is None
     assert r["outcome"] == "scored"   # can't be "not adopted" without a bar
-
-
-# ── revert reason surfaced (trace-in-report) ──────────────────────────────────
-
-
-def test_per_case_surfaces_revert_reason():
-    """A real-sim revert decodes a reason that reaches per_case.your, so a miner
-    can see WHY their plan failed on-chain without running their own node."""
-    details = {
-        "total_intents": 1, "plans_generated": 1, "errors": 1, "avg_score": 0.0,
-        "scorecard": {"scenario_scores": {"WETH_to_DAI": 0.0}},
-        "per_intent": [
-            {"intent_id": "WETH_to_DAI", "score": 0.0, "on_chain_score": None,
-             "has_plan": True,
-             "error": 'real_sim_reverted: scoreIntent reverted: Error("Too little received")',
-             "revert_reason": 'Error("Too little received")',
-             "mock_simulation": False},
-        ],
-    }
-    case = _report(_sub("scored", score=0.0, details=details))["per_case"][0]
-    assert case["case"] == "WETH_to_DAI"
-    assert case["your"]["revert_reason"] == 'Error("Too little received")'
-    assert case["your"]["passed"] is False
-
-
-def test_per_case_revert_reason_key_present_and_none_when_absent():
-    """A normal (non-reverting) case still carries the key, valued None — so the
-    field is stable for clients regardless of outcome."""
-    for case in _report(_sub("scored", 0.594, _DETAILS))["per_case"]:
-        assert "revert_reason" in case["your"]
-        assert case["your"]["revert_reason"] is None
