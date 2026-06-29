@@ -437,6 +437,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8080, help="Listen port")
     args = parser.parse_args()
 
+    # Production: refuse to run a persistent store in-memory. A node that can't resolve a
+    # durable path now crashes at boot with a clear message instead of silently losing its
+    # round/submission state on the next restart (the #430 class). Only the real server
+    # process enables this — tests/TestClient never call main(), so they stay in-memory-safe.
+    from minotaur_subnet.api.routes.submissions.state import require_durable_state
+    require_durable_state()
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
