@@ -238,6 +238,12 @@ class CloseRoundRequest(BaseModel):
     # max_length bounds a hostile/buggy leader's payload (a real round holds at
     # most one submission per active miner; far below this cap).
     submissions: list[dict[str, Any]] | None = Field(default=None, max_length=1024)
+    # Operator force-sync ("emergency reattach"): when True the follower adopts this round
+    # even if it is older-or-equal to its current round (bypasses the adopt-if-behind
+    # staleness guard). Used by the champion re-attest lever to remind a follower of a
+    # champion round it never saw / has pruned, so it re-activates the standing champion.
+    # Carried inside the signed payload like every other field.
+    force: bool = False
     # Leader EIP-712 signature over the canonical JSON of this sync payload
     # (with proposer_signature stripped). Backward-compatible: empty during the
     # staggered rollout, when followers fall back to the shared-key header.
