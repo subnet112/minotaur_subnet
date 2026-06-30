@@ -456,6 +456,19 @@ class EpochManager:
 
         finalist = self._find_champion(epoch, round_id=round_id)
         if finalist is None:
+            # DEFER (don't abort) while the round can still produce a candidate. Any
+            # submission still in a non-terminal pre-score state can yet become SCORED —
+            # and a not-yet-benchmarked submission (incl. one waiting on a fork-pin that
+            # only sealed at close) sits in BENCHMARKING, so this in-flight check also
+            # covers "pin unsealed, nothing scored yet" — the cause of the spurious
+            # no_champion_candidate aborts. Leaving the round in REPLAYING with NO abort
+            # broadcast is consensus-neutral (followers keep their CLOSED view); the
+            # coordinator loop re-evaluates next tick (and _maybe_abort_expired_round at the
+            # decision_deadline bounds a round whose submissions never score).
+            if self._round_has_inflight_submissions(round_id):
+                result["deferred"] = True
+                result["status_after"] = round_state.status.value
+                return result
             next_round = self._complete_round(
                 round_state,
                 epoch,
@@ -936,6 +949,28 @@ class EpochManager:
         return self._champion
 
     # ── Internal ──────────────────────────────────────────────────────────
+
+    def _round_has_inflight_submissions(self, round_id: str) -> bool:
+        """True if any submission for this round is still in a non-terminal pre-score
+        state (QUEUED / screening / BENCHMARKING) and could yet become SCORED — in which
+        case evaluation should DEFER rather than abort ``no_champion_candidate``. A
+        submission awaiting an unsealed fork-pin (run_once benchmarked nothing) sits in
+        BENCHMARKING, so this also covers the unsealed-pin case."""
+        if not self._sub_store:
+            return False
+        inflight = (
+            SubmissionStatus.QUEUED,
+            SubmissionStatus.SCREENING_STAGE_1,
+            SubmissionStatus.SCREENING_STAGE_2,
+            SubmissionStatus.SCREENING_STAGE_3,
+            SubmissionStatus.BENCHMARKING,
+        )
+        try:
+            return any(
+                s.status in inflight for s in self._sub_store.list_by_round(round_id)
+            )
+        except Exception:  # noqa: BLE001 — a store hiccup must not turn a defer into an abort
+            return False
 
     def _find_champion(self, epoch: int, *, round_id: str | None = None) -> Submission | None:
         """Find the highest-scoring champion-eligible submission for the epoch.

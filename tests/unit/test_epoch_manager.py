@@ -649,6 +649,42 @@ class TestEpochManager:
         assert next_round.round_id != current_round.round_id
 
     @pytest.mark.asyncio
+    async def test_evaluate_round_defers_when_submission_still_benchmarking(self):
+        """Contrast with test_round_store_aborts_round_when_no_candidate: closed-round
+        evaluation with a still-BENCHMARKING submission and no finalist must DEFER (status
+        stays REPLAYING, no abort) rather than abort no_champion_candidate — so the
+        post-close benchmark can finish. This is the fork-pin defer fix; a not-yet-scored
+        submission (incl. one that waited on an unsealed pin) sits in BENCHMARKING."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=4)
+        round_store.close_current_round(
+            close_epoch=4,
+            benchmark_pack_hash="pack-4",
+            committee_hash="committee-4",
+            quorum_required=2,
+        )
+        inflight = _make_submission(
+            submission_id="sub_inflight",
+            epoch=4,
+            round_id=current_round.round_id,
+            status=SubmissionStatus.BENCHMARKING,
+        )
+        store = _make_store_with_subs(inflight)
+        worker = _make_mock_benchmark_worker()
+        mgr = EpochManager(
+            benchmark_worker=worker,
+            submission_store=store,
+            round_store=round_store,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        updated_round = round_store.get_round(current_round.round_id)
+        assert result.get("deferred") is True
+        assert result.get("abort_reason") is None
+        assert updated_round.status != RoundStatus.ABORTED
+
+    @pytest.mark.asyncio
     async def test_round_scope_ignores_other_round_submissions(self):
         """Round-aware champion selection only considers the active round cohort."""
         round_store = RoundStore()

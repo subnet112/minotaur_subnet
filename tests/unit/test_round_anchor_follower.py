@@ -54,29 +54,50 @@ def test_resolve_returns_cached_without_deriving(monkeypatch):
 
 def test_resolve_derives_and_caches_when_uncached(monkeypatch):
     monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")
-    rs = RoundState(round_id="r1", status=RoundStatus.CLOSED, close_epoch=100,
-                    fork_pins=None)
+    rs = RoundState(round_id="r1", status=RoundStatus.CLOSED, opened_epoch=95,
+                    close_epoch=100, fork_pins=None)
     store = _store_with(rs)
     with _patch_store(store), \
          patch.object(startup, "_derive_round_fork_pins", return_value={8453: 3000}) as derive:
         assert _resolve_round_fork_pins("r1") == {8453: 3000}
-        derive.assert_called_once_with(100)            # anchored on close_epoch
+        derive.assert_called_once_with(95)             # anchored on OPENED_epoch, not close
         store.set_round_fork_pins.assert_called_once_with("r1", {8453: 3000})  # cached
 
 
-def test_resolve_none_when_not_closed(monkeypatch):
+def test_resolve_derives_during_open_window(monkeypatch):
+    """The fork-pin fix: the pin anchors at opened_epoch, so it RESOLVES during the OPEN
+    window (close_epoch still None) instead of deferring until close — the defect that made
+    every round abort benchmarked=0."""
     monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")
-    rs = RoundState(round_id="r1", status=RoundStatus.OPEN, close_epoch=None, fork_pins=None)
-    with _patch_store(_store_with(rs)), \
-         patch.object(startup, "_derive_round_fork_pins") as derive:
-        assert _resolve_round_fork_pins("r1") is None
-        derive.assert_not_called()
+    rs = RoundState(round_id="r1", status=RoundStatus.OPEN, opened_epoch=95,
+                    close_epoch=None, fork_pins=None)
+    store = _store_with(rs)
+    with _patch_store(store), \
+         patch.object(startup, "_derive_round_fork_pins", return_value={8453: 2970}) as derive:
+        assert _resolve_round_fork_pins("r1") == {8453: 2970}
+        derive.assert_called_once_with(95)             # opened_epoch, available at OPEN
 
 
 def test_resolve_none_when_round_missing(monkeypatch):
     monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")
     with _patch_store(_store_with(None)):
         assert _resolve_round_fork_pins("r1") is None
+
+
+def test_set_round_fork_pins_idempotent_guard():
+    """A non-None pin is FIXED once set: a DIFFERING overwrite is refused (consensus
+    safety — the pin is already folded into the signed pack hash), while the same value
+    or a clear-to-None is allowed."""
+    from minotaur_subnet.harness.round_store import RoundStore
+    store = RoundStore()
+    r = store.ensure_open_round(opened_epoch=10)
+    store.set_round_fork_pins(r.round_id, {8453: 100})
+    store.set_round_fork_pins(r.round_id, {8453: 100})          # same -> ok
+    assert store.get_round(r.round_id).fork_pins == {8453: 100}
+    store.set_round_fork_pins(r.round_id, {8453: 999})          # DIFFERING -> refused
+    assert store.get_round(r.round_id).fork_pins == {8453: 100}
+    store.set_round_fork_pins(r.round_id, None)                 # clear -> allowed
+    assert store.get_round(r.round_id).fork_pins is None
 
 
 # ── follower reactive benchmark forks at the round pin ────────────────────────
