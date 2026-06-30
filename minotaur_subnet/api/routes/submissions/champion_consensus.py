@@ -679,49 +679,69 @@ def _floor_champion_nonce(
     mints fresh; followers reuse the leader's nonce verbatim via *_override and
     must NOT re-floor (it would diverge their signed digest from the leader's).
     """
-    pc = getattr(consensus_manager, "protocol_config", None)
-    if pc is None:
-        return wallclock_ms
-    rpc_url = (getattr(pc, "rpc_url", "") or "").strip()
-    # The ChampionRegistry lives at quorum_address (distinct from the
-    # ValidatorRegistry); mirror _read_quorum_bps' quorum_address-or-registry
-    # fallback for the single-contract topology.
-    registry_address = (
-        (getattr(pc, "quorum_address", "") or "").strip()
-        or (getattr(pc, "registry_address", "") or "").strip()
-    )
-    if not rpc_url or not registry_address:
-        return wallclock_ms
-
-    signers = [s for s in (getattr(consensus_manager, "validators", None) or []) if s]
-    if not signers:
-        vid = (getattr(consensus_manager, "validator_id", "") or "").strip()
-        signers = [vid] if vid else []
-    if not signers:
-        return wallclock_ms
-
-    reader = nonce_reader or read_champion_last_nonce
-    highwater = 0
-    for signer in signers:
-        try:
-            highwater = max(highwater, int(reader(rpc_url, registry_address, signer)))
-        except Exception as exc:  # noqa: BLE001 — fail-open, never block proposing
-            logger.warning(
-                "champion nonce floor: lastNonce(%s) read failed on %s (%s); "
-                "falling back to wall-clock nonce %d (no floor applied this round)",
-                signer, registry_address, exc, wallclock_ms,
-            )
+    # Belt-and-suspenders fail-open: the per-signer reader is already guarded
+    # below, but the attribute reads here (protocol_config / quorum_address /
+    # validators — any of which could be a property that raises) are not. Wrap the
+    # whole body so NOTHING in flooring can ever propagate and block proposing a
+    # champion; an unexpected error just degrades to the raw wall-clock nonce.
+    try:
+        pc = getattr(consensus_manager, "protocol_config", None)
+        if pc is None:
+            return wallclock_ms
+        rpc_url = (getattr(pc, "rpc_url", "") or "").strip()
+        # The ChampionRegistry lives at quorum_address (distinct from the
+        # ValidatorRegistry); mirror _read_quorum_bps' quorum_address-or-registry
+        # fallback for the single-contract topology.
+        registry_address = (
+            (getattr(pc, "quorum_address", "") or "").strip()
+            or (getattr(pc, "registry_address", "") or "").strip()
+        )
+        if not rpc_url or not registry_address:
             return wallclock_ms
 
-    floored = max(int(wallclock_ms), highwater + 1)
-    if floored != wallclock_ms:
+        # NOTE: ``signers`` is the leader's DISCOVERED committee (its in-memory peer
+        # view), NOT the full on-chain authorized signer set. At quorum>1 an
+        # authorized co-signer the leader hasn't discovered yet whose lastNonce slot
+        # is higher could still make certify() revert "Nonce not increasing" — that
+        # residual is fail-open here AND now surfaced by the relayer's revert
+        # diagnostic. Production runs at the quorum floor (=1, leader-only signs),
+        # where the leader's own slot is the only one that matters.
+        signers = [s for s in (getattr(consensus_manager, "validators", None) or []) if s]
+        if not signers:
+            vid = (getattr(consensus_manager, "validator_id", "") or "").strip()
+            signers = [vid] if vid else []
+        if not signers:
+            return wallclock_ms
+
+        reader = nonce_reader or read_champion_last_nonce
+        highwater = 0
+        for signer in signers:
+            try:
+                highwater = max(highwater, int(reader(rpc_url, registry_address, signer)))
+            except Exception as exc:  # noqa: BLE001 — fail-open, never block proposing
+                logger.warning(
+                    "champion nonce floor: lastNonce(%s) read failed on %s (%s); "
+                    "falling back to wall-clock nonce %d (no floor applied this round)",
+                    signer, registry_address, exc, wallclock_ms,
+                )
+                return wallclock_ms
+
+        floored = max(int(wallclock_ms), highwater + 1)
+        if floored != wallclock_ms:
+            logger.warning(
+                "champion nonce floored %d -> %d (on-chain per-signer high-water %d "
+                "across %d signer(s) exceeds wall-clock) — the leader host clock is "
+                "BEHIND the on-chain champion nonce; check NTP/clock skew",
+                wallclock_ms, floored, highwater, len(signers),
+            )
+        return floored
+    except Exception as exc:  # noqa: BLE001 — fail-open: flooring must NEVER block proposing
         logger.warning(
-            "champion nonce floored %d -> %d (on-chain per-signer high-water %d "
-            "across %d signer(s) exceeds wall-clock) — the leader host clock is "
-            "BEHIND the on-chain champion nonce; check NTP/clock skew",
-            wallclock_ms, floored, highwater, len(signers),
+            "champion nonce floor: unexpected error (%s); falling back to "
+            "wall-clock nonce %d (no floor applied this round)",
+            exc, wallclock_ms,
         )
-    return floored
+        return wallclock_ms
 
 
 def _build_champion_proposal_for_round(

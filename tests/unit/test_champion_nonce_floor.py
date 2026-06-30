@@ -168,3 +168,59 @@ def test_falls_back_to_validator_id_when_validators_empty():
     out = cc._floor_champion_nonce(2_000, mgr, nonce_reader=reader)
     assert out == 7_001
     assert reader.calls[0][2] == "0xLEAD"
+
+
+# ── builder-level wiring: floor ONLY on fresh mint, never on nonce_override ──────
+#
+# The 12 cases above exercise _floor_champion_nonce in isolation; none assert the
+# WIRING in _build_champion_proposal_for_round. A regression that moved/added the
+# floor call onto the nonce_override (follower / re-broadcast) path would pass all
+# of them while silently breaking consensus — a follower that re-floored would sign
+# a different nonce than the leader, diverging the EIP-712 digest. These lock that
+# invariant directly at the builder.
+
+
+def _wire_builder(monkeypatch, floor_returns=99_999):
+    """Patch the builder's heavy deps + spy on _floor_champion_nonce. Returns the
+    list that records floor calls (so a test can assert called / not-called)."""
+    candidate = SimpleNamespace(
+        submission_id="sub_x", image_digest=None, image_id="sha256:" + "b" * 64,
+        hotkey="5Gminer", repo_url="https://github.com/m/s", commit_hash="c" * 40,
+    )
+    monkeypatch.setattr(cc, "get_store", lambda: SimpleNamespace(get=lambda sid: candidate))
+    monkeypatch.setattr(
+        cc, "get_champion_consensus_manager",
+        lambda: SimpleNamespace(quorum_required=1, committee_hash="committee"),
+    )
+    floor_calls: list = []
+    monkeypatch.setattr(
+        cc, "_floor_champion_nonce",
+        lambda wallclock_ms, mgr, **kw: floor_calls.append(wallclock_ms) or floor_returns,
+    )
+    return floor_calls
+
+
+def _round_state():
+    # quorum=1 + image_digest=None → the digest gate is skipped (legacy id OK).
+    return SimpleNamespace(
+        round_id="round-1", finalist_submission_id="sub_x", quorum_required=1,
+        committee_hash="committee", benchmark_pack_hash="pack", effective_epoch=6,
+        finalist_image_id=None, shadow_case_log_hash=None, incumbent_image_id=None,
+    )
+
+
+def test_builder_floors_on_fresh_mint(monkeypatch):
+    # Leader, no nonce_override → the floor IS applied and its value is used.
+    floor_calls = _wire_builder(monkeypatch, floor_returns=99_999)
+    proposal = cc._build_champion_proposal_for_round(_round_state())[0]
+    assert len(floor_calls) == 1            # floor was consulted exactly once
+    assert proposal.nonce == 99_999         # …and its result is the proposal nonce
+
+
+def test_builder_does_not_refloor_on_override(monkeypatch):
+    # Follower / re-broadcast: nonce_override set → the floor MUST NOT be called, and
+    # the leader's nonce is reused VERBATIM (re-flooring would diverge the digest).
+    floor_calls = _wire_builder(monkeypatch, floor_returns=99_999)
+    proposal = cc._build_champion_proposal_for_round(_round_state(), nonce_override=42)[0]
+    assert floor_calls == []                # the load-bearing invariant
+    assert proposal.nonce == 42             # verbatim passthrough, NOT floored to 99_999
