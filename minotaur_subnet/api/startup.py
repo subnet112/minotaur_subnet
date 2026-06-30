@@ -131,9 +131,11 @@ def _resolve_solver_round_hotkey() -> str | None:
         return None
 
     try:
-        import bittensor as bt
+        # Honour BT_WALLET_PATH (+ actionable diagnostic on failure) instead of
+        # relying solely on the SDK's $HOME/.bittensor default — see bt_wallet.
+        from minotaur_subnet.shared.bt_wallet import load_hotkey_wallet
 
-        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
+        wallet = load_hotkey_wallet(wallet_name, hotkey_name)
         return wallet.hotkey.ss58_address
     except Exception:
         logger.warning(

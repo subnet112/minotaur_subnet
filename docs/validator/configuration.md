@@ -30,6 +30,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `NETUID` | `112` | Subnet UID. Set to `1` for local testnet. |
 | `WALLET_NAME` | -- | Bittensor wallet name (same as `--wallet-name`) |
 | `HOTKEY_NAME` | -- | Bittensor hotkey name (same as `--hotkey-name`) |
+| `BT_WALLET_PATH` | -- | Wallet **root** directory (parent of `<WALLET_NAME>/hotkeys/<HOTKEY_NAME>`). Unset → SDK default `$HOME/.bittensor/wallets` (in-container `/home/minotaur/.bittensor/wallets` for uid 1000). Set this when the wallet is mounted elsewhere, or when the default lookup can't see/read it — a wrong path or a mount **not readable by uid 1000** is the usual cause of `weights_emitter_configured=false` (a silent dead emitter). The hotkey file must be readable by uid 1000. Alias: `WALLET_PATH`. |
 | `SUBTENSOR_URL` | -- | Subtensor WebSocket endpoint (same as `--subtensor-url`). Accepts the alias `finney` (= public `wss://entrypoint-finney.opentensor.ai:443`) or any explicit `ws://`/`wss://` URL. If you operate your own subtensor node, point this at it (e.g. `ws://your-subtensor:9944`) to avoid the per-IP rate limits on the public endpoint — see [Run your own subtensor](./quickstart.md#run-your-own-subtensor-recommended-for-datacenter-operators) in the quickstart. |
 
 ### Simulation (Anvil)
