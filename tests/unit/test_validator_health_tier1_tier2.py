@@ -571,6 +571,17 @@ def test_fmt_last_emit_ok_abbreviates_source_and_drops_result_word():
     assert out == "2m ago · burn · ✅"
 
 
+def test_fmt_last_emit_champion_source_abbreviates_to_champ():
+    """The current champion-emit label abbreviates ``champion`` → ``champ`` (the legacy
+    ``burn_fallback`` still maps to ``burn`` above for already-persisted last_emit state)."""
+    now = 1_000_000.0
+    out = _fmt_last_emit(
+        {"attempted_at": now - 45, "source": "champion", "result": "ok"},
+        now=now,
+    )
+    assert out == "45s ago · champ · ✅"
+
+
 def test_fmt_last_emit_queued_source_abbreviates_to_api():
     """The api-queued path abbreviates ``queued_from_api`` → ``api``."""
     now = 1_000_000.0

@@ -166,7 +166,7 @@ async def test_burn_fires_when_queue_empty():
     await _run_n_iterations(self_stub, 1)
 
     self_stub._weights_emitter.emit_async.assert_awaited_once_with(burn)
-    assert self_stub._last_emit_state["source"] == "burn_fallback"
+    assert self_stub._last_emit_state["source"] == "burn"
 
 
 @pytest.mark.asyncio
@@ -241,7 +241,7 @@ async def test_queue_emit_failure_does_not_re_queue():
 
     # last_emit on tick 2 (the most recent) is the burn success.
     assert self_stub._last_emit_state["result"] == "ok"
-    assert self_stub._last_emit_state["source"] == "burn_fallback"
+    assert self_stub._last_emit_state["source"] == "burn"
 
 
 @pytest.mark.asyncio
