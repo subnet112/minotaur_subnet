@@ -2027,7 +2027,15 @@ class EpochManager:
                 logger.warning("Reaper: failed to reject %s: %s", sub.submission_id, exc)
 
     def _get_incumbent_snapshot(self) -> ChampionSnapshot | None:
-        """Return the best available active champion snapshot for round sync."""
+        """Return the active champion snapshot for round sync.
+
+        SINGLE SOURCE OF TRUTH precedence (NOT an arbitrary tie-break): the RoundStore
+        snapshot is AUTHORITATIVE — if it holds a champion, that is the answer. The
+        SubmissionStore ADOPTED row and the in-memory _champion are COLD-BOOT REPAIR only
+        (consulted when the RoundStore has not yet loaded a champion), never competing
+        sources. So the _hot_swap dual-write (RoundStore + SubmissionStore) is safe: a
+        partial write can never surface a WRONG champion here — at worst it surfaces the
+        right one from the repair tier."""
         if self._round_store is not None:
             snapshot = self._round_store.get_active_champion()
             if snapshot.submission_id:

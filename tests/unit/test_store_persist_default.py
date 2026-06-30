@@ -66,3 +66,35 @@ class TestGetterDefaultsToVolume:
             assert rs._persist_path == tmp_path / "custom.json"
         finally:
             set_round_store(None)
+
+
+class TestFailLoudDurableState:
+    """require_durable_state() makes the getters CRASH instead of silently running
+    in-memory — a mis-volumed production node refuses to boot rather than losing state."""
+
+    def test_off_by_default_returns_none(self, monkeypatch):
+        import minotaur_subnet.api.routes.submissions.state as st
+        monkeypatch.delenv("SUBMISSION_STORE_PATH", raising=False)
+        monkeypatch.delenv("APP_INTENTS_STORE_PATH", raising=False)
+        if not _data_is_writable():  # default (not required): legacy None, no raise
+            assert st._resolve_persist_path("submissions.json", "SUBMISSION_STORE_PATH") is None
+
+    def test_required_raises_when_unresolvable(self, monkeypatch):
+        import pytest
+        import minotaur_subnet.api.routes.submissions.state as st
+        monkeypatch.delenv("SUBMISSION_STORE_PATH", raising=False)
+        monkeypatch.delenv("APP_INTENTS_STORE_PATH", raising=False)
+        if _data_is_writable():
+            pytest.skip("/data writable here; cannot exercise the unresolvable branch")
+        monkeypatch.setattr(st, "_REQUIRE_DURABLE_STATE", True)  # auto-reset after test
+        with pytest.raises(RuntimeError):
+            st._resolve_persist_path("submissions.json", "SUBMISSION_STORE_PATH")
+
+    def test_required_returns_env_path(self, monkeypatch):
+        import minotaur_subnet.api.routes.submissions.state as st
+        monkeypatch.setattr(st, "_REQUIRE_DURABLE_STATE", True)
+        monkeypatch.setenv("SUBMISSION_STORE_PATH", "/srv/data/submissions.json")
+        assert (
+            st._resolve_persist_path("submissions.json", "SUBMISSION_STORE_PATH")
+            == "/srv/data/submissions.json"
+        )
