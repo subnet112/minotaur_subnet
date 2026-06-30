@@ -4,13 +4,10 @@ from unittest.mock import MagicMock
 
 import minotaur_subnet.weight_policy as weight_policy
 from minotaur_subnet.weight_policy import (
-    CHAMPION_MINER_WEIGHT_FLOOR,
     CHAMPION_MINER_WEIGHT_FRACTION,
     GENESIS_HOTKEY,
-    ORDERS_FOR_FULL_EMISSION,
     apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
-    champion_miner_weight_fraction,
     lookup_subnet_owner_from_chain,
     resolve_subnet_owner_hotkey,
 )
@@ -32,11 +29,15 @@ def test_build_weights_burns_to_owner_for_genesis():
 
 
 def test_build_weights_ramps_champion_with_owner_burn():
-    # Once a real miner champion exists: 0.05 to the champion, 0.95 burned to owner.
+    # Once a real miner champion exists: the champion gets the fixed fraction
+    # (0.10), the owner burns the rest (0.90).
     assert build_bootstrap_or_champion_weights(
         "5Gminer",
         owner_hotkey="5Gowner",
-    ) == {"5Gowner": 0.95, "5Gminer": 0.05}
+    ) == {
+        "5Gowner": 1 - CHAMPION_MINER_WEIGHT_FRACTION,
+        "5Gminer": CHAMPION_MINER_WEIGHT_FRACTION,
+    }
 
 
 def test_build_weights_full_to_champion_when_owner_unresolvable(monkeypatch):
@@ -64,14 +65,16 @@ def test_champion_ramp_split_sums_to_one():
 
 
 def test_apply_burn_ramp_caps_miners_preserves_ratios():
-    # A ranked multi-miner distribution: miners collectively get 0.05, owner 0.95,
-    # and the relative split AMONG miners is preserved.
+    # A ranked multi-miner distribution: miners collectively get the champion
+    # fraction, the owner the rest, and the relative split AMONG miners is preserved.
     ramped = apply_champion_burn_ramp(
         {"m1": 0.6, "m2": 0.3, "m3": 0.1}, owner_hotkey="5Gowner"
     )
     assert abs(sum(ramped.values()) - 1.0) < 1e-9
-    assert ramped["5Gowner"] == 0.95
-    assert abs((ramped["m1"] + ramped["m2"] + ramped["m3"]) - 0.05) < 1e-9
+    assert abs(ramped["5Gowner"] - (1 - CHAMPION_MINER_WEIGHT_FRACTION)) < 1e-9
+    assert abs(
+        (ramped["m1"] + ramped["m2"] + ramped["m3"]) - CHAMPION_MINER_WEIGHT_FRACTION
+    ) < 1e-9
     assert abs(ramped["m1"] / ramped["m2"] - 2.0) < 1e-9  # 0.6/0.3 preserved
 
 
@@ -84,23 +87,26 @@ def test_apply_burn_ramp_noop_without_owner(monkeypatch):
 def test_apply_burn_ramp_drops_owner_and_still_burns():
     # Footgun fix: the owner appearing in the miner set must NOT skip the burn.
     # The owner is the burn target, not a miner — it is dropped, the remaining
-    # miner re-normalized, and the 0.95 burn still applies.
+    # miner re-normalized, and the burn still applies.
     ramped = apply_champion_burn_ramp(
         {"5Gowner": 0.7, "m1": 0.3}, owner_hotkey="5Gowner"
     )
-    assert ramped == {"5Gowner": 0.95, "m1": 0.05}
+    assert ramped == {
+        "5Gowner": 1 - CHAMPION_MINER_WEIGHT_FRACTION,
+        "m1": CHAMPION_MINER_WEIGHT_FRACTION,
+    }
 
 
 def test_apply_burn_ramp_owner_among_many_miners_burn_not_skipped():
     # The actual footgun: an owner submission landing among MULTIPLE ranked miners
-    # must not disable the 0.95 burn for everyone. Owner dropped; the remaining
-    # miners share 0.05 with their relative ratio preserved.
+    # must not disable the burn for everyone. Owner dropped; the remaining miners
+    # share the champion fraction with their relative ratio preserved.
     ramped = apply_champion_burn_ramp(
         {"5Gowner": 0.5, "m1": 0.3, "m2": 0.2}, owner_hotkey="5Gowner"
     )
     assert abs(sum(ramped.values()) - 1.0) < 1e-9
-    assert ramped["5Gowner"] == 0.95
-    assert abs((ramped["m1"] + ramped["m2"]) - 0.05) < 1e-9
+    assert abs(ramped["5Gowner"] - (1 - CHAMPION_MINER_WEIGHT_FRACTION)) < 1e-9
+    assert abs((ramped["m1"] + ramped["m2"]) - CHAMPION_MINER_WEIGHT_FRACTION) < 1e-9
     assert abs(ramped["m1"] / ramped["m2"] - 1.5) < 1e-9  # 0.3/0.2 preserved
 
 
@@ -109,7 +115,10 @@ def test_champion_weights_uses_owner_burn_before_real_champion():
 
     assert tracker.maybe_emit(None) == {"5Gowner": 1.0}
     assert tracker.get_weights(GENESIS_HOTKEY) == {"5Gowner": 1.0}
-    assert tracker.get_weights("5Gminer") == {"5Gowner": 0.95, "5Gminer": 0.05}
+    assert tracker.get_weights("5Gminer") == {
+        "5Gowner": 1 - CHAMPION_MINER_WEIGHT_FRACTION,
+        "5Gminer": CHAMPION_MINER_WEIGHT_FRACTION,
+    }
 
 
 def test_seed_epoch_clock_stale_emits_on_next_tick():
@@ -231,44 +240,6 @@ def test_maybe_emit_recovers_after_owner_hotkey_set_late(monkeypatch):
     assert tracker.maybe_emit(None) == {"5Gowner": 1.0}
 
 
-# ── order-volume emission ramp ────────────────────────────────────────────
-
-
-def test_fraction_at_zero_orders_is_floor():
-    assert champion_miner_weight_fraction(0) == CHAMPION_MINER_WEIGHT_FLOOR
-
-
-def test_fraction_at_full_volume_is_one():
-    assert champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION) == 1.0
-
-
-def test_fraction_clamped_above_full_volume():
-    assert champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION * 5) == 1.0
-
-
-def test_fraction_is_linear_at_midpoint():
-    # Halfway to full volume → halfway between floor and 1.0.
-    mid = champion_miner_weight_fraction(ORDERS_FOR_FULL_EMISSION // 2)
-    expected = CHAMPION_MINER_WEIGHT_FLOOR + (1.0 - CHAMPION_MINER_WEIGHT_FLOOR) * 0.5
-    assert abs(mid - expected) < 1e-9
-
-
-def test_fraction_monotonic_increasing():
-    # Sample points across the ramp, bar-agnostic so this holds at any
-    # ORDERS_FOR_FULL_EMISSION: floor at 0, full at the bar, monotonic between.
-    full = ORDERS_FOR_FULL_EMISSION
-    points = (0, full // 10, full // 4, full // 2, (full * 3) // 4, full)
-    samples = [champion_miner_weight_fraction(n) for n in points]
-    assert samples == sorted(samples)
-    assert samples[0] == CHAMPION_MINER_WEIGHT_FLOOR
-    assert samples[-1] == 1.0
-
-
-def test_fraction_negative_and_garbage_degrade_to_floor():
-    assert champion_miner_weight_fraction(-50) == CHAMPION_MINER_WEIGHT_FLOOR
-    assert champion_miner_weight_fraction("not-a-number") == CHAMPION_MINER_WEIGHT_FLOOR
-
-
 def test_ramp_with_full_fraction_routes_everything_to_miner():
     # 1.0 fraction → no burn; the champion takes the whole emission.
     ramped = apply_champion_burn_ramp(
@@ -278,10 +249,13 @@ def test_ramp_with_full_fraction_routes_everything_to_miner():
 
 
 def test_ramp_is_idempotent_in_fraction():
-    # Re-ramping an already-floor-ramped mapping re-targets the aggregate share
-    # cleanly — the emission chokepoint relies on this.
+    # Re-applying the split with a new fraction re-targets the aggregate share
+    # cleanly — the emission path relies on this.
     floor = apply_champion_burn_ramp({"5Gminer": 1.0}, owner_hotkey="5Gowner")
-    assert floor == {"5Gminer": 0.05, "5Gowner": 0.95}
+    assert floor == {
+        "5Gminer": CHAMPION_MINER_WEIGHT_FRACTION,
+        "5Gowner": 1 - CHAMPION_MINER_WEIGHT_FRACTION,
+    }
     rescaled = apply_champion_burn_ramp(
         floor, owner_hotkey="5Gowner", miner_fraction=0.5
     )

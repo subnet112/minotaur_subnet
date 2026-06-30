@@ -1176,7 +1176,7 @@ class TestWeightEmission:
 
     @pytest.mark.asyncio
     async def test_weights_winner_takes_all(self, monkeypatch):
-        """Winner-takes-all: ONLY the adopted champion earns weight (0.05), 0.95
+        """Winner-takes-all: ONLY the adopted champion earns weight (0.10), 0.90
         burns to owner — there is NO exponential-decay tail to other scored
         submissions. (Replaces the old decay-tail behavior.)"""
         sub1 = _make_submission(
@@ -1213,9 +1213,9 @@ class TestWeightEmission:
         assert "5Gminer_best" in mapping
         assert "5Gminer_mid" not in mapping
         assert "5Gminer_low" not in mapping
-        # 0.05 to the champion, 0.95 burns to owner.
-        assert mapping["5Gminer_best"] == pytest.approx(0.05)
-        assert mapping[owner] == pytest.approx(0.95)
+        # 0.10 to the champion, 0.90 burns to owner.
+        assert mapping["5Gminer_best"] == pytest.approx(0.10)
+        assert mapping[owner] == pytest.approx(0.90)
 
     @pytest.mark.asyncio
     async def test_no_champion_burns_to_owner(self, monkeypatch):
