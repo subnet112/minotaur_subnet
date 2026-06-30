@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 from threading import Lock
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
@@ -1087,6 +1087,37 @@ async def reattest_current_champion(request: Request) -> dict:
     }
 
 
+def _raise_round_sync_failure(op: str, round_id: str, exc: BaseException) -> NoReturn:
+    """Map an internal round-sync handler failure to an actionable HTTP status.
+
+    Shared by the /internal/close|certify|activate broadcast handlers so a failure
+    is never an opaque bare 500. ``KeyError`` → 404 (round not found), ``ValueError``
+    → 409 (wrong round state), a deliberate downstream ``HTTPException`` passes
+    through unchanged, and ANY OTHER exception — e.g. the champion hot-swap's
+    ``docker run`` failing because an operator-env docker network is missing —
+    becomes a **503 carrying the cause**. The leader logs the peer response body on
+    rejection (peer_network: ``"Peer … rejected … (HTTP 503): <detail>"``), so the
+    reason shows up FLEET-side without the follower's own logs; a bare 500 hid
+    exactly that — the follower silently fell back to 100% burn while the leader
+    saw only "Internal Server Error". Consensus is unaffected: the leader already
+    treats any non-200 the same (the peer just isn't counted toward quorum).
+    """
+    if isinstance(exc, HTTPException):
+        raise exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=409, detail=str(exc))
+    logger.error(
+        "%s failed for round %s on this validator: %s",
+        op, round_id, exc, exc_info=True,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=f"{op} failed on this validator: {exc}",
+    )
+
+
 @router.post("/solver/round/internal/close", response_model=SolverRoundResponse)
 async def internal_close_solver_round(
     body: CloseRoundRequest,
@@ -1094,8 +1125,11 @@ async def internal_close_solver_round(
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round close on this validator."""
     await _authorize_internal_round_sync(request)
-    closed = _sync_close_solver_round_state(body)
-    return _round_state_to_response(closed)
+    try:
+        closed = _sync_close_solver_round_state(body)
+        return _round_state_to_response(closed)
+    except Exception as exc:
+        _raise_round_sync_failure("round close", getattr(body, "round_id", "?"), exc)
 
 
 @router.post("/solver/round/internal/certify", response_model=SolverRoundResponse)
@@ -1105,8 +1139,11 @@ async def internal_certify_solver_round(
 ) -> SolverRoundResponse:
     """Persist a leader-broadcast round certificate on this validator."""
     await _authorize_internal_round_sync(request)
-    certified = await _sync_certified_round_state(body)
-    return _round_state_to_response(certified)
+    try:
+        certified = await _sync_certified_round_state(body)
+        return _round_state_to_response(certified)
+    except Exception as exc:
+        _raise_round_sync_failure("round certify", getattr(body, "round_id", "?"), exc)
 
 
 @router.post("/solver/round/internal/abort", response_model=SolverRoundResponse)
@@ -1362,14 +1399,19 @@ async def internal_activate_solver_round(
     body: ActivateRoundRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Persist a leader-broadcast round activation on this validator."""
+    """Persist a leader-broadcast round activation on this validator.
+
+    Activation runs the real champion-adoption work — most importantly the hot-swap
+    that ``docker run``s the new solver runtime — so an UNEXPECTED failure here is
+    almost always an operator-env problem on THIS validator (e.g. a missing docker
+    network). ``_raise_round_sync_failure`` surfaces it as an actionable 503 with
+    the cause (visible in the leader's rejection log) instead of a silent 500 + burn.
+    """
     await _authorize_internal_round_sync(request)
     try:
         return await _activate_solver_round_state(body)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        _raise_round_sync_failure("champion activation", getattr(body, "round_id", "?"), exc)
 
 
 @router.post("/solver/round/activate")
