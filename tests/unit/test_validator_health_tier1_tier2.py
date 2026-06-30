@@ -36,6 +36,7 @@ from scripts.validator_health_check import (
     _fmt_running,
     _fmt_solver_round,
     _fmt_uptime,
+    _fmt_weight_source,
     _identify_leader_uid,
     _render_health_detail_table,
     detect_findings,
@@ -590,6 +591,25 @@ def test_fmt_last_emit_queued_source_abbreviates_to_api():
         now=now,
     )
     assert out == "30s ago · api · ✅"
+
+
+def test_fmt_weight_source_self_subindicator_matches_new_emit_labels():
+    """The dashboard's weight_source sub-indicator must track the SAME emit labels
+    the validator now writes ("champion"/"burn"), the api-queue label, and the
+    legacy "burn_fallback" still present in already-persisted last_emit state."""
+    assert _fmt_weight_source("self", {"source": "champion"}) == "🟢 self·champ"
+    assert _fmt_weight_source("self", {"source": "burn"}) == "🟢 self·burn"
+    assert _fmt_weight_source("self", {"source": "burn_fallback"}) == "🟢 self·burn"
+    assert _fmt_weight_source("self", {"source": "queued_from_api"}) == "🟢 self·queued"
+
+
+def test_fmt_weight_source_unknown_or_missing_falls_back_to_plain_self():
+    """An unrecognized / missing emit source renders plain self (no stray glyph)."""
+    assert _fmt_weight_source("self", {"source": "something_else"}) == "🟢 self"
+    assert _fmt_weight_source("self", {}) == "🟢 self"
+    assert _fmt_weight_source("self", None) == "🟢 self"
+    # Non-self classifications are unaffected by last_emit.
+    assert _fmt_weight_source("external", {"source": "champion"}) == "🟠 external"
 
 
 def test_fmt_last_emit_error_keeps_failure_marker():

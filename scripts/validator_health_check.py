@@ -1571,10 +1571,12 @@ def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     sub-indicator when available (post single-emit-path refactor):
 
       - ``self·queued`` — last emit was a per-miner ranking from the
-        api EpochManager's queue POST (the daemon's _epoch_loop
-        recorded ``source="queued_from_api"``).
-      - ``self·burn`` — last emit was the burn fallback (no champion
-        adopted yet, or the queue was empty when the loop ticked).
+        api EpochManager's queue POST (``source="queued_from_api"``).
+      - ``self·champ`` — last emit weighted a resolved champion (the
+        0.05/0.95 ramp; ``source="champion"``).
+      - ``self·burn`` — last emit was a definitive owner burn (no
+        champion adopted; ``source="burn"``, or the legacy
+        ``"burn_fallback"`` label from pre-rename daemons).
 
     Older daemons (pre-refactor) don't populate ``last_emit.source``;
     in that case we render just ``🟢 self`` exactly as before.
@@ -1589,10 +1591,17 @@ def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
     }.get(src, src or "—")
     if src == "self" and last_emit is not None:
         emit_source = (last_emit or {}).get("source")
-        if emit_source == "queued_from_api":
-            return f"{base}·queued"
-        if emit_source == "burn_fallback":
-            return f"{base}·burn"
+        # "champion"/"burn" are the current emit labels (validator _epoch_loop);
+        # "burn_fallback" is the pre-rename label still emitted by older daemons
+        # during a staggered rollout; "queued_from_api" is the api-queue ranking.
+        sub = {
+            "queued_from_api": "queued",
+            "champion": "champ",
+            "burn": "burn",
+            "burn_fallback": "burn",
+        }.get(emit_source)
+        if sub:
+            return f"{base}·{sub}"
     return base
 
 
