@@ -48,6 +48,11 @@ def _make_stub(*, queued=None, queued_source=None, burn_returns=None):
     self_stub.weights = MagicMock()
     self_stub.weights.maybe_emit = MagicMock(return_value=burn_returns)
     self_stub._champion_miner_id = None
+    # _local_champion_hotkey is async now (HTTP-resolves the champion from the co-located
+    # API). Default None + source 'api' = DEFINITIVE no-champion => the 100% burn path.
+    # (An UNRESOLVED None with source 'none' SKIPs instead — see test_burn_path_skips_*.)
+    self_stub._local_champion_hotkey = AsyncMock(return_value=None)
+    self_stub._champion_source = "api"
     self_stub._weights_emitter = MagicMock()
     self_stub._weights_emitter.emit_async = AsyncMock(return_value=True)
     self_stub._queued_weights_mapping = queued
@@ -162,6 +167,24 @@ async def test_burn_fires_when_queue_empty():
 
     self_stub._weights_emitter.emit_async.assert_awaited_once_with(burn)
     assert self_stub._last_emit_state["source"] == "burn_fallback"
+
+
+@pytest.mark.asyncio
+async def test_burn_path_skips_when_champion_unresolved():
+    """If the champion is UNRESOLVED (co-located API unreachable: source 'none', NOT a
+    definitive 'no champion'), the validator must NOT emit a 100% burn — it SKIPs so its
+    prior on-chain champion weights persist. This is the fix for the cold-memo /
+    watchtower-co-restart burn regression: burning out of ignorance would collapse the
+    standing champion's emission for a full commit-reveal window."""
+    burn = {"5OwnerHotkey": 1.0}
+    self_stub = _make_stub(queued=None, burn_returns=burn)
+    self_stub._local_champion_hotkey = AsyncMock(return_value=None)
+    self_stub._champion_source = "none"  # API unreachable, no last-known-good memo
+
+    await _run_n_iterations(self_stub, 1)
+
+    self_stub._weights_emitter.emit_async.assert_not_awaited()
+    self_stub.weights.maybe_emit.assert_not_called()  # skipped before maybe_emit
 
 
 @pytest.mark.asyncio
