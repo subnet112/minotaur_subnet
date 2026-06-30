@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import HTTPException
 
+from minotaur_subnet.consensus.protocol_config import read_champion_last_nonce
 from minotaur_subnet.harness.round_store import (
     ChampionApproval,
     ChampionCertificate,
@@ -646,6 +647,103 @@ async def _maybe_prepare_round_for_certification(
     return round_state
 
 
+def _floor_champion_nonce(
+    wallclock_ms: int,
+    consensus_manager: Any,
+    *,
+    nonce_reader: Callable[[str, str, str], int] | None = None,
+) -> int:
+    """Floor a freshly-minted champion nonce against the on-chain per-signer
+    high-water so it is ALWAYS strictly greater than ``lastNonce[signer]``.
+
+    Why: the leader mints the nonce from wall-clock ms (``time.time()*1000``).
+    ``ChampionRegistry.certify()`` enforces
+    ``require(nonces[i] > lastNonce[signer], "Nonce not increasing")`` per
+    signer, and the relayer swallows that revert to ``None`` (round aborts
+    ``merge_failed`` with no nonce-specific diagnosis). So if the leader's clock
+    moves BACKWARD — NTP step-back, VM migration, restart onto a skewed host, or
+    a leader change to a lagging-clock validator — the minted nonce can be <= the
+    stored high-water and EVERY future champion certification reverts, silently,
+    for the whole skew duration. Flooring removes the only un-guarded path to a
+    stale nonce.
+
+    All co-signers share the leader's single minted nonce (a follower approval
+    must carry ``approval.nonce == proposal.nonce``), and the contract checks the
+    nonce against EACH signer's slot, so we clear the MAX high-water across the
+    whole committee, not just the leader's own address.
+
+    Best-effort / FAIL-OPEN: any chain-read failure (RPC down, registry
+    unconfigured, no protocol_config) returns the wall-clock value unchanged —
+    flooring is a safety boost layered on top of monotonic wall-clock, never a
+    gate that may block proposing a champion. Only ever applied when the leader
+    mints fresh; followers reuse the leader's nonce verbatim via *_override and
+    must NOT re-floor (it would diverge their signed digest from the leader's).
+    """
+    # Belt-and-suspenders fail-open: the per-signer reader is already guarded
+    # below, but the attribute reads here (protocol_config / quorum_address /
+    # validators — any of which could be a property that raises) are not. Wrap the
+    # whole body so NOTHING in flooring can ever propagate and block proposing a
+    # champion; an unexpected error just degrades to the raw wall-clock nonce.
+    try:
+        pc = getattr(consensus_manager, "protocol_config", None)
+        if pc is None:
+            return wallclock_ms
+        rpc_url = (getattr(pc, "rpc_url", "") or "").strip()
+        # The ChampionRegistry lives at quorum_address (distinct from the
+        # ValidatorRegistry); mirror _read_quorum_bps' quorum_address-or-registry
+        # fallback for the single-contract topology.
+        registry_address = (
+            (getattr(pc, "quorum_address", "") or "").strip()
+            or (getattr(pc, "registry_address", "") or "").strip()
+        )
+        if not rpc_url or not registry_address:
+            return wallclock_ms
+
+        # NOTE: ``signers`` is the leader's DISCOVERED committee (its in-memory peer
+        # view), NOT the full on-chain authorized signer set. At quorum>1 an
+        # authorized co-signer the leader hasn't discovered yet whose lastNonce slot
+        # is higher could still make certify() revert "Nonce not increasing" — that
+        # residual is fail-open here AND now surfaced by the relayer's revert
+        # diagnostic. Production runs at the quorum floor (=1, leader-only signs),
+        # where the leader's own slot is the only one that matters.
+        signers = [s for s in (getattr(consensus_manager, "validators", None) or []) if s]
+        if not signers:
+            vid = (getattr(consensus_manager, "validator_id", "") or "").strip()
+            signers = [vid] if vid else []
+        if not signers:
+            return wallclock_ms
+
+        reader = nonce_reader or read_champion_last_nonce
+        highwater = 0
+        for signer in signers:
+            try:
+                highwater = max(highwater, int(reader(rpc_url, registry_address, signer)))
+            except Exception as exc:  # noqa: BLE001 — fail-open, never block proposing
+                logger.warning(
+                    "champion nonce floor: lastNonce(%s) read failed on %s (%s); "
+                    "falling back to wall-clock nonce %d (no floor applied this round)",
+                    signer, registry_address, exc, wallclock_ms,
+                )
+                return wallclock_ms
+
+        floored = max(int(wallclock_ms), highwater + 1)
+        if floored != wallclock_ms:
+            logger.warning(
+                "champion nonce floored %d -> %d (on-chain per-signer high-water %d "
+                "across %d signer(s) exceeds wall-clock) — the leader host clock is "
+                "BEHIND the on-chain champion nonce; check NTP/clock skew",
+                wallclock_ms, floored, highwater, len(signers),
+            )
+        return floored
+    except Exception as exc:  # noqa: BLE001 — fail-open: flooring must NEVER block proposing
+        logger.warning(
+            "champion nonce floor: unexpected error (%s); falling back to "
+            "wall-clock nonce %d (no floor applied this round)",
+            exc, wallclock_ms,
+        )
+        return wallclock_ms
+
+
 def _build_champion_proposal_for_round(
     round_state: RoundState,
     *,
@@ -769,9 +867,15 @@ def _build_champion_proposal_for_round(
         CHAMPION_APPROVAL_DEADLINE_SECONDS,
     )
     if nonce_override is not None:
+        # Follower (or re-broadcast): reuse the leader's signed nonce verbatim so
+        # the EIP-712 digest matches. Must NOT re-floor — that would diverge the
+        # follower's signed struct from the leader's and fail signature recovery.
         nonce = int(nonce_override)
     else:
-        nonce = int(_time.time() * 1000)
+        # Leader minting fresh: floor the wall-clock nonce against the on-chain
+        # per-signer high-water so a backward clock movement can't mint a stale
+        # nonce that silently bricks certification. Fail-open (see helper).
+        nonce = _floor_champion_nonce(int(_time.time() * 1000), consensus_manager)
     if deadline_override is not None:
         deadline = int(deadline_override)
     else:
