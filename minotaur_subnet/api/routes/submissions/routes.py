@@ -1370,6 +1370,30 @@ async def internal_activate_solver_round(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except HTTPException:
+        # A deliberate status (e.g. a downstream 4xx) must pass through unchanged,
+        # not get masked into the generic 503 below.
+        raise
+    except Exception as exc:
+        # Activation does the real champion-adoption work — most importantly the
+        # hot-swap that ``docker run``s the new solver runtime. An UNEXPECTED failure
+        # here is almost always an operator-env problem ON THIS validator (e.g. a
+        # missing docker network so the solver container can't launch), not a bad
+        # request from the leader. Surface it as an actionable 503 carrying the
+        # cause instead of a bare 500: the leader logs the peer response body on
+        # rejection (peer_network: "Peer … rejected … (HTTP 503): <detail>"), so the
+        # reason shows up FLEET-side without needing this follower's own logs — and
+        # log it loud locally with the traceback. A bare 500 ("Internal Server
+        # Error") hid exactly this — the follower silently fell back to 100% burn
+        # while the leader saw only an opaque error.
+        logger.error(
+            "internal/activate failed for round %s on this validator: %s",
+            getattr(body, "round_id", "?"), exc, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"champion activation failed on this validator: {exc}",
+        )
 
 
 @router.post("/solver/round/activate")
