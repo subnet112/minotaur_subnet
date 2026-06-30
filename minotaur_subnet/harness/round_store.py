@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -715,7 +716,27 @@ class RoundStore:
                 },
             }
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            self._persist_path.write_text(json.dumps(data, indent=2))
+            # Atomic write: a crash (or a concurrent _load reader) mid-write must
+            # never observe a truncated / half-written round store — that would
+            # lose or corrupt the leader's round + champion state on restart.
+            # Write to a temp file in the SAME directory (so the rename stays on
+            # one filesystem), fsync it durable, then os.replace over the target
+            # (atomic on POSIX: a reader sees either the whole old file or the
+            # whole new one, never a partial).
+            tmp_path = self._persist_path.with_name(f".{self._persist_path.name}.tmp")
+            try:
+                with open(tmp_path, "w") as fh:
+                    fh.write(json.dumps(data, indent=2))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, self._persist_path)
+            finally:
+                # On any failure the partial temp must not linger; on success it
+                # was renamed away and this is a no-op.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("Failed to persist round store: %s", exc)
