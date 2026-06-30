@@ -89,3 +89,33 @@ def test_persist_preserves_file_mode(tmp_path: Path):
     store.close_current_round(close_epoch=8)        # next persist replaces via mkstemp
 
     assert _stat.S_IMODE(p.stat().st_mode) == 0o640  # preserved, not reset to 0600
+
+
+def test_first_write_falls_back_to_0644(tmp_path: Path):
+    """The FIRST persist has no target to copy a mode from; it must fall back to
+    0644 (the umask-default the old write_text produced), NOT leave mkstemp's
+    0600 — else a co-located reader (or a shared store-data mount) can't open it."""
+    import stat as _stat
+
+    p = tmp_path / "solver_rounds.json"
+    store = RoundStore(persist_path=p)
+    store.ensure_open_round(opened_epoch=7)  # first-ever persist
+
+    assert _stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_orphan_temp_swept_on_load(tmp_path: Path):
+    """A crash between mkstemp and os.replace leaves a unique .tmp orphan. Because
+    temp names are unique they'd accumulate; a fresh store must sweep them on load."""
+    p = tmp_path / "solver_rounds.json"
+    RoundStore(persist_path=p).ensure_open_round(opened_epoch=3)  # real file now exists
+
+    orphan = tmp_path / ".solver_rounds.json.deadbeef.tmp"
+    orphan.write_text("half-written-garbage")
+    assert orphan.exists()
+
+    reloaded = RoundStore(persist_path=p)  # __init__ -> _load -> _sweep_orphan_temps
+
+    assert not orphan.exists()                       # orphan swept
+    assert p.exists()                                # real store untouched
+    assert reloaded.get_current_round() is not None  # and still loads
