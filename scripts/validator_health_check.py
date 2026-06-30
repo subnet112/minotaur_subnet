@@ -1411,7 +1411,12 @@ def _fmt_last_emit(last_emit: dict | None, *, now: float) -> str:
         secs = int(max(0, now - attempted))
         when = _fmt_seconds_ago(secs)
     src_raw = last_emit.get("source")
-    src = {"burn_fallback": "burn", "queued_from_api": "api"}.get(src_raw, src_raw or "—")
+    # "champion"/"burn" are the current emit labels; "burn_fallback" is the legacy label
+    # kept here so already-persisted last_emit state still abbreviates cleanly.
+    src = {
+        "champion": "champ", "burn": "burn",
+        "burn_fallback": "burn", "queued_from_api": "api",
+    }.get(src_raw, src_raw or "—")
     result = last_emit.get("result")
     marker = {"ok": "✅", "error": "❌"}.get(result, "·")
     return f"{when} · {src} · {marker}"

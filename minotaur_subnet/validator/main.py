@@ -1109,7 +1109,14 @@ class AppIntentsValidator:
                 continue
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights:
-                await self._do_emit(epoch_weights, source="burn_fallback")
+                # Label the emit by what it actually does so /health last_emit.source agrees
+                # with emission_mode: "champion" when weighting a resolved champion (the
+                # 0.05/0.95 ramp), "burn" when champion is None (definitive owner burn). The
+                # old hardcoded "burn_fallback" mislabeled champion emits as burns.
+                await self._do_emit(
+                    epoch_weights,
+                    source="champion" if self._champion_miner_id else "burn",
+                )
 
     def _orders_last_24h(self) -> int:
         """Count orders that went through Minotaur in the trailing 24h.
