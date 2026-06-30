@@ -908,6 +908,28 @@ class AppIntentsValidator:
                 label, path, exc,
             )
 
+    def _reconnect_bt_subtensor(self) -> None:
+        """Rebuild the long-lived Subtensor used by the axon-resync loop after a
+        stale-websocket failure (e.g. the operator rotated the RPC), so the next
+        tick reconnects instead of reusing the dead socket until a restart. Mirrors
+        the emitter's reconnect. Best-effort; no-op without a URL / bittensor handle."""
+        url = self._subtensor_url
+        bt = self._bt_module
+        if not url or bt is None:
+            return
+        try:
+            self._bt_subtensor = bt.Subtensor(network=url)
+            logger.info(
+                "Reconnected axon-resync subtensor to %s after a failed serve "
+                "(stale-websocket recovery)",
+                url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Axon-resync subtensor reconnect to %s failed (retry next tick): %s",
+                url, exc,
+            )
+
     async def _axon_resync_loop(self) -> None:
         """Periodically re-resolve VALIDATOR_AXON_URL and re-publish on
         chain if the IP changed.
@@ -967,6 +989,10 @@ class AppIntentsValidator:
                     "Periodic axon resync iteration failed (continuing): %s",
                     exc,
                 )
+                # Most likely a stale subtensor websocket (RPC rotation) — rebuild
+                # the long-lived client so the next tick reconnects rather than
+                # re-failing on the dead socket until a daemon restart.
+                self._reconnect_bt_subtensor()
 
     def _load_orders_from_store(self) -> None:
         """Load persisted orders from the store into the in-memory OrderBook."""
