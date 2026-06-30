@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import tarfile
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -128,3 +129,105 @@ class TestCloneDispatch:
         monkeypatch.setattr(sp, "_clone_repo_in_process", fake_ip)
         assert await sp._clone_repo("file:///repo", "abc1234", "/tmp/d") is True
         assert "in_process" in called and "sandbox" not in called
+
+
+class TestCloneRetry:
+    """The sandboxed clone retries a transient failure (a truncated tarball →
+    'unexpected end of data') so a one-off network blip doesn't reject an
+    otherwise-valid submission."""
+
+    def test_clone_attempts_default_is_three(self, monkeypatch):
+        monkeypatch.delenv("SUBMISSION_CLONE_RETRIES", raising=False)
+        assert sp._clone_attempts() == 3  # 1 + 2 retries
+
+    def test_clone_attempts_env_override(self, monkeypatch):
+        monkeypatch.setenv("SUBMISSION_CLONE_RETRIES", "4")
+        assert sp._clone_attempts() == 5
+
+    def test_clone_attempts_zero_disables_retries(self, monkeypatch):
+        monkeypatch.setenv("SUBMISSION_CLONE_RETRIES", "0")
+        assert sp._clone_attempts() == 1
+
+    def test_clone_attempts_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv("SUBMISSION_CLONE_RETRIES", "garbage")
+        assert sp._clone_attempts() == 3
+
+    def test_clear_dir_empties_but_keeps_dir(self, tmp_path):
+        (tmp_path / "f.txt").write_text("x")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "g.txt").write_text("y")
+        sp._clear_dir(str(tmp_path))
+        assert tmp_path.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_retries_then_succeeds_and_clears_between(self, monkeypatch, tmp_path):
+        calls = []
+
+        async def fake_sandbox(repo_url, commit, dest, *, token=None):
+            calls.append(1)
+            return len(calls) >= 3  # fail attempts 1 & 2, succeed on 3
+
+        cleared = []
+        monkeypatch.setattr(sp, "_clone_repo_sandboxed", fake_sandbox)
+        monkeypatch.setattr(sp, "_clear_dir", lambda p: cleared.append(p))
+        monkeypatch.setattr(sp.asyncio, "sleep", AsyncMock())
+        monkeypatch.delenv("SUBMISSION_CLONE_RETRIES", raising=False)
+
+        ok = await sp._clone_repo("https://github.com/x/y", "abc", str(tmp_path))
+
+        assert ok is True
+        assert len(calls) == 3          # retried until success
+        assert cleared == [str(tmp_path)] * 2  # dest cleared before attempts 2 and 3
+
+    @pytest.mark.asyncio
+    async def test_all_attempts_fail_returns_false(self, monkeypatch, tmp_path):
+        n = []
+
+        async def always_fail(*a, **k):
+            n.append(1)
+            return False
+
+        monkeypatch.setattr(sp, "_clone_repo_sandboxed", always_fail)
+        monkeypatch.setattr(sp.asyncio, "sleep", AsyncMock())
+        monkeypatch.setenv("SUBMISSION_CLONE_RETRIES", "2")
+
+        ok = await sp._clone_repo("https://github.com/x/y", "abc", str(tmp_path))
+
+        assert ok is False
+        assert len(n) == 3  # 1 + 2 retries, all attempted
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_success_no_retry_no_sleep(self, monkeypatch, tmp_path):
+        n = []
+        cleared = []
+
+        async def ok_first(*a, **k):
+            n.append(1)
+            return True
+
+        monkeypatch.setattr(sp, "_clone_repo_sandboxed", ok_first)
+        monkeypatch.setattr(sp, "_clear_dir", lambda p: cleared.append(p))
+        sleep = AsyncMock()
+        monkeypatch.setattr(sp.asyncio, "sleep", sleep)
+
+        ok = await sp._clone_repo("https://github.com/x/y", "abc", str(tmp_path))
+
+        assert ok is True
+        assert n == [1]        # no retry
+        assert cleared == []   # no clear on the first attempt
+        sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_file_scheme_uses_in_process_and_does_not_retry(self, monkeypatch, tmp_path):
+        sandbox = AsyncMock()
+        inproc = AsyncMock(return_value=True)
+        monkeypatch.setattr(sp, "_clone_repo_sandboxed", sandbox)
+        monkeypatch.setattr(sp, "_clone_repo_in_process", inproc)
+
+        ok = await sp._clone_repo("file:///repo", "abc", str(tmp_path))
+
+        assert ok is True
+        sandbox.assert_not_called()      # file:// never uses the sandboxed/retry path
+        inproc.assert_awaited_once()

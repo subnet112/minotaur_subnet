@@ -298,6 +298,44 @@ async def _clone_repo_sandboxed(
     return _safe_extract_tar(stdout, dest)
 
 
+# Retry knobs for the sandboxed clone. The miner tree is streamed back as a tar
+# over the sandbox's stdout, which can arrive TRUNCATED on a transient network
+# blip — _safe_extract_tar then fails with "unexpected end of data" and an
+# otherwise-valid submission is rejected ("Failed to clone repository"). A fresh
+# re-clone almost always succeeds, so retry a few times with a short backoff.
+_CLONE_RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _clone_attempts() -> int:
+    """Total sandboxed-clone attempts (1 + retries). Env ``SUBMISSION_CLONE_RETRIES``
+    (default 2); 0 disables retries. Retries only absorb transient failures; a
+    genuinely bad repo still fails every attempt (a bounded few extra tries)."""
+    try:
+        retries = int(os.environ.get("SUBMISSION_CLONE_RETRIES", "2"))
+    except ValueError:
+        retries = 2
+    return 1 + max(0, retries)
+
+
+def _clear_dir(path: str) -> None:
+    """Empty a directory in place (keep the dir itself) so a clone retry extracts
+    into a clean tree — a failed attempt may have left a partial extraction.
+    Best-effort; never raises."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return
+    for name in entries:
+        p = os.path.join(path, name)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
 async def _clone_repo(
     repo_url: str, commit_hash: str, dest: str, *, token: str | None = None,
 ) -> bool:
@@ -305,9 +343,10 @@ async def _clone_repo(
 
     http(s) repos (the production path) are fetched in an ephemeral hardened
     container (``_clone_repo_sandboxed``) so the validator process never runs
-    git on untrusted input. ``file://`` repos — only used by the bind-mounted
-    local-testnet stack — keep the in-process clone, which understands the
-    host-foreign-ownership trust dance.
+    git on untrusted input, and are RETRIED on a transient failure (a truncated
+    tarball / network blip) — see ``_clone_attempts``. ``file://`` repos — only
+    used by the bind-mounted local-testnet stack — keep the in-process clone,
+    which understands the host-foreign-ownership trust dance.
 
     ``token`` (private path) is the per-submission GitHub PAT used to authenticate
     the https clone of the miner's private repo.
@@ -315,9 +354,27 @@ async def _clone_repo(
     Returns True on success, False on failure.
     """
     scheme = (urlparse(repo_url).scheme or "").lower()
-    if scheme in ("http", "https"):
-        return await _clone_repo_sandboxed(repo_url, commit_hash, dest, token=token)
-    return await _clone_repo_in_process(repo_url, commit_hash, dest)
+    if scheme not in ("http", "https"):
+        return await _clone_repo_in_process(repo_url, commit_hash, dest)
+
+    attempts = _clone_attempts()
+    for i in range(1, attempts + 1):
+        if i > 1:
+            _clear_dir(dest)  # discard any partial extraction from the prior try
+        if await _clone_repo_sandboxed(repo_url, commit_hash, dest, token=token):
+            if i > 1:
+                logger.info(
+                    "Clone succeeded for %s on attempt %d/%d", repo_url, i, attempts,
+                )
+            return True
+        if i < attempts:
+            delay = _CLONE_RETRY_BACKOFF_SECONDS * i
+            logger.warning(
+                "Clone attempt %d/%d failed for %s; retrying in %.0fs",
+                i, attempts, repo_url, delay,
+            )
+            await asyncio.sleep(delay)
+    return False
 
 
 async def _clone_repo_in_process(repo_url: str, commit_hash: str, dest: str) -> bool:
