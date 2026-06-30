@@ -11,6 +11,8 @@ import copy
 import json
 import logging
 import os
+import stat
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -719,17 +721,41 @@ class RoundStore:
             # Atomic write: a crash (or a concurrent _load reader) mid-write must
             # never observe a truncated / half-written round store — that would
             # lose or corrupt the leader's round + champion state on restart.
-            # Write to a temp file in the SAME directory (so the rename stays on
-            # one filesystem), fsync it durable, then os.replace over the target
-            # (atomic on POSIX: a reader sees either the whole old file or the
-            # whole new one, never a partial).
-            tmp_path = self._persist_path.with_name(f".{self._persist_path.name}.tmp")
+            # Write to a UNIQUE temp file in the SAME directory (so the rename stays
+            # on one filesystem), fsync it durable, then os.replace over the target
+            # (atomic on POSIX: a reader sees either the whole old file or the whole
+            # new one, never a partial). mkstemp gives a unique name so two
+            # overlapping persists can never share/truncate one temp inode and rename
+            # a corrupt file into place (a fixed ".name.tmp" left that latent hazard).
+            parent = self._persist_path.parent
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(parent), prefix=f".{self._persist_path.name}.", suffix=".tmp",
+            )
             try:
-                with open(tmp_path, "w") as fh:
+                with os.fdopen(fd, "w") as fh:
                     fh.write(json.dumps(data, indent=2))
                     fh.flush()
                     os.fsync(fh.fileno())
+                # mkstemp creates the temp 0600; copy the target's existing mode so a
+                # replace never silently narrows a custom/group-readable permission.
+                try:
+                    os.chmod(tmp_path, stat.S_IMODE(self._persist_path.stat().st_mode))
+                except OSError:
+                    pass
                 os.replace(tmp_path, self._persist_path)
+                # fsync the PARENT DIR so the rename itself is crash-durable —
+                # os.replace is atomic, but the directory entry isn't guaranteed on
+                # disk until the dir is fsync'd, so a hard power-loss could otherwise
+                # roll back to the prior (whole, valid) file. Best-effort: not every
+                # platform/filesystem permits a directory fsync.
+                try:
+                    dir_fd = os.open(str(parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
             finally:
                 # On any failure the partial temp must not linger; on success it
                 # was renamed away and this is a no-op.
