@@ -27,6 +27,11 @@ class WeightsEmitter:
         version_key: Version key for weight commits.
         max_attempts: Max attempts for commit-reveal set_weights.
         block_time: Expected block time (0.25 for local testnet, 12 for mainnet).
+        subtensor_url: Network/URL used to REBUILD the client after a stale-
+            websocket failure (self-healing reconnect). Without it the emitter
+            reuses one long-lived Subtensor whose ws dies when an operator rotates
+            the RPC, and every set_weights then fails on the dead socket until a
+            daemon restart. None disables reconnect (keeps the legacy behaviour).
     """
 
     def __init__(
@@ -37,6 +42,7 @@ class WeightsEmitter:
         version_key: int = 6,
         max_attempts: int = 10,
         block_time: float = 12.0,
+        subtensor_url: str | None = None,
     ) -> None:
         self.wallet = wallet
         self.subtensor = subtensor
@@ -44,6 +50,7 @@ class WeightsEmitter:
         self.version_key = version_key
         self.max_attempts = max_attempts
         self.block_time = block_time
+        self._subtensor_url = subtensor_url
 
     async def emit_async(self, weights_mapping: dict[str, float]) -> bool:
         """Submit weights to the chain asynchronously.
@@ -64,7 +71,38 @@ class WeightsEmitter:
             )
         except Exception as exc:
             logger.error("Weight emission failed: %s", exc)
+            # A RAISED emit (vs a returned False from a chain-level rejection) is
+            # almost always a dead/stale subtensor websocket — most commonly the
+            # operator rotated the RPC, leaving this emitter's long-lived client
+            # pinned to a closed socket. Rebuild it so the NEXT emit reconnects on
+            # its own instead of failing here every epoch until a daemon restart.
+            # Run the (blocking) ws handshake off the event loop.
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._reconnect_subtensor,
+            )
             return False
+
+    def _reconnect_subtensor(self) -> None:
+        """Rebuild the Subtensor client against ``subtensor_url`` so a stale
+        websocket self-heals on the next emit. Best-effort and blocking (called in
+        an executor): a still-down RPC just fails here too and we retry next epoch.
+        No-op when no URL was configured (legacy behaviour preserved)."""
+        if not self._subtensor_url:
+            return
+        try:
+            import bittensor as bt
+
+            self.subtensor = bt.Subtensor(network=self._subtensor_url)
+            logger.info(
+                "Reconnected emitter subtensor to %s after a failed emit "
+                "(stale-websocket recovery)",
+                self._subtensor_url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Emitter subtensor reconnect to %s failed (will retry next emit): %s",
+                self._subtensor_url, exc,
+            )
 
     def _emit_blocking(self, weights_mapping: dict[str, float]) -> bool:
         """Blocking weight submission (runs in executor).
