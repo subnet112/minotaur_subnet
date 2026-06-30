@@ -266,13 +266,14 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     """Resolve the round's canonical fork pins, deriving + caching if absent.
 
     Gated by ``ROUND_ANCHORED_PIN``. Returns ``RoundState.fork_pins`` when already
-    set (leader populated at close, or a prior resolve); otherwise derives them
-    independently from the round's ``close_epoch`` anchor and caches them. Returns
-    None (defer / live head) when the gate is off, the round is unknown or not yet
-    closed, or derivation defers.
+    set (a prior resolve / open-time populate); otherwise derives them independently
+    from the round's ``opened_epoch`` anchor and caches them. Returns None (defer /
+    live head) when the gate is off, the round is unknown, or derivation defers.
 
-    This is what gives followers Option-b parity: each validator derives the same
-    pin from the same anchor, with no trust in a leader-asserted number.
+    Anchoring to ``opened_epoch`` (encoded in the round_id, fleet-identical, known at
+    OPEN) rather than ``close_epoch`` (set only at close) is what makes the pin
+    resolvable DURING the open window instead of sealing one second too late, while
+    keeping every validator's derived pin byte-identical (no leader-asserted number).
     """
     from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not round_anchored_pin_enabled():
@@ -289,10 +290,16 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     cached = getattr(round_state, "fork_pins", None)
     if cached:
         return cached
-    close_epoch = getattr(round_state, "close_epoch", None)
-    if close_epoch is None:
-        return None  # not closed yet -> no anchor
-    pins = _derive_round_fork_pins(int(close_epoch))
+    # Anchor to opened_epoch (NOT close_epoch). opened_epoch is fleet-identical from the
+    # instant the round exists — it is encoded in the round_id (round-e{opened_epoch}-n{n})
+    # and followers parse it back verbatim — so every validator derives the SAME pin, and
+    # (unlike close_epoch, set only at close) it is KNOWN AT OPEN, so the pin resolves
+    # DURING the open window. round_anchor_ts(opened_epoch) sits ~1 epoch in the confirmed
+    # past at open so find_pin_block brackets immediately; by close it is deeply confirmed.
+    opened_epoch = getattr(round_state, "opened_epoch", None)
+    if opened_epoch is None:
+        return None
+    pins = _derive_round_fork_pins(int(opened_epoch))
     if pins:
         try:
             store.set_round_fork_pins(round_id, pins)  # cache for reuse
@@ -2570,14 +2577,21 @@ async def initialize(ctx: ServerContext) -> dict:
                     int(current.opened_epoch),
                     _current_solver_round_epoch(ctx),
                 )
-                # Round-anchored fork pins (gated, default-off). Populate BEFORE
-                # the pack hash below so the canonical pins are folded into it.
-                _maybe_populate_round_fork_pins(current.round_id, close_epoch)
-                # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off,
-                # still derive + log the pins the leader WOULD pin, so fleet pin
-                # parity can be verified before enabling. No consensus effect.
+                # Round-anchored fork pins (gated, default-off). Populate BEFORE the pack
+                # hash below so the canonical pins are folded into it. Anchor to
+                # opened_epoch (NOT close_epoch): the pin is fixed at OPEN, so this
+                # close-time populate derives the SAME pin the worker already used during
+                # the open window — it can never overwrite the open-derived cache with a
+                # different (close_epoch) block, which would split scored-pin != hashed-pin.
+                _maybe_populate_round_fork_pins(
+                    current.round_id, int(current.opened_epoch)
+                )
+                # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off, still
+                # derive + log the pins the leader WOULD pin, so fleet pin parity can be
+                # verified before enabling. No consensus effect.
                 _maybe_shadow_log_round_fork_pins(
-                    ctx, current.round_id, role="leader", anchor_epoch=close_epoch,
+                    ctx, current.round_id, role="leader",
+                    anchor_epoch=int(current.opened_epoch),
                 )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
