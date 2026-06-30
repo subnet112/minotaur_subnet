@@ -55,14 +55,41 @@ def _default_persist_path(filename: str) -> str | None:
     return None
 
 
+# Fail-loud durable-state mode, set by the production api entrypoint. When on, a store whose
+# path cannot be resolved RAISES at construction instead of silently running in-memory.
+_REQUIRE_DURABLE_STATE = False
+
+
+def require_durable_state() -> None:
+    """Switch the store getters to FAIL LOUD instead of silently running in-memory.
+
+    Called by the production api entrypoint so a node that can't resolve a durable path
+    CRASHES at boot with a clear message, instead of silently losing round/submission state
+    on the next restart (the #430 class). Tests/dev leave this off; they may run in-memory
+    explicitly via set_store/set_round_store."""
+    global _REQUIRE_DURABLE_STATE
+    _REQUIRE_DURABLE_STATE = True
+
+
+def _resolve_persist_path(filename: str, env_var: str) -> str | None:
+    """Resolve a durable store path (explicit env, else the shared /data default). When
+    durable state is required and nothing resolves, RAISE — never a silent in-memory store."""
+    path = os.environ.get(env_var) or _default_persist_path(filename)
+    if path is None and _REQUIRE_DURABLE_STATE:
+        raise RuntimeError(
+            f"No durable path for {filename}: set {env_var}, set APP_INTENTS_STORE_PATH, or "
+            f"mount a writable /data volume. Refusing to run a persistent store in-memory "
+            f"(state would be lost on the next restart)."
+        )
+    return path
+
+
 def get_store() -> SubmissionStore:
     """Get or create the submission store singleton."""
     global _store
     if _store is None:
         from pathlib import Path
-        persist_path = os.environ.get("SUBMISSION_STORE_PATH") or _default_persist_path(
-            "submissions.json"
-        )
+        persist_path = _resolve_persist_path("submissions.json", "SUBMISSION_STORE_PATH")
         _store = SubmissionStore(
             persist_path=Path(persist_path) if persist_path else None,
         )
@@ -94,9 +121,7 @@ def get_round_store() -> RoundStore:
     if _round_store is None:
         from pathlib import Path
 
-        persist_path = os.environ.get("SOLVER_ROUND_STORE_PATH") or _default_persist_path(
-            "solver_rounds.json"
-        )
+        persist_path = _resolve_persist_path("solver_rounds.json", "SOLVER_ROUND_STORE_PATH")
         _round_store = RoundStore(
             persist_path=Path(persist_path) if persist_path else None,
             record_sink=_round_history_sink,

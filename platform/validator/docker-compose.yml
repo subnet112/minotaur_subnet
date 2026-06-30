@@ -268,6 +268,11 @@ services:
       # JsExecutionEngine has no scoring code loaded, and re-scoring of
       # incoming consensus proposals fails. Leaders should leave this unset.
       LEADER_API_URL: "${LEADER_API_URL:-https://api.minotaursubnet.com}"
+      # Champion source for weight emission: THIS node's CO-LOCATED api (single source of
+      # truth — it ran consensus + adopted). Read over HTTP; the validator holds no champion
+      # state of its own. MUST be the operator's OWN api, NEVER the public leader
+      # (anti-free-ride). Default matches the api service name + port below.
+      CHAMPION_API_URL: "${CHAMPION_API_URL:-http://api:8080}"
     volumes:
       # Bittensor wallet directory — read-only.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"

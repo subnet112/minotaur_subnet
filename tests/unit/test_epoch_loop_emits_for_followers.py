@@ -57,6 +57,11 @@ async def _run_one_iteration(self_stub) -> None:
     # The order-volume ramp runs inside _do_emit; stub it to a passthrough so
     # these emit-path tests see the mapping unchanged (ramp covered separately).
     self_stub._scale_emission_by_order_volume = lambda mapping: mapping
+    # _local_champion_hotkey is async now (HTTP-resolves the champion from the co-located
+    # API); the burn path awaits it. None + source 'api' = DEFINITIVE no-champion => the
+    # owner-burn path these tests mock via maybe_emit (an UNRESOLVED None would SKIP).
+    self_stub._local_champion_hotkey = AsyncMock(return_value=None)
+    self_stub._champion_source = "api"
 
     call_count = {"sleep": 0}
 
