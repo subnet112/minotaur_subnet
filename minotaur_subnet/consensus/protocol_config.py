@@ -112,6 +112,20 @@ _VALIDATOR_REGISTRY_ABI = [
     },
 ]
 
+# Minimal ABI for the one ChampionRegistry view the nonce floor needs.
+# ChampionRegistry is a DISTINCT contract from ValidatorRegistry (it lives at
+# ``quorum_address``); it enforces ``require(nonce > lastNonce[signer])`` in
+# ``certify()`` and exposes the per-signer high-water as a public mapping getter.
+_CHAMPION_REGISTRY_ABI = [
+    {
+        "name": "lastNonce",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
+
 _OVERRIDE_ENV = "QUORUM_BPS_OVERRIDE"
 
 
@@ -564,6 +578,29 @@ def _read_validators(rpc_url: str, registry_address: str) -> list[str]:
         abi=_VALIDATOR_REGISTRY_ABI,
     )
     return [str(a) for a in registry.functions.getValidators().call()]
+
+
+def read_champion_last_nonce(
+    rpc_url: str, champion_registry_address: str, signer: str
+) -> int:
+    """Read ``ChampionRegistry.lastNonce(signer)`` — the per-signer monotonic
+    high-water the contract enforces with
+    ``require(nonces[i] > lastNonce[signer], "Nonce not increasing")``.
+
+    Used to FLOOR a freshly-minted champion proposal nonce so a backward
+    wall-clock movement on the proposing leader can never mint a nonce <= the
+    on-chain high-water (which would brick certification). ``champion_registry_
+    address`` is the ChampionRegistry (``ProtocolConfig.quorum_address``), NOT
+    the ValidatorRegistry — they are distinct contracts on BT EVM.
+    """
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    registry = w3.eth.contract(
+        address=Web3.to_checksum_address(champion_registry_address),
+        abi=_CHAMPION_REGISTRY_ABI,
+    )
+    return int(
+        registry.functions.lastNonce(Web3.to_checksum_address(signer)).call()
+    )
 
 
 def _read_block_number(rpc_url: str) -> int:
