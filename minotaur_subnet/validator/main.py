@@ -575,6 +575,10 @@ class AppIntentsValidator:
                         subtensor=subtensor,
                         netuid=netuid,
                         block_time=0.25 if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url else 12.0,
+                        # Pass the URL so a failed emit can rebuild the client —
+                        # the emitter holds ONE long-lived Subtensor whose ws goes
+                        # stale on an RPC rotation and otherwise needs a restart.
+                        subtensor_url=subtensor_url,
                     )
 
                     # Auto-publish the axon URL on the metagraph. Bittensor
