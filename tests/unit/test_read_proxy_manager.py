@@ -58,6 +58,7 @@ def test_proxy_stale_image_recreated(monkeypatch):
         (0, "sha256:NEW|minotaur benchmark-sandbox ", ""),  # api image NEW
         (0, "true|sha256:OLD", ""),                         # proxy running OLD image
         (0, "", ""),                                        # rm -f
+        (0, "[{}]", ""),                                     # network inspect -> net EXISTS (no create)
         (0, "cid", ""),                                     # run
         (0, "", ""),                                        # network connect
     ])
@@ -65,6 +66,7 @@ def test_proxy_stale_image_recreated(monkeypatch):
     assert asyncio.run(rpm.ensure_read_proxy_container()) is True
     assert any(c[:2] == ("rm", "-f") for c in fake.calls)   # removed stale
     assert any(c and c[0] == "run" for c in fake.calls)     # recreated on the new image
+    assert not any(c[:2] == ("network", "create") for c in fake.calls)  # net present -> no create
 
 
 def test_env_wired_inspect_403_running_proxy_left(monkeypatch):
@@ -110,6 +112,7 @@ def test_launch_when_absent(monkeypatch):
         (1, "", "No such object"),                             # proxy inspect -> absent
         (0, "", ""),                                           # proxy ps -> empty (not running)
         (0, "", ""),                                           # rm -f
+        (0, "[{}]", ""),                                       # network inspect -> exists
         (0, "cid", ""),                                        # run
         (0, "", ""),                                           # network connect
     ])
@@ -134,6 +137,7 @@ def test_launch_via_ps_fallback_when_inspect_403(monkeypatch):
         (1, "", "No such object"),                                         # proxy inspect -> absent
         (0, "", ""),                                                       # proxy ps -> not running
         (0, "", ""),                                                       # rm -f
+        (0, "[{}]", ""),                                                   # network inspect -> exists
         (0, "cid", ""),                                                    # run
         (0, "", ""),                                                       # network connect
     ])
@@ -154,8 +158,90 @@ def test_create_failure_still_wires_env(monkeypatch):
         (1, "", "No such object"),                           # proxy inspect -> absent
         (0, "", ""),                                          # proxy ps -> not running
         (0, "", ""),                                          # rm -f
+        (0, "[{}]", ""),                                      # network inspect -> exists (no create)
         (1, "", "Address already in use"),                   # run FAILS
     ])
     monkeypatch.setattr(rpm, "_docker", fake)
     assert asyncio.run(rpm.ensure_read_proxy_container()) is False
     assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL  # wired despite launch fail
+
+
+# ── benchmark-sandbox network self-heal (the unused-top-level-net gap) ────────
+
+def test_ensure_benchmark_network_noop_when_present(monkeypatch):
+    _clear_env(monkeypatch)
+    fake = FakeDocker([(0, "[{}]", "")])  # network inspect -> exists
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm._ensure_benchmark_network("benchmark-sandbox")) is True
+    assert not any(c[:2] == ("network", "create") for c in fake.calls)  # never creates
+
+
+def test_ensure_benchmark_network_creates_when_missing(monkeypatch):
+    _clear_env(monkeypatch)
+    fake = FakeDocker([
+        (1, "", "network benchmark-sandbox not found"),  # inspect -> MISSING
+        (0, "netid", ""),                                # create -> ok
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm._ensure_benchmark_network("benchmark-sandbox")) is True
+    creates = [c for c in fake.calls if c[:2] == ("network", "create")]
+    assert creates, "should have created the missing network"
+    args = creates[0]
+    assert "--internal" in args and "--subnet" in args
+    assert "172.30.0.0/24" in args and args[-1] == "benchmark-sandbox"
+
+
+def test_ensure_benchmark_network_subnet_env_override(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("BENCHMARK_DOCKER_NETWORK_SUBNET", "10.9.0.0/24")
+    fake = FakeDocker([(1, "", "missing"), (0, "netid", "")])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm._ensure_benchmark_network("bench")) is True
+    creates = [c for c in fake.calls if c[:2] == ("network", "create")]
+    assert "10.9.0.0/24" in creates[0]
+
+
+def test_ensure_benchmark_network_create_race_then_present(monkeypatch):
+    # create loses a race (already exists) -> re-inspect finds it -> success, not failure.
+    _clear_env(monkeypatch)
+    fake = FakeDocker([
+        (1, "", "missing"),          # inspect -> missing
+        (1, "", "already exists"),   # create -> fails (concurrent create)
+        (0, "netid", ""),            # re-inspect -> now present
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm._ensure_benchmark_network("benchmark-sandbox")) is True
+
+
+def test_ensure_benchmark_network_hard_fail_returns_false(monkeypatch):
+    # create fails AND still missing -> False (logged, best-effort), never raises.
+    _clear_env(monkeypatch)
+    fake = FakeDocker([
+        (1, "", "missing"),  # inspect -> missing
+        (1, "", "boom"),     # create -> hard fail
+        (1, "", "missing"),  # re-inspect -> still missing
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm._ensure_benchmark_network("benchmark-sandbox")) is False
+
+
+def test_launch_path_self_heals_missing_network(monkeypatch):
+    # The proxy-launch path creates the missing net BEFORE the run (the prod fix).
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    fake = FakeDocker([
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # api image
+        (1, "", "no such container"),                       # _proxy_state inspect -> not running
+        (1, "", "no such container"),                       # _proxy_state ps fallback -> not running
+        (0, "", ""),                                        # rm -f
+        (1, "", "network not found"),                       # network inspect -> MISSING
+        (0, "netid", ""),                                   # network create -> ok
+        (0, "cid", ""),                                     # run
+        (0, "", ""),                                        # network connect
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
+    assert any(c[:2] == ("network", "create") for c in fake.calls)   # self-healed
+    # ordering: the create must precede the proxy run
+    order = [c for c in fake.calls if c[:2] == ("network", "create") or (c and c[0] == "run")]
+    assert order[0][:2] == ("network", "create") and order[1][0] == "run"

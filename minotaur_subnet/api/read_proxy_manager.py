@@ -145,6 +145,52 @@ async def _resolve_self_image_and_net() -> tuple[str, str | None]:
     return "", None
 
 
+async def _ensure_benchmark_network(name: str) -> bool:
+    """Create the sealed benchmark network if it's missing — self-heal.
+
+    NOTHING ELSE creates it. It's a top-level compose network that NO service
+    attaches to (the read-proxy + benchmark/live-champion solvers attach
+    imperatively via ``docker run --network=<name>``), and ``docker compose up``
+    does NOT create a top-level network that no service uses — so a fresh host, a
+    ``docker network prune``/``rm``, or a partial setup leaves it ABSENT. Every
+    later ``docker run --network=<name>`` then fails "network not found": the
+    read-proxy can't launch AND the live champion can't hot-swap, so the validator
+    silently falls back to 100% burn (observed in prod — a follower stuck on burn
+    for days traced to exactly this).
+
+    Create it with the spec the validator compose declares: an ``--internal``
+    bridge on ``172.30.0.0/24`` (subnet env-overridable via
+    ``BENCHMARK_DOCKER_NETWORK_SUBNET``), so an untrusted solver can reach ONLY the
+    ``.5`` block-pin proxy. Idempotent + best-effort: an already-present net (incl.
+    a concurrent-create race) is success; a hard failure is logged and we proceed —
+    the proxy launch still surfaces it loudly, exactly as before.
+    """
+    rc, _out, _err = await _docker("network", "inspect", name)
+    if rc == 0:
+        return True  # already exists — nothing to do
+    subnet = os.environ.get("BENCHMARK_DOCKER_NETWORK_SUBNET", "172.30.0.0/24").strip()
+    rc, _cid, err = await _docker(
+        "network", "create", "--driver", "bridge", "--internal",
+        "--subnet", subnet, name,
+    )
+    if rc == 0:
+        logger.info(
+            "[read-proxy] created missing benchmark network %s (internal bridge %s)",
+            name, subnet,
+        )
+        return True
+    # Lost a create race against another process? Re-check before declaring failure.
+    rc2, _, _ = await _docker("network", "inspect", name)
+    if rc2 == 0:
+        return True
+    logger.error(
+        "[read-proxy] could NOT create benchmark network %s (%s) — proxy + solver "
+        "launches will keep failing 'network not found' until it exists",
+        name, err,
+    )
+    return False
+
+
 async def ensure_read_proxy_container() -> bool:
     """Ensure the api ROUTES through the block-pin proxy, launching the managed container
     if it isn't already up. Idempotent; call once at api startup.
@@ -198,6 +244,11 @@ async def ensure_read_proxy_container() -> bool:
         )
     await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # clear any stale/stopped instance
     sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
+    # SELF-HEAL: nothing else creates this network (unused top-level compose net), so
+    # create it if missing BEFORE the proxy — and, by extension, before the live champion
+    # hot-swap — tries to attach. Without this, the run below fails "network not found"
+    # and the validator silently burns 100%.
+    await _ensure_benchmark_network(sandbox)
     # NOTE: no Watchtower label — the api owns this container's lifecycle: it recreates the
     # proxy from its OWN image when they diverge (api update) and leaves it otherwise.
     create = [
