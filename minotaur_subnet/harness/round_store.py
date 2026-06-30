@@ -555,14 +555,30 @@ class RoundStore:
         """Store the round's canonical per-chain benchmark fork pins.
 
         Set by the leader (and, independently, each follower) before the
-        benchmark_pack_hash is computed, so the pins enter the hash. ``None`` or
-        empty clears them (legacy / live-head behavior).
+        benchmark_pack_hash is computed, so the pins enter the hash. ``None`` or empty
+        clears them (legacy / live-head). Once a non-empty pin is set it is FIXED: a later
+        call that would overwrite it with a DIFFERENT non-None value is refused — the pin is
+        anchored at opened_epoch and already folded into the signed hash.
         """
         self._maybe_reload()
         state = self._rounds.get(round_id)
         if state is None:
             raise KeyError(f"Round not found: {round_id}")
-        state.fork_pins = {int(k): int(v) for k, v in pins.items()} if pins else None
+        new_pins = {int(k): int(v) for k, v in pins.items()} if pins else None
+        # Idempotent guard: refuse a DIFFERING non-None overwrite of an already-set pin.
+        # The pin is fixed at opened_epoch; silently changing it after it was folded into
+        # the signed pack hash would split scored-pin != hashed-pin across the fleet.
+        # Clearing to None stays allowed (gate-off / live-head). With every derivation site
+        # on opened_epoch the value is identical anyway — this is a consensus-safety backstop.
+        existing = getattr(state, "fork_pins", None)
+        if existing and new_pins is not None and new_pins != existing:
+            logger.warning(
+                "fork-pins: refusing to overwrite round %s pins %s with differing %s "
+                "(pin is fixed once set)",
+                round_id, existing, new_pins,
+            )
+            return copy.deepcopy(state)
+        state.fork_pins = new_pins
         state.updated_at = time.time()
         self._persist()
         self._record(state)
