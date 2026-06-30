@@ -736,10 +736,17 @@ class RoundStore:
                     fh.write(json.dumps(data, indent=2))
                     fh.flush()
                     os.fsync(fh.fileno())
-                # mkstemp creates the temp 0600; copy the target's existing mode so a
-                # replace never silently narrows a custom/group-readable permission.
+                # mkstemp creates the temp 0600; match the target's mode so a replace
+                # never silently narrows a custom/group-readable permission. On the
+                # FIRST persist there is no target to stat — fall back to 0644 (the
+                # umask-default the old write_text produced) so we don't ship a
+                # 0600 store that a co-located reader can't open.
                 try:
-                    os.chmod(tmp_path, stat.S_IMODE(self._persist_path.stat().st_mode))
+                    target_mode = stat.S_IMODE(self._persist_path.stat().st_mode)
+                except OSError:
+                    target_mode = 0o644
+                try:
+                    os.chmod(tmp_path, target_mode)
                 except OSError:
                     pass
                 os.replace(tmp_path, self._persist_path)
@@ -767,8 +774,27 @@ class RoundStore:
         except Exception as exc:
             logger.warning("Failed to persist round store: %s", exc)
 
+    def _sweep_orphan_temps(self) -> None:
+        """Remove leftover ``.<name>.<rand>.tmp`` files from a crash between
+        mkstemp and os.replace. Temp names are unique (mkstemp), so without this
+        they'd accumulate across crashes. Best-effort; never raises."""
+        if self._persist_path is None:
+            return
+        try:
+            pattern = f".{self._persist_path.name}.*.tmp"
+            for stale in self._persist_path.parent.glob(pattern):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     def _load(self) -> None:
         try:
+            # Clean up any orphan temp files from a prior crashed persist before
+            # loading (the unique-temp-name scheme would otherwise let them pile up).
+            self._sweep_orphan_temps()
             data = json.loads(self._persist_path.read_text())
             current_round_id = data.get("current_round_id")
             active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))
