@@ -35,6 +35,58 @@ class TestWeightsEmitter:
         result = await we.emit_async({})
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_emit_reconnects_on_stale_ws(self):
+        # A dead/stale subtensor websocket (operator rotated the RPC) makes the
+        # blocking emit RAISE; the emitter must rebuild its client against the URL
+        # so the NEXT epoch reconnects instead of failing on the dead socket forever.
+        wallet = MagicMock()
+        dead = MagicMock()
+        dead.metagraph.side_effect = ConnectionError("websocket connection closed")
+        fresh = MagicMock()
+
+        we = WeightsEmitter(
+            wallet=wallet, subtensor=dead, netuid=1, subtensor_url="ws://node:9944",
+        )
+        with patch("bittensor.Subtensor", return_value=fresh) as mk_subtensor:
+            result = await we.emit_async({"hk_a": 1.0})
+
+        assert result is False                     # this emit failed (dead ws)
+        mk_subtensor.assert_called_once_with(network="ws://node:9944")
+        assert we.subtensor is fresh               # …but it self-healed for next time
+
+    @pytest.mark.asyncio
+    async def test_emit_no_reconnect_without_url(self):
+        # Legacy behaviour preserved: no URL → no reconnect attempt, client unchanged.
+        wallet = MagicMock()
+        dead = MagicMock()
+        dead.metagraph.side_effect = ConnectionError("websocket connection closed")
+
+        we = WeightsEmitter(wallet=wallet, subtensor=dead, netuid=1)  # no subtensor_url
+        with patch("bittensor.Subtensor") as mk_subtensor:
+            result = await we.emit_async({"hk_a": 1.0})
+
+        assert result is False
+        mk_subtensor.assert_not_called()
+        assert we.subtensor is dead
+
+    @pytest.mark.asyncio
+    async def test_reconnect_failure_is_swallowed(self):
+        # If the RPC is still down, rebuilding the client also fails — that must be
+        # caught (logged), not raised, so the emit loop keeps ticking.
+        wallet = MagicMock()
+        dead = MagicMock()
+        dead.metagraph.side_effect = ConnectionError("ws closed")
+
+        we = WeightsEmitter(
+            wallet=wallet, subtensor=dead, netuid=1, subtensor_url="ws://node:9944",
+        )
+        with patch("bittensor.Subtensor", side_effect=OSError("still down")):
+            result = await we.emit_async({"hk_a": 1.0})
+
+        assert result is False
+        assert we.subtensor is dead   # left as-is; next epoch retries the reconnect
+
     def test_emit_blocking_maps_hotkeys_to_uids(self):
         wallet = MagicMock()
         subtensor = MagicMock()
