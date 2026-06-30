@@ -149,13 +149,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #   - docker-ce-cli: spawning benchmark containers via docker-socket-proxy
 #     (NOT docker.io — that pulls dockerd, containerd, runc; we only
 #     need the CLI client because the daemon lives on the host)
-#   - docker-buildx-plugin: REQUIRED for solver image builds (screening
-#     Stage 2). Without it `docker build` falls back to the LEGACY builder,
-#     whose image-layer cache hard-fails ("unable to find image sha256:…")
-#     once a referenced base layer is GC'd — which silently blocked EVERY
-#     fresh submission build (only pre-cached images could score). buildx
-#     gives BuildKit's content-addressed cache, which has no such fragility.
-#     Paired with DOCKER_BUILDKIT=1 below so `docker build` uses it by default.
+#     Solver image builds (screening Stage 2) use the LEGACY builder on purpose
+#     (DOCKER_BUILDKIT=0, forced in harness/screening.py): BuildKit/buildx needs
+#     docker-API session-upgrade calls the docker-socket-proxy forbids (HTTP 403)
+#     and a writable ~/.docker (the mount is read-only). The legacy builder's only
+#     weakness — a layer-cache hard-fail after a base layer is GC'd — is avoided
+#     with `docker build --no-cache`. So no buildx plugin is installed.
 #
 # Docker apt repo signing key is fetched once and pinned to the keyring;
 # the repo line uses signed-by= so apt won't trust other sources.
@@ -173,14 +172,14 @@ RUN apt-get update \
         https://download.docker.com/linux/debian bookworm stable" \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
     && apt-get purge -y --auto-remove gnupg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Make `docker build` use BuildKit by default (buildx is installed above). The
-# legacy builder is deprecated and its layer cache is what broke fresh builds.
-ENV DOCKER_BUILDKIT=1
+# No DOCKER_BUILDKIT=1: solver builds force the legacy builder (DOCKER_BUILDKIT=0 is
+# set per-build in harness/screening.py) because BuildKit can't run behind the
+# docker-socket-proxy / read-only ~/.docker here (see the docker-ce-cli note above).
 
 # Non-root runtime user. uid 1000 must match the compose-side `user:
 # "1000:1000"` directive (PR-3) and the chown on the /data volume below.

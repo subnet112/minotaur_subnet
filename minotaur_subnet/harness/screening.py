@@ -268,14 +268,29 @@ async def run_stage_2(
     build_cmd = [
         "docker", "build",
         "--network=none",
-        "--provenance=false",
+        # --no-cache: the legacy layer cache hard-fails once a referenced base layer is
+        # GC'd (the #449 incident). Skipping it is robust; the base FROM stays in the image
+        # store, so only the solver's small layers rebuild — cheap.
+        "--no-cache",
+        # per-build memory cap on untrusted miner builds. The legacy builder supports it;
+        # BuildKit did not, which is why #449 had to drop the cap (#451). Restored here.
+        "--memory=4g",
         "-t", image_tag,
         repo_path,
     ]
 
+    # Force the LEGACY builder. BuildKit/buildx CANNOT run in this api container: it needs
+    # docker-API session-upgrade calls the docker-socket-proxy forbids (HTTP 403) and writes
+    # builder state into the read-only ~/.docker mount. The legacy builder only needs
+    # POST /build (allowed by the proxy) and loads straight into the image store, so
+    # `docker inspect {{.Id}}` and the entrypoint checks below keep working. This reverts
+    # #449's BuildKit switch, whose failures were silently blocking every fresh build.
+    build_env = {**os.environ, "DOCKER_BUILDKIT": "0"}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *build_cmd,
+            env=build_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
