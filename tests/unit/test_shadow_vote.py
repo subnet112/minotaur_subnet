@@ -63,12 +63,12 @@ def _make_worker(monkeypatch, scores, champion="champ:ref"):
     monkeypatch.setattr(w, "_compute_avg_score", lambda results: results[0].score)
 
     async def _run_benchmark(session, intents, **kwargs):
-        # One per-order result carrying the RAW delivered output (shadow_score, an
+        # One per-order result carrying the RAW delivered output (raw_output, an
         # exact decimal-wei STRING) the relative rule actually compares. Same
         # intent_id on both sides so they JOIN. Output scales with the score map.
         sc = scores[session.image]
         return [BenchmarkResult(
-            intent_id="dex:s1", score=sc, shadow_score=str(int(round(sc * 100))),
+            intent_id="dex:s1", score=sc, raw_output=str(int(round(sc * 100))),
         )]
 
     monkeypatch.setattr(orch_mod, "run_benchmark", _run_benchmark)

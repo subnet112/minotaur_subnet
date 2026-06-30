@@ -935,12 +935,12 @@ class BenchmarkWorker:
             # authoritative unclamped value is metadata.raw_output: an EXACT DECIMAL
             # WEI STRING (BigInt -> .toString()) stored VERBATIM — no float(), which
             # would reintroduce IEEE-754 precision loss above 2^53. The orchestrator
-            # copies result.shadow_score onto BenchmarkResult.shadow_score and
-            # _results_to_details into per_intent[*].shadow_score; the relative rule
+            # copies result.raw_output onto BenchmarkResult.raw_output and
+            # _results_to_details into per_intent[*].raw_output; the relative rule
             # parses it with int(). None/"" when the live scorer emits no raw_output
             # (e.g. the pre-cutover quote-anchored scorer) -> no per-order signal.
             raw = (result.metadata or {}).get("raw_output")
-            result.shadow_score = (
+            result.raw_output = (
                 str(raw) if (raw is not None and str(raw) != "") else None
             )
             return result
@@ -1510,7 +1510,7 @@ class BenchmarkWorker:
 
         # champ_score / chal_score are the aggregate JS means — LOGGING/DISPLAY only
         # now; the AUTHORITATIVE verdict is the per-order relative rule over the RAW
-        # delivered output (shadow_score), IDENTICAL to the leader + followers.
+        # delivered output (raw_output), IDENTICAL to the leader + followers.
         champ_score = self._compute_avg_score(champ_results)
         chal_score = self._compute_avg_score(chal_results)
         verdict = evaluate_relative_adoption(champ_results, chal_results)
@@ -1935,10 +1935,11 @@ class BenchmarkWorker:
                     # RAW delivered output from the LIVE raw-output scorer's
                     # metadata.raw_output (see _build_score_fn); an EXACT DECIMAL WEI
                     # STRING, or None when the live scorer emits no raw_output. This
-                    # is the per-order signal the relative adoption rule consumes
-                    # (field name kept as shadow_score to avoid rippling the API
-                    # counts shape). Never feeds the legacy aggregate `score`.
-                    "shadow_score": getattr(r, "shadow_score", None),
+                    # is the per-order signal the relative adoption rule consumes.
+                    # Never feeds the legacy aggregate `score`. (Readers also accept
+                    # the legacy ``shadow_score`` key for rows persisted before the
+                    # rename — see relative_scoring._raw_output.)
+                    "raw_output": getattr(r, "raw_output", None),
                     "elapsed_ms": r.elapsed_ms,
                     "error": r.error,
                     "revert_reason": getattr(r, "revert_reason", None),

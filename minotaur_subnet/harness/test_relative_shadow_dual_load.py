@@ -89,9 +89,9 @@ def _plan():
     )
 
 
-async def test_score_fn_attaches_shadow_score_from_live_metadata():
+async def test_score_fn_attaches_raw_output_from_live_metadata():
     # The LIVE scorer (js_code) is the raw-output scorer post-cutover; its result
-    # carries metadata.raw_output, which the score_fn threads onto shadow_score.
+    # carries metadata.raw_output, which the score_fn threads onto raw_output.
     eng = _FakeEngine(raw_output="2500")
     worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
     score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
@@ -103,18 +103,18 @@ async def test_score_fn_attaches_shadow_score_from_live_metadata():
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
     assert res.score == 0.5  # clamped live score untouched
     # raw output attached as an EXACT decimal STRING (not a float).
-    assert getattr(res, "shadow_score", None) == "2500"
-    assert isinstance(res.shadow_score, str)
+    assert getattr(res, "raw_output", None) == "2500"
+    assert isinstance(res.raw_output, str)
 
 
 async def test_score_fn_none_when_live_emits_no_raw_output():
-    # Pre-cutover scorer (no raw_output in metadata) -> shadow_score stays None.
+    # Pre-cutover scorer (no raw_output in metadata) -> raw_output stays None.
     eng = _FakeEngine(raw_output=None)
     worker = BenchmarkWorker(SubmissionStore(), js_engine=eng)
     score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
 
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
-    assert getattr(res, "shadow_score", None) is None
+    assert getattr(res, "raw_output", None) is None
 
 
 async def test_score_fn_none_when_raw_output_empty_string():
@@ -124,7 +124,7 @@ async def test_score_fn_none_when_raw_output_empty_string():
     score_fn = await worker._build_score_fn([(_intent(), _state(), _snap())])
 
     res = await score_fn("app", _plan(), SimulationResult(success=True), _state())
-    assert getattr(res, "shadow_score", None) is None
+    assert getattr(res, "raw_output", None) is None
 
 
 # ── the real raw-output shadow scorer (needs Node) ───────────────────────────
