@@ -494,8 +494,15 @@ class RelayerService:
                 status=500,
             )
 
-        # Charge against the daily gas budget. Only on a successful submit.
-        if submit_result.success and submit_result.gas_used:
+        # Charge against the daily gas budget whenever gas was actually burned
+        # ON-CHAIN — i.e. a successful submit OR a mined-then-reverted tx. The
+        # daily cap is the worst-case griefing backstop; charging only on
+        # success undercounted exactly the spend it exists to bound, since a tx
+        # that passes the pre-broadcast dry-run but reverts when mined still
+        # burns real gas (gas_used is populated from the receipt). gas_used is
+        # 0 for pre-broadcast failures and dry-run rejections (no gas spent),
+        # so those are still correctly not charged.
+        if submit_result.gas_used:
             # Approximate gas price — Base mainnet typically 0.001-0.1 gwei.
             # The Web3 instance inside EvmRelayer has the actual value, but
             # we'd need to thread it through SubmitResult. For now, charge
