@@ -252,11 +252,23 @@ async def run_stage_2(
     """
     start = time.monotonic()
 
-    # Step 1: Build Docker image
+    # Step 1: Build Docker image.
+    # Runs under BuildKit (the image ships docker-buildx-plugin + DOCKER_BUILDKIT=1);
+    # the legacy builder's layer cache hard-fails once a base layer is GC'd, which
+    # silently blocked every fresh submission build.
+    #   --network=none      RUN has no network — pip can't reach PyPI (anti-exfil /
+    #                       reproducibility); the base image carries the deps. This
+    #                       stays the primary abuse guard for untrusted Dockerfiles.
+    #   --provenance=false  Emit a plain single-platform image, NOT an attestation
+    #                       manifest-list, so `docker inspect {{.Id}}` and the
+    #                       run/entrypoint checks below behave exactly like before.
+    # NOTE: BuildKit does not support the legacy `--memory` flag, so the prior
+    # per-build 4 GB cap is dropped here. `--network=none` remains; a hard memory
+    # cap, if wanted, belongs in buildkitd worker config, not the build command.
     build_cmd = [
         "docker", "build",
         "--network=none",
-        "--memory=4g",
+        "--provenance=false",
         "-t", image_tag,
         repo_path,
     ]
