@@ -84,7 +84,7 @@ def test_genesis_incumbent_still_burns_weights_to_owner():
 
 def test_winner_takes_all_only_champion_earns_weight():
     # With a REAL miner champion, _build_weights_mapping is winner-takes-all:
-    # ONLY self._champion gets 0.05, owner gets 0.95 — NO score-ranked decay tail
+    # ONLY self._champion gets 0.10, owner gets 0.90 — NO score-ranked decay tail
     # to other scored submissions. Folds #329: a non-adopted candidate (e.g. a
     # merge-failed winner that's still SCORED) is never self._champion, so even if
     # it out-scores the champion it can never appear in the weight mapping.
@@ -104,8 +104,8 @@ def test_winner_takes_all_only_champion_earns_weight():
     weights = mgr._build_weights_mapping(epoch=1, round_id="r1")
 
     assert set(weights) == {"5RealMiner", OWNER}
-    assert weights["5RealMiner"] == pytest.approx(0.05)
-    assert weights[OWNER] == pytest.approx(0.95)
+    assert weights["5RealMiner"] == pytest.approx(0.10)
+    assert weights[OWNER] == pytest.approx(0.90)
     assert "5OtherMiner" not in weights  # no decay tail; non-champion earns nothing
 
 

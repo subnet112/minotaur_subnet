@@ -183,7 +183,9 @@ class Safeguards:
             return True, ""
 
     def record_gas_used(self, gas_used: int, gas_price_wei: int) -> None:
-        """Charge a successful submission against the daily budget."""
+        """Charge a mined submission against the daily budget — on success OR an
+        on-chain revert (both burn real gas). Caller passes gas_used=0 for
+        pre-broadcast failures so nothing is charged for gas that was not spent."""
         cost_wei = int(gas_used) * int(gas_price_wei)
         with self._lock:
             self._daily_gas.gas_used_wei += cost_wei

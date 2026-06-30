@@ -1,7 +1,7 @@
 """Unit tests for the relative per-order scoring rule (the sole adoption path).
 
 Covers the pure ``evaluate_relative_adoption`` decision across the full verdict
-matrix, on EXACT INTEGER wei (shadow_score is a decimal STRING; the verdict
+matrix, on EXACT INTEGER wei (raw_output is a decimal STRING; the verdict
 cross-multiplies the 10-bps band with no float).
 """
 
@@ -19,16 +19,16 @@ from minotaur_subnet.epoch.relative_scoring import (
     RELATIVE_TOL,
     RELATIVE_TOL_BPS,
     evaluate_relative_adoption,
-    has_shadow_rows,
+    has_raw_output_rows,
     relative_counts,
     relative_reason,
 )
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
 
 
-def _r(intent_id: str, shadow_score):
-    """A real BenchmarkResult carrying only intent_id + shadow_score (decimal str)."""
-    return BenchmarkResult(intent_id=intent_id, shadow_score=shadow_score)
+def _r(intent_id: str, raw_output):
+    """A real BenchmarkResult carrying only intent_id + raw_output (decimal str)."""
+    return BenchmarkResult(intent_id=intent_id, raw_output=raw_output)
 
 
 def test_tol_bps_matches_relative_tol():
@@ -151,8 +151,8 @@ def test_both_no_value_is_skipped():
 
 def test_accepts_per_intent_dicts():
     # The report/manager paths pass stored per_intent dicts, not BenchmarkResults.
-    champ = [{"intent_id": "o1", "shadow_score": "100"}]
-    chal = [{"intent_id": "o1", "shadow_score": "150"}]
+    champ = [{"intent_id": "o1", "raw_output": "100"}]
+    chal = [{"intent_id": "o1", "raw_output": "150"}]
     res = evaluate_relative_adoption(champ, chal)
     assert res["adopt"] is True
     assert res["per_order"][0]["ratio"] == 1.5
@@ -373,7 +373,7 @@ def test_bignum_regression_is_exact():
 
 
 def test_counts_clean_win_is_dethrone():
-    # shadow_score is an EXACT INTEGER DECIMAL STRING (#395), not a float.
+    # raw_output is an EXACT INTEGER DECIMAL STRING (#395), not a float.
     champ = [_r("o1", "100"), _r("o2", "200")]
     chal = [_r("o1", "120"), _r("o2", "250")]
     c = relative_counts(champ, chal)
@@ -437,12 +437,32 @@ def test_counts_compared_excludes_skips():
     assert c["verdict"] == "dethrone"
 
 
-def test_has_shadow_rows():
-    assert has_shadow_rows([{"intent_id": "o1", "shadow_score": "1"}]) is True
-    assert has_shadow_rows([{"intent_id": "o1", "shadow_score": None}]) is False
-    assert has_shadow_rows([{"intent_id": "o1", "score": 0.5}]) is False
-    assert has_shadow_rows([]) is False
-    assert has_shadow_rows(None) is False
+def test_has_raw_output_rows():
+    assert has_raw_output_rows([{"intent_id": "o1", "raw_output": "1"}]) is True
+    assert has_raw_output_rows([{"intent_id": "o1", "raw_output": None}]) is False
+    assert has_raw_output_rows([{"intent_id": "o1", "score": 0.5}]) is False
+    assert has_raw_output_rows([]) is False
+    assert has_raw_output_rows(None) is False
+
+
+def test_legacy_shadow_score_key_still_reads():
+    """Backward compat: rows persisted before the rename carry the legacy
+    ``shadow_score`` key; the reader must still pick them up (raw_output preferred,
+    shadow_score fallback) so a champion record or in-flight round written by older
+    code isn't silently treated as empty."""
+    # has_raw_output_rows accepts the legacy key.
+    assert has_raw_output_rows([{"intent_id": "o1", "shadow_score": "100"}]) is True
+    # And the full verdict reads legacy rows identically to current ``raw_output`` rows.
+    champ = [{"intent_id": "o1", "shadow_score": "100"}]
+    chal = [{"intent_id": "o1", "shadow_score": "120"}]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_wins"] == 1
+    assert res["scenarios_compared"] == 1
+    # New key wins when both are present (a migrated row that kept the stale key).
+    mixed = [{"intent_id": "o1", "raw_output": "120", "shadow_score": "100"}]
+    assert evaluate_relative_adoption(
+        [{"intent_id": "o1", "raw_output": "100"}], mixed,
+    )["n_wins"] == 1
 
 
 # ── relative_reason (display vocabulary) ──────────────────────────────────────

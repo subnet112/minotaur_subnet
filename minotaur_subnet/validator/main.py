@@ -44,12 +44,6 @@ from minotaur_subnet.shared.types import (
 # 2026-05-25: their only callers in this module (_handle_submit,
 # _handle_app_details, etc.) were deleted in the validator-surface cleanup.
 
-from minotaur_subnet.weight_policy import (
-    CHAMPION_MINER_WEIGHT_FLOOR,
-    ORDERS_FOR_FULL_EMISSION,
-    apply_champion_burn_ramp,
-    champion_miner_weight_fraction,
-)
 
 # Extracted modules
 from minotaur_subnet.validator.weight_policy import ChampionWeights
@@ -423,10 +417,6 @@ class AppIntentsValidator:
         self._block_loop_task: asyncio.Task | None = None
         # Champion miner tracking (set by git-based submission pipeline)
         self._champion_miner_id: str | None = None
-        # Live order-volume emission ramp signal (updated each emit; surfaced
-        # on /health). Floor share until the first emit measures order volume.
-        self._orders_24h: int = 0
-        self._miner_weight_fraction: float = CHAMPION_MINER_WEIGHT_FLOOR
 
         # ── Bittensor integration ────────────────────────────────────────
         self._metagraph_sync = None
@@ -1144,61 +1134,14 @@ class AppIntentsValidator:
                 continue
             epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights:
-                await self._do_emit(epoch_weights, source="burn_fallback")
-
-    def _orders_last_24h(self) -> int:
-        """Count orders that went through Minotaur in the trailing 24h.
-
-        Reads the local order store (the same store the order API writes to).
-        Any failure degrades to 0 — i.e. the conservative floor share — so a
-        store hiccup never inflates miner emission."""
-        store = getattr(self, "store", None)
-        if store is None or not hasattr(store, "count_orders_since"):
-            return 0
-        try:
-            return int(store.count_orders_since(time.time() - 86400.0))
-        except Exception as exc:
-            logger.warning("Could not count 24h orders for emission scaling: %s", exc)
-            return 0
-
-    def _scale_emission_by_order_volume(
-        self, mapping: dict[str, float]
-    ) -> dict[str, float]:
-        """Scale the aggregate miner share of an emission mapping by trailing-24h
-        order volume, the single chokepoint shared by both the queued (API) and
-        burn-fallback paths.
-
-        At 0 orders the miner share stays at the conservative floor (5%, the
-        incoming mappings are already built at the floor — this is a no-op); it
-        ramps linearly to 100% at ``ORDERS_FOR_FULL_EMISSION`` (5000) orders.
-        ``apply_champion_burn_ramp`` is idempotent in the fraction, so re-ramping
-        an already-floor-ramped mapping just re-targets the aggregate share while
-        preserving the relative split among miners and the owner burn target.
-
-        Pure-burn mappings (no champion → ``{owner: 1.0}``) and mappings with no
-        resolvable owner are returned unchanged: there is no miner share to ramp."""
-        if not mapping:
-            return mapping
-        orders = self._orders_last_24h()
-        fraction = champion_miner_weight_fraction(orders)
-        # Surface the live signal on /health and in logs for operators.
-        self._orders_24h = orders
-        self._miner_weight_fraction = fraction
-        if fraction <= CHAMPION_MINER_WEIGHT_FLOOR + 1e-12:
-            return mapping  # at the floor: incoming mapping is already correct
-        owner = (self.weights.owner_hotkey or "").strip()
-        if not owner or list(mapping.keys()) == [owner]:
-            return mapping  # nothing to ramp (no burn target / pure burn)
-        scaled = apply_champion_burn_ramp(
-            mapping, owner_hotkey=owner, miner_fraction=fraction
-        )
-        logger.info(
-            "Order-volume emission ramp: %d orders/24h → miners %.1f%% "
-            "(floor %.0f%%, full at %d orders)",
-            orders, fraction * 100, CHAMPION_MINER_WEIGHT_FLOOR * 100,
-            ORDERS_FOR_FULL_EMISSION,
-        )
-        return scaled
+                # Label the emit by what it actually does so /health last_emit.source agrees
+                # with emission_mode: "champion" when weighting a resolved champion (the
+                # 0.05/0.95 ramp), "burn" when champion is None (definitive owner burn). The
+                # old hardcoded "burn_fallback" mislabeled champion emits as burns.
+                await self._do_emit(
+                    epoch_weights,
+                    source="champion" if self._champion_miner_id else "burn",
+                )
 
     async def _do_emit(self, mapping: dict[str, float], *, source: str) -> None:
         """Actually call ``WeightsEmitter.emit_async`` + record + persist state.
@@ -1208,7 +1151,9 @@ class AppIntentsValidator:
         which input drove this emit (queued_from_api vs burn_fallback).
         """
         attempt_ts = time.time()
-        mapping = self._scale_emission_by_order_volume(mapping)
+        # The mapping already carries the fixed champion/owner split from
+        # build_bootstrap_or_champion_weights (CHAMPION_MINER_WEIGHT_FRACTION) —
+        # emit it as-is; there is no order-volume scaling.
         uids_attempted = len(mapping)
         try:
             success = await self._weights_emitter.emit_async(mapping)
@@ -1381,8 +1326,6 @@ class AppIntentsValidator:
             "last_emit": self._last_emit_state,
             "last_successful_emit": self._last_successful_emit_state,
             "orderbook": ob_stats,
-            "orders_24h": self._orders_24h,
-            "miner_weight_fraction": round(self._miner_weight_fraction, 4),
         })
 
     async def _handle_weights(self, request: web.Request) -> web.Response:

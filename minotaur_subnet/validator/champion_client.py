@@ -90,11 +90,15 @@ class ChampionResolver:
                 self._memo_at = now
             return (hotkey, "api")
         except Exception as exc:  # noqa: BLE001 — transient API/transport error
+            # %r, NOT %s: the common failures here are connection-level aiohttp
+            # exceptions (TimeoutError, ServerDisconnectedError, ClientConnectorError)
+            # whose str() is EMPTY — %s logged a useless "champion API read failed ()"
+            # that hid the real cause. %r surfaces the exception type + repr.
             if self._memo_at is not None and (now - self._memo_at) <= self._memo_ttl:
                 logger.warning(
-                    "champion API read failed (%s); using last-known-good (age %.0fs)",
+                    "champion API read failed (%r); using last-known-good (age %.0fs)",
                     exc, now - self._memo_at,
                 )
                 return (self._memo_hotkey, "memo")
-            logger.warning("champion API read failed (%s); no fresh memo -> no champion", exc)
+            logger.warning("champion API read failed (%r); no fresh memo -> no champion", exc)
             return (None, "none")

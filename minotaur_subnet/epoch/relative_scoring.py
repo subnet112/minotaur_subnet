@@ -19,11 +19,14 @@ leader (``EpochManager._meets_adoption_criteria``) and every follower
 adoption decision is fleet-uniform by construction. The per-order RAW output is
 sourced from the LIVE scorer's ``metadata.raw_output`` (the raw-output scorer an
 operator PUTs into the live ``js_code`` slot at cutover), threaded onto
-``BenchmarkResult.shadow_score`` / ``per_intent[*].shadow_score`` (field name kept
-to avoid rippling the API counts shape).
+``BenchmarkResult.raw_output`` / ``per_intent[*].raw_output``. (Historically this
+field was misnamed ``shadow_score`` after the observe-only shadow scorer it came
+from; the shadow scorer is gone, so the field now matches the value it carries.
+Reads still accept the legacy ``shadow_score`` key for rows persisted before the
+rename — see :func:`_raw_output`.)
 
 This module is PURE: a stateless decision function over result objects, duck-typed
-on ``intent_id`` / ``shadow_score`` (no imports from the heavy harness path), so it
+on ``intent_id`` / ``raw_output`` (no imports from the heavy harness path), so it
 stays trivially testable and import-light.
 """
 
@@ -81,9 +84,9 @@ DETHRONE_WIN_MARGIN = 1
 # Basis-points denominator for the cross-multiplied comparison.
 _BPS = 10000
 
-# A per-order shadow output at/below this (EXACT integer wei) is treated as "no
+# A per-order raw output at/below this (EXACT integer wei) is treated as "no
 # value delivered" (the order produced nothing for the receiver — a champion
-# blind spot or a challenger drop). 0 because the raw-output shadow JS returns
+# blind spot or a challenger drop). 0 because the raw-output scorer JS returns
 # "0" for a below-min / no-output order.
 MIN_VALID_OUTPUT = 0
 
@@ -105,10 +108,23 @@ def _field(item: Any, name: str) -> Any:
     return getattr(item, name, None)
 
 
-def _parse_output(score: Any) -> int | None:
-    """Parse a per-order shadow output into EXACT integer wei.
+def _raw_output(item: Any) -> Any:
+    """Read a per-order RAW delivered output off a result row.
 
-    The canonical carrier is a decimal STRING (the raw-output shadow JS emits
+    Prefers the current ``raw_output`` field; falls back to the legacy
+    ``shadow_score`` key/attr for rows persisted (or benched) before the rename, so
+    a champion record or in-flight round written by older code still reads. The
+    fallback can be dropped once all persisted ``benchmark_details`` have cycled."""
+    v = _field(item, "raw_output")
+    if v is None:
+        v = _field(item, "shadow_score")
+    return v
+
+
+def _parse_output(score: Any) -> int | None:
+    """Parse a per-order raw output into EXACT integer wei.
+
+    The canonical carrier is a decimal STRING (the raw-output scorer JS emits
     ``BigInt(...).toString()``), parsed with ``int(...)`` so amounts above 2^53
     keep full precision — no ``float`` anywhere in the decision path. Returns
     ``None`` for ``None`` / ``""`` / non-integer garbage so a bad row is treated
@@ -160,7 +176,7 @@ def evaluate_relative_adoption(
     """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
     Joins champion and challenger results by ``intent_id`` and, for each order,
-    compares the RAW delivered output (``shadow_score``, an exact decimal wei
+    compares the RAW delivered output (``raw_output``, an exact decimal wei
     STRING) as INTEGER wei. The verdict cross-multiplies the BPS band so there is
     no ``float`` in the decision and no rounding at the boundary:
 
@@ -197,12 +213,12 @@ def evaluate_relative_adoption(
     for r in champion_results or []:
         iid = _field(r, "intent_id")
         if iid is not None:
-            champ_by[iid] = _field(r, "shadow_score")
+            champ_by[iid] = _raw_output(r)
     chal_by: dict[str, Any] = {}
     for r in challenger_results or []:
         iid = _field(r, "intent_id")
         if iid is not None:
-            chal_by[iid] = _field(r, "shadow_score")
+            chal_by[iid] = _raw_output(r)
 
     per_order: list[dict[str, Any]] = []
     n_wins = n_regressions = n_blind_spots = n_matched = 0
@@ -355,14 +371,15 @@ def relative_counts(
     }
 
 
-def has_shadow_rows(rows: list[Any] | None) -> bool:
-    """True when at least one per-order row carries a non-None ``shadow_score``.
+def has_raw_output_rows(rows: list[Any] | None) -> bool:
+    """True when at least one per-order row carries a non-None raw output.
 
-    Used to gate the relative block: a submission benched BEFORE the shadow path
-    existed has no ``shadow_score`` rows, so it gets no relative block (rather than
-    a misleading all-skip one).
+    Used to gate the relative block: a submission benched BEFORE the raw-output
+    scorer existed has no raw output on any row, so it gets no relative block
+    (rather than a misleading all-skip one). Accepts the legacy ``shadow_score``
+    key via :func:`_raw_output` for rows persisted before the rename.
     """
-    return any(_field(r, "shadow_score") is not None for r in rows or [])
+    return any(_raw_output(r) is not None for r in rows or [])
 
 
 def relative_reason(

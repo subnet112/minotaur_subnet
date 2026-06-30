@@ -59,7 +59,7 @@ def _candidate():
 
 def _results(pairs):
     """Per-order BenchmarkResults carrying intent_id + RAW output (decimal str)."""
-    return [BenchmarkResult(intent_id=iid, shadow_score=sc) for iid, sc in pairs]
+    return [BenchmarkResult(intent_id=iid, raw_output=sc) for iid, sc in pairs]
 
 
 async def _run_dissent(

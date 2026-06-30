@@ -133,7 +133,7 @@ def _make_submission(
         benchmark_details={
             "total_intents": 5,
             # The relative per-order rule decides adoption on the RAW delivered
-            # output (shadow_score), not the aggregate score. Derive a single
+            # output (raw_output), not the aggregate score. Derive a single
             # proportional order from `score` so a higher-scoring challenger WINS,
             # an equal one MATCHES, and a lower one REGRESSES — the same ordering
             # these fixtures relied on under the legacy aggregate rule.
@@ -141,7 +141,7 @@ def _make_submission(
                 {
                     "intent_id": "o1",
                     "score": score,
-                    "shadow_score": str(int(round(score * 1_000_000))),
+                    "raw_output": str(int(round(score * 1_000_000))),
                 },
             ],
         },
@@ -242,6 +242,27 @@ class TestEpochManager:
         assert mgr.champion.submission_id == "sub_1"
         assert mgr.champion.benchmark_score == 0.85
         assert mgr.champion.epoch_adopted == 1
+
+    def test_finalist_tiebreak_is_deterministic_not_insertion_order(self):
+        """On a TRUE benchmark-score tie the finalist is chosen by a deterministic,
+        content-addressed key (image_id, then submission_id) — NOT the submissions'
+        local-clock insertion order — so every validator (and a failed-over leader)
+        nominates the SAME finalist for the same tie. Guards consensus determinism."""
+        mgr = EpochManager(
+            block_loop=_make_mock_block_loop(),
+            submission_store=_make_store_with_subs(),
+        )
+        a = _make_submission(submission_id="sub_aaa", score=0.952)
+        b = _make_submission(submission_id="sub_bbb", score=0.952)
+        c = _make_submission(submission_id="sub_ccc", score=0.952)
+        # Deterministic ascending (image_id, submission_id): aaa < bbb < ccc, regardless
+        # of the order the (equally-scored) submissions arrive in.
+        for order in ([a, b, c], [c, b, a], [b, c, a], [c, a, b]):
+            ranked = mgr._eligible_candidates(list(order))
+            assert [s.submission_id for s in ranked] == ["sub_aaa", "sub_bbb", "sub_ccc"]
+        # A strictly higher score still wins outright (primary key unchanged).
+        top = _make_submission(submission_id="sub_zzz", score=0.99)
+        assert mgr._eligible_candidates([a, top, b])[0].submission_id == "sub_zzz"
 
     @pytest.mark.asyncio
     async def test_no_submissions_keeps_current(self):
@@ -801,13 +822,13 @@ class TestEpochManager:
         is left untouched, and a competitor without shadow rows is skipped."""
         champ = _make_submission(submission_id="champ", round_id="round-e1-n0")
         champ.benchmark_details = {"per_intent": [
-            {"intent_id": "o1", "shadow_score": "100"},
-            {"intent_id": "o2", "shadow_score": "200"},
+            {"intent_id": "o1", "raw_output": "100"},
+            {"intent_id": "o2", "raw_output": "200"},
         ]}
         chal = _make_submission(submission_id="chal", round_id="round-e1-n1")
         chal.benchmark_details = {"per_intent": [
-            {"intent_id": "o1", "shadow_score": "120"},
-            {"intent_id": "o2", "shadow_score": "250"},
+            {"intent_id": "o1", "raw_output": "120"},
+            {"intent_id": "o2", "raw_output": "250"},
         ]}
         # No shadow rows → must be skipped (no relative block written).
         no_shadow = _make_submission(submission_id="noshadow", round_id="round-e1-n1")
@@ -1155,7 +1176,7 @@ class TestWeightEmission:
 
     @pytest.mark.asyncio
     async def test_weights_winner_takes_all(self, monkeypatch):
-        """Winner-takes-all: ONLY the adopted champion earns weight (0.05), 0.95
+        """Winner-takes-all: ONLY the adopted champion earns weight (0.10), 0.90
         burns to owner — there is NO exponential-decay tail to other scored
         submissions. (Replaces the old decay-tail behavior.)"""
         sub1 = _make_submission(
@@ -1192,9 +1213,9 @@ class TestWeightEmission:
         assert "5Gminer_best" in mapping
         assert "5Gminer_mid" not in mapping
         assert "5Gminer_low" not in mapping
-        # 0.05 to the champion, 0.95 burns to owner.
-        assert mapping["5Gminer_best"] == pytest.approx(0.05)
-        assert mapping[owner] == pytest.approx(0.95)
+        # 0.10 to the champion, 0.90 burns to owner.
+        assert mapping["5Gminer_best"] == pytest.approx(0.10)
+        assert mapping[owner] == pytest.approx(0.90)
 
     @pytest.mark.asyncio
     async def test_no_champion_burns_to_owner(self, monkeypatch):

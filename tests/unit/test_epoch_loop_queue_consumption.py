@@ -62,10 +62,6 @@ def _make_stub(*, queued=None, queued_source=None, burn_returns=None):
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,
     )
-    # The order-volume ramp runs inside _do_emit; stub it to a passthrough so
-    # these queue/burn-priority tests see the mapping unchanged. The ramp's own
-    # behavior is covered in test_weight_policy.
-    self_stub._scale_emission_by_order_volume = lambda mapping: mapping
     return self_stub
 
 
@@ -166,7 +162,7 @@ async def test_burn_fires_when_queue_empty():
     await _run_n_iterations(self_stub, 1)
 
     self_stub._weights_emitter.emit_async.assert_awaited_once_with(burn)
-    assert self_stub._last_emit_state["source"] == "burn_fallback"
+    assert self_stub._last_emit_state["source"] == "burn"
 
 
 @pytest.mark.asyncio
@@ -241,7 +237,7 @@ async def test_queue_emit_failure_does_not_re_queue():
 
     # last_emit on tick 2 (the most recent) is the burn success.
     assert self_stub._last_emit_state["result"] == "ok"
-    assert self_stub._last_emit_state["source"] == "burn_fallback"
+    assert self_stub._last_emit_state["source"] == "burn"
 
 
 @pytest.mark.asyncio
