@@ -283,9 +283,36 @@ def attest_champion_on_chain(
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
 
         if receipt["status"] != 1:
+            # Surface the on-chain revert reason rather than failing silently.
+            # A mined-but-reverted tx carries no reason in the receipt, so
+            # re-execute it at its (reverted) block — web3 raises with the
+            # require() string. Best-effort: never let the diagnostic itself throw.
+            revert_reason = "unknown (could not re-call)"
+            try:
+                w3.eth.call(
+                    {
+                        "from": tx["from"],
+                        "to": tx["to"],
+                        "data": tx["data"],
+                        "value": tx.get("value", 0),
+                    },
+                    block_identifier=receipt["blockNumber"],
+                )
+            except Exception as call_exc:  # noqa: BLE001 — best-effort diagnostic
+                revert_reason = str(call_exc)
+            hint = ""
+            if "Nonce not increasing" in revert_reason:
+                hint = (
+                    " — a champion nonce <= the on-chain per-signer high-water "
+                    "(lastNonce). Usually a BACKWARD wall-clock movement on the "
+                    "proposing leader (NTP step / VM migration / restart onto a "
+                    "skewed host). The off-chain floor (_floor_champion_nonce) "
+                    "should prevent this; if it recurs, suspect the leader clock "
+                    "or its BT-EVM RPC read of lastNonce."
+                )
             logger.error(
-                "ChampionRegistry.certify() reverted: tx=%s",
-                tx_hash.hex(),
+                "ChampionRegistry.certify() reverted: tx=%s reason=%s nonces=%s%s",
+                tx_hash.hex(), revert_reason, nonces, hint,
             )
             return None
 
