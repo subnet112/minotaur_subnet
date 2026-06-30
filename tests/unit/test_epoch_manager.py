@@ -243,6 +243,27 @@ class TestEpochManager:
         assert mgr.champion.benchmark_score == 0.85
         assert mgr.champion.epoch_adopted == 1
 
+    def test_finalist_tiebreak_is_deterministic_not_insertion_order(self):
+        """On a TRUE benchmark-score tie the finalist is chosen by a deterministic,
+        content-addressed key (image_id, then submission_id) — NOT the submissions'
+        local-clock insertion order — so every validator (and a failed-over leader)
+        nominates the SAME finalist for the same tie. Guards consensus determinism."""
+        mgr = EpochManager(
+            block_loop=_make_mock_block_loop(),
+            submission_store=_make_store_with_subs(),
+        )
+        a = _make_submission(submission_id="sub_aaa", score=0.952)
+        b = _make_submission(submission_id="sub_bbb", score=0.952)
+        c = _make_submission(submission_id="sub_ccc", score=0.952)
+        # Deterministic ascending (image_id, submission_id): aaa < bbb < ccc, regardless
+        # of the order the (equally-scored) submissions arrive in.
+        for order in ([a, b, c], [c, b, a], [b, c, a], [c, a, b]):
+            ranked = mgr._eligible_candidates(list(order))
+            assert [s.submission_id for s in ranked] == ["sub_aaa", "sub_bbb", "sub_ccc"]
+        # A strictly higher score still wins outright (primary key unchanged).
+        top = _make_submission(submission_id="sub_zzz", score=0.99)
+        assert mgr._eligible_candidates([a, top, b])[0].submission_id == "sub_zzz"
+
     @pytest.mark.asyncio
     async def test_no_submissions_keeps_current(self):
         """Epoch with no submissions keeps the current solver."""

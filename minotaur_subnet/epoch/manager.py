@@ -1033,7 +1033,22 @@ class EpochManager:
                 submission.submission_id,
                 reason,
             )
-        eligible.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
+        # Rank by benchmark_score descending. On a TRUE exact-float tie, break it
+        # DETERMINISTICALLY by a content-addressed key (image digest, then the unique
+        # submission_id) instead of the incidental input order. The previous implicit
+        # break was the stable sort preserving list_by_round/_epoch order, which is the
+        # submissions' LOCAL-clock created_at — so two validators (or a failed-over
+        # leader) could order an exact tie differently and nominate a DIFFERENT finalist
+        # for the same round, diverging consensus. Negating the score keeps the primary
+        # ordering (highest first) while letting the tie-break sort ascending + stable
+        # and host-independent.
+        eligible.sort(
+            key=lambda s: (
+                -(s.benchmark_score or 0.0),
+                str(s.image_id or ""),
+                str(s.submission_id or ""),
+            )
+        )
         return eligible
 
     def _maybe_seed_genesis_incumbent(self) -> None:
