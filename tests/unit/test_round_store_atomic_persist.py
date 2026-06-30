@@ -11,6 +11,7 @@ reader always sees either the whole old file or the whole new one.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -63,18 +64,28 @@ def test_failed_replace_leaves_prior_file_intact(tmp_path: Path):
 
 
 def test_failed_write_cleans_up_temp(tmp_path: Path):
-    """An error during the temp write must not leave a stray temp file."""
+    """An error during the temp write must not leave a stray temp file. fsync is
+    the write-phase op (the temp is created by mkstemp, then written + fsync'd);
+    a failure there must still hit the finally that unlinks the temp."""
     p = tmp_path / "solver_rounds.json"
     store = RoundStore(persist_path=p)
 
-    real_open = open
-
-    def _boom_open(file, *args, **kwargs):
-        if str(file).endswith(".solver_rounds.json.tmp"):
-            raise OSError("no space")
-        return real_open(file, *args, **kwargs)
-
-    with patch("builtins.open", side_effect=_boom_open):
-        store.ensure_open_round(opened_epoch=5)  # _persist fails on the temp write
+    with patch.object(rs_mod.os, "fsync", side_effect=OSError("no space")):
+        store.ensure_open_round(opened_epoch=5)  # _persist fails on the temp fsync
 
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_persist_preserves_file_mode(tmp_path: Path):
+    """os.replace swaps the inode, so the temp's mode would otherwise win. mkstemp
+    creates the temp 0600; the persist must copy the target's existing mode so an
+    operator-set permission is not silently narrowed on every write."""
+    import stat as _stat
+
+    p = tmp_path / "solver_rounds.json"
+    store = RoundStore(persist_path=p)
+    store.ensure_open_round(opened_epoch=7)        # first persist creates the file
+    os.chmod(p, 0o640)                              # operator sets a restrictive mode
+    store.close_current_round(close_epoch=8)        # next persist replaces via mkstemp
+
+    assert _stat.S_IMODE(p.stat().st_mode) == 0o640  # preserved, not reset to 0600
