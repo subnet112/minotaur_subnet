@@ -23,7 +23,7 @@ def _winning_sub(sid: str = "sub_win", score: float = 0.99) -> Submission:
 
     Under the relative per-order rule a bootstrap adoption requires the challenger
     to deliver RAW output on at least one order, so carry a per_intent row with a
-    positive shadow_score (the raw delivered output the live scorer emits)."""
+    positive raw_output (the raw delivered output the live scorer emits)."""
     return Submission(
         submission_id=sid,
         repo_url="https://github.com/test/solver",
@@ -35,7 +35,7 @@ def _winning_sub(sid: str = "sub_win", score: float = 0.99) -> Submission:
         benchmark_score=score,
         benchmark_details={
             "total_intents": 5,
-            "per_intent": [{"intent_id": "o1", "shadow_score": "1000"}],
+            "per_intent": [{"intent_id": "o1", "raw_output": "1000"}],
         },
     )
 

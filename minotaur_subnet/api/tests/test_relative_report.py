@@ -3,8 +3,8 @@
 The relative rule is the sole adoption path, so the relative block + ``scoring_mode``
 are ALWAYS emitted (no flag). These tests pin: the report / round response / app
 status always carry ``scoring_mode == "relative"`` and the relative count block when
-both sides have shadow_score rows; the count block is gracefully omitted (no error)
-when either side lacks shadow_score rows.
+both sides have raw_output rows; the count block is gracefully omitted (no error)
+when either side lacks raw_output rows.
 """
 
 from __future__ import annotations
@@ -32,14 +32,14 @@ from minotaur_subnet.harness.round_store import RoundState, RoundStatus  # noqa:
 
 # ── fixtures / helpers ───────────────────────────────────────────────────────
 
-# shadow_score is an EXACT INTEGER DECIMAL STRING, not a float.
+# raw_output is an EXACT INTEGER DECIMAL STRING, not a float.
 _CHAMP_INTENT = [
-    {"intent_id": "o1", "score": 0.90, "shadow_score": "100"},
-    {"intent_id": "o2", "score": 0.80, "shadow_score": "200"},
+    {"intent_id": "o1", "score": 0.90, "raw_output": "100"},
+    {"intent_id": "o2", "score": 0.80, "raw_output": "200"},
 ]
 _CHAL_INTENT = [
-    {"intent_id": "o1", "score": 0.95, "shadow_score": "120"},
-    {"intent_id": "o2", "score": 0.85, "shadow_score": "250"},
+    {"intent_id": "o1", "score": 0.95, "raw_output": "120"},
+    {"intent_id": "o2", "score": 0.85, "raw_output": "250"},
 ]
 
 
@@ -122,7 +122,7 @@ def test_report_relative_is_stored_not_cross_fork_recompute():
 def test_report_no_stored_relative_omits_block():
     """No STORED relative block → the block is omitted (pending). There is NO
     cross-fork recompute against the champion record (that surface was removed),
-    so even with shadow_score rows on both sides the block stays absent."""
+    so even with raw_output rows on both sides the block stays absent."""
     rpt = _build_report(_sub(_CHAL_INTENT), {"per_intent": _CHAMP_INTENT})
     assert rpt["scoring_mode"] == "relative"  # mode always emitted (no flag)
     assert "relative" not in rpt             # no stored counts → graceful omit

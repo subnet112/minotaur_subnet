@@ -837,9 +837,9 @@ class AppIntentStore:
         """Return the number of orders created since ``cutoff_ts`` (Unix seconds).
 
         Counts every order that entered the system in the window — i.e. that
-        "went through" Minotaur — regardless of terminal status. Drives the
-        order-volume emission ramp (see ``champion_miner_weight_fraction``); the
-        ``created_at`` index keeps it a cheap COUNT even on a large orders table.
+        "went through" Minotaur — regardless of terminal status. A generic
+        order-throughput metric; the ``created_at`` index keeps it a cheap COUNT
+        even on a large orders table.
         """
         query = "SELECT COUNT(*) AS n FROM orders WHERE created_at > ?"
         params: list[Any] = [float(cutoff_ts)]

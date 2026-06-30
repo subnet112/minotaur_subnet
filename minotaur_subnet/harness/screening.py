@@ -227,6 +227,55 @@ def run_stage_1(repo_path: str) -> StageResult:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _solver_build_command(image_tag: str, repo_path: str) -> list[str]:
+    """``docker build`` argv for an UNTRUSTED, miner-submitted Dockerfile.
+
+    The build runs on the validator's SHARED host docker daemon — there is no
+    rootless / isolated builder (see issue #472; BuildKit can't run behind the
+    docker-socket-proxy, so buildx-only isolation is unavailable). These flags
+    bound what a malicious Dockerfile's ``RUN`` steps can consume on the host;
+    all are legacy-builder-compatible (plain ``POST /build`` params the proxy
+    allows). They do NOT contain a daemon/kernel escape — that needs the
+    isolated builder tracked in #472.
+
+    Tunable via env (conservative defaults):
+      ``SCREENING_BUILD_MEMORY``      RSS cap                 (default ``4g``)
+      ``SCREENING_BUILD_CPU_PERIOD``  CFS period, µs          (default ``100000``)
+      ``SCREENING_BUILD_CPU_QUOTA``   CFS quota, µs           (default ``200000`` = 2 CPUs)
+      ``SCREENING_BUILD_NOFILE``      open-fd ulimit (soft:hard) (default ``4096``)
+    """
+    memory = (os.environ.get("SCREENING_BUILD_MEMORY") or "4g").strip() or "4g"
+    cpu_period = (os.environ.get("SCREENING_BUILD_CPU_PERIOD") or "100000").strip() or "100000"
+    cpu_quota = (os.environ.get("SCREENING_BUILD_CPU_QUOTA") or "200000").strip() or "200000"
+    nofile = (os.environ.get("SCREENING_BUILD_NOFILE") or "4096").strip() or "4096"
+    return [
+        "docker", "build",
+        # RUN has no network — pip can't reach PyPI (anti-exfil / reproducibility);
+        # the base image carries the deps. The primary abuse guard.
+        "--network=none",
+        # The legacy layer cache hard-fails once a referenced base layer is GC'd
+        # (the #449 incident); skipping it is robust and cheap — only the solver's
+        # small layers rebuild — and avoids cross-submission cache poisoning.
+        "--no-cache",
+        # RSS cap on the untrusted build.
+        f"--memory={memory}",
+        # Cap total memory INCLUDING swap (== --memory disables the swap escape;
+        # without this, swap defaults to ~2x --memory).
+        f"--memory-swap={memory}",
+        # Bound build CPU so a crypto-mining / CPU-DoS RUN can't peg the validator
+        # host for the whole build_timeout window. quota/period = N CPUs.
+        f"--cpu-period={cpu_period}",
+        f"--cpu-quota={cpu_quota}",
+        # Cap open file descriptors per build process (cheap fd-exhaustion guard).
+        # NOTE: legacy `docker build` has no `--pids-limit`, so a fork bomb is only
+        # bounded by --cpu/--memory + build_timeout, not a hard pid cap — another
+        # reason for the isolated builder in #472.
+        "--ulimit", f"nofile={nofile}:{nofile}",
+        "-t", image_tag,
+        repo_path,
+    ]
+
+
 async def run_stage_2(
     repo_path: str,
     image_tag: str,
@@ -252,32 +301,12 @@ async def run_stage_2(
     """
     start = time.monotonic()
 
-    # Step 1: Build Docker image.
-    # Runs under BuildKit (the image ships docker-buildx-plugin + DOCKER_BUILDKIT=1);
-    # the legacy builder's layer cache hard-fails once a base layer is GC'd, which
-    # silently blocked every fresh submission build.
-    #   --network=none      RUN has no network — pip can't reach PyPI (anti-exfil /
-    #                       reproducibility); the base image carries the deps. This
-    #                       stays the primary abuse guard for untrusted Dockerfiles.
-    #   --provenance=false  Emit a plain single-platform image, NOT an attestation
-    #                       manifest-list, so `docker inspect {{.Id}}` and the
-    #                       run/entrypoint checks below behave exactly like before.
-    # NOTE: BuildKit does not support the legacy `--memory` flag, so the prior
-    # per-build 4 GB cap is dropped here. `--network=none` remains; a hard memory
-    # cap, if wanted, belongs in buildkitd worker config, not the build command.
-    build_cmd = [
-        "docker", "build",
-        "--network=none",
-        # --no-cache: the legacy layer cache hard-fails once a referenced base layer is
-        # GC'd (the #449 incident). Skipping it is robust; the base FROM stays in the image
-        # store, so only the solver's small layers rebuild — cheap.
-        "--no-cache",
-        # per-build memory cap on untrusted miner builds. The legacy builder supports it;
-        # BuildKit did not, which is why #449 had to drop the cap (#451). Restored here.
-        "--memory=4g",
-        "-t", image_tag,
-        repo_path,
-    ]
+    # Step 1: Build the untrusted miner image on the LEGACY builder (see build_env
+    # below for why BuildKit can't run in this container). The resource caps that
+    # bound what a malicious Dockerfile's RUN steps can consume on the shared host
+    # daemon live in _solver_build_command; issue #472 tracks the residual
+    # host-daemon (root-equivalent) risk and the rootless/isolated-builder follow-up.
+    build_cmd = _solver_build_command(image_tag, repo_path)
 
     # Force the LEGACY builder. BuildKit/buildx CANNOT run in this api container: it needs
     # docker-API session-upgrade calls the docker-socket-proxy forbids (HTTP 403) and writes

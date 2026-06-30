@@ -190,12 +190,13 @@ class BenchmarkResult:
     mock_simulation: bool = False  # True when scored with fabricated simulation data
     on_chain_score: int | None = None  # scoreIntent BPS (0-10000) from the simulation
     # RAW delivered output from the LIVE raw-output scorer's metadata.raw_output
-    # (relative_scoring; field name kept). An EXACT DECIMAL WEI STRING (not a float)
-    # so token amounts above 2^53 keep full precision end-to-end. None when the live
+    # (consumed by relative_scoring). An EXACT DECIMAL WEI STRING (not a float) so
+    # token amounts above 2^53 keep full precision end-to-end. None when the live
     # scorer emits no raw_output (pre-cutover scorer); "0" when the order delivered
     # nothing / fell below min. The per-order signal the relative adoption rule
-    # consumes; NEVER feeds the aggregate `score`.
-    shadow_score: str | None = None
+    # consumes; NEVER feeds the aggregate `score`. (Formerly ``shadow_score`` — the
+    # observe-only shadow scorer it was named after is gone.)
+    raw_output: str | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
@@ -1511,7 +1512,7 @@ async def _process_scenario(
                     # raw-output scorer's metadata.raw_output) to the returned
                     # ScoreResult; absent (pre-cutover scorer) -> stays None. The
                     # relative adoption rule consumes it; never affects br.score.
-                    br.shadow_score = getattr(score_result, "shadow_score", None)
+                    br.raw_output = getattr(score_result, "raw_output", None)
 
                     # Compute composite score for auto-triggered intents
                     if is_auto and br.trigger_decision is not None:
