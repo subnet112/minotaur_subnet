@@ -44,7 +44,6 @@ from minotaur_subnet.harness.round_store import (
 from minotaur_subnet.weight_policy import (
     GENESIS_EPOCH,
     GENESIS_HOTKEY,
-    apply_champion_burn_ramp,
     build_bootstrap_or_champion_weights,
     get_subnet_owner_hotkey,
     is_real_miner_hotkey,
@@ -1773,13 +1772,9 @@ class EpochManager:
         """Build a hotkey→weight mapping for emission policy.
 
         WINNER-TAKES-ALL, champion-only: 100% burn to the subnet owner before a
-        real miner-backed champion exists; once one does, the champion gets
-        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.05, the FLOOR) and 0.95 burns to the
-        owner. The validator daemon then scales this aggregate miner share ABOVE
-        the floor by trailing-24h order volume at emission time (see
-        ``_scale_emission_by_order_volume``); the mapping built here is the
-        conservative floor and the volume ramp is applied at the single emit
-        chokepoint that owns the order store.
+        real miner-backed champion exists; once one does, the champion gets a flat
+        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.10) and 0.90 burns to the owner. This
+        is a FIXED split — there is no order-volume scaling.
 
         Only ``self._champion`` — the submission that won AND was finalized
         (merge-gate passed → ``_hot_swap`` set it as the live champion) — is ever
