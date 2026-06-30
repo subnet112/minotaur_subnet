@@ -536,7 +536,12 @@ class AppIntentsValidator:
 
                 if wallet_name and hotkey_name:
                     try:
-                        self._bt_wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
+                        from minotaur_subnet.shared.bt_wallet import load_hotkey_wallet
+                        # Honour BT_WALLET_PATH and log an actionable diagnostic on
+                        # failure instead of a bare "wallet load failed" — the most
+                        # common cause is a mount the SDK's $HOME/.bittensor default
+                        # doesn't see, or one uid 1000 can't read.
+                        self._bt_wallet = load_hotkey_wallet(wallet_name, hotkey_name)
                         resolved_hotkey = self._bt_wallet.hotkey.ss58_address
                     except Exception as exc:
                         if not resolved_hotkey:
