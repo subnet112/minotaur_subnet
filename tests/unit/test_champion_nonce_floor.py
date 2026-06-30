@@ -224,3 +224,30 @@ def test_builder_does_not_refloor_on_override(monkeypatch):
     proposal = cc._build_champion_proposal_for_round(_round_state(), nonce_override=42)[0]
     assert floor_calls == []                # the load-bearing invariant
     assert proposal.nonce == 42             # verbatim passthrough, NOT floored to 99_999
+
+
+# ── the on-chain reader uses a BOUNDED request timeout ───────────────────────────
+#
+# read_champion_last_nonce runs inline on the API event loop. The floor is
+# fail-open on *exceptions*, but a hung RPC isn't an exception without a timeout —
+# it would stall the whole loop. Lock that the provider gets a bounded timeout.
+
+
+def test_read_champion_last_nonce_uses_bounded_timeout(monkeypatch):
+    from unittest.mock import MagicMock
+    from minotaur_subnet.consensus import protocol_config as pc
+
+    fake_w3 = MagicMock()
+    fake_w3.eth.contract.return_value.functions.lastNonce.return_value.call.return_value = 7
+
+    MockWeb3 = MagicMock()
+    MockWeb3.return_value = fake_w3
+    MockWeb3.to_checksum_address.side_effect = lambda a: a
+    monkeypatch.setattr(pc, "Web3", MockWeb3)
+
+    result = pc.read_champion_last_nonce("http://bt-evm:9944", "0xCHAMP", "0xSigner")
+
+    assert result == 7
+    _args, kwargs = MockWeb3.HTTPProvider.call_args
+    assert "request_kwargs" in kwargs
+    assert kwargs["request_kwargs"].get("timeout") == pc._NONCE_READ_TIMEOUT_SECONDS

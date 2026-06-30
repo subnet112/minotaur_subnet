@@ -126,6 +126,11 @@ _CHAMPION_REGISTRY_ABI = [
     },
 ]
 
+# Bound the inline lastNonce read so a hung BT-EVM RPC can't stall the API event
+# loop (the champion nonce floor is fail-open, but a hang isn't a catchable
+# error without a timeout). A few seconds is ample for a single view call.
+_NONCE_READ_TIMEOUT_SECONDS = 5.0
+
 _OVERRIDE_ENV = "QUORUM_BPS_OVERRIDE"
 
 
@@ -592,8 +597,16 @@ def read_champion_last_nonce(
     on-chain high-water (which would brick certification). ``champion_registry_
     address`` is the ChampionRegistry (``ProtocolConfig.quorum_address``), NOT
     the ValidatorRegistry — they are distinct contracts on BT EVM.
+
+    BOUNDED TIMEOUT: this is called inline from the synchronous champion-proposal
+    builder on the API event loop. A bounded request timeout guarantees a hung
+    BT-EVM RPC degrades to a catchable error (→ the floor's fail-open → bare
+    wall-clock nonce) in a few seconds instead of stalling the whole event loop
+    until the socket's default timeout.
     """
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = Web3(Web3.HTTPProvider(
+        rpc_url, request_kwargs={"timeout": _NONCE_READ_TIMEOUT_SECONDS},
+    ))
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(champion_registry_address),
         abi=_CHAMPION_REGISTRY_ABI,
