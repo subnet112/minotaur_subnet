@@ -1539,35 +1539,18 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     # detail + aggregate-vs-champion. Best-effort — never break /status on it.
     try:
         from .report import build_submission_report
-        from minotaur_subnet.epoch.adopt_rule import PER_APP_MIN_SCORE
-        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
-        champion_score: float | None = None
-        champ = get_round_store().get_active_champion()
-        if champ is not None and champ.submission_id:
-            champ_sub = store.get(champ.submission_id)
-            if champ_sub is not None:
-                champion_score = champ_sub.benchmark_score
-
-        # The report's absolute "too low" floor is the surviving per-app sanity
-        # floor (PER_APP_MIN_SCORE) — the absolute GLOBAL floor was purged. The
-        # dethrone bar (champion*(1+margin)) is computed inside the report as
-        # score_to_beat, which drives the "scored but didn't dethrone" outcome;
-        # keeping threshold distinct from it keeps both outcomes reachable.
-        threshold = PER_APP_MIN_SCORE
+        # The report is now purely the same-pin per-order ``relative`` block +
+        # verdict (the sole adoption path); the legacy aggregate-vs-champion
+        # scalars — and the champion-score / threshold / dethrone-margin lookups
+        # that fed them — were removed. See ``report.py`` module docstring.
         reason = d.get("rejection_reason")
         if not reason and sub.round_id:
             rs = get_round_store().get_round(sub.round_id)
             if rs is not None and getattr(rs, "abort_reason", None):
                 reason = rs.abort_reason
 
-        d["report"] = build_submission_report(
-            sub,
-            champion_score=champion_score,
-            threshold=threshold,
-            dethrone_margin=DETHRONE_MARGIN,
-            reason=reason,
-        )
+        d["report"] = build_submission_report(sub, reason=reason)
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)
         d["report"] = None
