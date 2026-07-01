@@ -539,7 +539,10 @@ def _render_report_body(
         )
 
         report = build_submission_report(submission, reason=reason, won=won)
-        if not report:
+        # Only enrich when there's real per-order detail to show; a screening or
+        # otherwise-empty (no stored ``relative`` block) report falls back to the
+        # concise reason message.
+        if not report or not report.get("relative"):
             return fallback
         md = render_report_md(report, submission_id=getattr(submission, "submission_id", None))
         return md or fallback

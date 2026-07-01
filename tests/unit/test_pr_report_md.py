@@ -38,8 +38,7 @@ def test_render_drops_aggregate_scalars():
     # scoring the JS `score` is a [0,1] validity sentinel, so a scalar is meaningless.
     assert render_report_md(None) == ""
     sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.7)
-    rep = build_submission_report(sub, champion_score=0.85, threshold=0.3,
-                                  dethrone_margin=0.05, reason="did not beat the champion")
+    rep = build_submission_report(sub, reason="did not beat the champion")
     md = render_report_md(rep, submission_id="sub_x")
     assert "**Your score:**" not in md and "**Champion:**" not in md
     assert "did not beat the champion" in md  # reason still shown in the header
@@ -50,8 +49,7 @@ def test_render_relative_summary_and_pipe_escaping():
     # markdown-escaped (pipes).
     rel = {"better": 2, "worse": 0, "matched": 1, "new": 0, "verdict": "a|b"}
     sub = _sub([{"intent_id": "a", "score": 0.9}], relative=rel)
-    rep = build_submission_report(sub, champion_score=None, threshold=0.3,
-                                  dethrone_margin=0.05, reason="r")
+    rep = build_submission_report(sub, reason="r")
     md = render_report_md(rep)
     assert "Per-order vs champion (same-pin)" in md
     assert "2 better" in md and "1 matched" in md
@@ -60,16 +58,14 @@ def test_render_relative_summary_and_pipe_escaping():
 
 def test_render_note_when_no_relative_block():
     sub = _sub([{"intent_id": "a", "score": 0.9}])  # no stored relative block
-    rep = build_submission_report(sub, champion_score=None, threshold=0.3,
-                                  dethrone_margin=0.05, reason="r")
+    rep = build_submission_report(sub, reason="r")
     md = render_report_md(rep)
     assert "`relative` block" in md  # points the miner at the status endpoint
 
 
 def test_render_adopted_header():
     sub = _sub([{"intent_id": "a", "score": 0.9}], status="adopted")
-    rep = build_submission_report(sub, champion_score=0.5, threshold=0.3,
-                                  dethrone_margin=0.05, reason=None)
+    rep = build_submission_report(sub, reason=None)
     assert "✅ Adopted as champion" in render_report_md(rep)
 
 
@@ -77,9 +73,7 @@ def test_build_and_render_won_header():
     # A scored finalist that BEAT the champion: won=True overrides the
     # score-derived outcome → "won", and renders the 🏆 win header (not ❌).
     sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
-    rep = build_submission_report(sub, champion_score=0.5, threshold=0.3,
-                                  dethrone_margin=0.05, reason="selected as finalist",
-                                  won=True)
+    rep = build_submission_report(sub, reason="selected as finalist", won=True)
     assert rep["outcome"] == "won"
     md = render_report_md(rep, submission_id="sub_x")
     assert "🏆 Beat the champion — selected as finalist" in md

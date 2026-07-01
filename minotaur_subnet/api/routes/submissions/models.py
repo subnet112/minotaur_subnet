@@ -131,7 +131,9 @@ class StatusResponse(BaseModel):
     benchmark_score: float | None = None
     benchmark_rank: int | None = None
     rejection_reason: str | None = None
-    # Feedback report (P1): per-case scores + aggregate-vs-champion + worst cases.
+    # Feedback report (P1): the same-pin per-order ``relative`` block (better /
+    # worse / matched / new + per-order deltas) and a verdict-derived outcome.
+    # The legacy aggregate-vs-champion scalars were removed (see report.py).
     # Present once benchmarked (or screening-rejected); None while in-flight.
     report: dict[str, Any] | None = None
 
