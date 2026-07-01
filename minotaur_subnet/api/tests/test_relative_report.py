@@ -26,7 +26,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from minotaur_subnet.api.routes.submissions import round_manager  # noqa: E402
 from minotaur_subnet.api.routes.submissions.models import SolverRoundResponse  # noqa: E402
-from minotaur_subnet.api.routes.submissions.report import build_submission_report  # noqa: E402
+from minotaur_subnet.api.routes.submissions.report import (  # noqa: E402
+    build_submission_report,
+    render_report_md,
+)
 from minotaur_subnet.harness.round_store import RoundState, RoundStatus  # noqa: E402
 
 
@@ -77,13 +80,9 @@ def _build_report(sub, champ_details=None):
     # surfaces (per_case / shadow_relative) were removed, so the only per-order
     # block is the submission's OWN stored same-pin ``relative``. The arg is kept
     # to narrate "even with a champion record present, there is no recompute".
-    return build_submission_report(
-        sub,
-        champion_score=0.9,
-        threshold=0.5,
-        dethrone_margin=0.01,
-        reason=None,
-    )
+    # No champion_score / threshold / dethrone_margin: the aggregate scalars they
+    # fed were removed — the report is now purely the per-order relative block.
+    return build_submission_report(sub, reason=None)
 
 
 # ── report.py: per-submission relative block (always on) ─────────────────────
@@ -99,8 +98,11 @@ def test_report_reads_stored_same_pin_counts():
     assert rpt["relative"]["better"] == 2
     assert rpt["relative"]["verdict"] == "dethrone"
     assert rpt["reason_relative"].startswith("adopted")
-    # Legacy aggregate scalar still present (additive).
-    assert rpt["aggregate"]["your_score"] == 0.9
+    # Outcome is derived from the per-order verdict (dethrone -> beat_champion),
+    # NOT a scalar comparison.
+    assert rpt["outcome"] == "beat_champion"
+    # Legacy aggregate scalars were REMOVED — the per-order block is the sole signal.
+    assert "aggregate" not in rpt
     # The cross-fork per-order surfaces (shadow_relative / per_case) were removed.
     assert "shadow_relative" not in rpt
     assert "per_case" not in rpt
@@ -127,6 +129,65 @@ def test_report_no_stored_relative_omits_block():
     assert rpt["scoring_mode"] == "relative"  # mode always emitted (no flag)
     assert "relative" not in rpt             # no stored counts → graceful omit
     assert "reason_relative" not in rpt
+
+
+def test_report_no_aggregate_scalars_ever():
+    """The aggregate scalar block (your_score / champion_score / score_to_beat /
+    gap / dethrone_margin) is gone from every report shape."""
+    for rel in (_STORED_DETHRONE, _STORED_MATCHED, None):
+        rpt = _build_report(_sub(_CHAL_INTENT, relative=rel))
+        assert "aggregate" not in rpt
+        for legacy in ("your_score", "champion_score", "score_to_beat", "gap", "dethrone_margin"):
+            assert legacy not in rpt
+
+
+def test_outcome_from_per_order_verdict():
+    """Outcome is derived from the per-order verdict, not a scalar."""
+    matched = {**_STORED_MATCHED}
+    assert _build_report(_sub(_CHAL_INTENT, relative=matched))["outcome"] == "matched"
+    worse = {"better": 0, "worse": 1, "matched": 1, "new": 0, "compared": 2,
+             "verdict": "worse", "per_order": [], "round_id": "r"}
+    assert _build_report(_sub(_CHAL_INTENT, relative=worse))["outcome"] == "regressed"
+
+
+# ── render_report_md: per-order breakdown (the miner-facing signal) ───────────
+
+
+def test_render_lists_differing_orders_worse_first():
+    """The markdown surfaces the specific orders that differ from the champion —
+    worse rows first (where to improve) — with signed % deltas, and NO scalar line."""
+    rel = {
+        "better": 1, "worse": 1, "matched": 1, "new": 0, "compared": 3,
+        "verdict": "worse", "round_id": "r",
+        "per_order": [
+            {"intent_id": "app:WETH_to_DAI", "champ": "100", "chal": "98",
+             "ratio": 0.98, "verdict": "worse"},
+            {"intent_id": "app:USDC_to_WETH", "champ": "100", "chal": "103",
+             "ratio": 1.03, "verdict": "better"},
+            {"intent_id": "app:DAI_to_USDC", "champ": "100", "chal": "100",
+             "ratio": 1.0, "verdict": "matched"},
+        ],
+    }
+    md = render_report_md(build_submission_report(_sub(_CHAL_INTENT, relative=rel), reason=None),
+                          submission_id="sub-1")
+    # No legacy scalar line.
+    assert "Your score" not in md and "score_to_beat" not in md
+    # Per-order counts summary present.
+    assert "1 better · 1 worse · 1 matched" in md
+    # Both differing orders rendered with signed deltas; the matched one is NOT in the table.
+    assert "app:WETH_to_DAI" in md and "-2.00%" in md
+    assert "app:USDC_to_WETH" in md and "+3.00%" in md
+    # Worse row comes before the better row (optimize-this ordering).
+    assert md.index("app:WETH_to_DAI") < md.index("app:USDC_to_WETH")
+
+
+def test_render_all_matched_gives_guidance():
+    """When every order ties the champion, the miner is told they need a strictly
+    better route on at least one order (no empty table)."""
+    md = render_report_md(build_submission_report(
+        _sub(_CHAL_INTENT, relative=_STORED_MATCHED), reason=None))
+    assert "Identical output to the champion" in md
+    assert "strictly better route" in md
 
 
 # ── round response: finalist relative block (always on) ──────────────────────

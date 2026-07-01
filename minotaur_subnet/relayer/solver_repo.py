@@ -515,16 +515,19 @@ def delete_candidate_image(pr_number: int) -> bool:
 def _render_report_body(
     submission: Any,
     reason: str,
-    champion_score: float | None,
-    dethrone_margin: float | None,
+    champion_score: float | None = None,   # retained for call-site compat; unused
+    dethrone_margin: float | None = None,  # (report is now per-order only)
     *,
     won: bool = False,
 ) -> str:
-    """PR-comment body for a champion-consensus outcome: the full scored benchmark
-    report when the submission was benchmarked (the aggregate-vs-champion scalars
-    plus the same-pin per-order ``relative`` count summary), else the concise
+    """PR-comment body for a champion-consensus outcome: the same-pin per-order
+    ``relative`` report when the submission was benchmarked, else the concise
     reason. ``won=True`` renders it as a win (header + fallback), otherwise as a
-    rejection. Never raises."""
+    rejection. Never raises.
+
+    ``champion_score`` / ``dethrone_margin`` are accepted for call-site
+    compatibility but no longer used — the report dropped the aggregate scalars
+    they fed (see ``report.py`` module docstring)."""
     fallback = (
         f"### 🏆 Beat the champion\n\n{reason}" if won
         else f"### ❌ Submission rejected\n\n{reason}"
@@ -534,23 +537,9 @@ def _render_report_body(
             build_submission_report,
             render_report_md,
         )
-        from minotaur_subnet.epoch.adopt_rule import PER_APP_MIN_SCORE
-        from minotaur_subnet.epoch.manager import DETHRONE_MARGIN
 
-        report = build_submission_report(
-            submission,
-            champion_score=champion_score,
-            threshold=PER_APP_MIN_SCORE,
-            dethrone_margin=(dethrone_margin if dethrone_margin is not None else DETHRONE_MARGIN),
-            reason=reason,
-            won=won,
-        )
+        report = build_submission_report(submission, reason=reason, won=won)
         if not report:
-            return fallback
-        # Only enrich when there's real benchmark detail to show; a screening or
-        # otherwise-empty report falls back to the concise message.
-        agg = report.get("aggregate") or {}
-        if not (agg.get("your_score") is not None or report.get("relative")):
             return fallback
         md = render_report_md(report, submission_id=getattr(submission, "submission_id", None))
         return md or fallback
