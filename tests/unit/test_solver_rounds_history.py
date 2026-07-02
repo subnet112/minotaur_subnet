@@ -134,3 +134,16 @@ def test_summary_activated_falls_back_to_finalist_when_no_certificate():
         "finalist_submission_id": "sub_y", "created_at": 100.0,
     })
     assert s.adopted is True and s.adopted_submission_id == "sub_y"
+
+
+def test_summary_exposes_effective_at_wall_clock():
+    from minotaur_subnet.epoch.clock import EPOCH_SECONDS
+
+    s = _round_summary_from_dict({
+        "round_id": "r5", "status": "certified", "opened_epoch": 29716481,
+        "effective_epoch": 29716525, "created_at": 100.0,
+    })
+    assert s.effective_at == 29716525 * EPOCH_SECONDS
+    # No effective epoch yet (open round) -> no fabricated timestamp.
+    s_open = _round_summary_from_dict({"round_id": "r6", "status": "open", "created_at": 100.0})
+    assert s_open.effective_at is None

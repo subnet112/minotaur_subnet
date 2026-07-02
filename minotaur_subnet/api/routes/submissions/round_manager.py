@@ -271,6 +271,22 @@ def _round_relative_extra(state: RoundState) -> dict[str, Any]:
         return {}
 
 
+def epoch_start_ts(epoch: int | None) -> float | None:
+    """Unix seconds at which a solver-round epoch begins — PURE.
+
+    Round epochs are wall-clock buckets of the fixed ``EPOCH_SECONDS`` protocol
+    constant (``epoch = unix // EPOCH_SECONDS``; the coordinator forces
+    time-based mode, see ``startup._current_solver_round_epoch``), so the
+    boundary timestamp is exactly ``epoch * EPOCH_SECONDS``. Lets API consumers
+    render "activates at" / "deadline at" without hardcoding the epoch width.
+    """
+    if epoch is None:
+        return None
+    from minotaur_subnet.epoch.clock import EPOCH_SECONDS
+
+    return float(int(epoch) * EPOCH_SECONDS)
+
+
 def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
     certificate = state.certificate
     return SolverRoundResponse(
@@ -286,10 +302,12 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         committee_hash=state.committee_hash,
         quorum_required=state.quorum_required,
         decision_deadline_epoch=state.decision_deadline_epoch,
+        decision_deadline_at=epoch_start_ts(state.decision_deadline_epoch),
         finalist_submission_id=state.finalist_submission_id,
         finalist_image_id=state.finalist_image_id,
         shadow_case_log_hash=state.shadow_case_log_hash,
         effective_epoch=state.effective_epoch,
+        effective_at=epoch_start_ts(state.effective_epoch),
         abort_reason=state.abort_reason,
         certificate_candidate_submission_id=(
             certificate.candidate_submission_id if certificate else None
