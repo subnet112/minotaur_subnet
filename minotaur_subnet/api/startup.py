@@ -2831,6 +2831,14 @@ async def initialize(ctx: ServerContext) -> dict:
                                         _abort_sync_payload(processed_round),
                                         label="abort",
                                     )
+                            # A DEFERRED evaluation (in-flight submissions still scoring)
+                            # leaves the round REPLAYING and evaluate_round a no-op. Sleep
+                            # before re-evaluating so we don't busy-spin at full CPU — which
+                            # STARVES the benchmark worker that scores those submissions,
+                            # self-perpetuating the loop and pinning the api unhealthy with
+                            # no champion ever selected (incident 2026-07-02).
+                            if summary.get("status_after") == RoundStatus.REPLAYING.value:
+                                await asyncio.sleep(solver_round_poll_interval)
                             continue
 
                         if current is not None and await _maybe_certify_round(current):
