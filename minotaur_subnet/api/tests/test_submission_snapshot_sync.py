@@ -207,6 +207,41 @@ def test_sync_close_skips_upsert_when_already_closed(monkeypatch):
     assert calls["upsert"] == 0  # idempotency check ran BEFORE any upsert
 
 
+def test_sync_close_force_heals_snapshot_when_already_closed(monkeypatch):
+    """A FORCED close (champion re-attest) on an already-closed round re-upserts
+    the snapshot — healing a follower that adopted the round shell but missed the
+    original snapshot (down/mid-restart at first close). Without this the re-attest
+    lever is a no-op for exactly that stuck state: certify-prepare can't find the
+    candidate, the round never leaves CLOSED, and every re-attest 409s (observed
+    fleet-wide 2026-07-02, round-e29716562-n1). The round FSM must stay untouched."""
+    calls = {"upsert": 0}
+    fake_store = SimpleNamespace(
+        upsert_submissions=lambda recs: calls.__setitem__("upsert", len(recs)) or len(recs))
+    closed_round = SimpleNamespace(status=RoundStatus.CLOSED)
+    monkeypatch.setattr(rm, "get_store", lambda: fake_store)
+    monkeypatch.setattr(rm, "get_round_store", lambda: SimpleNamespace(get_round=lambda rid: closed_round))
+    monkeypatch.setattr(rm, "_close_solver_round_state", lambda body: (_ for _ in ()).throw(AssertionError("should not close")))
+
+    body = CloseRoundRequest(round_id="rr", close_epoch=100, force=True,
+                             submissions=[{"submission_id": "sub_x"}])
+    out = rm._sync_close_solver_round_state(body)
+    assert out is closed_round  # FSM untouched — still the early return
+    assert calls["upsert"] == 1  # but the snapshot was healed
+
+
+def test_sync_close_force_without_snapshot_stays_noop(monkeypatch):
+    """Force with NO submissions payload changes nothing (no upsert, no close)."""
+    fake_store = SimpleNamespace(
+        upsert_submissions=lambda recs: (_ for _ in ()).throw(AssertionError("no upsert expected")))
+    closed_round = SimpleNamespace(status=RoundStatus.CLOSED)
+    monkeypatch.setattr(rm, "get_store", lambda: fake_store)
+    monkeypatch.setattr(rm, "get_round_store", lambda: SimpleNamespace(get_round=lambda rid: closed_round))
+    monkeypatch.setattr(rm, "_close_solver_round_state", lambda body: (_ for _ in ()).throw(AssertionError("should not close")))
+
+    body = CloseRoundRequest(round_id="rr", close_epoch=100, force=True)
+    assert rm._sync_close_solver_round_state(body) is closed_round
+
+
 def test_sync_close_upserts_on_first_close(monkeypatch):
     """First close (round OPEN / unknown) mirrors the snapshot, then closes."""
     calls = {"upsert": 0, "closed": False}
