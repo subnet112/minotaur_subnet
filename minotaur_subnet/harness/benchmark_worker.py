@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -188,18 +190,21 @@ def _consolidate_champion_bench() -> bool:
     """Whether to MEMOIZE the champion benchmark within a round so the two
     champion-run paths (dethrone re-bench in ``_refresh_incumbent_score`` and the
     trustless quorum verdict in ``_independent_adopt_vote``) share ONE result
-    instead of each re-running the champion solver. **DEFAULT OFF.**
+    instead of each re-running the champion solver. **DEFAULT ON**
+    (``CONSOLIDATE_CHAMPION_BENCH=0`` disables).
 
     Pure compute optimization: a cached result is reused ONLY when round_id +
     champion image + fork block + corpus fingerprint + real-sim mode all match,
     so a hit is provably the SAME deterministic computation — the verdict and the
-    persisted score are byte-identical to recomputing. Flag-gated so the saving
-    can be enabled + validated separately. Off → both paths recompute (legacy).
+    persisted score are byte-identical to recomputing. Shipped default-off for
+    separate validation, but the flag was never actually set in production
+    (audited on the leader 2026-07-02), so every round paid the redundant
+    champion run — now default-on with the env as the kill switch.
     """
     import os
 
-    return os.environ.get("CONSOLIDATE_CHAMPION_BENCH", "").strip().lower() in (
-        "1", "true", "yes", "on",
+    return os.environ.get("CONSOLIDATE_CHAMPION_BENCH", "1").strip().lower() not in (
+        "0", "false", "no", "off",
     )
 
 
@@ -216,6 +221,38 @@ _CHAMPION_BENCH_CACHE_MAX = 32  # hard backstop; normally holds only the current
 def _clear_champion_bench_cache() -> None:
     """Reset the process-wide champion-bench memo (test hook / operational reset)."""
     _CHAMPION_BENCH_CACHE.clear()
+
+
+def _refquote_checkpoint_enabled() -> bool:
+    """Whether the reference-quote pre-pass is checkpointed (memory + /data).
+
+    Default ON; ``BENCHMARK_REFQUOTE_CHECKPOINT=0`` disables (recompute every
+    pass — the pre-#496 behavior).
+    """
+    import os
+
+    return os.environ.get("BENCHMARK_REFQUOTE_CHECKPOINT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+# PROCESS-WIDE reference-quote memo, same sharing rationale as the champion
+# memo above (fresh BenchmarkWorker instances must share it). Additionally
+# PERSISTED next to the submission store (/data) so an api restart resumes the
+# round with the SAME reference quotes instead of re-running the champion
+# pre-pass — both a rework saving (the pre-pass ran ~3x/round: once per
+# run_once pass as submissions trickle in, once per incumbent re-score) and a
+# within-round consistency improvement (every challenger in the round is graded
+# against ONE reference set, not whichever pass happened to produce it).
+_REFERENCE_QUOTES_CACHE: dict[str, dict] = {}
+_REFERENCE_QUOTES_CACHE_MAX = 8
+_REFQUOTE_CHECKPOINT_FILENAME = "refquote_checkpoints.json"
+_REFQUOTE_CHECKPOINT_KEEP = 4  # last N keys on disk (a round has 1; margin for overlap)
+
+
+def _clear_reference_quotes_cache() -> None:
+    """Reset the process-wide reference-quote memo (test hook)."""
+    _REFERENCE_QUOTES_CACHE.clear()
 
 
 class BenchmarkWorker:
@@ -642,7 +679,7 @@ class BenchmarkWorker:
         # (CoW quoted_output etc.) to the champion solver so every challenger is
         # graded against the same reference output. Falls back to per-submission
         # self-quoting when no champion is available (still fixes the revert).
-        reference_quotes = await self._build_reference_quotes(intents)
+        reference_quotes = await self._get_or_build_reference_quotes(intents)
 
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
@@ -795,7 +832,7 @@ class BenchmarkWorker:
                         intents.extend(historical)
                 except Exception as exc:
                     logger.warning("[%s] historical load failed: %s", context, exc)
-        reference_quotes = await self._build_reference_quotes(intents)
+        reference_quotes = await self._get_or_build_reference_quotes(intents)
 
         logger.info("[%s] scoring image %s via challenger path (%d intents)", context, image_tag, len(intents))
         results = await self._benchmark_submission(
@@ -1545,6 +1582,116 @@ class BenchmarkWorker:
         except Exception:  # observe-only — must never break
             pass
         return vote
+    def _refquote_checkpoint_path(self) -> Path | None:
+        """The on-disk checkpoint file, colocated with the submission store
+        (which already defaults onto the /data volume — #430), or None when the
+        store is memory-only (tests/dev)."""
+        p = getattr(self._sub_store, "_persist_path", None)
+        return p.with_name(_REFQUOTE_CHECKPOINT_FILENAME) if p is not None else None
+
+    def _refquote_checkpoint_key(
+        self, intents: list, image: str, fork_block: int, round_id: str,
+    ) -> str:
+        """Fully-deterministic identity of one pre-pass result — same components
+        as the champion-bench memo key, flattened for JSON storage."""
+        return "|".join((
+            round_id, image, str(int(fork_block)),
+            str(self._corpus_fingerprint(intents)),
+            str(self._loaded_js_fingerprint(intents)),
+        ))
+
+    def _refquote_disk_load(self, key: str) -> dict[str, dict[str, str]] | None:
+        path = self._refquote_checkpoint_path()
+        if path is None:
+            return None
+        try:
+            entries = json.loads(path.read_text()).get("entries", [])
+        except (OSError, ValueError):
+            return None
+        for e in entries:
+            if isinstance(e, dict) and e.get("key") == key:
+                quotes = e.get("quotes")
+                return quotes if isinstance(quotes, dict) else None
+        return None
+
+    def _refquote_disk_save(self, key: str, quotes: dict) -> None:
+        """Best-effort atomic append-and-trim; a failed save only costs a
+        recompute after the next restart, never correctness."""
+        path = self._refquote_checkpoint_path()
+        if path is None:
+            return
+        try:
+            try:
+                entries = json.loads(path.read_text()).get("entries", [])
+            except (OSError, ValueError):
+                entries = []
+            entries = [e for e in entries if isinstance(e, dict) and e.get("key") != key]
+            entries.append({"key": key, "quotes": quotes})
+            entries = entries[-_REFQUOTE_CHECKPOINT_KEEP:]
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "entries": entries}))
+            tmp.replace(path)
+        except OSError as exc:
+            logger.warning("[reference-quote] checkpoint save failed: %s", exc)
+
+    async def _get_or_build_reference_quotes(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        *,
+        image_tag: str | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Memoized + /data-checkpointed :meth:`_build_reference_quotes`.
+
+        The pre-pass is fully determined by (round, champion image, fork block,
+        corpus, scoring-JS) — the same key discipline as ``memo_champion_bench``
+        — so reuse is the identical computation, and an api restart mid-round
+        picks the round back up with the SAME reference set instead of paying a
+        fresh champion session (~30 quotes) per run_once pass.
+
+        Falls through to a plain build when: checkpointing is disabled, any key
+        component is unavailable (no round / no pin / no champion — dev paths),
+        or the build produced an EMPTY result (champion session failed to start:
+        transient, must retry next pass, never freeze for the round).
+        """
+        round_id = None
+        if self._round_store is not None:
+            current = self._round_store.get_current_round()
+            round_id = getattr(current, "round_id", None)
+        image = image_tag
+        if image is None and self._use_docker:
+            image = self._resolve_champion_image()
+        fork_block = self._epoch_block_number
+        if (
+            not _refquote_checkpoint_enabled()
+            or not round_id or not image or fork_block is None
+        ):
+            return await self._build_reference_quotes(intents, image_tag=image_tag)
+
+        key = self._refquote_checkpoint_key(intents, image, fork_block, round_id)
+        hit = _REFERENCE_QUOTES_CACHE.get(key)
+        if hit is not None:
+            logger.info(
+                "[reference-quote] reuse memoized pre-pass round=%s (skipped a "
+                "champion session)", round_id,
+            )
+            return hit
+        disk = self._refquote_disk_load(key)
+        if disk is not None:
+            logger.info(
+                "[reference-quote] resumed pre-pass from /data checkpoint "
+                "round=%s (survived a restart)", round_id,
+            )
+            _REFERENCE_QUOTES_CACHE[key] = disk
+            return disk
+
+        quotes = await self._build_reference_quotes(intents, image_tag=image)
+        if quotes:  # {} = transient champion-session failure: retry next pass
+            if len(_REFERENCE_QUOTES_CACHE) >= _REFERENCE_QUOTES_CACHE_MAX:
+                _REFERENCE_QUOTES_CACHE.clear()
+            _REFERENCE_QUOTES_CACHE[key] = quotes
+            self._refquote_disk_save(key, quotes)
+        return quotes
+
     async def _build_reference_quotes(
         self,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
