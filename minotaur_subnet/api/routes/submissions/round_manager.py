@@ -581,6 +581,34 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
     }
 
 
+def _reattest_chain_payloads(state: RoundState) -> dict[str, dict[str, Any]]:
+    """The force-sync chain for a STANDING champion round: close+certify+activate.
+
+    Canonical builder shared by the champion re-attest lever (leader PUSH, one
+    broadcast per phase) and the /solver/champion/sync-bundle endpoint (follower
+    PULL reconcile) so both recovery paths apply byte-identical payloads:
+      1) close (force=True): upsert the round + submission snapshot, bypassing
+         the adopt-if-behind staleness guard AND re-delivering a snapshot the
+         follower missed (the round is OLDER than the follower's current one);
+      2) certify (force=True): the signed certificate, deadline-bypassed
+         (#434) — verify_approval still round-trips, this is not blind trust;
+      3) activate: drive adoption now (q1-trust) instead of waiting for a tick.
+    """
+    close_payload = _close_round_sync_payload(state)
+    close_payload["force"] = True
+    certify_payload = _certify_round_sync_payload(state)
+    certify_payload["force"] = True
+    return {
+        "close": close_payload,
+        "certify": certify_payload,
+        "activate": {
+            "round_id": state.round_id,
+            "activation_epoch": state.effective_epoch or state.close_epoch,
+            "champion_changed": True,
+        },
+    }
+
+
 def _activate_round_sync_payload(
     body: ActivateRoundRequest, champion_changed: bool | None = None,
 ) -> dict[str, Any]:
