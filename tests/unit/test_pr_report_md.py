@@ -56,6 +56,52 @@ def test_render_relative_summary_and_pipe_escaping():
     assert "a\\|b" in md  # verdict cell escaped
 
 
+def test_render_table_shows_only_diverging_orders_skip_omitted():
+    # The table allowlists diverging verdicts: `skip` rows (neither side
+    # delivered) are omitted — rendered, they'd read as phantom ✅ wins — and
+    # `dropped` (hard veto) renders as ❌, sorted with the regressions before wins.
+    rel = {
+        "better": 1, "worse": 2, "matched": 1, "new": 0, "compared": 4,
+        "verdict": "behind",
+        "per_order": [
+            {"intent_id": "a_win", "champ": "100", "chal": "120", "ratio": 1.2, "verdict": "win"},
+            {"intent_id": "b_reg", "champ": "100", "chal": "90", "ratio": 0.9, "verdict": "regression"},
+            {"intent_id": "c_drop", "champ": "100", "chal": None, "ratio": None, "verdict": "dropped"},
+            {"intent_id": "d_skip", "champ": None, "chal": None, "ratio": None, "verdict": "skip"},
+            {"intent_id": "e_tie", "champ": "100", "chal": "100", "ratio": 1.0, "verdict": "matched"},
+        ],
+    }
+    sub = _sub([{"intent_id": "a_win", "score": 0.9}], relative=rel)
+    rep = build_submission_report(sub, reason="r")
+    md = render_report_md(rep)
+    assert "`d_skip`" not in md and "`e_tie`" not in md  # skip + matched omitted
+    assert "| `c_drop` | — | ❌ dropped |" in md          # dropped flagged as worse
+    assert "| `b_reg` | -10.00% | ❌ |" in md
+    assert "| `a_win` | +20.00% | ✅ |" in md
+    # worse rows (regression + dropped) sort before the win
+    assert md.index("`b_reg`") < md.index("`a_win`")
+    assert md.index("`c_drop`") < md.index("`a_win`")
+
+
+def test_render_all_skip_or_matched_yields_no_table():
+    # A submission whose rows are all matched/skip diverges nowhere: no table,
+    # and the identical-output hint counts only the COMPARED orders (not skips).
+    rel = {
+        "better": 0, "worse": 0, "matched": 2, "new": 0, "compared": 2,
+        "verdict": "matched",
+        "per_order": [
+            {"intent_id": "t1", "champ": "5", "chal": "5", "ratio": 1.0, "verdict": "matched"},
+            {"intent_id": "t2", "champ": "5", "chal": "5", "ratio": 1.0, "verdict": "matched"},
+            {"intent_id": "s1", "champ": None, "chal": None, "ratio": None, "verdict": "skip"},
+        ],
+    }
+    sub = _sub([{"intent_id": "t1", "score": 0.9}], relative=rel)
+    rep = build_submission_report(sub, reason="matched: no order better or worse")
+    md = render_report_md(rep)
+    assert "Orders that differ" not in md
+    assert "Identical output to the champion on all 2 orders" in md
+
+
 def test_render_note_when_no_relative_block():
     sub = _sub([{"intent_id": "a", "score": 0.9}])  # no stored relative block
     rep = build_submission_report(sub, reason="r")
