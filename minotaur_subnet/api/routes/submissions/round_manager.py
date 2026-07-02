@@ -432,17 +432,37 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
         # submission mirror here — the round FSM stays untouched (still the
         # early return), and force only enters via the authenticated re-attest
         # broadcast.
-        if bool(getattr(body, "force", False)) and body.submissions:
-            try:
-                n = get_store().upsert_submissions(body.submissions)
-                if n:
-                    logger.info(
-                        "Submission snapshot: force-close healed %d records "
-                        "for %s (re-attest recovery)",
-                        n, body.round_id,
-                    )
-            except Exception:  # noqa: BLE001 — best-effort, mirror of the path below
-                logger.warning("forced submission snapshot upsert failed", exc_info=True)
+        if bool(getattr(body, "force", False)):
+            if body.submissions:
+                try:
+                    n = get_store().upsert_submissions(body.submissions)
+                    if n:
+                        logger.info(
+                            "Submission snapshot: force-close healed %d records "
+                            "for %s (re-attest recovery)",
+                            n, body.round_id,
+                        )
+                except Exception:  # noqa: BLE001 — best-effort, mirror of the path below
+                    logger.warning("forced submission snapshot upsert failed", exc_info=True)
+            # Un-abort under force: a follower whose decision deadline elapsed
+            # before the certificate arrived aborts the round LOCALLY — but the
+            # leader's forced chain carries the signed certificate proving the
+            # round DID certify fleet-level. Left ABORTED, certify-prepare (which
+            # only advances CLOSED/REPLAYING) 409s "is aborted; expected
+            # certifying" forever, wedging both the re-attest push AND the pull
+            # reconcile (observed live 2026-07-02, round-e29716673-n1 on
+            # 0x7EF6fAFC). Revert exactly ABORTED→CLOSED so the forced certify
+            # can proceed; CERTIFIED/ACTIVATED rounds are never touched
+            # (idempotent re-application is handled downstream).
+            if existing.status == RoundStatus.ABORTED:
+                existing = round_store.set_round_status(
+                    body.round_id, RoundStatus.CLOSED,
+                )
+                logger.warning(
+                    "[force-close] un-aborted round %s (leader carries its "
+                    "signed certificate) — resuming the force-sync chain",
+                    body.round_id,
+                )
         return existing
     # Mirror the leader's close-time submission snapshot so the local pack-hash
     # recompute matches the leader's (else PACK_HASH_MISMATCH drops us from the
