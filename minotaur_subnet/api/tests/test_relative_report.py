@@ -243,6 +243,35 @@ def test_round_response_no_finalist_marks_mode_only():
     assert "finalist_relative" not in dumped
 
 
+# ── round response: epoch → wall-clock timestamps ─────────────────────────────
+
+
+def test_round_response_exposes_wall_clock_deadlines():
+    """decision_deadline_at / effective_at are the epoch boundaries in unix
+    seconds (epoch * EPOCH_SECONDS) so consumers never hardcode the epoch width."""
+    from minotaur_subnet.epoch.clock import EPOCH_SECONDS
+
+    state = RoundState(
+        round_id="round-e1-n1",
+        status=RoundStatus.CERTIFIED,
+        opened_epoch=29716481,
+        decision_deadline_epoch=29716523,
+        effective_epoch=29716525,
+    )
+    resp = round_manager._round_state_to_response(state)
+    assert resp.decision_deadline_at == 29716523 * EPOCH_SECONDS
+    assert resp.effective_at == 29716525 * EPOCH_SECONDS
+
+
+def test_round_response_wall_clock_none_while_open():
+    """An open round has no deadline/effective epoch yet — the timestamps stay
+    None instead of fabricating epoch-0 dates."""
+    state = RoundState(round_id="round-e1-n1", status=RoundStatus.OPEN, opened_epoch=1)
+    resp = round_manager._round_state_to_response(state)
+    assert resp.decision_deadline_at is None
+    assert resp.effective_at is None
+
+
 # ── get_app_status: scoring_mode marker (always on) ──────────────────────────
 
 
