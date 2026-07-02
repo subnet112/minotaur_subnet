@@ -61,7 +61,6 @@ def build_state(scenario: Scenario) -> IntentState:
         control={
             "_intent_function": scenario.intent_function,
             "_scenario_name": scenario.name,
-            "_stage": scenario.stage,
             "_fund": {scenario.input_token: int(scenario.input_amount)},
         },
     )
@@ -155,18 +154,31 @@ class ScoreJsStage:
 _WORKER = BenchmarkWorker.__new__(BenchmarkWorker)  # pure helper; no ctor deps used by these methods
 
 
+def _card_global(card: BenchmarkScorecard) -> float:
+    """Offline-lab aggregate proxy = mean of per-scenario scores.
+
+    The production scalar composite (BenchmarkScorecard.global_score, the retired
+    0.4/0.6 stage blend) was REMOVED — adoption + finalist ranking are per-order
+    relative now. The lab keeps this self-contained aggregate PURELY for its offline
+    parameter-sweep proxy; it is never a production input.
+    """
+    scores = list(card.scenario_scores.values())
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def aggregate(brs: list[BenchmarkResult]) -> tuple[BenchmarkScorecard, StageRecord]:
     t0 = time.monotonic()
     card = _WORKER._build_scorecard(brs)
+    _global = _card_global(card)
     rec = StageRecord(
         stage="aggregate", scenario="(all)", ok=True,
-        summary=(f"global={card.global_score:.4f} apps="
+        summary=(f"global={_global:.4f} apps="
                  + ",".join(f"{k}={v:.3f}" for k, v in sorted(card.app_scores.items()))),
         inputs={"results": len(brs)},
-        outputs={"global_score": round(card.global_score, 6),
+        outputs={"global_score": round(_global, 6),
                  "app_scores": {k: round(v, 6) for k, v in card.app_scores.items()},
                  "failures": card.failures, "total": card.total},
-        meta={"ports_to": "benchmark_worker._build_scorecard / _compute_avg_score"},
+        meta={"ports_to": "benchmark_worker._build_scorecard (single flat set)"},
         duration_ms=_ms(t0),
     )
     return card, rec
@@ -186,9 +198,10 @@ class CurrentAdoptRule(AdoptRule):
     """Offline-lab AGGREGATE adoption approximation (sweepable proxy).
 
     NOTE: production's AUTHORITATIVE rule is now the PER-ORDER relative rule
-    (``epoch/relative_scoring.evaluate_relative_adoption``): adopt iff the
-    challenger beats-or-matches the champion on EVERY order's RAW delivered output
-    and strictly wins at least one. The lab operates on aggregate SCORECARDS
+    (``epoch/relative_scoring.evaluate_relative_adoption``): a BOUNDED-REGRESSION
+    NET-BETTER rule (no order cut >1%, no dropped order, net wins+blind-spots exceed
+    regressions by the margin) over each order's RAW delivered output. The lab
+    operates on aggregate SCORECARDS
     (per-app means), not per-order shadow rows, so it cannot express that per-order
     rule faithfully. This keeps a SELF-CONTAINED aggregate check — per-app floor +
     per-app non-regression + dethrone margin — purely as an offline parameter-sweep
@@ -223,15 +236,15 @@ class CurrentAdoptRule(AdoptRule):
                 if inc > 0 and ch < inc * (1 - max_regression):
                     adopt, reason = False, f"regresses on {app_id}"
                     break
-        # (3) aggregate dethrone margin
-        if adopt and chal_card.global_score < champ_card.global_score * (1 + margin):
+        # (3) aggregate dethrone margin (offline proxy over the local scenario mean)
+        if adopt and _card_global(chal_card) < _card_global(champ_card) * (1 + margin):
             adopt, reason = False, "below dethrone margin"
 
         rec = StageRecord(
             stage="adopt", scenario="(all)", ok=True,
             summary=f"rule=current(aggregate-proxy) -> {'ADOPT' if adopt else 'REJECT'}",
-            inputs={"champion_global": round(champ_card.global_score, 6),
-                    "challenger_global": round(chal_card.global_score, 6),
+            inputs={"champion_global": round(_card_global(champ_card), 6),
+                    "challenger_global": round(_card_global(chal_card), 6),
                     "dethrone_margin": cfg.dethrone_margin,
                     "max_app_regression": cfg.max_app_regression},
             outputs={"adopt": adopt, "reason": reason},

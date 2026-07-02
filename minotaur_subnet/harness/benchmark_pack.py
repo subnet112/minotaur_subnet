@@ -1,9 +1,15 @@
 """Benchmark pack hash — consensus primitive for round scoring.
 
 A "benchmark pack" is the full set of scenarios that will be used to
-score a solver for a given round:
-- Stage 1: synthetic scenarios from every operational app's JS manifest
-- Stage 2: historical orders sampled deterministically from round_id
+score a solver for a given round: every operational app's synthetic scenarios
+(from its JS manifest) PLUS the historical orders sampled deterministically from
+round_id. These form ONE flat scenario set — the synthetic/historical STAGE split
++ weighting were removed; the relative rule joins all orders by intent_id.
+
+The V1 hash still emits the historical/synthetic sections separately (byte-for-byte
+unchanged) so the rip-out is hash-invisible and mixed old/new builds stay
+consensus-compatible. A single-flat-set V2 hash is available behind the
+``BENCHMARK_PACK_V2`` code constant (default OFF; flip fleet-wide atomically).
 
 The pack hash is a canonical SHA-256 digest of the scenario inventory.
 All validators compute the same hash from the same round_id, and the
@@ -23,6 +29,15 @@ import logging
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
+
+
+# Fleet-uniform CODE constant — NEVER env-read. A per-validator value would split
+# the pack hash and strand quorum. ON: the single-flat-set V2 hash (matches the
+# single-stage benchmark). This is a fleet-wide ATOMIC cutover (same discipline as
+# ROUND_ANCHORED_PIN / the compute budget) — every validator must ship the same value
+# in one release, or mixed V1/V2 builds compute different pack hashes and quorum
+# strands. Set back to False only to roll the whole fleet back to the V1 layout.
+BENCHMARK_PACK_V2: bool = True
 
 
 def compute_pack_hash(
@@ -52,27 +67,48 @@ def compute_pack_hash(
         Hex string (0x-prefixed, 64 chars) representing the SHA-256 digest.
     """
     h = hashlib.sha256()
-    h.update(b"MINOTAUR_BENCHMARK_PACK_V1\n")
-    h.update(round_id.encode("utf-8"))
-    h.update(b"\n")
-
-    # Synthetic: sort by (app_id, scenario_name) for determinism
-    synthetic_list = sorted(
-        list(synthetic_scenarios),
-        key=lambda s: (s.get("app_id", ""), s.get("name", "")),
-    )
-    h.update(b"SYNTHETIC\n")
-    for scenario in synthetic_list:
-        canonical = _canonical_scenario(scenario)
-        h.update(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if BENCHMARK_PACK_V2:
+        # SINGLE FLAT SET (V2): one unified SCENARIOS section — synthetic scenarios
+        # and historical orders as one sorted set of canonical tokens, mirroring the
+        # single-stage benchmark (no synthetic/historical split). Scores + the retired
+        # _stage tag were never hashed, so this differs from V1 ONLY in structure.
+        h.update(b"MINOTAUR_BENCHMARK_PACK_V2\n")
+        h.update(round_id.encode("utf-8"))
+        h.update(b"\n")
+        tokens = [
+            json.dumps(_canonical_scenario(s), sort_keys=True, separators=(",", ":"))
+            for s in synthetic_scenarios
+        ]
+        tokens += [
+            json.dumps({"order_id": oid}, separators=(",", ":"))
+            for oid in historical_order_ids
+        ]
+        h.update(b"SCENARIOS\n")
+        for tok in sorted(tokens):
+            h.update(tok.encode("utf-8"))
+            h.update(b"\n")
+    else:
+        h.update(b"MINOTAUR_BENCHMARK_PACK_V1\n")
+        h.update(round_id.encode("utf-8"))
         h.update(b"\n")
 
-    # Historical: sort order IDs alphabetically
-    historical_sorted = sorted(historical_order_ids)
-    h.update(b"HISTORICAL\n")
-    for order_id in historical_sorted:
-        h.update(order_id.encode("utf-8"))
-        h.update(b"\n")
+        # Synthetic: sort by (app_id, scenario_name) for determinism
+        synthetic_list = sorted(
+            list(synthetic_scenarios),
+            key=lambda s: (s.get("app_id", ""), s.get("name", "")),
+        )
+        h.update(b"SYNTHETIC\n")
+        for scenario in synthetic_list:
+            canonical = _canonical_scenario(scenario)
+            h.update(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            h.update(b"\n")
+
+        # Historical: sort order IDs alphabetically
+        historical_sorted = sorted(historical_order_ids)
+        h.update(b"HISTORICAL\n")
+        for order_id in historical_sorted:
+            h.update(order_id.encode("utf-8"))
+            h.update(b"\n")
 
     # Deterministic RPC compute budget (the budget proxy's {budget, cost_table}
     # record). Folded in ONLY when active, so the hash is byte-identical to the

@@ -288,7 +288,6 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         decision_deadline_epoch=state.decision_deadline_epoch,
         finalist_submission_id=state.finalist_submission_id,
         finalist_image_id=state.finalist_image_id,
-        finalist_score=state.finalist_score,
         shadow_case_log_hash=state.shadow_case_log_hash,
         effective_epoch=state.effective_epoch,
         abort_reason=state.abort_reason,

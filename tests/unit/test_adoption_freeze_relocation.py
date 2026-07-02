@@ -26,8 +26,17 @@ def _bare_manager() -> EpochManager:
     return m
 
 
-def _chal(sid="chal", score=0.6):
-    return SimpleNamespace(submission_id=sid, benchmark_score=score)
+def _chal(sid="chal", raw_output="1000"):
+    # A SCORED challenger under the new contract: the scalar composite
+    # ``benchmark_score`` was removed, so "scored-with-delivered-value" is now
+    # expressed as a per-order row whose ``raw_output`` (exact decimal wei string)
+    # parses to > 0. The adoption path here reads ``submission_id`` and delegates
+    # the verdict to the (mocked) relative per-order rule, so the row is just a
+    # faithful stand-in for a real scored submission.
+    return SimpleNamespace(
+        submission_id=sid,
+        benchmark_details={"per_intent": [{"intent_id": "app:scn", "raw_output": raw_output}]},
+    )
 
 
 # ── 1. The split: _should_adopt keeps the freeze (synchronous path safety) ──────
@@ -54,7 +63,13 @@ def test_meets_criteria_ignores_freeze(monkeypatch):
     # The PURE verdict (used by the consensus path) must NOT consult the freeze, so
     # the pipeline can broadcast + collect a would-be quorum observe-only.
     m = _bare_manager()
-    m._champion = SimpleNamespace(submission_id="champ", benchmark_score=0.5)
+    # A scored incumbent: its delivered-value per-order rows are the champion "bar"
+    # (the retired scalar benchmark_score is gone). The relative verdict is mocked
+    # below, so the rows here just make the champion a faithful scored incumbent.
+    m._champion = SimpleNamespace(
+        submission_id="champ",
+        benchmark_details={"per_intent": [{"intent_id": "app:scn", "raw_output": "500"}]},
+    )
     m._incumbent_refresh_failed = False
     m._dethrone_margin = 0.05
     # The relative per-order rule is the sole decision; force it ADOPT here.
