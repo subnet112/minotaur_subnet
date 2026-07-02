@@ -70,6 +70,7 @@ from .round_manager import (
     _get_current_solver_round,
     _require_open_submission_round,
     _round_state_to_response,
+    epoch_start_ts,
     _sync_abort_solver_round_state,
     _sync_close_solver_round_state,
     _sync_round_incumbent_from_submission_store,
@@ -1546,6 +1547,7 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
             if adopted else None
         ),
         effective_epoch=d.get("effective_epoch"),
+        effective_at=epoch_start_ts(d.get("effective_epoch")),
         abort_reason=d.get("abort_reason"),
         created_at=float(d.get("created_at") or 0.0),
         updated_at=float(d.get("updated_at") or 0.0),

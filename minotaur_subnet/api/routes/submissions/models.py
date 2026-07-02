@@ -175,10 +175,15 @@ class SolverRoundResponse(BaseModel):
     committee_hash: str | None = None
     quorum_required: int | None = None
     decision_deadline_epoch: int | None = None
+    # Wall-clock unix seconds for the epoch fields above/below (epoch *
+    # EPOCH_SECONDS — round epochs are wall-clock buckets), so API consumers can
+    # render "activates at" without knowing the epoch width.
+    decision_deadline_at: float | None = None
     finalist_submission_id: str | None = None
     finalist_image_id: str | None = None
     shadow_case_log_hash: str | None = None
     effective_epoch: int | None = None
+    effective_at: float | None = None
     abort_reason: str | None = None
     certificate_candidate_submission_id: str | None = None
     certificate_candidate_image_id: str | None = None
@@ -210,6 +215,8 @@ class SolverRoundSummary(BaseModel):
     adopted: bool = False
     adopted_submission_id: str | None = None
     effective_epoch: int | None = None
+    # Unix seconds for effective_epoch (see SolverRoundResponse.effective_at).
+    effective_at: float | None = None
     abort_reason: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
