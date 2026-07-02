@@ -1255,6 +1255,7 @@ async def solver_round_consensus_proposal(
             commit_hash_override=body.commit_hash,
             nonce_override=int(body.nonce or 0) or None,
             deadline_override=int(body.deadline or 0) or None,
+            incumbent_image_id_override=body.incumbent_image_id or None,
         )
     except HTTPException as exc:
         return {

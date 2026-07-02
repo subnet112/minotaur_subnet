@@ -273,6 +273,13 @@ class CertifyRoundRequest(BaseModel):
     candidate_submission_id: str | None = None
     candidate_image_id: str | None = None
     committee_hash: str | None = None
+    # The incumbent (previous champion) image id is part of the SIGNED proposal
+    # digest but is NOT reproducible across hosts (a local {{.Id}} at quorum<=1),
+    # so — like commit_hash/nonce/deadline — the leader's signed value MUST ride in
+    # this payload. Without it a follower rebuilds the incumbent from its OWN round
+    # record, the digest diverges, and the leader's approval is rejected as
+    # "Invalid champion approvals" — stranding the round leader-only.
+    incumbent_image_id: str | None = None
     benchmark_pack_hash: str | None = None
     shadow_case_log_hash: str | None = None
     effective_epoch: int = Field(..., ge=0)
