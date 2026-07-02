@@ -37,6 +37,30 @@ from minotaur_subnet.orderbook.orderbook import IntentOrderBook
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _open_admin_gate(test_case: unittest.TestCase) -> None:
+    """Open the admin gate for a route test.
+
+    ``POST /apps/``, ``/apps/{id}/deploy`` and friends became admin-gated (PR-2,
+    audit C1): with no relayer, ``LOCAL_TESTNET=1`` is the dev-open path (no real
+    gas is spent). Route tests that create apps must open the gate or every create
+    401s (and ``resp.json()["app_id"]`` raises ``KeyError``). Env is restored after
+    the test via ``addCleanup`` so the flag can't leak into other classes.
+    """
+    prev = {k: os.environ.get(k) for k in ("LOCAL_TESTNET", "RELAYER_URL", "ADMIN_API_KEY")}
+
+    def _restore() -> None:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    test_case.addCleanup(_restore)
+    os.environ["LOCAL_TESTNET"] = "1"
+    os.environ.pop("RELAYER_URL", None)
+    os.environ.pop("ADMIN_API_KEY", None)
+
+
 class TestHealthEndpoint(unittest.TestCase):
     """Tests for GET /health."""
 
@@ -212,6 +236,7 @@ class TestAppRoutes(unittest.TestCase):
     """Tests for app CRUD endpoints."""
 
     def setUp(self):
+        _open_admin_gate(self)  # POST /apps/ + /deploy are admin-gated (PR-2)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def _create_app_payload(self, name="Test Swap"):
@@ -436,6 +461,7 @@ class TestWalletRoutes(unittest.TestCase):
     """Tests for wallet management endpoints."""
 
     def setUp(self):
+        _open_admin_gate(self)  # admin-gated endpoint (PR-2)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def test_create_wallet(self):
@@ -462,6 +488,7 @@ class TestManifestRoutes(unittest.TestCase):
     """Tests for manifest extraction endpoints."""
 
     def setUp(self):
+        _open_admin_gate(self)  # POST /apps/ is admin-gated (PR-2)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def _create_app_with_manifest(self):
@@ -507,6 +534,7 @@ class TestScorePlanRoutes(unittest.TestCase):
     """Tests for POST /v1/apps/{app_id}/score."""
 
     def setUp(self):
+        _open_admin_gate(self)  # POST /apps/ is admin-gated (PR-2)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def tearDown(self):
@@ -778,6 +806,7 @@ class TestDryRunRoutes(unittest.TestCase):
     """Tests for dry-run scoring endpoint."""
 
     def setUp(self):
+        _open_admin_gate(self)  # admin-gated endpoint (PR-2)
         self.ob = IntentOrderBook()
         orders_module.set_orderbook(self.ob)
         self.client = TestClient(app, raise_server_exceptions=False)
@@ -957,15 +986,26 @@ class TestUserSignatureValidation(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 201)
 
-    def test_submit_with_invalid_signature(self):
-        """Invalid signature hex should be rejected."""
-        resp = self.client.post("/v1/apps/sig-app/orders", json={
+    def test_invalid_signature_rejected_on_attach(self):
+        """A wrong user_signature is rejected (403) when ATTACHED via
+        PATCH /orders/{id}/signature. Submit itself stores the signature UNVERIFIED
+        for backward compat — verification moved to the dedicated signature endpoint
+        (orders.py), which recovers the signer and 403s on a mismatch."""
+        os.environ["REQUIRE_ORDER_OWNER_SIG"] = "1"  # enforce (default; explicit vs leak)
+        self.addCleanup(lambda: os.environ.pop("REQUIRE_ORDER_OWNER_SIG", None))
+        submit = self.client.post("/v1/apps/sig-app/orders", json={
             "submitted_by": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
             "params": {},
-            "user_signature": "0x" + "ab" * 65,  # Wrong signature
         })
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("Invalid user signature", resp.json()["detail"])
+        self.assertEqual(submit.status_code, 201)
+        order_id = submit.json()["order_id"]
+
+        resp = self.client.patch(
+            f"/v1/orders/{order_id}/signature",
+            json={"user_signature": "0x" + "ab" * 65},  # wrong signature
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("does not recover", resp.json()["detail"])
 
 
 if __name__ == "__main__":
