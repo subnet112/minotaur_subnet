@@ -42,6 +42,12 @@ errors/timeouts, so a solver cannot observe the proxy by inspecting numbers or
 whitespace. When budget is hit it fails LOUD with a well-formed JSON-RPC error
 matching the request shape — never a silent pass-through to direct Anvil.
 
+One deliberate exception: immutable per-chain constants (``eth_chainId``,
+``net_version``) are fetched from the upstream ONCE per chain and answered
+locally thereafter. web3.py re-validates the chain id around nearly every
+call, which made these ~2/3 of all upstream traffic; the value cannot differ
+by block or time, so the solver-visible VALUE is identical either way.
+
 NETWORK ISOLATION (caller's responsibility)
 ===========================================
 The ``/rpc/...`` data plane faces the untrusted solver; the ``/control/...``
@@ -70,6 +76,10 @@ BUDGET_EXCEEDED_MESSAGE = "MINOTAUR_BUDGET_EXCEEDED"
 
 # Bucket name used to count calls that arrive with an unknown session id.
 ANON_SESSION = "__anon__"
+
+# Methods whose result is an immutable per-chain constant: answered from a
+# proxy-lifetime cache after one upstream fetch (see module docstring).
+IMMUTABLE_CHAIN_METHODS = frozenset({"eth_chainId", "net_version"})
 
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8645
@@ -202,6 +212,9 @@ class BudgetProxy:
         self.control_token: str = str(control_token or "")
         self.sessions: dict[str, Session] = {}
         self._client: ClientSession | None = None
+        # (chain, method) -> cached "result" for IMMUTABLE_CHAIN_METHODS.
+        # Proxy-lifetime: an UPSTREAMS repoint requires a restart, which drops it.
+        self._chain_constants: dict[tuple[str, str], Any] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -341,6 +354,23 @@ class BudgetProxy:
             is_batch,
         )
 
+        # Immutable per-chain constants: answer from the cache (or fetch-and-fill
+        # on the first call). Placed AFTER the budget decision so an exhausted
+        # enforce session still gets the deterministic budget error, and BEFORE
+        # the block-pin because these methods are block-independent.
+        if parse_ok and isinstance(parsed, dict):
+            method = parsed.get("method")
+            if method in IMMUTABLE_CHAIN_METHODS:
+                chain_key = chain or self._default_chain
+                cached = self._chain_constants.get((chain_key, method))
+                if cached is not None:
+                    return web.json_response(
+                        {"jsonrpc": "2.0", "id": parsed.get("id"), "result": cached}
+                    )
+                resp = await self._forward(upstream, raw_body, request)
+                self._maybe_cache_constant(chain_key, method, resp)
+                return resp
+
         # Block-pin: when this session has a pinned block for the chain, FORCE
         # every read to it (rewriting the request body) so the untrusted solver
         # reads exactly the scored state — deterministic on any archive upstream.
@@ -391,6 +421,24 @@ class BudgetProxy:
             return self._json_error_response(
                 None, code=-32000, message="upstream unreachable", http_status=502
             )
+
+    def _maybe_cache_constant(
+        self, chain_key: str, method: str, resp: web.StreamResponse
+    ) -> None:
+        """Cache the ``result`` of a successful constant fetch; never raises.
+
+        Only a 200 with a parseable single JSON-RPC object carrying a non-null
+        ``result`` fills the cache — errors keep forwarding until one succeeds.
+        """
+        body = getattr(resp, "body", None)
+        if resp.status != 200 or not body:
+            return
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return
+        if isinstance(data, dict) and data.get("result") is not None:
+            self._chain_constants[(chain_key, method)] = data["result"]
 
     # -- deterministic responses -------------------------------------------
 
