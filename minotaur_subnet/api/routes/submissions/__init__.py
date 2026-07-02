@@ -66,3 +66,8 @@ from .routes import (  # noqa: F401
     verify_hotkey_signature,
     build_submission_message,
 )
+
+# Round-entry rotation (used by the startup round coordinator at close)
+from .routes import (  # noqa: F401
+    apply_round_rotation,
+)
