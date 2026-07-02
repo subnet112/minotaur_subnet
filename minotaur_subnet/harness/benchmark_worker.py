@@ -186,6 +186,21 @@ def _challenger_quorum_mode() -> bool:
     return raw.strip().lower() not in _CHALLENGER_QUORUM_OFF_VALUES
 
 
+def _rotation_slate_slots() -> int:
+    """Benched-slate width (``SOLVER_ROUND_MAX_SUBMISSIONS``, 0 = no rotation).
+
+    Mirrors ``routes._max_submissions_per_round_total`` — read directly from the
+    env here to avoid a harness→api import. When > 0, the slate is selected at
+    round CLOSE by LRU rotation (``harness/rotation.py``), so open-round eager
+    benching is deferred (see ``run_once``).
+    """
+    raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def _consolidate_champion_bench() -> bool:
     """Whether to MEMOIZE the champion benchmark within a round so the two
     champion-run paths (dethrone re-bench in ``_refresh_incumbent_score`` and the
@@ -619,6 +634,24 @@ class BenchmarkWorker:
                     if s.round_id == current_round.round_id
                 ]
                 if round_subs:
+                    if (
+                        current_round.status == RoundStatus.OPEN
+                        and _rotation_slate_slots() > 0
+                    ):
+                        # Rotation (SOLVER_ROUND_MAX_SUBMISSIONS = slate width,
+                        # selected at close by LRU seniority): the benched slate
+                        # isn't known while the round is OPEN, so eager-benching
+                        # now would spend serialized sim time on submissions
+                        # that may not make the slate — and hand early
+                        # submitters exactly the arrival-order head start the
+                        # rotation exists to remove. Defer: the slate benches
+                        # after close, under the auto-scaled decision window.
+                        logger.debug(
+                            "[benchmark] deferring %d open-round submission(s) "
+                            "until the rotation slate is selected at close",
+                            len(round_subs),
+                        )
+                        return 0
                     benchmarking = round_subs
                 else:
                     # No submissions for this round — run genesis/bootstrap

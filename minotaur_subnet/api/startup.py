@@ -2589,6 +2589,28 @@ async def initialize(ctx: ServerContext) -> dict:
                 if _round_open_elapsed(current) < solver_round_open_seconds:
                     return False
 
+                # Rotation slate (leader-local fairness): pick which of the round's
+                # submissions get benched — miners benched longest ago first, NOT
+                # first-come — and reject the overflow with a resubmit reason.
+                # Runs BEFORE the close snapshot + decision-window autoscale so
+                # followers mirror the post-rotation set and the window scales with
+                # the real slate. Best-effort: must never block the close.
+                try:
+                    _rot = submissions.apply_round_rotation(current.round_id)
+                    if _rot.get("applied") and _rot.get("skipped"):
+                        logger.info(
+                            "Rotation slate for %s: %d candidates, %d slots — "
+                            "selected=%s skipped=%s",
+                            current.round_id, _rot.get("candidates"),
+                            _rot.get("slots"), _rot.get("selected"),
+                            _rot.get("skipped"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "rotation slate failed for %s (ignored — closing with all "
+                        "submissions)", current.round_id, exc_info=True,
+                    )
+
                 validators = _solver_round_validator_set()
                 manager = submissions.get_champion_consensus_manager()
                 if manager is not None and validators:
@@ -2622,7 +2644,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
                 # it (keep ACTIVATION_DELAY >= the effective decision window).
                 try:
-                    _n_subs = len(submissions.get_store().list_by_round(current.round_id))
+                    # Count only the surviving slate: rotation (and screening)
+                    # rejects don't get benched, so they must not inflate the
+                    # decision window.
+                    _n_subs = len([
+                        s for s in submissions.get_store().list_by_round(current.round_id)
+                        if str(getattr(getattr(s, "status", None), "value", "") or getattr(s, "status", "")) != "rejected"
+                    ])
                 except Exception:
                     _n_subs = 0
                 _decision_window = submissions.autoscaled_decision_window(
