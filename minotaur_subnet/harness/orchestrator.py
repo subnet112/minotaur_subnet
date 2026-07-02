@@ -98,6 +98,38 @@ _KILL_REAP_TIMEOUT = 5.0
 # can't grow memory without bound.
 _STDERR_TAIL_LINES = 50
 
+# Transient RPC / upstream-provider failure signatures. A solver quotes/routes
+# against a live provider (e.g. Alchemy) from inside its container; when that
+# provider rate-limits, times out, or 5xx's, the solver silently produces NO plan
+# for the affected order. The scorer then records that order as a blind spot /
+# drop and zeroes it — indistinguishable, today, from the solver being genuinely
+# unable to serve the pair. That misattribution is a MINER-FAIRNESS bug: a miner
+# is scored down for the provider's hiccup, not its own capability. These
+# signatures let us SURFACE + COUNT such failures (see `_classify_rpc_error`).
+# OBSERVABILITY ONLY — never feeds scoring, benchmark results, or the pack hash.
+_RPC_ERROR_SIGNATURES: tuple[str, ...] = (
+    "429", "too many requests", "rate limit", "rate-limit", "ratelimit",
+    "exceeded your", "compute unit", "over capacity", "throughput",
+    "timeout", "timed out", "etimedout", "esockettimedout",
+    "econnreset", "connection reset", "connection refused", "econnrefused",
+    "socket hang up", "fetch failed", "network error",
+    "bad gateway", "service unavailable", "gateway timeout",
+    "alchemy", "provider error", "json-rpc error", "-32005", "-32603",
+)
+
+
+def _classify_rpc_error(text: str | None) -> str | None:
+    """Return the first transient-RPC/provider signature found in ``text``, else
+    ``None``. Pure + case-insensitive; used only to label + count failures for the
+    fairness audit — it never changes any benchmark outcome."""
+    if not text:
+        return None
+    low = text.lower()
+    for sig in _RPC_ERROR_SIGNATURES:
+        if sig in low:
+            return sig
+    return None
+
 
 class SolverTimeoutError(Exception):
     """A solver command exceeded its timeout."""
@@ -263,6 +295,13 @@ class SolverSession:
         # for crash diagnostics.
         self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._stderr_task: Any = None
+        # Transient RPC/provider errors (Alchemy rate-limit, timeout, 5xx) seen on
+        # this session's stderr or protocol responses. Surfaced + counted for the
+        # miner-fairness audit — such a failure makes the solver emit no plan, which
+        # the scorer misreads as a blind spot / drop and zeroes the order.
+        # OBSERVABILITY ONLY: never read by scoring, results, or the pack hash.
+        self._rpc_error_count: int = 0
+        self._rpc_error_samples: deque[str] = deque(maxlen=8)
         self._begin_stderr_drain()
 
     def _begin_stderr_drain(self) -> None:
@@ -297,12 +336,45 @@ class SolverSession:
                     break
                 text = line.decode("utf-8", "replace").rstrip()
                 if text:
-                    self._stderr_tail.append(text)
-                    logger.debug("[%s solver-stderr] %s", self._label, text)
+                    self._note_stderr_line(text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — draining must never break the session
             logger.debug("[%s] stderr drain ended: %r", self._label, exc)
+
+    def _note_stderr_line(self, text: str) -> None:
+        """Record one stderr line: keep the bounded tail, and — for the fairness
+        audit — SURFACE + COUNT transient RPC/provider errors that would otherwise
+        be buried at DEBUG. A matching line is logged at WARNING because it likely
+        caused a silent no-plan (a blind spot / drop that unfairly zeroes an order).
+        Observability only — this never touches scoring, results, or the pack hash."""
+        self._stderr_tail.append(text)
+        sig = _classify_rpc_error(text)
+        if sig is None:
+            logger.debug("[%s solver-stderr] %s", self._label, text)
+            return
+        self._rpc_error_count += 1
+        self._rpc_error_samples.append(text)
+        logger.warning(
+            "[%s solver-rpc-error] transient RPC/provider failure (%s) during "
+            "benchmark — may silently zero an order (miner-fairness impact): %s",
+            self._label, sig, text,
+        )
+
+    def _note_protocol_rpc_error(self, error: Any) -> str | None:
+        """Classify + count a protocol-level failure (``resp.error``) as a transient
+        RPC/provider error. Returns the matched signature (for the caller's log) or
+        ``None``. Observability only."""
+        sig = _classify_rpc_error(str(error) if error is not None else None)
+        if sig is not None:
+            self._rpc_error_count += 1
+            self._rpc_error_samples.append(str(error))
+        return sig
+
+    def rpc_error_report(self) -> tuple[int, list[str]]:
+        """``(count, sample lines)`` of transient RPC/provider errors seen on this
+        session — for the miner-fairness audit. Never affects any benchmark outcome."""
+        return self._rpc_error_count, list(getattr(self, "_rpc_error_samples", ()))
 
     def _stderr_snapshot(self) -> str:
         """The last captured stderr lines, for surfacing in a crash error."""
@@ -371,9 +443,11 @@ class SolverSession:
             make_generate_plan_request(intent, state, snapshot)
         )
         if not resp.success:
+            sig = self._note_protocol_rpc_error(resp.error)
             logger.warning(
-                "[%s] generate_plan failed for %s: %s",
-                self._label, intent.app_id, resp.error,
+                "[%s] generate_plan failed for %s%s: %s",
+                self._label, intent.app_id,
+                f" [transient RPC/provider:{sig}]" if sig else "", resp.error,
             )
             return None
         return parse_plan_response(resp)
@@ -389,9 +463,11 @@ class SolverSession:
             make_quote_request(intent, state, snapshot)
         )
         if not resp.success:
+            sig = self._note_protocol_rpc_error(resp.error)
             logger.warning(
-                "[%s] quote failed for %s: %s",
-                self._label, intent.app_id, resp.error,
+                "[%s] quote failed for %s%s: %s",
+                self._label, intent.app_id,
+                f" [transient RPC/provider:{sig}]" if sig else "", resp.error,
             )
             return None
         return parse_quote_response(resp)
@@ -1320,6 +1396,34 @@ async def run_benchmark(
             await asyncio.gather(
                 *(s.shutdown() for s in spawned_sessions), return_exceptions=True,
             )
+    # Fairness audit (OBSERVABILITY ONLY — never affects scoring or the pack hash):
+    # if any solver session hit transient RPC/provider errors during this run,
+    # surface a per-run summary. Such errors make the solver emit no plan for the
+    # affected orders, which the scorer records as blind spots / drops and zeroes —
+    # misattributing provider flake to a lack of miner capability.
+    try:
+        _sessions = {
+            id(s): s for s in ([session] + list(spawned_sessions)) if s is not None
+        }
+        _rpc_total = 0
+        _rpc_samples: list[str] = []
+        for _s in _sessions.values():
+            _report = getattr(_s, "rpc_error_report", None)
+            if _report is None:
+                continue
+            _n, _samples = _report()
+            _rpc_total += _n
+            _rpc_samples.extend(_samples)
+        if _rpc_total:
+            logger.warning(
+                "[benchmark-rpc-health] %s: %d transient RPC/provider error(s) over "
+                "%d scenario(s) this run — these silently zero orders and get "
+                "misattributed to miner capability (fairness impact). samples: %s",
+                getattr(session, "_label", "solver"), _rpc_total, len(intents),
+                " | ".join(_rpc_samples[:4]),
+            )
+    except Exception as exc:  # noqa: BLE001 — audit logging must never break a run
+        logger.debug("[benchmark-rpc-health] summary failed: %r", exc)
     return results
 
 
