@@ -1186,7 +1186,7 @@ async def reattest_current_champion(request: Request) -> dict:
 
 
 @router.get("/solver/champion/sync-bundle")
-async def champion_sync_bundle(request: Request) -> dict[str, Any]:
+async def champion_sync_bundle() -> dict[str, Any]:
     """Serve the standing champion's force-sync chain for follower PULL reconcile.
 
     The pull-side twin of /solver/champion/reattest: a follower that diverged from
@@ -1197,8 +1197,18 @@ async def champion_sync_bundle(request: Request) -> dict[str, Any]:
     identical; the certificate approvals are still cryptographically verified on
     apply — serving this bundle is not blind trust. Leader-side only in practice
     (followers poll whoever the metagraph says leads); harmless anywhere.
+
+    PUBLIC (no internal-key gate) — deliberately. SOLVER_ROUND_INTERNAL_API_KEY
+    is per-validator, not fleet-shared (each follower generates its own and
+    registers it), so gating this GET on the leader's key locked out every
+    follower: their reconcile loops 401'd on each tick and the fleet silently
+    stopped self-healing (observed live 2026-07-02, round-e29716673-n1 — the
+    activation broadcast fanned out to zero peers during a boot window and no
+    follower converged). Safe to serve publicly: read-only, and everything in it
+    is already public (round + certificate via /v1/solver/round/{id}, submission
+    records via /v1/submissions — private-repo tokens are never serialized);
+    authenticity comes from the leader signature + cert approvals, not transport.
     """
-    await _authorize_internal_round(request)
     store = get_round_store()
     champ = store.get_active_champion()
     rid = getattr(champ, "activated_round_id", None)
