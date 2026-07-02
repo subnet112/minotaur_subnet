@@ -904,7 +904,17 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertEqual(data["status"], "certified")
         self.assertEqual(data["certificate_candidate_submission_id"], sub.submission_id)
         consensus_manager.propose.assert_awaited_once()
-        peer_network.broadcast_champion_proposal.assert_called_once()
+        # broadcast_champion_proposal now fires TWICE: once for consensus
+        # (collector=consensus_manager) and once from the post-cert best-effort
+        # quorum MONITOR (collector=None, read-only, added after this test). Assert
+        # the consensus broadcast happened exactly once. Use call_args_list (not
+        # await_args_list): the consensus broadcast is fired via asyncio.create_task,
+        # so it is CALLED (coroutine created) but not necessarily awaited in-test.
+        consensus_broadcasts = [
+            c for c in peer_network.broadcast_champion_proposal.call_args_list
+            if c.kwargs.get("collector") is consensus_manager
+        ]
+        self.assertEqual(len(consensus_broadcasts), 1)
 
     def test_solver_round_consensus_proposal_endpoint_signs_matching_tuple(self):
         from minotaur_subnet.api.routes import submissions as sub_mod
@@ -1610,16 +1620,25 @@ class TestScreeningBackground(unittest.TestCase):
         _cleanup_temp_file(helper_path)
         self.assertFalse(os.path.exists(helper_path))
 
-    def test_clone_repo_passes_scoped_noninteractive_git_env(self):
+    def test_clone_repo_sandboxed_passes_scoped_noninteractive_git_env(self):
+        """https(s) clones run in the hardened docker sandbox (``_clone_repo_sandboxed``),
+        not an in-process ``git clone``. Assert the sandbox's security properties: git is
+        non-interactive (``GIT_TERMINAL_PROMPT=0``), and repo/commit/private-repo auth are
+        passed via ENV (``REPO_URL``/``COMMIT``/``GIT_BASIC_AUTH`` → an ``http.extraHeader``),
+        never on the argv where a secret could leak into logs/ps.
+
+        (Rewritten from the old in-process assertion — http(s) no longer uses
+        ``_build_git_process_env``/``GIT_ASKPASS``; that path is now file://-only.)"""
         import asyncio
-        from minotaur_subnet.api.routes.submissions import _clone_repo
+        import base64
+
+        from minotaur_subnet.api.routes.submissions import screening_pipeline as sp
 
         class _FakeProc:
-            def __init__(self, returncode: int = 0):
-                self.returncode = returncode
+            returncode = 0
 
             async def communicate(self):
-                return b"", b""
+                return b"<tarball-bytes>", b""
 
         os.environ["SUBMISSION_GIT_CLONE_ALLOWED_HOSTS"] = "github.com"
         os.environ["SUBMISSION_GIT_CLONE_USERNAME"] = "x-access-token"
@@ -1628,10 +1647,10 @@ class TestScreeningBackground(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch(
                 "minotaur_subnet.api.routes.submissions.screening_pipeline.asyncio.create_subprocess_exec",
-                new=AsyncMock(side_effect=[_FakeProc(), _FakeProc()]),
-            ) as mock_exec:
+                new=AsyncMock(return_value=_FakeProc()),
+            ) as mock_exec, patch.object(sp, "_safe_extract_tar", return_value=True):
                 result = asyncio.run(
-                    _clone_repo(
+                    sp._clone_repo(
                         "https://github.com/subnet112/minotaur-solver",
                         "abc1234",
                         tmpdir,
@@ -1639,13 +1658,20 @@ class TestScreeningBackground(unittest.TestCase):
                 )
 
         self.assertTrue(result)
-        clone_env = mock_exec.await_args_list[0].kwargs["env"]
-        checkout_env = mock_exec.await_args_list[1].kwargs["env"]
-        self.assertEqual(clone_env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(clone_env["MINOTAUR_GIT_CLONE_USERNAME"], "x-access-token")
-        self.assertEqual(clone_env["MINOTAUR_GIT_CLONE_PASSWORD"], "demo-token")
-        self.assertEqual(checkout_env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertFalse(os.path.exists(clone_env["GIT_ASKPASS"]))
+        cmd = list(mock_exec.await_args.args)
+        run_env = mock_exec.await_args.kwargs["env"]
+        cmd_str = " ".join(str(c) for c in cmd)
+
+        self.assertEqual(cmd[0], "docker")             # sandboxed, not host git
+        self.assertIn("GIT_TERMINAL_PROMPT=0", cmd)    # non-interactive
+        # Repo, commit, and auth ride the ENV — never the argv.
+        self.assertEqual(run_env["REPO_URL"], "https://github.com/subnet112/minotaur-solver")
+        self.assertEqual(run_env["COMMIT"], "abc1234")
+        self.assertEqual(
+            run_env["GIT_BASIC_AUTH"],
+            base64.b64encode(b"x-access-token:demo-token").decode(),
+        )
+        self.assertNotIn("demo-token", cmd_str)        # secret never on the command line
 
     def test_pipeline_nonexistent_submission(self):
         """Pipeline handles missing submission gracefully."""
