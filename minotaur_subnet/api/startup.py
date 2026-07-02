@@ -2397,6 +2397,42 @@ async def initialize(ctx: ServerContext) -> dict:
             except Exception:
                 logger.warning("App-catalog sync not started", exc_info=True)
 
+            # Champion pull-reconcile — followers self-heal a missed champion
+            # lifecycle broadcast (blip/restart during the one-shot fan-out) by
+            # pulling the leader's standing champion + sync bundle and applying
+            # it through the same handlers as the push path. Pull twin of the
+            # /solver/champion/reattest lever; removes the operator from blip
+            # recovery. Kill switch: CHAMPION_PULL_RECONCILE=0.
+            try:
+                if (os.environ.get("CHAMPION_PULL_RECONCILE", "1").strip() or "1") != "0":
+                    from minotaur_subnet.api.routes.submissions.champion_reconcile import (
+                        ChampionPullReconcile,
+                    )
+                    _reconcile_interval = float(
+                        os.environ.get("CHAMPION_PULL_RECONCILE_SECONDS", "300").strip()
+                        or "300"
+                    )
+                    _reconcile = ChampionPullReconcile(
+                        leader_api_url=_resolve_leader_api_url,
+                        is_follower=(
+                            lambda: ctx.solver_round_metagraph_sync is not None
+                            and not _is_solver_round_leader()
+                        ),
+                        interval=_reconcile_interval,
+                        api_key=(
+                            os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
+                            or os.environ.get("SUBMISSIONS_API_KEY", "").strip()
+                        ),
+                    )
+                    ctx.champion_reconcile_task = asyncio.create_task(_reconcile.run_loop())
+                    logger.info(
+                        "Champion pull-reconcile loop started (followers self-heal "
+                        "missed champion broadcasts, interval=%.0fs)",
+                        _reconcile_interval,
+                    )
+            except Exception:
+                logger.warning("Champion pull-reconcile not started", exc_info=True)
+
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
                 network = submissions.get_champion_peer_network()
