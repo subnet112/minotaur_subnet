@@ -607,6 +607,30 @@ def _max_submissions_per_owner_per_round() -> int:
         return 1
 
 
+def _max_rounds_per_commit() -> int:
+    """Per-(hotkey, commit) lifetime BENCHMARK participation cap — anti-resubmit-spam.
+
+    Measured over 50 live rounds (2026-07-02): 61% of benchmark slots re-scored
+    a commit already benched in the window; one bot resubmitted the identical
+    commit 36 rounds straight at ~28min cadence. Same commit + unchanged champion
+    bar = same relative verdict, so re-benching is pure sim waste that crowds
+    fresh code out of the slate. After the cap, further submissions of that exact
+    commit are rejected at intake — push a new commit to participate again.
+
+    Trivially evaded by changing one byte (new SHA): this stops naive
+    resubmit-every-round automation, not a determined adversary. Only BENCHED
+    rounds count (rotation not-selected / screening rejections don't burn quota).
+    Configurable via ``SUBMISSIONS_MAX_ROUNDS_PER_COMMIT`` (default 5); a value
+    <= 0 disables it. Operator-local admission control at the leader gateway
+    (the only ingress), like the other submission caps — not fleet-consensus.
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_COMMIT", "5").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 5
+
+
 def _max_submissions_per_round_total() -> int:
     """Benched SLATE width per round — how many submissions get benchmarked.
 
@@ -790,8 +814,10 @@ async def create_source_submission(
 
     code_hash = hashlib.sha256(body.solver_source.encode()).hexdigest()[:12]
 
-    # Same per-round caps as the git path so SUBMISSIONS_MAX_PER_ROUND and
-    # SOLVER_ROUND_MAX_SUBMISSIONS apply uniformly across both ingresses.
+    # Same caps as the git path so SUBMISSIONS_MAX_PER_ROUND,
+    # SOLVER_ROUND_MAX_SUBMISSIONS and SUBMISSIONS_MAX_ROUNDS_PER_COMMIT apply
+    # uniformly across both ingresses. commit_hash here is the source content
+    # hash, so the per-commit cap naturally means "same code, same quota".
     try:
         sub = store.create(
             repo_url="source://inline",
@@ -801,6 +827,7 @@ async def create_source_submission(
             round_id=current_round.round_id,
             max_per_round=_max_submissions_per_round(),
             max_total_per_round=_round_intake_max(),
+            max_rounds_per_commit=_max_rounds_per_commit(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -969,6 +996,25 @@ async def create_submission(
                 ),
             )
 
+    # Per-(hotkey, commit) participation cap — anti-resubmit-spam. Uses the
+    # RESOLVED head SHA (not the client-claimed one, though they matched above).
+    # Checked post-auth like the owner cap, and before the mergeability GitHub
+    # call. The store re-checks atomically inside create() as the TOCTOU backstop.
+    max_commit_rounds = _max_rounds_per_commit()
+    if max_commit_rounds > 0:
+        benched_rounds = store.count_benched_rounds_by_commit(
+            body.hotkey, pr["head_sha"]
+        )
+        if benched_rounds >= max_commit_rounds:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Commit {pr['head_sha'][:12]} has already been benchmarked in "
+                    f"{benched_rounds} round(s) (max {max_commit_rounds} rounds per "
+                    f"commit); push a new commit to participate again."
+                ),
+            )
+
     # Fail-fast: reject a PR that can't actually be merged (merge conflicts /
     # stale base after a newer champion landed / draft) with a clear message,
     # rather than spend a benchmark on a PR the leader's merge gate would later
@@ -1003,6 +1049,7 @@ async def create_submission(
             repo_token=(body.repo_token if _private else None),
             github_owner=_github_owner,
             max_per_owner_per_round=max_per_owner,
+            max_rounds_per_commit=max_commit_rounds,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -1139,7 +1186,7 @@ async def reattest_current_champion(request: Request) -> dict:
 
 
 @router.get("/solver/champion/sync-bundle")
-async def champion_sync_bundle(request: Request) -> dict[str, Any]:
+async def champion_sync_bundle() -> dict[str, Any]:
     """Serve the standing champion's force-sync chain for follower PULL reconcile.
 
     The pull-side twin of /solver/champion/reattest: a follower that diverged from
@@ -1150,8 +1197,18 @@ async def champion_sync_bundle(request: Request) -> dict[str, Any]:
     identical; the certificate approvals are still cryptographically verified on
     apply — serving this bundle is not blind trust. Leader-side only in practice
     (followers poll whoever the metagraph says leads); harmless anywhere.
+
+    PUBLIC (no internal-key gate) — deliberately. SOLVER_ROUND_INTERNAL_API_KEY
+    is per-validator, not fleet-shared (each follower generates its own and
+    registers it), so gating this GET on the leader's key locked out every
+    follower: their reconcile loops 401'd on each tick and the fleet silently
+    stopped self-healing (observed live 2026-07-02, round-e29716673-n1 — the
+    activation broadcast fanned out to zero peers during a boot window and no
+    follower converged). Safe to serve publicly: read-only, and everything in it
+    is already public (round + certificate via /v1/solver/round/{id}, submission
+    records via /v1/submissions — private-repo tokens are never serialized);
+    authenticity comes from the leader signature + cert approvals, not transport.
     """
-    await _authorize_internal_round(request)
     store = get_round_store()
     champ = store.get_active_champion()
     rid = getattr(champ, "activated_round_id", None)
