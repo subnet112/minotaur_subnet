@@ -107,18 +107,22 @@ class TestListAvailableApps:
 class TestListOrders:
     @patch("minotaur_subnet.miner.agent.mcp_server._http_get")
     def test_no_filters(self, mock_get):
+        # /v1/orders is paginated — the tool always sends the page params.
         mock_get.return_value = {"orders": [], "count": 0}
-        result = mcp_server.list_orders()
-        assert "/orders" in mock_get.call_args[0][0]
-        assert "?" not in mock_get.call_args[0][0]
+        mcp_server.list_orders()
+        url = mock_get.call_args[0][0]
+        assert "/orders?" in url
+        assert "limit=100" in url and "offset=0" in url
+        assert "app_id" not in url and "status" not in url
 
     @patch("minotaur_subnet.miner.agent.mcp_server._http_get")
     def test_with_filters(self, mock_get):
         mock_get.return_value = {"orders": [], "count": 0}
-        mcp_server.list_orders(app_id="app-001", status="open")
+        mcp_server.list_orders(app_id="app-001", status="open", limit=25, offset=50)
         url = mock_get.call_args[0][0]
         assert "app_id=app-001" in url
         assert "status=open" in url
+        assert "limit=25" in url and "offset=50" in url
 
 
 # ── Strategy development tools ─────────────────────────────────────────────
