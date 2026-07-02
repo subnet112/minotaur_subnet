@@ -302,16 +302,17 @@ class TestSubmissionStore(unittest.TestCase):
             epoch=42,
             hotkey="5GrwvaEF_test",
         )
+        details = {"per_intent": [{"intent_id": "app:scn", "raw_output": "1000"}]}
         self.store.set_benchmark_result(
             sub.submission_id,
-            score=0.85,
+            valid=True,
             rank=1,
-            details={"plans_scored": 10, "avg_score": 0.85},
+            details=details,
         )
         updated = self.store.get(sub.submission_id)
         self.assertEqual(updated.status, SubmissionStatus.SCORED)
-        self.assertEqual(updated.benchmark_score, 0.85)
         self.assertEqual(updated.benchmark_rank, 1)
+        self.assertEqual(updated.benchmark_details, details)
 
     def test_reject_and_adopt(self):
         sub = self.store.create(
@@ -758,7 +759,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.91,
         )
 
         resp = self.client.post("/v1/solver/round/certify", json={
@@ -812,7 +812,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.91,
         )
         sub_mod.set_solver_round_epoch_provider(lambda: 44)
 
@@ -856,7 +855,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.91,
         )
         certificate = ChampionCertificate(
             round_id=current.round_id,
@@ -940,7 +938,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.91,
         )
         approval = ChampionApproval(
             validator_id="0xvalidator",
@@ -977,7 +974,9 @@ class TestSubmissionAPI(unittest.TestCase):
         ), patch(
             "minotaur_subnet.api.routes.submissions.routes."
             "_reactive_benchmark_candidate",
-            new=AsyncMock(return_value=(True, 0.91)),
+            new=AsyncMock(
+                return_value=(True, {"better": 1, "worse": 0, "matched": 0, "compared": 1})
+            ),
         ):
             resp = self.client.post("/v1/solver/round/consensus/proposal", json={
                 "round_id": current.round_id,
@@ -1021,7 +1020,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.91,
         )
         consensus_manager = MagicMock()
         sub_mod.set_champion_consensus_manager(consensus_manager)
@@ -1128,7 +1126,6 @@ class TestSubmissionAPI(unittest.TestCase):
             current.round_id,
             submission_id=sub.submission_id,
             image_id=sub.image_id,
-            benchmark_score=0.95,
         )
         self.round_store.certify_round(
             current.round_id,

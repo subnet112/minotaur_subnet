@@ -152,8 +152,12 @@ class Submission:
     solver_name: str | None = None
     solver_version: str | None = None
 
-    # Set after benchmarking
-    benchmark_score: float | None = None
+    # Set after benchmarking. NOTE: the scalar composite benchmark_score was
+    # removed — adoption is decided by the per-order relative rule
+    # (epoch/relative_scoring.evaluate_relative_adoption) and finalist ranking by
+    # relative net-better vs the champion. benchmark_rank is a DISPLAY rank derived
+    # from that same net-better ordering; benchmark_details carries the per-order
+    # raw_output rows the relative rule consumes.
     benchmark_rank: int | None = None
     benchmark_details: dict[str, Any] | None = None
 
@@ -189,7 +193,6 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
-            "benchmark_score": self.benchmark_score,
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
@@ -210,7 +213,6 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
-            "benchmark_score": self.benchmark_score,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
         }
@@ -454,7 +456,6 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
-            benchmark_score=record.get("benchmark_score"),
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
@@ -725,47 +726,57 @@ class SubmissionStore:
     def set_benchmark_result(
         self,
         submission_id: str,
-        score: float,
+        *,
+        valid: bool,
         rank: int | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Record benchmark results.
+        """Record benchmark results and flip terminal status.
 
-        Will not overwrite a real score (>0) with 0.0 to prevent
-        the rank-assignment pass from erasing Docker benchmark results.
+        ``valid`` is the per-order VALIDITY GATE (see
+        ``relative_scoring.has_delivered_value_rows``): a submission is SCORED iff it
+        delivered a usable output on >= 1 order, else REJECTED. This replaced the
+        retired scalar ``benchmark_score > 0`` gate. Adoption itself is decided later
+        by the per-order relative rule; this only records ``details`` (the per-order
+        raw_output rows), an optional display ``rank``, and the SCORED/REJECTED
+        verdict. The display rank is written via :meth:`set_benchmark_rank` in a
+        separate pass, so there is no longer a "don't clobber a real score" guard.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
 
-        # Don't overwrite a real score with 0
-        if score <= 0 and sub.benchmark_score is not None and sub.benchmark_score > 0:
-            # Only update rank/details, keep the real score
-            if rank is not None:
-                sub.benchmark_rank = rank
-            sub.updated_at = time.time()
-            self._persist()
-            return
-
-        sub.benchmark_score = score
         if rank is not None:
             sub.benchmark_rank = rank
         if details is not None:
             sub.benchmark_details = details
-        # A zero or negative score means the solver failed to produce
-        # any valid plans — reject it instead of marking it scored.
-        # Previously this was SCORED regardless, allowing broken solvers
-        # to proceed through the pipeline.
-        if score <= 0:
+        # The validity gate: no order delivered value -> the solver produced no
+        # usable plans, reject it instead of marking it scored.
+        if not valid:
             sub.status = SubmissionStatus.REJECTED
             sub.rejection_reason = (
                 sub.rejection_reason
-                or f"Benchmark score {score:.4f} <= 0 (solver produced no valid plans)"
+                or "no order delivered value (solver produced no valid plans)"
             )
             self.purge_token(submission_id)  # terminal — drop the secret
         else:
             sub.status = SubmissionStatus.SCORED
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_benchmark_rank(self, submission_id: str, rank: int) -> None:
+        """Set the DISPLAY rank only (the relative net-better ordering), no status flip.
+
+        Replaces the old rank-only re-call of :meth:`set_benchmark_result` — the
+        display-rank pass must never re-evaluate the SCORED/REJECTED verdict.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.benchmark_rank = rank
         sub.updated_at = time.time()
         self._persist()
 
@@ -1057,7 +1068,6 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
-                    benchmark_score=d.get("benchmark_score"),
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),

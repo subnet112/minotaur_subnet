@@ -6,7 +6,7 @@ Flow:
   3. Submit a "better" solver via signed git submission
   4. Wait for autonomous round lifecycle: screening → benchmarking → champion
      quorum → activation
-  5. Verify: new champion is activated, benchmark score improved
+  5. Verify: new champion is activated (relative net-better vs the baseline)
 
 This test does NOT manually call close/certify/activate — the coordinator
 loop must drive the full lifecycle autonomously.
@@ -42,9 +42,6 @@ REQUIRE_LOCAL_TESTNET = os.environ.get("REQUIRE_LOCAL_TESTNET", "").strip().lowe
     "1", "true", "yes", "on",
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEX_AGGREGATOR_SOLIDITY = (
-    REPO_ROOT / "contracts" / "src" / "DexAggregatorApp.sol"
-).read_text()
 LOCAL_TESTNET_SUBMISSION_ROOT = Path(
     os.environ.get(
         "LOCAL_TESTNET_SUBMISSION_HOST_ROOT",
@@ -52,9 +49,23 @@ LOCAL_TESTNET_SUBMISSION_ROOT = Path(
     )
 )
 LOCAL_TESTNET_SUBMISSION_CONTAINER_ROOT = "/solver-submissions"
-EXAMPLE_SOLVER_DOCKERFILE = (
-    REPO_ROOT / "minotaur_subnet" / "docker" / "example-solver" / "Dockerfile"
-).read_text()
+
+
+def _dex_aggregator_solidity() -> str:
+    """Read the DEX aggregator contract lazily (only when a test actually runs).
+
+    Read at call time rather than import time so the module still collects (and
+    the ``require_local_testnet`` fixture can skip cleanly) in environments that
+    ship without the contract sources checked out.
+    """
+    return (REPO_ROOT / "contracts" / "src" / "DexAggregatorApp.sol").read_text()
+
+
+def _example_solver_dockerfile() -> str:
+    """Read the example-solver Dockerfile lazily (see ``_dex_aggregator_solidity``)."""
+    return (
+        REPO_ROOT / "minotaur_subnet" / "docker" / "example-solver" / "Dockerfile"
+    ).read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +312,7 @@ def _create_app(name: str) -> dict:
         "description": "Challenger demo app for testing miner competition",
         "supported_chains": [31337],
         "js_code": _challenger_scoring_js(),
-        "solidity_code": DEX_AGGREGATOR_SOLIDITY,
+        "solidity_code": _dex_aggregator_solidity(),
     })
     assert status in (200, 201), payload
     return payload
@@ -343,7 +354,7 @@ def _wait_for_round_open(timeout: int = 240) -> dict:
 def _create_local_submission_repo(prefix: str) -> tuple[str, str]:
     LOCAL_TESTNET_SUBMISSION_ROOT.mkdir(parents=True, exist_ok=True)
     repo_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=LOCAL_TESTNET_SUBMISSION_ROOT))
-    (repo_dir / "Dockerfile").write_text(EXAMPLE_SOLVER_DOCKERFILE)
+    (repo_dir / "Dockerfile").write_text(_example_solver_dockerfile())
     (repo_dir / "solver.py").write_text(_challenger_solver_source())
     (repo_dir / "README.md").write_text("# Challenger Demo Solver\n")
     (repo_dir / "requirements.txt").write_text("\n")
@@ -503,9 +514,9 @@ def test_challenger_dethrones_baseline_champion():
     """Full miner competition demo:
 
     1. Deploy app → genesis baseline champion bootstraps
-    2. Submit challenger solver → screening → benchmarking → scored higher
+    2. Submit challenger solver → screening → benchmarking → delivers value
     3. Coordinator autonomously drives round lifecycle → champion activated
-    4. Verify: new champion has higher benchmark score than baseline
+    4. Verify: new champion beats the baseline on the relative net-better rule
     """
     _wait_for_api_cluster()
 
@@ -541,9 +552,24 @@ def test_challenger_dethrones_baseline_champion():
 
     # --- Step 3: Wait for screening + benchmarking ---
     scored = _wait_for_submission_scored(submission_id)
-    challenger_score = scored.get("benchmark_score", 0)
-    print(f"  Challenger scored: {challenger_score}")
-    assert challenger_score > 0, f"Challenger scored 0: {scored}"
+    # benchmark_score (the retired scalar composite) was removed. Reaching the
+    # "scored" state now REQUIRES delivered value (>=1 per-intent raw_output > 0);
+    # a value-less run is rejected instead. The status endpoint surfaces the
+    # relative feedback ``report`` (per-order better/worse/matched vs the champion)
+    # plus a display ``benchmark_rank`` in place of the old positive score.
+    report = scored.get("report") or {}
+    outcome = report.get("outcome")
+    print(
+        f"  Challenger benchmarked: rank={scored.get('benchmark_rank')} "
+        f"outcome={outcome}"
+    )
+    assert scored.get("status") in {"scored", "adopted"}, scored
+    # A real, value-delivering benchmark yields a per-order outcome
+    # (scored/matched/beat_champion/adopted), never a failed/rejected one — the
+    # faithful successor to the old "score > 0" (non-zero, non-failed) checkpoint.
+    assert outcome not in {None, "benchmark_failed", "rejected_screening"}, (
+        f"Challenger benchmark did not deliver value: {scored}"
+    )
 
     # --- Step 4: Wait for autonomous round lifecycle ---
     round_open_seconds = int(os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "600"))

@@ -13,20 +13,20 @@ from types import SimpleNamespace
 
 from minotaur_subnet.api.routes.submissions.report import build_submission_report
 
+# Post-ripout benchmark_details: the scalar composite (``avg_score`` /
+# ``scorecard.scenario_scores`` / per-intent ``score``) is GONE. Scored-ness is
+# carried by ``per_intent`` raw_output rows (EXACT DECIMAL WEI STRING; >0 ⇒
+# delivered value), and per-order detail lives solely in the ``relative`` block.
 _DETAILS = {
     "total_intents": 3,
     "plans_generated": 3,
     "errors": 0,
-    "avg_score": 0.594,
-    "scorecard": {
-        "scenario_scores": {"WETH_to_USDC": 0.65, "USDC_to_WETH": 0.55, "BAD": 0.0}
-    },
     "per_intent": [
-        {"intent_id": "WETH_to_USDC", "score": 0.65, "on_chain_score": 5027,
+        {"intent_id": "WETH_to_USDC", "raw_output": "5027000000",
          "has_plan": True, "error": None, "mock_simulation": False},
-        {"intent_id": "USDC_to_WETH", "score": 0.55, "on_chain_score": 5010,
+        {"intent_id": "USDC_to_WETH", "raw_output": "5010000000",
          "has_plan": True, "error": None, "mock_simulation": False},
-        {"intent_id": "BAD", "score": 0.0, "on_chain_score": None,
+        {"intent_id": "BAD", "raw_output": "0",
          "has_plan": False, "error": "no plan", "mock_simulation": False},
     ],
 }
@@ -40,13 +40,15 @@ def _rel(verdict, *, better=0, worse=0, matched=0):
     }
 
 
-def _sub(status="scored", score=0.594, details=None, screening=None, relative=None):
+def _sub(status="scored", details=None, screening=None, relative=None):
+    # ``benchmark_score`` was REMOVED from Submission: a scored submission is
+    # signalled by ``benchmark_details`` (its per_intent raw_output rows), not a
+    # scalar. The fake carries no scalar score.
     d = dict(details) if isinstance(details, dict) else details
     if relative is not None and isinstance(d, dict):
         d = {**d, "relative": relative}
     return SimpleNamespace(
         status=SimpleNamespace(value=status),
-        benchmark_score=score,
         benchmark_details=d,
         screening=screening or {},
     )
@@ -60,15 +62,15 @@ def _report(sub, reason=None):
 
 
 def test_inflight_returns_none():
-    assert _report(_sub("benchmarking", score=None, details=None)) is None
-    assert _report(_sub("screening_stage_2", score=None, details=None)) is None
+    assert _report(_sub("benchmarking", details=None)) is None
+    assert _report(_sub("screening_stage_2", details=None)) is None
 
 
 # ── no scalars, ever ──────────────────────────────────────────────────────────
 
 
 def test_scored_no_relative_has_no_aggregate():
-    r = _report(_sub("scored", 0.594, _DETAILS), reason="dethrone_margin_not_met")
+    r = _report(_sub("scored", _DETAILS), reason="dethrone_margin_not_met")
     # No stored relative block -> generic "scored", and NO aggregate scalars.
     assert r["outcome"] == "scored"
     assert r["reason"] == "dethrone_margin_not_met"
@@ -84,17 +86,17 @@ def test_scored_no_relative_has_no_aggregate():
 
 
 def test_outcome_matched():
-    r = _report(_sub("scored", 0.594, _DETAILS, relative=_rel("matched", matched=3)))
+    r = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=3)))
     assert r["outcome"] == "matched"
 
 
 def test_outcome_regressed():
-    r = _report(_sub("scored", 0.594, _DETAILS, relative=_rel("worse", worse=1, matched=2)))
+    r = _report(_sub("scored", _DETAILS, relative=_rel("worse", worse=1, matched=2)))
     assert r["outcome"] == "regressed"
 
 
 def test_outcome_beat_champion():
-    r = _report(_sub("scored", 0.594, _DETAILS, relative=_rel("dethrone", better=2, matched=1)))
+    r = _report(_sub("scored", _DETAILS, relative=_rel("dethrone", better=2, matched=1)))
     assert r["outcome"] == "beat_champion"
 
 
@@ -102,13 +104,13 @@ def test_outcome_beat_champion():
 
 
 def test_adopted():
-    r = _report(_sub("adopted", 0.65, _DETAILS))
+    r = _report(_sub("adopted", _DETAILS))
     assert r["outcome"] == "adopted"
 
 
 def test_won_overrides_verdict():
     r = build_submission_report(
-        _sub("scored", 0.65, _DETAILS, relative=_rel("matched", matched=3)),
+        _sub("scored", _DETAILS, relative=_rel("matched", matched=3)),
         reason="selected as finalist", won=True,
     )
     assert r["outcome"] == "won"
@@ -116,12 +118,12 @@ def test_won_overrides_verdict():
 
 def test_rejected_screening_carries_detail():
     scr = {"stage": "stage_1", "detail": "banned import: os.system"}
-    r = _report(_sub("rejected", score=None, details=None, screening=scr))
+    r = _report(_sub("rejected", details=None, screening=scr))
     assert r["outcome"] == "rejected_screening"
     assert r["screening"] == scr
 
 
 def test_benchmark_failed_when_no_plans():
-    details = {"errors": 3, "plans_generated": 0, "per_intent": [], "scorecard": {}}
-    r = _report(_sub("scored", 0.0, details))
+    details = {"errors": 3, "plans_generated": 0, "per_intent": []}
+    r = _report(_sub("scored", details))
     assert r["outcome"] == "benchmark_failed"

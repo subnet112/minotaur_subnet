@@ -558,10 +558,12 @@ def _build_solver_round_benchmark_pack_hash(
     *,
     shadow_pin_segment: str | None = None,
 ) -> str:
-    """Build a deterministic benchmark-pack hash covering:
+    """Build a deterministic benchmark-pack hash covering (ONE flat scenario set —
+    the synthetic/historical stage split is a hash-layout detail only, see
+    benchmark_pack.BENCHMARK_PACK_V2):
     1. Round metadata (app list, submissions, policy)
-    2. Stage 1 synthetic scenarios from every app's manifest
-    3. Stage 2 historical order IDs (deterministic sample from round_id)
+    2. Synthetic scenarios from every app's manifest
+    3. Historical order IDs (deterministic sample from round_id)
 
     All validators compute the same hash from the same round_id and local
     state. If any validator's manifests or order history differ, pack hashes

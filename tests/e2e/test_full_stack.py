@@ -8,6 +8,7 @@ Docker is optional (subtensor tests skipped if not available).
 """
 
 import asyncio
+import os
 import shutil
 import sys
 import time
@@ -34,6 +35,7 @@ from minotaur_subnet.consensus.peer_network import ValidatorPeerNetwork, PeerEnd
 from minotaur_subnet.consensus.signatures import sign_plan_approval
 from minotaur_subnet.validator.metagraph_sync import PeerInfo, elect_leader
 from minotaur_subnet.epoch.manager import EpochManager
+from minotaur_subnet.epoch.relative_scoring import has_delivered_value_rows
 from minotaur_subnet.harness.submission_store import SubmissionStatus, SubmissionStore
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.orderbook.orderbook import IntentOrderBook, OrderStatus
@@ -226,8 +228,21 @@ class _MockSession:
         return self._solver.metadata()
 
 
+# Single benchmark order the mock worker records delivered value for. The scalar
+# composite score is gone: benchmarking now records the RAW delivered output per
+# order (an exact decimal wei string), and the relative net-better rule decides
+# adoption off those rows.
+BENCH_INTENT_ID = "swap-app:benchmark"
+
+
 class MockBenchmarkWorker:
-    """In-process benchmark worker for testing."""
+    """In-process benchmark worker for testing.
+
+    Records per-order delivered value (``benchmark_details.per_intent[*].raw_output``)
+    instead of the retired scalar ``benchmark_score``. A richer plan (more
+    interactions) models proportionally more delivered value, so an improved solver
+    wins the per-order relative net-better comparison the EpochManager runs.
+    """
 
     def __init__(self, sub_store, orchestrator):
         self._sub_store = sub_store
@@ -242,7 +257,8 @@ class MockBenchmarkWorker:
             try:
                 session = await self._orch.start_docker(sub.image_tag)
                 await session.initialize({})
-                # Simple scoring: count interactions
+                # Model delivered value from plan richness: more interactions ->
+                # more raw output delivered on the benchmark order.
                 plan = session.generate_plan(
                     AppIntentDefinition(
                         app_id="test", name="t", version="1", intent_type="swap", js_code="",
@@ -250,16 +266,39 @@ class MockBenchmarkWorker:
                     IntentState(contract_address="", chain_id=1, nonce=0, owner=""),
                     MarketSnapshot(chain_id=1, block_number=1, timestamp=int(time.time())),
                 )
-                score = 0.5 + min(len(plan.interactions) * 0.15, 0.4)
-                self._sub_store.set_benchmark_result(sub.submission_id, score=score)
+                raw_output = str(1000 * len(plan.interactions))
+                # valid=True + a per-order row with raw_output > 0 == SCORED-with-value
+                # (the delivered-value validity gate that replaced score > 0).
+                self._sub_store.set_benchmark_result(
+                    sub.submission_id,
+                    valid=True,
+                    details={"per_intent": [
+                        {"intent_id": BENCH_INTENT_ID, "raw_output": raw_output},
+                    ]},
+                )
             except Exception:
-                self._sub_store.set_benchmark_result(sub.submission_id, score=0.0)
+                # No usable plan -> delivered no value -> validity gate rejects it
+                # (old: score <= 0).
+                self._sub_store.set_benchmark_result(sub.submission_id, valid=False)
 
-        scored = self._sub_store.list_by_status(SubmissionStatus.SCORED)
-        if scored:
-            scored.sort(key=lambda s: s.benchmark_score or 0, reverse=True)
-            self._sub_store.adopt(scored[0].submission_id)
+        # Adoption is owned by the EpochManager (relative net-better vs the
+        # champion), not by the benchmark worker — it no longer picks a winner
+        # off a scalar score.
         return len(pending)
+
+
+# ── Champion runtime builder ──────────────────────────────────────────────
+
+
+def _mock_runtime_builder(submission, epoch):
+    """Build the live champion runtime for a hot-swap.
+
+    Returning a plain object is enough here: BlockLoop is not wired into these
+    EpochManagers, so ``_hot_swap`` only records champion metadata. Using the
+    runtime-builder path (instead of the orchestrator/Docker path) avoids a live
+    ``docker inspect`` of the image_id required for champion eligibility.
+    """
+    return object()
 
 
 # ── Shared state class ────────────────────────────────────────────────────
@@ -296,6 +335,17 @@ _state = FullStackState()
 @pytest.fixture(scope="module", autouse=True)
 def setup_full_stack(anvil, deployed_contracts, test_accounts, eip712_domain, tmp_path_factory):
     """Initialize all components for the full stack test."""
+    # Champion eligibility enforces signed provenance by default; these in-process
+    # mock submissions carry no provenance, so relax it for the test (same as
+    # tests/unit/test_epoch_manager.py). The delivered-value validity gate and the
+    # relative net-better adoption rule are still fully exercised.
+    _prov_env = {
+        "REQUIRE_SIGNED_PROVENANCE": "0",
+        "REQUIRE_ASYMMETRIC_PROVENANCE": "0",
+    }
+    _saved_env = {k: os.environ.get(k) for k in _prov_env}
+    os.environ.update(_prov_env)
+
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     _web3_cache[CHAIN_ID] = w3
 
@@ -323,6 +373,11 @@ def setup_full_stack(anvil, deployed_contracts, test_accounts, eip712_domain, tm
     yield
 
     _web3_cache.pop(CHAIN_ID, None)
+    for k, v in _saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 # ── Ordered Tests ─────────────────────────────────────────────────────────
@@ -430,6 +485,9 @@ class TestFullStack:
         _state.sub_store.set_screening_result(sub.submission_id, 2, True, 3000)
         _state.sub_store.set_solver_info(sub.submission_id, "simple-solver", "1.0.0")
         _state.sub_store.set_image_tag(sub.submission_id, "simple-solver:latest")
+        # Stage 3 captures the immutable image_id (sha256) — required for champion
+        # eligibility (is_submission_champion_eligible).
+        _state.sub_store.set_image_id(sub.submission_id, "sha256:" + "a" * 64)
         _state.sub_store.update_status(sub.submission_id, SubmissionStatus.SCREENING_STAGE_3)
         _state.sub_store.set_screening_result(sub.submission_id, 3, True, 10000)
         _state.sub_store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
@@ -447,6 +505,7 @@ class TestFullStack:
             benchmark_worker=bw,
             submission_store=_state.sub_store,
             orchestrator=orch,
+            runtime_builder=_mock_runtime_builder,
         )
         _state.epoch_mgr = epoch_mgr
 
@@ -455,7 +514,15 @@ class TestFullStack:
         )
 
         assert result["champion_changed"] is True
-        assert epoch_mgr.champion.benchmark_score > 0
+        # The scalar benchmark_score is gone; a champion is a submission that
+        # delivered value (>= 1 per-order raw_output > 0) and won the relative
+        # net-better contest. Assert both that a champion was adopted and that it
+        # is the benchmarked submission with delivered value on record.
+        champ_sub = _state.sub_store.get(epoch_mgr.champion.submission_id)
+        assert champ_sub is not None
+        assert has_delivered_value_rows(
+            (champ_sub.benchmark_details or {}).get("per_intent")
+        )
 
     def test_09_setup_solver_and_blockloop(self):
         """Wire AnvilSwapSolver into BlockLoop."""
@@ -603,29 +670,37 @@ class TestFullStack:
             benchmark_worker=bw,
             submission_store=_state.sub_store,
             orchestrator=orch,
-            dethrone_margin=0.0,  # No margin for test
+            runtime_builder=_mock_runtime_builder,
         )
 
-        # Re-run epoch 1 to set champion
+        # Re-run epoch 1 to set champion (the simple solver)
         asyncio.get_event_loop().run_until_complete(
             epoch_mgr.on_epoch_boundary(epoch=1)
         )
-        old_score = epoch_mgr.champion.benchmark_score
+        old_champion_id = epoch_mgr.champion.submission_id
+        assert epoch_mgr.champion.solver_name == "simple-solver"
 
-        # Epoch 2: improved solver
+        # Epoch 2: improved solver (2 interactions -> more delivered value)
         sub2 = _state.sub_store.create(
             "https://github.com/m2/solver", "bbb222",
             epoch=2, hotkey="5Gminer2...",
         )
-        _state.sub_store.update_status(sub2.submission_id, SubmissionStatus.BENCHMARKING)
+        _state.sub_store.set_solver_info(sub2.submission_id, "improved-solver", "2.0.0")
         _state.sub_store.set_image_tag(sub2.submission_id, "improved-solver:latest")
+        _state.sub_store.set_image_id(sub2.submission_id, "sha256:" + "b" * 64)
+        _state.sub_store.update_status(sub2.submission_id, SubmissionStatus.BENCHMARKING)
 
         result = asyncio.get_event_loop().run_until_complete(
             epoch_mgr.on_epoch_boundary(epoch=2)
         )
 
-        # New champion should have higher or equal score
-        assert epoch_mgr.champion.benchmark_score >= old_score
+        # No scalar score to compare: the improved solver dethrones the incumbent
+        # by delivering strictly more value per order (relative net-better wins),
+        # so the champion is hot-swapped to it.
+        assert result["champion_changed"] is True
+        assert epoch_mgr.champion.submission_id == sub2.submission_id
+        assert epoch_mgr.champion.submission_id != old_champion_id
+        assert epoch_mgr.champion.solver_name == "improved-solver"
 
     def test_16_peer_network_wired_into_blockloop(self):
         """ValidatorPeerNetwork wires into BlockLoop alongside consensus."""

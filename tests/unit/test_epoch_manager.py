@@ -128,7 +128,6 @@ def _make_submission(
         image_id=image_id or ("sha256:" + submission_id.replace("_", "").ljust(64, "0")[:64]),
         solver_name=solver_name,
         solver_version="1.0.0",
-        benchmark_score=score,
         benchmark_rank=1,
         benchmark_details={
             "total_intents": 5,
@@ -198,7 +197,7 @@ def _make_certified_round(score: float = 0.94, quorum: int = 1):
     store = _make_store_with_subs(sub)
     round_store.set_round_finalist(
         current_round.round_id, submission_id="sub_certified",
-        image_id=sub.image_id, benchmark_score=sub.benchmark_score,
+        image_id=sub.image_id,
     )
     round_store.certify_round(
         current_round.round_id,
@@ -240,7 +239,7 @@ class TestEpochManager:
 
         assert result["champion_changed"] is True
         assert mgr.champion.submission_id == "sub_1"
-        assert mgr.champion.benchmark_score == 0.85
+        assert mgr.champion.hotkey == "5Gtest"
         assert mgr.champion.epoch_adopted == 1
 
     def test_finalist_tiebreak_is_deterministic_not_insertion_order(self):
@@ -260,9 +259,19 @@ class TestEpochManager:
         for order in ([a, b, c], [c, b, a], [b, c, a], [c, a, b]):
             ranked = mgr._eligible_candidates(list(order))
             assert [s.submission_id for s in ranked] == ["sub_aaa", "sub_bbb", "sub_ccc"]
-        # A strictly higher score still wins outright (primary key unchanged).
-        top = _make_submission(submission_id="sub_zzz", score=0.99)
-        assert mgr._eligible_candidates([a, top, b])[0].submission_id == "sub_zzz"
+        # The PRIMARY ranking key still trumps the content-addressed tie-break.
+        # Under the relative net-better rule "strictly better" means net-better vs
+        # the CHAMPION, so seed a champion baseline: a challenger that WINS an order
+        # the equally-delivering peers only MATCH sorts first, ahead of the (aaa/bbb)
+        # tie-break it would otherwise lose.
+        champ = _make_submission(submission_id="sub_champ", score=0.952)
+        mgr2 = EpochManager(
+            block_loop=_make_mock_block_loop(),
+            submission_store=_make_store_with_subs(champ),
+        )
+        mgr2._champion = ChampionInfo(submission_id="sub_champ")
+        top = _make_submission(submission_id="sub_zzz", score=0.99)  # wins o1 vs 0.952 champ
+        assert mgr2._eligible_candidates([a, top, b])[0].submission_id == "sub_zzz"
 
     @pytest.mark.asyncio
     async def test_no_submissions_keeps_current(self):
@@ -365,7 +374,7 @@ class TestEpochManager:
         result = await mgr.on_epoch_boundary(epoch=2)
         assert result["champion_changed"] is True
         assert mgr.champion.submission_id == "sub_new"
-        assert mgr.champion.benchmark_score == 0.90
+        assert mgr.champion.solver_name == "new-solver"
 
     @pytest.mark.asyncio
     async def test_hot_swap_with_orchestrator(self):
@@ -519,7 +528,7 @@ class TestEpochManager:
         assert isinstance(champion, dict)
         assert "submission_id" in champion
         assert "solver_name" in champion
-        assert "benchmark_score" in champion
+        assert "hotkey" in champion
         assert "epoch_adopted" in champion
 
     @pytest.mark.asyncio
@@ -877,7 +886,6 @@ class TestEpochManager:
             current_round.round_id,
             submission_id="sub_certified",
             image_id=sub.image_id,
-            benchmark_score=sub.benchmark_score,
         )
         round_store.certify_round(
             current_round.round_id,
@@ -1124,7 +1132,6 @@ class TestChampionInfo:
             submission_id="s1",
             solver_name="my-solver",
             solver_version="2.0.0",
-            benchmark_score=0.92,
             epoch_adopted=5,
             image_tag="solver:v2",
             hotkey="5Gtest",
@@ -1133,13 +1140,13 @@ class TestChampionInfo:
         d = info.to_dict()
         assert d["submission_id"] == "s1"
         assert d["solver_name"] == "my-solver"
-        assert d["benchmark_score"] == 0.92
+        assert d["image_tag"] == "solver:v2"
         assert d["epoch_adopted"] == 5
 
     def test_default_values(self):
         info = ChampionInfo()
         assert info.submission_id is None
-        assert info.benchmark_score == 0.0
+        assert info.solver_name is None
         assert info.epoch_adopted == 0
 
 

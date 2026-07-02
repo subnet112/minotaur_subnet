@@ -277,6 +277,7 @@ class TestE2ESubmissionPipeline(unittest.TestCase):
             SubmissionStore,
             SubmissionStatus,
         )
+        from minotaur_subnet.epoch.relative_scoring import has_delivered_value_rows
 
         store = SubmissionStore()
 
@@ -308,17 +309,34 @@ class TestE2ESubmissionPipeline(unittest.TestCase):
         refreshed = store.get(sub.submission_id)
         self.assertEqual(refreshed.status, SubmissionStatus.BENCHMARKING)
 
-        # Set benchmark results
+        # Set benchmark results. Under the relative / single-stage contract there
+        # is no scalar benchmark_score: a submission is SCORED iff at least one
+        # order DELIVERED value (raw_output parses to > 0), which replaced the
+        # retired `benchmark_score > 0` gate. benchmark_rank is now a display-only
+        # relative rank. Build per-order rows where one order delivered value so
+        # this submission passes the validity gate and scores.
+        per_intent = [
+            {"intent_id": "app:swap", "raw_output": "1000"},
+            {"intent_id": "app:limit", "raw_output": "0"},
+        ]
+        self.assertTrue(has_delivered_value_rows(per_intent))
         store.set_benchmark_result(
             sub.submission_id,
-            score=0.75,
+            valid=has_delivered_value_rows(per_intent),
             rank=1,
-            details={"total_intents": 3, "plans_generated": 2},
+            details={
+                "total_intents": 3,
+                "plans_generated": 2,
+                "per_intent": per_intent,
+            },
         )
         refreshed = store.get(sub.submission_id)
         self.assertEqual(refreshed.status, SubmissionStatus.SCORED)
-        self.assertEqual(refreshed.benchmark_score, 0.75)
         self.assertEqual(refreshed.benchmark_rank, 1)
+        # The delivered-value gate (which replaced benchmark_score > 0) is satisfied.
+        self.assertTrue(
+            has_delivered_value_rows(refreshed.benchmark_details["per_intent"])
+        )
 
         # Adopt
         store.adopt(sub.submission_id)
@@ -345,6 +363,7 @@ class TestE2ESubmissionPipeline(unittest.TestCase):
         )
         from minotaur_subnet.harness.snapshot import build_synthetic_intents
         from minotaur_subnet.shared.types import ScoreResult
+        from minotaur_subnet.epoch.relative_scoring import has_delivered_value_rows
 
         store = SubmissionStore()
         commit_hash = f"e2e{int(time.time())}"
@@ -424,34 +443,47 @@ class TestE2ESubmissionPipeline(unittest.TestCase):
         results = asyncio.run(_benchmark())
         self.assertTrue(len(results) > 0, "No benchmark results")
 
-        # Compute average score
+        # Determine which orders delivered value. Under the relative / single-stage
+        # contract, a submission is SCORED iff at least one order DELIVERED value
+        # (its raw_output parses to > 0) — this replaced the scalar avg-score > 0
+        # gate. Build per-order rows carrying an exact-decimal-wei raw_output: an
+        # order that produced a scoring plan delivered value, the rest delivered
+        # nothing.
         scored = [r for r in results if r.error is None and r.plan is not None]
-        avg_score = sum(r.score for r in scored) / len(scored) if scored else 0.0
+        per_intent = [
+            {
+                "intent_id": r.intent_id,
+                "raw_output": (
+                    "1000000000000000000"
+                    if (r.error is None and r.plan is not None and r.score > 0)
+                    else "0"
+                ),
+                "score": r.score,
+                "error": r.error,
+                "has_plan": r.plan is not None,
+            }
+            for r in results
+        ]
+        valid = has_delivered_value_rows(per_intent)
 
         # 5. Record benchmark results
         store.set_benchmark_result(
             sub.submission_id,
-            score=avg_score,
+            valid=valid,
             rank=1,
             details={
                 "total_intents": len(results),
                 "plans_generated": len(scored),
-                "avg_score": avg_score,
-                "per_intent": [
-                    {
-                        "intent_id": r.intent_id,
-                        "score": r.score,
-                        "error": r.error,
-                        "has_plan": r.plan is not None,
-                    }
-                    for r in results
-                ],
+                "per_intent": per_intent,
             },
         )
 
         refreshed = store.get(sub.submission_id)
         self.assertEqual(refreshed.status, SubmissionStatus.SCORED)
-        self.assertGreater(refreshed.benchmark_score, 0.0)
+        self.assertTrue(
+            has_delivered_value_rows(refreshed.benchmark_details["per_intent"]),
+            "No order delivered value during benchmarking",
+        )
 
         # 6. Adopt as champion
         store.adopt(sub.submission_id)
@@ -467,9 +499,15 @@ class TestE2ESubmissionPipeline(unittest.TestCase):
         )
 
         # Print summary for debugging
+        delivered = sum(
+            1
+            for row in refreshed.benchmark_details["per_intent"]
+            if has_delivered_value_rows([row])
+        )
         print(f"\n  E2E Pipeline Summary:")
         print(f"  Solver: {refreshed.solver_name} v{refreshed.solver_version}")
-        print(f"  Score:  {refreshed.benchmark_score:.4f}")
+        print(f"  Rank:   {refreshed.benchmark_rank}")
+        print(f"  Delivered: {delivered}/{refreshed.benchmark_details['total_intents']} orders")
         print(f"  Plans:  {refreshed.benchmark_details['plans_generated']}/{refreshed.benchmark_details['total_intents']}")
         print(f"  Status: {refreshed.status.value}")
 

@@ -10,6 +10,7 @@ from typing import Any
 
 from . import make_engine
 from .model import DEFAULT_DEX_SCORER, DEFAULT_GENESIS_IMAGE, Fill, LabConfig, Scenario
+from .stages import _card_global
 from .pipeline import FakeBackend, SolverResult, compare, run_solver
 
 
@@ -25,7 +26,7 @@ def _print_solver(res: SolverResult, floor: int | None = None) -> None:
         print(f"  {rec.scenario:<24} {rec.summary}  on_chain={oc_s}{flag}")
     apps = ", ".join(f"{k}={v:.4f}" for k, v in sorted(res.card.app_scores.items()))
     print(f"  per-app: {apps}")
-    print(f"  global : {res.card.global_score:.4f}  "
+    print(f"  global : {_card_global(res.card):.4f}  "
           f"(coverage {res.card.coverage:.0%}, {res.card.total} scenarios)")
     if res.quote_by_app:
         qa = ", ".join(f"{k}={v['mean_err']:+.3f}" for k, v in sorted(res.quote_by_app.items()))

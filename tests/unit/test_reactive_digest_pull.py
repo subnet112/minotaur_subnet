@@ -49,10 +49,10 @@ def test_digest_mode_pulls_by_digest_then_proceeds(monkeypatch):
     local_id = AsyncMock(return_value=f"sha256:{HEX}")
     with patch.object(cc, "_pull_image_by_digest", pull), \
          patch.object(cc, "_resolve_local_image_id", local_id):
-        # Returns (False, 0.0) when the benchmark can't run in a unit env; the
+        # Returns (False, {}) when the benchmark can't run in a unit env; the
         # resolution branch (the part under test) already executed before that.
         _run(cc._reactive_benchmark_candidate(
-            _candidate(), leader_score=0.5, candidate_image_id=HEX,
+            _candidate(), candidate_image_id=HEX,
         ))
     pull.assert_awaited_once()
     assert pull.await_args.args[0] == f"{REPO}@sha256:{HEX}"   # pulled the digest ref
@@ -62,10 +62,10 @@ def test_digest_mode_pulls_by_digest_then_proceeds(monkeypatch):
 def test_digest_mode_refuses_on_pull_failure(monkeypatch):
     monkeypatch.setenv("CANDIDATE_IMAGE_REPO", REPO)
     with patch.object(cc, "_pull_image_by_digest", AsyncMock(return_value=False)):
-        verified, score = _run(cc._reactive_benchmark_candidate(
-            _candidate(), leader_score=0.5, candidate_image_id=HEX,
+        verified, counts = _run(cc._reactive_benchmark_candidate(
+            _candidate(), candidate_image_id=HEX,
         ))
-    assert verified is False and score == 0.0                  # refuse to sign, no benchmark
+    assert verified is False and counts == {}                  # refuse to sign, no benchmark
 
 
 def test_legacy_mode_keeps_local_id_compare():
@@ -75,9 +75,9 @@ def test_legacy_mode_keeps_local_id_compare():
     local_id = AsyncMock(return_value=f"sha256:{'b' * 64}")
     with patch.object(cc, "_pull_image_by_digest", pull), \
          patch.object(cc, "_resolve_local_image_id", local_id):
-        verified, score = _run(cc._reactive_benchmark_candidate(
-            _candidate(), leader_score=0.5, candidate_image_id=f"sha256:{HEX}",
+        verified, counts = _run(cc._reactive_benchmark_candidate(
+            _candidate(), candidate_image_id=f"sha256:{HEX}",
         ))
-    assert verified is False and score == 0.0
+    assert verified is False and counts == {}
     local_id.assert_awaited_once()       # legacy {{.Id}} compare ran
     pull.assert_not_awaited()            # no pull in legacy mode

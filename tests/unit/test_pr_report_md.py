@@ -18,14 +18,16 @@ from minotaur_subnet.harness import orchestrator as orch
 from minotaur_subnet.relayer import solver_repo as sr
 
 
-def _sub(per_intent, *, score=0.7, status="scored", relative=None):
+def _sub(per_intent, *, status="scored", relative=None):
+    # ``Submission.benchmark_score`` was removed with the scalar composite; a
+    # benchmarked submission is now modeled by a truthy ``benchmark_details``
+    # (the report reads the per-order ``relative`` block, never a scalar).
     details = {"per_intent": per_intent}
     if relative is not None:
         details["relative"] = relative
     return SimpleNamespace(
         submission_id="sub_x",
         status=SimpleNamespace(value=status),
-        benchmark_score=score,
         benchmark_details=details,
         screening={},
     )
@@ -37,7 +39,7 @@ def test_render_drops_aggregate_scalars():
     # The legacy aggregate "Your score / Champion" line is removed — under raw-output
     # scoring the JS `score` is a [0,1] validity sentinel, so a scalar is meaningless.
     assert render_report_md(None) == ""
-    sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.7)
+    sub = _sub([{"intent_id": "a", "score": 0.9}])
     rep = build_submission_report(sub, reason="did not beat the champion")
     md = render_report_md(rep, submission_id="sub_x")
     assert "**Your score:**" not in md and "**Champion:**" not in md
@@ -117,8 +119,8 @@ def test_render_adopted_header():
 
 def test_build_and_render_won_header():
     # A scored finalist that BEAT the champion: won=True overrides the
-    # score-derived outcome → "won", and renders the 🏆 win header (not ❌).
-    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
+    # status-derived outcome → "won", and renders the 🏆 win header (not ❌).
+    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}])
     rep = build_submission_report(sub, reason="selected as finalist", won=True)
     assert rep["outcome"] == "won"
     md = render_report_md(rep, submission_id="sub_x")
@@ -147,7 +149,7 @@ def test_on_champion_rejected_pr_body_has_scores():
 def test_on_champion_rejected_pr_falls_back_when_not_benchmarked():
     sub = SimpleNamespace(submission_id="s", pr_number=11,
                           status=SimpleNamespace(value="rejected"),
-                          benchmark_score=None, benchmark_details=None, screening={})
+                          benchmark_details=None, screening={})
     captured = {}
     with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: captured.update(body=b) or True), \
          patch.object(sr, "close_pr", lambda n: True), \
@@ -159,7 +161,7 @@ def test_on_champion_rejected_pr_falls_back_when_not_benchmarked():
 def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
     # WIN path: posts the scored report rendered as a win, and does NOT close the
     # PR or GC the image (the PR stays open for the cert-gated merge).
-    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}], score=0.9)
+    sub = _sub([{"intent_id": "a", "score": 0.9, "on_chain_score": 9900}])
     sub.pr_number = 22
     captured = {}
     calls = {"close": 0, "gc": 0}
@@ -177,31 +179,44 @@ def test_on_champion_finalist_pr_comments_and_keeps_pr_open():
 
 
 def test_on_champion_finalist_pr_skips_without_pr_number():
-    sub = _sub([{"intent_id": "a", "score": 0.9}], score=0.9)  # no pr_number
+    sub = _sub([{"intent_id": "a", "score": 0.9}])  # no pr_number
     with patch.object(sr, "comment_on_pr", lambda n, b, owner_repo=None, token=None: (_ for _ in ()).throw(AssertionError("posted"))):
         assert sr.on_champion_finalist_pr(sub, "selected as finalist") is False
 
 
 # ── manager wiring (call the method unbound with a fake self) ─────────────────
 
-def test_manager_forwards_champion_context():
+def test_manager_forwards_repo_token_not_scalar_context():
+    # The scalar champion context (champion_score / dethrone_margin) was removed
+    # with the scalar composite, so the manager no longer forwards it — a callback
+    # that still declares those kwargs sees only its defaults. The surviving
+    # signature-inspected forward is ``repo_token`` (so the report can post to the
+    # miner's PRIVATE repo).
     from minotaur_subnet.epoch.manager import EpochManager
     rec = {}
 
-    # The cross-fork champion_details surface was removed; the manager forwards
-    # only the scalar champion context the callback declares.
-    def cb(submission, reason, *, champion_score=None, dethrone_margin=None):
-        rec.update(champion_score=champion_score, dethrone_margin=dethrone_margin)
+    def cb(submission, reason, *, repo_token=None, champion_score=None, dethrone_margin=None):
+        rec.update(
+            repo_token=repo_token,
+            champion_score=champion_score,
+            dethrone_margin=dethrone_margin,
+        )
 
     fake_self = SimpleNamespace(
         _on_champion_rejected=cb,
-        _champion=SimpleNamespace(benchmark_score=0.85, submission_id="champ1"),
+        _champion=SimpleNamespace(submission_id="champ1"),
         _dethrone_margin=0.05,
-        _sub_store=SimpleNamespace(get=lambda sid: None),
+        _sub_store=SimpleNamespace(
+            get=lambda sid: None,
+            get_repo_token=lambda sid: "tok-abc",
+        ),
         _is_leader=lambda: True,
     )
-    EpochManager._notify_champion_rejected(fake_self, SimpleNamespace(pr_number=11), "lost")
-    assert rec == {"champion_score": 0.85, "dethrone_margin": 0.05}
+    EpochManager._notify_champion_rejected(
+        fake_self, SimpleNamespace(pr_number=11, submission_id="sub_x"), "lost",
+    )
+    # repo_token is still wired through; the removed scalar context is not.
+    assert rec == {"repo_token": "tok-abc", "champion_score": None, "dethrone_margin": None}
 
 
 def test_manager_legacy_two_arg_callback_still_works():
@@ -209,7 +224,7 @@ def test_manager_legacy_two_arg_callback_still_works():
     seen = {}
     fake_self = SimpleNamespace(
         _on_champion_rejected=lambda submission, reason: seen.update(ok=True),
-        _champion=SimpleNamespace(benchmark_score=0.85, submission_id="c"),
+        _champion=SimpleNamespace(submission_id="c"),
         _dethrone_margin=0.05,
         _sub_store=SimpleNamespace(get=lambda sid: None),
         _is_leader=None,  # ungated
@@ -223,7 +238,7 @@ def test_manager_leader_gate_blocks_follower():
     seen = {}
     fake_self = SimpleNamespace(
         _on_champion_rejected=lambda submission, reason, **kw: seen.update(posted=True),
-        _champion=SimpleNamespace(benchmark_score=0.85, submission_id="c"),
+        _champion=SimpleNamespace(submission_id="c"),
         _dethrone_margin=0.05,
         _sub_store=SimpleNamespace(get=lambda sid: None),
         _is_leader=lambda: False,  # this node is NOT the leader
@@ -239,7 +254,7 @@ def test_manager_refetches_submission_so_report_has_relative_counts():
     from minotaur_subnet.epoch.manager import EpochManager
     rec = {}
 
-    def cb(submission, reason, *, champion_score=None, dethrone_margin=None):
+    def cb(submission, reason, **_):
         rec["details"] = getattr(submission, "benchmark_details", None)
 
     stale = SimpleNamespace(pr_number=11, submission_id="sub_x", benchmark_details={})
@@ -249,7 +264,7 @@ def test_manager_refetches_submission_so_report_has_relative_counts():
     )
     fake_self = SimpleNamespace(
         _on_champion_finalist=cb,
-        _champion=SimpleNamespace(benchmark_score=0.9, submission_id="champ1"),
+        _champion=SimpleNamespace(submission_id="champ1"),
         _dethrone_margin=0.05,
         _sub_store=SimpleNamespace(get=lambda sid: fresh if sid == "sub_x" else None),
         _is_leader=lambda: True,

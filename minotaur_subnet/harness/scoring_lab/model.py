@@ -37,7 +37,10 @@ class Scenario:
     receiver: str = "0x0000000000000000000000000000000000000001"
     contract_address: str = ZERO_ADDR   # fork mode overwrites this from the AppRegistry
     intent_function: str = "swap"
-    stage: str = "synthetic"            # "synthetic" (Stage 1, 0.4) | "historical" (Stage 2, 0.6)
+    stage: str = "synthetic"            # DEPRECATED + IGNORED: benchmarking is one
+                                        # flat set now (no synthetic/historical split
+                                        # or weighting). Kept as an accepted field so
+                                        # existing scenarios.json (Scenario(**s)) load.
     quoted_output: str | None = None    # CoW-fee reference (12th intent param), defaults to min
 
     def to_dict(self) -> dict[str, Any]:

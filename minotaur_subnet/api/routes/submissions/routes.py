@@ -1391,10 +1391,11 @@ async def solver_round_consensus_proposal(
     _can_benchmark = bool(_candidate.image_tag) or is_bare_digest(_proposed_image)
     if not is_builtin and _can_benchmark:
         try:
-            verified, local_score = await _reactive_benchmark_candidate(
+            # Follower verification is this node's OWN relative adopt verdict over the
+            # shared corpus (per-order raw_output, bounded-regression net-better) —
+            # NOT a leader-score tolerance check (that scalar was removed).
+            verified, counts = await _reactive_benchmark_candidate(
                 candidate=_candidate,
-                leader_score=round_state.finalist_score or 0.0,
-                tolerance_pct=0.15,
                 round_id=round_state.round_id,
                 # The leader-signed candidate_image_id: a bare 64-hex digest D in
                 # content-addressed mode (pull <repo>@sha256:D), else legacy {{.Id}}.
@@ -1404,9 +1405,9 @@ async def solver_round_consensus_proposal(
                 return {
                     "approved": False,
                     "reason": (
-                        f"Independent benchmark rejected: "
-                        f"local_score={local_score:.4f} "
-                        f"vs leader_score={round_state.finalist_score:.4f}"
+                        "Independent relative benchmark rejected: "
+                        f"{counts.get('better', 0)} better / {counts.get('worse', 0)} worse "
+                        f"vs the champion (did not meet the net-better rule)"
                     ),
                     "reason_code": RejectionCode.BENCHMARK_MISMATCH.value,
                 }
@@ -1538,7 +1539,6 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
         opened_epoch=int(d.get("opened_epoch") or 0),
         close_epoch=d.get("close_epoch"),
         finalist_submission_id=d.get("finalist_submission_id"),
-        finalist_score=d.get("finalist_score"),
         incumbent_submission_id=d.get("incumbent_submission_id"),
         adopted=adopted,
         adopted_submission_id=(

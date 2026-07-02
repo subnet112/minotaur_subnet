@@ -115,14 +115,15 @@ diagnosis of what needs to improve and why.
    as distinct scenarios; check `scenario["chains"]` explicitly.
 3. `get_score_feedback(app_id)` — recent trend + stats. NOTE post relative-
    cutover the 0..1 JS score is a validity sentinel, not a quality grade: the
-   real bar is the RELATIVE per-order rule (beat the champion's delivered output
-   on every order, strictly win ≥1). The orders where the champion delivers the
-   LEAST output are your opportunity — out-deliver it there without regressing
-   anywhere.
-4. `list_orders(app_id)` — **sample recent filled orders**. The live
-   benchmark replays historical filled orders as Stage 2; if the
-   strategy fails on those replays, the global score tanks regardless
-   of how well the strategy handles Stage 1 manifest scenarios. Check
+   real bar is the RELATIVE per-order NET-BETTER rule (out-deliver the champion on
+   balance — no order cut >1%, drop none, net wins exceed regressions). The orders
+   where the champion delivers the LEAST output are your opportunity — out-deliver
+   it there and keep any regressions within 1%.
+4. `list_orders(app_id)` — **sample recent filled orders**. The live benchmark
+   replays historical orders alongside the manifest scenarios as ONE flat set; if
+   the strategy under-delivers on those replayed orders it loses them in the
+   relative per-order comparison, regardless of how well it handles the synthetic
+   manifest scenarios. Check
    a few recent orders to see the real `min_output_amount` and
    `intent_function` values in use.
 5. `get_app_solidity(app_id)` — only if the ABI doesn't answer a specific

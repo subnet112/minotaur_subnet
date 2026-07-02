@@ -36,9 +36,14 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStore,
 )
 from minotaur_subnet.harness.round_store import RoundStore
-from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker, GENESIS_HOTKEY
 
 os.environ.setdefault("ALLOW_SUBPROCESS_BENCHMARK", "1")
+# These are worker-LOGIC unit tests (routing / genesis / ranking) that mock the
+# actual benchmark call; they do not exercise the fork-pin consensus path. Disable
+# the round-anchored fork pin (default ON in code) so run_once doesn't DEFER on the
+# missing round pin resolver before reaching the logic under test.
+os.environ.setdefault("ROUND_ANCHORED_PIN", "0")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -405,17 +410,19 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
         store.set_image_tag(sub.submission_id, "solver-abc123:screening")
 
-        # Worker with Docker disabled — will reject since no subprocess path
-        # But we can verify it tries to process
-        worker = BenchmarkWorker(store, use_docker=True)
+        # use_docker=False bypasses the "real simulator not wired" defer guard;
+        # _benchmark_submission is mocked so no container actually runs.
+        worker = BenchmarkWorker(store, use_docker=False)
 
-        # Mock the actual benchmarking to avoid Docker
+        # Mock the actual benchmarking to avoid Docker. raw_output>0 makes the
+        # order deliver value, so the submission passes the validity gate -> SCORED.
         async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="test",
                 plan=_make_plan("test"),
                 score=0.75,
                 plan_score=0.75,
+                raw_output="1000",
             )]
 
         worker._benchmark_submission = mock_benchmark_submission
@@ -425,7 +432,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         updated = store.get(sub.submission_id)
         self.assertEqual(updated.status, SubmissionStatus.SCORED)
-        self.assertIsNotNone(updated.benchmark_score)
+        self.assertIsNotNone(updated.benchmark_details)
 
     def test_open_round_blocks_benchmarking_when_round_store_enabled(self):
         """Miner benchmarking waits until the current round is explicitly closed."""
@@ -468,9 +475,15 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
             hotkey="5GrwvaEF_test_hotkey",
             round_id=current_round.round_id,
         )
-        store.set_benchmark_result(sub.submission_id, 0.88, {"ok": True})
+        store.set_benchmark_result(
+            sub.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "dex:s1", "raw_output": "1000"}]},
+        )
 
-        worker = BenchmarkWorker(store, round_store=round_store, use_docker=True)
+        # use_docker=False so the round-gating path is actually exercised (rather
+        # than short-circuiting on the "real simulator not wired" defer guard).
+        worker = BenchmarkWorker(store, round_store=round_store, use_docker=False)
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 0)
@@ -491,7 +504,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
         # No image_tag or solver_path set
 
-        worker = BenchmarkWorker(store)
+        worker = BenchmarkWorker(store, use_docker=False)
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
 
@@ -499,7 +512,13 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         self.assertEqual(updated.status, SubmissionStatus.REJECTED)
 
     def test_run_once_ranks_best_without_adoption(self):
-        """Replay-only worker assigns ranks but does not adopt a champion."""
+        """Replay-only worker assigns ranks but does not adopt a champion.
+
+        Ranking is now RELATIVE NET-BETTER (delivered-value breadth) vs the
+        champion, not a scalar score. With no champion every delivered order is a
+        blind-spot cover, so the broader solver (more orders delivering value)
+        ranks first.
+        """
         store = SubmissionStore()
         sub1 = store.create(
             repo_url="https://github.com/a/s", commit_hash="aaa1234",
@@ -518,17 +537,23 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
                 "sha256:" + s.commit_hash.ljust(64, "0")[:64],
             )
 
-        worker = BenchmarkWorker(store)
-        scores = {sub1.submission_id: 0.65, sub2.submission_id: 0.85}
+        worker = BenchmarkWorker(store, use_docker=False)
+        # sub2 delivers value on TWO orders, sub1 on ONE — sub2 is net-broader.
+        value_orders = {
+            sub1.submission_id: [("test_a", "1000")],
+            sub2.submission_id: [("test_a", "1000"), ("test_b", "1000")],
+        }
 
         async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
-            # Determine which submission this is
-            for sid, score in scores.items():
+            for sid, orders in value_orders.items():
                 sub = store.get(sid)
                 if sub and sub.image_tag == image_tag:
-                    return [BenchmarkResult(
-                        intent_id="test", plan=_make_plan(), score=score,
-                    )]
+                    return [
+                        BenchmarkResult(
+                            intent_id=iid, plan=_make_plan(), score=0.5, raw_output=raw,
+                        )
+                        for iid, raw in orders
+                    ]
             return []
 
         worker._benchmark_submission = mock_benchmark_submission
@@ -538,23 +563,12 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         s1 = store.get(sub1.submission_id)
         s2 = store.get(sub2.submission_id)
 
-        # sub2 should rank first, but both remain replay-scored only
+        # sub2 (broader delivery) ranks first, but both remain replay-scored only
         self.assertEqual(s2.status, SubmissionStatus.SCORED)
         self.assertEqual(s1.status, SubmissionStatus.SCORED)
         self.assertEqual(s2.benchmark_rank, 1)
         self.assertEqual(s1.benchmark_rank, 2)
         self.assertIsNone(store.get_champion())
-
-    def test_compute_avg_score(self):
-        worker = BenchmarkWorker(SubmissionStore())
-        results = [
-            BenchmarkResult(intent_id="a", score=0.8, plan=_make_plan()),
-            BenchmarkResult(intent_id="b", score=0.6, plan=_make_plan()),
-            BenchmarkResult(intent_id="c", score=0.0, error="crashed"),
-        ]
-        avg = worker._compute_avg_score(results)
-        # Only 2 scored (the one with error is excluded)
-        self.assertAlmostEqual(avg, 0.7, places=2)
 
     def test_results_to_details(self):
         worker = BenchmarkWorker(SubmissionStore())
@@ -588,7 +602,11 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
             repo_url="https://github.com/a/s", commit_hash="champ123",
             epoch=42, hotkey="champ_key",
         )
-        store.set_benchmark_result(champion.submission_id, score=0.80)
+        store.set_benchmark_result(
+            champion.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "test", "raw_output": "1000"}]},
+        )
         store.adopt(champion.submission_id)
 
         challenger = store.create(
@@ -599,10 +617,13 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         store.set_image_tag(challenger.submission_id, "solver-chal:screening")
         store.set_image_id(challenger.submission_id, "sha256:" + "b" * 64)
 
-        worker = BenchmarkWorker(store)
+        worker = BenchmarkWorker(store, use_docker=False)
 
+        # Challenger beats the champion on the shared order (2000 > 1000).
         async def mock_benchmark(image_tag, intents, score_fn, reference_quotes=None):
-            return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.99)]
+            return [BenchmarkResult(
+                intent_id="test", plan=_make_plan(), score=0.99, raw_output="2000",
+            )]
 
         worker._benchmark_submission = mock_benchmark
         asyncio.run(worker.run_once())
@@ -648,7 +669,11 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         )
         self.assertIsNone(store.get_champion())
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
-        store.set_benchmark_result(sub.submission_id, score=0.5)
+        store.set_benchmark_result(
+            sub.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "a", "raw_output": "1000"}]},
+        )
         store.adopt(sub.submission_id)
         champion = store.get_champion()
         self.assertIsNotNone(champion)
@@ -772,8 +797,12 @@ class TestEnrichIntentsWithManifests(unittest.TestCase):
 class TestBenchmarkWorkerSolverPath(unittest.TestCase):
     """Tests for solver_path-based benchmarking (source submissions)."""
 
-    def test_solver_path_submission_is_benchmarked(self):
-        """Submissions with solver_path use subprocess mode, not Docker."""
+    def test_solver_path_submission_is_rejected(self):
+        """Source solver_path submissions can no longer be benchmarked.
+
+        Subprocess mode is permanently disabled, so a solver_path submission is
+        rejected by policy instead of being scored.
+        """
         store = SubmissionStore()
         sub = store.create(
             repo_url="source://inline",
@@ -784,26 +813,19 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
         store.set_solver_path(sub.submission_id, "/tmp/fake_solver.py")
 
-        worker = BenchmarkWorker(store)
-
-        # Mock _benchmark_solver_path to avoid real subprocess
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
-            self.assertEqual(solver_path, "/tmp/fake_solver.py")
-            return [BenchmarkResult(
-                intent_id="test", plan=_make_plan(), score=0.7, plan_score=0.7,
-            )]
-
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker = BenchmarkWorker(store, use_docker=False)
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
 
         updated = store.get(sub.submission_id)
-        self.assertEqual(updated.status, SubmissionStatus.SCORED)
-        self.assertAlmostEqual(updated.benchmark_score, 0.7, places=2)
+        self.assertEqual(updated.status, SubmissionStatus.REJECTED)
+        self.assertIn("disabled by policy", updated.rejection_reason or "")
 
     def test_solver_path_preferred_over_image_tag(self):
-        """When both solver_path and image_tag are set, solver_path is used."""
+        """When both solver_path and image_tag are set, the solver_path branch is
+        evaluated first. Subprocess mode is disabled, so the submission is rejected
+        by policy and the Docker path is never taken."""
         store = SubmissionStore()
         sub = store.create(
             repo_url="source://inline",
@@ -815,21 +837,17 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.set_solver_path(sub.submission_id, "/tmp/solver.py")
         store.set_image_tag(sub.submission_id, "solver-abc:screening")
 
-        worker = BenchmarkWorker(store)
-        path_used = []
-
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
-            path_used.append(solver_path)
-            return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.5)]
+        worker = BenchmarkWorker(store, use_docker=False)
 
         async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             self.fail("Docker benchmark should not be called when solver_path exists")
 
-        worker._benchmark_solver_path = mock_benchmark_solver_path
         worker._benchmark_submission = mock_benchmark_submission
 
         asyncio.run(worker.run_once())
-        self.assertEqual(path_used, ["/tmp/solver.py"])
+        updated = store.get(sub.submission_id)
+        self.assertEqual(updated.status, SubmissionStatus.REJECTED)
+        self.assertIn("disabled by policy", updated.rejection_reason or "")
 
     def test_solver_path_rejected_when_policy_disabled(self):
         """Source solver_path submissions are rejected when subprocess mode is disabled."""
@@ -843,7 +861,7 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
         store.set_solver_path(sub.submission_id, "/tmp/solver.py")
 
-        worker = BenchmarkWorker(store)
+        worker = BenchmarkWorker(store, use_docker=False)
         with patch.dict(os.environ, {"ALLOW_SUBPROCESS_BENCHMARK": "0"}, clear=False):
             processed = asyncio.run(worker.run_once())
         self.assertEqual(processed, 1)
@@ -858,32 +876,35 @@ class TestGenesisBootstrap(unittest.TestCase):
 
     def test_genesis_runs_when_no_champion_and_solving_apps(self):
         """Genesis creates a baseline submission when conditions are met."""
-        from minotaur_subnet.harness.benchmark_worker import GENESIS_HOTKEY
-
         store = SubmissionStore()
         app_store = MagicMock()
 
         # Mock: one app in SOLVING status
-        from minotaur_subnet.shared.types import AppStatus, DeploymentResult
+        from minotaur_subnet.shared.types import AppStatus
         mock_app = _make_intent("dex-app")
         app_store.list_apps.return_value = [mock_app]
         mock_deployment = MagicMock()
         mock_deployment.status = AppStatus.SOLVING
+        mock_deployment.chain_id = 1
         app_store.get_deployment.return_value = mock_deployment
 
+        # Genesis now benchmarks a Docker image (genesis_solver_image), not a
+        # subprocess baseline path. use_docker=False bypasses the simulator guard.
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
-        # Mock the actual benchmarking
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
+        # Mock the actual (Docker) benchmarking; raw_output>0 => delivered value.
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
+                raw_output="1000",
             )]
 
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker._benchmark_submission = mock_benchmark_submission
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
@@ -895,7 +916,6 @@ class TestGenesisBootstrap(unittest.TestCase):
 
     def test_genesis_uses_current_round_when_round_store_present(self):
         """Genesis bootstrap should inherit the active solver round ID."""
-        from minotaur_subnet.harness.benchmark_worker import GENESIS_HOTKEY
         from minotaur_subnet.shared.types import AppStatus
 
         store = SubmissionStore()
@@ -906,21 +926,24 @@ class TestGenesisBootstrap(unittest.TestCase):
         app_store.list_apps.return_value = [mock_app]
         mock_deployment = MagicMock()
         mock_deployment.status = AppStatus.SOLVING
+        mock_deployment.chain_id = 1
         app_store.get_deployment.return_value = mock_deployment
 
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
             round_store=round_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
+                raw_output="1000",
             )]
 
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker._benchmark_submission = mock_benchmark_submission
 
         asyncio.run(worker.run_once())
 
@@ -938,28 +961,33 @@ class TestGenesisBootstrap(unittest.TestCase):
             epoch=1, hotkey="existing_miner",
         )
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
-        store.set_benchmark_result(sub.submission_id, score=0.8)
+        store.set_benchmark_result(
+            sub.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "a", "raw_output": "1000"}]},
+        )
         store.adopt(sub.submission_id)
 
         worker = BenchmarkWorker(
             store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 0)  # No work done
 
-    def test_genesis_skipped_without_baseline_path(self):
-        """Genesis does not run if no baseline solver path is configured."""
+    def test_genesis_skipped_without_genesis_image(self):
+        """Genesis does not run if no genesis solver image is configured."""
         store = SubmissionStore()
-        worker = BenchmarkWorker(store, baseline_solver_path=None)
+        worker = BenchmarkWorker(store, genesis_solver_image=None, use_docker=False)
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 0)
 
     def test_genesis_idempotent(self):
         """Running genesis twice does not create duplicate submissions."""
-        from minotaur_subnet.harness.benchmark_worker import GENESIS_HOTKEY, GENESIS_EPOCH
+        from minotaur_subnet.harness.benchmark_worker import GENESIS_EPOCH
 
         store = SubmissionStore()
         app_store = MagicMock()
@@ -969,20 +997,23 @@ class TestGenesisBootstrap(unittest.TestCase):
         app_store.list_apps.return_value = [mock_app]
         mock_deployment = MagicMock()
         mock_deployment.status = AppStatus.SOLVING
+        mock_deployment.chain_id = 1
         app_store.get_deployment.return_value = mock_deployment
 
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
+                raw_output="1000",
             )]
 
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker._benchmark_submission = mock_benchmark_submission
 
         # Run twice
         asyncio.run(worker.run_once())
@@ -1004,7 +1035,8 @@ class TestGenesisBootstrap(unittest.TestCase):
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
         result = asyncio.run(worker.run_once())
@@ -1026,7 +1058,11 @@ class TestChampionBootstrap(unittest.TestCase):
             hotkey="champion_miner",
         )
         store.set_image_tag(champion.submission_id, "solver-champ:screening")
-        store.set_benchmark_result(champion.submission_id, score=0.9)
+        store.set_benchmark_result(
+            champion.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "x", "raw_output": "1000"}]},
+        )
         store.adopt(champion.submission_id)
 
         solving_app = _make_intent("solving-app")
@@ -1043,7 +1079,7 @@ class TestChampionBootstrap(unittest.TestCase):
 
         app_store.get_deployment.side_effect = _deployment_for
 
-        worker = BenchmarkWorker(store, app_store=app_store, baseline_solver_path=None)
+        worker = BenchmarkWorker(store, app_store=app_store, use_docker=False)
 
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
@@ -1055,6 +1091,7 @@ class TestChampionBootstrap(unittest.TestCase):
                 intent_id="solving-app",
                 plan=_make_plan("solving-app"),
                 score=0.6,
+                raw_output="1000",
             )]
 
         worker._build_score_fn = mock_build_score_fn
@@ -1067,9 +1104,9 @@ class TestChampionBootstrap(unittest.TestCase):
             "solving-app", 1, AppStatus.SOLVED,
         )
 
-    def test_genesis_champion_uses_baseline_solver_path_for_bootstrap(self):
-        """Builtin genesis champion should bootstrap solving apps via baseline path."""
-        from minotaur_subnet.harness.benchmark_worker import GENESIS_HOTKEY
+    def test_genesis_champion_uses_genesis_image_for_bootstrap(self):
+        """Builtin genesis champion (no image_tag) bootstraps solving apps via the
+        configured genesis solver image."""
         from minotaur_subnet.shared.types import AppStatus
 
         store = SubmissionStore()
@@ -1079,7 +1116,11 @@ class TestChampionBootstrap(unittest.TestCase):
             epoch=0,
             hotkey=GENESIS_HOTKEY,
         )
-        store.set_benchmark_result(champion.submission_id, score=0.9)
+        store.set_benchmark_result(
+            champion.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "x", "raw_output": "1000"}]},
+        )
         store.adopt(champion.submission_id)
 
         solving_app = _make_intent("solving-app")
@@ -1095,23 +1136,25 @@ class TestChampionBootstrap(unittest.TestCase):
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
-            self.assertEqual(solver_path, "/tmp/fake_baseline.py")
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+            self.assertEqual(image_tag, "genesis:latest")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
                 intent_id="solving-app",
                 plan=_make_plan("solving-app"),
                 score=0.6,
+                raw_output="1000",
             )]
 
         worker._build_score_fn = mock_build_score_fn
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker._benchmark_submission = mock_benchmark_submission
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
@@ -1121,7 +1164,6 @@ class TestChampionBootstrap(unittest.TestCase):
 
     def test_scored_genesis_bootstraps_new_solving_apps_without_adoption(self):
         """A scored genesis baseline can bootstrap later apps before activation."""
-        from minotaur_subnet.harness.benchmark_worker import GENESIS_HOTKEY
         from minotaur_subnet.shared.types import AppStatus
 
         store = SubmissionStore()
@@ -1131,7 +1173,11 @@ class TestChampionBootstrap(unittest.TestCase):
             epoch=0,
             hotkey=GENESIS_HOTKEY,
         )
-        store.set_benchmark_result(genesis.submission_id, score=0.9)
+        store.set_benchmark_result(
+            genesis.submission_id,
+            valid=True,
+            details={"per_intent": [{"intent_id": "x", "raw_output": "1000"}]},
+        )
 
         solving_app = _make_intent("solving-app")
         app_store = MagicMock()
@@ -1146,23 +1192,25 @@ class TestChampionBootstrap(unittest.TestCase):
         worker = BenchmarkWorker(
             store,
             app_store=app_store,
-            baseline_solver_path="/tmp/fake_baseline.py",
+            genesis_solver_image="genesis:latest",
+            use_docker=False,
         )
 
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_solver_path(solver_path, intents, score_fn, reference_quotes=None):
-            self.assertEqual(solver_path, "/tmp/fake_baseline.py")
+        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+            self.assertEqual(image_tag, "genesis:latest")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
                 intent_id="solving-app",
                 plan=_make_plan("solving-app"),
                 score=0.6,
+                raw_output="1000",
             )]
 
         worker._build_score_fn = mock_build_score_fn
-        worker._benchmark_solver_path = mock_benchmark_solver_path
+        worker._benchmark_submission = mock_benchmark_submission
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)

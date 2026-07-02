@@ -17,8 +17,9 @@ fraction of comparable orders NOT yet beating the champion
 to an ``avg_score``-derived headroom (unit-robust: it accepts both the legacy
 0..1 form and the new on-chain BPS form), so it never crashes on missing data.
 
-Miners always work to improve — there is no "good enough". The goal is to
-become champion by beating the incumbent on every order (relative dethrone).
+Miners always work to improve — there is no "good enough". The goal is to become
+champion under the relative NET-BETTER rule: out-deliver the incumbent on balance
+(no order cut >1%, drop none, net wins exceed regressions).
 
 Improvement target reasons:
 - no_strategy: App has no strategy at all (new app discovered)
@@ -303,8 +304,8 @@ class ScoreTracker:
 
         # Champion target: the champion has NO absolute score post-cutover (it is
         # the relative baseline; the API serves champion_score as null/0), so the
-        # numeric ``target_score`` is vestigial — the real bar is "beat the champion
-        # on every order" (verdict == dethrone). Kept defensively for back-compat.
+        # numeric ``target_score`` is vestigial — the real bar is the relative
+        # NET-BETTER verdict (verdict == dethrone). Kept defensively for back-compat.
         champion_score = float(stats.get("champion_score") or 0.0)
         target_score = champion_score * 1.05  # dethrone margin (legacy display)
 

@@ -12,9 +12,13 @@ cannot conclude the challenger genuinely beats the incumbent per order:
   (d) bootstrap (no incumbent + delivers value) -> ADOPT (must not deadlock)
   (e) champion exists but its image is unresolvable -> REJECT (conservative)
   (f) the challenger benchmark needs a real simulator and none is available
-      (RealSimulationUnavailable) -> fail CLOSED -> (False, 0.0)
+      (RealSimulationUnavailable) -> fail CLOSED -> (False, {})
   (g) the CHAMPION benchmark needs a real simulator and none is available
       -> fail CLOSED -> REJECT
+
+The scalar composite / leader-score-tolerance check was removed: the verdict is now
+the pure relative per-order rule and the second tuple element is a COUNTS dict
+(``better``/``worse``/``matched``/``compared``), not an aggregate score.
 
 Hermetic: Docker, Anvil, the orchestrator and every BenchmarkWorker IO method are
 mocked. The PURE ``evaluate_relative_adoption`` rule runs for real so the verdict
@@ -66,7 +70,6 @@ async def _run_dissent(
     *,
     chal_orders,
     champ_orders,
-    chal_avg: float = 0.9,
     has_incumbent: bool = True,
     champ_image: str | None = "champ:latest",
     challenger_sim_unavailable: bool = False,
@@ -78,7 +81,9 @@ async def _run_dissent(
 
     The challenger pass runs first (inside _reactive_benchmark_candidate), then the
     champion pass runs inside _independent_adopt_vote — distinguished by a call
-    counter on the patched run_benchmark.
+    counter on the patched run_benchmark. Returns ``(verified, counts)`` where
+    counts is the relative better/worse/matched breakdown (``{}`` on a fail-closed
+    reject).
     """
     from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
 
@@ -93,10 +98,6 @@ async def _run_dissent(
         if state["calls"] == 2 and champion_sim_unavailable:
             raise RealSimulationUnavailable("no real sim (champion)")
         return chal_results if state["calls"] == 1 else champ_results
-
-    def fake_compute_avg(self, results):
-        # Only the returned challenger score is asserted; champion avg is log-only.
-        return chal_avg
 
     def fake_scorecard(self, results):
         # Used only by the determinism-logging block (reads .app_onchain).
@@ -150,9 +151,6 @@ async def _run_dissent(
             new=AsyncMock(return_value={"dex": {"quoted_output": "1"}}),
         ),
         patch.object(
-            BenchmarkWorker, "_compute_avg_score", new=fake_compute_avg,
-        ),
-        patch.object(
             BenchmarkWorker, "_build_scorecard", new=fake_scorecard,
         ),
         patch.object(
@@ -165,7 +163,6 @@ async def _run_dissent(
     ):
         return await _reactive_benchmark_candidate(
             candidate=_candidate(),
-            leader_score=chal_avg,
             round_id="round-dissent",
         )
 
@@ -176,11 +173,12 @@ async def _run_dissent(
 @pytest.mark.asyncio
 async def test_challenger_only_matched_rejects():
     # Identical per-order output everywhere -> matched, no win -> not adopted.
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "100")], champ_orders=[("o1", "100")], chal_avg=0.70,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "100")], champ_orders=[("o1", "100")],
     )
     assert verified is False, "a challenger that only ties must not be adopted"
-    assert score == pytest.approx(0.70)
+    assert counts["better"] == 0, "no order is better on a pure tie"
+    assert counts["matched"] == 1
 
 
 # ── (b) challenger strictly wins an order -> AGREE (ADOPT) ────────────────────
@@ -188,11 +186,12 @@ async def test_challenger_only_matched_rejects():
 
 @pytest.mark.asyncio
 async def test_challenger_wins_an_order_adopts():
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")], chal_avg=0.80,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")],
     )
     assert verified is True, "a strict per-order win with no regression must adopt"
-    assert score == pytest.approx(0.80)
+    assert counts["better"] == 1
+    assert counts["worse"] == 0
 
 
 # ── (c) regression veto: challenger drops an order the champion served ────────
@@ -202,21 +201,22 @@ async def test_challenger_wins_an_order_adopts():
 async def test_challenger_drops_order_vetoes():
     # Challenger delivers nothing ("0") on an order the champion served -> dropped
     # -> regression -> REJECT, even though it never under-delivers a positive amount.
-    verified, _ = await _run_dissent(
-        chal_orders=[("o1", "0")], champ_orders=[("o1", "100")], chal_avg=0.95,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "0")], champ_orders=[("o1", "100")],
     )
-    assert verified is False, "a dropped order must veto regardless of aggregate score"
+    assert verified is False, "a dropped order must veto regardless of the tally"
+    assert counts["worse"] >= 1, "the dropped order counts on the worse side"
 
 
 @pytest.mark.asyncio
 async def test_challenger_regresses_an_order_vetoes():
     # One clear win but one regression -> the regression vetoes adoption.
-    verified, _ = await _run_dissent(
+    verified, counts = await _run_dissent(
         chal_orders=[("o1", "200"), ("o2", "50")],
         champ_orders=[("o1", "100"), ("o2", "100")],
-        chal_avg=0.95,
     )
     assert verified is False, "any per-order regression vetoes"
+    assert counts["better"] >= 1 and counts["worse"] >= 1
 
 
 # ── (d) bootstrap: no incumbent + delivers value -> ADOPT (no deadlock) ───────
@@ -224,18 +224,18 @@ async def test_challenger_regresses_an_order_vetoes():
 
 @pytest.mark.asyncio
 async def test_bootstrap_no_incumbent_adopts_when_delivers_value():
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "100")], champ_orders=[], chal_avg=0.55,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "100")], champ_orders=[],
         has_incumbent=False,
     )
     assert verified is True, "first champion delivering value must adopt (no deadlock)"
-    assert score == pytest.approx(0.55)
+    assert counts["better"] == 1, "the delivered order is a blind-spot cover (better)"
 
 
 @pytest.mark.asyncio
 async def test_bootstrap_rejects_when_no_value_delivered():
     verified, _ = await _run_dissent(
-        chal_orders=[("o1", "0")], champ_orders=[], chal_avg=0.10,
+        chal_orders=[("o1", "0")], champ_orders=[],
         has_incumbent=False,
     )
     assert verified is False, "a first champion delivering nothing must be rejected"
@@ -246,15 +246,15 @@ async def test_bootstrap_rejects_when_no_value_delivered():
 
 @pytest.mark.asyncio
 async def test_incumbent_image_unresolvable_rejects():
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")], chal_avg=0.90,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")],
         has_incumbent=True, champ_image=None,
     )
     assert verified is False, (
         "with an incumbent whose image can't be resolved improvement can't be "
         "proven -> dissent"
     )
-    assert score == pytest.approx(0.90)
+    assert counts == {}, "an unresolvable champion yields no comparison counts"
 
 
 # ── (f) challenger benchmark requires real sim, none available -> fail closed ─
@@ -262,12 +262,12 @@ async def test_incumbent_image_unresolvable_rejects():
 
 @pytest.mark.asyncio
 async def test_challenger_real_sim_unavailable_fails_closed():
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")], chal_avg=0.90,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")],
         challenger_sim_unavailable=True,
     )
     assert verified is False
-    assert score == 0.0, "RealSimulationUnavailable must fail closed to (False, 0.0)"
+    assert counts == {}, "RealSimulationUnavailable must fail closed to (False, {})"
 
 
 # ── (g) champion benchmark requires real sim, none available -> REJECT ───────
@@ -277,13 +277,14 @@ async def test_challenger_real_sim_unavailable_fails_closed():
 async def test_champion_real_sim_unavailable_rejects():
     # The challenger pass succeeds; the CHAMPION re-benchmark hits
     # RealSimulationUnavailable -> we cannot verify improvement -> REJECT.
-    verified, score = await _run_dissent(
-        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")], chal_avg=0.90,
+    verified, counts = await _run_dissent(
+        chal_orders=[("o1", "200")], champ_orders=[("o1", "100")],
         champion_sim_unavailable=True,
     )
     assert verified is False, (
         "if the champion benchmark needs a real sim and none is available the "
         "follower cannot verify improvement -> dissent"
     )
-    # _independent_adopt_vote returns (False, chal_score) here, not (False, 0.0).
-    assert score == pytest.approx(0.90)
+    # _independent_adopt_vote fails closed to (False, {}) — no counts on an
+    # unverifiable champion (was the retired (False, chal_score)).
+    assert counts == {}

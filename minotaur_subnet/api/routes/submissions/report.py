@@ -61,7 +61,7 @@ def build_submission_report(
     details = getattr(sub, "benchmark_details", None) or {}
     screening = getattr(sub, "screening", None) or {}
 
-    benchmarked = bool(details) or getattr(sub, "benchmark_score", None) is not None
+    benchmarked = bool(details)
     rejected_in_screening = status == "rejected" and not benchmarked
     if not benchmarked and not rejected_in_screening:
         return None  # queued / screening / benchmarking — no report yet

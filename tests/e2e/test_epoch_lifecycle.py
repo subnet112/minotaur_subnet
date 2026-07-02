@@ -24,6 +24,7 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStatus,
     SubmissionStore,
 )
+from minotaur_subnet.epoch.relative_scoring import has_delivered_value_rows
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.orderbook.orderbook import IntentOrderBook
 from minotaur_subnet.relayer.base import MockRelayer
@@ -196,7 +197,15 @@ class TestBenchmarkWorker:
         self._test_intents = test_intents or _build_test_intents()
 
     async def run_once(self) -> int:
-        """Benchmark all BENCHMARKING submissions."""
+        """Benchmark all BENCHMARKING submissions.
+
+        Single-stage/relative model: there is no scalar composite score. Each
+        submission is scored into per-order ``raw_output`` rows (the delivered value
+        in wei); it is marked SCORED iff it delivered value on >= 1 order
+        (``has_delivered_value_rows`` — the validity gate that replaced
+        ``benchmark_score > 0``), else REJECTED. The best-delivering scored
+        submission is then adopted.
+        """
         pending = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
         if not pending:
             return 0
@@ -209,46 +218,74 @@ class TestBenchmarkWorker:
             try:
                 session = await self._orchestrator.start_docker(sub.image_tag)
                 await session.initialize({"epoch": sub.epoch})
-                score = self._benchmark_session(session)
-                self._sub_store.set_benchmark_result(
-                    sub.submission_id, score=score,
-                    details={"method": "in-process"},
-                )
+                rows = self._benchmark_session(session)
             except Exception as exc:
                 self._sub_store.set_benchmark_result(
-                    sub.submission_id, score=0.0,
-                    details={"error": str(exc)},
+                    sub.submission_id, valid=False,
+                    details={"error": str(exc), "per_intent": []},
                 )
+                continue
 
-        # Rank and adopt
+            self._sub_store.set_benchmark_result(
+                sub.submission_id,
+                valid=has_delivered_value_rows(rows),
+                details={"method": "in-process", "per_intent": rows},
+            )
+
+        # Rank the scored submissions by total delivered value (a net-better proxy)
+        # and adopt the best. The display rank is set via set_benchmark_rank (no
+        # status flip); adoption is a separate call.
         scored = self._sub_store.list_by_status(SubmissionStatus.SCORED)
         if scored:
-            scored.sort(key=lambda s: s.benchmark_score or 0, reverse=True)
+            scored.sort(key=_delivered_value_total, reverse=True)
             for i, s in enumerate(scored):
-                self._sub_store.set_benchmark_result(
-                    s.submission_id, score=s.benchmark_score or 0,
-                    rank=i + 1, details=s.benchmark_details,
-                )
+                self._sub_store.set_benchmark_rank(s.submission_id, i + 1)
             best = scored[0]
-            if best.benchmark_score and best.benchmark_score > 0:
+            if _delivered_value_total(best) > 0:
                 self._sub_store.adopt(best.submission_id)
 
         return len(pending)
 
-    def _benchmark_session(self, session: MockSolverSession) -> float:
-        """Run solver against test intents and compute average score."""
-        scores = []
-        for intent_def, state, snapshot in self._test_intents:
+    def _benchmark_session(self, session: MockSolverSession) -> list[dict[str, Any]]:
+        """Run the solver against the test intents → per-order ``raw_output`` rows.
+
+        Each row carries the delivered value as an EXACT DECIMAL WEI STRING (what the
+        live raw-output scorer emits). A richer plan delivers more value; an empty
+        plan or a crash delivers ``"0"`` (no value → the validity gate rejects it).
+        """
+        rows: list[dict[str, Any]] = []
+        for i, (intent_def, state, snapshot) in enumerate(self._test_intents):
+            intent_id = f"{intent_def.app_id}:{i}"
             try:
                 plan = session.generate_plan(intent_def, state, snapshot)
                 if plan and len(plan.interactions) > 0:
-                    score = 0.5 + min(len(plan.interactions) * 0.15, 0.4)
+                    wei = (1000 + len(plan.interactions) * 500) * 10**18
                 else:
-                    score = 0.1
-                scores.append(score)
+                    wei = 0
             except Exception:
-                scores.append(0.0)
-        return sum(scores) / len(scores) if scores else 0.0
+                wei = 0
+            rows.append({"intent_id": intent_id, "raw_output": str(wei)})
+        return rows
+
+
+def _delivered_value_total(sub: Any) -> int:
+    """Sum a submission's per-order delivered value (raw_output wei); 0 if none.
+
+    The relative model has no scalar score, so this simple total stands in for
+    "how much value did this solver deliver" — enough for the mock worker to rank
+    submissions and pick a best-delivering champion.
+    """
+    details = sub.benchmark_details or {}
+    rows = details.get("per_intent") if isinstance(details, dict) else None
+    total = 0
+    for row in rows or []:
+        try:
+            val = int(str(row.get("raw_output")))
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            total += val
+    return total
 
 
 def _build_test_intents():
@@ -393,8 +430,10 @@ class TestBenchmarking:
 
         assert processed == 1
         refreshed = sub_store.get(sub.submission_id)
-        assert refreshed.benchmark_score is not None
-        assert refreshed.benchmark_score > 0
+        # No scalar score anymore: a scored solver is one that delivered value on
+        # >= 1 order (per-order raw_output rows), ending up SCORED or ADOPTED.
+        assert refreshed.benchmark_details is not None
+        assert has_delivered_value_rows(refreshed.benchmark_details["per_intent"])
         assert refreshed.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED)
 
     def test_champion_selection(self, sub_store, benchmark_worker):
@@ -418,7 +457,7 @@ class TestBenchmarking:
         assert len(adopted) == 1
 
     def test_fallback_on_solver_failure(self, sub_store, benchmark_worker):
-        """Bad solver → score 0 → not adopted."""
+        """Bad solver → delivers no value → REJECTED, not adopted."""
         sub = sub_store.create(
             "https://github.com/bad/solver", "bad1", epoch=3, hotkey="5Gbad..."
         )
@@ -428,13 +467,46 @@ class TestBenchmarking:
         asyncio.get_event_loop().run_until_complete(benchmark_worker.run_once())
 
         refreshed = sub_store.get(sub.submission_id)
-        assert refreshed.benchmark_score == 0.0
+        # A crashing solver delivers no value → fails the validity gate → REJECTED
+        # (the retired scalar path recorded score 0.0), and is never adopted.
+        assert refreshed.status == SubmissionStatus.REJECTED
+        assert not has_delivered_value_rows(
+            (refreshed.benchmark_details or {}).get("per_intent")
+        )
+        assert sub_store.list_by_status(SubmissionStatus.ADOPTED) == []
+
+
+# Fake immutable image id used by the tests that actually ADOPT a champion. The
+# champion-eligibility policy (image_id must be a sha256 + signed provenance) is
+# ORTHOGONAL to the scalar removal, so these tests satisfy it with test-only setup.
+_FAKE_IMAGE_ID = "sha256:" + "ab" * 32
+
+
+def _make_champion_eligible(sub_store, submission_id, monkeypatch):
+    """Give a submission the champion-eligibility prerequisites that never depended
+    on the (now-removed) scalar score: a valid immutable ``image_id``, a stubbed
+    docker id-resolver (real docker is unavailable in-process, and ``_hot_swap``
+    verifies the local image id against the certified one), and provenance
+    verification disabled. This is pure test setup — it lets the test exercise the
+    real adoption/hot-swap path rather than being blocked by the eligibility gate.
+    """
+    monkeypatch.setenv("REQUIRE_SIGNED_PROVENANCE", "false")
+    monkeypatch.setenv("REQUIRE_ASYMMETRIC_PROVENANCE", "false")
+    sub_store.set_image_id(submission_id, _FAKE_IMAGE_ID)
+
+    async def _fake_resolve(image_tag):
+        return _FAKE_IMAGE_ID
+
+    monkeypatch.setattr(
+        "minotaur_subnet.epoch.manager._resolve_image_id_via_docker",
+        _fake_resolve,
+    )
 
 
 class TestEpochManager:
     """Epoch lifecycle: boundary detection → benchmark → champion selection."""
 
-    def test_dethrone_margin(self, sub_store, orchestrator, app_store):
+    def test_dethrone_margin(self, sub_store, orchestrator, app_store, monkeypatch):
         """Challenger must beat champion by the dethrone margin to be adopted."""
         bw = TestBenchmarkWorker(sub_store, orchestrator)
         epoch_mgr = EpochManager(
@@ -450,15 +522,18 @@ class TestEpochManager:
         )
         sub_store.update_status(sub1.submission_id, SubmissionStatus.BENCHMARKING)
         sub_store.set_image_tag(sub1.submission_id, "good-solver:latest")
+        _make_champion_eligible(sub_store, sub1.submission_id, monkeypatch)
 
         result = asyncio.get_event_loop().run_until_complete(
             epoch_mgr.on_epoch_boundary(epoch=10)
         )
 
         assert result["champion_changed"] is True
-        assert epoch_mgr.champion.benchmark_score > 0
+        # ChampionInfo no longer carries a scalar benchmark_score; the first solver
+        # to deliver value is adopted as champion (blind-spot cover over the empty bar).
+        assert epoch_mgr.champion.submission_id == sub1.submission_id
 
-    def test_hot_swap_into_blockloop(self, sub_store, orchestrator, app_store):
+    def test_hot_swap_into_blockloop(self, sub_store, orchestrator, app_store, monkeypatch):
         """New champion wired into running BlockLoop."""
         ob = IntentOrderBook()
         loop = BlockLoop(
@@ -482,6 +557,7 @@ class TestEpochManager:
         )
         sub_store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
         sub_store.set_image_tag(sub.submission_id, "good-solver:latest")
+        _make_champion_eligible(sub_store, sub.submission_id, monkeypatch)
 
         result = asyncio.get_event_loop().run_until_complete(
             epoch_mgr.on_epoch_boundary(epoch=20)
