@@ -815,6 +815,37 @@ def _solver_round_epoch_health(ctx: ServerContext) -> dict[str, object]:
     )
 
 
+def _require_real_consensus_signing_key(consensus_mode: str) -> None:
+    """Fail fast when real consensus mode has no signing key to work with.
+
+    An empty/unset VALIDATOR_PRIVATE_KEY under CONSENSUS_MODE=real is a pure
+    misconfiguration (never transient) that silently disables BOTH consensus
+    managers — the api then runs "healthy" but can never certify a round
+    (2026-07-02: a compose recreate without .env.keys baked an empty key and a
+    certified-ready dethrone stalled ~50 min behind a 5s warning loop). Crash
+    at boot instead, so the container restart policy makes the misconfiguration
+    impossible to miss. VALIDATOR_PRIVATE_KEYS (plural, deprecated) still
+    satisfies the check — the order-consensus path can derive the leader key
+    from it. Break-glass: CONSENSUS_KEY_FAIL_FAST=0 restores warn-only.
+    """
+    if consensus_mode != "real":
+        return
+    if os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip():
+        return
+    if os.environ.get("VALIDATOR_PRIVATE_KEYS", "").strip():
+        return
+    msg = (
+        "CONSENSUS_MODE=real but VALIDATOR_PRIVATE_KEY is empty/unset — "
+        "order + champion consensus cannot sign and round certification "
+        "would be silently disabled. If this node was started via docker "
+        "compose, check that the keys env-file was passed "
+        "(--env-file .env.keys)."
+    )
+    if (os.environ.get("CONSENSUS_KEY_FAIL_FAST", "1").strip() or "1") != "0":
+        raise RuntimeError(msg)
+    logger.error("%s (CONSENSUS_KEY_FAIL_FAST=0 — continuing degraded)", msg)
+
+
 # ── initialization ───────────────────────────────────────────────────────────
 
 
@@ -1494,6 +1525,7 @@ async def initialize(ctx: ServerContext) -> dict:
         consensus_mode = os.environ.get("CONSENSUS_MODE", "local").strip().lower()
         validator_keys_env = os.environ.get("VALIDATOR_PRIVATE_KEYS", "")
         validator_addrs_env = os.environ.get("VALIDATOR_ADDRESSES", "")
+        _require_real_consensus_signing_key(consensus_mode)
         # Bootstrap when either env is set. ``VALIDATOR_ADDRESSES`` is the
         # preferred public-only shape for real consensus mode; the older
         # ``VALIDATOR_PRIVATE_KEYS`` is kept for local-testnet (where the

@@ -263,7 +263,7 @@ services:
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
 
       # EVM signing key (no funds, just identity)
-      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY:?empty signing key would silently disable round certification - set it in your env file}"
 
       # Per-chain ValidatorRegistry addresses
       # (current values in docs/operator/network-reference.md)
@@ -375,7 +375,7 @@ services:
       SUBTENSOR_URL: "${SUBTENSOR_URL:-finney}"
       NETUID: "${NETUID:-112}"
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
-      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY:?empty signing key would silently disable round certification - set it in your env file}"
 
       # Singleton relayer: the api submits signed quorum bundles here.
       # Third-party validators do NOT hold a gas wallet — the subnet
