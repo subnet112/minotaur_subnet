@@ -55,6 +55,7 @@ from .state import (
     _rate_limit_lock,
     get_benchmark_worker,
     get_champion_consensus_manager,
+    get_champion_peer_network,
     get_round_store,
     get_store,
 )
@@ -65,6 +66,8 @@ from .round_manager import (
     _close_solver_round_state,
     _close_round_sync_payload,
     _certify_round_sync_payload,
+    _reattest_chain_payloads,
+    _sign_internal_round_payload,
     _activate_round_sync_payload,
     _abort_round_sync_payload,
     _get_current_solver_round,
@@ -1110,29 +1113,17 @@ async def reattest_current_champion(request: Request) -> dict:
     approvals = len(state.certificate.approvals)
     # EMERGENCY FORCE-SYNC ("remind him + make him accept"): re-send the WHOLE round so a
     # follower that never saw it — or pruned it on a restart — can re-adopt the standing
-    # champion instead of 404-ing the bare cert. Three ordered broadcasts:
-    #   1) close (force=True): upsert the round state + submission snapshot, bypassing the
-    #      adopt-if-behind staleness guard (the champion round is OLDER than the follower's
-    #      current round, so normal sync would refuse it);
-    #   2) certify: the signed certificate (verify_approval still round-trips — not blind);
-    #   3) activate: drive adoption now (q1-trust) instead of waiting for a leader tick.
-    _close_payload = _close_round_sync_payload(state)
-    _close_payload["force"] = True
+    # champion instead of 404-ing the bare cert. Chain semantics documented on
+    # _reattest_chain_payloads (shared with the PULL twin, /solver/champion/sync-bundle).
+    chain = _reattest_chain_payloads(state)
     await _broadcast_internal_round_sync(
-        "/v1/solver/round/internal/close", _close_payload,
-    )
-    _certify_payload = _certify_round_sync_payload(state)
-    _certify_payload["force"] = True  # bypass the (long-elapsed) certification deadline
-    await _broadcast_internal_round_sync(
-        "/v1/solver/round/internal/certify", _certify_payload,
+        "/v1/solver/round/internal/close", chain["close"],
     )
     await _broadcast_internal_round_sync(
-        "/v1/solver/round/internal/activate",
-        {
-            "round_id": state.round_id,
-            "activation_epoch": state.effective_epoch or state.close_epoch,
-            "champion_changed": True,
-        },
+        "/v1/solver/round/internal/certify", chain["certify"],
+    )
+    await _broadcast_internal_round_sync(
+        "/v1/solver/round/internal/activate", chain["activate"],
     )
     logger.info(
         "[champion-reattest] FORCE-synced champion %s (round=%s, %d approval(s)): "
@@ -1144,6 +1135,48 @@ async def reattest_current_champion(request: Request) -> dict:
         "round_id": rid,
         "approvals": approvals,
         "forced": True,
+    }
+
+
+@router.get("/solver/champion/sync-bundle")
+async def champion_sync_bundle(request: Request) -> dict[str, Any]:
+    """Serve the standing champion's force-sync chain for follower PULL reconcile.
+
+    The pull-side twin of /solver/champion/reattest: a follower that diverged from
+    the leader's champion (it missed a one-shot lifecycle broadcast during a blip
+    or restart — broadcast_json has no retry) fetches this bundle and applies the
+    SAME close+certify+activate payloads locally, self-healing without an operator.
+    Payloads are signed like the push path, so the staggered-rollout trust story is
+    identical; the certificate approvals are still cryptographically verified on
+    apply — serving this bundle is not blind trust. Leader-side only in practice
+    (followers poll whoever the metagraph says leads); harmless anywhere.
+    """
+    await _authorize_internal_round(request)
+    store = get_round_store()
+    champ = store.get_active_champion()
+    rid = getattr(champ, "activated_round_id", None)
+    if not rid:
+        raise HTTPException(status_code=404, detail="no active champion to bundle")
+    state = store.get_round(rid)
+    if state is None or state.certificate is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"certified round {rid} for champion "
+                f"{getattr(champ, 'submission_id', None)} not found or carries no certificate"
+            ),
+        )
+    chain = _reattest_chain_payloads(state)
+    network = get_champion_peer_network()
+    if network is not None:
+        chain = {
+            phase: _sign_internal_round_payload(network, payload)
+            for phase, payload in chain.items()
+        }
+    return {
+        "submission_id": getattr(champ, "submission_id", None),
+        "round_id": rid,
+        **chain,
     }
 
 

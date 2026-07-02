@@ -15,6 +15,7 @@ outputs feed the authoritative relative adoption rule
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import random
 from typing import Any
@@ -25,6 +26,17 @@ logger = logging.getLogger(__name__)
 # Fields to strip for privacy when exposing sampled orders to solvers.
 # The solver only needs the trade parameters, not who submitted it.
 _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
+
+
+# Params that vary per submission/quote but do not change the trade a solver must
+# solve — excluded from the dedup identity so two submissions of the same trade
+# with different quote snapshots still collapse to one scenario.
+_VOLATILE_PARAMS = {"quoted_output", "platform_fee_wei"}
+
+# Swap-style params handled specially by the near-dup bucket key: the pair is
+# identity, the amount is bucketed by order of magnitude, and the slippage guard
+# scales with the amount (so it would defeat the bucketing if kept exact).
+_BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_amount"}
 
 
 # Stage-2 SHARED corpus size per chain — THE SINGLE SOURCE OF TRUTH, consensus-
@@ -63,6 +75,12 @@ def sample_historical_orders(
     live head by default), NEVER the order's own block. So an unfilled order (no
     fill block) replays against current state exactly like a filled one — no
     per-order fork anchor is needed, and the draw stays deterministic per the seed.
+
+    Duplicate demand is collapsed before the draw (see ``_dedup_key``): exact
+    re-submissions of one trade, and near-dups on the same pair within the same
+    order-of-magnitude amount, count as ONE candidate — the n_per_chain slots go
+    to distinct scenarios instead of copies, and corpus-stuffing (spamming one
+    trade to weight the draw) loses its cheapest form.
 
     The draw is seeded by ``round_id`` ALONE, so EVERY validator derives the
     IDENTICAL subset without broadcasting the selection — one shared corpus that
@@ -129,6 +147,16 @@ def sample_historical_orders(
     if not candidates:
         return []
 
+    # Collapse duplicate demand BEFORE the draw so the fixed n_per_chain slots
+    # carry distinct scenarios. Two orders with identical solver-relevant params
+    # build literally identical IntentStates (replay forks at the round pin, never
+    # the order's block), so a duplicate adds zero signal while burning a redundant
+    # scoreIntent per submission through the serialized sim — and it lets anyone
+    # weight the corpus toward their solver's best trade by spamming copies.
+    # Deterministic (pure function of order content, order-independent min), so
+    # every validator still derives the identical post-dedup pool.
+    candidates = _dedup_candidates(candidates)
+
     # Deterministic RNG seed: round_id ALONE → every validator draws the identical
     # shared subset (no per-validator seed, no broadcast).
     seed = int.from_bytes(
@@ -154,6 +182,72 @@ def sample_historical_orders(
 
     # Strip PII
     return [_strip_pii(o) for o in sampled]
+
+
+def _amount_decade(amount: Any) -> str:
+    """Order-of-magnitude bucket for an integer amount string (wei/base units).
+
+    Non-integer / non-positive values fall back to the raw value so they never
+    wrongly collapse with anything else.
+    """
+    try:
+        value = int(str(amount))
+    except (TypeError, ValueError):
+        return f"raw:{amount}"
+    if value <= 0:
+        return f"raw:{amount}"
+    # len(str(v)) - 1 == floor(log10(v)) for positive ints — no float involved,
+    # so the bucket is exact and platform-independent.
+    return f"e{len(str(value)) - 1}"
+
+
+def _dedup_key(order: dict[str, Any]) -> str:
+    """Canonical identity of the trade an order asks a solver to solve.
+
+    Swap-style orders (input_token/output_token/input_amount present) get a
+    NEAR-dup key: same pair + same order-of-magnitude amount collapse, with the
+    amount-scaled slippage guard excluded and every other param kept exact (so an
+    app's extra meaningful params — recipient, path, … — never wrongly collapse).
+    Orders without the swap triple fall back to EXACT-shape identity over all
+    non-volatile params.
+    """
+    params = order.get("params") or {}
+    core = {k: v for k, v in params.items() if k not in _VOLATILE_PARAMS}
+    prefix = [order.get("app_id", ""), order.get("intent_function", ""),
+              order.get("chain_id")]
+    input_token = core.get("input_token")
+    output_token = core.get("output_token")
+    input_amount = core.get("input_amount")
+    if input_token and output_token and input_amount is not None:
+        rest = {k: v for k, v in core.items() if k not in _BUCKETED_PARAMS}
+        parts = prefix + [str(input_token).lower(), str(output_token).lower(),
+                          _amount_decade(input_amount), rest]
+    else:
+        parts = prefix + [core]
+    return json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _representative_rank(order: dict[str, Any]) -> tuple[int, str]:
+    """Deterministic preference among duplicate orders: a filled order first (it
+    carries real tx/block metadata), then lowest order_id."""
+    filled_first = 0 if order.get("status", "").lower() == "filled" else 1
+    return (filled_first, order.get("order_id", ""))
+
+
+def _dedup_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one deterministic representative per trade shape (see _dedup_key)."""
+    best: dict[str, dict[str, Any]] = {}
+    for order in candidates:
+        key = _dedup_key(order)
+        current = best.get(key)
+        if current is None or _representative_rank(order) < _representative_rank(current):
+            best[key] = order
+    if len(best) < len(candidates):
+        logger.info(
+            "Stage-2 dedup: %d candidate orders -> %d distinct trade shapes",
+            len(candidates), len(best),
+        )
+    return list(best.values())
 
 
 def _strip_pii(order: dict[str, Any]) -> dict[str, Any]:
