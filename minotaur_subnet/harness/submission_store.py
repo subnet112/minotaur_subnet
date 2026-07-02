@@ -41,6 +41,63 @@ except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
 logger = logging.getLogger(__name__)
 
 
+# ── Private-repo token encryption at rest ─────────────────────────────────────
+#
+# Private submissions carry a per-submission PAT so the relayer can clone the
+# miner's private tree at finalize time. Keeping it in memory only meant ANY
+# api restart between submission and finalize voided the dethrone fail-closed
+# ("has no token", round-e29716440-n1, 2026-07-02). Tokens are now ALSO written
+# to a sidecar file next to the store, encrypted with a key derived from
+# VALIDATOR_PRIVATE_KEY (NaCl SecretBox, authenticated), never plaintext on
+# disk. No signing key (or SUBMISSION_TOKEN_PERSIST=0) → in-memory-only, the
+# historical behaviour.
+
+_TOKEN_KEY_PERSON = b"mino-token-store"  # blake2b personalization, must be ≤16 bytes
+
+
+def _derive_token_key() -> bytes | None:
+    """32-byte SecretBox key derived from the validator signing key, or None.
+
+    Uses keyed BLAKE2b over the raw key material with a store-specific
+    personalization, so the derived key is bound to this purpose and cannot be
+    confused with a signature over the same material.
+    """
+    raw = (os.environ.get("VALIDATOR_PRIVATE_KEY") or "").strip()
+    if not raw:
+        return None
+    try:
+        import nacl.encoding
+        import nacl.hash
+        import nacl.secret
+    except ImportError:  # pragma: no cover - pynacl is a hard dep in prod
+        logger.warning("pynacl unavailable — private-repo tokens stay in-memory only")
+        return None
+    material = raw.lower().removeprefix("0x").encode("utf-8")
+    return nacl.hash.blake2b(
+        material,
+        digest_size=nacl.secret.SecretBox.KEY_SIZE,
+        person=_TOKEN_KEY_PERSON,
+        encoder=nacl.encoding.RawEncoder,
+    )
+
+
+def _encrypt_token(key: bytes, token: str) -> str:
+    import base64
+
+    import nacl.secret
+
+    blob = nacl.secret.SecretBox(key).encrypt(token.encode("utf-8"))
+    return base64.b64encode(bytes(blob)).decode("ascii")
+
+
+def _decrypt_token(key: bytes, blob_b64: str) -> str:
+    import base64
+
+    import nacl.secret
+
+    return nacl.secret.SecretBox(key).decrypt(base64.b64decode(blob_b64)).decode("utf-8")
+
+
 class SubmissionStatus(str, Enum):
     """Submission lifecycle states."""
     QUEUED = "queued"
@@ -66,7 +123,8 @@ class Submission:
     # Private-submission path: PR lives in the miner's own private repo, cloned
     # with a per-submission token. is_private/private_repo_full are persisted
     # (non-secret, drive finalization dispatch + status); repo_token is the
-    # transient credential and is NEVER persisted (see _repo_token below).
+    # credential and NEVER appears on the record or in the main JSON — it lives
+    # in the store's token side map (encrypted sidecar file at rest).
     is_private: bool = False
     private_repo_full: str | None = None  # "owner/repo" of the miner's private repo
     # Head-repo GitHub account (lowercased owner login), derived from the resolved
@@ -118,7 +176,8 @@ class Submission:
             "is_private": self.is_private,
             "private_repo_full": self.private_repo_full,
             "github_owner": self.github_owner,
-            # NOTE: _repo_token is intentionally NEVER serialized.
+            # NOTE: the repo token is intentionally NEVER serialized here —
+            # at rest it exists only encrypted, in the sidecar token file.
             "status": self.status.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -193,11 +252,25 @@ class SubmissionStore:
         self._submissions: dict[str, Submission] = {}
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
-        # Per-submission private-repo PATs. Kept OUTSIDE _submissions (and never
-        # persisted) so the secret survives the reload-on-write in _write_guard,
-        # which rebuilds _submissions from disk. In-process only: unavailable to
-        # other workers / after a restart (the miner re-submits in that case).
+        # Per-submission private-repo PATs. Kept OUTSIDE _submissions so the
+        # secret is never part of to_dict()/the main JSON file. _tokens is the
+        # in-process plaintext cache; _enc_tokens mirrors the encrypted sidecar
+        # file (SecretBox blobs, base64) that lets the token survive restarts
+        # and reach sibling workers. Without a derivable key the sidecar is
+        # disabled and tokens are in-process only (the historical behaviour:
+        # the miner re-submits after a restart).
         self._tokens: dict[str, str] = {}
+        self._enc_tokens: dict[str, str] = {}
+        _persist_tokens_enabled = (
+            (os.environ.get("SUBMISSION_TOKEN_PERSIST", "1").strip() or "1") != "0"
+        )
+        self._token_key = _derive_token_key() if _persist_tokens_enabled else None
+        self._tokens_path = (
+            persist_path.with_name(persist_path.name + ".tokens")
+            if (persist_path is not None and self._token_key is not None)
+            else None
+        )
+        self._tokens_mtime_ns: int | None = None
         self._persist_path = persist_path
         # Cross-process advisory lock lives in a sibling file that is never
         # rewritten — locking the data file itself would break, since each
@@ -214,6 +287,8 @@ class SubmissionStore:
 
         if persist_path and persist_path.exists():
             self._load()
+        if self._tokens_path is not None and self._tokens_path.exists():
+            self._load_tokens()
 
     @_write_locked
     def create(
@@ -323,6 +398,15 @@ class SubmissionStore:
         self._by_hotkey_round[round_key] = sub.submission_id
         self._by_hotkey_epoch[epoch_key] = sub.submission_id
         self._persist()
+        # With an encryption key available the secret also goes to the sidecar
+        # file (after the record is indexed — _persist_tokens prunes to known
+        # submissions) so finalize still works after a restart / from a
+        # sibling worker.
+        if repo_token and self._token_key is not None and self._tokens_path is not None:
+            self._enc_tokens[sub.submission_id] = _encrypt_token(
+                self._token_key, repo_token
+            )
+            self._persist_tokens()
 
         logger.info(
             "Submission created: %s (miner=%s, round=%s, epoch=%d, repo=%s@%s)",
@@ -741,6 +825,9 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.status = SubmissionStatus.ADOPTED
         sub.updated_at = time.time()
+        # Terminal for the credential too: adoption only happens AFTER the
+        # relayer's attest + merge consumed the token (merge-gate ordering).
+        self.purge_token(submission_id)
         self._persist()
 
     def get_champion(self) -> Any:
@@ -753,20 +840,98 @@ class SubmissionStore:
     def get_repo_token(self, submission_id: str) -> str | None:
         """Return the per-submission private-repo PAT, or None.
 
-        The token is in-memory only and never persisted, so it is unavailable
-        after a process restart (the miner re-submits in that case).
+        Served from the in-process cache first, then from the encrypted
+        sidecar (which survives restarts and is shared across workers). With
+        no encryption key configured the token is in-memory only and
+        unavailable after a restart (the miner re-submits in that case).
         """
-        return self._tokens.get(submission_id)
+        token = self._tokens.get(submission_id)
+        if token is not None:
+            return token
+        if self._token_key is None or self._tokens_path is None:
+            return None
+        self._maybe_reload_tokens()
+        blob = self._enc_tokens.get(submission_id)
+        if blob is None:
+            return None
+        try:
+            token = _decrypt_token(self._token_key, blob)
+        except Exception:
+            # Fail-closed, same outcome as a lost token: the miner re-submits.
+            logger.warning(
+                "Could not decrypt persisted repo token for %s "
+                "(VALIDATOR_PRIVATE_KEY rotated?) — treating as absent",
+                submission_id,
+            )
+            return None
+        self._tokens[submission_id] = token
+        return token
 
+    @_write_locked
     def purge_token(self, submission_id: str) -> None:
-        """Drop the in-memory private-repo token once it is no longer needed.
+        """Drop the private-repo token once it is no longer needed.
 
         Called when a submission reaches a terminal state (or after a successful
-        private-champion publish) to minimise how long the credential lives in
-        memory. Idempotent and never raises for an unknown id. No file lock /
-        persist needed — the token never touched disk.
+        private-champion publish) to minimise how long the credential lives.
+        Removes both the in-memory copy and the encrypted sidecar entry.
+        Idempotent and never raises for an unknown id. Write-locked because the
+        sidecar rewrite prunes against ``_submissions``, which must be fresh
+        when several workers share the backing files.
         """
         self._tokens.pop(submission_id, None)
+        if self._tokens_path is not None:
+            self._maybe_reload_tokens()
+            if self._enc_tokens.pop(submission_id, None) is not None:
+                self._persist_tokens()
+
+    def _persist_tokens(self) -> None:
+        """Atomically rewrite the encrypted-token sidecar (0600).
+
+        Prunes entries whose submission no longer exists so the sidecar cannot
+        accumulate ciphertext for records that were purged from the store.
+        """
+        if self._tokens_path is None:
+            return
+        try:
+            self._enc_tokens = {
+                sid: blob
+                for sid, blob in self._enc_tokens.items()
+                if sid in self._submissions
+            }
+            self._tokens_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._tokens_path.with_name(
+                f".{self._tokens_path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.touch(mode=0o600)
+            tmp_path.write_text(json.dumps(self._enc_tokens, indent=2))
+            os.replace(tmp_path, self._tokens_path)
+            self._tokens_mtime_ns = self._tokens_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to persist submission tokens: %s", exc)
+
+    def _load_tokens(self) -> None:
+        """Load the encrypted-token sidecar (ciphertext only — no decryption)."""
+        if self._tokens_path is None:
+            return
+        try:
+            data = json.loads(self._tokens_path.read_text())
+            self._enc_tokens = {
+                str(sid): str(blob) for sid, blob in data.items()
+            }
+            self._tokens_mtime_ns = self._tokens_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to load submission tokens: %s", exc)
+
+    def _maybe_reload_tokens(self) -> None:
+        """Re-read the sidecar when another process updated it."""
+        if self._tokens_path is None or not self._tokens_path.exists():
+            return
+        try:
+            current_mtime_ns = self._tokens_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if self._tokens_mtime_ns is None or current_mtime_ns > self._tokens_mtime_ns:
+            self._load_tokens()
 
     # ── Cross-process write lock ─────────────────────────────────────────────
 
