@@ -604,20 +604,75 @@ def _max_submissions_per_owner_per_round() -> int:
 
 
 def _max_submissions_per_round_total() -> int:
-    """Round-wide submission cap across ALL miners — bounds the per-round
-    benchmark batch (first-come; the rest retry next round).
+    """Benched SLATE width per round — how many submissions get benchmarked.
 
-    Configurable via ``SOLVER_ROUND_MAX_SUBMISSIONS`` (default 0 = unlimited =
-    today's behaviour). Like the per-hotkey cap, this is operator-local admission
-    control at the leader gateway (the only ingress) — submissions are
-    leader-canonical and followers mirror the leader's accepted set — so it is
-    NOT a fleet-consensus parameter and an env knob is the right shape.
+    Configurable via ``SOLVER_ROUND_MAX_SUBMISSIONS`` (default 0 = unlimited).
+    This is NO LONGER an intake cap: submissions beyond it are accepted during
+    the OPEN window and the slate is selected at close by LRU rotation
+    (:func:`apply_round_rotation` — miners benched longest ago go first), so
+    round entry is fair instead of first-come. The overflow is rejected at
+    close with a resubmit-next-round reason. Intake flood protection is the
+    separate ``SOLVER_ROUND_INTAKE_MAX`` (:func:`_round_intake_max`).
+
+    Like the per-hotkey cap, this is operator-local admission control at the
+    leader gateway (the only ingress) — submissions are leader-canonical and
+    followers mirror the leader's accepted set — so it is NOT a fleet-consensus
+    parameter and an env knob is the right shape.
     """
     raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
     try:
         return int(raw)
     except ValueError:
         return 0
+
+
+def _round_intake_max() -> int:
+    """Round-wide INTAKE bound across all miners — a coarse flood guard for the
+    screening pipeline now that ``SOLVER_ROUND_MAX_SUBMISSIONS`` selects the
+    benched slate at close instead of turning miners away at the gateway.
+
+    Configurable via ``SOLVER_ROUND_INTAKE_MAX`` (default 0 = unlimited; the
+    per-hotkey and per-GitHub-owner caps already bound intake by registered
+    identity). Operator-local, like the other caps.
+    """
+    raw = os.environ.get("SOLVER_ROUND_INTAKE_MAX", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _rotation_ledger_path() -> str:
+    """Path of the leader-local rotation ledger (see ``harness/rotation.py``).
+
+    ``SOLVER_ROTATION_LEDGER_PATH`` wins; otherwise the ledger lives next to
+    the round store (``SOLVER_ROUND_STORE_PATH``) so it lands on the same
+    persistent volume (/data in production, per #430).
+    """
+    explicit = os.environ.get("SOLVER_ROTATION_LEDGER_PATH", "").strip()
+    if explicit:
+        return explicit
+    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
+    base = os.path.dirname(round_store_path) if round_store_path else "."
+    return os.path.join(base or ".", "solver_rotation.json")
+
+
+def apply_round_rotation(round_id: str) -> dict[str, Any]:
+    """Select this round's benched slate by LRU rotation; reject the overflow.
+
+    Called by the LEADER's round coordinator at close, before the close
+    snapshot is built (so followers mirror the post-rotation set). Thin
+    env/store wiring around the pure
+    :func:`minotaur_subnet.harness.rotation.apply_rotation_slate`.
+    """
+    from minotaur_subnet.harness.rotation import RotationLedger, apply_rotation_slate
+
+    return apply_rotation_slate(
+        get_store(),
+        round_id,
+        _max_submissions_per_round_total(),
+        RotationLedger(_rotation_ledger_path()),
+    )
 
 
 def _enforce_rate_limit(request: Request, principal: str) -> None:
@@ -741,7 +796,7 @@ async def create_source_submission(
             hotkey=body.hotkey,
             round_id=current_round.round_id,
             max_per_round=_max_submissions_per_round(),
-            max_total_per_round=_max_submissions_per_round_total(),
+            max_total_per_round=_round_intake_max(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -816,9 +871,13 @@ async def create_submission(
                 ),
             )
 
-    # Round-wide cap across all miners (bounds the per-round benchmark batch).
-    # First-come; the store re-checks atomically inside create() as the backstop.
-    max_total = _max_submissions_per_round_total()
+    # Round-wide INTAKE bound (coarse flood guard, default unlimited). The
+    # benched-slate width (SOLVER_ROUND_MAX_SUBMISSIONS) no longer rejects
+    # intake — the slate is selected at close by LRU rotation so entry is fair
+    # instead of first-come; overflow submissions are rejected at close with a
+    # resubmit-next-round reason. The store re-checks this bound atomically
+    # inside create() as the backstop.
+    max_total = _round_intake_max()
     if max_total > 0:
         round_total = store.count_by_round(current_round.round_id)
         if round_total >= max_total:
