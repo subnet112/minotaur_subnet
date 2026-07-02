@@ -1072,6 +1072,17 @@ class TestSubmissionAPI(unittest.TestCase):
         self.assertEqual(keyed.status_code, 401)
         self.assertIn("eip-712", keyed.json()["detail"].lower())
 
+    def test_champion_sync_bundle_is_public(self):
+        # The pull-reconcile bundle GET must NOT be gated on the internal key:
+        # SOLVER_ROUND_INTERNAL_API_KEY is per-validator (each follower registers
+        # its own), so a key gate 401'd every follower's reconcile tick and the
+        # fleet silently stopped self-healing (2026-07-02, round-e29716673-n1).
+        # With no standing champion the unauthenticated answer is 404, never 401.
+        os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
+        resp = self.client.get("/v1/solver/champion/sync-bundle")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("no active champion", resp.json()["detail"])
+
     def test_internal_abort_solver_round_requires_eip712(self):
         os.environ["SOLVER_ROUND_INTERNAL_API_KEY"] = "internal-secret"
         current = self.round_store.ensure_open_round(opened_epoch=42)

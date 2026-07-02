@@ -229,6 +229,51 @@ def test_sync_close_force_heals_snapshot_when_already_closed(monkeypatch):
     assert calls["upsert"] == 1  # but the snapshot was healed
 
 
+def test_sync_close_force_unaborts_the_round(monkeypatch):
+    """A FORCED close on a locally-ABORTED round reverts it to CLOSED so the
+    forced certify can proceed. A follower whose decision deadline elapsed before
+    the certificate arrived aborts locally; left ABORTED, certify-prepare (which
+    only advances CLOSED/REPLAYING) 409s forever — wedging both the re-attest
+    push and the pull reconcile (observed live 2026-07-02, round-e29716673-n1)."""
+    aborted = SimpleNamespace(status=RoundStatus.ABORTED)
+    closed = SimpleNamespace(status=RoundStatus.CLOSED)
+    calls = {"set": None, "upsert": 0}
+
+    def set_round_status(rid, status):
+        calls["set"] = (rid, status)
+        return closed
+
+    fake_round_store = SimpleNamespace(
+        get_round=lambda rid: aborted, set_round_status=set_round_status)
+    monkeypatch.setattr(rm, "get_round_store", lambda: fake_round_store)
+    monkeypatch.setattr(rm, "get_store", lambda: SimpleNamespace(
+        upsert_submissions=lambda recs: calls.__setitem__("upsert", len(recs)) or len(recs)))
+    monkeypatch.setattr(rm, "_close_solver_round_state", lambda body: (_ for _ in ()).throw(AssertionError("should not close")))
+
+    body = CloseRoundRequest(round_id="rr", close_epoch=100, force=True,
+                             submissions=[{"submission_id": "sub_x"}])
+    out = rm._sync_close_solver_round_state(body)
+    assert calls["set"] == ("rr", RoundStatus.CLOSED)
+    assert calls["upsert"] == 1  # snapshot still healed first
+    assert out is closed
+
+
+def test_sync_close_unforced_leaves_aborted_round_alone(monkeypatch):
+    """Without force, an aborted round is untouched (normal idempotency)."""
+    aborted = SimpleNamespace(status=RoundStatus.ABORTED)
+    fake_round_store = SimpleNamespace(
+        get_round=lambda rid: aborted,
+        set_round_status=lambda *a: (_ for _ in ()).throw(AssertionError("no status change")))
+    monkeypatch.setattr(rm, "get_round_store", lambda: fake_round_store)
+    monkeypatch.setattr(rm, "get_store", lambda: SimpleNamespace(
+        upsert_submissions=lambda recs: (_ for _ in ()).throw(AssertionError("no upsert"))))
+    monkeypatch.setattr(rm, "_close_solver_round_state", lambda body: (_ for _ in ()).throw(AssertionError("should not close")))
+
+    body = CloseRoundRequest(round_id="rr", close_epoch=100,
+                             submissions=[{"submission_id": "sub_x"}])
+    assert rm._sync_close_solver_round_state(body) is aborted
+
+
 def test_sync_close_force_without_snapshot_stays_noop(monkeypatch):
     """Force with NO submissions payload changes nothing (no upsert, no close)."""
     fake_store = SimpleNamespace(
