@@ -15,8 +15,9 @@ Two surfaces, two guarantees:
    future edit that drops the ``sorted()`` is caught.
 
 2. ``BenchmarkWorker._build_scorecard`` (the benchmark *outputs*) — the
-   vote-driving scalars (``app_scores`` per-app means, ``global_score``) are
-   order-independent, BUT ``app_onchain`` is a per-app LIST in results order. That
+   order-free diagnostic scalars (``app_scores`` per-app means, ``scenario_scores``,
+   ``failures``/``total``) are order-independent, BUT ``app_onchain`` is a per-app
+   LIST in results order. That
    asymmetry is the load-bearing constraint for the pool: workers MUST write
    results back by input index (``results[idx] = br``), NOT append in completion
    order — otherwise ``app_onchain`` (which the on-chain adoption rule ranks on)
@@ -113,10 +114,12 @@ def test_scorecard_scalar_scores_invariant_to_result_order():
     base = _scorecard(_results())
     for seed in _SEEDS:
         sc = _scorecard(_shuffled(_results(), seed))
-        # These are the values the adoption vote ranks on — must be byte-identical
-        # regardless of which worker finished which scenario first.
+        # The order-free diagnostic scalars — must be byte-identical regardless of
+        # which worker finished which scenario first. (The retired ``global_score``
+        # composite is gone; adoption/ranking now go through the relative rule over
+        # per_intent raw_output, but these scorecard scalars still MUST NOT drift
+        # with execution order, which is what the pool refactor relies on.)
         assert sc.app_scores == base.app_scores
-        assert sc.global_score == base.global_score
         assert sc.scenario_scores == base.scenario_scores
         assert sc.failures == base.failures
         assert sc.total == base.total

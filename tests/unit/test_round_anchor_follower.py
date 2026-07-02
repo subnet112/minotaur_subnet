@@ -137,7 +137,7 @@ async def _run_reactive(captured: dict, round_id="round-pin"):
         patch.object(BenchmarkWorker, "_load_historical_scenarios", return_value=[]),
     ):
         return await _reactive_benchmark_candidate(
-            candidate=candidate, leader_score=0.5, round_id=round_id,
+            candidate=candidate, round_id=round_id,
         )
 
 

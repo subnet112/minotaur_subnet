@@ -26,9 +26,10 @@ def _mgr(*, champion_id, incumbent_refresh_failed: bool) -> EpochManager:
     """Build a bare manager via __new__ (bypass ctor) with only the attributes
     ``_should_adopt`` touches before/at the stale-bar guard."""
     mgr = EpochManager.__new__(EpochManager)
-    mgr._champion = types.SimpleNamespace(
-        submission_id=champion_id, benchmark_score=0.6
-    )
+    # The champion fake carries only what the guard reads: its identity. The
+    # retired scalar ``benchmark_score`` is gone from ChampionInfo, so it is no
+    # longer part of the incumbent shape.
+    mgr._champion = types.SimpleNamespace(submission_id=champion_id)
     mgr._incumbent_refresh_failed = incumbent_refresh_failed
     mgr._dethrone_margin = 0.005
     # Scorecard hooks: real callables so the (default-on) observability path in
@@ -41,10 +42,12 @@ def _mgr(*, champion_id, incumbent_refresh_failed: bool) -> EpochManager:
     return mgr
 
 
-def _challenger(score: float = 0.9):
-    # A clear winner: anything that blocks adoption here is the stale-bar guard,
-    # not the rule (which we force to ADOPT below).
-    return types.SimpleNamespace(submission_id="chal", benchmark_score=score)
+def _challenger():
+    # The relative per-order rule is FORCED to ADOPT below (see the force_adopt
+    # fixture), so this challenger counts as a clear winner regardless of its
+    # rows — anything that blocks adoption here is therefore the stale-bar guard,
+    # not the rule. (The retired scalar ``benchmark_score`` no longer exists.)
+    return types.SimpleNamespace(submission_id="chal")
 
 
 @pytest.fixture
@@ -71,14 +74,14 @@ def test_stale_incumbent_abstains_even_for_a_winner(force_adopt):
     # Incumbent EXISTS + refresh FAILED -> stale bar -> ABSTAIN (False), even
     # though the rule would adopt this clear winner.
     mgr = _mgr(champion_id="champ", incumbent_refresh_failed=True)
-    assert mgr._should_adopt(_challenger(0.9)) is False
+    assert mgr._should_adopt(_challenger()) is False
 
 
 def test_fresh_incumbent_lets_adopt_verdict_pass_through(force_adopt):
     # Incumbent EXISTS but bar is FRESH -> guard does not fire -> the (forced)
     # adopt verdict passes through.
     mgr = _mgr(champion_id="champ", incumbent_refresh_failed=False)
-    assert mgr._should_adopt(_challenger(0.9)) is True
+    assert mgr._should_adopt(_challenger()) is True
 
 
 def test_no_incumbent_is_not_blocked_by_stale_flag(force_adopt):
@@ -87,14 +90,14 @@ def test_no_incumbent_is_not_blocked_by_stale_flag(force_adopt):
     # (forced) adopt verdict must pass through. This is the branch the existing
     # adoption_gate_p0 test does not exercise.
     mgr = _mgr(champion_id="", incumbent_refresh_failed=True)
-    assert mgr._should_adopt(_challenger(0.9)) is True
+    assert mgr._should_adopt(_challenger()) is True
 
 
 def test_no_incumbent_with_none_submission_id_not_blocked(force_adopt):
     # Same bootstrap carve-out, but with submission_id=None (the seeded-but-empty
     # shape) rather than "" — still falsy, still must not be blocked.
     mgr = _mgr(champion_id=None, incumbent_refresh_failed=True)
-    assert mgr._should_adopt(_challenger(0.9)) is True
+    assert mgr._should_adopt(_challenger()) is True
 
 
 def test_stale_flag_missing_defaults_to_not_stale(force_adopt):
@@ -103,4 +106,4 @@ def test_stale_flag_missing_defaults_to_not_stale(force_adopt):
     # default means it is treated as NOT stale -> adopt verdict passes through.
     mgr = _mgr(champion_id="champ", incumbent_refresh_failed=False)
     del mgr._incumbent_refresh_failed
-    assert mgr._should_adopt(_challenger(0.9)) is True
+    assert mgr._should_adopt(_challenger()) is True

@@ -35,6 +35,10 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStore,
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
+from minotaur_subnet.epoch.relative_scoring import (
+    evaluate_relative_adoption,
+    has_delivered_value_rows,
+)
 from minotaur_subnet.harness.round_store import (
     ChampionSnapshot,
     RoundState,
@@ -148,7 +152,6 @@ class ChampionInfo:
     submission_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
-    benchmark_score: float = 0.0
     epoch_adopted: int = 0
     image_tag: str | None = None
     hotkey: str | None = None
@@ -159,7 +162,6 @@ class ChampionInfo:
             "submission_id": self.submission_id,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
-            "benchmark_score": self.benchmark_score,
             "epoch_adopted": self.epoch_adopted,
             "image_tag": self.image_tag,
             "hotkey": self.hotkey,
@@ -255,7 +257,6 @@ class EpochManager:
                 submission_id=restored.submission_id,
                 solver_name=restored.solver_name,
                 solver_version=restored.solver_version,
-                benchmark_score=restored.benchmark_score or 0.0,
                 epoch_adopted=(
                     restored_snapshot.activated_epoch
                     if restored_snapshot.submission_id == restored.submission_id
@@ -316,10 +317,17 @@ class EpochManager:
                 self._epoch_history.append(result)
                 return result
 
-        # Step 2: Find the best champion-eligible scored submission for this epoch
+        # Step 2: Find the best champion-eligible submission. Ranked by relative
+        # net-better vs the champion's STORED per-order rows — deterministic across a
+        # failed-over leader on the same store, so no incumbent re-bench is needed just
+        # to RANK (the incumbent is re-benched below only once we actually have a
+        # finalist to weigh for adoption).
         new_champion_sub = self._find_champion(epoch, round_id=scope_round_id)
 
         if new_champion_sub is None:
+            # No challenger this round → keep the champion and do NOT re-bench the
+            # incumbent (nothing to compare it against — the re-bench is a full Docker
+            # run and would be pure waste on an idle round).
             logger.info("No champion found for epoch %d, keeping current solver", epoch)
             next_round = self._complete_round(
                 current_round,
@@ -333,7 +341,9 @@ class EpochManager:
             self._epoch_history.append(result)
             return result
 
-        # Step 3: Re-score incumbent with current scenarios, then check margin
+        # Step 3: We have a finalist — re-bench the incumbent at the current round pin
+        # (fresh same-pin bar + genesis-as-bar seeding) so the adoption verdict weighs
+        # like against like, then apply the bounded-regression per-order relative rule.
         await self._refresh_incumbent_score()
         if self._should_adopt(new_champion_sub):
             try:
@@ -348,10 +358,9 @@ class EpochManager:
                 if next_round is not None:
                     result["next_round_id"] = next_round.round_id
                 logger.info(
-                    "Champion changed in epoch %d: %s (score=%.4f)",
+                    "Champion changed in epoch %d: %s",
                     epoch,
                     self._champion.solver_name,
-                    self._champion.benchmark_score,
                 )
             except Exception as exc:
                 logger.error(
@@ -453,6 +462,9 @@ class EpochManager:
                     result["next_round_id"] = next_round.round_id
                 return result
 
+        # Rank by relative net-better vs the champion's STORED per-order rows
+        # (deterministic on the shared store) — no incumbent re-bench is needed just to
+        # pick the finalist; the incumbent is re-benched below only once we HAVE one.
         finalist = self._find_champion(epoch, round_id=round_id)
         if finalist is None:
             # DEFER (don't abort) while the round can still produce a candidate. Any
@@ -480,10 +492,11 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
-        # Re-benchmark the incumbent with current scenarios so the
-        # comparison is fair. Without this, a JS scoring update that adds
-        # harder scenarios would make the incumbent's stale score (from
-        # easier scenarios) impossible to beat.
+        # We have a finalist — re-benchmark the incumbent at the current round pin so
+        # the comparison is fair (fresh same-pin bar + genesis-as-bar seeding). Without
+        # this, a JS scoring update that adds harder scenarios would make the incumbent's
+        # stale rows impossible to beat. Skipped entirely on the no-finalist path above,
+        # so an idle round never pays for a re-bench.
         await self._refresh_incumbent_score()
 
         # DISPLAY-ONLY: persist each competitor's SAME-PIN relative counts vs the
@@ -528,7 +541,6 @@ class EpochManager:
             round_id,
             submission_id=finalist.submission_id,
             image_id=finalist.image_id,
-            benchmark_score=finalist.benchmark_score,
         )
         result["status_after"] = updated.status.value
         result["finalist_submission_id"] = updated.finalist_submission_id
@@ -837,10 +849,8 @@ class EpochManager:
             params = inspect.signature(self._on_champion_rejected).parameters
         except (TypeError, ValueError):
             params = {}
-        if "champion_score" in params:
-            kwargs["champion_score"] = self._champion.benchmark_score
-        if "dethrone_margin" in params:
-            kwargs["dethrone_margin"] = self._dethrone_margin
+        # champion_score / dethrone_margin are no longer forwarded — the scalar
+        # composite was removed; the PR report renders the relative counts instead.
         # Private submissions: the report must post to the miner's PRIVATE repo,
         # which needs the per-submission token. Fetch it from the (same-process)
         # store; None for public submissions → the callback falls back to canonical.
@@ -898,10 +908,8 @@ class EpochManager:
             params = inspect.signature(self._on_champion_finalist).parameters
         except (TypeError, ValueError):
             params = {}
-        if "champion_score" in params:
-            kwargs["champion_score"] = self._champion.benchmark_score
-        if "dethrone_margin" in params:
-            kwargs["dethrone_margin"] = self._dethrone_margin
+        # champion_score / dethrone_margin are no longer forwarded — the scalar
+        # composite was removed; the PR report renders the relative counts instead.
         # Private submissions: report must post to the miner's PRIVATE repo (needs
         # the per-submission token). None for public → callback uses canonical.
         if "repo_token" in params:
@@ -993,8 +1001,8 @@ class EpochManager:
                 )
                 if all_scored:
                     logger.info(
-                        "No round %s candidates; using best scored submission: %s (%.3f)",
-                        round_id, all_scored[0].submission_id, all_scored[0].benchmark_score or 0,
+                        "No round %s candidates; using best scored submission: %s",
+                        round_id, all_scored[0].submission_id,
                     )
                     return all_scored[0]
             return None
@@ -1016,12 +1024,40 @@ class EpochManager:
         return None
 
     def _eligible_candidates(self, submissions: list[Submission]) -> list[Submission]:
-        """Filter and rank champion-eligible scored submissions."""
+        """Filter and rank champion-eligible submissions by relative NET-BETTER.
+
+        VALIDITY GATE: SCORED/ADOPTED + delivered value on >= 1 order
+        (``has_delivered_value_rows`` over the per-order raw_output) — the per-order
+        gate that replaced the retired scalar ``benchmark_score > 0``.
+
+        RANKING: relative net-better vs the CURRENT champion — ``n_wins +
+        n_blind_spots - n_regressions - n_dropped`` from :func:`evaluate_relative_adoption`
+        over each candidate's per-order raw_output — so the candidate that most
+        improves on the champion's DELIVERED outputs is nominated finalist (adoption
+        itself is still gated later by the bounded-regression rule). NO scalar score.
+        Reuses the per-order rows already computed this round; needs no extra bench.
+
+        DETERMINISM: an adoptable candidate always outranks a non-adoptable one, then
+        higher net-better wins, then a content-addressed (image_id, submission_id)
+        tie-break — so a failed-over leader on the same store nominates the SAME
+        finalist (the previous stable-sort break was the LOCAL-clock created_at, which
+        could diverge). champ_rows are the champion's STORED per-order rows (from its
+        last bench), which is enough for a deterministic RANK — the incumbent is only
+        re-benched (for the actual adoption verdict) AFTER a finalist is picked, so an
+        idle round with no candidate never pays for a re-bench.
+        """
+        champ_sub = (
+            self._sub_store.get(self._champion.submission_id)
+            if (self._sub_store and self._champion.submission_id)
+            else None
+        )
+        champ_rows = self._per_intent(champ_sub)
+
         eligible: list[Submission] = []
         for submission in submissions:
             if submission.status not in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED):
                 continue
-            if submission.benchmark_score is None or submission.benchmark_score <= 0:
+            if not has_delivered_value_rows(self._per_intent(submission)):
                 continue
             ok, reason = is_submission_champion_eligible(submission)
             if ok:
@@ -1032,28 +1068,24 @@ class EpochManager:
                 submission.submission_id,
                 reason,
             )
-        # Rank by benchmark_score descending. On a TRUE exact-float tie, break it
-        # DETERMINISTICALLY by a content-addressed key (image digest, then the unique
-        # submission_id) instead of the incidental input order. The previous implicit
-        # break was the stable sort preserving list_by_round/_epoch order, which is the
-        # submissions' LOCAL-clock created_at — so two validators (or a failed-over
-        # leader) could order an exact tie differently and nominate a DIFFERENT finalist
-        # for the same round, diverging consensus. Negating the score keeps the primary
-        # ordering (highest first) while letting the tie-break sort ascending + stable
-        # and host-independent.
-        eligible.sort(
-            key=lambda s: (
-                -(s.benchmark_score or 0.0),
-                str(s.image_id or ""),
+
+        def _rank_key(s: Submission) -> tuple[int, int, str, str]:
+            v = evaluate_relative_adoption(champ_rows, self._per_intent(s))
+            net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
+            return (
+                0 if v["adopt"] else 1,   # adoptable candidates first
+                -net,                     # then most net-better vs champion
+                str(s.image_id or ""),    # content-addressed, host-independent tie-break
                 str(s.submission_id or ""),
             )
-        )
+
+        eligible.sort(key=_rank_key)
         return eligible
 
     def _maybe_seed_genesis_incumbent(self) -> None:
         """Decision-time: when no champion is seeded, treat a SCORED genesis as the
-        incumbent BAR (has_champion=True) so the FIRST real champion must BEAT
-        genesis (>= genesis*(1+DETHRONE_MARGIN) + per-app floor + on-chain veto),
+        incumbent BAR (has_champion=True) so the FIRST real champion must BEAT genesis
+        under the bounded-regression net-better rule (per-order raw delivered output),
         matching the follower's _resolve_incumbent_submission.
 
         In-memory ONLY — never adopt()/_hot_swap()/set_active_champion() (those
@@ -1073,22 +1105,25 @@ class EpochManager:
             SubmissionStatus.ADOPTED,
         ):
             return
-        if (genesis.benchmark_score or 0.0) <= 0:  # no usable bar yet -> stay bootstrap
+        # No usable bar yet (genesis delivered value on no order) -> stay bootstrap.
+        # SAME predicate as benchmark_worker._resolve_incumbent_submission (both call
+        # has_delivered_value_rows on the genesis per_intent rows) — keep them identical
+        # or leader/follower has_champion parity breaks.
+        if not has_delivered_value_rows(self._per_intent(genesis)):
             return
         assert genesis.hotkey == GENESIS_HOTKEY, "genesis incumbent must keep the burn hotkey"
         self._champion = ChampionInfo(
             submission_id=genesis.submission_id,
             solver_name=genesis.solver_name,
             solver_version=genesis.solver_version,
-            benchmark_score=genesis.benchmark_score or 0.0,
             epoch_adopted=genesis.epoch,
             image_tag=genesis.image_tag,  # None for genesis -> re-bench resolves the genesis image
             hotkey=GENESIS_HOTKEY,  # keeps weights on the burn branch
             adopted_at=genesis.updated_at,
         )
         logger.info(
-            "Seeded genesis as the adoption incumbent bar: %s score=%.4f (weights still burn)",
-            genesis.submission_id, genesis.benchmark_score or 0.0,
+            "Seeded genesis as the adoption incumbent bar: %s (weights still burn)",
+            genesis.submission_id,
         )
 
     async def _refresh_incumbent_score(self) -> None:
@@ -1172,45 +1207,41 @@ class EpochManager:
             if not inspect.iscoroutinefunction(_score_one):
                 return
             diag = await _score_one(image_tag, context="incumbent")
-            if not isinstance(diag, dict) or not isinstance(diag.get("score"), (int, float)):
+            if not isinstance(diag, dict) or diag.get("details") is None:
                 return  # degenerate result — test-compat, no stale flag
 
-            fresh_score = float(diag["score"])
             details = diag.get("details")
-            old_score = self._champion.benchmark_score
-            self._champion.benchmark_score = fresh_score
 
-            # Display-path + adoption consistency (#FIX): ALWAYS persist this round's
-            # FRESH re-bench (score + per_intent, incl. raw_output) back to the
-            # champion's submission record. The relative adoption rule
+            # Display-path + adoption consistency (#FIX): ALWAYS refresh this round's
+            # FRESH per_intent (incl. raw_output) on the champion's submission record,
+            # WITHOUT touching its SCORED/ADOPTED status — an incumbent must never be
+            # rejected by a transient re-bench (so this uses merge_benchmark_details,
+            # NOT set_benchmark_result). The relative adoption rule
             # (_evaluate_per_order_adoption) and the same-pin display persist
             # (_persist_round_relative_counts, which reads the champion's STORED
             # per_intent) BOTH join against the champion's STORED per_intent;
-            # persisting the same-round re-bench guarantees they compare the
-            # challenger against the SAME same-round/same-fork reference the adoption
-            # used — instead of a stale bench from a different round/fork (which
-            # produced transient wrong counts on the frontend). Persist whenever we
-            # have fresh details so a JS-unchanged round still refreshes the rows.
+            # refreshing the same-round re-bench guarantees they compare the challenger
+            # against the SAME same-round/same-fork reference the adoption used —
+            # instead of a stale bench from a different round/fork.
             if self._sub_store and details is not None:
-                self._sub_store.set_benchmark_result(
-                    incumbent_sub.submission_id,
-                    score=fresh_score,
-                    details=details,
+                self._sub_store.merge_benchmark_details(
+                    incumbent_sub.submission_id, details,
                 )
 
             logger.info(
-                "Incumbent re-scored via challenger path (symmetric bar): %s %.4f → %.4f "
-                "(%d scenarios)",
-                self._champion.submission_id, old_score, fresh_score,
+                "Incumbent re-benched via challenger path (symmetric bar): %s "
+                "(%d scenarios, %d delivered value)",
+                self._champion.submission_id,
                 diag.get("intent_count", 0),
+                diag.get("delivered_value_count", 0),
             )
         except Exception:
             # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
-            # _should_adopt abstains rather than deciding on the prior score.
+            # _should_adopt abstains rather than deciding on the prior rows.
             self._incumbent_refresh_failed = True
             logger.warning(
-                "Failed to re-benchmark incumbent %s — STALE bar, will abstain (was %.4f)",
-                self._champion.submission_id, self._champion.benchmark_score,
+                "Failed to re-benchmark incumbent %s — STALE bar, will abstain",
+                self._champion.submission_id,
                 exc_info=True,
             )
 
@@ -1282,10 +1313,11 @@ class EpochManager:
 
         Delegates the verdict to :meth:`_meets_adoption_criteria` — the SOLE
         adoption rule is the relative per-order rule
-        (:func:`evaluate_relative_adoption`): the challenger must beat-or-match the
-        freshly re-benched champion on EVERY order's RAW delivered output and
-        strictly win at least one. Adds the synchronous-path
-        ``DISABLE_CHAMPION_ADOPTION`` freeze (that path commits immediately).
+        (:func:`evaluate_relative_adoption`), a BOUNDED-REGRESSION NET-BETTER rule
+        over the freshly re-benched champion's RAW delivered outputs: no order cut by
+        more than 1%, no dropped order, and net wins+blind-spots exceed regressions by
+        the margin. Adds the synchronous-path ``DISABLE_CHAMPION_ADOPTION`` freeze
+        (that path commits immediately).
         """
         # Observability (CHALLENGER_QUORUM_MODE): publish this leader's would-be vote
         # BEFORE the disable gate so the shadow tally sees it with adoption off.
@@ -1304,11 +1336,13 @@ class EpochManager:
 
     def _meets_adoption_criteria(self, challenger: Submission) -> bool:
         """The PURE adoption verdict — the relative per-order rule is the SOLE
-        decision: the challenger must beat-or-match the freshly re-benched champion
-        on EVERY order's RAW delivered output and strictly win at least one
-        (``evaluate_relative_adoption``). This is the IDENTICAL rule the followers
-        run (``champion_consensus._independent_adopt_vote``), so the leader and the
-        fleet decide alike.
+        decision (``evaluate_relative_adoption``): a BOUNDED-REGRESSION NET-BETTER
+        rule over the freshly re-benched champion's RAW delivered outputs — adopt iff
+        no order is cut by more than 1% (hard floor), no champion-served order is
+        dropped, and net wins+blind-spot covers exceed regressions by the margin. This
+        is the IDENTICAL rule the followers run
+        (``champion_consensus._independent_adopt_vote``), so the leader and the fleet
+        decide alike.
 
         Does NOT consult ``DISABLE_CHAMPION_ADOPTION``: the freeze is enforced at the
         COMMIT boundary (``activate_certified_round``), so the consensus pipeline can
@@ -1598,7 +1632,6 @@ class EpochManager:
             submission_id=submission.submission_id,
             solver_name=submission.solver_name,
             solver_version=submission.solver_version,
-            benchmark_score=submission.benchmark_score or 0.0,
             epoch_adopted=epoch,
             image_tag=submission.image_tag,
             hotkey=submission.hotkey,

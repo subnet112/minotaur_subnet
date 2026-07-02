@@ -43,7 +43,7 @@ PORT_MAP: dict[str, str] = {
     "solve": "orchestrator.SolverSession.generate_plan (fork) | fabricated Fill (fake)",
     "simulate": "simulator/anvil_simulator.py:_simulate_via_score_intent (fork) | fabricated (fake)",
     "score_js": "engine/js_engine.py:JsExecutionEngine.score (benchmark_worker._build_score_fn)",
-    "aggregate": "harness/benchmark_worker.py:_build_scorecard / _compute_avg_score",
+    "aggregate": "harness/benchmark_worker.py:_build_scorecard (offline lab proxy; production has no scalar composite)",
     "adopt": "epoch/manager.py:_should_adopt",
 }
 

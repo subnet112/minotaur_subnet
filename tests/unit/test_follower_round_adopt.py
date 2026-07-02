@@ -407,8 +407,11 @@ def test_certify_prep_with_candidate_transitions_closed_to_certifying(fresh_stor
             commit_hash="abc123", epoch=500, hotkey="5Gtest", round_id="round-e500-n1",
             status=SubmissionStatus.SCORED, created_at=_time.time(), updated_at=_time.time(),
             image_tag="solver:v1", image_id="sha256:" + "c" * 64, solver_name="top-miner",
-            solver_version="1.0.0", benchmark_score=0.48, benchmark_rank=1,
-            benchmark_details={"total_intents": 5},
+            solver_version="1.0.0", benchmark_rank=1,
+            # Genuinely scored, value-delivering candidate: >=1 per-order row with
+            # raw_output>0 is what marks a submission as SCORED-with-value now that
+            # the scalar benchmark_score is gone.
+            benchmark_details={"per_intent": [{"intent_id": "app:scn", "raw_output": "1000"}]},
         )
         sub_store = SubmissionStore()
         sub_store._submissions["sub_cand"] = cand

@@ -98,15 +98,19 @@ def test_record_sink_receives_the_mutated_round(tmp_path):
 # ── route summary: outcome derivation ────────────────────────────────────────
 
 def test_summary_activated_round_is_adopted_with_winner():
+    # ``finalist_score`` was removed from RoundState/SolverRoundSummary (relative
+    # net-better replaced the scalar composite); the finalist is now identified
+    # solely by submission id. Intent preserved: activated round == adopted, and
+    # the certified challenger is surfaced as the winner.
     s = _round_summary_from_dict({
         "round_id": "r1", "status": "activated", "opened_epoch": 1, "close_epoch": 2,
-        "finalist_submission_id": "sub_x", "finalist_score": 0.91,
+        "finalist_submission_id": "sub_x",
         "certificate": {"candidate_submission_id": "sub_x"},
         "effective_epoch": 8, "created_at": 100.0, "updated_at": 150.0,
     })
     assert s.adopted is True
     assert s.adopted_submission_id == "sub_x"
-    assert s.finalist_score == 0.91 and s.status == "activated"
+    assert s.finalist_submission_id == "sub_x" and s.status == "activated"
 
 
 def test_summary_aborted_round_is_not_adopted():

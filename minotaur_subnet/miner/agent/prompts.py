@@ -469,7 +469,7 @@ def build_improve_task(
         champion_score: Vestigial — the champion has no absolute score now (it's
             the relative baseline). Kept for back-compat display only.
         target_score: Vestigial dethrone target; the real bar is the relative
-            verdict (beat the champion on every order).
+            net-better verdict vs the champion.
         scenario_scores: Per-scenario scores from champion's benchmark.
         quote_failure_rate: Fraction of quotes that failed (0.0-1.0).
         recent_quote_errors: Recent quote error strings.
@@ -480,7 +480,8 @@ def build_improve_task(
         relative_headroom: Fraction of orders NOT yet beating the champion.
     """
     # Post relative-cutover the adoption bar is the RELATIVE per-order verdict
-    # (beat the champion on every order, strictly win ≥1), not a numeric score.
+    # (BOUNDED-REGRESSION NET-BETTER: no order cut >1%, none dropped, net wins
+    # exceed regressions), not a numeric score.
     # Lead with the counts when we have them; the 0..1 score numbers are now
     # saturated validity sentinels so they're shown only as secondary context.
     if relative:
@@ -498,8 +499,10 @@ matched={relative.get('matched', 0)}  new(blind-spot covers)={relative.get('new'
 compared={relative.get('compared', 0)}
 - verdict: {verdict or relative.get('verdict', '?')}  \
 (headroom: {relative_headroom:.0%} of orders not yet beating the champion)
-- To ADOPT you must beat the champion on EVERY order (0 'worse') AND strictly
-  win at least one — matching everywhere is NOT enough. Trend of orders-won: {trend}."""
+- To ADOPT (NET-BETTER rule): no order may be cut by more than 1% and you must
+  drop no order the champion serves; then your wins + blind-spot covers must exceed
+  your (<=1%) regressions by at least one. Small regressions are tolerated and netted
+  against wins; matching everywhere is NOT enough. Trend of orders-won: {trend}."""
     else:
         head = f"""\
 You are the **root miner agent** for Minotaur. An existing strategy for
@@ -510,8 +513,9 @@ write code yourself.
 Strategy file path: `{app_id}/strategy.py`
 
 No relative counts yet (not benched since the cutover). The adoption bar is
-the RELATIVE per-order rule: beat the current champion on every order and
-strictly win at least one. Secondary context (saturated validity sentinels,
+the RELATIVE per-order NET-BETTER rule: no order cut >1%, drop none, and your
+wins + blind-spot covers must exceed your (<=1%) regressions. Secondary context
+(saturated validity sentinels,
 not quality grades): recent={recent_scores}, trend={trend}."""
     sections = [head]
 

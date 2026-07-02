@@ -220,7 +220,6 @@ class RoundState:
     decision_deadline_epoch: int | None = None
     finalist_submission_id: str | None = None
     finalist_image_id: str | None = None
-    finalist_score: float | None = None
     shadow_case_log_hash: str | None = None
     certificate: ChampionCertificate | None = None
     effective_epoch: int | None = None
@@ -271,7 +270,6 @@ class RoundState:
             "decision_deadline_epoch": self.decision_deadline_epoch,
             "finalist_submission_id": self.finalist_submission_id,
             "finalist_image_id": self.finalist_image_id,
-            "finalist_score": self.finalist_score,
             "shadow_case_log_hash": self.shadow_case_log_hash,
             "certificate": self.certificate.to_dict() if self.certificate else None,
             "effective_epoch": self.effective_epoch,
@@ -303,7 +301,6 @@ class RoundState:
             decision_deadline_epoch=raw.get("decision_deadline_epoch"),
             finalist_submission_id=raw.get("finalist_submission_id"),
             finalist_image_id=raw.get("finalist_image_id"),
-            finalist_score=raw.get("finalist_score"),
             shadow_case_log_hash=raw.get("shadow_case_log_hash"),
             certificate=ChampionCertificate.from_dict(raw.get("certificate")),
             effective_epoch=raw.get("effective_epoch"),
@@ -534,7 +531,6 @@ class RoundStore:
         *,
         submission_id: str,
         image_id: str | None,
-        benchmark_score: float | None = None,
         shadow_case_log_hash: str | None = None,
     ) -> RoundState:
         self._maybe_reload()
@@ -543,7 +539,6 @@ class RoundStore:
             raise KeyError(f"Round not found: {round_id}")
         state.finalist_submission_id = submission_id
         state.finalist_image_id = image_id
-        state.finalist_score = benchmark_score
         if shadow_case_log_hash is not None:
             state.shadow_case_log_hash = shadow_case_log_hash
         state.status = RoundStatus.CERTIFYING

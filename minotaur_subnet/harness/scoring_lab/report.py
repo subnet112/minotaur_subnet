@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .model import LabConfig, Scenario
+from .stages import _card_global
 from .pipeline import SolverResult
 
 REPORT_VERSION = "v1"
@@ -88,7 +89,7 @@ def build_report(
         },
         "solver": {
             "label": label,
-            "global_score": round(result.card.global_score, 6),
+            "global_score": round(_card_global(result.card), 6),
             "app_scores": {k: round(v, 6) for k, v in result.card.app_scores.items()},
             "coverage": round(result.card.coverage, 4),
             "total": result.card.total,
