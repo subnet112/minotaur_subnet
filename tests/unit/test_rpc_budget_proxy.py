@@ -504,6 +504,160 @@ async def test_reset_repoints_blocks(proxy_client):
 
 
 # ---------------------------------------------------------------------------
+# (h1) pinned-read cache: (chain, block, method, params) -> result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_serves_repeat_reads_locally(proxy_client):
+    proxy, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    r1 = await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}, "latest"]))
+    assert (await r1.json())["result"] == "0xabc"
+    before = len(upstream.received)
+    r2 = await client.post(
+        "/rpc/p/eth",
+        json={"jsonrpc": "2.0", "id": 42, "method": "eth_call", "params": [{"to": "0xq"}, "latest"]},
+    )
+    body = await r2.json()
+    assert body["result"] == "0xabc"  # replayed upstream value
+    assert body["id"] == 42           # echoes THIS request's id
+    assert len(upstream.received) == before  # not forwarded
+    assert proxy._pin_cache.stats()["hits"] == 1
+    # metering is unaffected by the cache: both eth_calls charged cost 1
+    assert proxy.sessions["p"].spent == 2
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_keyed_by_params(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xOTHER"}]))
+    assert len(upstream.received) == 2  # different reads both forwarded
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_key_canonicalizes_param_spelling(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    # same read, dict keys spelled in different order + block written as
+    # 'latest' vs explicit — the rewrite pins both to the same canonical key
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq", "data": "0x1"}, "latest"]))
+    await client.post("/rpc/p/eth", json=_call([{"data": "0x1", "to": "0xq"}, "0x3039"]))
+    assert len(upstream.received) == 1
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_shared_across_sessions_same_block(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "a", 12345)
+    await _open_pinned(client, "b", 12345)
+    await client.post("/rpc/a/eth", json=_call([{"to": "0xq"}]))
+    before = len(upstream.received)
+    await client.post("/rpc/b/eth", json=_call([{"to": "0xq"}]))
+    assert len(upstream.received) == before  # b served from a's fetch
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_misses_on_new_block(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    await client.post("/control/reset", json={"session_id": "p", "blocks": {"eth": 999}})
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    assert len(upstream.received) == 2  # new block = new state = must re-fetch
+
+
+@pytest.mark.asyncio
+async def test_unpinned_reads_never_cached(proxy_client):
+    _, client, upstream = proxy_client
+    await client.post("/control/open", json={"session_id": "np", "budget": 100})  # no pin
+    await client.post("/rpc/np/eth", json=_call([{"to": "0xq"}, "latest"]))
+    await client.post("/rpc/np/eth", json=_call([{"to": "0xq"}, "latest"]))
+    assert len(upstream.received) == 2  # 'latest' is a moving target — no cache
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_skips_block_independent_methods(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/rpc/p/eth", json=_call([], method="eth_gasPrice"))
+    await client.post("/rpc/p/eth", json=_call([], method="eth_gasPrice"))
+    assert len(upstream.received) == 2  # non-constant passthrough: always forwards
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_hit_still_consumes_budget(upstream):
+    proxy, client = await _make_proxy_client(upstream.url, mode="enforce", budget=2)
+    try:
+        await client.post("/control/open", json={
+            "session_id": "e", "budget": 2, "mode": "enforce", "blocks": {"eth": 12345},
+        })
+        await client.post("/rpc/e/eth", json=_call([{"to": "0xq"}]))  # forward, spent=1
+        await client.post("/rpc/e/eth", json=_call([{"to": "0xq"}]))  # cache hit, spent=2
+        resp = await client.post("/rpc/e/eth", json=_call([{"to": "0xq"}]))  # over budget
+        body = await resp.json()
+        assert body["error"]["message"] == BUDGET_EXCEEDED_MESSAGE
+        assert proxy.sessions["e"].spent == 2  # hits metered exactly like forwards
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_does_not_cache_jsonrpc_errors():
+    calls = []
+
+    async def flaky(request: web.Request) -> web.Response:
+        calls.append(await request.read())
+        if len(calls) == 1:  # transient upstream error (e.g. rate limit)
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "limit"}}
+            )
+        return web.json_response({"jsonrpc": "2.0", "id": 1, "result": "0xgood"})
+
+    app = web.Application()
+    app.router.add_post("/", flaky)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        _, client = await _make_proxy_client(str(server.make_url("/")))
+        try:
+            await _open_pinned(client, "p", 12345)
+            await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))  # error: NOT cached
+            r2 = await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))  # re-forwards
+            assert (await r2.json())["result"] == "0xgood"
+            r3 = await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))  # now cached
+            assert (await r3.json())["result"] == "0xgood"
+            assert len(calls) == 2
+        finally:
+            await client.close()
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_pin_cache_evicts_oldest_block_group(proxy_client):
+    from minotaur_subnet.harness.rpc_budget_proxy.proxy import PinCache
+
+    proxy, client, upstream = proxy_client
+    proxy._pin_cache = PinCache(max_blocks=2)
+    for block in (100, 200, 300):  # 3 blocks through a 2-block cache
+        await client.post("/control/open", json={
+            "session_id": "p", "budget": 10 ** 9, "blocks": {"eth": block},
+        })
+        await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    assert proxy._pin_cache.stats()["blocks"] == 2
+    # block 100 was evicted: reading it again must re-forward
+    await client.post("/control/open", json={
+        "session_id": "p", "budget": 10 ** 9, "blocks": {"eth": 100},
+    })
+    before = len(upstream.received)
+    await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}]))
+    assert len(upstream.received) == before + 1
+
+
+# ---------------------------------------------------------------------------
 # (h2) immutable per-chain constants (eth_chainId / net_version) cache
 # ---------------------------------------------------------------------------
 
@@ -568,6 +722,46 @@ async def test_chain_constant_still_budget_gated_when_exhausted(upstream):
         assert len(upstream.received) == before  # not forwarded, not cache-served
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# (h3) RPC_PROXY_RESPONSE_CACHE=0 kill switch: both caches off, old behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_response_cache_kill_switch_restores_forward_everything(upstream):
+    proxy = BudgetProxy(
+        {"eth": upstream.url}, response_cache_enabled=False,
+    )
+    client = TestClient(TestServer(proxy.build_app()))
+    await client.start_server()
+    try:
+        await _open_pinned(client, "p", 12345)
+        # pinned reads: every repeat forwards (pin still applied)
+        await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}, "latest"]))
+        await client.post("/rpc/p/eth", json=_call([{"to": "0xq"}, "latest"]))
+        assert json.loads(upstream.received[-1])["params"][1] == "0x3039"
+        # chain constants: every repeat forwards too
+        await client.post("/rpc/p/eth", json=_rpc("eth_chainId"))
+        await client.post("/rpc/p/eth", json=_rpc("eth_chainId"))
+        assert len(upstream.received) == 4
+        assert proxy._pin_cache.stats()["entries"] == 0  # nothing cached
+    finally:
+        await client.close()
+
+
+def test_response_cache_env_switch(monkeypatch):
+    from minotaur_subnet.harness.rpc_budget_proxy.proxy import (
+        _response_cache_enabled_from_env,
+    )
+    monkeypatch.delenv("RPC_PROXY_RESPONSE_CACHE", raising=False)
+    assert _response_cache_enabled_from_env() is True  # default: on
+    for off in ("0", "false", "no", "OFF"):
+        monkeypatch.setenv("RPC_PROXY_RESPONSE_CACHE", off)
+        assert _response_cache_enabled_from_env() is False
+    monkeypatch.setenv("RPC_PROXY_RESPONSE_CACHE", "1")
+    assert _response_cache_enabled_from_env() is True
 
 
 # ---------------------------------------------------------------------------
