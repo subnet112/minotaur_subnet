@@ -214,9 +214,77 @@ async def _ensure_benchmark_network(name: str) -> bool:
     return False
 
 
+# Background self-heal cadence for a DEGRADED ensure (docker resolution failed or
+# was uncomparable). Observed live 2026-07-02: during a watchtower rolling update
+# two consecutive api boots each failed the ONE-SHOT docker resolve (transient
+# socket-proxy/DNS churn), first leaving a stale proxy "uncompared", then — after
+# the stale one was removed — no proxy at all, with no recovery until a human
+# stepped in. ~10 retries x 30s rides out that churn window.
+_ENSURE_RETRY_ATTEMPTS = 10
+_ENSURE_RETRY_DELAY_SECONDS = 30.0
+_ensure_retry_task: asyncio.Task | None = None
+
+
+def _schedule_ensure_retry() -> None:
+    """Spawn (at most one) background task re-running the ensure until it is
+    fully healthy — proxy running, image AND env actually compared current —
+    or the attempt budget runs out. Benchmarks fail loud (defer) meanwhile."""
+    global _ensure_retry_task
+    if _ensure_retry_task is not None and not _ensure_retry_task.done():
+        return
+
+    async def _loop() -> None:
+        for attempt in range(1, _ENSURE_RETRY_ATTEMPTS + 1):
+            await asyncio.sleep(_ENSURE_RETRY_DELAY_SECONDS)
+            try:
+                ok, degraded = await _ensure_impl()
+            except Exception as exc:  # noqa: BLE001 - keep retrying through raise
+                logger.warning("[read-proxy] ensure retry %d raised: %s", attempt, exc)
+                continue
+            if not degraded:
+                logger.info(
+                    "[read-proxy] ensure retry %d recovered (proxy %s)",
+                    attempt, "up" if ok else "disabled",
+                )
+                return
+        # INFO, not ERROR: on hosts where the socket-proxy permanently denies
+        # inspect (#301 fallback), "uncomparable" is a steady state, not a fault.
+        logger.info(
+            "[read-proxy] ensure retries exhausted (%d) — proxy state still "
+            "uncomparable/unresolved; a stale proxy may persist until the next "
+            "api restart with healthy docker access",
+            _ENSURE_RETRY_ATTEMPTS,
+        )
+
+    _ensure_retry_task = asyncio.get_running_loop().create_task(_loop())
+
+
 async def ensure_read_proxy_container() -> bool:
     """Ensure the api ROUTES through the block-pin proxy, launching the managed container
     if it isn't already up. Idempotent; call once at api startup.
+
+    Returns True if the proxy is up + env wired, False if only the env could be wired
+    (logged) — in which case a previously-launched proxy must already exist, else
+    benchmarks fail loud (defer) rather than read the anvil.
+
+    A DEGRADED result (docker resolution failed or the running proxy couldn't be
+    compared) additionally schedules a bounded background retry — a boot-time
+    docker/socket-proxy race (e.g. a watchtower rolling update) must not strand
+    the proxy unmanaged for the api's whole lifetime.
+    """
+    ok, degraded = await _ensure_impl()
+    if degraded:
+        _schedule_ensure_retry()
+    return ok
+
+
+async def _ensure_impl() -> tuple[bool, bool]:
+    """One ensure pass. Returns ``(ok, degraded)``.
+
+    ``ok`` mirrors the public contract (proxy up + env wired). ``degraded`` is True
+    when docker state could not be (fully) resolved — self-image unresolved, launch
+    failed, or a running proxy left in place UNCOMPARED — i.e. the cases a later
+    retry can genuinely improve on.
 
     CRITICAL ORDER: the env wiring (``SOLVER_READ_PROXY*``) is exported FIRST and is
     INDEPENDENT of any docker call. The proxy lives at a FIXED address, so a docker-socket
@@ -224,14 +292,10 @@ async def ensure_read_proxy_container() -> bool:
     root cause of the repoint intermittency: the manager couldn't ``docker inspect`` itself,
     bailed BEFORE exporting, and every benchmark then read the un-pinned raw anvil instead
     of the proxy (silently pre-firewall; "no Web3" once the anvil was network-isolated).
-
-    Returns True if the proxy is up + env wired, False if only the env could be wired
-    (logged) — in which case a previously-launched proxy must already exist, else
-    benchmarks fail loud (defer) rather than read the anvil.
     """
     if read_proxy_launch_disabled():
         logger.info("[read-proxy] DISABLE_READ_PROXY set — not wiring/launching the managed proxy")
-        return False
+        return False, False
 
     token = os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
     # (1) WIRE FIRST — unconditional, no docker call (fixed proxy address).
@@ -248,14 +312,16 @@ async def ensure_read_proxy_container() -> bool:
     # denied -> ''/None), fall back to leaving a running proxy alone (#301 robustness:
     # never block on the socket; a stale proxy is the rare, opt-in-only risk then).
     running, proxy_image, proxy_rpc_env = await _proxy_state()
+    compared = bool(image and proxy_image) and proxy_rpc_env is not None
     image_current = not image or not proxy_image or proxy_image == image
     env_current = proxy_rpc_env is None or proxy_rpc_env == _rpc_proxy_env()
     if running and image_current and env_current:
         logger.info(
             "[read-proxy] env wired to %s; managed proxy running (%s)", PROXY_DATA_URL,
-            "current image" if proxy_image and proxy_image == image else "image uncompared",
+            "current image" if compared else "image/env uncompared",
         )
-        return True
+        # Uncompared = a stale proxy may be in place; degraded so a retry re-checks.
+        return True, not compared
     if not image:
         logger.error(
             "[read-proxy] env wired to %s but could NOT determine the api image to launch "
@@ -263,7 +329,7 @@ async def ensure_read_proxy_container() -> bool:
             "required; otherwise benchmarks fail loud (defer), never read the anvil.",
             PROXY_DATA_URL,
         )
-        return False
+        return False, True
     if running:
         if not image_current:
             logger.info(
@@ -302,7 +368,7 @@ async def ensure_read_proxy_container() -> bool:
             "benchmarks fail loud (defer) until a proxy is up; they never read the anvil.",
             PROXY_DATA_URL, err,
         )
-        return False
+        return False, True
     if minotaur_net:
         rcn, _, errn = await _docker("network", "connect", minotaur_net, PROXY_CONTAINER_NAME)
         if rcn != 0:
@@ -314,4 +380,4 @@ async def ensure_read_proxy_container() -> bool:
         "[read-proxy] launched managed proxy %s on %s(.5)+%s from image %s; env wired to %s",
         PROXY_CONTAINER_NAME, sandbox, minotaur_net, image[:24], PROXY_DATA_URL,
     )
-    return True
+    return True, False
