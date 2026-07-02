@@ -73,12 +73,24 @@ def _call(w, run, *, round_id="r1", image="img", fork_block=100, intents=None,
 # ── flag gating ──────────────────────────────────────────────────────────────
 
 def test_flag_off_never_caches(monkeypatch):
-    monkeypatch.delenv("CONSOLIDATE_CHAMPION_BENCH", raising=False)
+    monkeypatch.setenv("CONSOLIDATE_CHAMPION_BENCH", "0")  # explicit kill switch
     w, c = _worker(), {"n": 0}
     run = _counting_run(["R"], c)
     assert _call(w, run) == ["R"]
     assert _call(w, run) == ["R"]
     assert c["n"] == 2  # ran both times — no cache when flag off
+
+
+def test_flag_default_on_caches(monkeypatch):
+    # The flag was never set in production (leader audit 2026-07-02), so the
+    # memo was inert and every round paid the redundant champion run — the
+    # default is now ON, with the env var as the kill switch.
+    monkeypatch.delenv("CONSOLIDATE_CHAMPION_BENCH", raising=False)
+    w, c = _worker(), {"n": 0}
+    run = _counting_run(["R"], c)
+    assert _call(w, run) == ["R"]
+    assert _call(w, run) == ["R"]
+    assert c["n"] == 1  # cached on the identical key by default
 
 
 def test_flag_on_reuses_on_identical_key(monkeypatch):
