@@ -110,3 +110,86 @@ async def test_certify_handler_absent_v2_fields_passes_none_override():
 
     assert captured["nonce_override"] is None      # 0 -> None (leader computes its own)
     assert captured["deadline_override"] is None
+
+
+# ── incumbent_image_id propagation (same class of bug as #414) ────────────────
+# incumbent_image_id is part of the SIGNED champion-approval digest but was NOT
+# declared on CertifyRoundRequest nor carried in the /certify payload, so a
+# follower rebuilt it from its OWN (differently-represented) round record → the
+# digest diverged → verify_approval rejected the leader's own approval as
+# "Invalid champion approvals" → the round stranded leader-only (100% burn until
+# a signature-bypassing reattest). These pin the round-trip + forwarding.
+
+
+def test_certify_request_round_trips_incumbent_image_id():
+    body = CertifyRoundRequest(
+        round_id="r", effective_epoch=6, quorum_required=1,
+        incumbent_image_id="sha256:" + "ab" * 32,
+    )
+    assert body.incumbent_image_id == "sha256:" + "ab" * 32
+    # Absent on an old-leader cert -> safe default (never AttributeError).
+    assert CertifyRoundRequest(round_id="r", effective_epoch=6).incumbent_image_id is None
+
+
+@pytest.mark.asyncio
+async def test_certify_handler_forwards_incumbent_override():
+    """The handler MUST forward the leader's signed incumbent as
+    ``incumbent_image_id_override`` so the follower rebuilds the identical digest;
+    absent -> None so the leader uses its own round record (signing path unchanged)."""
+    from minotaur_subnet.api.routes.submissions import champion_consensus as cc
+    from minotaur_subnet.harness.round_store import RoundStatus
+
+    certifying = SimpleNamespace(status=RoundStatus.CERTIFYING, decision_deadline_epoch=None)
+
+    async def _fake_prepare(round_id, *, candidate_submission_id=None):
+        return certifying
+
+    async def _run(body):
+        captured: dict = {}
+
+        def _fake_builder(round_state, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop")
+
+        with patch.object(cc, "_maybe_prepare_round_for_certification", _fake_prepare), \
+             patch.object(cc, "_round_certification_deadline_elapsed", lambda rs: False), \
+             patch.object(cc, "_build_champion_proposal_for_round", _fake_builder), \
+             patch.object(cc, "get_round_store", lambda: SimpleNamespace()):
+            with pytest.raises(RuntimeError, match="stop"):
+                await cc._certify_solver_round_state(body)
+        return captured
+
+    with_inc = await _run(CertifyRoundRequest(
+        round_id="r", effective_epoch=6, quorum_required=1,
+        incumbent_image_id="sha256:LEADER_SIGNED",
+    ))
+    assert with_inc["incumbent_image_id_override"] == "sha256:LEADER_SIGNED"
+
+    without = await _run(CertifyRoundRequest(round_id="r", effective_epoch=6, quorum_required=1))
+    assert without["incumbent_image_id_override"] is None  # "" -> None (leader's own record)
+
+
+def test_builder_incumbent_override_wins_else_local_record():
+    """The proposal builder uses the SIGNED override when given (follower path) and
+    the local round record otherwise (leader path). This is the actual fix: with the
+    override both sides sign the SAME incumbent -> the digest matches."""
+    from minotaur_subnet.api.routes.submissions import champion_consensus as cc
+
+    rs = SimpleNamespace(
+        round_id="r", finalist_submission_id="s", finalist_image_id="builtin:x",
+        committee_hash="ch", benchmark_pack_hash="bp", shadow_case_log_hash="sc",
+        effective_epoch=6, incumbent_image_id="sha256:LOCAL_FOLLOWER_ID", quorum_required=1,
+    )
+    cand = SimpleNamespace(
+        submission_id="s", hotkey="__genesis__", repo_url="builtin://x",
+        image_digest=None, image_id=None, commit_hash="c",
+    )
+    with patch.object(cc, "get_store", lambda: SimpleNamespace(get=lambda sid: cand)), \
+         patch.object(cc, "get_champion_consensus_manager", lambda: None):
+        # Follower path: override wins -> matches the leader's signed value.
+        prop, _, _ = cc._build_champion_proposal_for_round(
+            rs, incumbent_image_id_override="sha256:LEADER_SIGNED")
+        assert prop.incumbent_image_id == "sha256:LEADER_SIGNED"
+        # Leader path: no override -> its own round record (signing unchanged).
+        prop2, _, _ = cc._build_champion_proposal_for_round(rs)
+        assert prop2.incumbent_image_id == "sha256:LOCAL_FOLLOWER_ID"

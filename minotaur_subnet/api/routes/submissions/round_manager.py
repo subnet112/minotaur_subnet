@@ -522,6 +522,13 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "round_id": state.round_id,
         "candidate_submission_id": state.finalist_submission_id,
         "candidate_image_id": state.finalist_image_id,
+        # incumbent_image_id is in the SIGNED digest but not reproducible across
+        # hosts — carry the leader's SIGNED value (from the cert approval) so a
+        # follower rebuilds the identical proposal instead of its own incumbent
+        # record ("Invalid champion approvals" otherwise). Falls back to the round
+        # record when no approval is attached (should not happen post-certify).
+        "incumbent_image_id": getattr(_lead, "incumbent_image_id", None)
+        or state.incumbent_image_id,
         "committee_hash": state.committee_hash,
         "benchmark_pack_hash": state.benchmark_pack_hash,
         "shadow_case_log_hash": state.shadow_case_log_hash,
