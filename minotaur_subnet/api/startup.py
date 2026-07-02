@@ -2449,6 +2449,11 @@ async def initialize(ctx: ServerContext) -> dict:
                     "round_id": round_state.round_id,
                     "candidate_submission_id": round_state.finalist_submission_id,
                     "candidate_image_id": round_state.finalist_image_id,
+                    # SIGNED-but-not-reproducible incumbent id: carry the leader's
+                    # signed value so followers rebuild the same digest (else
+                    # "Invalid champion approvals" strands the round leader-only).
+                    "incumbent_image_id": getattr(_lead, "incumbent_image_id", None)
+                    or round_state.incumbent_image_id,
                     "committee_hash": round_state.committee_hash,
                     "benchmark_pack_hash": round_state.benchmark_pack_hash,
                     "shadow_case_log_hash": round_state.shadow_case_log_hash,
