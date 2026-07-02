@@ -89,10 +89,33 @@ def _resolved(head):
     return {"clone_url": "https://github.com/x/y", "head_sha": head, "state": "open", "base": "main"}
 
 
-def test_merge_refuses_on_head_drift(monkeypatch):
+def test_merge_drift_publishes_certified_tree(monkeypatch):
+    """A post-certification force-push no longer voids the win: the gate falls
+    back to publishing the CERTIFIED tree directly and closes the drifted PR."""
     _env(monkeypatch); _registry(monkeypatch)
-    with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(OTHER)):
+    published, commented, closed = [], [], []
+    with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(OTHER)), \
+         patch.object(sr, "_publish_certified_tree_to_canonical",
+                      lambda *a, **kw: published.append((a, kw)) or True), \
+         patch.object(sr, "comment_on_pr", lambda n, body, **kw: commented.append(n) or True), \
+         patch.object(sr, "close_pr", lambda n: closed.append(n) or True):
+        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is True
+    (args, kwargs), = published
+    assert args[2] == SHA  # published the CERTIFIED sha, not the drifted head
+    assert kwargs["source_token"] is None
+    assert commented == [7] and closed == [7]  # drifted PR closed UNMERGED
+
+
+def test_merge_drift_refuses_when_cert_not_bound(monkeypatch):
+    """Drift fallback keeps the on-chain authority: no cert binding the
+    CERTIFIED sha -> no publish, fail closed."""
+    _env(monkeypatch); _registry(monkeypatch, latest_commit=OTHER)
+    published = []
+    with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(OTHER)), \
+         patch.object(sr, "_publish_certified_tree_to_canonical",
+                      lambda *a, **kw: published.append(a) or True):
         assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is False
+    assert published == []
 
 
 def test_merge_refuses_when_pr_touches_ci(monkeypatch):
@@ -126,7 +149,27 @@ def test_merge_succeeds_and_pins_sha(monkeypatch):
     assert payload == {"merge_method": "squash", "sha": SHA}  # squash + pinned to head
 
 
-def test_merge_refuses_when_pr_unresolvable(monkeypatch):
+def test_merge_unresolvable_pr_falls_back_to_certified_publish(monkeypatch):
+    """A PR closed post-certification is the same grief as a drifted head: the
+    certified tree publishes anyway."""
+    from minotaur_subnet.api.routes.submissions.github_pr import PRResolutionError
+    _env(monkeypatch); _registry(monkeypatch)
+
+    def boom(n):
+        raise PRResolutionError("closed")
+
+    published = []
+    with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", boom), \
+         patch.object(sr, "_publish_certified_tree_to_canonical",
+                      lambda *a, **kw: published.append(a) or True), \
+         patch.object(sr, "comment_on_pr", lambda n, body, **kw: True), \
+         patch.object(sr, "close_pr", lambda n: True):
+        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is True
+    assert published and published[0][2] == SHA
+
+
+def test_merge_refuses_when_pr_unresolvable_and_no_certified_sha(monkeypatch):
+    """No live head AND no certified sha -> nothing to merge or publish."""
     from minotaur_subnet.api.routes.submissions.github_pr import PRResolutionError
     _env(monkeypatch); _registry(monkeypatch)
 
@@ -134,7 +177,7 @@ def test_merge_refuses_when_pr_unresolvable(monkeypatch):
         raise PRResolutionError("closed")
 
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", boom):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is False
+        assert sr.merge_miner_pr_when_certified(7, "", round_id="r") is False
 
 
 # ── assert_solver_repo_token_not_admin ───────────────────────────────────────
