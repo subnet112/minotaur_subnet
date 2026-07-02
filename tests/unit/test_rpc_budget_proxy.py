@@ -504,6 +504,73 @@ async def test_reset_repoints_blocks(proxy_client):
 
 
 # ---------------------------------------------------------------------------
+# (h2) immutable per-chain constants (eth_chainId / net_version) cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_constant_cached_after_first_fetch(proxy_client):
+    _, client, upstream = proxy_client
+    await client.post("/control/open", json={"session_id": "c", "budget": 100})
+    for i in range(5):
+        resp = await client.post("/rpc/c/eth", json=_rpc("eth_chainId", _id=i))
+        body = await resp.json()
+        assert body["result"] == "0xabc"  # the (stubbed) upstream constant
+        if i > 0:  # first call is the raw upstream forward (echoes the stub's id)
+            assert body["id"] == i        # synthesized answers echo the request id
+    assert len(upstream.received) == 1    # only the first call forwarded
+
+
+@pytest.mark.asyncio
+async def test_chain_constant_cache_keyed_per_chain_and_method(proxy_client):
+    _, client, upstream = proxy_client
+    await client.post("/control/open", json={"session_id": "c", "budget": 100})
+    for chain in ("eth", "base"):
+        for method in ("eth_chainId", "net_version"):
+            await client.post(f"/rpc/c/{chain}", json=_rpc(method))
+            await client.post(f"/rpc/c/{chain}", json=_rpc(method))
+    assert len(upstream.received) == 4  # one fetch per (chain, method), repeats cached
+
+
+@pytest.mark.asyncio
+async def test_chain_constant_cache_shared_across_sessions(proxy_client):
+    _, client, upstream = proxy_client
+    await client.post("/control/open", json={"session_id": "a", "budget": 100})
+    await client.post("/control/open", json={"session_id": "b", "budget": 100})
+    await client.post("/rpc/a/eth", json=_rpc("eth_chainId"))
+    await client.post("/rpc/b/eth", json=_rpc("eth_chainId"))
+    assert len(upstream.received) == 1  # session b served from a's fetch
+
+
+@pytest.mark.asyncio
+async def test_chain_constant_served_under_pin(proxy_client):
+    _, client, upstream = proxy_client
+    await _open_pinned(client, "p", 12345)
+    await client.post("/rpc/p/eth", json=_rpc("eth_chainId"))
+    before = len(upstream.received)
+    resp = await client.post("/rpc/p/eth", json=_rpc("eth_chainId"))
+    body = await resp.json()
+    assert body["result"] == "0xabc"
+    assert len(upstream.received) == before  # cached, not forwarded
+
+
+@pytest.mark.asyncio
+async def test_chain_constant_still_budget_gated_when_exhausted(upstream):
+    proxy, client = await _make_proxy_client(upstream.url, mode="enforce", budget=1)
+    try:
+        await client.post("/control/open", json={"session_id": "x", "budget": 1, "mode": "enforce"})
+        await client.post("/rpc/x/eth", json=_rpc("eth_call"))   # spends the budget
+        await client.post("/rpc/x/eth", json=_rpc("eth_call"))   # exceeds -> exhausted
+        before = len(upstream.received)
+        resp = await client.post("/rpc/x/eth", json=_rpc("eth_chainId"))
+        body = await resp.json()
+        assert body["error"]["message"] == "MINOTAUR_BUDGET_EXCEEDED"  # sticky
+        assert len(upstream.received) == before  # not forwarded, not cache-served
+    finally:
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
 # (i) control-plane auth + session registry cap
 # ---------------------------------------------------------------------------
 
