@@ -192,6 +192,21 @@ class TestDedup:
         sample = sample_historical_orders(_FakeAppStore(orders), "round-1", n_per_chain=50)
         assert len(sample) == 4
 
+    def test_stale_intent_params_hex_does_not_block_collapse(self):
+        # intent_params_hex is DERIVED (re-encoded from the manifest at benchmark
+        # time) and embeds quote-time fields (deadline/nonce/min-output), so it
+        # differs on every submission of the SAME trade. It must not count as a
+        # meaningful extra param: on the live 2026-07-02 corpus keeping it exact
+        # capped the collapse at 16% when the true duplicate rate was 55%.
+        def swap(oid, hex_blob):
+            return _make_order(oid, params={
+                "input_token": "0xUSDC", "output_token": "0xTOK",
+                "input_amount": "1000000", "intent_params_hex": hex_blob,
+            })
+        orders = [swap("ord_a", "0xaaaa" * 100), swap("ord_b", "0xbbbb" * 100)]
+        sample = sample_historical_orders(_FakeAppStore(orders), "round-1", n_per_chain=50)
+        assert len(sample) == 1
+
     def test_extra_meaningful_params_never_collapse(self):
         # An app param outside the bucketed swap fields (e.g. recipient) keeps
         # orders distinct even on the same pair/decade.
