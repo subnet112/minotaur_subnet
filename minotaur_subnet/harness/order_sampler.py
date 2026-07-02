@@ -1,13 +1,15 @@
-"""Deterministic sampling of historical orders for benchmark Stage 2.
+"""Deterministic sampling of historical orders for the benchmark.
 
 Samples terminal-demand orders (filled + the champion's failures) from the app
 store as real-world benchmark scenarios. Sampling is deterministic from the
 round_id alone — every validator derives the SAME shared subset without
 broadcasting the selection (#242: partitioned/diverse per-validator draws retired).
 
-Stage 2 replays these orders' parameters against the current benchmark
-fork (weekly-pinned Anvil), and the resulting per-app scores feed the
-adoption rule's per-app non-regression floor.
+The draw joins the synthetic manifest scenarios as ONE flat benchmark set (there is
+no longer a synthetic/historical STAGE split or weighting). The orders replay against
+the current benchmark fork (weekly-pinned Anvil), and their per-order RAW delivered
+outputs feed the authoritative relative adoption rule
+(``epoch/relative_scoring.evaluate_relative_adoption``).
 """
 
 from __future__ import annotations

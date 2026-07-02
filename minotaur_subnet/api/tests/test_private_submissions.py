@@ -288,9 +288,24 @@ class TestPublishPrivateChampion(unittest.TestCase):
         self.assertFalse(ok)
         self.assertFalse(fake.merged)
 
-    def test_fail_closed_on_head_drift(self):
+    def test_drift_publishes_certified_sha_anyway(self):
+        """A post-certification push to the private PR no longer voids the win:
+        the CERTIFIED sha is the publish target either way (the drifted content
+        is simply never published)."""
         fake = _FakeGitHub()
         ok = self._run(fake, resolved_head="b" * 40)  # live head != certified head
+        self.assertTrue(ok)
+        self.assertTrue(fake.merged)
+        # The tree was read at the CERTIFIED head, not the drifted live head.
+        tree_reads = [u for m, u, _ in fake.calls if m == "GET" and "me/solver/git/trees/" in u]
+        self.assertTrue(any(_HEAD in u for u in tree_reads))
+        self.assertFalse(any("b" * 40 in u for u in tree_reads))
+
+    def test_fail_closed_on_drift_when_cert_does_not_bind(self):
+        """The drift path keeps the on-chain authority: no cert binding the
+        certified sha -> refuse."""
+        fake = _FakeGitHub()
+        ok = self._run(fake, cert_binds=False, resolved_head="b" * 40)
         self.assertFalse(ok)
         self.assertFalse(fake.merged)
 

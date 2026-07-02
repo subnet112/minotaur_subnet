@@ -50,14 +50,50 @@ services:
   # bloat (~40-50 GB/fork/day in current production, May 2026). The
   # every-6h recycle cron in docs/validator/quickstart.md is required.
 
+  fork-cache:
+    # Read-through JSON-RPC cache between the anvil forks and their upstream
+    # archive providers (minotaur_subnet.harness.rpc_budget_proxy.fork_cache).
+    # Caches ONLY immutable responses (explicit-block state reads, hash-keyed
+    # lookups, chain constants); latest/pending and unknown methods forward.
+    # A compose service (NOT api-managed like the block-pin proxy): anvil needs
+    # its fork url at startup and the api needs anvil — api-managed would
+    # deadlock a fresh host. FORK_CACHE_DISABLE=1 = forward-everything mode.
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "exec python -m minotaur_subnet.harness.rpc_budget_proxy.fork_cache"
+    environment:
+      UPSTREAMS: "eth=${ETH_UPSTREAM_RPC_URL:-},base=${BASE_UPSTREAM_RPC_URL:-},btevm=${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      LISTEN_PORT: "8650"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8650/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # minotaur ONLY — the sealed benchmark-sandbox never reaches this (the
+    # solver's reads go through the block-pin proxy at 172.30.0.5).
+    networks: [minotaur]
+
   anvil-eth:
+    depends_on:
+      - fork-cache
     image: ghcr.io/foundry-rs/foundry:latest
     restart: unless-stopped
     entrypoint: ["anvil"]
     command:
       - "--host=0.0.0.0"
       - "--port=8545"
-      - "--fork-url=${ETH_UPSTREAM_RPC_URL}"
+      # Routed through the fork-cache service (read-through cache of
+      # immutable state at explicit blocks) — the anvils re-fetch all
+      # touched state per re-fork (--no-storage-caching below), which made
+      # these fetches the dominant archive-provider compute-unit driver.
+      # The cache is OUTSIDE anvil, so a solver cannot write to it: the
+      # poisoning vector --no-storage-caching closes stays closed.
+      - "--fork-url=http://fork-cache:8650/eth"
       - "--chain-id=1"
       # Reads through to upstream every call (no in-anvil state cache).
       # Reduces the attack surface for cache-based exploitation by a
@@ -66,6 +102,9 @@ services:
       # after our snapshot/revert restores the underlying state.
       # anvil-base + anvil-btevm already carry this flag.
       - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
       # NOTE: no --block-time. The simulator force-mines every tx (evm_mine)
       # and re-forks to the upstream head before each simulation, so interval
       # mining is never used — it only burned CPU/RAM mining ~43k empty blocks
@@ -90,15 +129,21 @@ services:
     networks: [minotaur]
 
   anvil-base:
+    depends_on:
+      - fork-cache
     image: ghcr.io/foundry-rs/foundry:latest
     restart: unless-stopped
     entrypoint: ["anvil"]
     command:
       - "--host=0.0.0.0"
       - "--port=8546"
-      - "--fork-url=${BASE_UPSTREAM_RPC_URL}"
+      # Routed through fork-cache — see anvil-eth.
+      - "--fork-url=http://fork-cache:8650/base"
       - "--chain-id=8453"
       - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
       # NOTE: no --block-time. The simulator force-mines every tx (evm_mine)
       # and re-forks to the upstream head before each simulation, so interval
       # mining is never used — it only burned CPU/RAM mining ~43k empty blocks
@@ -119,13 +164,16 @@ services:
     networks: [minotaur]
 
   anvil-btevm:
+    depends_on:
+      - fork-cache
     image: ghcr.io/foundry-rs/foundry:latest
     restart: unless-stopped
     entrypoint: ["anvil"]
     command:
       - "--host=0.0.0.0"
       - "--port=8547"
-      - "--fork-url=${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      # Routed through fork-cache — see anvil-eth.
+      - "--fork-url=http://fork-cache:8650/btevm"
       - "--chain-id=964"
       - "--no-storage-caching"
       - "--fork-retry-backoff=5000"
@@ -215,7 +263,7 @@ services:
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
 
       # EVM signing key (no funds, just identity)
-      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY:?empty signing key would silently disable round certification - set it in your env file}"
 
       # Per-chain ValidatorRegistry addresses
       # (current values in docs/operator/network-reference.md)
@@ -327,7 +375,7 @@ services:
       SUBTENSOR_URL: "${SUBTENSOR_URL:-finney}"
       NETUID: "${NETUID:-112}"
       VALIDATOR_AXON_URL: "${VALIDATOR_AXON_URL}"
-      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY:?empty signing key would silently disable round certification - set it in your env file}"
 
       # Singleton relayer: the api submits signed quorum bundles here.
       # Third-party validators do NOT hold a gas wallet — the subnet

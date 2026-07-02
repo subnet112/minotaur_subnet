@@ -47,12 +47,17 @@ from minotaur_subnet.shared.types import (
 # Import discovery solver
 from minotaur_subnet.docker.discovery_solver import DiscoverySolver
 
-# Reuse test helpers from epoch lifecycle test
+# Reuse test helpers from epoch lifecycle test. NOTE: the shared
+# ``TestBenchmarkWorker`` there still uses the retired scalar API
+# (``set_benchmark_result(score=...)``), so this file defines its own
+# ``LocalBenchmarkWorker`` below against the post-scalar (delivered-value)
+# contract instead of importing it.
 from tests.e2e.test_epoch_lifecycle import (
     MockOrchestrator,
     MockSolverSession,
-    TestBenchmarkWorker,
+    _build_test_intents,
 )
+from minotaur_subnet.epoch.relative_scoring import has_delivered_value_rows
 
 
 # ── JS fixture with manifest ──────────────────────────────────────────────
@@ -93,6 +98,108 @@ SOLIDITY_STUB = """\
 pragma solidity ^0.8.24;
 contract TestSwap {}
 """
+
+
+# ── In-process benchmark worker (post-scalar / delivered-value API) ────────
+
+
+class LocalBenchmarkWorker:
+    """In-process benchmark worker on the NEW (post-scalar) contract.
+
+    Mirrors the real worker: run each solver against the test intents, record
+    per-order ``raw_output`` rows in ``benchmark_details``, and let the
+    delivered-value gate (``has_delivered_value_rows``) decide SCORED vs
+    REJECTED. Ranking + adoption use that same delivered-value signal — there
+    is no scalar ``benchmark_score`` anymore.
+    """
+    __test__ = False
+
+    def __init__(
+        self,
+        submission_store: SubmissionStore,
+        orchestrator: MockOrchestrator,
+        test_intents=None,
+    ):
+        self._sub_store = submission_store
+        self._orchestrator = orchestrator
+        self._test_intents = test_intents or _build_test_intents()
+
+    async def run_once(self) -> int:
+        """Benchmark all BENCHMARKING submissions, then rank + adopt."""
+        pending = self._sub_store.list_by_status(SubmissionStatus.BENCHMARKING)
+        if not pending:
+            return 0
+
+        for sub in pending:
+            if sub.image_tag is None:
+                self._sub_store.reject(sub.submission_id, "No image tag")
+                continue
+
+            try:
+                session = await self._orchestrator.start_docker(sub.image_tag)
+                await session.initialize({"epoch": sub.epoch})
+                rows = self._benchmark_session(session)
+                details = {"per_intent": rows, "method": "in-process"}
+                # Validity gate: SCORED iff >= 1 order delivered value
+                # (raw_output parses to > 0), else REJECTED.
+                self._sub_store.set_benchmark_result(
+                    sub.submission_id,
+                    valid=has_delivered_value_rows(rows),
+                    details=details,
+                )
+            except Exception as exc:
+                self._sub_store.set_benchmark_result(
+                    sub.submission_id,
+                    valid=False,
+                    details={"per_intent": [], "error": str(exc)},
+                )
+
+        # Rank scored submissions (display rank) + adopt the top delivered-value
+        # solver. Ranking by total delivered value stands in for the real
+        # worker's relative net-better ordering for this in-process mock.
+        scored = self._sub_store.list_by_status(SubmissionStatus.SCORED)
+        if scored:
+            scored.sort(key=self._delivered_value, reverse=True)
+            for i, s in enumerate(scored):
+                self._sub_store.set_benchmark_rank(s.submission_id, i + 1)
+            best = scored[0]
+            if has_delivered_value_rows(
+                (best.benchmark_details or {}).get("per_intent")
+            ):
+                self._sub_store.adopt(best.submission_id)
+
+        return len(pending)
+
+    def _benchmark_session(self, session: MockSolverSession) -> list[dict]:
+        """Run solver against test intents → per-order raw_output rows.
+
+        A plan with interactions "delivers value" (positive wei raw_output that
+        scales with plan richness, mirroring the old 0.5 + 0.15*n heuristic);
+        an empty/failed plan delivers "0".
+        """
+        rows = []
+        for idx, (intent_def, state, snapshot) in enumerate(self._test_intents):
+            try:
+                plan = session.generate_plan(intent_def, state, snapshot)
+                if plan and len(plan.interactions) > 0:
+                    wei = 10**18 * (1 + min(len(plan.interactions), 4))
+                    raw_output = str(wei)
+                else:
+                    raw_output = "0"
+            except Exception:
+                raw_output = "0"
+            rows.append({"intent_id": f"app:scn{idx}", "raw_output": raw_output})
+        return rows
+
+    @staticmethod
+    def _delivered_value(sub) -> int:
+        total = 0
+        for r in (sub.benchmark_details or {}).get("per_intent") or []:
+            try:
+                total += int(r.get("raw_output") or "0")
+            except (TypeError, ValueError):
+                continue
+        return total
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -143,7 +250,7 @@ def orchestrator():
 
 @pytest.fixture
 def benchmark_worker(sub_store, orchestrator):
-    return TestBenchmarkWorker(sub_store, orchestrator)
+    return LocalBenchmarkWorker(sub_store, orchestrator)
 
 
 # ── Test: Manifest Discovery ──────────────────────────────────────────────
@@ -420,8 +527,13 @@ class TestFullMinerLifecycle:
             assert processed == 1
 
             refreshed_sub = sub_store.get(sub.submission_id)
-            assert refreshed_sub.benchmark_score is not None
-            assert refreshed_sub.benchmark_score > 0
+            # Post-scalar: "scored with value" == the submission delivered value
+            # on >= 1 order (raw_output > 0 in the per_intent rows), which is the
+            # validity gate that replaced ``benchmark_score > 0``.
+            assert refreshed_sub.benchmark_details is not None
+            assert has_delivered_value_rows(
+                refreshed_sub.benchmark_details.get("per_intent")
+            )
             assert refreshed_sub.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED)
 
             # ── Step 7: Hot-swap solver into BlockLoop ───────────────

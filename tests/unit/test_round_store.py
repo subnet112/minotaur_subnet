@@ -111,7 +111,6 @@ def test_set_finalist_and_certificate():
         current.round_id,
         submission_id="sub_finalist",
         image_id="sha256:" + "c" * 64,
-        benchmark_score=0.91,
         shadow_case_log_hash="shadow-1",
     )
     certified = store.certify_round(

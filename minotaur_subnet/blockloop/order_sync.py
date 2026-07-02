@@ -22,6 +22,11 @@ from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
+# /v1/orders is paginated (max limit 500) and defaults to a SLIM summary view;
+# the sync needs FULL records (plan/consensus_result/params blob) to rebuild a
+# usable corpus, so it pages through with full=1 at the max page size.
+_SYNC_PAGE_SIZE = 500
+
 
 class OrderSync:
     def __init__(
@@ -62,8 +67,29 @@ class OrderSync:
         if not url:
             return 0
         # The order book is PUBLIC (no auth) — /v1/orders already strips
-        # user_signature. Followers pull it to build their benchmark corpus.
-        orders = await self._http_get(f"{url}/v1/orders")
+        # user_signature. Followers pull it to build their benchmark corpus:
+        # full=1 (the summary view drops plan/consensus_result/params blob),
+        # paged at the endpoint's max limit. The seen-set both dedupes and
+        # terminates against a pre-pagination leader that ignores limit/offset
+        # and returns the whole set on every page.
+        orders: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page_offset = 0
+        while True:
+            page = await self._http_get(
+                f"{url}/v1/orders?full=1&limit={_SYNC_PAGE_SIZE}&offset={page_offset}"
+            )
+            fresh = [
+                o for o in page
+                if isinstance(o, dict) and o.get("order_id") and o["order_id"] not in seen
+            ]
+            if not fresh:
+                break
+            orders.extend(fresh)
+            seen.update(o["order_id"] for o in fresh)
+            if len(page) < _SYNC_PAGE_SIZE:
+                break
+            page_offset += _SYNC_PAGE_SIZE
         if not orders:
             return 0
         n = 0

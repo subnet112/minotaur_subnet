@@ -51,15 +51,18 @@ def test_score_image_diagnostic_uses_champion_reference_anchor():
         return ["R1", "R2"]
 
     w._benchmark_submission = AsyncMock(side_effect=_bench)
-    w._compute_avg_score = MagicMock(return_value=0.70)
-    w._results_to_details = MagicMock(return_value={"scorecard": {}})
+    details = {"per_intent": [{"intent_id": "dex:scn", "raw_output": "1000"}]}
+    w._results_to_details = MagicMock(return_value=details)
 
     out = asyncio.run(w.score_image_diagnostic("king:exact"))
 
     # benchmarked the GIVEN image against the CHAMPION reference anchor (challenger path)
     assert seen["image"] == "king:exact"
     assert seen["reference_quotes"] is refq
-    assert out["score"] == 0.70
+    # the diagnostic returns the challenger-path scorecard (raw_output rows), not a
+    # scalar composite — one row delivered value (>0), so delivered_value_count == 1
+    assert out["details"] is details
+    assert out["delivered_value_count"] == 1
     assert out["intent_count"] == 2
     assert out["image"] == "king:exact"
     # applied the deterministic round-anchored pin, exactly like run_once

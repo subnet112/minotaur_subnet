@@ -59,8 +59,6 @@ def _make_worker(monkeypatch, scores, champion="champ:ref"):
 
     monkeypatch.setattr(w, "_build_score_fn", _sf)
     monkeypatch.setattr(w, "_enrich_intents_with_manifests", lambda intents: intents)
-    # Aggregate mean is LOGGING/DISPLAY only now; read it off the per-order result.
-    monkeypatch.setattr(w, "_compute_avg_score", lambda results: results[0].score)
 
     async def _run_benchmark(session, intents, **kwargs):
         # One per-order result carrying the RAW delivered output (raw_output, an
@@ -81,10 +79,12 @@ def test_better_challenger_votes_adopt(monkeypatch):
     w = _make_worker(monkeypatch, {"champ:ref": 0.70, "chal:good": 0.90})
     vote = asyncio.run(w.run_shadow_vote("chal:good"))
     assert vote["vote"] == "ADOPT", vote
-    assert vote["champ_score"] == 0.70 and vote["chal_score"] == 0.90
+    # No aggregate score exists anymore; the vote carries the per-order RELATIVE
+    # counts. Delivering MORE on the one order is a win, no regression.
+    assert vote["n_wins"] == 1 and vote["n_regressions"] == 0
+    assert vote["scenarios_compared"] == 1
     assert vote["champion_image"] == "champ:ref"
     assert vote["validator_id"] == "val-1"
-    assert vote["n_wins"] == 1 and vote["n_regressions"] == 0
 
 
 def test_worse_challenger_votes_reject(monkeypatch):

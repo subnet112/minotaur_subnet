@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -49,6 +51,10 @@ from minotaur_subnet.harness.orchestrator import (
     build_rpc_url_map,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
+from minotaur_subnet.epoch.relative_scoring import (
+    evaluate_relative_adoption,
+    has_delivered_value_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,34 +65,16 @@ GENESIS_SOLVER_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
 
 
 @dataclass
-class _StageScore:
-    """Aggregated score for one benchmark stage (synthetic or historical)."""
-    avg_score: float
-    count: int
-    success_count: int
-
-
-def _result_stage(result: Any) -> str:
-    """Extract the stage tag ('synthetic' or 'historical') from a result.
-
-    The stage is embedded in the intent_id format. Historical scenarios
-    use 'hist:ord_xxx' in the scenario name; synthetic use the manifest
-    scenario name. For backward compat, unknown tags default to 'synthetic'.
-    """
-    intent_id = getattr(result, "intent_id", "") or ""
-    if ":hist:" in intent_id or intent_id.endswith(":hist") or "hist:ord_" in intent_id:
-        return "historical"
-    return "synthetic"
-
-
-@dataclass
 class BenchmarkScorecard:
     """Per-app and per-scenario scoring breakdown.
 
-    Used by the champion adoption logic to enforce non-regression
-    guarantees and per-app quality floors.
+    Non-scalar diagnostics only. The scalar composite (``global_score``, the
+    retired ``0.4*synthetic + 0.6*historical`` blend) was removed: adoption and
+    finalist ranking are decided per-order by the relative rule
+    (``epoch/relative_scoring``) over ``per_intent[*].raw_output``. Benchmarking is
+    a SINGLE flat scenario set (every app's synthetic orders ∪ the round-seeded
+    historical draw); there is no longer a synthetic/historical stage split.
     """
-    global_score: float = 0.0
     app_scores: dict[str, float] = field(default_factory=dict)
     # Per-app on-chain scoreIntent BPS (one list entry per scenario; None when the
     # sim didn't yield a score). The unfakeable output signal the current adoption
@@ -108,7 +96,6 @@ class BenchmarkScorecard:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "global_score": self.global_score,
             "app_scores": dict(self.app_scores),
             "app_onchain": {k: list(v) for k, v in self.app_onchain.items()},
             "scenario_scores": dict(self.scenario_scores),
@@ -124,7 +111,6 @@ class BenchmarkScorecard:
         if not data:
             return cls()
         return cls(
-            global_score=data.get("global_score", 0.0),
             app_scores=data.get("app_scores", {}),
             app_onchain=data.get("app_onchain", {}),
             scenario_scores=data.get("scenario_scores", {}),
@@ -184,22 +170,40 @@ def _challenger_quorum_mode() -> bool:
     return raw.strip().lower() not in _CHALLENGER_QUORUM_OFF_VALUES
 
 
+def _rotation_slate_slots() -> int:
+    """Benched-slate width (``SOLVER_ROUND_MAX_SUBMISSIONS``, 0 = no rotation).
+
+    Mirrors ``routes._max_submissions_per_round_total`` — read directly from the
+    env here to avoid a harness→api import. When > 0, the slate is selected at
+    round CLOSE by LRU rotation (``harness/rotation.py``), so open-round eager
+    benching is deferred (see ``run_once``).
+    """
+    raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def _consolidate_champion_bench() -> bool:
     """Whether to MEMOIZE the champion benchmark within a round so the two
     champion-run paths (dethrone re-bench in ``_refresh_incumbent_score`` and the
     trustless quorum verdict in ``_independent_adopt_vote``) share ONE result
-    instead of each re-running the champion solver. **DEFAULT OFF.**
+    instead of each re-running the champion solver. **DEFAULT ON**
+    (``CONSOLIDATE_CHAMPION_BENCH=0`` disables).
 
     Pure compute optimization: a cached result is reused ONLY when round_id +
     champion image + fork block + corpus fingerprint + real-sim mode all match,
     so a hit is provably the SAME deterministic computation — the verdict and the
-    persisted score are byte-identical to recomputing. Flag-gated so the saving
-    can be enabled + validated separately. Off → both paths recompute (legacy).
+    persisted score are byte-identical to recomputing. Shipped default-off for
+    separate validation, but the flag was never actually set in production
+    (audited on the leader 2026-07-02), so every round paid the redundant
+    champion run — now default-on with the env as the kill switch.
     """
     import os
 
-    return os.environ.get("CONSOLIDATE_CHAMPION_BENCH", "").strip().lower() in (
-        "1", "true", "yes", "on",
+    return os.environ.get("CONSOLIDATE_CHAMPION_BENCH", "1").strip().lower() not in (
+        "0", "false", "no", "off",
     )
 
 
@@ -216,6 +220,38 @@ _CHAMPION_BENCH_CACHE_MAX = 32  # hard backstop; normally holds only the current
 def _clear_champion_bench_cache() -> None:
     """Reset the process-wide champion-bench memo (test hook / operational reset)."""
     _CHAMPION_BENCH_CACHE.clear()
+
+
+def _refquote_checkpoint_enabled() -> bool:
+    """Whether the reference-quote pre-pass is checkpointed (memory + /data).
+
+    Default ON; ``BENCHMARK_REFQUOTE_CHECKPOINT=0`` disables (recompute every
+    pass — the pre-#496 behavior).
+    """
+    import os
+
+    return os.environ.get("BENCHMARK_REFQUOTE_CHECKPOINT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+# PROCESS-WIDE reference-quote memo, same sharing rationale as the champion
+# memo above (fresh BenchmarkWorker instances must share it). Additionally
+# PERSISTED next to the submission store (/data) so an api restart resumes the
+# round with the SAME reference quotes instead of re-running the champion
+# pre-pass — both a rework saving (the pre-pass ran ~3x/round: once per
+# run_once pass as submissions trickle in, once per incumbent re-score) and a
+# within-round consistency improvement (every challenger in the round is graded
+# against ONE reference set, not whichever pass happened to produce it).
+_REFERENCE_QUOTES_CACHE: dict[str, dict] = {}
+_REFERENCE_QUOTES_CACHE_MAX = 8
+_REFQUOTE_CHECKPOINT_FILENAME = "refquote_checkpoints.json"
+_REFQUOTE_CHECKPOINT_KEEP = 4  # last N keys on disk (a round has 1; margin for overlap)
+
+
+def _clear_reference_quotes_cache() -> None:
+    """Reset the process-wide reference-quote memo (test hook)."""
+    _REFERENCE_QUOTES_CACHE.clear()
 
 
 class BenchmarkWorker:
@@ -582,6 +618,24 @@ class BenchmarkWorker:
                     if s.round_id == current_round.round_id
                 ]
                 if round_subs:
+                    if (
+                        current_round.status == RoundStatus.OPEN
+                        and _rotation_slate_slots() > 0
+                    ):
+                        # Rotation (SOLVER_ROUND_MAX_SUBMISSIONS = slate width,
+                        # selected at close by LRU seniority): the benched slate
+                        # isn't known while the round is OPEN, so eager-benching
+                        # now would spend serialized sim time on submissions
+                        # that may not make the slate — and hand early
+                        # submitters exactly the arrival-order head start the
+                        # rotation exists to remove. Defer: the slate benches
+                        # after close, under the auto-scaled decision window.
+                        logger.debug(
+                            "[benchmark] deferring %d open-round submission(s) "
+                            "until the rotation slate is selected at close",
+                            len(round_subs),
+                        )
+                        return 0
                     benchmarking = round_subs
                 else:
                     # No submissions for this round — run genesis/bootstrap
@@ -611,7 +665,7 @@ class BenchmarkWorker:
             for sub in benchmarking:
                 self._sub_store.set_benchmark_result(
                     sub.submission_id,
-                    score=0.0,
+                    valid=False,
                     details={"error": "no_active_intents"},
                 )
             return len(benchmarking)
@@ -619,11 +673,14 @@ class BenchmarkWorker:
         # Build scoring function from JS engine (also loads JS into engine)
         score_fn = await self._build_score_fn(intents)
 
-        # Stage 1: enrich intents with synthetic scenarios from manifest
+        # Build the SINGLE flat benchmark scenario set: every app's synthetic
+        # scenarios from the manifest ∪ the round-seeded historical order draw.
+        # There is no stage split or weighting — the relative rule joins all
+        # orders by intent_id regardless of origin.
         intents = self._enrich_intents_with_manifests(intents)
 
-        # Stage 2: append historical order scenarios (deterministic from round_id).
-        # Uses the current round's ID so all validators sample the same orders.
+        # Append the round-seeded historical order draw (deterministic from
+        # round_id, so every validator samples the identical orders).
         if self._round_store is not None:
             current_round = self._round_store.get_current_round()
             if current_round is not None:
@@ -632,7 +689,7 @@ class BenchmarkWorker:
                     if historical:
                         intents.extend(historical)
                         logger.info(
-                            "Added %d Stage 2 historical scenarios for round %s",
+                            "Added %d historical order scenarios for round %s",
                             len(historical), current_round.round_id,
                         )
                 except Exception as exc:
@@ -642,14 +699,17 @@ class BenchmarkWorker:
         # (CoW quoted_output etc.) to the champion solver so every challenger is
         # graded against the same reference output. Falls back to per-submission
         # self-quoting when no champion is available (still fixes the revert).
-        reference_quotes = await self._build_reference_quotes(intents)
+        reference_quotes = await self._get_or_build_reference_quotes(intents)
 
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
-            # Skip already-scored submissions (may appear in BENCHMARKING
-            # from a previous pass that scored then persisted)
-            if sub.benchmark_score is not None and sub.benchmark_score > 0:
-                logger.info("Skipping already-scored submission %s (%.3f)", sub.submission_id, sub.benchmark_score)
+            # Skip already-benchmarked submissions (may appear in BENCHMARKING
+            # from a previous pass that benched then persisted). "Already
+            # benchmarked" = it delivered value on >= 1 order (the validity gate).
+            if sub.benchmark_details and has_delivered_value_rows(
+                sub.benchmark_details.get("per_intent")
+            ):
+                logger.info("Skipping already-benchmarked submission %s", sub.submission_id)
                 continue
             if sub.solver_path is not None:
                 if not _allow_subprocess_benchmark():
@@ -677,17 +737,18 @@ class BenchmarkWorker:
                         sub.solver_path, intents, score_fn,
                         reference_quotes=reference_quotes,
                     )
-                    avg_score = self._compute_avg_score(results)
                     details = self._results_to_details(results)
+                    valid = has_delivered_value_rows(details["per_intent"])
 
                     self._sub_store.set_benchmark_result(
                         sub.submission_id,
-                        score=avg_score,
+                        valid=valid,
                         details=details,
                     )
                     logger.info(
-                        "Submission %s scored %.4f (%d intents)",
-                        sub.submission_id, avg_score, len(results),
+                        "Submission %s benchmarked over %d orders -> %s",
+                        sub.submission_id, len(results),
+                        "SCORED" if valid else "REJECTED (no order delivered value)",
                     )
                 except Exception as exc:
                     logger.exception(
@@ -696,7 +757,7 @@ class BenchmarkWorker:
                     )
                     self._sub_store.set_benchmark_result(
                         sub.submission_id,
-                        score=0.0,
+                        valid=False,
                         details={"error": str(exc)},
                     )
 
@@ -711,18 +772,19 @@ class BenchmarkWorker:
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
                         print(f"[BENCHMARK]   {r.intent_id}: score={r.score} error={r.error} plan={r.plan is not None}", flush=True)
-                    avg_score = self._compute_avg_score(results)
                     details = self._results_to_details(results)
-                    print(f"[BENCHMARK] avg_score={avg_score:.4f}", flush=True)
+                    valid = has_delivered_value_rows(details["per_intent"])
+                    print(f"[BENCHMARK] valid={valid} orders={len(results)}", flush=True)
 
                     self._sub_store.set_benchmark_result(
                         sub.submission_id,
-                        score=avg_score,
+                        valid=valid,
                         details=details,
                     )
                     logger.info(
-                        "Submission %s scored %.4f (%d intents)",
-                        sub.submission_id, avg_score, len(results),
+                        "Submission %s benchmarked over %d orders -> %s",
+                        sub.submission_id, len(results),
+                        "SCORED" if valid else "REJECTED (no order delivered value)",
                     )
                 except Exception as exc:
                     import traceback
@@ -734,7 +796,7 @@ class BenchmarkWorker:
                     )
                     self._sub_store.set_benchmark_result(
                         sub.submission_id,
-                        score=0.0,
+                        valid=False,
                         details={"error": str(exc)},
                     )
 
@@ -761,11 +823,12 @@ class BenchmarkWorker:
 
         Mirrors ``run_once``'s per-submission setup: applies the SAME epoch/round
         fork-pin a real challenger gets (the incumbent re-score historically did NOT
-        apply the round-anchored pin), builds the same intents corpus (synthetic +
-        the round's historical scenarios) and the same champion reference-quote
-        anchor, then runs the same ``_benchmark_submission`` + ``_compute_avg_score``
-        / ``_results_to_details``. Nothing is persisted or made adoption-eligible here
-        — the caller decides what to do with the returned score.
+        apply the round-anchored pin), builds the same flat intents corpus (synthetic
+        ∪ the round's historical order draw) and the same champion reference-quote
+        anchor, then runs the same ``_benchmark_submission`` / ``_results_to_details``.
+        Nothing is persisted or made adoption-eligible here — the caller decides what
+        to do with the returned ``details`` (whose ``per_intent[*].raw_output`` rows
+        are what the relative rule consumes).
 
         Raises ForkPinUnavailable when the round pin is unsealed (caller defers),
         and RuntimeError when the simulator isn't wired / no active intents.
@@ -795,18 +858,26 @@ class BenchmarkWorker:
                         intents.extend(historical)
                 except Exception as exc:
                     logger.warning("[%s] historical load failed: %s", context, exc)
-        reference_quotes = await self._build_reference_quotes(intents)
+        reference_quotes = await self._get_or_build_reference_quotes(intents)
 
         logger.info("[%s] scoring image %s via challenger path (%d intents)", context, image_tag, len(intents))
         results = await self._benchmark_submission(
             image_tag, intents, score_fn, reference_quotes=reference_quotes,
         )
-        avg = self._compute_avg_score(results)
         details = self._results_to_details(results)
-        logger.info("[%s] image %s scored %.4f (%d intents)", context, image_tag, avg, len(results))
+        # DISPLAY/logging only — the authoritative payload is `details`
+        # (per_intent raw_output rows). Adoption/ranking never read this count.
+        delivered_value_count = sum(
+            1 for row in details["per_intent"]
+            if row.get("raw_output") not in (None, "", "0")
+        )
+        logger.info(
+            "[%s] image %s benchmarked: %d/%d orders delivered value",
+            context, image_tag, delivered_value_count, len(results),
+        )
         return {
             "image": image_tag,
-            "score": avg,
+            "delivered_value_count": delivered_value_count,
             "intent_count": len(results),
             "details": details,
             "pin_round_id": _pin_round_id,
@@ -998,7 +1069,6 @@ class BenchmarkWorker:
                         **state.control_view(),
                         "_intent_function": fn_name,
                         "_scenario_name": scenario.get("name", ""),
-                        "_stage": "synthetic",
                     }
                     fund = scenario.get("fund")
                     if fund:
@@ -1141,15 +1211,14 @@ class BenchmarkWorker:
         round_id: str,
         n_per_chain: int | None = None,
     ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
-        """Load Stage 2 scenarios from historical order samples.
+        """Load the round's historical-order scenarios (the round-seeded draw).
 
-        Deterministic sampling from round_id ensures all validators
-        score against the same set of historical orders without needing
-        to broadcast the sample list.
+        Deterministic sampling from round_id ensures all validators score against
+        the same set of historical orders without broadcasting the sample list.
 
-        Returns (intent_def, state, snapshot) tuples tagged with
-        state.control["_stage"] == "historical" so the scoring pipeline
-        can separate Stage 1 from Stage 2 for composite scoring.
+        Returns (intent_def, state, snapshot) tuples. These join the synthetic
+        scenarios as ONE flat benchmark set — there is no stage tag or split; the
+        per-order relative rule keys on each order's ``hist:`` scenario name.
         """
         if self._app_store is None:
             return []
@@ -1237,7 +1306,8 @@ class BenchmarkWorker:
                 owner="",
                 raw_params=dict(order.get("params", {})),
                 control={
-                    "_stage": "historical",
+                    # hist: prefix is the per-order JOIN id the relative rule keys
+                    # on, NOT a stage marker — benchmarking is one flat set now.
                     "_scenario_name": f"hist:{order.get('order_id', '?')}",
                     "_intent_function": order.get("intent_function", "swap"),
                     "_original_block_number": order.get("block_number"),
@@ -1315,14 +1385,15 @@ class BenchmarkWorker:
         if not intents:
             logger.warning("Genesis: no active intents for benchmarking")
             self._sub_store.set_benchmark_result(
-                sub.submission_id, score=0.0, details={"error": "no_active_intents"},
+                sub.submission_id, valid=False, details={"error": "no_active_intents"},
             )
             return 1
 
         score_fn = await self._build_score_fn(intents)
         intents = self._enrich_intents_with_manifests(intents)
 
-        # Stage 2: historical scenarios (if any order history exists)
+        # Append the historical order draw (if any order history exists) — same
+        # flat set as a real challenger, no stage split.
         if self._round_store is not None:
             current_round = self._round_store.get_current_round()
             if current_round is not None:
@@ -1339,19 +1410,20 @@ class BenchmarkWorker:
             results = await self._benchmark_submission(
                 self._genesis_solver_image, intents, score_fn,
             )
-            avg_score = self._compute_avg_score(results)
             details = self._results_to_details(results)
+            valid = has_delivered_value_rows(details["per_intent"])
 
             self._sub_store.set_benchmark_result(
-                sub.submission_id, score=avg_score, details=details,
+                sub.submission_id, valid=valid, details=details,
             )
             logger.info(
-                "Genesis submission scored %.4f (%d intents)", avg_score, len(results),
+                "Genesis submission benchmarked over %d orders -> %s",
+                len(results), "SCORED" if valid else "REJECTED (no order delivered value)",
             )
         except Exception as exc:
             logger.exception("Genesis benchmarking failed: %s", exc)
             self._sub_store.set_benchmark_result(
-                sub.submission_id, score=0.0, details={"error": str(exc)},
+                sub.submission_id, valid=False, details={"error": str(exc)},
             )
 
         # Transition SOLVING apps and rank the replay result (same pipeline as run_once)
@@ -1367,11 +1439,11 @@ class BenchmarkWorker:
         active-champion snapshot, else a SCORED/ADOPTED genesis with a usable score.
 
         Genesis-as-bar (#242, user decision): the FIRST champion must BEAT genesis, so
-        a benchmarked (SCORED, score>0) genesis IS the incumbent here — mirroring the
-        leader's ``_maybe_seed_genesis_incumbent`` (which seeds self._champion from the
-        same predicate at decision time). KEEP this predicate identical to the leader's
-        or has_champion parity breaks. Returns ``None`` only at true bootstrap (no
-        adopted/snapshot champion AND no scored genesis yet).
+        a benchmarked genesis that DELIVERED VALUE on >= 1 order IS the incumbent here
+        — mirroring the leader's ``_maybe_seed_genesis_incumbent`` (which seeds
+        self._champion from the same predicate at decision time). KEEP this predicate
+        identical to the leader's or has_champion parity breaks. Returns ``None`` only
+        at true bootstrap (no adopted/snapshot champion AND no valid genesis yet).
         """
         adopted = self._sub_store.get_champion()
         if adopted is not None:
@@ -1384,13 +1456,14 @@ class BenchmarkWorker:
                     return self._sub_store.get(sid)
             except Exception:  # pragma: no cover - defensive
                 return None
-        # Genesis-as-bar: a SCORED/ADOPTED genesis with a usable score is the
-        # incumbent (same predicate as EpochManager._maybe_seed_genesis_incumbent).
+        # Genesis-as-bar: a SCORED/ADOPTED genesis that DELIVERED VALUE is the
+        # incumbent (same predicate as EpochManager._maybe_seed_genesis_incumbent —
+        # both call has_delivered_value_rows on the genesis per_intent rows).
         genesis = self._sub_store.get_by_hotkey_epoch(GENESIS_HOTKEY, GENESIS_EPOCH)
         if (
             genesis is not None
             and genesis.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED)
-            and (genesis.benchmark_score or 0.0) > 0
+            and has_delivered_value_rows((genesis.benchmark_details or {}).get("per_intent"))
         ):
             return genesis
         return None
@@ -1431,8 +1504,8 @@ class BenchmarkWorker:
         Benchmarks the REAL reference champion — the adopted champion, or the
         official genesis solver when none is adopted (``_resolve_champion_image``,
         the same store-backed resolution scoring uses) — and ``challenger_image``
-        on THIS validator's own diverse Stage-2 subset, then applies the
-        AUTHORITATIVE relative per-order rule
+        on the round's shared flat benchmark set (synthetic ∪ the round-seeded
+        historical order draw), then applies the AUTHORITATIVE relative per-order rule
         (:func:`evaluate_relative_adoption`) — the IDENTICAL rule the leader + every
         follower run. Returns + publishes this validator's vote.
 
@@ -1451,7 +1524,6 @@ class BenchmarkWorker:
             require_real_sim_default,
             run_benchmark,
         )
-        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
         champ_image = self._resolve_champion_image()
         if not champ_image:
@@ -1459,8 +1531,8 @@ class BenchmarkWorker:
         if not challenger_image:
             return {"error": "challenger_image required"}
 
-        # Same benchmark set run_once uses: Stage-1 synthetic + Stage-2 diverse
-        # (per-validator seed when CHALLENGER_QUORUM_MODE is on).
+        # Same flat benchmark set run_once uses: synthetic ∪ the round-seeded
+        # historical order draw (one shared draw for every validator).
         intents = self._load_benchmark_intents()
         if not intents:
             return {"error": "no active intents"}
@@ -1508,11 +1580,9 @@ class BenchmarkWorker:
         except RealSimulationUnavailable:
             return {"error": "real simulator unavailable"}
 
-        # champ_score / chal_score are the aggregate JS means — LOGGING/DISPLAY only
-        # now; the AUTHORITATIVE verdict is the per-order relative rule over the RAW
-        # delivered output (raw_output), IDENTICAL to the leader + followers.
-        champ_score = self._compute_avg_score(champ_results)
-        chal_score = self._compute_avg_score(chal_results)
+        # The AUTHORITATIVE verdict is the per-order relative rule over the RAW
+        # delivered output (raw_output), IDENTICAL to the leader + followers. The
+        # vote carries the relative COUNTS (no aggregate score exists anymore).
         verdict = evaluate_relative_adoption(champ_results, chal_results)
         adopt = bool(verdict["adopt"])
         reason = verdict["reason"]
@@ -1520,8 +1590,6 @@ class BenchmarkWorker:
             "candidate_id": challenger_image,
             "role": "shadow",
             "vote": "ADOPT" if adopt else "REJECT",
-            "chal_score": round(float(chal_score), 4),
-            "champ_score": round(float(champ_score), 4),
             "n_wins": verdict["n_wins"],
             "n_regressions": verdict["n_regressions"],
             "n_blind_spots": verdict["n_blind_spots"],
@@ -1545,6 +1613,116 @@ class BenchmarkWorker:
         except Exception:  # observe-only — must never break
             pass
         return vote
+    def _refquote_checkpoint_path(self) -> Path | None:
+        """The on-disk checkpoint file, colocated with the submission store
+        (which already defaults onto the /data volume — #430), or None when the
+        store is memory-only (tests/dev)."""
+        p = getattr(self._sub_store, "_persist_path", None)
+        return p.with_name(_REFQUOTE_CHECKPOINT_FILENAME) if p is not None else None
+
+    def _refquote_checkpoint_key(
+        self, intents: list, image: str, fork_block: int, round_id: str,
+    ) -> str:
+        """Fully-deterministic identity of one pre-pass result — same components
+        as the champion-bench memo key, flattened for JSON storage."""
+        return "|".join((
+            round_id, image, str(int(fork_block)),
+            str(self._corpus_fingerprint(intents)),
+            str(self._loaded_js_fingerprint(intents)),
+        ))
+
+    def _refquote_disk_load(self, key: str) -> dict[str, dict[str, str]] | None:
+        path = self._refquote_checkpoint_path()
+        if path is None:
+            return None
+        try:
+            entries = json.loads(path.read_text()).get("entries", [])
+        except (OSError, ValueError):
+            return None
+        for e in entries:
+            if isinstance(e, dict) and e.get("key") == key:
+                quotes = e.get("quotes")
+                return quotes if isinstance(quotes, dict) else None
+        return None
+
+    def _refquote_disk_save(self, key: str, quotes: dict) -> None:
+        """Best-effort atomic append-and-trim; a failed save only costs a
+        recompute after the next restart, never correctness."""
+        path = self._refquote_checkpoint_path()
+        if path is None:
+            return
+        try:
+            try:
+                entries = json.loads(path.read_text()).get("entries", [])
+            except (OSError, ValueError):
+                entries = []
+            entries = [e for e in entries if isinstance(e, dict) and e.get("key") != key]
+            entries.append({"key": key, "quotes": quotes})
+            entries = entries[-_REFQUOTE_CHECKPOINT_KEEP:]
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "entries": entries}))
+            tmp.replace(path)
+        except OSError as exc:
+            logger.warning("[reference-quote] checkpoint save failed: %s", exc)
+
+    async def _get_or_build_reference_quotes(
+        self,
+        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
+        *,
+        image_tag: str | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Memoized + /data-checkpointed :meth:`_build_reference_quotes`.
+
+        The pre-pass is fully determined by (round, champion image, fork block,
+        corpus, scoring-JS) — the same key discipline as ``memo_champion_bench``
+        — so reuse is the identical computation, and an api restart mid-round
+        picks the round back up with the SAME reference set instead of paying a
+        fresh champion session (~30 quotes) per run_once pass.
+
+        Falls through to a plain build when: checkpointing is disabled, any key
+        component is unavailable (no round / no pin / no champion — dev paths),
+        or the build produced an EMPTY result (champion session failed to start:
+        transient, must retry next pass, never freeze for the round).
+        """
+        round_id = None
+        if self._round_store is not None:
+            current = self._round_store.get_current_round()
+            round_id = getattr(current, "round_id", None)
+        image = image_tag
+        if image is None and self._use_docker:
+            image = self._resolve_champion_image()
+        fork_block = self._epoch_block_number
+        if (
+            not _refquote_checkpoint_enabled()
+            or not round_id or not image or fork_block is None
+        ):
+            return await self._build_reference_quotes(intents, image_tag=image_tag)
+
+        key = self._refquote_checkpoint_key(intents, image, fork_block, round_id)
+        hit = _REFERENCE_QUOTES_CACHE.get(key)
+        if hit is not None:
+            logger.info(
+                "[reference-quote] reuse memoized pre-pass round=%s (skipped a "
+                "champion session)", round_id,
+            )
+            return hit
+        disk = self._refquote_disk_load(key)
+        if disk is not None:
+            logger.info(
+                "[reference-quote] resumed pre-pass from /data checkpoint "
+                "round=%s (survived a restart)", round_id,
+            )
+            _REFERENCE_QUOTES_CACHE[key] = disk
+            return disk
+
+        quotes = await self._build_reference_quotes(intents, image_tag=image)
+        if quotes:  # {} = transient champion-session failure: retry next pass
+            if len(_REFERENCE_QUOTES_CACHE) >= _REFERENCE_QUOTES_CACHE_MAX:
+                _REFERENCE_QUOTES_CACHE.clear()
+            _REFERENCE_QUOTES_CACHE[key] = quotes
+            self._refquote_disk_save(key, quotes)
+        return quotes
+
     async def _build_reference_quotes(
         self,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
@@ -1809,66 +1987,6 @@ class BenchmarkWorker:
 
         return 1 if results or transitioned else 0
 
-    def _compute_avg_score(self, results: list[BenchmarkResult]) -> float:
-        """Compute composite score: 40% Stage 1 (synthetic) + 60% Stage 2 (historical).
-
-        If no Stage 2 (historical) results exist (e.g. new app with no order
-        history), falls back to pure Stage 1 to avoid penalizing bootstrap.
-
-        Failures and timeouts count as 0 in the denominator — prevents a
-        solver that handles 1/10 well from outscoring one that handles 10/10.
-
-        Mock-simulation results are heavily penalized (score zeroed) to
-        prevent fabricated passing scores from inflating benchmarks.
-        """
-        if not results:
-            return 0.0
-
-        stage1 = self._compute_stage_score(results, stage_tag="synthetic")
-        stage2 = self._compute_stage_score(results, stage_tag="historical")
-
-        # If no historical scenarios ran, use pure Stage 1 (bootstrap case)
-        if stage2.count == 0:
-            return stage1.avg_score
-        # If no synthetic scenarios ran, use pure Stage 2 (unusual, but possible)
-        if stage1.count == 0:
-            return stage2.avg_score
-
-        return 0.4 * stage1.avg_score + 0.6 * stage2.avg_score
-
-    def _compute_stage_score(
-        self,
-        results: list[BenchmarkResult],
-        stage_tag: str,
-    ) -> "_StageScore":
-        """Compute average score for a single stage.
-
-        Stage is identified by the _stage tag in each result's intent_id
-        (via the state.control["_stage"] field preserved through scoring).
-        For backward compat: results without a _stage tag are counted as
-        "synthetic".
-        """
-        from dataclasses import dataclass
-
-        stage_results = [
-            r for r in results
-            if _result_stage(r) == stage_tag
-        ]
-        if not stage_results:
-            return _StageScore(avg_score=0.0, count=0, success_count=0)
-
-        total = 0.0
-        successes = 0
-        for r in stage_results:
-            if r.score <= 0:
-                continue
-            if getattr(r, "mock_simulation", False):
-                continue
-            total += r.score
-            successes += 1
-        avg = total / len(stage_results)
-        return _StageScore(avg_score=avg, count=len(stage_results), success_count=successes)
-
     def _build_scorecard(self, results: list[BenchmarkResult]) -> BenchmarkScorecard:
         """Build a per-app scorecard from benchmark results.
 
@@ -1894,18 +2012,16 @@ class BenchmarkWorker:
         app_onchain: dict[str, list[int | None]] = {}
         for app_id, app_results in by_app.items():
             # Per-app average; failed/zero scenarios stay in the denominator
-            # (same anti-gaming dilution as _compute_stage_score).
+            # (anti-gaming dilution: a solver that handles 1/10 well doesn't
+            # outscore one that handles 10/10). DIAGNOSTIC only — not an adoption input.
             app_total = sum(r.score for r in app_results if r.score > 0)
             app_scores[app_id] = app_total / len(app_results) if app_results else 0.0
             # Per-app on-chain scoreIntent BPS (one per scenario; None if no sim score).
             app_onchain[app_id] = [getattr(r, "on_chain_score", None) for r in app_results]
 
-        global_score = self._compute_avg_score(results)
-
         mock_count = sum(1 for r in results if getattr(r, "mock_simulation", False))
 
         return BenchmarkScorecard(
-            global_score=global_score,
             app_scores=app_scores,
             app_onchain=app_onchain,
             scenario_scores=scenario_scores,
@@ -1923,7 +2039,6 @@ class BenchmarkWorker:
             "total_intents": len(results),
             "plans_generated": sum(1 for r in results if r.plan is not None),
             "errors": sum(1 for r in results if r.error is not None),
-            "avg_score": scorecard.global_score,
             "scorecard": scorecard.to_dict(),
             "per_intent": [
                 {
@@ -1955,7 +2070,7 @@ class BenchmarkWorker:
         """Transition SOLVING → SOLVED for apps proven by benchmark results.
 
         After benchmarking, check per-app scores in the best submission's
-        details. If any SOLVING app achieved avg_score > 0, transition it.
+        details. If any SOLVING app scored > 0 on any scenario, transition it.
         """
         if self._app_store is None:
             return
@@ -1995,7 +2110,13 @@ class BenchmarkWorker:
         self,
         submissions: list,
     ) -> list[Any]:
-        """Assign benchmark ranks for the current replay-scored batch."""
+        """Assign DISPLAY benchmark ranks for the current replay-scored batch.
+
+        Ranks by relative NET-BETTER vs the current champion (the same per-order
+        raw_output signal finalist selection + adoption use), NOT a scalar score.
+        Ties break on the content-addressed (image_id, submission_id) so the rank is
+        host-deterministic. DISPLAY only — never gates adoption.
+        """
         scored = []
         for sub in submissions:
             refreshed = self._sub_store.get(sub.submission_id)
@@ -2005,15 +2126,24 @@ class BenchmarkWorker:
         if not scored:
             return []
 
-        # Sort by benchmark score descending
-        scored.sort(key=lambda s: s.benchmark_score or 0.0, reverse=True)
+        incumbent = self._resolve_incumbent_submission()
+        champ_rows = (
+            (incumbent.benchmark_details or {}).get("per_intent")
+            if incumbent is not None else None
+        ) or []
 
-        # Assign ranks
+        def _net_better(sub) -> int:
+            rows = (sub.benchmark_details or {}).get("per_intent") or []
+            v = evaluate_relative_adoption(champ_rows, rows)
+            return v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
+
+        # Highest net-better first; content-addressed tie-break (host-deterministic).
+        scored.sort(key=lambda s: (
+            -_net_better(s),
+            str(s.image_id or ""),
+            str(s.submission_id or ""),
+        ))
+
         for i, sub in enumerate(scored):
-            self._sub_store.set_benchmark_result(
-                sub.submission_id,
-                score=sub.benchmark_score or 0.0,
-                rank=i + 1,
-                details=sub.benchmark_details,
-            )
+            self._sub_store.set_benchmark_rank(sub.submission_id, i + 1)
         return scored

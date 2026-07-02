@@ -70,6 +70,7 @@ from .round_manager import (
     _get_current_solver_round,
     _require_open_submission_round,
     _round_state_to_response,
+    epoch_start_ts,
     _sync_abort_solver_round_state,
     _sync_close_solver_round_state,
     _sync_round_incumbent_from_submission_store,
@@ -604,20 +605,75 @@ def _max_submissions_per_owner_per_round() -> int:
 
 
 def _max_submissions_per_round_total() -> int:
-    """Round-wide submission cap across ALL miners — bounds the per-round
-    benchmark batch (first-come; the rest retry next round).
+    """Benched SLATE width per round — how many submissions get benchmarked.
 
-    Configurable via ``SOLVER_ROUND_MAX_SUBMISSIONS`` (default 0 = unlimited =
-    today's behaviour). Like the per-hotkey cap, this is operator-local admission
-    control at the leader gateway (the only ingress) — submissions are
-    leader-canonical and followers mirror the leader's accepted set — so it is
-    NOT a fleet-consensus parameter and an env knob is the right shape.
+    Configurable via ``SOLVER_ROUND_MAX_SUBMISSIONS`` (default 0 = unlimited).
+    This is NO LONGER an intake cap: submissions beyond it are accepted during
+    the OPEN window and the slate is selected at close by LRU rotation
+    (:func:`apply_round_rotation` — miners benched longest ago go first), so
+    round entry is fair instead of first-come. The overflow is rejected at
+    close with a resubmit-next-round reason. Intake flood protection is the
+    separate ``SOLVER_ROUND_INTAKE_MAX`` (:func:`_round_intake_max`).
+
+    Like the per-hotkey cap, this is operator-local admission control at the
+    leader gateway (the only ingress) — submissions are leader-canonical and
+    followers mirror the leader's accepted set — so it is NOT a fleet-consensus
+    parameter and an env knob is the right shape.
     """
     raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
     try:
         return int(raw)
     except ValueError:
         return 0
+
+
+def _round_intake_max() -> int:
+    """Round-wide INTAKE bound across all miners — a coarse flood guard for the
+    screening pipeline now that ``SOLVER_ROUND_MAX_SUBMISSIONS`` selects the
+    benched slate at close instead of turning miners away at the gateway.
+
+    Configurable via ``SOLVER_ROUND_INTAKE_MAX`` (default 0 = unlimited; the
+    per-hotkey and per-GitHub-owner caps already bound intake by registered
+    identity). Operator-local, like the other caps.
+    """
+    raw = os.environ.get("SOLVER_ROUND_INTAKE_MAX", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _rotation_ledger_path() -> str:
+    """Path of the leader-local rotation ledger (see ``harness/rotation.py``).
+
+    ``SOLVER_ROTATION_LEDGER_PATH`` wins; otherwise the ledger lives next to
+    the round store (``SOLVER_ROUND_STORE_PATH``) so it lands on the same
+    persistent volume (/data in production, per #430).
+    """
+    explicit = os.environ.get("SOLVER_ROTATION_LEDGER_PATH", "").strip()
+    if explicit:
+        return explicit
+    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
+    base = os.path.dirname(round_store_path) if round_store_path else "."
+    return os.path.join(base or ".", "solver_rotation.json")
+
+
+def apply_round_rotation(round_id: str) -> dict[str, Any]:
+    """Select this round's benched slate by LRU rotation; reject the overflow.
+
+    Called by the LEADER's round coordinator at close, before the close
+    snapshot is built (so followers mirror the post-rotation set). Thin
+    env/store wiring around the pure
+    :func:`minotaur_subnet.harness.rotation.apply_rotation_slate`.
+    """
+    from minotaur_subnet.harness.rotation import RotationLedger, apply_rotation_slate
+
+    return apply_rotation_slate(
+        get_store(),
+        round_id,
+        _max_submissions_per_round_total(),
+        RotationLedger(_rotation_ledger_path()),
+    )
 
 
 def _enforce_rate_limit(request: Request, principal: str) -> None:
@@ -741,7 +797,7 @@ async def create_source_submission(
             hotkey=body.hotkey,
             round_id=current_round.round_id,
             max_per_round=_max_submissions_per_round(),
-            max_total_per_round=_max_submissions_per_round_total(),
+            max_total_per_round=_round_intake_max(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -816,9 +872,13 @@ async def create_submission(
                 ),
             )
 
-    # Round-wide cap across all miners (bounds the per-round benchmark batch).
-    # First-come; the store re-checks atomically inside create() as the backstop.
-    max_total = _max_submissions_per_round_total()
+    # Round-wide INTAKE bound (coarse flood guard, default unlimited). The
+    # benched-slate width (SOLVER_ROUND_MAX_SUBMISSIONS) no longer rejects
+    # intake — the slate is selected at close by LRU rotation so entry is fair
+    # instead of first-come; overflow submissions are rejected at close with a
+    # resubmit-next-round reason. The store re-checks this bound atomically
+    # inside create() as the backstop.
+    max_total = _round_intake_max()
     if max_total > 0:
         round_total = store.count_by_round(current_round.round_id)
         if round_total >= max_total:
@@ -1332,10 +1392,11 @@ async def solver_round_consensus_proposal(
     _can_benchmark = bool(_candidate.image_tag) or is_bare_digest(_proposed_image)
     if not is_builtin and _can_benchmark:
         try:
-            verified, local_score = await _reactive_benchmark_candidate(
+            # Follower verification is this node's OWN relative adopt verdict over the
+            # shared corpus (per-order raw_output, bounded-regression net-better) —
+            # NOT a leader-score tolerance check (that scalar was removed).
+            verified, counts = await _reactive_benchmark_candidate(
                 candidate=_candidate,
-                leader_score=round_state.finalist_score or 0.0,
-                tolerance_pct=0.15,
                 round_id=round_state.round_id,
                 # The leader-signed candidate_image_id: a bare 64-hex digest D in
                 # content-addressed mode (pull <repo>@sha256:D), else legacy {{.Id}}.
@@ -1345,9 +1406,9 @@ async def solver_round_consensus_proposal(
                 return {
                     "approved": False,
                     "reason": (
-                        f"Independent benchmark rejected: "
-                        f"local_score={local_score:.4f} "
-                        f"vs leader_score={round_state.finalist_score:.4f}"
+                        "Independent relative benchmark rejected: "
+                        f"{counts.get('better', 0)} better / {counts.get('worse', 0)} worse "
+                        f"vs the champion (did not meet the net-better rule)"
                     ),
                     "reason_code": RejectionCode.BENCHMARK_MISMATCH.value,
                 }
@@ -1479,7 +1540,6 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
         opened_epoch=int(d.get("opened_epoch") or 0),
         close_epoch=d.get("close_epoch"),
         finalist_submission_id=d.get("finalist_submission_id"),
-        finalist_score=d.get("finalist_score"),
         incumbent_submission_id=d.get("incumbent_submission_id"),
         adopted=adopted,
         adopted_submission_id=(
@@ -1487,6 +1547,7 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
             if adopted else None
         ),
         effective_epoch=d.get("effective_epoch"),
+        effective_at=epoch_start_ts(d.get("effective_epoch")),
         abort_reason=d.get("abort_reason"),
         created_at=float(d.get("created_at") or 0.0),
         updated_at=float(d.get("updated_at") or 0.0),

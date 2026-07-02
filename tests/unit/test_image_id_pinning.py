@@ -46,11 +46,12 @@ async def test_reactive_benchmark_refuses_on_image_id_mismatch():
         "minotaur_subnet.api.routes.submissions.champion_consensus._resolve_local_image_id",
         new=AsyncMock(return_value="sha256:local_different"),
     ):
-        verified, local_score = await _reactive_benchmark_candidate(
-            candidate=candidate, leader_score=0.9, round_id="round-1",
+        verified, counts = await _reactive_benchmark_candidate(
+            candidate=candidate, round_id="round-1",
         )
     assert verified is False
-    assert local_score == 0.0
+    # Refusing before benchmarking means no relative comparison was ever run.
+    assert counts == {}
 
 
 @pytest.mark.asyncio
@@ -65,11 +66,12 @@ async def test_reactive_benchmark_refuses_when_local_image_absent():
         "minotaur_subnet.api.routes.submissions.champion_consensus._resolve_local_image_id",
         new=AsyncMock(return_value=None),
     ):
-        verified, local_score = await _reactive_benchmark_candidate(
-            candidate=candidate, leader_score=0.9, round_id="round-1",
+        verified, counts = await _reactive_benchmark_candidate(
+            candidate=candidate, round_id="round-1",
         )
     assert verified is False
-    assert local_score == 0.0
+    # Refusing before benchmarking means no relative comparison was ever run.
+    assert counts == {}
 
 
 @pytest.mark.asyncio

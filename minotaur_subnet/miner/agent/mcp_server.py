@@ -351,23 +351,27 @@ def list_available_apps() -> dict:
     name="list_orders",
     description=(
         "List orders in the OrderBook, optionally filtered by app_id and status. "
-        "Use this to understand what orders exist for an app."
+        "Use this to understand what orders exist for an app. Returns newest-first "
+        "SUMMARIES (token/amount params, status, scores — no execution plan or "
+        "consensus detail; fetch a single order for those), paginated: the "
+        "response carries total/limit/offset."
     ),
 )
-def list_orders(app_id: str = "", status: str = "") -> dict:
-    """List orders from the validator.
+def list_orders(app_id: str = "", status: str = "", limit: int = 100, offset: int = 0) -> dict:
+    """List orders from the validator (paginated summary view, newest first).
 
     Args:
         app_id: Filter by app ID. Empty for all.
         status: Filter by status (open, filled, cancelled). Empty for all.
+        limit: Page size (server clamps to 1..500).
+        offset: Page start; the response's ``total`` says how many match.
     """
-    params = []
+    params = [f"limit={int(limit)}", f"offset={int(offset)}"]
     if app_id:
         params.append(f"app_id={app_id}")
     if status:
         params.append(f"status={status}")
-    qs = f"?{'&'.join(params)}" if params else ""
-    url = f"{_validator_url()}/v1/orders{qs}"
+    url = f"{_validator_url()}/v1/orders?{'&'.join(params)}"
     return _http_get(url)
 
 

@@ -128,7 +128,8 @@ class StatusResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
-    benchmark_score: float | None = None
+    # benchmark_score (the retired scalar composite) was removed; benchmark_rank is
+    # the DISPLAY rank derived from relative net-better vs the champion.
     benchmark_rank: int | None = None
     rejection_reason: str | None = None
     # Feedback report (P1): the same-pin per-order ``relative`` block (better /
@@ -174,11 +175,15 @@ class SolverRoundResponse(BaseModel):
     committee_hash: str | None = None
     quorum_required: int | None = None
     decision_deadline_epoch: int | None = None
+    # Wall-clock unix seconds for the epoch fields above/below (epoch *
+    # EPOCH_SECONDS — round epochs are wall-clock buckets), so API consumers can
+    # render "activates at" without knowing the epoch width.
+    decision_deadline_at: float | None = None
     finalist_submission_id: str | None = None
     finalist_image_id: str | None = None
-    finalist_score: float | None = None
     shadow_case_log_hash: str | None = None
     effective_epoch: int | None = None
+    effective_at: float | None = None
     abort_reason: str | None = None
     certificate_candidate_submission_id: str | None = None
     certificate_candidate_image_id: str | None = None
@@ -204,13 +209,14 @@ class SolverRoundSummary(BaseModel):
     opened_epoch: int = 0
     close_epoch: int | None = None
     finalist_submission_id: str | None = None
-    finalist_score: float | None = None
     incumbent_submission_id: str | None = None
     # Outcome: `adopted` is True when the round activated a new champion;
     # `adopted_submission_id` is the certified challenger that won.
     adopted: bool = False
     adopted_submission_id: str | None = None
     effective_epoch: int | None = None
+    # Unix seconds for effective_epoch (see SolverRoundResponse.effective_at).
+    effective_at: float | None = None
     abort_reason: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0

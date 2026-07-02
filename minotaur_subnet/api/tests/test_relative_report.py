@@ -62,14 +62,16 @@ _STORED_MATCHED = {
 }
 
 
-def _sub(per_intent, *, sid="sub-1", score=0.9, status="scored", relative=None):
+def _sub(per_intent, *, sid="sub-1", status="scored", relative=None):
+    # ``benchmark_score`` was removed: scored-ness is carried by raw_output rows in
+    # ``benchmark_details["per_intent"]`` (>0 raw_output ⇒ delivered value), so the
+    # fake submission no longer carries a scalar score.
     details = {"per_intent": per_intent, "scorecard": {}}
     if relative is not None:
         details["relative"] = relative
     return SimpleNamespace(
         submission_id=sid,
         status=status,
-        benchmark_score=score,
         benchmark_details=details,
         screening={},
     )
@@ -203,12 +205,13 @@ def _wire_round_stores(monkeypatch, *, finalist_relative=None):
 
 
 def _round_state():
+    # ``finalist_score`` was removed from RoundState (relative net-better replaced
+    # the scalar finalist score) — the finalist is identified purely by id/image.
     return RoundState(
         round_id="round-e1-n1",
         status=RoundStatus.CERTIFYING,
         opened_epoch=1,
         finalist_submission_id="fin-1",
-        finalist_score=0.95,
     )
 
 
@@ -220,8 +223,9 @@ def test_round_response_attaches_finalist_relative(monkeypatch):
     assert dumped["finalist_relative"]["better"] == 2
     assert dumped["finalist_relative"]["verdict"] == "dethrone"
     assert dumped["reason_relative"].startswith("adopted fin-1")
-    # Legacy finalist_score still present (not replaced).
-    assert dumped["finalist_score"] == 0.95
+    # ``finalist_score`` was removed from the round response — the relative count
+    # block is the sole finalist-vs-champion signal.
+    assert "finalist_score" not in dumped
     # The ONLY keys beyond the declared model fields are the relative extras.
     extras = set(dumped) - set(SolverRoundResponse.model_fields)
     assert extras == {"scoring_mode", "finalist_relative", "reason_relative"}
@@ -241,6 +245,35 @@ def test_round_response_no_finalist_marks_mode_only():
     dumped = resp.model_dump()
     assert dumped["scoring_mode"] == "relative"
     assert "finalist_relative" not in dumped
+
+
+# ── round response: epoch → wall-clock timestamps ─────────────────────────────
+
+
+def test_round_response_exposes_wall_clock_deadlines():
+    """decision_deadline_at / effective_at are the epoch boundaries in unix
+    seconds (epoch * EPOCH_SECONDS) so consumers never hardcode the epoch width."""
+    from minotaur_subnet.epoch.clock import EPOCH_SECONDS
+
+    state = RoundState(
+        round_id="round-e1-n1",
+        status=RoundStatus.CERTIFIED,
+        opened_epoch=29716481,
+        decision_deadline_epoch=29716523,
+        effective_epoch=29716525,
+    )
+    resp = round_manager._round_state_to_response(state)
+    assert resp.decision_deadline_at == 29716523 * EPOCH_SECONDS
+    assert resp.effective_at == 29716525 * EPOCH_SECONDS
+
+
+def test_round_response_wall_clock_none_while_open():
+    """An open round has no deadline/effective epoch yet — the timestamps stay
+    None instead of fabricating epoch-0 dates."""
+    state = RoundState(round_id="round-e1-n1", status=RoundStatus.OPEN, opened_epoch=1)
+    resp = round_manager._round_state_to_response(state)
+    assert resp.decision_deadline_at is None
+    assert resp.effective_at is None
 
 
 # ── get_app_status: scoring_mode marker (always on) ──────────────────────────

@@ -191,6 +191,65 @@ class TestOrderRoutes(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["count"], 1)
 
+    def test_list_orders_summary_pagination_and_full(self):
+        # The list view is a paginated newest-first SUMMARY: plan /
+        # consensus_result / plan_assessment / intent_params_hex live only on
+        # the single-order GET, or on ?full=true (the follower order-sync).
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        store.list_orders.return_value = [
+            {
+                "order_id": f"ord_{i}",
+                "status": "filled",
+                "created_at": str(1000.0 + i),
+                "plan": {"steps": ["heavy"]},
+                "consensus_result": {"votes": ["heavy"]},
+                "plan_assessment": "heavy",
+                "user_signature": "0xsecret",
+                "params": {
+                    "input_token": "0xA",
+                    "input_amount": "1",
+                    "intent_params_hex": "00" * 300,
+                },
+            }
+            for i in range(5)
+        ]
+        orders_module.set_app_store(store)
+        try:
+            resp = self.client.get("/v1/orders?limit=2")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(
+                (data["total"], data["count"], data["limit"], data["offset"]),
+                (5, 2, 2, 0),
+            )
+            # newest first (created_at desc)
+            self.assertEqual([o["order_id"] for o in data["orders"]], ["ord_4", "ord_3"])
+            head = data["orders"][0]
+            for heavy in ("plan", "consensus_result", "plan_assessment", "user_signature"):
+                self.assertNotIn(heavy, head)
+            self.assertNotIn("intent_params_hex", head["params"])
+            self.assertEqual(head["params"]["input_token"], "0xA")  # decoded params kept
+
+            # past-the-end page is a short page, total unchanged
+            resp = self.client.get("/v1/orders?limit=2&offset=4")
+            data = resp.json()
+            self.assertEqual([o["order_id"] for o in data["orders"]], ["ord_0"])
+            self.assertEqual((data["count"], data["total"]), (1, 5))
+
+            # full=true restores the record; sig still stripped without a reader-sig
+            resp = self.client.get("/v1/orders?limit=1&full=true")
+            full_order = resp.json()["orders"][0]
+            self.assertIn("plan", full_order)
+            self.assertIn("intent_params_hex", full_order["params"])
+            self.assertEqual(full_order["user_signature"], "")
+
+            # limit is clamped to [1, 500]
+            self.assertEqual(self.client.get("/v1/orders?limit=99999").json()["limit"], 500)
+            self.assertEqual(self.client.get("/v1/orders?limit=0").json()["limit"], 1)
+        finally:
+            orders_module.set_app_store(None)
+
     def test_list_orders_filter_by_status(self):
         o1 = self._submit(app_id="app-1", submitted_by="0xA")
         self._submit(app_id="app-1", submitted_by="0xB")
