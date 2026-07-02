@@ -129,7 +129,13 @@ class ValidatorAppCatalogSync:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                logger.warning("Catalog sync tick failed: %s", exc)
+                # %r, not %s: connection-level exceptions (TimeoutError,
+                # ServerDisconnectedError, ClientConnectorError) have an empty
+                # str(), so %s logged a blank line and hid the real cause —
+                # exactly what made Yuma's persistent "Catalog sync tick
+                # failed:" undiagnosable from their logs (2026-07-02). Same
+                # fix as OrderSync.run_loop.
+                logger.warning("Catalog sync tick failed: %r", exc)
 
     async def sync_once(self) -> tuple[int, int]:
         """Pull the catalog and upsert changes. Returns (apps_updated, deployments_updated)."""
