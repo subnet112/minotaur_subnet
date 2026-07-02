@@ -918,8 +918,14 @@ def merge_miner_pr_when_certified(
     """Squash-merge the miner's fork PR ONLY after the leader's OWN on-chain check.
 
     Never polls a GitHub status check (fork-spoofable). Steps:
-      1. Re-resolve the LIVE head SHA via resolve_pr (TOCTOU); abort if it drifted
-         off the miner-signed SHA.
+      1. Re-resolve the LIVE head SHA via resolve_pr (TOCTOU). If the head
+         drifted off the miner-signed SHA — or the PR was closed — the PR itself
+         is UNMERGEABLE (its live state is uncertified), but the certified win
+         still stands: fall back to publishing the CERTIFIED tree directly
+         (``_publish_certified_tree_despite_pr``). Without the fallback a miner
+         could void his own certified round (and block everyone else's
+         adoption) just by force-pushing or closing his PR post-certification —
+         the round-e29716481-n1 grief.
       2. Refuse if the PR diff touches .github/** (CI-disarm guard).
       3. Assert a quorum cert on-chain binds keccak(head_sha) (the authority).
       4. PUT a squash merge pinned to ``sha=<resolved head>`` so GitHub itself
@@ -936,23 +942,33 @@ def merge_miner_pr_when_certified(
         logger.error("merge gate: no owner/repo or pr_number — cannot merge")
         return False
     owner, repo = owner_repo
+    certified = (expected_head_sha or "").strip().lower()
 
-    # 1) TOCTOU — re-resolve the authoritative live head SHA.
+    # 1) TOCTOU — re-resolve the authoritative live head SHA. An unresolvable
+    # (closed/vanished) PR is handled like a drifted one below: the certificate
+    # binds a SHA, not the PR's live state.
+    live_head = ""
     try:
         resolved = resolve_pr(int(pr_number))
+        live_head = (resolved.get("head_sha") or "").strip().lower()
     except PRResolutionError as exc:
-        logger.error("merge gate: PR #%s unresolvable (closed/forced/bad base?): %s", pr_number, exc)
-        return False
-    live_head = (resolved.get("head_sha") or "").strip().lower()
-    if not live_head:
+        logger.warning(
+            "merge gate: PR #%s unresolvable (closed/forced/bad base?): %s", pr_number, exc,
+        )
+    if not live_head and not certified:
         logger.error("merge gate: PR #%s has no resolvable head SHA", pr_number)
         return False
-    if expected_head_sha and live_head != expected_head_sha.strip().lower():
-        logger.error(
-            "merge gate: PR #%s head drifted (%s) off the certified/signed SHA (%s) — refusing",
-            pr_number, live_head, expected_head_sha.strip().lower(),
+    if certified and live_head != certified:
+        logger.warning(
+            "merge gate: PR #%s live head (%s) is not the certified/signed SHA (%s) — "
+            "the PR is unmergeable, publishing the CERTIFIED tree directly instead "
+            "(a post-certification push/close can neither invalidate nor replace a "
+            "certified win)",
+            pr_number, live_head or "<unresolvable>", certified,
         )
-        return False
+        return _publish_certified_tree_despite_pr(
+            owner, repo, int(pr_number), certified, round_id,
+        )
 
     # 2) CI-disarm guard.
     if _pr_touches_ci(owner, repo, int(pr_number)):
@@ -980,6 +996,66 @@ def merge_miner_pr_when_certified(
     return False
 
 
+def _publish_certified_tree_despite_pr(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    certified_sha: str,
+    round_id: str | None,
+) -> bool:
+    """Land a certified PUBLIC win whose PR drifted or closed post-certification.
+
+    The quorum certified ``certified_sha`` (and the fleet verified the image
+    built from it) — the PR's live state is irrelevant to that authority. So:
+
+      1. Assert the on-chain quorum cert binds ``certified_sha`` (THE authority —
+         same check the normal merge path runs on the live head).
+      2. Publish the tree at ``certified_sha`` directly onto canonical ``main``
+         via the shared Git-Data publisher. The commit is read through the
+         canonical repo's object network (fork-PR commits stay reachable there
+         by SHA even after a force-push orphans them). CI-disarm holds by
+         construction: the source ``.github/**`` is excluded and canonical's own
+         is preserved verbatim — stronger than the ``_pr_touches_ci`` refusal on
+         the squash path.
+      3. Comment + close the miner's PR UNMERGED (its current head is
+         uncertified and never lands).
+
+    The post-certification push/close thus accomplishes nothing: the certified
+    code activates anyway. FAIL-CLOSED on any error (adoption then refuses as
+    before).
+    """
+    if not certified_sha:
+        return False
+    if not _onchain_cert_binds(certified_sha, round_id):
+        logger.error(
+            "merge gate: no on-chain quorum cert binds certified SHA %s (round %s) "
+            "— refusing drift-fallback publish",
+            certified_sha, round_id,
+        )
+        return False
+    published = _publish_certified_tree_to_canonical(
+        owner, repo, certified_sha, round_id,
+        pr_number=pr_number,
+        source_token=None,
+        branch_prefix="certified-champion",
+        label="certified submission (PR drifted/closed post-certification)",
+    )
+    if not published:
+        return False
+    comment_on_pr(
+        pr_number,
+        "### ⚠️ Certified tree published directly\n\n"
+        f"- round: `{round_id}`\n- certified SHA: `{certified_sha}`\n\n"
+        "This PR's head changed (or the PR was closed) AFTER the round was "
+        "certified, so the PR itself cannot be merged — only the certified SHA "
+        "is quorum-approved. The certified tree was published to canonical "
+        "`main` directly and the adoption proceeds; the post-certification "
+        "changes were NOT included. Submit them in a future round.",
+    )
+    close_pr(pr_number)
+    return True
+
+
 def _gh_json(method: str, url: str, payload: dict | None = None, *, token: str | None = None):
     """``_github_api_request`` wrapper that returns ``(ok, json)``; ``ok`` is True
     only on a 2xx. Never raises."""
@@ -988,12 +1064,15 @@ def _gh_json(method: str, url: str, payload: dict | None = None, *, token: str |
 
 
 def _private_tree_blobs(
-    owner: str, repo: str, head_sha: str, token: str,
+    owner: str, repo: str, head_sha: str, token: str | None,
 ) -> list[dict] | None:
-    """Return the miner private repo's tree at ``head_sha`` as a flat list of
-    blob entries ``{path, mode, sha}``, EXCLUDING anything under ``.github/``
-    (CI-disarm: a miner can never introduce/alter canonical CI). Returns None on
-    any API error or if GitHub truncated the tree (fail closed)."""
+    """Return the source repo's tree at ``head_sha`` as a flat list of blob
+    entries ``{path, mode, sha}``, EXCLUDING anything under ``.github/``
+    (CI-disarm: a miner can never introduce/alter canonical CI). ``token`` is
+    the miner's per-submission token (private path) or None for the env default
+    (public path — fork-PR commits are readable through the canonical repo's
+    object network, even after a force-push orphans them). Returns None on any
+    API error or if GitHub truncated the tree (fail closed)."""
     ok, body = _gh_json(
         "GET",
         f"https://api.github.com/repos/{owner}/{repo}/git/trees/{head_sha}?recursive=1",
@@ -1086,31 +1165,83 @@ def publish_private_champion_when_certified(
         return False
     p_owner, p_repo = private_repo.split("/", 1)
 
-    # 1) TOCTOU — re-resolve the authoritative live head with the miner token.
+    # 1) TOCTOU visibility — re-resolve the live head with the miner token. The
+    # CERTIFIED SHA is the publish target either way: a post-certification push
+    # or close cannot void a certified win (the drifted content just never gets
+    # published); we fail closed only when the certified commit itself is no
+    # longer fetchable (miner-controlled repo — a deleted repo/token still
+    # refuses, as before).
+    certified = (expected_head_sha or "").strip().lower()
+    live_head = ""
     try:
         resolved = resolve_pr(int(pr_number), owner_repo=(p_owner, p_repo), token=repo_token)
+        live_head = (resolved.get("head_sha") or "").strip().lower()
     except PRResolutionError as exc:
-        logger.error("publish: PR #%s (%s) unresolvable: %s", pr_number, private_repo, exc)
+        logger.warning("publish: PR #%s (%s) unresolvable: %s", pr_number, private_repo, exc)
+    target = certified or live_head
+    if not target:
+        logger.error("publish: PR #%s has no certified or resolvable head SHA", pr_number)
         return False
-    live_head = (resolved.get("head_sha") or "").strip().lower()
-    if not live_head:
-        logger.error("publish: PR #%s has no resolvable head SHA", pr_number)
-        return False
-    if expected_head_sha and live_head != expected_head_sha.strip().lower():
+    if certified and live_head != certified:
+        logger.warning(
+            "publish: PR #%s live head (%s) is not the certified SHA (%s) — "
+            "publishing the CERTIFIED tree anyway (post-certification drift/close "
+            "never voids a certified win)",
+            pr_number, live_head or "<unresolvable>", certified,
+        )
+
+    # 2) THE authority: on-chain quorum cert must bind this exact SHA (the
+    # cert's commit_hash is the private head SHA — same check as the public path).
+    if not _onchain_cert_binds(target, round_id):
         logger.error(
-            "publish: PR #%s head drifted (%s) off certified SHA (%s) — refusing",
-            pr_number, live_head, expected_head_sha.strip().lower(),
+            "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
+            target, round_id,
         )
         return False
 
-    # 2) THE authority: on-chain quorum cert must bind this exact head SHA (the
-    # cert's commit_hash is the private head SHA — same check as the public path).
-    if not _onchain_cert_binds(live_head, round_id):
-        logger.error(
-            "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
-            live_head, round_id,
-        )
+    # 3+4) Land the certified tree on canonical main (shared Git-Data publisher).
+    return _publish_certified_tree_to_canonical(
+        p_owner, p_repo, target, round_id,
+        pr_number=pr_number,
+        source_token=repo_token,
+        branch_prefix="private-champion",
+        label="private submission",
+    )
+
+
+def _publish_certified_tree_to_canonical(
+    source_owner: str,
+    source_repo: str,
+    certified_sha: str,
+    round_id: str | None,
+    *,
+    pr_number: int,
+    source_token: str | None,
+    branch_prefix: str,
+    label: str,
+) -> bool:
+    """Land the tree at ``source_repo@certified_sha`` on canonical ``main``.
+
+    The shared Git-Data publisher behind BOTH certified-tree paths (the private
+    leak-on-win publish and the public drifted-PR fallback): no git CLI, no
+    direct push — blobs are recreated on canonical, assembled into a tree that
+    preserves canonical's own ``.github/**`` verbatim (CI-disarm: the source
+    tree's ``.github/**`` is excluded by ``_private_tree_blobs``), committed
+    onto a fresh ``<branch_prefix>/<round>`` branch (parent = current ``main``,
+    deliberately NOT ``champion/*`` so the auto-merge Action ignores it), opened
+    as a PR and squash-merged pinned to the new commit — so the protect-main
+    ruleset is honored.
+
+    AUTHORITY IS THE CALLER'S JOB: every caller must have asserted the on-chain
+    quorum cert binds ``certified_sha`` (``_onchain_cert_binds``) BEFORE calling.
+    FAIL-CLOSED: any error returns False, best-effort cleaning up the branch it
+    created.
+    """
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None or not pr_number:
+        logger.error("publish: no canonical owner/repo or pr_number")
         return False
+    c_owner, c_repo = owner_repo
 
     push_token = (
         os.environ.get("SOLVER_REPO_PR_TOKEN") or os.environ.get("SOLVER_REPO_TOKEN") or ""
@@ -1119,12 +1250,12 @@ def publish_private_champion_when_certified(
         logger.error("publish: no SOLVER_REPO_TOKEN to write canonical — refusing")
         return False
 
-    # 3) Read the private source at the certified head (.github excluded).
-    blobs = _private_tree_blobs(p_owner, p_repo, live_head, repo_token)
+    # Read the certified source tree (.github excluded).
+    blobs = _private_tree_blobs(source_owner, source_repo, certified_sha, source_token)
     if blobs is None:
         return False
 
-    branch = f"private-champion/{(round_id or 'round').replace('/', '-')}-{live_head[:12]}"
+    branch = f"{branch_prefix}/{(round_id or 'round').replace('/', '-')}-{certified_sha[:12]}"
     created_ref = False
     new_pr_number: int | None = None
     try:
@@ -1149,16 +1280,16 @@ def publish_private_champion_when_certified(
         if github_entries is None:
             return False
 
-        # 4) Recreate each private blob on canonical, building the new tree entries.
+        # Recreate each source blob on canonical, building the new tree entries.
         tree_entries: list[dict] = []
         for b in blobs:
             ok, blob = _gh_json(
                 "GET",
-                f"https://api.github.com/repos/{p_owner}/{p_repo}/git/blobs/{b['sha']}",
-                token=repo_token,
+                f"https://api.github.com/repos/{source_owner}/{source_repo}/git/blobs/{b['sha']}",
+                token=source_token,
             )
             if not ok or not isinstance(blob, dict):
-                logger.error("publish: cannot read private blob %s", b["path"]); return False
+                logger.error("publish: cannot read source blob %s", b["path"]); return False
             ok, created = _gh_json(
                 "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/blobs",
                 {"content": blob.get("content", ""), "encoding": blob.get("encoding", "base64")},
@@ -1182,8 +1313,8 @@ def publish_private_champion_when_certified(
 
         # Commit (parent = current main), crediting the source.
         msg = (
-            f"champion: private submission via PR #{pr_number} (round {round_id})\n\n"
-            f"source: {private_repo}@{live_head}\n"
+            f"champion: {label} via PR #{pr_number} (round {round_id})\n\n"
+            f"source: {source_owner}/{source_repo}@{certified_sha}\n"
         )
         ok, commit = _gh_json(
             "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/git/commits",
@@ -1213,7 +1344,7 @@ def publish_private_champion_when_certified(
         # PR + squash-merge pinned to the new commit (same mechanism as public).
         ok, pr = _gh_json(
             "POST", f"https://api.github.com/repos/{c_owner}/{c_repo}/pulls",
-            {"title": f"champion: private round {round_id}", "head": branch, "base": "main", "body": msg},
+            {"title": f"champion: {label} round {round_id}", "head": branch, "base": "main", "body": msg},
             token=push_token,
         )
         if not ok or not isinstance(pr, dict) or not pr.get("number"):
@@ -1229,9 +1360,10 @@ def publish_private_champion_when_certified(
             logger.error("publish: squash-merge of PR #%s failed", new_pr_number); return False
 
         logger.info(
-            "publish: PR #%s private champion published to %s/%s main "
-            "(source %s@%s, canonical PR #%s)",
-            pr_number, c_owner, c_repo, private_repo, live_head, new_pr_number,
+            "publish: PR #%s %s published to %s/%s main "
+            "(source %s/%s@%s, canonical PR #%s)",
+            pr_number, label, c_owner, c_repo, source_owner, source_repo,
+            certified_sha, new_pr_number,
         )
         return True
     except Exception as exc:  # noqa: BLE001 — never raise into the finalize path
