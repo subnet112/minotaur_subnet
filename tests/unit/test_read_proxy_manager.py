@@ -39,13 +39,16 @@ def test_proxy_running_current_image_left_alone(monkeypatch):
     # inspect works: proxy running on the api's CURRENT image -> leave it, env wired.
     _clear_env(monkeypatch)
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    scheduled = []
+    monkeypatch.setattr(rpm, "_schedule_ensure_retry", lambda: scheduled.append(1))
     fake = FakeDocker([
-        (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # _resolve_self -> api image
-        (0, "true|sha256:img", ""),                         # _proxy_state -> running, SAME image
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # _resolve_self -> api image
+        (0, 'true|sha256:img|["PATH=/usr/bin"]', ""),        # _proxy_state -> running, SAME image
     ])
     monkeypatch.setattr(rpm, "_docker", fake)
     assert asyncio.run(rpm.ensure_read_proxy_container()) is True
     assert not any(c and c[0] == "run" for c in fake.calls)        # no relaunch
+    assert not scheduled                                           # fully compared -> no retry
     assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL
     assert os.environ["SOLVER_READ_PROXY_TOKEN"] == "tok"
 
@@ -100,9 +103,12 @@ def test_env_wired_inspect_403_running_proxy_left(monkeypatch):
         (1, "", "403 Forbidden"),                                          # inspect proxy -> 403
         (0, "minotaur-rpc-pin-proxy", ""),                                 # proxy ps -> running
     ])
+    scheduled = []
+    monkeypatch.setattr(rpm, "_schedule_ensure_retry", lambda: scheduled.append(1))
     monkeypatch.setattr(rpm, "_docker", fake)
     assert asyncio.run(rpm.ensure_read_proxy_container()) is True
     assert not any(c and c[0] == "run" for c in fake.calls)       # left alone (uncompared)
+    assert scheduled                                              # degraded -> retry scheduled
     assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL
 
 
@@ -117,9 +123,47 @@ def test_env_wired_even_when_all_docker_fails(monkeypatch):
         (1, "", "403 Forbidden"),   # inspect proxy -> 403
         (1, "", "403 Forbidden"),   # proxy ps -> 403  (running=False)
     ])
+    scheduled = []
+    monkeypatch.setattr(rpm, "_schedule_ensure_retry", lambda: scheduled.append(1))
     monkeypatch.setattr(rpm, "_docker", fake)
     assert asyncio.run(rpm.ensure_read_proxy_container()) is False
     assert os.environ["SOLVER_READ_PROXY"] == rpm.PROXY_DATA_URL  # env wired (THE FIX)
+    assert scheduled                                              # degraded -> retry scheduled
+
+
+def test_degraded_boot_background_retry_recovers(monkeypatch):
+    # THE 2026-07-02 INCIDENT: a watchtower rolling update makes every docker call
+    # fail at api boot -> ensure is degraded (no proxy launched). The background
+    # retry must re-run ensure once docker heals and launch the proxy — previously
+    # the one-shot ensure stranded the proxy unmanaged for the api's lifetime.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    monkeypatch.setattr(rpm, "_ENSURE_RETRY_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(rpm, "_ensure_retry_task", None)
+    fake = FakeDocker([
+        # boot pass: socket-proxy churn — everything fails
+        (1, "", "403 Forbidden"),   # inspect self
+        (1, "", "403 Forbidden"),   # self ps fallback
+        (1, "", "403 Forbidden"),   # inspect proxy
+        (1, "", "403 Forbidden"),   # proxy ps
+        # retry pass: docker healed — resolve, proxy absent, launch
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # self inspect OK
+        (1, "", "No such object"),                          # proxy inspect -> absent
+        (0, "", ""),                                        # proxy ps -> not running
+        (0, "", ""),                                        # rm -f
+        (0, "[{}]", ""),                                    # network inspect -> exists
+        (0, "cid", ""),                                     # run
+        (0, "", ""),                                        # network connect
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+
+    async def main():
+        assert await rpm.ensure_read_proxy_container() is False  # boot: degraded
+        assert rpm._ensure_retry_task is not None
+        await asyncio.wait_for(rpm._ensure_retry_task, timeout=5)
+
+    asyncio.run(main())
+    assert any(c and c[0] == "run" for c in fake.calls)  # retry launched the proxy
 
 
 def test_launch_when_absent(monkeypatch):
