@@ -998,6 +998,20 @@ async def initialize(ctx: ServerContext) -> dict:
     except Exception as exc:
         logger.error("[read-proxy] manager raised (continuing startup): %s", exc)
 
+    # ── stranded screening resume ────────────────────────────────────────
+    # The screening pipeline runs as a background task spawned once at
+    # submission time; a restart kills it and nothing re-starts it, parking
+    # the submission in QUEUED/SCREENING_* forever — the round then busy-spins
+    # in `replaying` with benchmarked=0 while miners see "scoring…". Re-kick
+    # any recent strandings (no-op on nodes with none, e.g. followers).
+    try:
+        from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+            resume_stranded_screenings,
+        )
+        await resume_stranded_screenings()
+    except Exception as exc:
+        logger.error("[screening] boot resume failed (continuing startup): %s", exc)
+
     # ── benchmark worker ─────────────────────────────────────────────────
     # ALWAYS wire the submission store: the EpochManager needs it to ACTIVATE a certified
     # round (load the champion's submission for the hot-swap), independent of whether this
