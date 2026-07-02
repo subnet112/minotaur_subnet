@@ -50,6 +50,26 @@ def test_proxy_running_current_image_left_alone(monkeypatch):
     assert os.environ["SOLVER_READ_PROXY_TOKEN"] == "tok"
 
 
+def test_proxy_rpc_env_drift_recreated(monkeypatch):
+    # inspect works: proxy on the CURRENT image but its RPC_PROXY_* env differs from
+    # the api's (operator flipped the cache kill switch) -> recreate to apply it.
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
+    monkeypatch.setenv("RPC_PROXY_RESPONSE_CACHE", "0")  # api wants caches OFF
+    fake = FakeDocker([
+        (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # api image
+        (0, 'true|sha256:img|["PATH=/usr/bin"]', ""),        # proxy running, NO cache var
+        (0, "", ""),                                         # rm -f
+        (0, "[{}]", ""),                                     # network inspect -> exists
+        (0, "cid", ""),                                      # run
+        (0, "", ""),                                         # network connect
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    assert asyncio.run(rpm.ensure_read_proxy_container()) is True
+    run_call = next(c for c in fake.calls if c and c[0] == "run")
+    assert "RPC_PROXY_RESPONSE_CACHE=0" in run_call  # switch forwarded into the container
+
+
 def test_proxy_stale_image_recreated(monkeypatch):
     # inspect works: proxy running on a STALE image -> recreate so it tracks the api.
     _clear_env(monkeypatch)
