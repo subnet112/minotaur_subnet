@@ -31,7 +31,15 @@ _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
 # Params that vary per submission/quote but do not change the trade a solver must
 # solve — excluded from the dedup identity so two submissions of the same trade
 # with different quote snapshots still collapse to one scenario.
-_VOLATILE_PARAMS = {"quoted_output", "platform_fee_wei"}
+#
+# intent_params_hex is DERIVED data: the ABI-encoded blob of these very params,
+# rebuilt from the manifest at benchmark time (the stored copy is a stale
+# quote-time encoding embedding deadline/nonce/min-output). Keeping it exact made
+# it differ on essentially every submission and single-handedly blocked most of
+# the collapse: on the live 2026-07-02 corpus the dedup went 393→330 (16%) with
+# it in the identity vs 393→173 (55%) without — the other 39 points were all
+# re-encodes of byte-identical trades.
+_VOLATILE_PARAMS = {"quoted_output", "platform_fee_wei", "intent_params_hex"}
 
 # Swap-style params handled specially by the near-dup bucket key: the pair is
 # identity, the amount is bucketed by order of magnitude, and the slippage guard
