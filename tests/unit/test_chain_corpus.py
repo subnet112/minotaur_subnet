@@ -76,7 +76,9 @@ def test_function_for_selector_maps_back():
 def test_sample_records_path_is_deterministic_and_store_free():
     recs = [{"order_id": f"o{i:02d}", "app_id": "app_x", "chain_id": 8453,
              "status": "filled", "block_number": 100 + i,
-             "params": {"input_token": "0x1"}} for i in range(20)]
+             # distinct token per record — identical params would (correctly)
+             # collapse to one trade shape in the pre-draw dedup
+             "params": {"input_token": f"0x{i:02d}"}} for i in range(20)]
     # app_store=None proves the records path never calls list_orders()
     s1 = sample_historical_orders(app_store=None, round_id="r1", n_per_chain=5, records=recs)
     s2 = sample_historical_orders(app_store=None, round_id="r1", n_per_chain=5, records=recs)
@@ -90,11 +92,11 @@ def test_sample_records_filters_inflight_keeps_unfilled_demand():
     # block); only in-flight (open/assigned) demand is filtered.
     recs = [
         {"order_id": "ok", "app_id": "a", "chain_id": 1, "status": "filled", "block_number": 5,
-         "params": {}},
+         "params": {"target": "0x1"}},
         {"order_id": "pending", "app_id": "a", "chain_id": 1, "status": "open", "block_number": 6,
-         "params": {}},
+         "params": {"target": "0x2"}},
         {"order_id": "noblock", "app_id": "a", "chain_id": 1, "status": "rejected", "block_number": None,
-         "params": {}},
+         "params": {"target": "0x3"}},
     ]
     sampled = sample_historical_orders(app_store=None, round_id="r", n_per_chain=10, records=recs)
     assert {o["order_id"] for o in sampled} == {"ok", "noblock"}  # in-flight 'pending' dropped
