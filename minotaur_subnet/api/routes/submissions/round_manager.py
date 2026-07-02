@@ -420,6 +420,29 @@ def _sync_close_solver_round_state(body: CloseRoundRequest) -> RoundState:
     round_store = get_round_store()
     existing = round_store.get_round(body.round_id or "")
     if existing is not None and existing.status != RoundStatus.OPEN:
+        # EXCEPT the snapshot, under operator force (the champion re-attest
+        # lever): a follower that adopted the round shell but MISSED the
+        # submission snapshot (down/mid-restart at first close) is stuck — its
+        # round sits CLOSED with no candidate record, so certify-prepare falls
+        # back to evaluate (a follower no-op), the round never reaches
+        # CERTIFYING, and every re-attest 409s ("is closed; expected
+        # certifying") forever. Returning before looking at body.force made the
+        # recovery lever a no-op for exactly the state it exists to heal
+        # (observed fleet-wide 2026-07-02, round-e29716562-n1). Heal ONLY the
+        # submission mirror here — the round FSM stays untouched (still the
+        # early return), and force only enters via the authenticated re-attest
+        # broadcast.
+        if bool(getattr(body, "force", False)) and body.submissions:
+            try:
+                n = get_store().upsert_submissions(body.submissions)
+                if n:
+                    logger.info(
+                        "Submission snapshot: force-close healed %d records "
+                        "for %s (re-attest recovery)",
+                        n, body.round_id,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort, mirror of the path below
+                logger.warning("forced submission snapshot upsert failed", exc_info=True)
         return existing
     # Mirror the leader's close-time submission snapshot so the local pack-hash
     # recompute matches the leader's (else PACK_HASH_MISMATCH drops us from the
