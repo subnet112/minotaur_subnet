@@ -756,6 +756,7 @@ def _build_champion_proposal_for_round(
     commit_hash_override: str | None = None,
     nonce_override: int | None = None,
     deadline_override: int | None = None,
+    incumbent_image_id_override: str | None = None,
 ) -> tuple[Any, Any, int]:
     """Resolve the frozen round tuple into a signable ChampionProposal.
 
@@ -888,7 +889,14 @@ def _build_champion_proposal_for_round(
     proposal = ChampionProposal(
         round_id=round_state.round_id,
         committee_hash=resolved_committee_hash,
-        incumbent_image_id=round_state.incumbent_image_id,
+        # incumbent_image_id is part of the SIGNED digest but is resolved from the
+        # round record, whose local image-id representation differs per host (a
+        # non-reproducible {{.Id}} at quorum<=1). A peer verifying the leader's
+        # approval MUST rebuild it from the leader's SIGNED value carried in the
+        # payload (incumbent_image_id_override) — else the digest diverges and
+        # verify_approval fails ("Invalid champion approvals"), stranding the round
+        # leader-only. The leader (no override) uses its own round record verbatim.
+        incumbent_image_id=incumbent_image_id_override or round_state.incumbent_image_id,
         candidate_submission_id=resolved_submission_id,
         candidate_image_id=resolved_image_id,
         benchmark_pack_hash=resolved_benchmark_pack_hash,
@@ -1149,6 +1157,12 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
         commit_hash_override=body.commit_hash,
         nonce_override=body.nonce or None,
         deadline_override=body.deadline or None,
+        # Rebuild the incumbent from the leader's SIGNED value (payload), not our
+        # own round record — otherwise the digest diverges and the leader's
+        # approval is rejected as "Invalid champion approvals". `or None`: the
+        # leader's own certify call carries no incumbent override (unset), so the
+        # builder uses its round record verbatim, leaving the signing path unchanged.
+        incumbent_image_id_override=body.incumbent_image_id or None,
     )
     quorum_required = body.quorum_required or default_quorum
     consensus_manager = get_champion_consensus_manager()
