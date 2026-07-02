@@ -599,16 +599,28 @@ def get_order_status(order_id: str) -> dict:
 
 @server.tool(
     name="list_orders",
-    description="List orders in the OrderBook, optionally filtered by app_id and status.",
+    description=(
+        "List orders in the OrderBook, optionally filtered by app_id and status. "
+        "Newest-first paginated SUMMARIES (no plan/consensus detail — use "
+        "get_order for the full record); the response carries total/limit/offset."
+    ),
 )
-def list_orders_tool(app_id: str = "", status: str = "") -> dict:
-    """List orders.
+def list_orders_tool(app_id: str = "", status: str = "", limit: int = 100, offset: int = 0) -> dict:
+    """List orders (paginated summary view, newest first).
 
     Args:
         app_id: Filter by app ID. Empty for all.
         status: Filter by status. Empty for all.
+        limit: Page size (server clamps to 1..500).
+        offset: Page start; the response's ``total`` says how many match.
     """
-    return _get("/orders", app_id=app_id if app_id else None, status=status if status else None)
+    return _get(
+        "/orders",
+        app_id=app_id if app_id else None,
+        status=status if status else None,
+        limit=int(limit),
+        offset=int(offset),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

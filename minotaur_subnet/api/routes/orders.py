@@ -856,6 +856,42 @@ def _strip_user_signature(order_dict: dict) -> dict:
     return out
 
 
+# GET /orders list view. A full order record embeds the execution ``plan``,
+# ``consensus_result``, ``plan_assessment`` and the raw ``intent_params_hex``
+# calldata blob — ~4 KB per order, so the unbounded full list crossed 1.4 MB
+# at ~400 orders. The list is therefore a paginated SUMMARY; the full record
+# stays on ``GET /orders/{order_id}``, and ``?full=true`` restores it for the
+# follower order-sync (the data is public — size, not secrecy, is the issue).
+_LIST_SUMMARY_DROP = ("plan", "consensus_result", "plan_assessment", "user_signature")
+_LIST_DEFAULT_LIMIT = 100
+_LIST_MAX_LIMIT = 500
+
+
+def _order_summary(order_dict: dict) -> dict:
+    """Slim list-view projection of a full order dict (~4 KB → ~0.6 KB).
+
+    Drops the heavyweight fields and ``params.intent_params_hex``, keeping the
+    scalars a list consumer needs: ids, status, the decoded token/amount
+    params, timestamps, scores, tx hash.
+    """
+    out = {k: v for k, v in order_dict.items() if k not in _LIST_SUMMARY_DROP}
+    params = out.get("params")
+    if isinstance(params, dict) and "intent_params_hex" in params:
+        slim = dict(params)
+        slim.pop("intent_params_hex")
+        out["params"] = slim
+    return out
+
+
+def _created_at(order_dict: dict) -> float:
+    """``created_at`` as a float for sorting; stores stringify it, and orders
+    persisted before the field existed sort last (0.0)."""
+    try:
+        return float(order_dict.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @router.get("/orders/{order_id}")
 def get_order(
     order_id: str,
@@ -898,9 +934,21 @@ def get_order(
 def list_orders(
     app_id: str | None = None,
     status: str | None = None,
+    limit: int = _LIST_DEFAULT_LIMIT,
+    offset: int = 0,
+    full: bool = False,
     x_reader_sig: str | None = Header(None, alias="X-Reader-Sig"),
 ) -> dict:
-    """List orders with optional filters.
+    """List orders — paginated (newest-first) SUMMARY view.
+
+    Each entry is the :func:`_order_summary` projection (no ``plan`` /
+    ``consensus_result`` / ``plan_assessment`` / ``intent_params_hex``); the
+    full record is on ``GET /orders/{order_id}``. ``full=true`` returns
+    unprojected records — used by the follower order-sync, which needs the
+    complete order to rebuild its benchmark corpus. ``limit`` is clamped to
+    [1, 500] (default 100); the response carries ``total`` (matches after
+    filtering, before paging) so callers can page: ``count``/``limit``/
+    ``offset`` describe the returned page.
 
     PR-2 (audit M-orders-leak): ``user_signature`` is stripped from
     every entry unless the caller presents an ``X-Reader-Sig`` that
@@ -910,6 +958,8 @@ def list_orders(
     reader-sig only unlocks the orders it actually owns.
     """
     ob = _require_orderbook()
+    limit = max(1, min(int(limit), _LIST_MAX_LIMIT))
+    offset = max(0, int(offset))
     # The durable store is the source of truth for which orders exist — it
     # survives restarts, whereas the in-memory OrderBook only holds the live
     # working set (and on restart only OPEN orders are reloaded). Source the
@@ -928,13 +978,26 @@ def list_orders(
         oid = d.get("order_id")
         if oid:
             merged[oid] = d
+    # Newest first; order_id tie-break keeps pages stable across requests
+    # when created_at collides (or is missing on pre-field orders).
+    ordered = sorted(
+        merged.values(),
+        key=lambda d: (-_created_at(d), str(d.get("order_id") or "")),
+    )
+    total = len(ordered)
     out = []
-    for d in merged.values():
+    for d in ordered[offset : offset + limit]:
         submitted_by = (d.get("submitted_by", "") or "")
         if not _verify_reader_sig(submitted_by, d.get("order_id", ""), x_reader_sig or ""):
             d = _strip_user_signature(d)
-        out.append(d)
-    return {"orders": out, "count": len(out)}
+        out.append(d if full else _order_summary(d))
+    return {
+        "orders": out,
+        "count": len(out),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.delete("/orders/{order_id}")
