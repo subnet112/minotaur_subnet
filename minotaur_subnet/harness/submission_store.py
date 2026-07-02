@@ -110,6 +110,17 @@ class SubmissionStatus(str, Enum):
     ADOPTED = "adopted"
 
 
+# Statuses meaning the submission actually occupied a benchmark slate slot (was
+# selected into a round and benched, or is being benched now). The per-commit
+# participation cap counts THESE — a rotation "not selected" or screening
+# rejection never consumed sim time, so it doesn't burn the commit's quota.
+BENCHED_STATUSES = frozenset({
+    SubmissionStatus.BENCHMARKING,
+    SubmissionStatus.SCORED,
+    SubmissionStatus.ADOPTED,
+})
+
+
 @dataclass
 class Submission:
     """A solver submission and its lifecycle state."""
@@ -308,6 +319,7 @@ class SubmissionStore:
         repo_token: str | None = None,
         github_owner: str | None = None,
         max_per_owner_per_round: int = 0,
+        max_rounds_per_commit: int = 0,
     ) -> Submission:
         """Create a new submission. Raises ValueError when a per-round cap is hit.
 
@@ -329,8 +341,19 @@ class SubmissionStore:
         hotkeys). Default 0 = disabled; skipped when ``github_owner`` is unset
         (inline-source). Case-insensitive.
 
-        All three checks run atomically here as the backstop against a TOCTOU race
-        between the route's pre-check and the insert. Counts are over ALL statuses.
+        ``max_rounds_per_commit`` caps how many ROUNDS the same (hotkey, commit)
+        may occupy a benchmark slate slot — anti-resubmit-spam (measured live:
+        61% of benchmark slots re-scored an already-benched commit; one bot
+        resubmitted the identical commit 36 rounds straight). Counts DISTINCT
+        rounds with a BENCHED status (see ``BENCHED_STATUSES``) so rotation
+        "not selected" / screening rejections don't burn quota. Keyed per hotkey
+        so a third party can't poison someone else's commit, and trivially
+        evaded by pushing a new commit — it stops automation, not adversaries.
+        Default 0 = disabled.
+
+        All checks run atomically here as the backstop against a TOCTOU race
+        between the route's pre-check and the insert. The per-round counts are
+        over ALL statuses.
         """
         self._maybe_reload()
         resolved_round_id = (round_id or "").strip() or self._legacy_round_id(epoch)
@@ -375,6 +398,15 @@ class SubmissionStore:
                     f"Round {resolved_round_id} is full "
                     f"({round_total}/{max_total_per_round} submissions); "
                     f"try again next round"
+                )
+        if max_rounds_per_commit > 0:
+            benched_rounds = self.count_benched_rounds_by_commit(hotkey, commit_hash)
+            if benched_rounds >= max_rounds_per_commit:
+                raise ValueError(
+                    f"Commit {commit_hash[:12]} has already been benchmarked in "
+                    f"{benched_rounds} round(s) for this hotkey "
+                    f"(max {max_rounds_per_commit}); submit new code to "
+                    f"participate again"
                 )
 
         now = time.time()
@@ -557,6 +589,26 @@ class SubmissionStore:
             1 for s in self._submissions.values()
             if (s.github_owner or "").lower() == owner and s.round_id == round_id
         )
+
+    def count_benched_rounds_by_commit(self, hotkey: str, commit_hash: str) -> int:
+        """DISTINCT rounds where this miner's exact commit occupied a benchmark
+        slate slot (status in ``BENCHED_STATUSES``).
+
+        The submission gate reads this to enforce the per-commit participation
+        cap BEFORE any expensive work. Scoped to the (hotkey, commit) pair —
+        another miner submitting the same commit can't burn this miner's quota.
+        Case-insensitive on the hash (git SHAs are hex). Empty commit returns 0.
+        """
+        self._maybe_reload()
+        commit = (commit_hash or "").strip().lower()
+        if not commit:
+            return 0
+        return len({
+            s.round_id for s in self._submissions.values()
+            if s.hotkey == hotkey
+            and (s.commit_hash or "").strip().lower() == commit
+            and s.status in BENCHED_STATUSES
+        })
 
     def count_by_round(self, round_id: str) -> int:
         """Total submissions for ``round_id`` across ALL miners.
