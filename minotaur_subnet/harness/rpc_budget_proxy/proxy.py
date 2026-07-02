@@ -42,11 +42,25 @@ errors/timeouts, so a solver cannot observe the proxy by inspecting numbers or
 whitespace. When budget is hit it fails LOUD with a well-formed JSON-RPC error
 matching the request shape — never a silent pass-through to direct Anvil.
 
-One deliberate exception: immutable per-chain constants (``eth_chainId``,
-``net_version``) are fetched from the upstream ONCE per chain and answered
-locally thereafter. web3.py re-validates the chain id around nearly every
-call, which made these ~2/3 of all upstream traffic; the value cannot differ
-by block or time, so the solver-visible VALUE is identical either way.
+Two deliberate exceptions, both value-preserving:
+
+1. Immutable per-chain constants (``eth_chainId``, ``net_version``) are
+   fetched from the upstream ONCE per chain and answered locally thereafter.
+   web3.py re-validates the chain id around nearly every call, which made
+   these ~2/3 of all upstream traffic; the value cannot differ by block or
+   time, so the solver-visible VALUE is identical either way.
+
+2. BLOCK-PINNED reads are cached per ``(chain, block, method, params)``. A
+   fixed historical block has exactly ONE canonical state, so after the
+   rewrite forces the pin, the upstream's answer is fully determined by the
+   request — replaying it is not an approximation. This is where the real
+   volume is: every challenger in a round quotes the SAME scenarios at the
+   SAME fork block, re-reading state the previous session already fetched.
+   Only rewrite-table-pinned methods are cached (``eth_call``,
+   ``eth_getStorageAt``, ..., ``eth_getLogs``); anything block-independent
+   and non-constant (e.g. ``eth_gasPrice``) always forwards. Budget metering
+   is charged BEFORE cache lookup, so a session's ``spent`` sequence — the
+   consensus-relevant meter — is identical whether or not a value was cached.
 
 NETWORK ISOLATION (caller's responsibility)
 ===========================================
@@ -66,7 +80,7 @@ from typing import Any
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 from .cost_table import batch_cost, request_cost
-from .rewrite_table import rewrite_single
+from .rewrite_table import classify, rewrite_single
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +94,17 @@ ANON_SESSION = "__anon__"
 # Methods whose result is an immutable per-chain constant: answered from a
 # proxy-lifetime cache after one upstream fetch (see module docstring).
 IMMUTABLE_CHAIN_METHODS = frozenset({"eth_chainId", "net_version"})
+
+# Kill switch for BOTH response caches (chain constants + pinned reads):
+# RPC_PROXY_RESPONSE_CACHE=0 restores the fully-transparent forward-everything
+# behavior of the pre-cache proxy, without an image rollback.
+_FALSEY_ENV = {"0", "false", "no", "off"}
+
+
+def _response_cache_enabled_from_env() -> bool:
+    return os.environ.get(
+        "RPC_PROXY_RESPONSE_CACHE", "1"
+    ).strip().lower() not in _FALSEY_ENV
 
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8645
@@ -101,6 +126,113 @@ try:
     UPSTREAM_MAX_CONCURRENCY = max(1, int(os.environ.get('RPC_PROXY_UPSTREAM_MAX_CONCURRENCY', '24')))
 except ValueError:
     UPSTREAM_MAX_CONCURRENCY = 24
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Bounds for the pinned-read cache. A round pins ONE block per chain, so the
+# working set is a handful of (chain, block) groups; old blocks age out as
+# rounds advance. Entries are capped per block (insert stops at the cap — the
+# set of reads at one block is finite, eviction churn buys nothing), and
+# oversized results are never cached so one giant eth_getLogs/eth_getCode
+# response can't balloon the proxy.
+PIN_CACHE_MAX_BLOCKS = _env_int("RPC_PROXY_PIN_CACHE_MAX_BLOCKS", 4)
+PIN_CACHE_MAX_ENTRIES_PER_BLOCK = _env_int(
+    "RPC_PROXY_PIN_CACHE_MAX_ENTRIES_PER_BLOCK", 250_000
+)
+PIN_CACHE_MAX_RESULT_BYTES = _env_int(
+    "RPC_PROXY_PIN_CACHE_MAX_RESULT_BYTES", 131_072
+)
+
+
+class PinCache:
+    """Bounded ``(chain, block) -> {request-key: result}`` cache for pinned reads.
+
+    Single-event-loop use only (like the session registry) — plain dicts, no
+    locking. Block groups are LRU-evicted whole: state at a block never changes,
+    so entries are only ever dropped because their block fell out of rotation.
+    """
+
+    def __init__(
+        self,
+        max_blocks: int = PIN_CACHE_MAX_BLOCKS,
+        max_entries_per_block: int = PIN_CACHE_MAX_ENTRIES_PER_BLOCK,
+        max_result_bytes: int = PIN_CACHE_MAX_RESULT_BYTES,
+    ) -> None:
+        self.max_blocks = max_blocks
+        self.max_entries_per_block = max_entries_per_block
+        self.max_result_bytes = max_result_bytes
+        # (chain, block_hex) -> {key: result}; dict preserves insertion order,
+        # re-inserting on access gives LRU over block groups.
+        self._blocks: dict[tuple[str, str], dict[str, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def key(method: str, params: Any) -> str:
+        """Canonical request key: method + params with dict keys sorted, so two
+        solvers spelling the same read differently share one entry."""
+        return f"{method}:{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
+
+    def _group(self, chain: str, block_hex: str) -> dict[str, Any]:
+        gk = (chain, block_hex)
+        group = self._blocks.get(gk)
+        if group is None:
+            group = self._blocks[gk] = {}
+        else:  # refresh LRU position
+            self._blocks[gk] = self._blocks.pop(gk)
+        while len(self._blocks) > self.max_blocks:
+            evicted = next(iter(self._blocks))
+            self._blocks.pop(evicted)
+            logger.info("pin-cache: evicted block group %s", evicted)
+        return group
+
+    def get(self, chain: str, block_hex: str, key: str) -> tuple[bool, Any]:
+        """``(hit, result)`` — the flag disambiguates a cached null result."""
+        group = self._group(chain, block_hex)
+        if key in group:
+            self.hits += 1
+            return True, group[key]
+        self.misses += 1
+        return False, None
+
+    def put_from_response(
+        self, chain: str, block_hex: str, key: str, resp: web.StreamResponse
+    ) -> None:
+        """Cache a forwarded response's ``result``; never raises.
+
+        Only a 200 carrying a single JSON-RPC object with a ``result`` and no
+        ``error`` fills the cache — upstream errors, JSON-RPC errors (e.g. a
+        transient rate-limit), and oversized bodies keep forwarding.
+        """
+        body = getattr(resp, "body", None)
+        if resp.status != 200 or not body or len(body) > self.max_result_bytes:
+            return
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return
+        if not isinstance(data, dict) or data.get("error") is not None:
+            return
+        if "result" not in data:
+            return
+        group = self._group(chain, block_hex)
+        if len(group) >= self.max_entries_per_block and key not in group:
+            return  # full: keep serving what we have, forward the rest
+        group[key] = data["result"]
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "blocks": len(self._blocks),
+            "entries": sum(len(g) for g in self._blocks.values()),
+        }
 
 
 class Session:
@@ -196,6 +328,7 @@ class BudgetProxy:
         default_mode: str = DEFAULT_MODE,
         default_budget: int = DEFAULT_BUDGET,
         control_token: str | None = None,
+        response_cache_enabled: bool = True,
     ) -> None:
         if not upstreams:
             raise ValueError("BudgetProxy requires at least one upstream URL")
@@ -215,6 +348,12 @@ class BudgetProxy:
         # (chain, method) -> cached "result" for IMMUTABLE_CHAIN_METHODS.
         # Proxy-lifetime: an UPSTREAMS repoint requires a restart, which drops it.
         self._chain_constants: dict[tuple[str, str], Any] = {}
+        # Deterministic pinned-read cache, shared across sessions (all sessions
+        # at one fork block read the same canonical state).
+        self._pin_cache = PinCache()
+        # False = RPC_PROXY_RESPONSE_CACHE=0 rollback: skip both caches, forward
+        # everything (metering/pinning unaffected — they never depended on them).
+        self.response_cache_enabled = bool(response_cache_enabled)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -358,7 +497,7 @@ class BudgetProxy:
         # on the first call). Placed AFTER the budget decision so an exhausted
         # enforce session still gets the deterministic budget error, and BEFORE
         # the block-pin because these methods are block-independent.
-        if parse_ok and isinstance(parsed, dict):
+        if self.response_cache_enabled and parse_ok and isinstance(parsed, dict):
             method = parsed.get("method")
             if method in IMMUTABLE_CHAIN_METHODS:
                 chain_key = chain or self._default_chain
@@ -378,12 +517,62 @@ class BudgetProxy:
         # (budget-only / legacy mode).
         block_hex = session.blocks.get(chain or self._default_chain)
         if block_hex is not None and parse_ok:
+            if isinstance(parsed, dict):
+                return await self._pinned_single(
+                    upstream, parsed, block_hex, chain or self._default_chain, request
+                )
             pinned = self._block_pin(parsed, block_hex)
             if isinstance(pinned, web.StreamResponse):
-                return pinned  # synthetic: eth_blockNumber result / rejected method
+                return pinned  # synthetic: rejected mixed batch
             return await self._forward(upstream, pinned, request)  # rewritten body
 
         return await self._forward(upstream, raw_body, request)
+
+    async def _pinned_single(
+        self,
+        upstream: str,
+        parsed: dict,
+        block_hex: str,
+        chain_key: str,
+        request: web.Request,
+    ) -> web.StreamResponse:
+        """Handle one pinned single (non-batch) request: rewrite, then serve
+        pinned reads from the :class:`PinCache` (fill on miss).
+
+        Same rewrite semantics as the batch path; the cache only ever sees a
+        request AFTER the pin was forced, so a key can't alias two blocks.
+        """
+        action, payload = rewrite_single(parsed, block_hex)
+        req_id = parsed.get("id")
+        if action == "blocknumber":
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": req_id, "result": payload}
+            )
+        if action == "reject":
+            return self._json_error_response(
+                req_id,
+                code=-32601,
+                message=f"method {payload!r} not allowed (read-only block-pinned proxy)",
+                http_status=200,
+            )
+
+        method = payload.get("method") if isinstance(payload, dict) else None
+        cache_key = None
+        if (
+            self.response_cache_enabled
+            and isinstance(method, str)
+            and classify(method) in ("rewrite", "getlogs")
+        ):
+            cache_key = PinCache.key(method, payload.get("params"))
+            hit, result = self._pin_cache.get(chain_key, block_hex, cache_key)
+            if hit:
+                return web.json_response(
+                    {"jsonrpc": "2.0", "id": req_id, "result": result}
+                )
+        resp = await self._forward(upstream, json.dumps(payload).encode(), request)
+        if cache_key is not None:
+            self._pin_cache.put_from_response(chain_key, block_hex, cache_key, resp)
+        return resp
 
     async def _forward(
         self, upstream: str, raw_body: bytes, request: web.Request
@@ -472,48 +661,33 @@ class BudgetProxy:
     # -- block-pin ---------------------------------------------------------
 
     def _block_pin(self, parsed: Any, block_hex: str) -> Any:
-        """Apply the block-pin rewrite to a parsed JSON-RPC body.
+        """Apply the block-pin rewrite to a parsed BATCH body (singles go
+        through :meth:`_pinned_single`, which adds the pinned-read cache).
 
-        Returns either a synthetic ``web.Response`` (an intercepted
-        ``eth_blockNumber`` answered with the pin, a rejected state-changing
-        method, or a batch mixing those) OR the rewritten body ``bytes`` to
+        Returns either a synthetic ``web.Response`` (a batch mixing
+        intercepted/rejected members) OR the rewritten body ``bytes`` to
         forward. For a batch with no intercept/reject members, each member's
-        block tag is rewritten and the batch is forwarded as one.
+        block tag is rewritten and the batch is forwarded as one (uncached —
+        the reference solver issues single calls; batches are rare).
         """
-        if isinstance(parsed, list):
-            out = []
-            for member in parsed:
-                action, payload = rewrite_single(member, block_hex)
-                if action in ("blocknumber", "reject"):
-                    # A batch mixing intercepted/rejected members can't be a
-                    # single upstream forward; reject it whole (fail-loud, rare —
-                    # the reference solver issues single calls, handled fully).
-                    return self._json_error_response(
-                        None,
-                        code=-32601,
-                        message=(
-                            "eth_blockNumber / state-changing methods must be "
-                            "single calls under block-pin"
-                        ),
-                        http_status=200,
-                    )
-                out.append(payload)
-            return json.dumps(out).encode()
-
-        action, payload = rewrite_single(parsed, block_hex)
-        req_id = parsed.get("id") if isinstance(parsed, dict) else None
-        if action == "blocknumber":
-            return web.json_response(
-                {"jsonrpc": "2.0", "id": req_id, "result": payload}
-            )
-        if action == "reject":
-            return self._json_error_response(
-                req_id,
-                code=-32601,
-                message=f"method {payload!r} not allowed (read-only block-pinned proxy)",
-                http_status=200,
-            )
-        return json.dumps(payload).encode()
+        out = []
+        for member in parsed:
+            action, payload = rewrite_single(member, block_hex)
+            if action in ("blocknumber", "reject"):
+                # A batch mixing intercepted/rejected members can't be a
+                # single upstream forward; reject it whole (fail-loud, rare —
+                # the reference solver issues single calls, handled fully).
+                return self._json_error_response(
+                    None,
+                    code=-32601,
+                    message=(
+                        "eth_blockNumber / state-changing methods must be "
+                        "single calls under block-pin"
+                    ),
+                    http_status=200,
+                )
+            out.append(payload)
+        return json.dumps(out).encode()
 
     # -- control plane -----------------------------------------------------
 
@@ -590,7 +764,8 @@ class BudgetProxy:
             {
                 "sessions": {
                     sid: sess.to_record() for sid, sess in self.sessions.items()
-                }
+                },
+                "pin_cache": self._pin_cache.stats(),
             }
         )
 
@@ -761,6 +936,7 @@ def make_app() -> web.Application:
         default_mode=mode,
         default_budget=default_budget,
         control_token=os.environ.get("CONTROL_TOKEN", ""),
+        response_cache_enabled=_response_cache_enabled_from_env(),
     )
     return proxy.build_app()
 

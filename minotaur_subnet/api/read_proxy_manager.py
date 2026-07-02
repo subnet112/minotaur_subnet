@@ -26,6 +26,7 @@ Disable with ``DISABLE_READ_PROXY=1`` (dev / local without docker-socket access)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -94,26 +95,48 @@ def _export_env(token: str) -> None:
         os.environ.setdefault("SOLVER_READ_PROXY_TOKEN", token)
 
 
-async def _proxy_state() -> tuple[bool, str]:
-    """``(running?, image)`` of the managed proxy.
+def _rpc_proxy_env() -> dict[str, str]:
+    """The api's ``RPC_PROXY_*`` env, forwarded verbatim into the managed proxy.
 
-    Tries ``docker inspect`` (precise image — so the proxy can be RECREATED when the api
-    image changes, e.g. a consensus-relevant rewrite-table version bump; needs the docker
-    CLI's API version pinned via ``DOCKER_API_VERSION``, else the unpinned CLI's version
+    This is the proxy's operator-tunable surface (e.g. the
+    ``RPC_PROXY_RESPONSE_CACHE=0`` cache kill switch, upstream concurrency,
+    cache bounds) — settable on the API service without an image change.
+    """
+    return {k: v for k, v in os.environ.items() if k.startswith("RPC_PROXY_")}
+
+
+async def _proxy_state() -> tuple[bool, str, dict[str, str] | None]:
+    """``(running?, image, rpc_env)`` of the managed proxy.
+
+    Tries ``docker inspect`` (precise image + env — so the proxy can be RECREATED when
+    the api image changes, e.g. a consensus-relevant rewrite-table version bump, OR when
+    the operator flips an ``RPC_PROXY_*`` var on the api; needs the docker CLI's API
+    version pinned via ``DOCKER_API_VERSION``, else the unpinned CLI's version
     negotiation gets a 403 from the socket-proxy). Falls back to ``docker ps``
-    (running-only, image ``""``) where inspect is denied — ``GET /containers/json`` is
-    allowed even where ``GET /containers/<id>/json`` 403s. Never blocks on the socket.
+    (running-only, image ``""``, env ``None`` = uncomparable) where inspect is denied —
+    ``GET /containers/json`` is allowed even where ``GET /containers/<id>/json`` 403s.
+    Never blocks on the socket.
     """
     rc, out, _ = await _docker(
-        "inspect", PROXY_CONTAINER_NAME, "--format", "{{.State.Running}}|{{.Image}}",
+        "inspect", PROXY_CONTAINER_NAME,
+        "--format", "{{.State.Running}}|{{.Image}}|{{json .Config.Env}}",
     )
     if rc == 0 and "|" in out:
-        running, image = (out.split("|", 1) + [""])[:2]
-        return running.strip() == "true", image.strip()
+        running, image, env_json = (out.split("|", 2) + ["", ""])[:3]
+        rpc_env: dict[str, str] | None = None
+        try:
+            entries = json.loads(env_json) or []
+            rpc_env = dict(
+                e.split("=", 1) for e in entries
+                if isinstance(e, str) and "=" in e and e.startswith("RPC_PROXY_")
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass  # env uncomparable; image comparison still works
+        return running.strip() == "true", image.strip(), rpc_env
     rc, names, _ = await _docker(
         "ps", "--filter", f"name=^{PROXY_CONTAINER_NAME}$", "--format", "{{.Names}}",
     )
-    return (rc == 0 and PROXY_CONTAINER_NAME in names.split()), ""
+    return (rc == 0 and PROXY_CONTAINER_NAME in names.split()), "", None
 
 
 async def _resolve_self_image_and_net() -> tuple[str, str | None]:
@@ -219,11 +242,15 @@ async def ensure_read_proxy_container() -> bool:
 
     # (3) If the proxy is already running, leave it ONLY when it's on the api's current
     # image — so the proxy TRACKS the api (a consensus-relevant rewrite-table version bump
-    # must not leave a stale proxy applying old rewrites). When we can't compare images
-    # (inspect denied -> ''), fall back to leaving a running proxy alone (#301 robustness:
+    # must not leave a stale proxy applying old rewrites) — AND its RPC_PROXY_* env matches
+    # the api's (so an operator flipping e.g. RPC_PROXY_RESPONSE_CACHE=0 takes effect on
+    # the next api restart, no manual container surgery). When we can't compare (inspect
+    # denied -> ''/None), fall back to leaving a running proxy alone (#301 robustness:
     # never block on the socket; a stale proxy is the rare, opt-in-only risk then).
-    running, proxy_image = await _proxy_state()
-    if running and (not image or not proxy_image or proxy_image == image):
+    running, proxy_image, proxy_rpc_env = await _proxy_state()
+    image_current = not image or not proxy_image or proxy_image == image
+    env_current = proxy_rpc_env is None or proxy_rpc_env == _rpc_proxy_env()
+    if running and image_current and env_current:
         logger.info(
             "[read-proxy] env wired to %s; managed proxy running (%s)", PROXY_DATA_URL,
             "current image" if proxy_image and proxy_image == image else "image uncompared",
@@ -238,10 +265,16 @@ async def ensure_read_proxy_container() -> bool:
         )
         return False
     if running:
-        logger.info(
-            "[read-proxy] proxy on stale image %s != api %s — recreating to track the api",
-            proxy_image[:19], image[:19],
-        )
+        if not image_current:
+            logger.info(
+                "[read-proxy] proxy on stale image %s != api %s — recreating to track the api",
+                proxy_image[:19], image[:19],
+            )
+        else:
+            logger.info(
+                "[read-proxy] proxy RPC_PROXY_* env %s != api %s — recreating to apply it",
+                proxy_rpc_env, _rpc_proxy_env(),
+            )
     await _docker("rm", "-f", PROXY_CONTAINER_NAME)  # clear any stale/stopped instance
     sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
     # SELF-HEAL: nothing else creates this network (unused top-level compose net), so
@@ -258,8 +291,10 @@ async def ensure_read_proxy_container() -> bool:
         "-e", f"CONTROL_TOKEN={token}",
         "-e", f"LISTEN_PORT={PROXY_PORT}",
         "-e", "LOG_LEVEL=INFO",
-        image, "-m", _PROXY_MODULE,
     ]
+    for k, v in sorted(_rpc_proxy_env().items()):  # operator-tunable proxy knobs
+        create += ["-e", f"{k}={v}"]
+    create += [image, "-m", _PROXY_MODULE]
     rc, _cid, err = await _docker(*create, timeout=90)
     if rc != 0:
         logger.error(
