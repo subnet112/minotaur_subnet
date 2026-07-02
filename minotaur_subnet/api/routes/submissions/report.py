@@ -61,7 +61,7 @@ def build_submission_report(
     details = getattr(sub, "benchmark_details", None) or {}
     screening = getattr(sub, "screening", None) or {}
 
-    benchmarked = bool(details) or getattr(sub, "benchmark_score", None) is not None
+    benchmarked = bool(details)
     rejected_in_screening = status == "rejected" and not benchmarked
     if not benchmarked and not rejected_in_screening:
         return None  # queued / screening / benchmarking — no report yet
@@ -185,15 +185,20 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         lines += [seg, ""]
 
         # The actionable part: the specific orders that DIFFER from the champion.
-        # Worse rows first (that's where to focus optimization), then wins. Matched
-        # orders are summarized by the counts above — listing hundreds of ties
-        # helps no one.
+        # Worse rows first (that's where to focus optimization), then wins.
+        # ALLOWLIST the diverging verdicts: matched orders are summarized by the
+        # counts above (listing hundreds of ties helps no one), and ``skip`` rows
+        # (neither side delivered) carry no signal — rendered, they read as
+        # phantom ✅ wins with no delta. ``dropped`` (the challenger produced
+        # nothing on a champion-served order) is a hard veto, so it counts as
+        # worse: ❌, sorted with the regressions.
         per_order = rel.get("per_order")
-        _worse = {"worse", "regression"}
+        _worse = {"worse", "regression", "dropped"}
+        _better = {"better", "win", "new", "blind_spot_cover"}
         diffs = (
             [
                 o for o in per_order
-                if isinstance(o, dict) and o.get("verdict") not in (None, "matched")
+                if isinstance(o, dict) and o.get("verdict") in _worse | _better
             ]
             if isinstance(per_order, list)
             else []
@@ -207,7 +212,13 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                 "|---|---|---|",
             ]
             for o in diffs[:_MAX_PER_ORDER_ROWS]:
-                mark = "❌" if o.get("verdict") in _worse else "✅"
+                verdict = o.get("verdict")
+                if verdict == "dropped":
+                    mark = "❌ dropped"  # no plan on a champion-served order (hard veto)
+                elif verdict in ("new", "blind_spot_cover"):
+                    mark = "✅ new"  # covered an order the champion delivers nothing on
+                else:
+                    mark = "❌" if verdict in _worse else "✅"
                 lines.append(
                     f"| `{_cell(o.get('intent_id'))}` | {_pct(o.get('ratio'))} | {mark} |"
                 )

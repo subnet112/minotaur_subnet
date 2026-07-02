@@ -602,6 +602,80 @@ async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
     return await _verify_digest_retrievable(ref, digest_ref, _docker)
 
 
+# Statuses a live pipeline task walks through — a submission parked in one of
+# these with NO running task is stranded (its task died with the process).
+_RESUMABLE_STATUSES = (
+    SubmissionStatus.QUEUED,
+    SubmissionStatus.SCREENING_STAGE_1,
+    SubmissionStatus.SCREENING_STAGE_2,
+    SubmissionStatus.SCREENING_STAGE_3,
+)
+# Don't resurrect ancient strandings (their round is long gone; rebuilding the
+# image would be wasted work) — bound the boot-time re-kick to recent ones.
+_RESUME_MAX_AGE_SECONDS = 24 * 3600.0
+
+
+async def resume_stranded_screenings() -> int:
+    """Re-kick screening for submissions stranded mid-pipeline by a restart.
+
+    The pipeline runs as a background task spawned once at submission time; a
+    process restart kills it and nothing re-starts it, leaving the submission
+    parked in QUEUED/SCREENING_* forever (observed live 2026-07-02: an update
+    restart stranded ALL 5 of a round's submissions in screening — the round
+    then busy-spun in ``replaying`` with benchmarked=0 and miners saw
+    "scoring…" indefinitely). Screening is idempotent-from-scratch (fresh
+    clone, stages re-run, statuses re-walk), so a boot-time re-kick is safe.
+
+    Private submissions lose their in-memory repo PAT on restart (by design —
+    the token is never persisted); those are rejected with an actionable
+    reason instead of the misleading generic clone failure they'd hit anyway.
+
+    Returns the number of pipelines re-spawned. Call once at api startup.
+    """
+    import time as _time
+
+    store = get_store()
+    stranded = [
+        sub for status in _RESUMABLE_STATUSES
+        for sub in store.list_by_status(status)
+    ]
+    resumed = 0
+    for sub in stranded:
+        age = _time.time() - (sub.updated_at or 0)
+        if age > _RESUME_MAX_AGE_SECONDS:
+            logger.warning(
+                "[screening] leaving stranded submission %s alone (status=%s, "
+                "stale for %.0fh — its round is long gone)",
+                sub.submission_id, sub.status.value, age / 3600,
+            )
+            continue
+        if sub.is_private and store.get_repo_token(sub.submission_id) is None:
+            store.reject(
+                sub.submission_id,
+                "screening was interrupted by a validator restart and the "
+                "private-repo token is not retained across restarts — please "
+                "re-submit",
+            )
+            logger.warning(
+                "[screening] rejected private submission %s stranded by a "
+                "restart (in-memory repo token lost)", sub.submission_id,
+            )
+            continue
+        asyncio.get_running_loop().create_task(
+            _run_screening_pipeline(sub.submission_id)
+        )
+        resumed += 1
+        logger.info(
+            "[screening] resuming submission %s stranded in %s by a restart",
+            sub.submission_id, sub.status.value,
+        )
+    if stranded:
+        logger.info(
+            "[screening] boot resume: %d stranded, %d re-spawned", len(stranded), resumed,
+        )
+    return resumed
+
+
 async def _run_screening_pipeline(submission_id: str) -> None:
     """Clone repo and run the 3-stage screening pipeline.
 

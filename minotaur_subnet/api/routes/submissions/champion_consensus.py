@@ -97,27 +97,26 @@ async def _pull_image_by_digest(digest_ref: str) -> bool:
 
 async def _reactive_benchmark_candidate(
     candidate: Any,
-    leader_score: float,
-    tolerance_pct: float = 0.15,
     round_id: str | None = None,
     candidate_image_id: str | None = None,
-) -> tuple[bool, float]:
-    """Independently benchmark a champion candidate to verify the leader's score.
+) -> tuple[bool, dict[str, Any]]:
+    """Independently verify a champion candidate via the relative adopt rule.
 
-    Peers call this when they receive a champion proposal. It mirrors how
-    order consensus peers re-simulate plans before signing — the peer runs
-    the same benchmark pipeline (Stage 1 synthetic + Stage 2 historical)
-    and checks that the score is within tolerance.
+    Peers call this when they receive a champion proposal. It mirrors how order
+    consensus peers re-simulate plans before signing — the peer benchmarks the
+    candidate on the round's shared flat scenario set (synthetic ∪ the round-seeded
+    historical order draw) and applies the AUTHORITATIVE per-order relative rule
+    itself (via :func:`_independent_adopt_vote`), signing only if IT concludes adopt
+    — NOT a leader-score tolerance check (that scalar was removed).
 
     Args:
         candidate: Submission object (has image_tag, commit_hash, repo_url).
-        leader_score: The score the leader claims for this candidate.
-        tolerance_pct: Maximum allowed relative difference (default 15%).
-        round_id: Current round ID — used to deterministically sample
-            the same historical orders the leader used for Stage 2.
+        round_id: Current round ID — used to deterministically sample the same
+            historical orders the leader used.
 
     Returns:
-        (verified, local_score) — verified is True if within tolerance.
+        (verified, counts) — verified is this validator's own relative adopt verdict;
+        counts is the relative better/worse/matched breakdown.
     """
     from minotaur_subnet.api.server_context import ctx
     from minotaur_subnet.harness.orchestrator import (
@@ -154,13 +153,13 @@ async def _reactive_benchmark_candidate(
                 "Reactive benchmark: cannot build digest ref for %s (D=%s) — refusing",
                 candidate.submission_id, candidate_image_id,
             )
-            return False, 0.0
+            return False, {}
         if not await _pull_image_by_digest(run_image):
             logger.warning(
                 "Reactive benchmark: pull-by-digest failed for %s (%s) — refusing to sign",
                 candidate.submission_id, run_image,
             )
-            return False, 0.0
+            return False, {}
         logger.info(
             "Reactive benchmark: pulled content-addressed candidate %s (%s)",
             candidate.submission_id, run_image,
@@ -172,7 +171,7 @@ async def _reactive_benchmark_candidate(
                 "Candidate %s has no image_tag — cannot benchmark reactively",
                 candidate.submission_id,
             )
-            return False, 0.0
+            return False, {}
 
         # Before burning CPU, make sure the image tag on this peer resolves to
         # the same sha256 image_id the leader built. Tags are local refs; two
@@ -186,20 +185,20 @@ async def _reactive_benchmark_candidate(
                     "refusing to benchmark",
                     run_image,
                 )
-                return False, 0.0
+                return False, {}
             if local_image_id.lower() != expected_image_id.lower():
                 logger.warning(
                     "Reactive benchmark image_id mismatch for %s: local=%s expected=%s "
                     "— refusing to benchmark",
                     candidate.submission_id, local_image_id, expected_image_id,
                 )
-                return False, 0.0
+                return False, {}
 
     # Build a temporary BenchmarkWorker to reuse intent loading and scoring
     app_store = ctx.store
     # Get the Anvil simulator for real simulation (not mock).
-    # Mock simulation results are zeroed by _compute_avg_score, so without
-    # a real simulator the reactive benchmark always scores 0.0.
+    # Mock simulation results deliver no raw_output, so without a real simulator the
+    # reactive benchmark sees no delivered value and the relative rule abstains.
     from minotaur_subnet.api.routes import apps as _apps_module
     simulator = getattr(_apps_module, "_simulator", None)
 
@@ -251,13 +250,14 @@ async def _reactive_benchmark_candidate(
     intents = worker._load_benchmark_intents()
     if not intents:
         logger.warning("No active intents for reactive benchmark")
-        return False, 0.0
+        return False, {}
 
     score_fn = await worker._build_score_fn(intents)
     intents = worker._enrich_intents_with_manifests(intents)
 
-    # Stage 2 historical scenarios — a single round-seeded SHARED corpus, identical
-    # on every validator (#242). The follower re-runs this same corpus, so its
+    # Historical order draw — a single round-seeded SHARED corpus, identical
+    # on every validator (#242), joined flat with the synthetic scenarios. The
+    # follower re-runs this same corpus, so its
     # independent champion-vs-challenger verdict (below) is directly comparable to
     # the leader's and ratifiable by quorum.
     if round_id:
@@ -285,7 +285,7 @@ async def _reactive_benchmark_candidate(
             candidate.submission_id,
             exc,
         )
-        return False, 0.0
+        return False, {}
 
     # Run the Docker benchmark. Honor the same fail-closed switch as the leader
     # (BENCHMARK_REQUIRE_REAL_SIM) so a follower never re-verifies a candidate on
@@ -313,22 +313,18 @@ async def _reactive_benchmark_candidate(
             "available — failing closed (verify=fail).",
             candidate.submission_id,
         )
-        return False, 0.0
+        return False, {}
     finally:
         await session.shutdown()
 
-    # Compute average score (same logic as BenchmarkWorker._compute_avg_score)
-    local_score = worker._compute_avg_score(results)
-
     logger.info(
-        "Reactive benchmark for %s: local_score=%.4f leader_score=%.4f",
-        candidate.submission_id, local_score, leader_score,
+        "Reactive benchmark for %s: %d orders benchmarked",
+        candidate.submission_id, len(results),
     )
 
-    # Determinism-comparable signals: the JS local_score alone can't be diffed
-    # against the leader's on-chain scoreIntent numbers.
-    # Log the per-app on-chain scoreIntent means so operators can grep-compare
-    # leader vs follower for the same candidate + pinned block across the fleet.
+    # Determinism-comparable signals: log the per-app on-chain scoreIntent means so
+    # operators can grep-compare leader vs follower for the same candidate + pinned
+    # block across the fleet.
     try:
         card = worker._build_scorecard(results)
         oc_means: dict[str, float | None] = {}
@@ -337,9 +333,9 @@ async def _reactive_benchmark_candidate(
             oc_means[app] = round(sum(present) / len(present), 1) if present else None
         logger.info(
             "[reactive-determinism] candidate=%s round=%s fork_block=%s "
-            "local_score=%.4f app_onchain_means=%s",
+            "app_onchain_means=%s",
             candidate.submission_id, round_id, worker._epoch_block_number,
-            local_score, oc_means,
+            oc_means,
         )
     except Exception as exc:  # observe-only — must never break verification
         logger.warning("[reactive-determinism] logging failed (ignored): %s", exc)
@@ -363,7 +359,7 @@ async def _reactive_benchmark_candidate(
     # every validator and the quorum of independent verdicts is meaningful.
     return await _independent_adopt_vote(
         worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
-        chal_results=results, chal_score=local_score, candidate=candidate,
+        chal_results=results, candidate=candidate,
         round_id=round_id, reference_quotes=reference_quotes,
     )
 
@@ -375,11 +371,10 @@ async def _independent_adopt_vote(
     score_fn: Any,
     simulator: Any,
     chal_results: list,
-    chal_score: float,
     candidate: Any,
     round_id: str | None,
     reference_quotes: dict[str, dict[str, str]] | None = None,
-) -> tuple[bool, float]:
+) -> tuple[bool, dict[str, Any]]:
     """This follower's INDEPENDENT adopt verdict over the SHARED corpus (#242).
 
     Benchmarks the CURRENT champion on the SAME ``intents`` the challenger was just
@@ -387,11 +382,11 @@ async def _independent_adopt_vote(
     — and applies the AUTHORITATIVE relative per-order rule
     (:func:`evaluate_relative_adoption`), the IDENTICAL rule the leader runs
     (``EpochManager._meets_adoption_criteria``), so the vote is this validator's own
-    per-order judgement (challenger beats-or-matches the champion on every order's
-    RAW delivered output and strictly wins at least one), NOT reproduction of the
-    leader's aggregate number. Because the corpus is shared and the rule is
-    fleet-uniform, the quorum of YES verdicts is meaningful. Returns
-    ``(adopt, chal_score)``.
+    per-order judgement under the BOUNDED-REGRESSION NET-BETTER rule (no order cut
+    >1%, no dropped order, net wins+blind-spots exceed regressions by the margin),
+    NOT reproduction of any aggregate number. Because the corpus is shared and the
+    rule is fleet-uniform, the quorum of YES verdicts is meaningful. Returns
+    ``(adopt, counts)`` — counts is the relative better/worse/matched breakdown.
 
     Conservative on uncertainty: if the champion image can't be resolved, or its
     benchmark needs a real simulator and none is available, vote REJECT rather than
@@ -406,8 +401,18 @@ async def _independent_adopt_vote(
     )
     from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
+    def _counts(v: dict[str, Any]) -> dict[str, Any]:
+        # Relative better/worse/matched breakdown — the display + tally shape that
+        # replaced the retired aggregate chal_score/champ_score.
+        return {
+            "better": v["n_wins"] + v["n_blind_spots"],
+            "worse": v["n_regressions"] + v["n_dropped"],
+            "matched": v["n_matched"],
+            "compared": v["scenarios_compared"],
+        }
+
     # has_champion mirrors the leader EXACTLY: adopted champion, active-champion
-    # snapshot, OR a SCORED genesis with a usable score (genesis-as-bar, #242 — the
+    # snapshot, OR a genesis that DELIVERED VALUE (genesis-as-bar, #242 — the
     # first champion must BEAT genesis). The leader seeds self._champion from the
     # same predicate at decision time (_maybe_seed_genesis_incumbent), so
     # _resolve_incumbent_submission() replicates it. The bootstrap branch below is
@@ -423,24 +428,25 @@ async def _independent_adopt_vote(
         # the very first adoption.
         verdict = evaluate_relative_adoption([], chal_results)
         adopt = bool(verdict["adopt"])
+        counts = _counts(verdict)
         logger.info(
             "[independent-vote] role=follower candidate=%s round=%s vote=%s "
-            "chal_score=%.4f champ=BOOTSTRAP(no incumbent) wins=%d blind_spots=%d: %s",
+            "champ=BOOTSTRAP(no incumbent) better=%d worse=%d: %s",
             candidate.submission_id, round_id,
-            "ADOPT" if adopt else "REJECT", chal_score,
-            verdict["n_wins"], verdict["n_blind_spots"], verdict["reason"],
+            "ADOPT" if adopt else "REJECT",
+            counts["better"], counts["worse"], verdict["reason"],
         )
         try:
             from minotaur_subnet.api.server_context import ctx
             ctx.last_independent_vote = {
                 "candidate_id": candidate.submission_id, "role": "follower",
                 "vote": "ADOPT" if adopt else "REJECT",
-                "chal_score": round(float(chal_score), 4), "champ_score": None,
+                **counts,
                 "round_id": round_id, "reason": verdict["reason"],
             }
         except Exception:  # observe-only — must never break verification
             pass
-        return adopt, chal_score
+        return adopt, counts
 
     if not champ_image:
         # has_champion=True but the incumbent's image can't be resolved — we cannot
@@ -451,7 +457,7 @@ async def _independent_adopt_vote(
             "— voting REJECT (cannot verify improvement)",
             candidate.submission_id,
         )
-        return False, chal_score
+        return False, {}
 
     _require_real_sim = require_real_sim_default()
     orch = SolverOrchestrator()
@@ -496,27 +502,24 @@ async def _independent_adopt_vote(
             "but none available — voting REJECT",
             candidate.submission_id,
         )
-        return False, chal_score
+        return False, {}
 
-    # champ_score is for logging only now (the AUTHORITATIVE verdict is per-order on
-    # the RAW delivered output, NOT the aggregate JS score).
-    champ_score = worker._compute_avg_score(champ_results)
     # AUTHORITATIVE relative per-order verdict — IDENTICAL to the leader's
     # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
     # Joins champion vs challenger BenchmarkResults by intent_id on raw_output (the
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
     verdict = evaluate_relative_adoption(champ_results, chal_results)
     adopt = bool(verdict["adopt"])
+    counts = _counts(verdict)
     logger.info(
-        "[independent-vote] role=follower candidate=%s round=%s vote=%s chal_score=%.4f "
-        "champ_score=%.4f fork_block=%s wins=%d regressions=%d blind_spots=%d "
+        "[independent-vote] role=follower candidate=%s round=%s vote=%s "
+        "fork_block=%s better=%d worse=%d wins=%d regressions=%d blind_spots=%d "
         "compared=%d: %s",
         candidate.submission_id,
         round_id,
         "ADOPT" if adopt else "REJECT",
-        chal_score,
-        champ_score,
         worker._epoch_block_number,
+        counts["better"], counts["worse"],
         verdict["n_wins"], verdict["n_regressions"], verdict["n_blind_spots"],
         verdict["scenarios_compared"], verdict["reason"],
     )
@@ -527,14 +530,13 @@ async def _independent_adopt_vote(
             "candidate_id": candidate.submission_id,
             "role": "follower",
             "vote": "ADOPT" if adopt else "REJECT",
-            "chal_score": round(float(chal_score), 4),
-            "champ_score": round(float(champ_score), 4),
+            **counts,
             "round_id": round_id,
             "reason": verdict["reason"],
         }
     except Exception:  # observe-only — must never break verification
         pass
-    return adopt, chal_score
+    return adopt, counts
 
 
 async def _maybe_prepare_round_for_certification(
@@ -607,12 +609,10 @@ async def _maybe_prepare_round_for_certification(
                     round_id,
                     submission_id=candidate.submission_id,
                     image_id=candidate.image_id,
-                    benchmark_score=candidate.benchmark_score,
                 )
                 logger.info(
-                    "Round %s → CERTIFYING with explicit candidate %s (score=%.4f)",
+                    "Round %s → CERTIFYING with explicit candidate %s",
                     round_id, candidate.submission_id,
-                    candidate.benchmark_score or 0,
                 )
             else:
                 logger.warning(

@@ -18,12 +18,14 @@ from minotaur_subnet.epoch.manager import EpochManager, _adoption_disabled
 from minotaur_subnet.harness.submission_store import Submission, SubmissionStatus
 
 
-def _winning_sub(sid: str = "sub_win", score: float = 0.99) -> Submission:
+def _winning_sub(sid: str = "sub_win") -> Submission:
     """A challenger that would clearly be adopted (no champion, delivers value).
 
     Under the relative per-order rule a bootstrap adoption requires the challenger
     to deliver RAW output on at least one order, so carry a per_intent row with a
-    positive raw_output (the raw delivered output the live scorer emits)."""
+    positive raw_output (the raw delivered output the live scorer emits). This
+    delivered-value row — not the retired scalar ``benchmark_score`` — is what now
+    makes the submission look SCORED-with-value to the adoption pipeline."""
     return Submission(
         submission_id=sid,
         repo_url="https://github.com/test/solver",
@@ -32,7 +34,6 @@ def _winning_sub(sid: str = "sub_win", score: float = 0.99) -> Submission:
         hotkey="5Gtestminerhotkey",
         round_id="r1",
         status=SubmissionStatus.SCORED,
-        benchmark_score=score,
         benchmark_details={
             "total_intents": 5,
             "per_intent": [{"intent_id": "o1", "raw_output": "1000"}],

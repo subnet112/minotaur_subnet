@@ -558,10 +558,12 @@ def _build_solver_round_benchmark_pack_hash(
     *,
     shadow_pin_segment: str | None = None,
 ) -> str:
-    """Build a deterministic benchmark-pack hash covering:
+    """Build a deterministic benchmark-pack hash covering (ONE flat scenario set —
+    the synthetic/historical stage split is a hash-layout detail only, see
+    benchmark_pack.BENCHMARK_PACK_V2):
     1. Round metadata (app list, submissions, policy)
-    2. Stage 1 synthetic scenarios from every app's manifest
-    3. Stage 2 historical order IDs (deterministic sample from round_id)
+    2. Synthetic scenarios from every app's manifest
+    3. Historical order IDs (deterministic sample from round_id)
 
     All validators compute the same hash from the same round_id and local
     state. If any validator's manifests or order history differ, pack hashes
@@ -815,6 +817,37 @@ def _solver_round_epoch_health(ctx: ServerContext) -> dict[str, object]:
     )
 
 
+def _require_real_consensus_signing_key(consensus_mode: str) -> None:
+    """Fail fast when real consensus mode has no signing key to work with.
+
+    An empty/unset VALIDATOR_PRIVATE_KEY under CONSENSUS_MODE=real is a pure
+    misconfiguration (never transient) that silently disables BOTH consensus
+    managers — the api then runs "healthy" but can never certify a round
+    (2026-07-02: a compose recreate without .env.keys baked an empty key and a
+    certified-ready dethrone stalled ~50 min behind a 5s warning loop). Crash
+    at boot instead, so the container restart policy makes the misconfiguration
+    impossible to miss. VALIDATOR_PRIVATE_KEYS (plural, deprecated) still
+    satisfies the check — the order-consensus path can derive the leader key
+    from it. Break-glass: CONSENSUS_KEY_FAIL_FAST=0 restores warn-only.
+    """
+    if consensus_mode != "real":
+        return
+    if os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip():
+        return
+    if os.environ.get("VALIDATOR_PRIVATE_KEYS", "").strip():
+        return
+    msg = (
+        "CONSENSUS_MODE=real but VALIDATOR_PRIVATE_KEY is empty/unset — "
+        "order + champion consensus cannot sign and round certification "
+        "would be silently disabled. If this node was started via docker "
+        "compose, check that the keys env-file was passed "
+        "(--env-file .env.keys)."
+    )
+    if (os.environ.get("CONSENSUS_KEY_FAIL_FAST", "1").strip() or "1") != "0":
+        raise RuntimeError(msg)
+    logger.error("%s (CONSENSUS_KEY_FAIL_FAST=0 — continuing degraded)", msg)
+
+
 # ── initialization ───────────────────────────────────────────────────────────
 
 
@@ -997,6 +1030,20 @@ async def initialize(ctx: ServerContext) -> dict:
         await ensure_read_proxy_container()
     except Exception as exc:
         logger.error("[read-proxy] manager raised (continuing startup): %s", exc)
+
+    # ── stranded screening resume ────────────────────────────────────────
+    # The screening pipeline runs as a background task spawned once at
+    # submission time; a restart kills it and nothing re-starts it, parking
+    # the submission in QUEUED/SCREENING_* forever — the round then busy-spins
+    # in `replaying` with benchmarked=0 while miners see "scoring…". Re-kick
+    # any recent strandings (no-op on nodes with none, e.g. followers).
+    try:
+        from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+            resume_stranded_screenings,
+        )
+        await resume_stranded_screenings()
+    except Exception as exc:
+        logger.error("[screening] boot resume failed (continuing startup): %s", exc)
 
     # ── benchmark worker ─────────────────────────────────────────────────
     # ALWAYS wire the submission store: the EpochManager needs it to ACTIVATE a certified
@@ -1480,6 +1527,7 @@ async def initialize(ctx: ServerContext) -> dict:
         consensus_mode = os.environ.get("CONSENSUS_MODE", "local").strip().lower()
         validator_keys_env = os.environ.get("VALIDATOR_PRIVATE_KEYS", "")
         validator_addrs_env = os.environ.get("VALIDATOR_ADDRESSES", "")
+        _require_real_consensus_signing_key(consensus_mode)
         # Bootstrap when either env is set. ``VALIDATOR_ADDRESSES`` is the
         # preferred public-only shape for real consensus mode; the older
         # ``VALIDATOR_PRIVATE_KEYS`` is kept for local-testnet (where the
@@ -2575,6 +2623,28 @@ async def initialize(ctx: ServerContext) -> dict:
                 if _round_open_elapsed(current) < solver_round_open_seconds:
                     return False
 
+                # Rotation slate (leader-local fairness): pick which of the round's
+                # submissions get benched — miners benched longest ago first, NOT
+                # first-come — and reject the overflow with a resubmit reason.
+                # Runs BEFORE the close snapshot + decision-window autoscale so
+                # followers mirror the post-rotation set and the window scales with
+                # the real slate. Best-effort: must never block the close.
+                try:
+                    _rot = submissions.apply_round_rotation(current.round_id)
+                    if _rot.get("applied") and _rot.get("skipped"):
+                        logger.info(
+                            "Rotation slate for %s: %d candidates, %d slots — "
+                            "selected=%s skipped=%s",
+                            current.round_id, _rot.get("candidates"),
+                            _rot.get("slots"), _rot.get("selected"),
+                            _rot.get("skipped"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "rotation slate failed for %s (ignored — closing with all "
+                        "submissions)", current.round_id, exc_info=True,
+                    )
+
                 validators = _solver_round_validator_set()
                 manager = submissions.get_champion_consensus_manager()
                 if manager is not None and validators:
@@ -2608,7 +2678,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
                 # it (keep ACTIVATION_DELAY >= the effective decision window).
                 try:
-                    _n_subs = len(submissions.get_store().list_by_round(current.round_id))
+                    # Count only the surviving slate: rotation (and screening)
+                    # rejects don't get benched, so they must not inflate the
+                    # decision window.
+                    _n_subs = len([
+                        s for s in submissions.get_store().list_by_round(current.round_id)
+                        if str(getattr(getattr(s, "status", None), "value", "") or getattr(s, "status", "")) != "rejected"
+                    ])
                 except Exception:
                     _n_subs = 0
                 _decision_window = submissions.autoscaled_decision_window(
@@ -2831,6 +2907,14 @@ async def initialize(ctx: ServerContext) -> dict:
                                         _abort_sync_payload(processed_round),
                                         label="abort",
                                     )
+                            # A DEFERRED evaluation (in-flight submissions still scoring)
+                            # leaves the round REPLAYING and evaluate_round a no-op. Sleep
+                            # before re-evaluating so we don't busy-spin at full CPU — which
+                            # STARVES the benchmark worker that scores those submissions,
+                            # self-perpetuating the loop and pinning the api unhealthy with
+                            # no champion ever selected (incident 2026-07-02).
+                            if summary.get("status_after") == RoundStatus.REPLAYING.value:
+                                await asyncio.sleep(solver_round_poll_interval)
                             continue
 
                         if current is not None and await _maybe_certify_round(current):

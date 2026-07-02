@@ -1,10 +1,11 @@
-"""Production Stage-2 corpus from chain (plan Phase 5b).
+"""Production historical-order corpus from chain (plan Phase 5b).
 
-A freshly-promoted leader has no local order history, so Stage 2 (~60% of the
-champion score) collapses. This rebuilds the filled-order corpus from the generic
-``IntentExecuted`` event + ``executeIntent`` calldata (any app) — no contract
-changes — so Stage 2 is reproducible without a synced local store. Gated by
-``BENCHMARK_CHAIN_CORPUS`` (default off = today's app_store.list_orders path).
+A freshly-promoted leader has no local order history, so the historical-order
+portion of the benchmark (a large share of the per-order comparison) collapses.
+This rebuilds the filled-order corpus from the generic ``IntentExecuted`` event +
+``executeIntent`` calldata (any app) — no contract changes — so the historical draw
+is reproducible without a synced local store. Gated by ``BENCHMARK_CHAIN_CORPUS``
+(default off = today's app_store.list_orders path).
 
 Reuses the chain-reading primitives proven live in
 ``scoring_lab/order_recovery.py`` and the AppRegistry/RPC resolution in

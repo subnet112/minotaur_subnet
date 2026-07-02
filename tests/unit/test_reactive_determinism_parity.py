@@ -86,7 +86,7 @@ async def _run_reactive(captured: dict):
         ),
     ):
         return await _reactive_benchmark_candidate(
-            candidate=_candidate(), leader_score=0.5, round_id="round-pin",
+            candidate=_candidate(), round_id="round-pin",
         )
 
 

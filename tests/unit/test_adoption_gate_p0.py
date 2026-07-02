@@ -49,8 +49,7 @@ def _mgr(champ_per_intent) -> EpochManager:
     """Bare manager whose stored champion submission carries ``champ_per_intent``
     (the freshly re-benched per-order RAW outputs the relative rule joins against)."""
     mgr = EpochManager.__new__(EpochManager)
-    mgr._champion = types.SimpleNamespace(submission_id="champ", benchmark_score=0.6)
-    mgr._dethrone_margin = 0.005
+    mgr._champion = types.SimpleNamespace(submission_id="champ")
     mgr._incumbent_refresh_failed = False
     champ_sub = types.SimpleNamespace(
         submission_id="champ",
@@ -64,10 +63,9 @@ def _mgr(champ_per_intent) -> EpochManager:
     return mgr
 
 
-def _challenger(chal_per_intent, score: float = 0.7):
+def _challenger(chal_per_intent):
     return types.SimpleNamespace(
         submission_id="chal",
-        benchmark_score=score,
         benchmark_details={"per_intent": chal_per_intent},
     )
 

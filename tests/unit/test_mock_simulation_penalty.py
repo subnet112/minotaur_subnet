@@ -1,21 +1,31 @@
-"""Mock-simulation anti-gaming penalty in score aggregation.
+"""Mock-simulation anti-gaming tracking in the benchmark scorecard.
 
-When a benchmark scenario can't run a real Anvil simulation it may fall back to
-a FABRICATED mock (see test_benchmark_fail_closed.py for where the flag is set).
-Those results are tagged ``BenchmarkResult.mock_simulation = True``. A solver
-must NOT be able to inflate its benchmark score by producing fabricated passes:
-``_compute_stage_score`` (and therefore ``_compute_avg_score``) must EXCLUDE
-mock-flagged results from the numerator while STILL counting them in the
-denominator — so a mock result dilutes the average rather than boosting it.
+When a benchmark scenario can't run a real Anvil simulation it may fall back to a
+FABRICATED mock (see test_benchmark_fail_closed.py for where the flag is set).
+Those results are tagged ``BenchmarkResult.mock_simulation = True``.
+
+The scalar two-stage score composite that once *diluted* a solver's average with
+mock results (``_compute_avg_score`` / ``_compute_stage_score``, weighting a
+synthetic Stage 1 at 0.4 and a historical Stage 2 at 0.6) was removed in the
+single-stage / relative-scoring cutover. Adoption now compares per-order RAW
+delivered output (``relative_scoring.evaluate_relative_adoption``) and mock
+fabrication is prevented AT THE SOURCE by the fail-closed ``require_real_sim``
+switch (exercised by test_benchmark_fail_closed.py) — it is no longer diluted after
+the fact inside a scalar average.
+
+What survives — and what this file now pins — is the DIAGNOSTIC tracking that keeps
+fabricated passes VISIBLE so they can never be silently credited as real value:
+``BenchmarkWorker._build_scorecard`` counts every mock result in the denominator
+(``total``) and flags it separately via ``mock_simulation_count`` /
+``mock_simulation_ratio``. A mock result is never dropped from the denominator, an
+all-real run reports a 0.0 ratio, and an all-mock run is reported as fully (ratio
+1.0) fabricated.
 
 Grounded in:
-  * minotaur_subnet/harness/orchestrator.py:127  (BenchmarkResult dataclass)
-  * minotaur_subnet/harness/benchmark_worker.py:1469 (_compute_avg_score)
-  * minotaur_subnet/harness/benchmark_worker.py:1496 (_compute_stage_score:
-      skips ``r.score <= 0`` and ``r.mock_simulation`` in the numerator but
-      divides by ``len(stage_results)``)
-  * minotaur_subnet/harness/benchmark_worker.py:68 (_result_stage: 'historical'
-      when intent_id contains ':hist:' / 'hist:ord_' / ends with ':hist')
+  * minotaur_subnet/harness/orchestrator.py       (BenchmarkResult.mock_simulation)
+  * minotaur_subnet/harness/benchmark_worker.py:_build_scorecard
+      (mock_simulation_count; every result — mock included — counts in ``total``)
+  * minotaur_subnet/harness/benchmark_worker.py:BenchmarkScorecard.mock_simulation_ratio
 """
 from __future__ import annotations
 
@@ -26,8 +36,9 @@ from minotaur_subnet.harness.orchestrator import BenchmarkResult
 
 
 def _worker() -> BenchmarkWorker:
-    # The real ctor wires up stores/clients/config; we only exercise the pure
-    # aggregation helpers, so build a bare instance via __new__.
+    # We only exercise the pure ``_build_scorecard`` aggregation helper (it reads
+    # its ``results`` arg and no instance state), so build a bare instance via
+    # __new__ — the real ctor wires up stores/clients/config we don't need here.
     return BenchmarkWorker.__new__(BenchmarkWorker)
 
 
@@ -39,84 +50,63 @@ def _mock(intent_id: str, score: float) -> BenchmarkResult:
     return BenchmarkResult(intent_id=intent_id, score=score, mock_simulation=True)
 
 
-# ── single-stage (synthetic only) bootstrap path ───────────────────────────────
+def test_mock_result_counts_in_denominator_and_is_flagged():
+    """A mock result stays in the denominator (``total``) AND is flagged.
 
-
-def test_mock_result_excluded_from_numerator_but_counts_in_denominator():
-    """A mock pass contributes 0 to the sum but 1 to the count: it dilutes."""
+    The retired scalar composite excluded the mock from the numerator while keeping
+    it in the denominator so a fabricated pass *diluted* the average rather than
+    boosting it. The numerator is gone, but the load-bearing half of that invariant
+    lives on: a mock is counted-but-flagged, never silently dropped so as to make a
+    partial-coverage run look complete.
+    """
     w = _worker()
-    # One genuine 0.8 pass + one fabricated "1.0" pass. With no historical
-    # scenarios, _compute_avg_score falls through to pure Stage 1.
-    results = [_real("dex:s1", 0.8), _mock("dex:s2", 1.0)]
-    avg = w._compute_avg_score(results)
-    # Numerator = 0.8 (mock skipped); denominator = 2 (mock still counted).
-    assert avg == pytest.approx(0.4)
+    card = w._build_scorecard([_real("dex:s1", 0.8), _mock("dex:s2", 1.0)])
+    assert card.total == 2                    # mock still counted in the denominator
+    assert card.mock_simulation_count == 1    # ...but flagged, not credited as real
+    assert card.mock_simulation_ratio == pytest.approx(0.5)
 
 
-def test_mock_cannot_outscore_an_all_real_solver():
-    """Anti-gaming: faking the failing scenarios must never beat real passes."""
+def test_mock_run_is_flagged_where_an_all_real_run_is_clean():
+    """Anti-gaming: fabricating a failing scenario can't masquerade as an all-real run.
+
+    With the scalar score gone a fabricated pass can no longer inflate an average —
+    and, just as importantly, it cannot hide: the gamer's scorecard carries a
+    nonzero ``mock_simulation_ratio`` while the honest all-real solver's is 0.0, so a
+    downstream gate can always tell the fabrication apart from genuine delivery.
+    """
     w = _worker()
     honest = [_real("dex:s1", 0.9), _real("dex:s2", 0.0)]   # handled 1/2 for real
     gamer = [_real("dex:s1", 0.9), _mock("dex:s2", 1.0)]    # faked the second
-    honest_avg = w._compute_avg_score(honest)
-    gamer_avg = w._compute_avg_score(gamer)
-    # The fabricated 1.0 is zeroed, so the gamer scores no higher than honest.
-    assert gamer_avg <= honest_avg
-    assert gamer_avg == pytest.approx(0.45)
-    assert honest_avg == pytest.approx(0.45)
+    honest_card = w._build_scorecard(honest)
+    gamer_card = w._build_scorecard(gamer)
+    assert honest_card.mock_simulation_count == 0
+    assert honest_card.mock_simulation_ratio == pytest.approx(0.0)
+    assert gamer_card.mock_simulation_count == 1
+    assert gamer_card.mock_simulation_ratio > honest_card.mock_simulation_ratio
 
 
-def test_all_mock_results_yield_zero_average():
-    """A solver that fabricated EVERY scenario scores 0, not its claimed scores."""
+def test_all_mock_run_is_fully_flagged():
+    """A solver that fabricated EVERY scenario is reported as 100% mock, not clean."""
     w = _worker()
     results = [_mock("dex:s1", 1.0), _mock("dex:s2", 0.95), _mock("dex:s3", 1.0)]
-    assert w._compute_avg_score(results) == pytest.approx(0.0)
+    card = w._build_scorecard(results)
+    assert card.total == 3
+    assert card.mock_simulation_count == 3
+    assert card.mock_simulation_ratio == pytest.approx(1.0)
 
 
-def test_no_mock_results_matches_plain_average():
-    """Sanity: with zero mocks the average is the ordinary score mean."""
+def test_no_mock_run_is_reported_clean():
+    """Sanity: with zero mocks the scorecard reports a 0.0 mock ratio."""
     w = _worker()
-    results = [_real("dex:s1", 0.6), _real("dex:s2", 0.4)]
-    assert w._compute_avg_score(results) == pytest.approx(0.5)
+    card = w._build_scorecard([_real("dex:s1", 0.6), _real("dex:s2", 0.4)])
+    assert card.total == 2
+    assert card.mock_simulation_count == 0
+    assert card.mock_simulation_ratio == pytest.approx(0.0)
 
 
-# ── two-stage (synthetic 40% + historical 60%) composite path ──────────────────
-
-
-def test_mock_penalty_applies_within_each_weighted_stage():
-    """Mock dilution holds independently in the 0.4*S1 + 0.6*S2 composite."""
+def test_empty_results_scorecard_is_empty():
     w = _worker()
-    results = [
-        # Stage 1 (synthetic): one real 0.8, one fabricated 1.0 -> 0.8/2 = 0.4
-        _real("dex:syn1", 0.8),
-        _mock("dex:syn2", 1.0),
-        # Stage 2 (historical): one real 0.6, one fabricated 1.0 -> 0.6/2 = 0.3
-        _real("dex:hist:ord_aaa", 0.6),
-        _mock("dex:hist:ord_bbb", 1.0),
-    ]
-    avg = w._compute_avg_score(results)
-    # 0.4 * 0.4 + 0.6 * 0.3 = 0.16 + 0.18 = 0.34
-    assert avg == pytest.approx(0.34)
-
-
-def test_historical_stage_mock_does_not_leak_into_score():
-    """A fabricated historical pass must not lift the 60%-weighted stage."""
-    w = _worker()
-    clean = [
-        _real("dex:syn1", 0.5),
-        _real("dex:hist:ord_aaa", 0.6),
-    ]
-    gamed = [
-        _real("dex:syn1", 0.5),
-        _real("dex:hist:ord_aaa", 0.6),
-        _mock("dex:hist:ord_bbb", 1.0),  # fabricated extra historical pass
-    ]
-    clean_avg = w._compute_avg_score(clean)
-    gamed_avg = w._compute_avg_score(gamed)
-    # The fabricated historical result can only dilute the historical stage.
-    assert gamed_avg < clean_avg
-
-
-def test_empty_results_is_zero():
-    w = _worker()
-    assert w._compute_avg_score([]) == pytest.approx(0.0)
+    card = w._build_scorecard([])
+    assert card.total == 0
+    assert card.mock_simulation_count == 0
+    assert card.mock_simulation_ratio == pytest.approx(0.0)

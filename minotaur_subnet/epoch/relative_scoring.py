@@ -382,6 +382,20 @@ def has_raw_output_rows(rows: list[Any] | None) -> bool:
     return any(_raw_output(r) is not None for r in rows or [])
 
 
+def has_delivered_value_rows(rows: list[Any] | None) -> bool:
+    """True when at least one per-order row DELIVERED value (parsed raw output > 0).
+
+    The fleet-uniform VALIDITY GATE that replaced the retired scalar
+    ``benchmark_score > 0`` check: a submission is valid iff it delivered a usable
+    output on >= 1 order. Stricter than :func:`has_raw_output_rows` (which passes a
+    solver that emitted only ``"0"`` rows) — a zero-delivery solver is REJECTED, not
+    merely scored 0. Every gate site (worker, manager, follower) imports THIS one
+    definition so leader/follower parity is guaranteed by construction. Accepts the
+    legacy ``shadow_score`` key via :func:`_raw_output`.
+    """
+    return any(_has_value(_raw_output(r)) for r in rows or [])
+
+
 def relative_reason(
     counts: dict[str, Any] | None,
     *,

@@ -18,8 +18,11 @@ import tally_independent_votes as T  # noqa: E402
 def _p(url, role, vote, cand="cand_1"):
     return {
         "url": url, "ok": True,
+        # NEW independent_vote shape: relative better/worse/matched/compared
+        # counts replaced the retired scalar chal_score/champ_score aggregates.
         "vote": {"candidate_id": cand, "role": role, "vote": vote,
-                 "chal_score": 0.9, "champ_score": 0.8, "reason": "x"},
+                 "better": 3, "worse": 1, "matched": 2, "compared": 6,
+                 "reason": "x"},
     }
 
 
