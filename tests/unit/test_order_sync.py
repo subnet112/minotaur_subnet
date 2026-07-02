@@ -35,8 +35,58 @@ def test_follower_pulls_and_upserts():
     # upserted both (including the rejected one — the #228 point)
     saved = [c.args[0]["order_id"] for c in store.save_order.call_args_list]
     assert saved == ["a", "b"]
-    # hit the leader's PUBLIC order book (no auth — anyone can read it)
-    assert cap["url"] == "http://leader:8080/v1/orders"
+    # hit the leader's PUBLIC order book (no auth — anyone can read it),
+    # asking for FULL records (the list view defaults to a slim summary)
+    assert cap["url"] == "http://leader:8080/v1/orders?full=1&limit=500&offset=0"
+
+
+def test_paginates_until_short_page():
+    # 600 orders on a paginating leader: two fetches (500 + 100), all upserted.
+    store = MagicMock()
+    pages = {
+        0: [{"order_id": f"a{i}"} for i in range(500)],
+        500: [{"order_id": f"b{i}"} for i in range(100)],
+    }
+    urls = []
+
+    async def fake_get(url):
+        urls.append(url)
+        return pages.get(int(url.rsplit("offset=", 1)[1]), [])
+
+    s = OrderSync(
+        app_store=store,
+        leader_api_url=lambda: "http://leader:8080",
+        is_follower=lambda: True,
+        http_get=fake_get,
+    )
+    assert _run(s.sync_once()) == 600
+    assert len(urls) == 2
+    assert "offset=0" in urls[0] and "offset=500" in urls[1]
+    assert all("full=1" in u for u in urls)
+
+
+def test_pre_pagination_leader_terminates():
+    # A leader that predates pagination ignores limit/offset and returns the
+    # SAME full set on every fetch. The seen-set dedupes it and the loop stops
+    # on the first fetch that yields nothing new — no infinite loop, no
+    # duplicate upserts. 502 > page size, so the loop does attempt a 2nd page.
+    store = MagicMock()
+    full = [{"order_id": f"o{i}"} for i in range(502)]
+    calls = []
+
+    async def fake_get(url):
+        calls.append(url)
+        return list(full)
+
+    s = OrderSync(
+        app_store=store,
+        leader_api_url=lambda: "http://leader:8080",
+        is_follower=lambda: True,
+        http_get=fake_get,
+    )
+    assert _run(s.sync_once()) == 502
+    assert len(calls) == 2  # second fetch returned nothing new → stop
+    assert store.save_order.call_count == 502
 
 
 def test_leader_does_not_sync():
