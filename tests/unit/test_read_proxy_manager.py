@@ -309,3 +309,42 @@ def test_launch_path_self_heals_missing_network(monkeypatch):
     # ordering: the create must precede the proxy run
     order = [c for c in fake.calls if c[:2] == ("network", "create") or (c and c[0] == "run")]
     assert order[0][:2] == ("network", "create") and order[1][0] == "run"
+
+
+def test_self_container_id_prefers_mountinfo_over_stale_hostname(monkeypatch, tmp_path):
+    # Watchtower clones bake the OLD container id in as the hostname; the real
+    # id must come from the kernel (mountinfo), never gethostname().
+    real_id = "a" * 64
+    mi = tmp_path / "mountinfo"
+    mi.write_text(
+        f"1510 1373 8:2 /var/lib/docker/containers/{real_id}/hostname "
+        "/etc/hostname rw,relatime - ext4 /dev/sda2 rw\n"
+    )
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(mi))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    monkeypatch.setattr(rpm.socket, "gethostname", lambda: "562d8cace782")  # stale
+    assert rpm._self_container_id() == real_id
+
+
+def test_self_container_id_falls_back_to_hostname(monkeypatch, tmp_path):
+    # Non-container dev runs: no docker paths anywhere -> hostname fallback.
+    plain = tmp_path / "mountinfo"
+    plain.write_text("29 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n")
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(plain))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    monkeypatch.setattr(rpm.socket, "gethostname", lambda: "devbox")
+    assert rpm._self_container_id() == "devbox"
+
+
+def test_resolve_self_uses_real_container_id(monkeypatch, tmp_path):
+    # The docker calls must be keyed by the mountinfo id, not the stale hostname.
+    real_id = "b" * 64
+    mi = tmp_path / "mountinfo"
+    mi.write_text(f"1510 1373 8:2 /x/docker/containers/{real_id}/hostname /etc/hostname rw\n")
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(mi))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    fake = FakeDocker([(0, "sha256:img|production_minotaur ", "")])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    image, net = asyncio.run(rpm._resolve_self_image_and_net())
+    assert image == "sha256:img" and net == "production_minotaur"
+    assert fake.calls[0][1] == real_id  # inspect <real id>, not gethostname()

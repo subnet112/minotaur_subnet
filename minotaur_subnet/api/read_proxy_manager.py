@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 
 logger = logging.getLogger(__name__)
@@ -139,14 +140,52 @@ async def _proxy_state() -> tuple[bool, str, dict[str, str] | None]:
     return (rc == 0 and PROXY_CONTAINER_NAME in names.split()), "", None
 
 
+# Where the api's REAL container id is read from (module constants for tests).
+_MOUNTINFO_PATH = "/proc/self/mountinfo"
+_CGROUP_PATH = "/proc/self/cgroup"
+_CONTAINER_ID_RE = re.compile(r"([0-9a-f]{64})")
+
+
+def _self_container_id() -> str:
+    """The api container's REAL id — do NOT trust the hostname for this.
+
+    Watchtower recreates containers by CLONING the old container's config,
+    which bakes the OLD container's id in as an explicit ``Hostname``. After
+    any watchtower update, ``socket.gethostname()`` therefore names a DEAD
+    container: self-inspect 403/404s, ``ps --filter id=`` matches nothing, and
+    the manager can never resolve its own image again (observed live
+    2026-07-02 — every ensure attempt, including #492's background retries,
+    stayed "uncomparable" and a stale proxy persisted). Compose-driven
+    recreates get a fresh id-hostname, which is why this only bites after
+    watchtower updates.
+
+    The kernel knows the truth: the container's /etc/hostname bind mount in
+    ``/proc/self/mountinfo`` (and, on cgroup-v1 hosts, ``/proc/self/cgroup``)
+    carries the real 64-hex id. Fall back to the hostname only when neither
+    yields one (non-container dev runs).
+    """
+    for path in (_MOUNTINFO_PATH, _CGROUP_PATH):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    m = _CONTAINER_ID_RE.search(line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            continue
+    return socket.gethostname()
+
+
 async def _resolve_self_image_and_net() -> tuple[str, str | None]:
     """The api's own image + its minotaur/validator network (to launch the proxy from the
     same image, attached to the same egress net).
 
-    Tries the precise ``docker inspect self``; falls back to ``docker ps`` where the
-    socket-proxy denies inspect-by-id (403). Returns ("", None) if both fail.
+    Identifies itself by the REAL container id (see :func:`_self_container_id`),
+    then tries the precise ``docker inspect self``; falls back to ``docker ps``
+    where the socket-proxy denies inspect-by-id (403). Returns ("", None) if
+    both fail.
     """
-    host = socket.gethostname()
+    host = _self_container_id()
     sandbox = os.environ.get("BENCHMARK_DOCKER_NETWORK", "benchmark-sandbox").strip()
     rc, info, _ = await _docker(
         "inspect", host,
