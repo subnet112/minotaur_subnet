@@ -465,7 +465,8 @@ class EpochManager:
         # Rank by relative net-better vs the champion's STORED per-order rows
         # (deterministic on the shared store) — no incumbent re-bench is needed just to
         # pick the finalist; the incumbent is re-benched below only once we HAVE one.
-        finalist = self._find_champion(epoch, round_id=round_id)
+        candidates = self._find_champion_candidates(epoch, round_id=round_id)
+        finalist = candidates[0] if candidates else None
         if finalist is None:
             # DEFER (don't abort) while the round can still produce a candidate. Any
             # submission still in a non-terminal pre-score state can yet become SCORED —
@@ -506,31 +507,69 @@ class EpochManager:
         # best-effort — it must never affect the authoritative verdict below.
         self._persist_round_relative_counts(round_id)
 
-        # Record the leader's would-be vote (observability), then proceed on the
-        # PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced at the
-        # COMMIT boundary (activate_certified_round), NOT here — so under the freeze
-        # the round still broadcasts + collects a would-be quorum (observe-only)
-        # before the commit is blocked, letting the fleet's cross-host agreement be
-        # measured without ever adopting.
-        self._record_would_be_vote(finalist)
-        if not self._meets_adoption_criteria(finalist):
+        # FALL-THROUGH: walk the ranked candidates and finalize on the FIRST one
+        # the live verdict adopts. The rank (_eligible_candidates) is
+        # adoptable-first, but it grades against the champion's STORED rows —
+        # the authoritative verdict below grades against the FRESHLY re-benched
+        # bar, and the two can disagree (stale stored rows, scenario drift). A
+        # top candidate failing the fresh bar must not abort a round that holds
+        # a runner-up the fresh bar adopts.
+        #
+        # A stale incumbent bar aborts identically for EVERY candidate (the
+        # abstain is about the champion side), so don't walk past the top one.
+        if self._champion.submission_id and getattr(self, "_incumbent_refresh_failed", False):
+            candidates = candidates[:1]
+
+        finalist = None
+        rejections: list[tuple[Submission, str]] = []
+        for candidate in candidates:
+            # Record the leader's would-be vote (observability), then proceed on
+            # the PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced
+            # at the COMMIT boundary (activate_certified_round), NOT here — so
+            # under the freeze the round still broadcasts + collects a would-be
+            # quorum (observe-only) before the commit is blocked, letting the
+            # fleet's cross-host agreement be measured without ever adopting.
+            self._record_would_be_vote(candidate)
+            if self._meets_adoption_criteria(candidate):
+                finalist = candidate
+                break
             # Relative-rule reject reason (e.g. "reject: N regression(s)/drop(s)" /
             # "reject: no win (challenger only matched the champion)"), not the
             # obsolete saturated "dethrone_margin_not_met".
-            reject_reason = getattr(self, "_last_adopt_reason", None) or "did not beat the champion"
+            rejections.append((
+                candidate,
+                getattr(self, "_last_adopt_reason", None) or "did not beat the champion",
+            ))
+            logger.info(
+                "finalist fall-through: %s rejected (%s) — %d lower-ranked "
+                "candidate(s) left to evaluate",
+                candidate.submission_id, rejections[-1][1],
+                len(candidates) - len(rejections),
+            )
+
+        if finalist is None:
+            # Abort with the TOP-RANKED candidate's reason (the round's headline,
+            # same as the pre-fall-through behavior).
+            reject_reason = rejections[0][1] if rejections else "did not beat the champion"
             next_round = self._complete_round(
                 round_state,
                 epoch,
                 activated=False,
                 abort_reason=reject_reason,
             )
-            # Mirror the reject onto the challenger's PR (comment + close + GC).
-            self._notify_champion_rejected(finalist, reject_reason)
+            # Mirror each reject onto its challenger's PR (comment + close + GC).
+            for candidate, reason in rejections:
+                self._notify_champion_rejected(candidate, reason)
             result["status_after"] = RoundStatus.ABORTED.value
             result["abort_reason"] = reject_reason
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
+
+        # Candidates the finalist was promoted over still get their reject
+        # feedback (comment + close + GC) — they lost to the rule, not silently.
+        for candidate, reason in rejections:
+            self._notify_champion_rejected(candidate, reason)
 
         # Private and public finalists follow the SAME adoption path. A private
         # finalist was certified by the quorum against its image digest (followers
@@ -980,18 +1019,35 @@ class EpochManager:
             return False
 
     def _find_champion(self, epoch: int, *, round_id: str | None = None) -> Submission | None:
-        """Find the highest-scoring champion-eligible submission for the epoch.
+        """Find the highest-ranked champion-eligible submission for the epoch.
 
         Prefers current-epoch `SCORED` or `ADOPTED` submissions and falls back
         to recent epochs if none are available for the current one.
         """
+        candidates = self._find_champion_candidates(epoch, round_id=round_id)
+        return candidates[0] if candidates else None
+
+    def _find_champion_candidates(
+        self, epoch: int, *, round_id: str | None = None,
+    ) -> list[Submission]:
+        """ALL champion-eligible submissions, ranked best-first.
+
+        Same sourcing as :meth:`_find_champion` (round scope with the
+        no-incumbent all-scored fallback, else epoch scope with the recent-epoch
+        fallback) but returns the FULL ranked list so ``evaluate_round`` can fall
+        through to the runner-up when the top-ranked candidate fails the live
+        adoption verdict. The rank (``_eligible_candidates``) already orders
+        adoptable-first vs the champion's STORED rows; the walk covers the
+        residual skew between that stored-row rank and the authoritative verdict
+        against the FRESHLY re-benched champion bar.
+        """
         if not self._sub_store:
-            return None
+            return []
 
         if round_id is not None:
             round_candidates = self._eligible_candidates(self._sub_store.list_by_round(round_id))
             if round_candidates:
-                return round_candidates[0]
+                return round_candidates
             # No candidates for this round — if there's no incumbent champion,
             # consider ALL scored submissions. This handles the case where a
             # submission was eagerly benchmarked during an earlier round.
@@ -1004,12 +1060,12 @@ class EpochManager:
                         "No round %s candidates; using best scored submission: %s",
                         round_id, all_scored[0].submission_id,
                     )
-                    return all_scored[0]
-            return None
+                    return all_scored
+            return []
 
         epoch_candidates = self._eligible_candidates(self._sub_store.list_by_epoch(epoch))
         if epoch_candidates:
-            return epoch_candidates[0]
+            return epoch_candidates
 
         # Fall back: recent scored/adopted submissions from nearby epochs
         all_subs = []
@@ -1017,11 +1073,7 @@ class EpochManager:
         for e in range(max(0, epoch - 5), epoch + 1):
             all_subs.extend(self._sub_store.list_by_epoch(e))
 
-        fallback_candidates = self._eligible_candidates(all_subs)
-        if fallback_candidates:
-            return fallback_candidates[0]
-
-        return None
+        return self._eligible_candidates(all_subs)
 
     def _eligible_candidates(self, submissions: list[Submission]) -> list[Submission]:
         """Filter and rank champion-eligible submissions by relative NET-BETTER.

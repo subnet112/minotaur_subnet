@@ -781,6 +781,124 @@ class TestEpochManager:
         assert mgr.current_epoch == 4
         assert mgr.champion.submission_id is None
 
+    @staticmethod
+    def _fallthrough_fixture(fresh_champ_rows, *challengers):
+        """Closed round + adopted champion whose STORED rows (rank-time bar,
+        two orders at raw 1000000) differ from the FRESH re-bench rows the
+        verdict grades against — the skew the fall-through walk covers. Returns
+        (mgr, round, rejected) with _refresh_incumbent_score patched to write
+        ``fresh_champ_rows`` onto the champion's stored per_intent, exactly like
+        the real refresh persists the same-round re-bench."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=4)
+        round_store.close_current_round(
+            close_epoch=4, benchmark_pack_hash="pack-4",
+            committee_hash="committee-4", quorum_required=1,
+        )
+        champ = _make_submission(submission_id="sub_champ", epoch=1)
+        champ.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "1000000"},
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        for c in challengers:
+            c.round_id = current_round.round_id
+        store = _make_store_with_subs(champ, *challengers)
+
+        rejected = []
+        mgr = EpochManager(
+            benchmark_worker=_make_mock_benchmark_worker(),
+            submission_store=store,
+            round_store=round_store,
+            on_champion_rejected=lambda sub, reason: rejected.append(
+                (sub.submission_id, reason)
+            ),
+        )
+        mgr._champion = ChampionInfo(submission_id="sub_champ")
+
+        async def _fresh_rebench():
+            mgr._incumbent_refresh_failed = False
+            champ.benchmark_details = {"per_intent": fresh_champ_rows}
+
+        mgr._refresh_incumbent_score = _fresh_rebench
+        return mgr, current_round, rejected
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_falls_through_when_fresh_bar_rejects_top(self):
+        """The rank grades vs the champion's STORED rows; the verdict grades vs
+        the FRESH re-bench. When the fresh bar rejects the top-ranked candidate,
+        the round must fall through to a runner-up the fresh bar adopts instead
+        of aborting."""
+        # Rank-time bar: o1=1000000. Both candidates rank adoptable (net +1),
+        # tie-broken by image_id -> top first.
+        top = _make_submission(
+            submission_id="sub_top", epoch=4,
+            image_id="sha256:" + "a" * 64,
+        )
+        top.pr_number = 41
+        top.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "2000000"},  # win vs stored bar
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        runner = _make_submission(
+            submission_id="sub_runner", epoch=4,
+            image_id="sha256:" + "b" * 64,
+        )
+        runner.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "2500000"},  # win vs stored bar
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        # Fresh bar: o1=2000000 -> top only MATCHES (no win -> reject), runner
+        # still strictly wins -> adopt.
+        mgr, current_round, rejected = self._fallthrough_fixture(
+            [{"intent_id": "o1", "raw_output": "2000000"},
+             {"intent_id": "o2", "raw_output": "1000000"}],
+            top, runner,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        assert result["status_after"] == RoundStatus.CERTIFYING.value
+        assert result["finalist_submission_id"] == "sub_runner"
+        # The passed-over top candidate got its own reject feedback.
+        assert [r[0] for r in rejected] == ["sub_top"]
+        assert "matched" in rejected[0][1]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_aborts_with_top_reason_when_fresh_bar_rejects_all(self):
+        """When the fresh bar rejects every ranked candidate, the round aborts
+        with the TOP-RANKED candidate's reason (the pre-fall-through headline)
+        and every evaluated candidate gets its own reject feedback."""
+        top = _make_submission(
+            submission_id="sub_top", epoch=4,
+            image_id="sha256:" + "a" * 64,
+        )
+        top.pr_number = 41
+        top.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "1010000"},  # +1% vs stored bar: win
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        runner = _make_submission(
+            submission_id="sub_runner", epoch=4,
+            image_id="sha256:" + "b" * 64,
+        )
+        runner.pr_number = 42
+        runner.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "1000000"},  # matched vs stored bar
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        # Fresh bar: o1=2000000 -> top is cut ~50% (hard floor), runner too.
+        mgr, current_round, rejected = self._fallthrough_fixture(
+            [{"intent_id": "o1", "raw_output": "2000000"},
+             {"intent_id": "o2", "raw_output": "1000000"}],
+            top, runner,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        assert result["status_after"] == RoundStatus.ABORTED.value
+        assert "hard floor" in result["abort_reason"]  # top candidate's reason
+        assert {r[0] for r in rejected} == {"sub_top", "sub_runner"}
+
     @pytest.mark.asyncio
     async def test_evaluate_round_is_noop_on_follower(self):
         """A non-leader must NOT evaluate/transition a round — it follows the leader's
