@@ -135,3 +135,108 @@ def test_retire_requires_auth_then_executes(client):
     r = c.post("/v1/apps/app_x/deployments/8453/retire",
                headers={"X-Admin-Key": "test-admin-key"})
     assert r.status_code == 200 and "No deployment" in str(r.json())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Deploy auth: wallet-sig gate (exempt = free, non-exempt = fee-required),
+# admin-key still free — NO shared admin key needed for a self-serve owner.
+# ════════════════════════════════════════════════════════════════════════════
+def test_deploy_no_auth_is_403(client):
+    c, _ = client
+    r = c.post("/v1/apps/app_x/deploy?chain_id=8453", json={})
+    assert r.status_code == 403
+    assert "required" in r.json()["detail"].lower()
+
+
+def test_deploy_wallet_sig_nonexempt_is_fee_required(client, monkeypatch):
+    monkeypatch.delenv("DEPLOY_FEE_EXEMPT_ADDRESSES", raising=False)
+    c, _ = client
+    dl = _future(c)
+    ph = app_auth.params_hash_for(developer_auth.ACTION_DEPLOY, "app_x", 8453)
+    h = _headers(developer_auth.ACTION_DEPLOY, "app_x", ph, 1, dl)
+    r = c.post("/v1/apps/app_x/deploy?chain_id=8453", json={}, headers=h)
+    # OWNER is the app's deployer → REQUEST authorized (not 403). But a
+    # non-exempt deployer with no payment is refused by the #238 fee gate.
+    assert r.status_code == 200, r.text
+    assert r.json().get("deploy_fee_required") is True
+
+
+def test_deploy_wallet_sig_exempt_signer_passes_fee_gate(client, monkeypatch):
+    monkeypatch.setenv("DEPLOY_FEE_EXEMPT_ADDRESSES", OWNER.address.lower())
+    c, _ = client
+    dl = _future(c)
+    ph = app_auth.params_hash_for(developer_auth.ACTION_DEPLOY, "app_x", 8453)
+    h = _headers(developer_auth.ACTION_DEPLOY, "app_x", ph, 1, dl)
+    r = c.post("/v1/apps/app_x/deploy?chain_id=8453", json={}, headers=h)
+    # Exempt deployer → past BOTH auth and the fee gate, with no admin key.
+    assert r.status_code == 200, r.text
+    assert r.json().get("deploy_fee_required") is not True
+
+
+def test_deploy_wrong_params_hash_is_403(client, monkeypatch):
+    monkeypatch.setenv("DEPLOY_FEE_EXEMPT_ADDRESSES", OWNER.address.lower())
+    c, _ = client
+    dl = _future(c)
+    # Sign for chain 999 but request 8453 → the route's paramsHash differs →
+    # recovered signer ≠ OWNER → 403 (a captured sig can't be re-pointed).
+    ph = app_auth.params_hash_for(developer_auth.ACTION_DEPLOY, "app_x", 999)
+    h = _headers(developer_auth.ACTION_DEPLOY, "app_x", ph, 1, dl)
+    r = c.post("/v1/apps/app_x/deploy?chain_id=8453", json={}, headers=h)
+    assert r.status_code == 403
+
+
+def test_deploy_admin_key_still_free(client):
+    c, _ = client
+    r = c.post("/v1/apps/app_x/deploy?chain_id=8453", json={},
+               headers={"X-Admin-Key": "test-admin-key"})
+    assert r.status_code == 200, r.text
+    assert r.json().get("deploy_fee_required") is not True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Create auth: admin key OR a self-serve owner_signature (no shared secret).
+# ════════════════════════════════════════════════════════════════════════════
+_CJS = (
+    "const manifest = { intent_functions: [{ name: 'swap', params: [] }] };\n"
+    "function score() { return 1; }\n"
+    "module.exports = { score, manifest };\n"
+)
+_CSOL = "contract X {}"
+
+
+def _create_body(**kw):
+    b = dict(name="dex2", description="", supported_chains=[8453],
+             js_code=_CJS, solidity_code=_CSOL)
+    b.update(kw)
+    return b
+
+
+def test_create_no_auth_is_403(client):
+    c, _ = client
+    r = c.post("/v1/apps/", json=_create_body())
+    assert r.status_code == 403
+    d = r.json()["detail"].lower()
+    assert "owner_signature" in d or "admin" in d
+
+
+def test_create_admin_key_passes_gate(client):
+    c, _ = client
+    r = c.post("/v1/apps/", json=_create_body(),
+               headers={"X-Admin-Key": "test-admin-key"})
+    assert r.status_code == 200, r.text  # past the gate; create_app_intent runs
+
+
+def test_create_owner_signature_no_admin_binds_owner(client):
+    c, _ = client
+    dl = _future(c)
+    ph = app_auth.create_owner_binding_hash(_CJS.strip(), _CSOL.strip())
+    sig = developer_auth.sign_developer_auth(
+        OWNER.key.hex(), action=developer_auth.ACTION_CREATE_APP,
+        app_id="", params_hash=ph, nonce=0, deadline=dl,
+    )
+    r = c.post("/v1/apps/", json=_create_body(owner_signature=sig, owner_deadline=dl))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert "app_id" in out, out
+    # Ownership PROVEN by key + bound to the signer — no admin key used.
+    assert out.get("deployer", "").lower() == OWNER.address.lower()
