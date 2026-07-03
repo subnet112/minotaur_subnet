@@ -471,19 +471,44 @@ def _store():
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
-@router.post("/apps/", dependencies=[Depends(_require_admin)])
+@router.post("/apps/")
 def create_app(
     body: CreateAppRequest,
+    request: Request,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Create a new App Intent with developer-provided JS and Solidity code.
 
-    Requires X-Admin-Key header unless ``RELAYER_URL`` is unset AND
-    ``LOCAL_TESTNET=1`` (see ``_require_admin`` for the full matrix). The
-    on-chain AppRegistry gate is the final authority — even an
-    unauthenticated app record can't be routed against an unregistered
-    contract — but the admin gate prevents wasted relayer gas from
-    spurious deploy attempts.
+    Auth (either):
+      * ``X-Admin-Key`` (legacy operator path), OR
+      * a self-serve ``owner_signature`` — an EIP-712 ``create_app`` signature
+        over the app content. ``create_app_intent`` recovers the signer and
+        records THAT as the deployer (ownership PROVEN by key, not a shared
+        secret), so a browser frontend can create + own an app with just a
+        MetaMask signature. The non-admin path spawns a Forge/JS validation
+        pass, so it is per-IP rate-limited (``APP_CREATE_RATE_PER_MIN``,
+        default 5/min).
+
+    The on-chain AppRegistry gate is still the final authority — an
+    unregistered app can't be routed against — this gate only stops
+    anonymous callers from burning validation CPU.
     """
+    if not ctx.admin_ok and not (body.owner_signature or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "create requires an admin key (X-Admin-Key) OR an "
+                "owner_signature (self-serve: sign the app content to prove "
+                "and bind ownership). See app_auth.create_owner_binding_hash."
+            ),
+        )
+    if not ctx.admin_ok:
+        # Self-serve path: rate-limit the validation compile per IP.
+        try:
+            per_min = max(1, int(os.environ.get("APP_CREATE_RATE_PER_MIN", "5")))
+        except ValueError:
+            per_min = 5
+        _debug_rate_limit(request, per_minute=per_min)
     return _tools.create_app_intent(
         _store(),
         name=body.name,
@@ -527,30 +552,36 @@ async def validate_app(
     )
 
 
-@router.post("/apps/{app_id}/deploy", dependencies=[Depends(_require_admin)])
+@router.post("/apps/{app_id}/deploy")
 async def deploy_app(
     app_id: str,
     chain_id: int | None = None,
     body: DeployRequest | None = None,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
 
-    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
-    ``_require_admin``). Without this gate, an unauthenticated caller
-    could trigger the relayer to spend gas on attacker-defined Solidity;
-    the deployed contract still can't execute orders (AppRegistry gate
-    is GATED + allowlist) but the gas burn is real.
+    Auth model — deploy is authorized by ONE of:
+      * ``X-Admin-Key`` (legacy operator path) → free deploy;
+      * a wallet signature (action="deploy") from an allowed signer (the app's
+        own ``deployer`` ∪ ``APP_ADMIN_SIGNERS``). If that signer / the app's
+        deployer is on the fee-EXEMPT allowlist (``DEPLOY_FEE_EXEMPT_ADDRESSES``)
+        the deploy is free; otherwise it is refused with ``deploy_fee_required``
+        and must use the payment path;
+      * a payment body (``payment_signature`` + on-chain proof) → the
+        public/3rd-party PAY path, authorized by the deployer's EIP-712
+        ``pay_deploy_fee`` signature and the #238 fee gate (default-off until
+        collection is live).
 
-    With a payment body, the deploy is authorized via the deployer's EIP-712
-    pay_deploy_fee signature + on-chain payment proof instead of admin privilege
-    (the shape the public deploy API will use). It still can't succeed until
-    collection is live — the #238 gate and the (default-off) payment verifier
-    keep it closed — so the fee stays unbypassable.
+    So a browser frontend deploys with a MetaMask signature and NO shared admin
+    key: an admin EVM address deploys free, anyone else pays. The AppRegistry
+    gate (GATED + allowlist) remains the final authority for execution.
 
     Runs in a thread executor so the synchronous compile + deploy chain
     can call asyncio.run() without conflicting with the FastAPI event loop.
     """
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
     loop = asyncio.get_running_loop()
 
     payment = None
@@ -563,14 +594,28 @@ async def deploy_app(
             signature=body.payment_signature,
         )
 
-    # No payment claim → operator/admin deploy (is_admin=True, free, as today).
-    # Payment claim → public/3rd-party deploy: deploy_app_intent flips to
-    # is_admin=False and authorizes via the fee payment.
+    if payment is None:
+        # FREE path — authorize the REQUEST (admin key OR a wallet signature
+        # from an allowed signer) so anonymous callers can't burn relayer gas.
+        # deploy_app_intent then decides the OUTCOME: free for an admin key
+        # (is_admin) or a fee-exempt deployer, else DeploymentFeeRequired.
+        _authorize_or_403(
+            ctx, app_id, developer_auth.ACTION_DEPLOY,
+            app_auth.params_hash_for(developer_auth.ACTION_DEPLOY, app_id, chain_id),
+        )
+        is_admin = ctx.admin_ok
+    else:
+        # PAY path — the payment's on-chain proof + pay_deploy_fee signature
+        # (verified in deploy_app_intent) ARE the authorization.
+        is_admin = False
+
+    # No payment claim → free/exempt deploy (authorized above). Payment claim →
+    # public/3rd-party deploy authorized via the fee payment.
     return await loop.run_in_executor(
         None,
         lambda: _tools.deploy_app_intent(
             _store(), app_id, chain_id=chain_id,
-            is_admin=(payment is None),
+            is_admin=is_admin,
             payment=payment,
         ),
     )
