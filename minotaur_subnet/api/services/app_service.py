@@ -346,7 +346,19 @@ def deploy_app_intent(
             }
 
         store.save_deployment(result)
-        return asdict(result)
+        out = asdict(result)
+        # Post-deploy AppRegistry registration (best-effort, never fatal):
+        # without it the app is constructed with the registry address and
+        # _requireRegistered() reverts every order until someone registers.
+        # The relayer key is the registry owner today, so revoke/allowlist/
+        # register can all be automated; AUTO_REGISTER_APPS=0 disables.
+        if result.contract_address and not result.error:
+            from .app_lifecycle import auto_register_deployment
+
+            out["registry"] = auto_register_deployment(
+                store, app_id, chain_id, result.contract_address,
+            )
+        return out
 
     # ── No relayer configured ────────────────────────────────────────────
     return {

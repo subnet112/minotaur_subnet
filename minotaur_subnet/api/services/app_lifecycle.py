@@ -259,3 +259,118 @@ def registry_calldata(store: Any, app_id: str, chain_id: int) -> dict[str, Any]:
             "re-registering an appId that already points at an old contract."
         ),
     }
+
+
+# ── AppRegistry automation (relayer key IS the registry owner today) ─────
+
+
+def _registry_ctx(store: Any, app_id: str, chain_id: int):
+    """(definition, app_addr, relayer, registry, w3) or an error dict."""
+    from minotaur_subnet.api.services.app_admin import _registry_address
+    from minotaur_subnet.blockchain.chains import get_web3
+
+    definition = store.get_app(app_id)
+    if definition is None:
+        return {"error": f"App not found: {app_id}"}
+    relayer = _relayer()
+    if relayer is None:
+        return {"error": "No EVM relayer configured"}
+    registry = _registry_address(chain_id, relayer)
+    if not registry:
+        return {"error": f"No AppRegistry configured for chain {chain_id}"}
+    return definition, relayer, registry, get_web3(chain_id)
+
+
+def set_developer_allowed(
+    store: Any, app_id: str, chain_id: int, developer: str, allowed: bool = True,
+) -> dict[str, Any]:
+    """Owner-only AppRegistry.setDeveloperAllowed via the relayer key.
+
+    Works today because the relayer key IS the registry owner; if ownership
+    ever rotates to a cold key/multisig this returns the revert and the
+    frontend falls back to registry-calldata. Allowlisting the app's REAL
+    developer is what lets them registerApp/updateManifest themselves —
+    the registry-side counterpart of the appOwner float rights.
+    """
+    ctx = _registry_ctx(store, app_id, chain_id)
+    if isinstance(ctx, dict):
+        return ctx
+    _definition, relayer, registry, w3 = ctx
+    if not developer or not int(developer, 16):
+        return {"error": "developer address is required"}
+
+    from minotaur_subnet.api.services.app_admin import _call, _selector
+
+    probe = _call(w3, registry, _selector("allowedDevelopers(address)")
+                  + bytes.fromhex(developer[2:].lower().zfill(64)))
+    already = bool(probe) and bool(int.from_bytes(probe[:32], "big"))
+    if already == allowed:
+        return {"developer": developer, "allowed": allowed, "changed": False}
+    tx = _run_async(relayer.call_contract_function(
+        registry, chain_id, "setDeveloperAllowed(address,bool)",
+        ["address", "bool"], [developer, allowed], gas=100_000,
+    ))
+    return {"developer": developer, "allowed": allowed, "changed": True, "tx": tx}
+
+
+def auto_register_deployment(
+    store: Any, app_id: str, chain_id: int, contract_address: str,
+) -> dict[str, Any]:
+    """Best-effort post-deploy AppRegistry registration (never raises).
+
+    Sequence: skip if the contract is already mapped; revokeApp if OUR appId
+    (keccak(app_id)) points at an older contract (owner-only — same key);
+    self-allowlist the relayer wallet if the registry is GATED; registerApp.
+    The registrant (our relayer) becomes developer-of-record — for external
+    developers, allowlist them via set_developer_allowed and let them sign
+    registry-calldata instead.
+    """
+    import os as _os
+
+    if _os.environ.get("AUTO_REGISTER_APPS", "1").strip() in ("0", "false", "no"):
+        return {"registered": False, "skipped": "AUTO_REGISTER_APPS disabled"}
+    try:
+        ctx = _registry_ctx(store, app_id, chain_id)
+        if isinstance(ctx, dict):
+            return {"registered": False, **ctx}
+        definition, relayer, registry, w3 = ctx
+
+        from eth_hash.auto import keccak
+
+        from minotaur_subnet.api.services.app_admin import _call, _selector
+
+        addr_word = bytes(12) + bytes.fromhex(contract_address[2:].lower().zfill(40)[-40:])
+        mapped = _call(w3, registry, _selector("appByContract(address)") + addr_word)
+        if mapped and any(mapped[:32]):
+            return {"registered": True, "already": True,
+                    "registry_app_id": "0x" + mapped[:32].hex()}
+
+        app_id_b32 = keccak(app_id.encode())
+        txs: dict[str, str] = {}
+        rec = _call(w3, registry, _selector("apps(bytes32)") + app_id_b32)
+        if rec and len(rec) >= 128 and int.from_bytes(rec[96:128], "big") != 0:
+            # Our appId points at an OLD contract (redeploy) — owner revoke.
+            txs["revoke"] = _run_async(relayer.call_contract_function(
+                registry, chain_id, "revokeApp(bytes32)", ["bytes32"],
+                [app_id_b32], gas=120_000,
+            ))
+
+        mode = _call(w3, registry, _selector("mode()"))
+        if mode and int.from_bytes(mode[:32], "big") == 0:  # GATED
+            wallet = relayer._resolve_wallet(chain_id)
+            allow = set_developer_allowed(store, app_id, chain_id, wallet, True)
+            if allow.get("error"):
+                return {"registered": False, "error": f"allowlist failed: {allow['error']}", "txs": txs}
+            if allow.get("changed"):
+                txs["allowlist"] = allow["tx"]
+
+        manifest_hash = hashlib.sha256((definition.js_code or "").encode()).digest()
+        txs["register"] = _run_async(relayer.call_contract_function(
+            registry, chain_id, "registerApp(bytes32,bytes32,address)",
+            ["bytes32", "bytes32", "address"],
+            [app_id_b32, manifest_hash, contract_address], gas=200_000,
+        ))
+        return {"registered": True, "registry_app_id": "0x" + app_id_b32.hex(), "txs": txs}
+    except Exception as exc:  # never fail the deploy over registration
+        logger.warning("auto-register failed for %s chain %d: %s", app_id, chain_id, exc)
+        return {"registered": False, "error": str(exc)[:300]}

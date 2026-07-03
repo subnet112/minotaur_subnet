@@ -192,3 +192,117 @@ def test_registry_calldata_encodes_register_and_revoke(tmp_path):
     assert APP_ADDR[2:].lower() in out["register_calldata"]
     rev = bytes.fromhex(out["revoke_calldata"][2:])
     assert rev[:4] == keccak(b"revokeApp(bytes32)")[:4]
+
+
+# ── registry automation ──────────────────────────────────────────────────
+
+
+def _registry_env(tmp_path, views):
+    """store + deploy_service + fake w3 answering by selector prefix."""
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    relayer._resolve_wallet = MagicMock(return_value="0x" + "d4" * 20)
+    cfg = MagicMock(); cfg.app_registry_address = "0x" + "55" * 20
+    relayer.chains = {8453: cfg}
+    w3 = MagicMock()
+    def call(tx):
+        key = bytes.fromhex(tx["data"][2:])[:4]
+        if key in views:
+            return views[key]
+        raise Exception("execution reverted")
+    w3.eth.call.side_effect = call
+    return s, svc, relayer, w3
+
+
+def _k(sig):
+    from eth_hash.auto import keccak
+    return keccak(sig.encode())[:4]
+
+
+def test_auto_register_fresh_contract_allowlists_and_registers(tmp_path):
+    views = {
+        _k("appByContract(address)"): bytes(32),          # not mapped
+        _k("apps(bytes32)"): bytes(128),                  # appId free
+        _k("mode()"): (0).to_bytes(32, "big"),            # GATED
+        _k("allowedDevelopers(address)"): bytes(32),      # relayer NOT allowed yet
+    }
+    from minotaur_subnet.api.services.app_lifecycle import auto_register_deployment
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = auto_register_deployment(s, "app_x", 8453, APP_ADDR)
+
+    assert out["registered"] is True
+    sigs = [c.args[2] for c in relayer.call_contract_function.await_args_list]
+    assert sigs == ["setDeveloperAllowed(address,bool)",
+                    "registerApp(bytes32,bytes32,address)"]
+
+
+def test_auto_register_redeploy_revokes_old_mapping(tmp_path):
+    from eth_hash.auto import keccak
+    old_rec = bytes(32) + b"\xaa" * 32 + bytes(12) + b"\x99" * 20 + (7).to_bytes(32, "big")
+    views = {
+        _k("appByContract(address)"): bytes(32),
+        _k("apps(bytes32)"): old_rec,                     # appId → OLD contract
+        _k("mode()"): (1).to_bytes(32, "big"),            # OPEN → no allowlist step
+    }
+    from minotaur_subnet.api.services.app_lifecycle import auto_register_deployment
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = auto_register_deployment(s, "app_x", 8453, APP_ADDR)
+
+    assert out["registered"] is True
+    sigs = [c.args[2] for c in relayer.call_contract_function.await_args_list]
+    assert sigs == ["revokeApp(bytes32)", "registerApp(bytes32,bytes32,address)"]
+    assert relayer.call_contract_function.await_args_list[0].args[4] == [keccak(b"app_x")]
+
+
+def test_auto_register_skips_already_mapped(tmp_path):
+    views = {_k("appByContract(address)"): b"\x07" * 32}
+    from minotaur_subnet.api.services.app_lifecycle import auto_register_deployment
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = auto_register_deployment(s, "app_x", 8453, APP_ADDR)
+    assert out == {"registered": True, "already": True,
+                   "registry_app_id": "0x" + ("07" * 32)}
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_auto_register_env_kill_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTO_REGISTER_APPS", "0")
+    from minotaur_subnet.api.services.app_lifecycle import auto_register_deployment
+    out = auto_register_deployment(_store(tmp_path), "app_x", 8453, APP_ADDR)
+    assert out["registered"] is False and "disabled" in out["skipped"]
+
+
+def test_auto_register_never_raises(tmp_path):
+    from minotaur_subnet.api.services.app_lifecycle import auto_register_deployment
+    with patch("minotaur_subnet.api.services._state._deploy_service", None):
+        out = auto_register_deployment(_store(tmp_path), "app_x", 8453, APP_ADDR)
+    assert out["registered"] is False
+
+
+def test_set_developer_allowed_noop_when_already_set(tmp_path):
+    views = {_k("allowedDevelopers(address)"): (1).to_bytes(32, "big")}
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out == {"developer": "0x" + "63" * 20, "allowed": True, "changed": False}
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_set_developer_allowed_sends_owner_tx(tmp_path):
+    views = {_k("allowedDevelopers(address)"): bytes(32)}
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out["changed"] is True and out["tx"] == "0xtx"
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setDeveloperAllowed(address,bool)"
+    assert call.args[4] == ["0x" + "63" * 20, True]
