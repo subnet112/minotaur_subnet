@@ -219,6 +219,10 @@ def get_app_admin_state(store: Any, app_id: str) -> dict[str, Any]:
         "supported_chains": list(definition.config.supported_chains or []),
         # Empty contract_version = record predates the field = v1 base.
         "contract_version": definition.contract_version or "v1",
+        # Moderation gate: "" (legacy) presents as "approved". See
+        # app_registration.py. registration_meta carries note/reviewer if set.
+        "registration_status": definition.registration_status or "approved",
+        "registration_meta": (definition.policy_metadata or {}).get("registration"),
         "constructor_args": definition.constructor_args,
         "js_code": definition.js_code,
         "js_code_sha256": _sha256(definition.js_code),

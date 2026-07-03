@@ -199,6 +199,11 @@ def create_app_intent(
         manifest=extracted_manifest,
         constructor_args=ctor_args,
         contract_version=contract_version,
+        # New apps enter the moderation queue as "unrequested" — they deploy
+        # and are owned by the deployer, but stay out of the live routing set
+        # until an admin approves registration (app_registration.py). Legacy
+        # apps (field absent) are grandfathered as approved.
+        registration_status="unrequested",
     )
 
     store.save_app(definition)
@@ -347,17 +352,27 @@ def deploy_app_intent(
 
         store.save_deployment(result)
         out = asdict(result)
-        # Post-deploy AppRegistry registration (best-effort, never fatal):
-        # without it the app is constructed with the registry address and
-        # _requireRegistered() reverts every order until someone registers.
-        # The relayer key is the registry owner today, so revoke/allowlist/
-        # register can all be automated; AUTO_REGISTER_APPS=0 disables.
+        # Post-deploy AppRegistry registration (best-effort, never fatal).
+        # Gated by the moderation state: only APPROVED (or legacy "") apps
+        # auto-register — a new, unapproved app deploys but stays OUT of the
+        # live routing set (_requireRegistered reverts its orders) until an
+        # admin approves it (api/services/app_registration.py). This is the
+        # permissionless-deploy / gated-activation boundary.
         if result.contract_address and not result.error:
             from .app_lifecycle import auto_register_deployment
+            from .app_registration import registration_allows_autoregister
 
-            out["registry"] = auto_register_deployment(
-                store, app_id, chain_id, result.contract_address,
-            )
+            if registration_allows_autoregister(definition.registration_status):
+                out["registry"] = auto_register_deployment(
+                    store, app_id, chain_id, result.contract_address,
+                )
+            else:
+                out["registry"] = {
+                    "registered": False,
+                    "pending_approval": True,
+                    "registration_status": definition.registration_status,
+                    "note": "app not approved — request registration for admin review",
+                }
         return out
 
     # ── No relayer configured ────────────────────────────────────────────

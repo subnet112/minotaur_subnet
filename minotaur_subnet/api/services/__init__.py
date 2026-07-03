@@ -78,6 +78,12 @@ from .app_lifecycle import (  # noqa: F401
     set_developer_allowed,
     auto_register_deployment,
 )
+from .app_registration import (  # noqa: F401
+    request_registration,
+    approve_registration,
+    reject_registration,
+    registration_allows_autoregister,
+)
 
 # ── order / quote / approval ─────────────────────────────────────────────
 from .order_service import (  # noqa: F401
