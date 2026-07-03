@@ -269,22 +269,34 @@ def deploy_app_intent(
     from ._state import _deploy_service
     from minotaur_subnet.deployment.deploy_fee import (
         DeploymentFeeRequired,
+        is_deploy_fee_exempt,
         require_deployment_authorized,
     )
 
     if not app_id:
         return {"error": "app_id is required"}
 
-    # Hard gate (#238) for the no-payment case: admin deploys pass; a public
-    # deploy with no payment claim is refused here, BEFORE any store lookup, so
-    # an unauthorized public caller does zero work (and a bare store is fine).
+    # Load the app up front (tolerant of a bare store in the no-store-lookup
+    # unit tests) so the fee-exemption check can see the app's deployer.
+    try:
+        definition = store.get_app(app_id)
+    except Exception:
+        definition = None
+    fee_exempt = bool(definition) and is_deploy_fee_exempt(
+        getattr(definition, "deployer", ""),
+    )
+
+    # Hard gate (#238) for the no-payment case: admin deploys pass; so do
+    # deploys by a fee-exempt (whitelisted) deployer. A public deploy with no
+    # payment claim from a non-exempt deployer is refused here.
     if payment is None:
         try:
-            require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
+            require_deployment_authorized(
+                is_admin=is_admin, fee_paid=fee_paid, fee_exempt=fee_exempt,
+            )
         except DeploymentFeeRequired as exc:
             return {"error": str(exc), "deploy_fee_required": True}
 
-    definition = store.get_app(app_id)
     if definition is None:
         return {"error": f"App not found: {app_id}"}
 
@@ -310,10 +322,10 @@ def deploy_app_intent(
     if payment is not None:
         from minotaur_subnet.api.services.deploy_payment import verify_deploy_fee_payment
 
-        # Idempotent per app: if the one-time fee is already recorded, a
-        # supplied payment for a further chain is accepted without re-charging
-        # (and its nonce/ref left unspent).
-        if _app_deploy_fee_paid(definition):
+        # A fee-exempt deployer or an app whose one-time fee is already recorded
+        # (a further-chain deploy) is accepted without charging — the supplied
+        # payment's nonce/ref are left unspent.
+        if fee_exempt or _app_deploy_fee_paid(definition):
             pass
         else:
             ok, fee_err = verify_deploy_fee_payment(store, definition, payment=payment)
@@ -373,6 +385,7 @@ def deploy_app_intent(
 
         store.save_deployment(result)
         out = asdict(result)
+        out["fee_exempt"] = fee_exempt
         # Post-deploy AppRegistry registration (best-effort, never fatal).
         # Gated by the moderation state: only APPROVED (or legacy "") apps
         # auto-register — a new, unapproved app deploys but stays OUT of the

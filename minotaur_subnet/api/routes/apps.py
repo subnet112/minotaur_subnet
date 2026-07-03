@@ -579,7 +579,7 @@ def deploy_quote(app_id: str, chain_id: int | None = None) -> dict[str, Any]:
         raise HTTPException(
             status_code=400, detail="App has no supported_chains configured"
         )
-    quote = quote_deployment(chains)
+    quote = quote_deployment(chains, deployer=definition.deployer)
     quote["app_id"] = app_id
     return quote
 
