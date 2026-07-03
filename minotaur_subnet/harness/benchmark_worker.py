@@ -46,6 +46,7 @@ from minotaur_subnet.harness.orchestrator import (
     SolverTimeoutError,
     SolverCrashedError,
     run_benchmark,
+    benchmark_static_quote_enabled,
     REFERENCE_QUOTE_FAILED_SENTINEL,
     BENCHMARK_MIN_SLIPPAGE_BPS,
     build_rpc_url_map,
@@ -1683,7 +1684,15 @@ class BenchmarkWorker:
         component is unavailable (no round / no pin / no champion — dev paths),
         or the build produced an EMPTY result (champion session failed to start:
         transient, must retry next pass, never freeze for the round).
+
+        STATIC-quote mode (``BENCHMARK_STATIC_QUOTE=1``): the pre-pass is
+        skipped entirely — the enrichment injects a static zero quote instead
+        of anchoring on the champion's, so computing champion reference quotes
+        (~30 champion-session quotes/round) would be wasted work. Returns {}.
         """
+        if benchmark_static_quote_enabled():
+            return {}
+
         round_id = None
         if self._round_store is not None:
             current = self._round_store.get_current_round()

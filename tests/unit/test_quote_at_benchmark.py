@@ -329,3 +329,36 @@ def test_run_benchmark_fails_loud_without_rpc_when_real_sim_required(monkeypatch
 
     with pytest.raises(RealSimulationUnavailable):
         asyncio.run(_go())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BENCHMARK_STATIC_QUOTE flag — inject a static zero quote, skip quoting.
+# The score is the relative RAW output; scoreIntent gates its CoW fee on
+# quotedOutput>0, so 0 = no anchor/no fee, full output. Default OFF preserves
+# the champion-anchored behavior exactly (instant-revert switch).
+# ════════════════════════════════════════════════════════════════════════════
+def test_static_quote_flag_injects_zero_and_never_quotes(monkeypatch):
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "1")
+    # Provide BOTH a reference AND a self-quote — the flag must ignore both and
+    # inject a static zero, proving the benchmark no longer depends on quote().
+    session = _FakeSession(self_quote=QuoteResult(estimated_output="2000000"))
+    ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
+    results, sess, captured = _run(session, ref)
+
+    assert len(results) == 1
+    assert sess.quote_calls == 0, "static-quote flag must NOT call solver.quote()"
+    scored = sess.scored_states[0]
+    assert scored["quoted_output"] == "0"
+    assert scored["min_output_amount"] == "0"
+    # Order still built → 12-field ABI stays valid (0 present, not omitted).
+    assert captured["intent_order"] is not None
+
+
+def test_static_quote_flag_off_is_unchanged_reference_behavior(monkeypatch):
+    monkeypatch.delenv("BENCHMARK_STATIC_QUOTE", raising=False)  # default OFF
+    session = _FakeSession(self_quote=None)
+    ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
+    _results, sess, _ = _run(session, ref)
+    # Current champion-anchored path: reference wins, no self-quote — unchanged.
+    assert sess.quote_calls == 0
+    assert sess.scored_states[0]["quoted_output"] == "999"
