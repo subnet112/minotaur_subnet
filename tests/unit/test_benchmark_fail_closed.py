@@ -101,6 +101,10 @@ def test_sim_throw_scores_zero_when_required_no_mock(monkeypatch):
     # A real simulator IS injected; an RPC must be present so run_benchmark's RPC
     # precondition passes and we exercise the THROW path (not the no-RPC raise).
     monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
+    # SOLVER_READ_PROXY routes onto a deterministic-read path that raises before
+    # the throw path — clear any leak (an API-server TestClient in another test
+    # exports it via os.environ.setdefault) so this asserts the sim path it means to.
+    monkeypatch.delenv("SOLVER_READ_PROXY", raising=False)
     results, calls = _run(simulator=_ThrowingSimulator(), require_real_sim=True)
     assert len(results) == 1
     r = results[0]
@@ -115,6 +119,7 @@ def test_sim_revert_scores_zero_when_required(monkeypatch):
     # possibly-lenient scorer — closes the gap the adversarial review found.
     # RPC present so the precondition passes and we reach the revert path.
     monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
+    monkeypatch.delenv("SOLVER_READ_PROXY", raising=False)  # see sibling test
     results, calls = _run(simulator=_RevertingSimulator(), require_real_sim=True)
     r = results[0]
     assert r.score == 0.0
