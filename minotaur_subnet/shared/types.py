@@ -675,6 +675,13 @@ class AppIntentDefinition:
     # Stored, not probed: V2 still exposes appPaymaster(), so on-chain views
     # can't distinguish the generations. Empty = pre-field legacy record (v1).
     contract_version: str = ""
+    # Moderation gate for AppRegistry registration (permissionless deploy,
+    # gated activation): "" = legacy/grandfathered (treated as approved),
+    # "unrequested" (new app, not yet submitted), "requested" (awaiting admin
+    # review), "approved" (admin registered it into the live routing set),
+    # "rejected". Only approved/legacy apps auto-register on deploy. See
+    # api/services/app_registration.py.
+    registration_status: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

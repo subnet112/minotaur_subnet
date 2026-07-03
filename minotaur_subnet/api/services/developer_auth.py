@@ -63,6 +63,12 @@ ACTION_FLOAT_WITHDRAW: Final[str] = "float_withdraw"
 ACTION_SET_CONFIG: Final[str] = "set_app_config"
 ACTION_ALLOW_DEVELOPER: Final[str] = "allow_developer"
 ACTION_ADMIN_STATE: Final[str] = "admin_state"
+# Registration moderation (permissionless deploy, gated activation):
+# request is owner-signed; approve/reject are ADMIN-ONLY (signer must be in
+# APP_ADMIN_SIGNERS, never the app's own deployer). See app_registration.py.
+ACTION_REQUEST_REGISTRATION: Final[str] = "request_registration"
+ACTION_APPROVE_REGISTRATION: Final[str] = "approve_registration"
+ACTION_REJECT_REGISTRATION: Final[str] = "reject_registration"
 
 # Reject deadlines further out than this — caps how long a signed-but-unused
 # authorization can sit before replay, even though the nonce already makes it

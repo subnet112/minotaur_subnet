@@ -56,10 +56,16 @@ def admin_signers() -> list[str]:
     return [a.strip().lower() for a in raw.split(",") if a.strip()]
 
 
-def allowed_signers(store: Any, app_id: str) -> list[str]:
-    """Addresses that may authorize actions for ``app_id`` (lowercased):
-    the app's own deployer plus the operator admin set."""
+def allowed_signers(store: Any, app_id: str, *, admin_only: bool = False) -> list[str]:
+    """Addresses that may authorize actions for ``app_id`` (lowercased): the
+    operator admin set, plus — unless ``admin_only`` — the app's own deployer.
+
+    ``admin_only=True`` is for actions an owner must NOT self-authorize (the
+    registration approval gate): only ``APP_ADMIN_SIGNERS`` qualify, never the
+    app's deployer."""
     out = list(admin_signers())
+    if admin_only:
+        return out
     definition = store.get_app(app_id)
     dep = (getattr(definition, "deployer", "") or "").strip().lower()
     if dep and dep not in out:
@@ -113,6 +119,7 @@ def authorize(
     auth: AuthBlock,
     admin_ok: bool,
     consume_nonce: bool = True,
+    admin_only: bool = False,
     now: int | None = None,
 ) -> tuple[bool, str, str]:
     """Authorize a lifecycle action. Returns ``(ok, error, signer)``.
@@ -127,10 +134,13 @@ def authorize(
 
     ``consume_nonce=False`` is for read actions (admin-state): the signature
     is still parameter- and deadline-bound, but reads don't burn a nonce.
+    ``admin_only=True`` restricts the signature path to ``APP_ADMIN_SIGNERS``
+    (the app owner cannot self-authorize) — for the registration approval
+    gate. The admin-key bypass still counts as admin authority.
     """
     sig = (auth.signature or "").strip()
     if sig:
-        allowed = allowed_signers(store, app_id)
+        allowed = allowed_signers(store, app_id, admin_only=admin_only)
         signer = (auth.signer or "").strip().lower()
         if not signer:
             # Default to the app's own deployer when the caller didn't say.
