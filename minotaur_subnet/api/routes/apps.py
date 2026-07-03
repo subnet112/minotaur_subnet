@@ -74,6 +74,75 @@ def _require_admin(
         )
 
 
+def _admin_key_ok(x_admin_key: str | None) -> bool:
+    """Non-raising variant of ``_require_admin`` — did the request carry a
+    valid admin key (or is this an open dev instance)? Used by the app-auth
+    gate to decide whether the legacy admin-key bypass applies."""
+    relayer_url = os.environ.get("RELAYER_URL", "").strip()
+    admin_key = os.environ.get("ADMIN_API_KEY", "").strip()
+    if not relayer_url and _env_true("LOCAL_TESTNET", default=False):
+        return True
+    return bool(admin_key) and x_admin_key == admin_key
+
+
+class _AppAuthCtx:
+    """Resolved authorization inputs for an app-management request: whether a
+    valid admin key was presented, plus any wallet-signature headers."""
+
+    __slots__ = ("admin_ok", "auth")
+
+    def __init__(self, admin_ok: bool, auth: Any) -> None:
+        self.admin_ok = admin_ok
+        self.auth = auth
+
+
+def _app_auth_ctx(
+    x_admin_key: str | None = Header(None),
+    x_app_auth_signer: str | None = Header(None),
+    x_app_auth_signature: str | None = Header(None),
+    x_app_auth_nonce: int | None = Header(None),
+    x_app_auth_deadline: int | None = Header(None),
+) -> _AppAuthCtx:
+    """Dependency: parse the admin key and the ``X-App-Auth-*`` wallet-auth
+    headers. Deliberately NON-rejecting — a signature-only caller (no admin
+    key) must reach the handler, which then verifies the signature bound to
+    the concrete request parameters. Anonymous callers with neither are
+    denied by the per-action ``authorize`` check, not here."""
+    from minotaur_subnet.api.services.app_auth import AuthBlock
+
+    return _AppAuthCtx(
+        admin_ok=_admin_key_ok(x_admin_key),
+        auth=AuthBlock(
+            signer=(x_app_auth_signer or "").strip(),
+            signature=(x_app_auth_signature or "").strip(),
+            nonce=int(x_app_auth_nonce or 0),
+            deadline=int(x_app_auth_deadline or 0),
+        ),
+    )
+
+
+def _authorize_or_403(
+    ctx: _AppAuthCtx,
+    app_id: str,
+    action: str,
+    params_hash: bytes,
+    *,
+    consume_nonce: bool = True,
+) -> str:
+    """Run the wallet-signature / admin-key authorization for one action or
+    raise 403. Returns the resolved signer ('admin' for the legacy bypass)."""
+    from minotaur_subnet.api.services import app_auth
+
+    ok, err, signer = app_auth.authorize(
+        _store(), app_id,
+        action=action, params_hash=params_hash,
+        auth=ctx.auth, admin_ok=ctx.admin_ok, consume_nonce=consume_nonce,
+    )
+    if not ok:
+        raise HTTPException(status_code=403, detail=f"Unauthorized: {err}")
+    return signer
+
+
 # Per-IP, per-path rate limit buckets for the debug helper routes
 # (/apps/validate, /apps/{id}/score). Even behind the admin gate these
 # routes spawn Forge / Anvil subprocesses, so an operator-shared key
@@ -529,8 +598,11 @@ def get_status(app_id: str) -> dict[str, Any]:
     return _tools.get_app_status(_store(), app_id)
 
 
-@router.get("/apps/{app_id}/admin-state", dependencies=[Depends(_require_admin)])
-async def get_admin_state(app_id: str) -> dict[str, Any]:
+@router.get("/apps/{app_id}/admin-state")
+async def get_admin_state(
+    app_id: str,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
     """Full operator view of an app for the management frontend.
 
     Aggregates the store record (JS + Solidity source with sha256 hashes,
@@ -541,14 +613,20 @@ async def get_admin_state(app_id: str) -> dict[str, Any]:
     AppRegistry registration status (mode, appByContract, record,
     developer allowlist).
 
-    Admin-gated: returns FULL Solidity/JS source and operational balances.
+    Auth (returns FULL Solidity/JS source + balances): admin key OR a wallet
+    signature (action="admin_state") from an allowed signer. A read, so no
+    nonce is consumed — the deadline still bounds the signature's lifetime.
     Chain reads are best-effort — an unreachable RPC degrades to nulls plus
-    a per-chain ``errors`` list, never a 5xx, so the frontend can always
-    render the store-side state. Runs in a thread executor: the chain reads
-    are synchronous web3 calls.
+    a per-chain ``errors`` list, never a 5xx. Runs in a thread executor.
     """
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
 
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_ADMIN_STATE,
+        app_auth.params_hash_for(developer_auth.ACTION_ADMIN_STATE, app_id, None),
+        consume_nonce=False,
+    )
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None, lambda: _tools.get_app_admin_state(_store(), app_id),
@@ -587,8 +665,12 @@ class UpdateSolidityRequest(BaseModel):
     )
 
 
-@router.put("/apps/{app_id}/solidity", dependencies=[Depends(_require_admin)])
-def update_solidity(app_id: str, body: UpdateSolidityRequest) -> dict[str, Any]:
+@router.put("/apps/{app_id}/solidity")
+def update_solidity(
+    app_id: str,
+    body: UpdateSolidityRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
     """Replace the stored contract source so the next deploy compiles it.
 
     The missing half of the update story (JS already had /scoring): without
@@ -596,7 +678,18 @@ def update_solidity(app_id: str, body: UpdateSolidityRequest) -> dict[str, Any]:
     brand-new app_id. Refuses mid-deploy. Pair with
     POST .../deployments/{chain_id}/retire + POST .../deploy for an in-place
     redeploy under the same app_id.
+
+    Auth: admin key OR a wallet signature (action="update_solidity",
+    paramsHash = keccak256(utf8(solidity_code)) — the signature authorizes
+    THAT exact source and nothing else).
     """
+    from eth_hash.auto import keccak
+    from minotaur_subnet.api.services import developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_UPDATE_SOLIDITY,
+        keccak(body.solidity_code.encode()),
+    )
     return _tools.update_app_solidity(
         _store(), app_id, body.solidity_code,
         constructor_args=body.constructor_args,
@@ -604,15 +697,25 @@ def update_solidity(app_id: str, body: UpdateSolidityRequest) -> dict[str, Any]:
     )
 
 
-@router.post(
-    "/apps/{app_id}/deployments/{chain_id}/retire",
-    dependencies=[Depends(_require_admin)],
-)
-def retire_deployment_route(app_id: str, chain_id: int) -> dict[str, Any]:
+@router.post("/apps/{app_id}/deployments/{chain_id}/retire")
+def retire_deployment_route(
+    app_id: str,
+    chain_id: int,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
     """Mark a chain's deployment RETIRED — releases the deploy guard so
     POST /apps/{app_id}/deploy performs an in-place redeploy (the
     deployment record upserts on (app_id, chain_id)). Store-only: recover
-    any V2 WETH float FIRST via .../float/withdraw."""
+    any V2 WETH float FIRST via .../float/withdraw.
+
+    Auth: admin key OR a wallet signature (action="retire_deployment",
+    paramsHash binds app_id + chain_id)."""
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_RETIRE_DEPLOYMENT,
+        app_auth.params_hash_for(developer_auth.ACTION_RETIRE_DEPLOYMENT, app_id, chain_id),
+    )
     return _tools.retire_deployment(_store(), app_id, chain_id)
 
 
@@ -626,31 +729,53 @@ class FloatWithdrawRequest(BaseModel):
     amount_wei: int = Field(..., gt=0)
 
 
-@router.post(
-    "/apps/{app_id}/deployments/{chain_id}/float/deposit",
-    dependencies=[Depends(_require_admin)],
-)
+@router.post("/apps/{app_id}/deployments/{chain_id}/float/deposit")
 async def float_deposit_route(
     app_id: str, chain_id: int, body: FloatDepositRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
-    """Fund the V2 app-held WETH fee float from the relayer wallet."""
+    """Fund the V2 app-held WETH fee float from the relayer wallet.
+
+    Auth: admin key OR a wallet signature (action="float_deposit",
+    paramsHash binds app_id + chain_id + amount_wei + wrap)."""
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_FLOAT_DEPOSIT,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_FLOAT_DEPOSIT, app_id, chain_id,
+            body.amount_wei, body.wrap,
+        ),
+    )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _tools.float_deposit(
         _store(), app_id, chain_id, body.amount_wei, wrap=body.wrap,
     ))
 
 
-@router.post(
-    "/apps/{app_id}/deployments/{chain_id}/float/withdraw",
-    dependencies=[Depends(_require_admin)],
-)
+@router.post("/apps/{app_id}/deployments/{chain_id}/float/withdraw")
 async def float_withdraw_route(
     app_id: str, chain_id: int, body: FloatWithdrawRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Recover the V2 WETH float (relayer-gated withdrawFloat on-chain) —
-    e.g. before retiring a deployment for a version migration."""
+    e.g. before retiring a deployment for a version migration.
+
+    Auth: admin key OR a wallet signature (action="float_withdraw",
+    paramsHash binds app_id + chain_id + recipient + amount_wei — so a
+    signature can NEVER be re-pointed to a different recipient or amount,
+    the drain vector this whole layer exists to close)."""
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_FLOAT_WITHDRAW,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_FLOAT_WITHDRAW, app_id, chain_id,
+            body.to, body.amount_wei,
+        ),
+    )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _tools.float_withdraw(
         _store(), app_id, chain_id, body.to, body.amount_wei,
@@ -663,15 +788,25 @@ class AppConfigRequest(BaseModel):
     fee_collector: str | None = None
 
 
-@router.patch(
-    "/apps/{app_id}/deployments/{chain_id}/config",
-    dependencies=[Depends(_require_admin)],
-)
+@router.patch("/apps/{app_id}/deployments/{chain_id}/config")
 async def set_app_config_route(
     app_id: str, chain_id: int, body: AppConfigRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
-    """Apply the relayer-gated on-chain config setters (V2 dex app)."""
+    """Apply the relayer-gated on-chain config setters (V2 dex app).
+
+    Auth: admin key OR a wallet signature (action="set_app_config",
+    paramsHash binds app_id + chain_id + each set field, so a signature to
+    change fee_bps can't be re-pointed to redirect the fee_collector)."""
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    parts = [f"{k}={app_auth._part(v)}" for k, v in sorted(updates.items())]
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_SET_CONFIG,
+        app_auth.params_hash_for(developer_auth.ACTION_SET_CONFIG, app_id, chain_id, *parts),
+    )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _tools.set_app_config(
         _store(), app_id, chain_id, body.model_dump(),
@@ -683,32 +818,53 @@ class AllowDeveloperRequest(BaseModel):
     allowed: bool = Field(True)
 
 
-@router.post(
-    "/apps/{app_id}/deployments/{chain_id}/registry/allow-developer",
-    dependencies=[Depends(_require_admin)],
-)
+@router.post("/apps/{app_id}/deployments/{chain_id}/registry/allow-developer")
 async def allow_developer_route(
     app_id: str, chain_id: int, body: AllowDeveloperRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Owner-only AppRegistry.setDeveloperAllowed via the relayer key (which
     IS the registry owner today). Allowlisting the app's real developer lets
     them registerApp/updateManifest from their own wallet — pair with
-    GET .../registry-calldata."""
+    GET .../registry-calldata.
+
+    Auth: admin key OR a wallet signature (action="allow_developer",
+    paramsHash binds app_id + chain_id + developer + allowed)."""
     import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_ALLOW_DEVELOPER,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_ALLOW_DEVELOPER, app_id, chain_id,
+            body.developer, body.allowed,
+        ),
+    )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _tools.set_developer_allowed(
         _store(), app_id, chain_id, body.developer, body.allowed,
     ))
 
 
-@router.get(
-    "/apps/{app_id}/deployments/{chain_id}/registry-calldata",
-    dependencies=[Depends(_require_admin)],
-)
-def registry_calldata_route(app_id: str, chain_id: int) -> dict[str, Any]:
+@router.get("/apps/{app_id}/deployments/{chain_id}/registry-calldata")
+def registry_calldata_route(
+    app_id: str, chain_id: int,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
     """Prepared AppRegistry registerApp/revokeApp calldata for the current
     deployment. The revoke needs the registry OWNER key, which stays cold —
-    the frontend surfaces this calldata for external signing."""
+    the frontend surfaces this calldata for external signing.
+
+    Auth: admin key OR a wallet read-signature (action="admin_state"); the
+    payload is non-sensitive (public calldata) but gated to keep the
+    frontend keyless like the rest of the management surface."""
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_ADMIN_STATE,
+        app_auth.params_hash_for(developer_auth.ACTION_ADMIN_STATE, app_id, None),
+        consume_nonce=False,
+    )
     return _tools.registry_calldata(_store(), app_id, chain_id)
 
 

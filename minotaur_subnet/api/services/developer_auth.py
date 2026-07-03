@@ -52,6 +52,17 @@ ACTION_UPDATE_SCORING: Final[str] = "update_scoring"
 ACTION_DEPLOY: Final[str] = "deploy"
 ACTION_PAY_DEPLOY_FEE: Final[str] = "pay_deploy_fee"
 ACTION_LINK_SS58: Final[str] = "link_ss58"
+# App-management lifecycle actions (see api/services/app_auth.py). Each gates
+# a relayer-key-signed operation, so the caller must prove owner authority by
+# signing the exact parameters — otherwise the API's relayer key would move
+# real funds / redirect fees on any unauthenticated caller's word.
+ACTION_UPDATE_SOLIDITY: Final[str] = "update_solidity"
+ACTION_RETIRE_DEPLOYMENT: Final[str] = "retire_deployment"
+ACTION_FLOAT_DEPOSIT: Final[str] = "float_deposit"
+ACTION_FLOAT_WITHDRAW: Final[str] = "float_withdraw"
+ACTION_SET_CONFIG: Final[str] = "set_app_config"
+ACTION_ALLOW_DEVELOPER: Final[str] = "allow_developer"
+ACTION_ADMIN_STATE: Final[str] = "admin_state"
 
 # Reject deadlines further out than this — caps how long a signed-but-unused
 # authorization can sit before replay, even though the nonce already makes it
