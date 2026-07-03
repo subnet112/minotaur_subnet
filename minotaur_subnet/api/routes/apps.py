@@ -309,6 +309,10 @@ class CreateAppRequest(BaseModel):
         "", description="Per-App on-chain fee mode: 'USER' (users pay) or 'APP' "
         "(the App's paymaster pays). Empty = operator default (FEE_MODE_DEFAULT).",
     )
+    contract_version: str = Field(
+        "", description="Contract base generation: 'v1' (AppIntentBase) or "
+        "'v2' (AppIntentBaseV2). Empty = v1.",
+    )
 
 
 class ValidateAppRequest(BaseModel):
@@ -409,6 +413,7 @@ def create_app(
         constructor_args=body.constructor_args,
         deployer=body.deployer,
         fee_mode=body.fee_mode,
+        contract_version=body.contract_version,
     )
 
 
@@ -524,6 +529,35 @@ def get_status(app_id: str) -> dict[str, Any]:
     return _tools.get_app_status(_store(), app_id)
 
 
+@router.get("/apps/{app_id}/admin-state", dependencies=[Depends(_require_admin)])
+async def get_admin_state(app_id: str) -> dict[str, Any]:
+    """Full operator view of an app for the management frontend.
+
+    Aggregates the store record (JS + Solidity source with sha256 hashes,
+    constructor args, contract_version, per-chain deployments) with live
+    per-chain state: on-chain app config (fee mode, collector, fee bounds,
+    paymaster, wrapped native), fee-settlement balances (the V2 app-held
+    WETH float, V1 paymaster balance + allowance, relayer gas), and
+    AppRegistry registration status (mode, appByContract, record,
+    developer allowlist).
+
+    Admin-gated: returns FULL Solidity/JS source and operational balances.
+    Chain reads are best-effort — an unreachable RPC degrades to nulls plus
+    a per-chain ``errors`` list, never a 5xx, so the frontend can always
+    render the store-side state. Runs in a thread executor: the chain reads
+    are synchronous web3 calls.
+    """
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, lambda: _tools.get_app_admin_state(_store(), app_id),
+    )
+    if "error" in result and "not found" in str(result.get("error", "")).lower():
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
 @router.put("/apps/{app_id}/scoring", dependencies=[Depends(_require_admin)])
 def update_scoring(
     app_id: str,
@@ -541,6 +575,118 @@ def update_scoring(
         nonce=body.nonce,
         deadline=body.deadline,
     )
+
+
+class UpdateSolidityRequest(BaseModel):
+    solidity_code: str = Field(..., description="New contract source")
+    constructor_args: list[list[str]] | None = Field(
+        None, description="Replacement ctor args: [[abi_type, value], ...]; omit to keep",
+    )
+    contract_version: str = Field(
+        "", description="New base generation ('v1'/'v2'); omit to keep",
+    )
+
+
+@router.put("/apps/{app_id}/solidity", dependencies=[Depends(_require_admin)])
+def update_solidity(app_id: str, body: UpdateSolidityRequest) -> dict[str, Any]:
+    """Replace the stored contract source so the next deploy compiles it.
+
+    The missing half of the update story (JS already had /scoring): without
+    this, a contract-generation migration (e.g. DexAggregatorAppV2) forced a
+    brand-new app_id. Refuses mid-deploy. Pair with
+    POST .../deployments/{chain_id}/retire + POST .../deploy for an in-place
+    redeploy under the same app_id.
+    """
+    return _tools.update_app_solidity(
+        _store(), app_id, body.solidity_code,
+        constructor_args=body.constructor_args,
+        contract_version=body.contract_version,
+    )
+
+
+@router.post(
+    "/apps/{app_id}/deployments/{chain_id}/retire",
+    dependencies=[Depends(_require_admin)],
+)
+def retire_deployment_route(app_id: str, chain_id: int) -> dict[str, Any]:
+    """Mark a chain's deployment RETIRED — releases the deploy guard so
+    POST /apps/{app_id}/deploy performs an in-place redeploy (the
+    deployment record upserts on (app_id, chain_id)). Store-only: recover
+    any V2 WETH float FIRST via .../float/withdraw."""
+    return _tools.retire_deployment(_store(), app_id, chain_id)
+
+
+class FloatDepositRequest(BaseModel):
+    amount_wei: int = Field(..., gt=0)
+    wrap: bool = Field(True, description="Wrap relayer ETH into WETH first")
+
+
+class FloatWithdrawRequest(BaseModel):
+    to: str = Field(..., description="Recipient of the recovered WETH")
+    amount_wei: int = Field(..., gt=0)
+
+
+@router.post(
+    "/apps/{app_id}/deployments/{chain_id}/float/deposit",
+    dependencies=[Depends(_require_admin)],
+)
+async def float_deposit_route(
+    app_id: str, chain_id: int, body: FloatDepositRequest,
+) -> dict[str, Any]:
+    """Fund the V2 app-held WETH fee float from the relayer wallet."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _tools.float_deposit(
+        _store(), app_id, chain_id, body.amount_wei, wrap=body.wrap,
+    ))
+
+
+@router.post(
+    "/apps/{app_id}/deployments/{chain_id}/float/withdraw",
+    dependencies=[Depends(_require_admin)],
+)
+async def float_withdraw_route(
+    app_id: str, chain_id: int, body: FloatWithdrawRequest,
+) -> dict[str, Any]:
+    """Recover the V2 WETH float (relayer-gated withdrawFloat on-chain) —
+    e.g. before retiring a deployment for a version migration."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _tools.float_withdraw(
+        _store(), app_id, chain_id, body.to, body.amount_wei,
+    ))
+
+
+class AppConfigRequest(BaseModel):
+    fee_bps: int | None = None
+    volume_cap_bps: int | None = None
+    fee_collector: str | None = None
+
+
+@router.patch(
+    "/apps/{app_id}/deployments/{chain_id}/config",
+    dependencies=[Depends(_require_admin)],
+)
+async def set_app_config_route(
+    app_id: str, chain_id: int, body: AppConfigRequest,
+) -> dict[str, Any]:
+    """Apply the relayer-gated on-chain config setters (V2 dex app)."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _tools.set_app_config(
+        _store(), app_id, chain_id, body.model_dump(),
+    ))
+
+
+@router.get(
+    "/apps/{app_id}/deployments/{chain_id}/registry-calldata",
+    dependencies=[Depends(_require_admin)],
+)
+def registry_calldata_route(app_id: str, chain_id: int) -> dict[str, Any]:
+    """Prepared AppRegistry registerApp/revokeApp calldata for the current
+    deployment. The revoke needs the registry OWNER key, which stays cold —
+    the frontend surfaces this calldata for external signing."""
+    return _tools.registry_calldata(_store(), app_id, chain_id)
 
 
 @router.get("/apps/{app_id}/auth-nonce")

@@ -671,6 +671,10 @@ class AppIntentDefinition:
     constructor_args: list[tuple[str, str]] | None = None  # Extra ctor args: [(abi_type, value), ...]
     schema_id: str = ""
     policy_metadata: dict[str, Any] = field(default_factory=dict)
+    # Contract base generation ("v1" = AppIntentBase, "v2" = AppIntentBaseV2).
+    # Stored, not probed: V2 still exposes appPaymaster(), so on-chain views
+    # can't distinguish the generations. Empty = pre-field legacy record (v1).
+    contract_version: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
