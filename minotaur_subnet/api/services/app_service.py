@@ -30,6 +30,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _app_deploy_fee_paid(definition: Any) -> bool:
+    """Whether this app's one-time #238 deploy fee has already been paid
+    (recorded in ``policy_metadata['deploy_fee']`` on first paid deploy)."""
+    meta = getattr(definition, "policy_metadata", None) or {}
+    return bool((meta.get("deploy_fee") or {}).get("paid"))
+
+
+def _record_app_deploy_fee_paid(store: AppIntentStore, definition: Any, payment_ref: str) -> None:
+    """Mark the app's one-time deploy fee paid so later per-chain deploys of
+    the SAME app aren't charged again."""
+    meta = dict(getattr(definition, "policy_metadata", None) or {})
+    meta["deploy_fee"] = {"paid": True, "payment_ref": payment_ref}
+    definition.policy_metadata = meta
+    store.save_app(definition)
+
+
 def create_app_intent(
     store: AppIntentStore,
     name: str,
@@ -294,11 +310,16 @@ def deploy_app_intent(
     if payment is not None:
         from minotaur_subnet.api.services.deploy_payment import verify_deploy_fee_payment
 
-        ok, fee_err = verify_deploy_fee_payment(
-            store, definition, chain_id=chain_id, payment=payment,
-        )
-        if not ok:
-            return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
+        # Idempotent per app: if the one-time fee is already recorded, a
+        # supplied payment for a further chain is accepted without re-charging
+        # (and its nonce/ref left unspent).
+        if _app_deploy_fee_paid(definition):
+            pass
+        else:
+            ok, fee_err = verify_deploy_fee_payment(store, definition, payment=payment)
+            if not ok:
+                return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
+            _record_app_deploy_fee_paid(store, definition, payment.payment_ref)
 
     # Check not already deployed on this chain
     existing = store.get_deployment(app_id, chain_id=chain_id)
