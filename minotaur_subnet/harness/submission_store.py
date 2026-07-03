@@ -163,6 +163,13 @@ class Submission:
     solver_name: str | None = None
     solver_version: str | None = None
 
+    # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
+    # any single named region (module / function / class body) across the
+    # submission's in-tree Python, computed once in screening stage 1. Persisted
+    # but NOT gated yet — we soak the live distribution to calibrate the floor and
+    # the saturated-tie dethrone tie-break. See harness/screening.max_region_nodes.
+    max_region_nodes: int | None = None
+
     # Set after benchmarking. NOTE: the scalar composite benchmark_score was
     # removed — adoption is decided by the per-order relative rule
     # (epoch/relative_scoring.evaluate_relative_adoption) and finalist ranking by
@@ -204,6 +211,7 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "max_region_nodes": self.max_region_nodes,
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
@@ -224,6 +232,7 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "max_region_nodes": self.max_region_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
         }
@@ -488,6 +497,7 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            max_region_nodes=record.get("max_region_nodes"),
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
@@ -717,6 +727,22 @@ class SubmissionStore:
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_id = image_id
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_max_region_nodes(self, submission_id: str, value: int) -> None:
+        """Persist the Phase-0 factorization metric computed in screening stage 1.
+
+        Observe-only: nothing gates on this yet. Stored once so every downstream
+        consumer READS the same integer (never recomputes), keeping the metric
+        consensus-safe across CPython versions.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.max_region_nodes = value
         sub.updated_at = time.time()
         self._persist()
 
@@ -1120,6 +1146,7 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    max_region_nodes=d.get("max_region_nodes"),
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),

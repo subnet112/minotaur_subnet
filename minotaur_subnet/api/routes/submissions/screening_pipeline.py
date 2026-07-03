@@ -718,6 +718,12 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s1.passed:
             return  # set_screening_result already rejected
 
+        # Phase-0 factorization metric (observe-only, not gated). Persist the
+        # value computed in stage 1 so it soaks into the live distribution; this
+        # runs for BOTH the public and private clone paths (single confluence).
+        if s1.max_region_nodes is not None:
+            store.set_max_region_nodes(submission_id, s1.max_region_nodes)
+
         # Stage 2: Build check
         store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_2)
 
