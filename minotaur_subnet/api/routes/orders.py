@@ -108,6 +108,76 @@ def set_js_engine(js_engine: Any) -> None:
 # How long (seconds) a quote is considered indicative
 _QUOTE_VALID_SECONDS = 30
 
+# The /quote endpoint now derives estimated_output ENTIRELY from generate_plan +
+# an anvil-fork simulation of that plan (see get_quote). That fork sim is
+# expensive and runs on EVERY quote, so its result is cached briefly keyed by
+# (app_id, chain_id, intent_function, normalized params). The short TTL stands in
+# for the fork block — a fresh quote re-simulates once the pinned state drifts.
+_QUOTE_PLAN_CACHE_TTL = 12.0   # seconds (~1 Base block); bounds re-sim frequency
+_QUOTE_PLAN_CACHE_MAX = 512    # hard cap on entries to keep memory bounded
+_QUOTE_PLAN_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _quote_plan_cache_key(
+    app_id: str, chain_id: int, intent_function: str, params: dict,
+) -> str:
+    """Stable cache key over the inputs that determine a plan sim's output."""
+    import json as _json
+    return "|".join([
+        str(app_id), str(chain_id), str(intent_function),
+        _json.dumps(params, sort_keys=True, default=str),
+    ])
+
+
+def _quote_plan_cache_get(key: str) -> dict | None:
+    import time as _time
+    entry = _QUOTE_PLAN_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if (_time.monotonic() - ts) > _QUOTE_PLAN_CACHE_TTL:
+        _QUOTE_PLAN_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _quote_plan_cache_put(key: str, value: dict) -> None:
+    import time as _time
+    # Cheap eviction: drop everything if we blow the cap (bounded, no LRU book-keeping).
+    if len(_QUOTE_PLAN_CACHE) >= _QUOTE_PLAN_CACHE_MAX:
+        _QUOTE_PLAN_CACHE.clear()
+    _QUOTE_PLAN_CACHE[key] = (_time.monotonic(), value)
+
+
+def _quote_delivered_output(sim: Any, params: dict, deployed: str) -> int:
+    """Delivered output of a simulated plan, measured the SAME way the benchmark
+    scores it (harness/scoring_lab/stages.realized_output + the raw-output
+    scorer): prefer the exact-wei ``metadata.raw_output`` the live scorer emits,
+    else sum output-token transfers to the recipient/contract. The plan-only sim
+    carries no scorer metadata here, so in practice the transfer-sum is what
+    yields the delivered amount. Never raises — returns 0 on anything unexpected.
+    """
+    try:
+        raw = (getattr(sim, "metadata", None) or {}).get("raw_output")
+    except Exception:
+        raw = None
+    if raw not in (None, ""):
+        try:
+            return int(str(raw))
+        except (ValueError, TypeError):
+            return 0
+    out_tok = (params.get("output_token") or "").lower()
+    recips = {"0x000000000000000000000000000000000000dead", (deployed or "").lower()}
+    delivered = 0
+    for t in (getattr(sim, "token_transfers", None) or []):
+        if (getattr(t, "token", "") or "").lower() == out_tok and \
+           (getattr(t, "to_addr", "") or "").lower() in recips:
+            try:
+                delivered += int(t.amount)
+            except (TypeError, ValueError):
+                pass
+    return delivered
+
 
 def _require_orderbook():
     if _orderbook is None:
@@ -1166,77 +1236,78 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         raw_params=req.params,
     )
 
-    # Solver builds its own data from RPC; no snapshot needed
-    # Call solver.quote() — supports both sync (BaselineSwapSolver) and
-    # async (DockerRuntimeSolver) solvers.
-    try:
-        import inspect
-        quote_call = bl.solver.quote(app_def, state)
-        if inspect.isawaitable(quote_call):
-            quote_result = await quote_call
-        else:
-            quote_result = quote_call
-    except NotImplementedError:
-        if s is not None:
-            s.record_quote_attempt(app_id, success=False, error="not_implemented")
-        raise HTTPException(
-            status_code=501,
-            detail="Solver does not support quoting",
-        )
-    except ValueError as exc:
-        if s is not None:
-            s.record_quote_attempt(app_id, success=False, error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        if s is not None:
-            s.record_quote_attempt(app_id, success=False, error=f"error: {exc}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Solver quote failed: {exc}",
-        )
-
-    # Legacy solver images may not implement the quote command — the Docker
-    # session logs "Unknown command: quote" and returns None. Treat this the
-    # same as NotImplementedError so the caller can fall back cleanly instead
-    # of crashing on attribute access.
-    if quote_result is None:
-        if s is not None:
-            s.record_quote_attempt(app_id, success=False, error="not_implemented")
-        raise HTTPException(
-            status_code=501,
-            detail="Solver does not support quoting (legacy image — rebuild champion)",
-        )
-
-    # ── Minotaur-controlled fee: measure gas via simulation, price it here ──
-    # The solver's quote() returns an advisory fee, but the BINDING fee is
-    # computed by us (fee_policy) from a REAL simulation's measured gas — so
-    # miners cannot influence the protocol fee (they cannot understate the gas
-    # of their own plan; the same plan is simulated and executed). The fee is a
-    # computational param the user locks at signing; the plan is NOT pinned.
-    # On any failure we fall back to the per-chain floor — never the solver's
-    # number — so the fee is always Minotaur-controlled.
+    # ── Quote ENTIRELY from generate_plan + its simulation ──
+    # This endpoint deliberately does NOT call solver.quote(): quote() and
+    # generate_plan() are DIFFERENT code paths. quote() is a frozen generic
+    # pool-router that returns "0" for many tokens whose routes only the solver's
+    # generate_plan() knows — yet generate_plan()'s plan is EXACTLY what the
+    # benchmark simulates and settles. So we quote from the settled plan:
+    #   estimated_output = the plan's DELIVERED output (measured like the
+    #                      benchmark — metadata.raw_output, else output-token
+    #                      transfers to the recipient/contract),
+    #   gas_estimate     = the sim's measured swap gas + framework overhead,
+    #   route_summary    = plan.metadata["route"].
+    # solver.quote(), SolverSession, baseline_solver and everything under harness/
+    # are UNTOUCHED — the benchmark still calls session.quote() for its own
+    # min-floor / sandbag paths; this endpoint is isolated from scoring.
     import inspect as _inspect
     from minotaur_subnet import fee_policy
-    if quote_result.estimated_output not in (None, "", "0"):  # route found (pre-filter)
-        _binding_gas_units = 0
-        try:
-            from minotaur_subnet.orderbook.orderbook import Order as _Order
-            _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
-            _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
-            _sim_runner = getattr(bl, "_simulation_runner", None)
-            _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
-            if _deployed and _has_sim:
-                _plan_state = IntentState(
-                    contract_address=_deployed,
-                    chain_id=req.chain_id,
-                    nonce=0,
-                    owner="0x000000000000000000000000000000000000dEaD",
-                    raw_params=req.params,
-                    control={"_intent_function": req.intent_function},
-                )
-                _plan_call = bl.solver.generate_plan(app_def, _plan_state)
-                _plan = await _plan_call if _inspect.isawaitable(_plan_call) else _plan_call
-                if _plan is not None and not _plan.metadata.get("cross_chain"):
+    from minotaur_subnet.shared.types import QuoteResult as _QuoteResult
+
+    quote_result = _QuoteResult(estimated_output="0")
+    _binding_gas_units = 0
+
+    # The anvil-fork plan sim is expensive and now runs on EVERY quote — cache it
+    # briefly keyed by (app_id, chain_id, intent_function, params). A sim failure
+    # degrades to a structured zero quote (never a 500).
+    _cache_key = _quote_plan_cache_key(app_id, req.chain_id, req.intent_function, req.params)
+    _cached = _quote_plan_cache_get(_cache_key)
+    try:
+        from minotaur_subnet.orderbook.orderbook import Order as _Order
+        _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
+        _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
+        _sim_runner = getattr(bl, "_simulation_runner", None)
+        _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
+
+        if _cached is not None:
+            quote_result.estimated_output = str(_cached.get("delivered", 0))
+            quote_result.route_summary = _cached.get("route", "") or ""
+            quote_result.metadata = dict(_cached.get("metadata", {}) or {})
+            _binding_gas_units = int(_cached.get("gas_units", 0) or 0)
+        else:
+            _plan_state = IntentState(
+                contract_address=_deployed,
+                chain_id=req.chain_id,
+                nonce=0,
+                owner="0x000000000000000000000000000000000000dEaD",
+                raw_params=req.params,
+                control={"_intent_function": req.intent_function},
+            )
+            _plan_call = bl.solver.generate_plan(app_def, _plan_state)
+            _plan = await _plan_call if _inspect.isawaitable(_plan_call) else _plan_call
+            if _plan is not None:
+                _pmeta = _plan.metadata or {}
+                quote_result.route_summary = str(_pmeta.get("route", "") or "")
+                quote_result.metadata = {
+                    _k: _pmeta[_k]
+                    for _k in ("route", "dex", "fee_tier", "pool", "data_source", "plan_type")
+                    if _pmeta.get(_k) is not None
+                }
+                if _pmeta.get("cross_chain"):
+                    # Cross-chain plans can't be single-fork-simulated here. Derive
+                    # a best-effort estimate from plan metadata rather than 0 so
+                    # cross-chain quotes don't regress; gas stays at floor.
+                    _xc_amt = (
+                        _pmeta.get("dst_amount")
+                        or _pmeta.get("expected_output")
+                        or _pmeta.get("bridge_amount")
+                    )
+                    if _xc_amt is not None:
+                        try:
+                            quote_result.estimated_output = str(int(_xc_amt))
+                        except (ValueError, TypeError):
+                            pass
+                elif _deployed and _has_sim:
                     _prov_order = _Order(
                         order_id="quote-sim",
                         app_id=app_id,
@@ -1245,38 +1316,51 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                         submitted_by="0x000000000000000000000000000000000000dEaD",
                         chain_id=req.chain_id,
                     )
-                    # Plan-only sim (no intent_order) measures the swap gas;
-                    # we add the framework wrapper overhead (executeIntent,
-                    # proxy deploy, sig verify, fee settle) below.
+                    # Plan-only sim (no intent_order) measures the swap gas; we add
+                    # the framework wrapper overhead (executeIntent, proxy deploy,
+                    # sig verify, fee settle) when pricing the fee below.
                     _sim = await _sim_runner.simulate(
                         _plan, _prov_order, None, None, False, _deployed,
                     )
                     _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
                     if _swap_gas > 0:
                         _binding_gas_units = _swap_gas + fee_policy.framework_overhead_gas()
-        except Exception as exc:
-            logger.warning(
-                "Quote simulation failed for %s on chain %s, using floor fee: %s",
-                app_id, req.chain_id, exc,
-            )
-            _binding_gas_units = 0
+                    _delivered = _quote_delivered_output(_sim, req.params, _deployed)
+                    quote_result.estimated_output = str(_delivered)
+                    _quote_plan_cache_put(_cache_key, {
+                        "delivered": _delivered,
+                        "gas_units": _binding_gas_units,
+                        "route": quote_result.route_summary,
+                        "metadata": quote_result.metadata,
+                    })
+    except Exception as exc:
+        # Never 500 on a sim hiccup — degrade to a structured zero quote.
+        logger.warning(
+            "Quote plan simulation failed for %s on chain %s: %s",
+            app_id, req.chain_id, exc,
+        )
+        _binding_gas_units = 0
 
-        _gas_price = fee_policy.current_gas_price_wei(req.chain_id)
-        _binding_fee = fee_policy.protocol_fee_wei(
-            req.chain_id, _binding_gas_units, _gas_price,
-        )
-        from minotaur_subnet.blockchain.tokens import (
-            WRAPPED_NATIVE_TOKEN, WRAPPED_NATIVE_SYMBOL,
-        )
-        quote_result.platform_fee_wei = str(_binding_fee)
-        quote_result.platform_fee_token = (
-            WRAPPED_NATIVE_TOKEN.get(req.chain_id) or quote_result.platform_fee_token or ""
-        )
-        quote_result.platform_fee_symbol = (
-            WRAPPED_NATIVE_SYMBOL.get(req.chain_id) or quote_result.platform_fee_symbol or ""
-        )
-        if _binding_gas_units > 0:
-            quote_result.gas_estimate = _binding_gas_units
+    # ── Minotaur-controlled fee: price the plan's measured gas HERE ──
+    # The BINDING fee is computed by us (fee_policy) from the plan sim's measured
+    # gas — miners cannot understate the gas of their own plan (the same plan is
+    # simulated and executed). On any failure we fall back to the per-chain floor.
+    _gas_price = fee_policy.current_gas_price_wei(req.chain_id)
+    _binding_fee = fee_policy.protocol_fee_wei(
+        req.chain_id, _binding_gas_units, _gas_price,
+    )
+    from minotaur_subnet.blockchain.tokens import (
+        WRAPPED_NATIVE_TOKEN, WRAPPED_NATIVE_SYMBOL,
+    )
+    quote_result.platform_fee_wei = str(_binding_fee)
+    quote_result.platform_fee_token = (
+        WRAPPED_NATIVE_TOKEN.get(req.chain_id) or quote_result.platform_fee_token or ""
+    )
+    quote_result.platform_fee_symbol = (
+        WRAPPED_NATIVE_SYMBOL.get(req.chain_id) or quote_result.platform_fee_symbol or ""
+    )
+    if _binding_gas_units > 0:
+        quote_result.gas_estimate = _binding_gas_units
 
     estimated_output_gross = quote_result.estimated_output
     # Track successful quote (zero output counts as failure)
