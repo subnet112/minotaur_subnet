@@ -981,30 +981,46 @@ class AnvilSimulator:
                 pass
 
     def _fund_app_paymaster(self, target: str, relayer_addr: str) -> None:
-        """Fund + approve the app's fee paymaster's wrapped-native float.
+        """Fund APP-mode protocol-fee settlement: V1 paymaster pull AND V2
+        app-held float.
 
-        In ``FeeMode.APP`` the protocol fee is settled in WETH — taken from the
-        swap output when ``tokenOut == WETH``, otherwise pulled from the
-        ``appPaymaster`` via
-        ``IERC20(WETH).safeTransferFrom(appPaymaster, platformFeeCollector, fee)``.
-        On a fresh fork the paymaster has no WETH, and even if its real balance
-        is inherited its allowance is granted to the LIVE app, not this
-        fork-deployed instance — so every ``tokenOut != WETH`` scenario reverts
-        with empty data (WETH9's message-less ``require``) at the fee step,
-        scoring 0 regardless of solver quality and starving the benchmark
-        signal. Mirror the user-input funding for the paymaster.
+        In ``FeeMode.APP`` the protocol fee is settled in WETH. Where it comes
+        from depends on the contract generation:
 
-        No-op for apps without an ``appPaymaster`` (USER-mode / non-fee apps):
-        the view reverts -> ``None`` -> skipped.
+        - **V1 (AppIntentBase apps)**: pulled from the ``appPaymaster`` via
+          ``IERC20(WETH).safeTransferFrom(appPaymaster, platformFeeCollector,
+          fee)`` — needs the paymaster funded AND an allowance to THIS fork
+          instance (any inherited allowance targets the LIVE app).
+        - **V2 (AppIntentBaseV2 apps, e.g. DexAggregatorAppV2)**: paid via
+          ``WETH.safeTransfer`` from a float held by the APP CONTRACT itself —
+          no paymaster, no allowance. NOTE: V2 still exposes ``appPaymaster()``
+          (informational "recommended source of funds"), so its presence does
+          NOT identify the generation; fund both models unconditionally.
+
+        On a fresh fork neither account holds WETH, so every order with a
+        nonzero fee (``tokenOut != WETH`` on V1; ALL on V2) reverts with empty
+        data (WETH9's message-less ``require``) at the fee step, scoring 0
+        regardless of solver quality and starving the benchmark signal.
+
+        The app float is keyed on ``wrappedNativeToken()`` alone — our own
+        deployer passes ``appPaymaster = 0x0`` (deployer.py), and a V2 app
+        deployed that way still needs its float. Funding an account the app
+        never draws from is inert (V1 ignores its own balance; V2 ignores the
+        paymaster), so no generation detection is needed. No-op for non-fee
+        apps: the ``wrappedNativeToken()`` view reverts -> ``None`` -> skipped.
         """
-        paymaster = self._read_view_address(target, b"appPaymaster()")
         weth = self._read_view_address(target, b"wrappedNativeToken()")
-        if not (paymaster and weth and int(paymaster, 16) and int(weth, 16)):
+        if not (weth and int(weth, 16)):
             return
-        self._deal_erc20(weth, paymaster, 100 * 10**18)
-        self._set_erc20_allowance(weth, paymaster, target, 2**256 - 1)
-        # _set_erc20_allowance stops impersonating the paymaster; the
-        # scoreIntent tx is sent from the relayer.
+        # V2: app-held float, paid out via safeTransfer from the app itself.
+        self._deal_erc20(weth, target, 100 * 10**18)
+        # V1: paymaster pull — balance + allowance to this fork instance.
+        paymaster = self._read_view_address(target, b"appPaymaster()")
+        if paymaster and int(paymaster, 16):
+            self._deal_erc20(weth, paymaster, 100 * 10**18)
+            # _set_erc20_allowance stops impersonating the paymaster.
+            self._set_erc20_allowance(weth, paymaster, target, 2**256 - 1)
+        # The scoreIntent tx is sent from the relayer — (re-)impersonate it.
         self._impersonate(relayer_addr)
 
     def _read_view_address(self, target: str, signature: bytes) -> str | None:

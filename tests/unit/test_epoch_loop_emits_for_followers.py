@@ -50,6 +50,11 @@ async def _run_one_iteration(self_stub) -> None:
         self_stub._queued_weights_mapping = None
         self_stub._queued_weights_source = None
 
+    # No tempo gate → the legacy wall-clock cadence these tests pin.
+    # Tempo-aligned scheduling is exercised by test_epoch_loop_tempo_alignment.py.
+    if isinstance(getattr(self_stub, "_tempo_gate", None), MagicMock):
+        self_stub._tempo_gate = None
+
     # Bind the real _do_emit method so emit_async actually runs.
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,

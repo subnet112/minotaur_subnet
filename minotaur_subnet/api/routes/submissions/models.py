@@ -131,6 +131,12 @@ class StatusResponse(BaseModel):
     # benchmark_score (the retired scalar composite) was removed; benchmark_rank is
     # the DISPLAY rank derived from relative net-better vs the champion.
     benchmark_rank: int | None = None
+    # SN112 UID of the submitting hotkey, looked up in the CURRENT metagraph at
+    # read time (not a historical snapshot). null when the metagraph hasn't
+    # synced yet or the hotkey is no longer registered — deregistered miners
+    # lose their UID and re-registration can reassign a UID to a different
+    # hotkey, so old submissions from churned hotkeys resolve to null by design.
+    miner_uid: int | None = None
     rejection_reason: str | None = None
     # Feedback report (P1): the same-pin per-order ``relative`` block (better /
     # worse / matched / new + per-order deltas) and a verdict-derived outcome.

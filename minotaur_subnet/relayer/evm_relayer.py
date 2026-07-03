@@ -838,6 +838,57 @@ class EvmRelayer(RelayerBase):
                      order_id[:16], leg_index, amount, tx_hash.hex()[:16])
         return tx_hash.hex()
 
+    async def call_contract_function(
+        self,
+        contract_address: str,
+        chain_id: int,
+        signature: str,
+        abi_types: list[str],
+        values: list,
+        tx_value: int = 0,
+        gas: int = 200_000,
+    ) -> str:
+        """Sign + send an arbitrary contract call from the relayer wallet.
+
+        Generic backend for the app-lifecycle admin endpoints (V2 float
+        deposit/withdraw via ``withdrawFloat``, relayer-gated config setters
+        like ``setFeeBps``). Same signing/nonce/gas pattern as the escrow
+        calls above. ``signature`` is the full function signature, e.g.
+        ``"withdrawFloat(address,uint256)"``.
+
+        Returns TX hash on success, raises on revert/failure.
+        """
+        from minotaur_subnet.blockchain.chains import get_web3
+        from eth_abi import encode as abi_encode
+        from eth_hash.auto import keccak
+
+        w3 = get_web3(chain_id)
+        wallet = self._resolve_wallet(chain_id)
+
+        selector = keccak(signature.encode())[:4]
+        params = abi_encode(abi_types, values) if abi_types else b""
+        call_data = "0x" + selector.hex() + params.hex()
+
+        nonce = self._nonce_manager.get_and_increment(chain_id, wallet, w3)
+        tx = {
+            "from": wallet,
+            "to": w3.to_checksum_address(contract_address),
+            "data": call_data,
+            "value": tx_value,
+            "nonce": nonce,
+            "gas": gas,
+            "gasPrice": self._get_gas_price(w3),
+        }
+
+        signed = w3.eth.account.sign_transaction(tx, self.private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] != 1:
+            raise RuntimeError(f"{signature} reverted: tx={tx_hash.hex()}")
+
+        logger.info("%s OK: to=%s tx=%s", signature, contract_address[:10], tx_hash.hex()[:16])
+        return tx_hash.hex()
+
     async def call_escrow_release(
         self,
         contract_address: str,

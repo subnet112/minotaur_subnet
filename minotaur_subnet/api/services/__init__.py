@@ -67,6 +67,15 @@ from .app_service import (  # noqa: F401
     get_app_manifest,
     build_intent_params_hex_from_manifest,
 )
+from .app_admin import get_app_admin_state  # noqa: F401
+from .app_lifecycle import (  # noqa: F401
+    update_app_solidity,
+    retire_deployment,
+    float_deposit,
+    float_withdraw,
+    set_app_config,
+    registry_calldata,
+)
 
 # ── order / quote / approval ─────────────────────────────────────────────
 from .order_service import (  # noqa: F401

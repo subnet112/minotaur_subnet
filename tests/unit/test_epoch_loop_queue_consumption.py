@@ -58,6 +58,9 @@ def _make_stub(*, queued=None, queued_source=None, burn_returns=None):
     self_stub._queued_weights_mapping = queued
     self_stub._queued_weights_source = queued_source
     self_stub._last_emit_state = None
+    # No tempo gate → the legacy wall-clock cadence these tests pin.
+    # Tempo-aligned scheduling is exercised by test_epoch_loop_tempo_alignment.py.
+    self_stub._tempo_gate = None
     # Bind real _do_emit so it actually exercises emit_async + state.
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,

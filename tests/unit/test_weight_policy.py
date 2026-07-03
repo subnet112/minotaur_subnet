@@ -121,6 +121,26 @@ def test_champion_weights_uses_owner_burn_before_real_champion():
     }
 
 
+def test_close_epoch_now_bypasses_wall_clock():
+    """The tempo-aligned scheduler decides timing from the CHAIN clock —
+    close_epoch_now must return weights even when epoch_seconds hasn't
+    elapsed (where maybe_emit would return None), and still reset the
+    wall clock so a later fallback spaces itself from this emit."""
+    tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="5Gowner")
+    tracker.seed_epoch_clock_from_last_emit(0.0)  # just emitted
+
+    assert tracker.maybe_emit("5Gminer") is None  # wall clock vetoes
+    result = tracker.close_epoch_now("5Gminer")
+    assert result == {
+        "5Gowner": 1 - CHAMPION_MINER_WEIGHT_FRACTION,
+        "5Gminer": CHAMPION_MINER_WEIGHT_FRACTION,
+    }
+    # History recorded like a normal epoch close.
+    assert tracker.get_history()[-1]["champion"] == "5Gminer"
+    # Clock reset → the wall-clock path still waits a full epoch from now.
+    assert tracker.maybe_emit("5Gminer") is None
+
+
 def test_seed_epoch_clock_stale_emits_on_next_tick():
     """A stale validator (last emit > epoch_seconds ago) must emit on the
     FIRST maybe_emit call, not wait another full epoch."""
