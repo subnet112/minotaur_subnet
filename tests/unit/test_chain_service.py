@@ -13,6 +13,7 @@ def _chain(
     name: str,
     rpc_url: str = "http://localhost:8545",
     validator_registry_address: str = "",
+    app_registry_address: str = "",
 ) -> SimpleNamespace:
     """Build a stand-in for relayer.chain_config.ChainDeployment.
 
@@ -23,6 +24,7 @@ def _chain(
         name=name,
         rpc_url=rpc_url,
         validator_registry_address=validator_registry_address,
+        app_registry_address=app_registry_address,
     )
 
 
@@ -75,3 +77,42 @@ def test_rpc_available_reflects_rpc_url():
 
 def test_empty_input_yields_empty_output():
     assert build_public_chain_info([]) == []
+
+
+def test_app_registry_address_from_chain_config():
+    chains = [
+        _chain(chain_id=8453, name="Base", validator_registry_address="0xabc",
+               app_registry_address="0xAppReg"),
+    ]
+    info = build_public_chain_info(chains)
+    assert info[0]["app_registry_address"] == "0xAppReg"
+
+
+def test_app_registry_address_env_fallback(monkeypatch):
+    """Chain config empty -> APP_REGISTRY_{chain_id} env wins (same resolution
+    order as the deployer / app_admin)."""
+    monkeypatch.setenv("APP_REGISTRY_8453", "  0xEnvReg  ")
+    chains = [
+        _chain(chain_id=8453, name="Base", validator_registry_address="0xabc"),
+    ]
+    info = build_public_chain_info(chains)
+    assert info[0]["app_registry_address"] == "0xEnvReg"
+
+
+def test_app_registry_address_empty_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("APP_REGISTRY_964", raising=False)
+    chains = [
+        _chain(chain_id=964, name="Bittensor EVM", validator_registry_address="0xdef"),
+    ]
+    info = build_public_chain_info(chains)
+    assert info[0]["app_registry_address"] == ""
+
+
+def test_chain_config_beats_env(monkeypatch):
+    monkeypatch.setenv("APP_REGISTRY_8453", "0xEnvReg")
+    chains = [
+        _chain(chain_id=8453, name="Base", validator_registry_address="0xabc",
+               app_registry_address="0xCfgReg"),
+    ]
+    info = build_public_chain_info(chains)
+    assert info[0]["app_registry_address"] == "0xCfgReg"
