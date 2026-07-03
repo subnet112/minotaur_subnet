@@ -32,6 +32,64 @@ _GAS_ESTIMATE_MULTIPLIER = float(os.environ.get("RELAYER_GAS_ESTIMATE_MULTIPLIER
 _MIN_BALANCE_WEI = int(os.environ.get("RELAYER_MIN_BALANCE_WEI", str(10**16)))  # 0.01 ETH
 
 
+# ── Contract-deploy gas + confirmation tuning ─────────────────────────────────
+# A deploy is a type-2 (EIP-1559) transaction on every chain that exposes a base
+# fee — Ethereum MUST NOT use a legacy gasPrice, and Base / BT-EVM support 1559
+# too. The node-suggested priority fee is near-zero on all three (Base ~0.001,
+# BT-EVM 0, ETH ~0.0001 gwei), so a legacy `gasPrice = w3.eth.gas_price` under-
+# prices the deploy and it sits unmined (the 0.006-gwei stuck tx). A per-chain
+# tip FLOOR + a base-fee buffer fixes that.
+_DEPLOY_BASE_FEE_BUFFER = 4  # maxFee = base*BUFFER + tip → headroom while the deploy waits several blocks
+
+_DEPLOY_MIN_TIP_WEI = {
+    1: 1_000_000_000,     # Ethereum: 1 gwei — a real tip for L1 inclusion
+    8453: 5_000_000,      # Base: 0.005 gwei
+    964: 500_000_000,     # BT-EVM: 0.5 gwei
+}
+_DEPLOY_DEFAULT_MIN_TIP_WEI = 50_000_000       # 0.05 gwei
+_DEPLOY_MIN_LEGACY_GAS_WEI = 1_000_000_000     # 1 gwei floor for legacy-only chains
+
+# Confirmation wait, per chain — 30s was too short for Ethereum/BT-EVM. Kept
+# under the HttpRelayer deploy_timeout (120s) and nginx proxy timeout (120s).
+# Override globally with DEPLOY_RECEIPT_TIMEOUT_SECONDS.
+_DEPLOY_RECEIPT_TIMEOUT = {1: 110, 8453: 90, 964: 90}
+_DEPLOY_DEFAULT_RECEIPT_TIMEOUT = 90
+
+
+def _deploy_receipt_timeout(chain_id: int) -> int:
+    env = os.environ.get("DEPLOY_RECEIPT_TIMEOUT_SECONDS", "").strip()
+    if env:
+        try:
+            return max(30, min(115, int(env)))
+        except ValueError:
+            pass
+    return _DEPLOY_RECEIPT_TIMEOUT.get(chain_id, _DEPLOY_DEFAULT_RECEIPT_TIMEOUT)
+
+
+def _build_deploy_gas_fields(w3: Any, chain_id: int) -> dict:
+    """Gas fields for a contract-deploy tx.
+
+    Type-2 (EIP-1559) wherever the chain exposes a base fee: ``maxFeePerGas =
+    base*BUFFER + tip`` with a per-chain tip floor so a near-zero node tip can't
+    underprice the deploy. Legacy ``gasPrice`` only as a fallback for a chain
+    that reports no base fee.
+    """
+    base_fee = w3.eth.get_block("latest").get("baseFeePerGas")
+    if base_fee is None:
+        gp = max(int(w3.eth.gas_price * 1.25), _DEPLOY_MIN_LEGACY_GAS_WEI)
+        return {"gasPrice": gp}
+    try:
+        tip = int(w3.eth.max_priority_fee)
+    except Exception:  # noqa: BLE001 — some RPCs lack eth_maxPriorityFeePerGas
+        tip = 0
+    tip = max(tip, _DEPLOY_MIN_TIP_WEI.get(chain_id, _DEPLOY_DEFAULT_MIN_TIP_WEI))
+    return {
+        "type": 2,
+        "maxPriorityFeePerGas": tip,
+        "maxFeePerGas": int(base_fee) * _DEPLOY_BASE_FEE_BUFFER + tip,
+    }
+
+
 def canonicalize_user_signature(sig: bytes) -> bytes:
     """Normalize a 65-byte ECDSA signature's recovery byte ``v`` to 27/28.
 
@@ -648,13 +706,19 @@ class EvmRelayer(RelayerBase):
             "nonce": nonce,
             "data": bytecode,
             "gas": gas_limit,
-            "gasPrice": w3.eth.gas_price,
             "chainId": chain_id,
+            # EIP-1559 (type-2) gas — never a legacy gasPrice on a base-fee
+            # chain (Ethereum in particular). See _build_deploy_gas_fields.
+            **_build_deploy_gas_fields(w3, chain_id),
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        # Confirmation wait — per-chain, longer for slow L1s (30s was too short
+        # for Ethereum/BT-EVM). Kept under the HttpRelayer deploy_timeout (120s).
+        receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash, timeout=_deploy_receipt_timeout(chain_id),
+        )
 
         tx_hash_hex = tx_hash.hex()
         if receipt.get("status", 1) != 1:
