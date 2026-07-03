@@ -13,6 +13,11 @@ from unittest.mock import patch
 
 os.environ["DISABLE_BENCHMARK_WORKER"] = "1"
 os.environ["DISABLE_BLOCK_LOOP"] = "1"
+# Don't launch/wire the managed read proxy from this TestClient(app) startup —
+# it exports SOLVER_READ_PROXY* via os.environ.setdefault, which leaks into the
+# shared pytest process and flips test_benchmark_fail_closed onto the
+# deterministic-read path (pre-existing latent ordering fragility).
+os.environ["DISABLE_READ_PROXY"] = "1"
 os.environ.setdefault("VALIDATOR_REGISTRY_8453", "0x" + "00" * 20)
 os.environ.setdefault("VALIDATOR_REGISTRY_964", "0x" + "00" * 20)
 os.environ.setdefault("SKIP_CONTRACT_PRESENCE_CHECK", "1")
