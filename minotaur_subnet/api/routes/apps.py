@@ -492,20 +492,26 @@ def create_app(
     )
 
 
-@router.post("/apps/validate", dependencies=[Depends(_require_admin)])
+@router.post("/apps/validate")
 async def validate_app(
     body: ValidateAppRequest,
     request: Request,
 ) -> dict[str, Any]:
     """Pre-flight validation for App Intent JS and/or Solidity code.
 
-    Admin-gated as of PR-2 (audit H3): this route spawns a Forge
-    subprocess to compile attacker-supplied Solidity. Anonymous abuse
-    can DoS the validator host by burning CPU on repeated compile
-    timeouts. Also rate-limited per source IP (5 req/min) for the case
-    where the operator-shared admin key is widely distributed.
+    PUBLIC (not admin-gated) so the self-serve app-management frontend can
+    check "does my JS parse / does my contract build?" straight from the
+    browser without a shared secret. It spawns a Forge subprocess to compile
+    submitted Solidity — a CPU-DoS surface — so it is per-IP rate-limited
+    (``APP_VALIDATE_RATE_PER_MIN``, default 5/min) and the compile has a hard
+    timeout (compiler.py). No state is changed and nothing is deployed.
     """
-    _debug_rate_limit(request, per_minute=5)
+    per_min = 5
+    try:
+        per_min = max(1, int(os.environ.get("APP_VALIDATE_RATE_PER_MIN", "5")))
+    except ValueError:
+        pass
+    _debug_rate_limit(request, per_minute=per_min)
     return await _tools.validate_app_intent_code(
         js_code=body.js_code,
         solidity_code=body.solidity_code,
