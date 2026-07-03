@@ -108,6 +108,24 @@ def build_submission_report(
         "scoring_mode": "relative",
     }
 
+    # Factorization metric (Phase 0, OBSERVE-ONLY) — surfaced next to the per-order
+    # relative stats so the frontend can show it. This submission's OWN
+    # max_region_nodes (a golf-immune worst-entanglement proxy); champion
+    # comparison arrives with the Phase-2 backfill. Measured, not gated.
+    factor = getattr(sub, "max_region_nodes", None)
+    if factor is not None:
+        try:
+            from minotaur_subnet.harness.screening import FLOOR_VERSION
+
+            floor_version: int | None = FLOOR_VERSION
+        except Exception:  # additive surface — never break the report
+            floor_version = None
+        report["factorization"] = {
+            "max_region_nodes": factor,
+            "floor_version": floor_version,
+            "observe_only": True,
+        }
+
     if rel is not None:
         report["relative"] = rel
         try:
