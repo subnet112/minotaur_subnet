@@ -199,6 +199,13 @@ class ValidatorStatus:
     # the daemon predates the field (older image) OR /health was unreachable.
     image_sha: str | None = None
     owner_hotkey_resolved: bool | None = None
+    # bt_init: the daemon's Bittensor bring-up state (dict with keys
+    # configured/ok/attempts/error/error_at/retrying). Present on images
+    # that carry the init-retry fix; None before that. When ok=false the
+    # ``error`` field holds the ACTUAL exception that broke the bring-up —
+    # alert texts prefer it over guessing the cause from downstream
+    # symptoms (weights_emitter_configured / owner_hotkey_resolved).
+    bt_init: dict | None = None
     loaded_intents: int | None = None
     uptime_seconds: float | None = None
     my_uid_reported: int | None = None
@@ -207,10 +214,11 @@ class ValidatorStatus:
     # ── Tier 2 derived signals ──
     # phantom_leader: daemon reports block_loop_running=True even though
     # it isn't the metagraph-elected leader (highest validator-permit
-    # stake). Indicates the daemon's metagraph_sync fell through to the
-    # fail-open ``_is_leader=True`` branch (eg. silent sync errors at
-    # startup). Cosmetic on prod since real chain interactions need a
-    # gas-wallet, but worth surfacing.
+    # stake). On pre-init-retry images this indicated the fail-open
+    # ``_is_leader=True`` branch after a startup sync error; on images
+    # with the fix leadership fails closed, so a phantom implies
+    # FORCE_LEADER=1 or an election bug. Cosmetic on prod since real
+    # chain interactions need a gas-wallet, but worth surfacing.
     phantom_leader: bool = False
     # metagraph_sync_stale: their daemon's cached ``my_last_update_block``
     # diverges from the chain's current view by more than one tempo
@@ -824,6 +832,7 @@ def build_statuses(
                 # image) — alert logic must handle that case gracefully.
                 s.image_sha = health.get("image_sha")
                 s.owner_hotkey_resolved = health.get("owner_hotkey_resolved")
+                s.bt_init = health.get("bt_init")
                 s.loaded_intents = health.get("loaded_intents")
                 s.uptime_seconds = health.get("uptime_seconds")
                 s.my_uid_reported = health.get("my_uid")
@@ -915,6 +924,65 @@ def build_statuses(
 # ── Issue detection ──────────────────────────────────────────────────────
 
 
+def _bt_init_excerpt(s: ValidatorStatus) -> str | None:
+    """One-line root cause from the daemon's own bt_init state, or None.
+
+    Returns text only when the daemon reports its Bittensor bring-up as
+    configured-but-failed — the state where every downstream symptom
+    (no emitter, unresolved owner hotkey, never-attempted set_weights)
+    is secondary to the ONE recorded exception. None on older images
+    that don't expose ``bt_init``, or when the bring-up succeeded.
+    """
+    bi = s.bt_init
+    if not isinstance(bi, dict) or not bi.get("configured") or bi.get("ok"):
+        return None
+    err = (bi.get("error") or "unknown error")[:200]
+    return (
+        f"The daemon's own diagnosis (`bt_init`): Bittensor bring-up failed "
+        f"and is retrying in the background (attempt {bi.get('attempts')}): "
+        f"`{err}`."
+    )
+
+
+def _no_emitter_cause(s: ValidatorStatus) -> str:
+    """The cause sentence for a ``weights_emitter_configured=false`` alert.
+
+    Three-way on the daemon's ``bt_init`` report:
+
+    * bring-up FAILED (ok=false) → quote the recorded exception; the
+      missing emitter is collateral of that one failure.
+    * bring-up SUCCEEDED (ok=true) → subtensor connect and owner lookup
+      are fine, so the missing emitter is wallet-side: the daemon runs
+      metagraph-only (WALLET_NAME/HOTKEY_NAME unset, or the wallet load
+      failed with VALIDATOR_HOTKEY_SS58 covering for it).
+    * no ``bt_init`` (image predates the field) → can't disambiguate;
+      name BOTH candidates instead of asserting one.
+    """
+    failed_excerpt = _bt_init_excerpt(s)
+    if failed_excerpt is not None:
+        return failed_excerpt
+    bi = s.bt_init
+    if isinstance(bi, dict) and bi.get("configured") and bi.get("ok"):
+        return (
+            "The daemon reports its Bittensor bring-up SUCCEEDED "
+            "(`bt_init.ok=true`) — subtensor connect and owner lookup are "
+            "fine — so the emitter is missing because the wallet never "
+            "loaded: WALLET_NAME / HOTKEY_NAME unset, or the wallet load "
+            "failed and VALIDATOR_HOTKEY_SS58 covered for it "
+            "(metagraph-only mode; classic cause: wallet dir not readable "
+            "by uid 1000). The boot log's `Failed to load wallet` warning "
+            "has the exact error."
+        )
+    return (
+        "The Bittensor bring-up failed at startup. The recurring culprit "
+        "is the subtensor websocket connect at boot (check SUBTENSOR_URL "
+        "reachability / rate limits); a wallet-load failure (WALLET_NAME "
+        "/ HOTKEY_NAME envs, wallet dir readable by uid 1000) looks the "
+        "same from here. The daemon boot log's `Bittensor init failed:` "
+        "line names the real one."
+    )
+
+
 def detect_findings(
     statuses: list[ValidatorStatus],
     *,
@@ -957,10 +1025,8 @@ def detect_findings(
             if s.weight_source == "no-emitter":
                 extra = (
                     " The daemon is running but its weight emitter never "
-                    "loaded (`weights_emitter_configured=false`) — almost "
-                    "certainly a wallet-load failure on startup. Check "
-                    "WALLET_NAME / HOTKEY_NAME envs and that the wallet "
-                    "dir is readable by uid 1000."
+                    "loaded (`weights_emitter_configured=false`). "
+                    + _no_emitter_cause(s)
                 )
             elif s.weight_source == "external":
                 extra = (
@@ -1032,15 +1098,15 @@ def detect_findings(
                 "identity_url": s.identity_url,
                 "axon_url": s.axon_url,
                 "details": (
-                    "Daemon is healthy on /health but its weight emitter "
-                    "isn't configured (`weights_emitter_configured=false`). "
-                    "Cannot sign chain TXs at all — wallet load failed at "
-                    "startup. Likely cause: WALLET_NAME / HOTKEY_NAME envs "
-                    "missing OR wallet directory not readable by uid 1000."
+                    "Daemon is up on /health but its weight emitter isn't "
+                    "configured (`weights_emitter_configured=false`) — it "
+                    "cannot sign chain TXs. "
+                    + _no_emitter_cause(s)
                 ),
             })
 
         if s.health_reachable and s.owner_hotkey_resolved is False:
+            bt_excerpt = _bt_init_excerpt(s)
             findings.append({
                 "type": "no_owner_hotkey",
                 "validator_evm": s.evm_address,
@@ -1056,6 +1122,7 @@ def detect_findings(
                     "into an empty weights dict and are silently dropped. "
                     "Check SUBTENSOR_URL connectivity OR set "
                     "SUBNET_OWNER_HOTKEY env as the fallback."
+                    + (" " + bt_excerpt if bt_excerpt is not None else "")
                 ),
             })
 
@@ -1194,12 +1261,15 @@ def detect_findings(
                 "details": (
                     "Daemon reports `block_loop_running=true` (claims to "
                     "be the order-consensus leader) but the metagraph "
-                    "election picks a different validator. Common causes: "
-                    "(a) metagraph_sync raised an exception at startup → "
-                    "fell through to fail-open `_is_leader=true` branch, "
-                    "or (b) FORCE_LEADER=1 explicitly set in their env. "
-                    "Cosmetic on prod (followers have no relayer key) but "
-                    "wastes CPU on a no-op block_loop and pollutes logs."
+                    "election picks a different validator. On images with "
+                    "the init-retry fix (those exposing `bt_init` in "
+                    "/health) leadership fails CLOSED, so this means "
+                    "FORCE_LEADER=1 is set in their env — or a genuine "
+                    "election bug. On older images the usual cause is a "
+                    "startup exception falling through to the fail-open "
+                    "`_is_leader=true` branch. Cosmetic on prod (followers "
+                    "have no relayer key) but wastes CPU on a no-op "
+                    "block_loop and pollutes logs."
                 ),
             })
 
