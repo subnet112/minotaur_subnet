@@ -541,6 +541,28 @@ def _require_registered_miner(hotkey: str) -> None:
         )
 
 
+def _hotkey_to_uid_map() -> dict[str, int]:
+    """Best-effort ``{hotkey: uid}`` from the CURRENT synced metagraph.
+
+    Powers the ``miner_uid`` display field on submission responses. Unlike
+    ``_require_registered_miner`` above (fail-closed, gates intake), this is
+    fail-OPEN to ``{}``: an unsynced/unwired metagraph must degrade the field
+    to null, never 500 a read endpoint. The lookup is current-state only —
+    a deregistered hotkey simply isn't in the map (no historical snapshot).
+    """
+    try:
+        from minotaur_subnet.api.server_context import ctx
+
+        sync = ctx.solver_round_metagraph_sync
+        state = getattr(sync, "state", None) if sync is not None else None
+        if state is None:
+            return {}
+        return {p.hotkey: int(p.uid) for p in state.peers}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("miner_uid metagraph lookup failed (returning nulls): %s", exc)
+        return {}
+
+
 def _resolve_client_ip(request: Request) -> str:
     """Determine the real client IP behind a reverse proxy.
 
@@ -1687,6 +1709,9 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     if sub is None:
         raise HTTPException(status_code=404, detail="Submission not found")
     d = sub.status_dict()
+    # Current-metagraph UID for the submitting hotkey (null when the metagraph
+    # hasn't synced or the hotkey has since deregistered) — display only.
+    d["miner_uid"] = _hotkey_to_uid_map().get(sub.hotkey)
     # Feedback report (P1): cheap read+shape of the already-persisted benchmark
     # detail + aggregate-vs-champion. Best-effort — never break /status on it.
     try:
@@ -1737,10 +1762,16 @@ async def list_submissions(
     if hotkey:
         subs = [s for s in subs if s.hotkey == hotkey]
 
+    # One metagraph read per request, shared across all shaped rows.
+    uid_by_hotkey = _hotkey_to_uid_map()
+
     def _shape(s: Any) -> dict[str, Any]:
         d = s.to_dict()
         if not include_details:
             d.pop("benchmark_details", None)
+        # Current-metagraph UID for the submitting hotkey (null when the
+        # metagraph hasn't synced or the hotkey has since deregistered).
+        d["miner_uid"] = uid_by_hotkey.get(s.hotkey)
         return d
 
     return {
