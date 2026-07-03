@@ -834,3 +834,93 @@ def test_render_health_detail_api_subtable_only_when_api_health_present():
     assert "✅ running" in out_with
     assert "#7 open · accepting" in out_with
     assert "2-of-3, 2 peers" in out_with
+
+
+# ── bt_init-aware alert texts (validator init-retry fix) ─────────────────
+#
+# Daemons carrying the init-retry fix report the ACTUAL bring-up exception
+# in /health ``bt_init``. The alert texts must surface that error instead
+# of the old guess ("almost certainly a wallet-load failure") — which the
+# issue #59 investigation showed was wrong for every recurring episode
+# (the culprit was the subtensor websocket connect at boot).
+
+
+def _bt_init_failed(attempts=3, error="[Errno 111] Connection refused"):
+    return {
+        "configured": True,
+        "ok": False,
+        "attempts": attempts,
+        "error": error,
+        "error_at": 1234.5,
+        "retrying": True,
+    }
+
+
+def test_no_emitter_alert_quotes_bt_init_error():
+    s = _base_status(
+        weights_emitter_configured=False,
+        bt_init=_bt_init_failed(),
+    )
+    findings = detect_findings([s])
+    f = next(f for f in findings if f["type"] == "no_emitter")
+    assert "Connection refused" in f["details"]
+    assert "attempt 3" in f["details"]
+    # The old unconditional wallet guess must be gone when the daemon
+    # told us what actually broke.
+    assert "wallet" not in f["details"].lower()
+
+
+def test_no_emitter_alert_without_bt_init_names_both_causes():
+    """Old images (no bt_init field): the alert can't know the cause, so
+    it must name BOTH candidates instead of asserting the wallet one."""
+    s = _base_status(weights_emitter_configured=False, bt_init=None)
+    findings = detect_findings([s])
+    f = next(f for f in findings if f["type"] == "no_emitter")
+    assert "SUBTENSOR_URL" in f["details"]
+    assert "WALLET_NAME" in f["details"]
+
+
+def test_no_owner_hotkey_alert_appends_bt_init_error():
+    s = _base_status(
+        owner_hotkey_resolved=False,
+        bt_init=_bt_init_failed(error="ws handshake timeout"),
+    )
+    findings = detect_findings([s])
+    f = next(f for f in findings if f["type"] == "no_owner_hotkey")
+    assert "ws handshake timeout" in f["details"]
+
+
+def test_stale_weights_no_emitter_extra_uses_bt_init(monkeypatch):
+    s = _base_status(
+        last_update_seconds_ago=STALE_THRESHOLD_SECONDS + 60,
+        weights_emitter_configured=False,
+        weight_source="no-emitter",
+        bt_init=_bt_init_failed(error="DNS failure resolving subtensor host"),
+    )
+    findings = detect_findings([s])
+    f = next(f for f in findings if f["type"] == "stale_weights")
+    assert "DNS failure resolving subtensor host" in f["details"]
+
+
+def test_bt_init_ok_no_emitter_points_at_wallet():
+    """bt_init.ok=true + emitter=false is the documented metagraph-only
+    state: the bring-up SUCCEEDED, so the alert must point at the wallet
+    and must NOT claim the bring-up failed (that would send the operator
+    to debug a subtensor connect that worked)."""
+    s = _base_status(
+        weights_emitter_configured=False,
+        bt_init={
+            "configured": True, "ok": True, "attempts": 1,
+            "error": None, "error_at": None, "retrying": False,
+        },
+    )
+    findings = detect_findings([s])
+    f = next(f for f in findings if f["type"] == "no_emitter")
+    assert "bt_init.ok=true" in f["details"]
+    assert "wallet" in f["details"].lower()
+    assert "bring-up failed" not in f["details"]
+    assert "attempt" not in f["details"]
+    # And the failed-bring-up excerpt must not appear anywhere for ok=true.
+    assert not any(
+        "retrying in the background" in f2["details"] for f2 in findings
+    )

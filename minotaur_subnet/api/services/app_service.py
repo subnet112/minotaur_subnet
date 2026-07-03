@@ -30,6 +30,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _app_deploy_fee_paid(definition: Any) -> bool:
+    """Whether this app's one-time #238 deploy fee has already been paid
+    (recorded in ``policy_metadata['deploy_fee']`` on first paid deploy)."""
+    meta = getattr(definition, "policy_metadata", None) or {}
+    return bool((meta.get("deploy_fee") or {}).get("paid"))
+
+
+def _record_app_deploy_fee_paid(store: AppIntentStore, definition: Any, payment_ref: str) -> None:
+    """Mark the app's one-time deploy fee paid so later per-chain deploys of
+    the SAME app aren't charged again."""
+    meta = dict(getattr(definition, "policy_metadata", None) or {})
+    meta["deploy_fee"] = {"paid": True, "payment_ref": payment_ref}
+    definition.policy_metadata = meta
+    store.save_app(definition)
+
+
 def create_app_intent(
     store: AppIntentStore,
     name: str,
@@ -41,6 +57,8 @@ def create_app_intent(
     deployer: str = "",
     fee_mode: str = "",
     contract_version: str = "",
+    owner_signature: str = "",
+    owner_deadline: int = 0,
 ) -> dict[str, Any]:
     """Define a new App Intent with developer-provided JS and Solidity code.
 
@@ -53,8 +71,17 @@ def create_app_intent(
         supported_chains: Chain IDs to deploy on (e.g. [1, 8453]).
         js_code:          JS scoring code (required).
         solidity_code:    Solidity contract code (required).
-        deployer:         Address of the deployer. Only this address can
-                          update the app's JS scoring code later.
+        deployer:         Claimed deployer address (the owner allowed to edit
+                          the app later). TRUSTED input only on the admin path;
+                          for self-serve, supply ``owner_signature`` so it is
+                          PROVEN instead of claimed.
+        owner_signature:  Optional EIP-712 ``create_app`` signature over the
+                          app content (see ``app_auth.create_owner_binding_hash``).
+                          When present, the deployer is set to the RECOVERED
+                          signer — ownership proven by key, not claimed — and a
+                          supplied ``deployer`` must match it.
+        owner_deadline:   Unix-seconds expiry the owner signature was signed
+                          with.
 
     Returns:
         Full AppIntentDefinition as a dict, including JS and Solidity
@@ -134,14 +161,42 @@ def create_app_intent(
     except Exception as exc:
         logger.warning("Pre-flight validation skipped: %s", exc)
 
-    # ── validate deployer address (if provided) ────────────────────────
+    # ── resolve the deployer (owner allowed to edit) ───────────────────
+    # Two paths:
+    #  • owner_signature present → PROVEN ownership: recover the signer over the
+    #    app content and record THAT as deployer (self-serve; can't be spoofed).
+    #    A supplied `deployer` must match the recovered signer.
+    #  • no signature → the deployer field is trusted as-is (admin path — the
+    #    create route is admin-gated, so only operators use this).
     deployer_addr = ""
-    if deployer and deployer.strip():
+    claimed = deployer.strip() if deployer else ""
+    if claimed:
         try:
-            ia = parse_address(deployer.strip())
-            deployer_addr = ia.address  # EIP-55 checksummed
+            deployer_addr = parse_address(claimed).address  # EIP-55 checksummed
         except ValueError as exc:
             return {"error": f"Invalid deployer address: {exc}"}
+
+    if owner_signature:
+        from minotaur_subnet.api.services import app_auth, developer_auth
+
+        # Binds the TRIMMED code the request carries — frontend signs
+        # keccak256(toUtf8Bytes(js.trim() + "␟" + sol.trim())).
+        binding = app_auth.create_owner_binding_hash(js_code, solidity_code)
+        signer, err = developer_auth.recover_developer_auth(
+            action=developer_auth.ACTION_CREATE_APP, app_id="",
+            params_hash=binding, nonce=0, deadline=owner_deadline,
+            signature=owner_signature,
+        )
+        if signer is None:
+            return {"error": f"Invalid owner signature: {err}"}
+        if deployer_addr and deployer_addr.lower() != signer.lower():
+            return {
+                "error": (
+                    "deployer does not match the owner signature signer "
+                    f"({signer[:10]}…) — sign with the address you claim as owner"
+                ),
+            }
+        deployer_addr = parse_address(signer).address  # proven owner
 
     # ── build definition ─────────────────────────────────────────────────
     app_id = _generate_app_id()
@@ -199,6 +254,11 @@ def create_app_intent(
         manifest=extracted_manifest,
         constructor_args=ctor_args,
         contract_version=contract_version,
+        # New apps enter the moderation queue as "unrequested" — they deploy
+        # and are owned by the deployer, but stay out of the live routing set
+        # until an admin approves registration (app_registration.py). Legacy
+        # apps (field absent) are grandfathered as approved.
+        registration_status="unrequested",
     )
 
     store.save_app(definition)
@@ -248,22 +308,34 @@ def deploy_app_intent(
     from ._state import _deploy_service
     from minotaur_subnet.deployment.deploy_fee import (
         DeploymentFeeRequired,
+        is_deploy_fee_exempt,
         require_deployment_authorized,
     )
 
     if not app_id:
         return {"error": "app_id is required"}
 
-    # Hard gate (#238) for the no-payment case: admin deploys pass; a public
-    # deploy with no payment claim is refused here, BEFORE any store lookup, so
-    # an unauthorized public caller does zero work (and a bare store is fine).
+    # Load the app up front (tolerant of a bare store in the no-store-lookup
+    # unit tests) so the fee-exemption check can see the app's deployer.
+    try:
+        definition = store.get_app(app_id)
+    except Exception:
+        definition = None
+    fee_exempt = bool(definition) and is_deploy_fee_exempt(
+        getattr(definition, "deployer", ""),
+    )
+
+    # Hard gate (#238) for the no-payment case: admin deploys pass; so do
+    # deploys by a fee-exempt (whitelisted) deployer. A public deploy with no
+    # payment claim from a non-exempt deployer is refused here.
     if payment is None:
         try:
-            require_deployment_authorized(is_admin=is_admin, fee_paid=fee_paid)
+            require_deployment_authorized(
+                is_admin=is_admin, fee_paid=fee_paid, fee_exempt=fee_exempt,
+            )
         except DeploymentFeeRequired as exc:
             return {"error": str(exc), "deploy_fee_required": True}
 
-    definition = store.get_app(app_id)
     if definition is None:
         return {"error": f"App not found: {app_id}"}
 
@@ -289,11 +361,16 @@ def deploy_app_intent(
     if payment is not None:
         from minotaur_subnet.api.services.deploy_payment import verify_deploy_fee_payment
 
-        ok, fee_err = verify_deploy_fee_payment(
-            store, definition, chain_id=chain_id, payment=payment,
-        )
-        if not ok:
-            return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
+        # A fee-exempt deployer or an app whose one-time fee is already recorded
+        # (a further-chain deploy) is accepted without charging — the supplied
+        # payment's nonce/ref are left unspent.
+        if fee_exempt or _app_deploy_fee_paid(definition):
+            pass
+        else:
+            ok, fee_err = verify_deploy_fee_payment(store, definition, payment=payment)
+            if not ok:
+                return {"error": f"Deploy fee not authorized: {fee_err}", "deploy_fee_required": True}
+            _record_app_deploy_fee_paid(store, definition, payment.payment_ref)
 
     # Check not already deployed on this chain
     existing = store.get_deployment(app_id, chain_id=chain_id)
@@ -346,7 +423,30 @@ def deploy_app_intent(
             }
 
         store.save_deployment(result)
-        return asdict(result)
+        out = asdict(result)
+        out["fee_exempt"] = fee_exempt
+        # Post-deploy AppRegistry registration (best-effort, never fatal).
+        # Gated by the moderation state: only APPROVED (or legacy "") apps
+        # auto-register — a new, unapproved app deploys but stays OUT of the
+        # live routing set (_requireRegistered reverts its orders) until an
+        # admin approves it (api/services/app_registration.py). This is the
+        # permissionless-deploy / gated-activation boundary.
+        if result.contract_address and not result.error:
+            from .app_lifecycle import auto_register_deployment
+            from .app_registration import registration_allows_autoregister
+
+            if registration_allows_autoregister(definition.registration_status):
+                out["registry"] = auto_register_deployment(
+                    store, app_id, chain_id, result.contract_address,
+                )
+            else:
+                out["registry"] = {
+                    "registered": False,
+                    "pending_approval": True,
+                    "registration_status": definition.registration_status,
+                    "note": "app not approved — request registration for admin review",
+                }
+        return out
 
     # ── No relayer configured ────────────────────────────────────────────
     return {

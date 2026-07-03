@@ -75,6 +75,14 @@ from .app_lifecycle import (  # noqa: F401
     float_withdraw,
     set_app_config,
     registry_calldata,
+    set_developer_allowed,
+    auto_register_deployment,
+)
+from .app_registration import (  # noqa: F401
+    request_registration,
+    approve_registration,
+    reject_registration,
+    registration_allows_autoregister,
 )
 
 # ── order / quote / approval ─────────────────────────────────────────────

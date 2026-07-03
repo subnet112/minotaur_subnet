@@ -913,6 +913,29 @@ REFERENCE_QUOTE_FAILED_SENTINEL = "__reference_quote_failed__"
 BENCHMARK_MIN_SLIPPAGE_BPS = 5000
 
 
+def benchmark_static_quote_enabled() -> bool:
+    """Flag: benchmark the STATIC-quote way (``BENCHMARK_STATIC_QUOTE=1``).
+
+    When ON, the benchmark injects a static zero quote (``quotedOutput=0``,
+    ``min=0``) instead of calling ``solver.quote()`` or the champion
+    reference-quote pre-pass. This is safe because the authoritative score is
+    the relative per-order RAW delivered output (no quote anchor), and the dex
+    ``scoreIntent`` gates its CoW fee on ``quotedOutput > 0`` — so ``0`` means
+    "no anchor, no fee, full output executes", which the raw scorer reads.
+    The zero is only there to keep the 12-field on-chain ABI valid (omitting
+    the field reverts on decode).
+
+    DEFAULT OFF — the current champion-anchored reference-quote behavior is
+    unchanged. This is the instant-revert switch for the sensitive scoring
+    path: flip the env, no code change, to re-enable either mode at will.
+    """
+    import os
+
+    return os.environ.get("BENCHMARK_STATIC_QUOTE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 async def _enrich_state_with_quote(
     session: "SolverSession",
     intent: AppIntentDefinition,
@@ -956,33 +979,47 @@ async def _enrich_state_with_quote(
     if raw.get("quoted_output") not in (None, ""):
         return state  # already quoted (real/historical order) — leave as-is
 
-    quote_params = reference_params
-    if not quote_params:
-        # Fallback: self-quote via the solver session, mapped through the
-        # one shared helper so there is no second quote implementation.
-        try:
-            quote_result = await session.quote(intent, state, snapshot)
-        except Exception as exc:  # noqa: BLE001 — defensive, never crash a run
-            logger.error(
-                "[quote-FAILED] self-quote raised for %s (%s); scenario keeps "
-                "the legacy (un-quoted) layout and will revert/score 0 — a real "
-                "failure, not a silent pass", intent.app_id, exc,
-            )
-            return state
-        if quote_result is None:
-            logger.error(
-                "[quote-FAILED] self-quote returned None for %s; scenario keeps "
-                "the legacy (un-quoted) layout and will revert/score 0 — a real "
-                "failure, not a silent pass", intent.app_id,
-            )
-            return state
-        from minotaur_subnet.api.services.app_service import (
-            map_quote_result_to_params,
-        )
+    from minotaur_subnet.api.services.app_service import (
+        map_quote_result_to_params,
+    )
+
+    if benchmark_static_quote_enabled():
+        # STATIC-quote mode (flag): skip quoting entirely. Inject a zero quote
+        # so the 12-field ABI stays valid; scoreIntent gates its CoW fee on
+        # quotedOutput>0 (so 0 = no fee, full output executes), and the
+        # relative scorer reads the RAW delivered output — the quote is not in
+        # the score. No solver.quote() call, no champion reference needed.
+        from minotaur_subnet.shared.types import QuoteResult
+
         quote_params = map_quote_result_to_params(
-            quote_result, intent.manifest, intent_function,
-            slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
+            QuoteResult(estimated_output="0"), intent.manifest, intent_function,
+            slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,
         )
+    else:
+        quote_params = reference_params
+        if not quote_params:
+            # Fallback: self-quote via the solver session, mapped through the
+            # one shared helper so there is no second quote implementation.
+            try:
+                quote_result = await session.quote(intent, state, snapshot)
+            except Exception as exc:  # noqa: BLE001 — defensive, never crash a run
+                logger.error(
+                    "[quote-FAILED] self-quote raised for %s (%s); scenario keeps "
+                    "the legacy (un-quoted) layout and will revert/score 0 — a real "
+                    "failure, not a silent pass", intent.app_id, exc,
+                )
+                return state
+            if quote_result is None:
+                logger.error(
+                    "[quote-FAILED] self-quote returned None for %s; scenario keeps "
+                    "the legacy (un-quoted) layout and will revert/score 0 — a real "
+                    "failure, not a silent pass", intent.app_id,
+                )
+                return state
+            quote_params = map_quote_result_to_params(
+                quote_result, intent.manifest, intent_function,
+                slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
+            )
 
     if not quote_params:
         return state
