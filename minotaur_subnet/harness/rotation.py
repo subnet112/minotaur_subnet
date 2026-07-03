@@ -137,6 +137,7 @@ def apply_rotation_slate(
     slots: int,
     ledger: RotationLedger,
     now: float | None = None,
+    notify: Any = None,
 ) -> dict[str, Any]:
     """Select the round's benched slate by rotation and reject the overflow.
 
@@ -149,6 +150,11 @@ def apply_rotation_slate(
     ``slots <= 0`` disables rotation (matches the cap's 0-=-unlimited
     convention). Selected miners' ledger entries advance even when the round is
     uncontested, so seniority always reflects the last actual bench.
+
+    ``notify`` (optional, ``fn(submission, reason)``) is fired for each skipped
+    submission BEFORE its terminal reject — reject purges a private submission's
+    repo token, and the caller's PR notification needs the token to post.
+    Best-effort: a notify failure never blocks the reject.
     """
     if slots <= 0:
         return {"applied": False, "reason": "rotation disabled (slots <= 0)"}
@@ -157,16 +163,22 @@ def apply_rotation_slate(
     selected, skipped = select_rotation_slate(
         candidates, slots, ledger.load(), round_id,
     )
+    reject_reason = (
+        f"not selected for {round_id} (rotation: "
+        f"{len(candidates)} candidates, {slots} slots) — resubmit "
+        f"next round; miners benched longest ago go first"
+    )
     for sub in skipped:
+        if notify is not None:
+            try:
+                notify(sub, reject_reason)
+            except Exception:
+                logger.warning(
+                    "rotation notify failed for %s (ignored)",
+                    getattr(sub, "submission_id", "?"), exc_info=True,
+                )
         try:
-            sub_store.reject(
-                sub.submission_id,
-                (
-                    f"not selected for {round_id} (rotation: "
-                    f"{len(candidates)} candidates, {slots} slots) — resubmit "
-                    f"next round; miners benched longest ago go first"
-                ),
-            )
+            sub_store.reject(sub.submission_id, reject_reason)
         except Exception:
             logger.warning(
                 "rotation reject failed for %s (ignored)",

@@ -541,6 +541,49 @@ def _require_registered_miner(hotkey: str) -> None:
         )
 
 
+def _require_pr_comment_scope(
+    pr_number: int, *, owner_repo: tuple[str, str], token: str, round_id: str,
+) -> None:
+    """Reject a private submission whose PAT cannot comment on its own PR.
+
+    Posts the intake ACK comment with the miner's token (see
+    ``solver_repo.post_intake_ack`` for why a real write is the only reliable
+    fine-grained-PAT permission check). Policy mirrors ``assess_pr_mergeability``:
+    only a DEFINITIVE permission failure blocks (401/403/404 → 400 with the exact
+    scope to grant); transient signals (network 0, 5xx, rate-limit 429) fail open
+    — the ACK is then skipped but the submission proceeds, and the report post
+    retries the same write later anyway.
+
+    404 counts as definitive: resolve_pr already proved this token can SEE the
+    PR, so a 404 on the comment POST is GitHub masking a permission gap, not a
+    missing resource. Operator kill-switch: SUBMISSION_INTAKE_ACK=0.
+    """
+    if not _env_true("SUBMISSION_INTAKE_ACK", default=True):
+        return
+    from minotaur_subnet.relayer.solver_repo import post_intake_ack
+
+    status = post_intake_ack(
+        pr_number, owner_repo=owner_repo, token=token, round_id=round_id,
+    )
+    if status in (401, 403, 404):
+        owner, repo = owner_repo
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"repo_token cannot comment on PR #{pr_number} in {owner}/{repo} "
+                f"(GitHub {status}). The benchmark report would silently fail to "
+                "post after scoring. Re-issue the fine-grained PAT with "
+                "'Pull requests: Read and write' (plus 'Contents: Read' and "
+                "'Metadata: Read') for that repository, then resubmit."
+            ),
+        )
+    if status not in (200, 201):
+        logger.warning(
+            "intake ACK on PR #%s got HTTP %s — transient, submission proceeds",
+            pr_number, status,
+        )
+
+
 def _hotkey_to_uid_map() -> dict[str, int]:
     """Best-effort ``{hotkey: uid}`` from the CURRENT synced metagraph.
 
@@ -717,11 +760,28 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
     """
     from minotaur_subnet.harness.rotation import RotationLedger, apply_rotation_slate
 
+    store = get_store()
+
+    def _notify_not_selected(sub: Any, reason: str) -> None:
+        # Runs BEFORE the store's terminal reject (which purges a private
+        # submission's repo token) so the PR comment can still post. Previously
+        # rotation-skipped miners got no PR feedback at all — the reason lived
+        # only on the status endpoint.
+        from minotaur_subnet.relayer.solver_repo import on_round_not_selected_pr
+
+        token = None
+        try:
+            token = store.get_repo_token(getattr(sub, "submission_id", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        on_round_not_selected_pr(sub, reason, repo_token=token)
+
     return apply_rotation_slate(
-        get_store(),
+        store,
         round_id,
         _max_submissions_per_round_total(),
         RotationLedger(_rotation_ledger_path()),
+        notify=_notify_not_selected,
     )
 
 
@@ -1051,6 +1111,20 @@ async def create_submission(
     )
     if not _merge_ok:
         raise HTTPException(status_code=409, detail=_merge_reason)
+
+    # Private path: verify the PAT can WRITE before accepting. Posting the intake
+    # ACK comment exercises the exact permission (Pull requests: Write) the
+    # post-benchmark report needs — reads alone (resolve_pr, clone, mergeability)
+    # all pass on an under-scoped token, and the miss would otherwise surface
+    # days later as a silent 403 on the report post. Runs LAST among the intake
+    # gates so a submission rejected above never receives an ACK comment.
+    if _private:
+        _require_pr_comment_scope(
+            body.pr_number,
+            owner_repo=_owner_repo,
+            token=body.repo_token,
+            round_id=current_round.round_id,
+        )
 
     # Check for duplicate submission. Store the RESOLVED clone_url + head SHA
     # as repo_url/commit_hash (downstream screening/champion plumbing is unchanged).

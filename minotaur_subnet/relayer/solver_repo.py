@@ -405,6 +405,44 @@ def comment_on_pr(
     return status in (200, 201)
 
 
+def post_intake_ack(
+    pr_number: int, *, owner_repo: tuple[str, str], token: str, round_id: str,
+) -> int:
+    """Post the intake ACK comment on a PRIVATE-path PR; return the HTTP status.
+
+    This is the write-scope probe for the miner's per-submission PAT: commenting
+    on a PR is gated by the SAME fine-grained permission (``Pull requests: Write``)
+    the post-benchmark report needs, and there is no reliable read-only way to
+    check a fine-grained token's granted permissions. Without it an under-scoped
+    (read-only) token passes intake — resolve_pr and clone only need reads — and
+    the failure surfaces days later as a silent 403 when the report posts (seen
+    live 2026-07-03: 39 x 403 across two miners' private repos).
+
+    Returns the raw status so the intake gate can distinguish a definitive
+    permission failure (401/403/404 → reject the submission with an actionable
+    message) from a transient one (0/5xx → fail open). Unlike ``comment_on_pr``
+    this never falls back to the canonical repo: the probe is only meaningful
+    against the miner's own repo with the miner's own token.
+    """
+    owner, repo = owner_repo
+    status, _ = _github_api_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        {
+            "body": (
+                "### Submission received\n\n"
+                f"Queued for screening and benchmarking in round `{round_id}`. "
+                "The benchmark report (or rejection reason) will be posted on "
+                "this PR.\n\n"
+                "_This comment also verifies your `repo_token` can post that "
+                "report (`Pull requests: Read and write`)._"
+            )
+        },
+        token=token,
+    )
+    return status
+
+
 def close_pr(pr_number: int) -> bool:
     """Close a solver-repo PR (the REJECT path — no certificate was emitted)."""
     owner_repo = _parse_github_owner_repo()
@@ -552,21 +590,26 @@ def _render_report_body(
 
 
 def _pr_comment_target(submission: Any, repo_token: str | None):
-    """Return ``(owner_repo, token)`` for commenting on a submission's PR.
+    """Return ``(owner_repo, token)`` for commenting on a submission's PR,
+    or ``None`` when there is NO safe target and the comment must be skipped.
 
-    Private submissions comment on the miner's private repo using the
-    per-submission PAT; public submissions return ``(None, None)`` so
-    ``comment_on_pr`` falls back to the canonical repo + env token.
+    Public submissions return ``(None, None)`` so ``comment_on_pr`` falls back
+    to the canonical repo + env token. Private submissions comment on the
+    miner's private repo using the per-submission PAT — and when that token is
+    unavailable (lost pre-#500, purged, SUBMISSION_TOKEN_PERSIST=0) the answer
+    is ``None``, NOT the canonical fallback: a private submission's pr_number
+    is meaningless on the canonical repo, and when a same-numbered PR happens
+    to exist there the post SUCCEEDS silently — misdirecting a private miner's
+    per-order report onto a public team PR (seen live 2026-07-02, canonical
+    PR#1/#3). Callers must treat ``None`` as skip-with-warning.
     """
-    if (
-        getattr(submission, "is_private", False)
-        and getattr(submission, "private_repo_full", None)
-        and repo_token
-    ):
+    if not getattr(submission, "is_private", False):
+        return None, None
+    if getattr(submission, "private_repo_full", None) and repo_token:
         owner, _, repo = submission.private_repo_full.partition("/")
         if owner and repo:
             return (owner, repo), repo_token
-    return None, None
+    return None
 
 
 def on_champion_rejected_pr(
@@ -597,8 +640,17 @@ def on_champion_rejected_pr(
     body = report_md or _render_report_body(
         submission, reason, champion_score, dethrone_margin,
     )
-    _owner_repo, _tok = _pr_comment_target(submission, repo_token)
-    commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
+    _target = _pr_comment_target(submission, repo_token)
+    if _target is None:
+        logger.warning(
+            "Champion reject for private %s (PR#%s): no usable repo token — "
+            "SKIPPING the PR comment (never fall back to the canonical repo)",
+            getattr(submission, "submission_id", "?"), pr_number,
+        )
+        commented = False
+    else:
+        _owner_repo, _tok = _target
+        commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
     # Do NOT close the PR on a failure — only a successful squash-merge ever closes a
     # PR (GitHub auto-closes on merge). Leaving reject / merge-gate failures OPEN lets
     # the miner read the feedback and iterate on the same PR.
@@ -641,11 +693,58 @@ def on_champion_finalist_pr(
         submission, reason, champion_score, dethrone_margin,
         won=True,
     )
-    _owner_repo, _tok = _pr_comment_target(submission, repo_token)
-    commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
+    _target = _pr_comment_target(submission, repo_token)
+    if _target is None:
+        logger.warning(
+            "Champion finalist for private %s (PR#%s): no usable repo token — "
+            "SKIPPING the PR comment (never fall back to the canonical repo)",
+            getattr(submission, "submission_id", "?"), pr_number,
+        )
+        commented = False
+    else:
+        _owner_repo, _tok = _target
+        commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
     logger.info(
         "Champion finalist PR#%s: comment=%s (kept open for cert-gated merge)",
         pr_number, commented,
+    )
+    return commented
+
+
+def on_round_not_selected_pr(
+    submission: Any, reason: str, *, repo_token: str | None = None,
+) -> bool:
+    """ROTATION path: light "not selected this round" comment on the miner's PR.
+
+    Fired at round close for submissions the LRU rotation left off the benched
+    slate — previously they were terminal-rejected with a reason only visible on
+    the status endpoint, and the PR read as pure silence. No scored report
+    (nothing was benchmarked), no image GC, PR stays open.
+
+    MUST run BEFORE the store's terminal ``reject()``: reject purges a private
+    submission's repo token, and this comment needs it to post.
+    """
+    pr_number = getattr(submission, "pr_number", None)
+    if not pr_number:
+        return False
+    _target = _pr_comment_target(submission, repo_token)
+    if _target is None:
+        logger.warning(
+            "Round not-selected for private %s (PR#%s): no usable repo token — "
+            "SKIPPING the PR comment (never fall back to the canonical repo)",
+            getattr(submission, "submission_id", "?"), pr_number,
+        )
+        return False
+    _owner_repo, _tok = _target
+    body = (
+        "### ⏭️ Not selected this round\n\n"
+        f"{reason}\n\n"
+        "_This was slate rotation (fair round entry), not a verdict on your "
+        "solver — no benchmark was run._"
+    )
+    commented = comment_on_pr(pr_number, body, owner_repo=_owner_repo, token=_tok)
+    logger.info(
+        "Round not-selected PR#%s: comment=%s (PR left OPEN)", pr_number, commented,
     )
     return commented
 

@@ -864,6 +864,45 @@ class TestEpochManager:
         assert "matched" in rejected[0][1]
 
     @pytest.mark.asyncio
+    async def test_evaluate_round_notifies_outranked_candidates_after_adoption(self):
+        """Candidates ranked BELOW the adopted finalist are never evaluated (the
+        fall-through walk stops at the first adoption) — they must still get
+        reject feedback with an explicit 'outranked' reason instead of silence
+        (live gap 2026-07-03: losers to an adopted champion got no PR comment)."""
+        top = _make_submission(
+            submission_id="sub_top", epoch=4,
+            image_id="sha256:" + "a" * 64,
+        )
+        top.pr_number = 41
+        top.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "3000000"},  # wins stored AND fresh bar
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        runner = _make_submission(
+            submission_id="sub_runner", epoch=4,
+            image_id="sha256:" + "b" * 64,
+        )
+        runner.pr_number = 42
+        runner.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "2500000"},  # adoptable at rank time
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        # Fresh bar: o1=2000000 -> top still strictly wins -> adopted first;
+        # runner is never evaluated.
+        mgr, current_round, rejected = self._fallthrough_fixture(
+            [{"intent_id": "o1", "raw_output": "2000000"},
+             {"intent_id": "o2", "raw_output": "1000000"}],
+            top, runner,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        assert result["finalist_submission_id"] == "sub_top"
+        assert [r[0] for r in rejected] == ["sub_runner"]
+        assert "outranked" in rejected[0][1]
+        assert "sub_top" in rejected[0][1]
+
+    @pytest.mark.asyncio
     async def test_evaluate_round_aborts_with_top_reason_when_fresh_bar_rejects_all(self):
         """When the fresh bar rejects every ranked candidate, the round aborts
         with the TOP-RANKED candidate's reason (the pre-fall-through headline)
