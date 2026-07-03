@@ -309,6 +309,10 @@ class CreateAppRequest(BaseModel):
         "", description="Per-App on-chain fee mode: 'USER' (users pay) or 'APP' "
         "(the App's paymaster pays). Empty = operator default (FEE_MODE_DEFAULT).",
     )
+    contract_version: str = Field(
+        "", description="Contract base generation: 'v1' (AppIntentBase) or "
+        "'v2' (AppIntentBaseV2). Empty = v1.",
+    )
 
 
 class ValidateAppRequest(BaseModel):
@@ -409,6 +413,7 @@ def create_app(
         constructor_args=body.constructor_args,
         deployer=body.deployer,
         fee_mode=body.fee_mode,
+        contract_version=body.contract_version,
     )
 
 
@@ -522,6 +527,35 @@ def list_apps(deployer: str = "", status: str = "") -> dict[str, Any]:
 def get_status(app_id: str) -> dict[str, Any]:
     """Get an App Intent's status and execution statistics."""
     return _tools.get_app_status(_store(), app_id)
+
+
+@router.get("/apps/{app_id}/admin-state", dependencies=[Depends(_require_admin)])
+async def get_admin_state(app_id: str) -> dict[str, Any]:
+    """Full operator view of an app for the management frontend.
+
+    Aggregates the store record (JS + Solidity source with sha256 hashes,
+    constructor args, contract_version, per-chain deployments) with live
+    per-chain state: on-chain app config (fee mode, collector, fee bounds,
+    paymaster, wrapped native), fee-settlement balances (the V2 app-held
+    WETH float, V1 paymaster balance + allowance, relayer gas), and
+    AppRegistry registration status (mode, appByContract, record,
+    developer allowlist).
+
+    Admin-gated: returns FULL Solidity/JS source and operational balances.
+    Chain reads are best-effort — an unreachable RPC degrades to nulls plus
+    a per-chain ``errors`` list, never a 5xx, so the frontend can always
+    render the store-side state. Runs in a thread executor: the chain reads
+    are synchronous web3 calls.
+    """
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, lambda: _tools.get_app_admin_state(_store(), app_id),
+    )
+    if "error" in result and "not found" in str(result.get("error", "")).lower():
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @router.put("/apps/{app_id}/scoring", dependencies=[Depends(_require_admin)])
