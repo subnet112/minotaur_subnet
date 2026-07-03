@@ -123,25 +123,18 @@ class ForgeCompiler:
         )
 
     def _rewrite_imports(self, source: str) -> str:
-        """Rewrite import paths so generated code resolves correctly.
+        """Rewrite import paths so submitted app source resolves during
+        ``forge build``.
 
-        Prototype imports like ``../AppIntentBase.sol`` become
-        ``../AppIntentBase.sol`` relative to ``contracts/src/generated/``.
+        Apps (minotaur-apps repo, V2 base) import the platform base contracts
+        via the ``minotaur_contracts/src/...`` submodule path, e.g.
+        ``import "minotaur_contracts/src/AppIntentBaseV2.sol"``. Generated code
+        is written to ``contracts/src/generated/``, so mapping the prefix to
+        ``../`` points it at this repo's ``contracts/src/`` — reaching
+        ``AppIntentBaseV2.sol``, ``ExecutorProxy.sol``, ``interfaces/...`` etc.
+        (V1 is not supported on this path — we only deploy V2 contracts.)
         """
-        replacements = {
-            '"./AppIntentBase.sol"': '"../AppIntentBase.sol"',
-            '"../AppIntentBase.sol"': '"../AppIntentBase.sol"',
-            '"../../AppIntentBase.sol"': '"../AppIntentBase.sol"',
-            '"../interfaces/IAppIntentBase.sol"': '"../interfaces/IAppIntentBase.sol"',
-            # OSS apps (minotaur-apps repo) import AppIntentBase via the
-            # minotaur_contracts submodule path; map it onto this repo's
-            # contracts/src/AppIntentBase.sol so submitted app source compiles
-            # without the submodule layout.
-            '"minotaur_contracts/src/AppIntentBase.sol"': '"../AppIntentBase.sol"',
-        }
-        for old, new in replacements.items():
-            source = source.replace(old, new)
-        return source
+        return source.replace('"minotaur_contracts/src/', '"../')
 
     def _run_forge_build(self) -> subprocess.CompletedProcess:
         """Run ``forge build`` in the contracts directory."""
