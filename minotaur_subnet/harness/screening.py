@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -72,6 +73,35 @@ BINARY_EXTENSIONS = {
     ".whl", ".tar", ".gz", ".zip", ".bz2",
 }
 
+# ── Factorization metric (Phase 0: OBSERVE-ONLY, not gated) ──────────────────
+# `max_region_nodes` is the largest AST-node count of any single *named region*
+# (module top-level body / function body / class body) across a submission's
+# in-tree Python. It is a golf-immune proxy for "worst entanglement": counting
+# AST nodes is invariant to formatting, so minifying a god-function changes
+# nothing — the only way to lower it is to split a region into named helpers,
+# which is exactly the factorization we want to reward.
+#
+# Phase 0 computes and PERSISTS this integer but does NOT gate on it: we soak
+# the live distribution first, then (Phase 1) set MAX_REGION_NODES to a real cap
+# and flip run_stage_1 to reject, and (Phase 2) reuse the same integer as the
+# saturated-tie dethrone tie-break. `FLOOR_VERSION` stamps the metric semantics
+# so a champion clean under vN is never retro-evicted by vN+1.
+FLOOR_VERSION = 1
+MAX_REGION_NODES: int | None = None  # None ⇒ observe-only; Phase 1 sets an int cap
+
+# Named scopes that START a new region: a nested def/class's *body* leaves its
+# parent region (its header still counts in the parent). Lambdas, comprehensions
+# and data literals deliberately do NOT appear here — their nodes count into the
+# enclosing region so logic can't be relocated into them to dodge the metric.
+_NAMED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+# Directories excluded from the scan. `.git` is VCS metadata; everything else
+# in-tree is treated as miner code (deps arrive via the pinned base image behind
+# the FROM allowlist, so a large in-tree *.py is the miner's own). Whether a
+# subnet-declared vendor path should be exempted is a Phase-1 decision — see the
+# rollout's open decision on in-tree vendored third-party *.py.
+_METRIC_EXCLUDE_DIRS = {".git"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          SCREENING RESULT
@@ -86,6 +116,10 @@ class StageResult:
     duration_ms: int = 0
     details: str = ""
     error_code: str | None = None
+    # Factorization metric, set by stage 1 only (None on other stages / errors).
+    # Computed once here so downstream consumers READ the persisted value and
+    # never recompute — a cross-CPython AST difference can't then split consensus.
+    max_region_nodes: int | None = None
 
 
 @dataclass
@@ -114,10 +148,75 @@ class ScreeningResult:
                     "duration_ms": s.duration_ms,
                     "details": s.details,
                     "error_code": s.error_code,
+                    "max_region_nodes": s.max_region_nodes,
                 }
                 for s in self.stages
             },
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                       FACTORIZATION METRIC (max_region_nodes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _module_max_region(tree: ast.Module) -> int:
+    """Largest region node-count within one parsed module.
+
+    A *region* is the body of a named scope: the module top level, or the body
+    of a FunctionDef / AsyncFunctionDef / ClassDef. Counting a region walks every
+    descendant AST node EXCEPT it does not descend into the body of a nested
+    named scope — that body forms its own region (the nested def's header still
+    counts in the parent, but its body "leaves"). So extracting a block into a
+    named helper strictly lowers the enclosing region, while hiding logic in a
+    lambda / comprehension / data literal does not (those don't start a region).
+    """
+    max_count = 0
+    regions: list[list[ast.stmt]] = [list(tree.body)]
+    while regions:
+        body = regions.pop()
+        count = 0
+        stack: list[ast.AST] = list(body)
+        while stack:
+            node = stack.pop()
+            count += 1
+            if isinstance(node, _NAMED_SCOPES):
+                # Body spins off its own region; header children (args,
+                # decorators, bases, returns) still count in THIS region.
+                regions.append(list(node.body))
+                for child in ast.iter_child_nodes(node):
+                    if any(child is stmt for stmt in node.body):
+                        continue
+                    stack.append(child)
+            else:
+                stack.extend(ast.iter_child_nodes(node))
+        if count > max_count:
+            max_count = count
+    return max_count
+
+
+def max_region_nodes(repo_path: str) -> int:
+    """Largest AST region across all in-tree Python — the factorization metric.
+
+    Golf-immune (counts AST nodes, so formatting/minification can't move it) and
+    a pure function of the candidate tree (no baseline diff, no champion source).
+    Returns 0 when the repo has no parseable Python. Unparseable files are
+    skipped in observe mode — stage 2's import check is the backstop for code
+    that cannot even be parsed.
+    """
+    root = Path(repo_path)
+    max_count = 0
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        m = _module_max_region(tree)
+        if m > max_count:
+            max_count = m
+    return max_count
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -215,10 +314,19 @@ def run_stage_1(repo_path: str) -> StageResult:
                     error_code="suspicious_binary",
                 )
 
+    # Factorization metric — Phase 0 OBSERVE-ONLY: compute + persist + log, but
+    # do NOT gate (MAX_REGION_NODES is None until Phase 1 calibrates the cap).
+    factor_nodes = max_region_nodes(repo_path)
+    logger.info(
+        "[factorization] max_region_nodes=%d floor_version=%d (observe-only, not gated) repo=%s",
+        factor_nodes, FLOOR_VERSION, repo_path,
+    )
+
     return StageResult(
         stage=1, passed=True,
         duration_ms=_elapsed(start),
         details="All static checks passed",
+        max_region_nodes=factor_nodes,
     )
 
 
