@@ -678,6 +678,29 @@ async def set_app_config_route(
     ))
 
 
+class AllowDeveloperRequest(BaseModel):
+    developer: str = Field(..., description="Developer address to (dis)allow")
+    allowed: bool = Field(True)
+
+
+@router.post(
+    "/apps/{app_id}/deployments/{chain_id}/registry/allow-developer",
+    dependencies=[Depends(_require_admin)],
+)
+async def allow_developer_route(
+    app_id: str, chain_id: int, body: AllowDeveloperRequest,
+) -> dict[str, Any]:
+    """Owner-only AppRegistry.setDeveloperAllowed via the relayer key (which
+    IS the registry owner today). Allowlisting the app's real developer lets
+    them registerApp/updateManifest from their own wallet — pair with
+    GET .../registry-calldata."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _tools.set_developer_allowed(
+        _store(), app_id, chain_id, body.developer, body.allowed,
+    ))
+
+
 @router.get(
     "/apps/{app_id}/deployments/{chain_id}/registry-calldata",
     dependencies=[Depends(_require_admin)],
