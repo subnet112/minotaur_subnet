@@ -421,6 +421,10 @@ class AppIntentsValidator:
         # ── Bittensor integration ────────────────────────────────────────
         self._metagraph_sync = None
         self._weights_emitter = None
+        # Tempo-aligned commit scheduler (TempoEmitGate) — built alongside the
+        # WeightsEmitter when Bittensor is configured; None means the legacy
+        # wall-clock cadence.
+        self._tempo_gate = None
         self._bt_wallet = None
         self._is_leader = True  # Default: standalone = always leader
         self._metagraph_task: asyncio.Task | None = None
@@ -560,16 +564,45 @@ class AppIntentsValidator:
                 if self._bt_wallet is not None:
                     from minotaur_subnet.validator.weights_emitter import WeightsEmitter
 
+                    bt_block_time = (
+                        0.25
+                        if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url
+                        else 12.0
+                    )
                     self._weights_emitter = WeightsEmitter(
                         wallet=self._bt_wallet,
                         subtensor=subtensor,
                         netuid=netuid,
-                        block_time=0.25 if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url else 12.0,
+                        block_time=bt_block_time,
                         # Pass the URL so a failed emit can rebuild the client —
                         # the emitter holds ONE long-lived Subtensor whose ws goes
                         # stale on an RPC rotation and otherwise needs a restart.
                         subtensor_url=subtensor_url,
                     )
+
+                    # Tempo-aligned commit scheduling: one commit per chain
+                    # tempo epoch, just before the epoch step, so it is the
+                    # LAST commit of its epoch and always reveals. The legacy
+                    # wall-clock cadence made 2-3 commits per tempo epoch and
+                    # the chain silently discarded all but the last — a
+                    # champion reigning less than one tempo could earn zero
+                    # despite successful set_weights calls (live incident
+                    # 2026-07-03, uid 124). TEMPO_ALIGNED_EMIT=0 restores the
+                    # legacy cadence; the gate also self-disables (returns
+                    # "unknown") when chain state can't be queried.
+                    if os.environ.get("TEMPO_ALIGNED_EMIT", "1").strip() not in ("0", "false", "no"):
+                        from minotaur_subnet.validator.tempo_gate import TempoEmitGate
+
+                        self._tempo_gate = TempoEmitGate(
+                            # Callable so the gate follows the emitter's
+                            # stale-websocket reconnects.
+                            get_subtensor=lambda: self._weights_emitter.subtensor,
+                            netuid=netuid,
+                            block_time=bt_block_time,
+                            lead_blocks=int(
+                                os.environ.get("TEMPO_EMIT_LEAD_BLOCKS", "20")
+                            ),
+                        )
 
                     # Auto-publish the axon URL on the metagraph. Bittensor
                     # convention is for the validator daemon to call
@@ -1095,17 +1128,40 @@ class AppIntentsValidator:
            burn path is unconditionally available — anything that breaks
            the queue just leaves the slot empty, and burn fires.
 
-        Cadence is rate-limited at the chain layer (commit-reveal on
-        sn112, ~100 blocks ~= 20 min). The loop ticks every 5s but
-        ``maybe_emit`` only returns a non-empty mapping when its
-        ``epoch_seconds`` window has elapsed.
+        Cadence: tempo-aligned when the TempoEmitGate can read chain state —
+        exactly ONE commit per chain tempo epoch, inside a short window just
+        before the epoch step. SN112 weights are commit-reveal and the chain
+        keeps a single pending commit per validator per tempo epoch, so any
+        earlier commit in the same epoch is silently discarded; committing
+        last-in-epoch is the only schedule where every commit reveals. Under
+        the legacy cadence (every ``epoch_seconds`` + one per round
+        activation) a champion dethroned within one tempo (~72 min) could
+        earn ZERO emission despite successful set_weights calls (live
+        incident 2026-07-03, uid 124). When the gate can't establish chain
+        state (returns None), the legacy ``maybe_emit`` wall-clock cadence
+        is the fallback. The loop ticks every 5s either way.
         """
         while True:
             await asyncio.sleep(5)
             if not self._weights_emitter:
                 continue
 
+            # Tempo gate decision: True = commit now (pre-boundary window),
+            # False = wait (mid-epoch — committing now would either be
+            # discarded by our own later commit or prematurely occupy the
+            # epoch's single reveal slot), None = chain state unknown →
+            # legacy wall-clock cadence.
+            in_window: bool | None = None
+            if self._tempo_gate is not None:
+                in_window = await self._tempo_gate.should_emit_now()
+                if in_window is False:
+                    continue
+            tempo_mode = in_window is True
+
             # Priority 1: queued per-miner mapping from api EpochManager.
+            # In tempo mode the mapping WAITS in its slot (newest-wins) until
+            # the commit window — a round activation mid-epoch no longer
+            # triggers an immediate commit that would erase the pending one.
             queued = self._queued_weights_mapping
             if queued:
                 source = self._queued_weights_source or "queued"
@@ -1113,7 +1169,9 @@ class AppIntentsValidator:
                 # The api will POST a fresh mapping on the next round close.
                 self._queued_weights_mapping = None
                 self._queued_weights_source = None
-                await self._do_emit(queued, source=source)
+                emitted = await self._do_emit(queued, source=source)
+                if tempo_mode and emitted:
+                    self._tempo_gate.mark_committed()
                 continue
 
             # Priority 2: burn fallback via ChampionWeights. Resolve the champion from
@@ -1132,25 +1190,38 @@ class AppIntentsValidator:
             self._champion_miner_id = await self._local_champion_hotkey()
             if self._champion_miner_id is None and self._champion_source != "api":
                 continue
-            epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
+            # Tempo mode: the gate already decided the timing — bypass the
+            # wall-clock check so it can't veto the boundary commit. Legacy
+            # mode: maybe_emit's epoch_seconds clock is the cadence.
+            if tempo_mode:
+                epoch_weights = self.weights.close_epoch_now(self._champion_miner_id)
+            else:
+                epoch_weights = self.weights.maybe_emit(self._champion_miner_id)
             if epoch_weights:
                 # Label the emit by what it actually does so /health last_emit.source agrees
                 # with emission_mode: "champion" when weighting a resolved champion (the
                 # 0.05/0.95 ramp), "burn" when champion is None (definitive owner burn). The
                 # old hardcoded "burn_fallback" mislabeled champion emits as burns.
-                await self._do_emit(
+                emitted = await self._do_emit(
                     epoch_weights,
                     source="champion" if self._champion_miner_id else "burn",
                 )
+                if tempo_mode and emitted:
+                    self._tempo_gate.mark_committed()
 
-    async def _do_emit(self, mapping: dict[str, float], *, source: str) -> None:
+    async def _do_emit(self, mapping: dict[str, float], *, source: str) -> bool:
         """Actually call ``WeightsEmitter.emit_async`` + record + persist state.
 
         Shared by the queue path and the burn path. The ``source`` field
         in ``_last_emit_state`` lets the validator-health workflow tell
         which input drove this emit (queued_from_api vs burn_fallback).
+
+        Returns True on a successful chain emit — the tempo-aligned scheduler
+        uses this to mark the boundary committed (a failed emit must stay
+        retryable within the commit window).
         """
         attempt_ts = time.time()
+        success = False
         # The mapping already carries the fixed champion/owner split from
         # build_bootstrap_or_champion_weights (CHAMPION_MINER_WEIGHT_FRACTION) —
         # emit it as-is; there is no order-volume scaling.
@@ -1183,6 +1254,7 @@ class AppIntentsValidator:
             logger.error("Weight emission failed (source=%s): %s", source, exc)
 
         self._persist_last_emit_state()
+        return success
 
     async def _leader_monitor_loop(self) -> None:
         """Watch for leader changes and transition between leader/follower."""
@@ -1321,6 +1393,16 @@ class AppIntentsValidator:
                 else "hold"
             ),
             "owner_hotkey_resolved": bool(self.weights.owner_hotkey),
+            # Commit scheduling: "tempo" (one commit per chain tempo epoch,
+            # pre-boundary window — see TempoEmitGate) with active=false when
+            # the gate can't read chain state and the wall-clock fallback is
+            # in effect; or "wall_clock" when TEMPO_ALIGNED_EMIT=0 / no
+            # Bittensor wiring.
+            "emit_schedule": (
+                self._tempo_gate.debug_state()
+                if self._tempo_gate is not None
+                else {"mode": "wall_clock", "epoch_seconds": self.weights.epoch_seconds}
+            ),
             "my_uid": sync_state.my_uid if sync_state is not None else None,
             "my_last_update_block": sync_state.my_last_update_block if sync_state is not None else None,
             "last_emit": self._last_emit_state,
