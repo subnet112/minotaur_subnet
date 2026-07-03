@@ -40,6 +40,7 @@ def create_app_intent(
     constructor_args: list[list[str]] | None = None,
     deployer: str = "",
     fee_mode: str = "",
+    contract_version: str = "",
 ) -> dict[str, Any]:
     """Define a new App Intent with developer-provided JS and Solidity code.
 
@@ -74,6 +75,14 @@ def create_app_intent(
     fee_mode = (fee_mode or "").strip().upper()
     if fee_mode and fee_mode not in ("USER", "APP"):
         return {"error": f"fee_mode must be 'USER', 'APP', or empty, got {fee_mode!r}"}
+
+    # Contract base generation — stored, not probed (V2 still exposes
+    # appPaymaster(), so chain views can't distinguish the generations).
+    contract_version = (contract_version or "").strip().lower()
+    if contract_version and contract_version not in ("v1", "v2"):
+        return {
+            "error": f"contract_version must be 'v1', 'v2', or empty, got {contract_version!r}",
+        }
 
     # ── both JS and Solidity are required ────────────────────────────────
     has_js = bool(js_code and js_code.strip())
@@ -189,6 +198,7 @@ def create_app_intent(
         description=description.strip() if description else "",
         manifest=extracted_manifest,
         constructor_args=ctor_args,
+        contract_version=contract_version,
     )
 
     store.save_app(definition)
