@@ -379,7 +379,7 @@ class CreateAppRequest(BaseModel):
     constructor_args: list[list[str]] | None = Field(
         None, description="Extra constructor args: [[abi_type, value], ...]",
     )
-    deployer: str = Field("", description="Deployer address (only this address can update JS later)")
+    deployer: str = Field("", description="Deployer/owner address (only this address can edit the app). Claimed unless owner_signature proves it.")
     fee_mode: str = Field(
         "", description="Per-App on-chain fee mode: 'USER' (users pay) or 'APP' "
         "(the App's paymaster pays). Empty = operator default (FEE_MODE_DEFAULT).",
@@ -388,6 +388,12 @@ class CreateAppRequest(BaseModel):
         "", description="Contract base generation: 'v1' (AppIntentBase) or "
         "'v2' (AppIntentBaseV2). Empty = v1.",
     )
+    owner_signature: str = Field(
+        "", description="EIP-712 'create_app' signature over the app content "
+        "(keccak256(js.trim()+'\\u241f'+solidity.trim())). When present, the "
+        "owner is the RECOVERED signer (proven, not claimed).",
+    )
+    owner_deadline: int = Field(0, description="Unix-seconds expiry the owner_signature was signed with.")
 
 
 class ValidateAppRequest(BaseModel):
@@ -489,6 +495,8 @@ def create_app(
         deployer=body.deployer,
         fee_mode=body.fee_mode,
         contract_version=body.contract_version,
+        owner_signature=body.owner_signature,
+        owner_deadline=body.owner_deadline,
     )
 
 
