@@ -71,7 +71,18 @@ class ChampionWeights:
         """Return champion weights if epoch has elapsed, else None."""
         if time.time() - self._epoch_start < self.epoch_seconds:
             return None
+        return self.close_epoch_now(champion_miner_id)
 
+    def close_epoch_now(self, champion_miner_id: str | None) -> dict[str, float] | None:
+        """``maybe_emit`` without the wall-clock gate.
+
+        Used by the tempo-aligned scheduler (``TempoEmitGate``), where the
+        CHAIN clock — the pre-boundary commit window — decides timing and this
+        local ``epoch_seconds`` clock must not add a second veto. Still resets
+        ``_epoch_start`` so a later fallback to the wall-clock cadence (chain
+        state unavailable) spaces itself from the last tempo-aligned emit
+        instead of firing immediately.
+        """
         weights = build_bootstrap_or_champion_weights(
             champion_miner_id,
             owner_hotkey=self.owner_hotkey,
