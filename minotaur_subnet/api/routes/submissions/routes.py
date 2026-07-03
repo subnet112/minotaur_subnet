@@ -760,11 +760,28 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
     """
     from minotaur_subnet.harness.rotation import RotationLedger, apply_rotation_slate
 
+    store = get_store()
+
+    def _notify_not_selected(sub: Any, reason: str) -> None:
+        # Runs BEFORE the store's terminal reject (which purges a private
+        # submission's repo token) so the PR comment can still post. Previously
+        # rotation-skipped miners got no PR feedback at all — the reason lived
+        # only on the status endpoint.
+        from minotaur_subnet.relayer.solver_repo import on_round_not_selected_pr
+
+        token = None
+        try:
+            token = store.get_repo_token(getattr(sub, "submission_id", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        on_round_not_selected_pr(sub, reason, repo_token=token)
+
     return apply_rotation_slate(
-        get_store(),
+        store,
         round_id,
         _max_submissions_per_round_total(),
         RotationLedger(_rotation_ledger_path()),
+        notify=_notify_not_selected,
     )
 
 
