@@ -571,6 +571,21 @@ class EpochManager:
         for candidate, reason in rejections:
             self._notify_champion_rejected(candidate, reason)
 
+        # Candidates ranked BELOW the finalist were never evaluated — the walk
+        # stops at the first adoption — and previously got NO feedback at all:
+        # from the miner's side an adopted round was indistinguishable from a
+        # dropped report (seen live 2026-07-03, knight474 PR#3/#5). Mirror the
+        # same reject path (comment + GC; their relative counts were persisted
+        # above, so the report still carries the per-order block) with an
+        # explicit outranked reason.
+        for candidate in candidates[candidates.index(finalist) + 1:]:
+            self._notify_champion_rejected(
+                candidate,
+                f"outranked: {finalist.submission_id} ranked higher and was "
+                "adopted this round, so this submission was not evaluated "
+                "against the champion — resubmit next round to compete again",
+            )
+
         # Private and public finalists follow the SAME adoption path. A private
         # finalist was certified by the quorum against its image digest (followers
         # pull-by-digest; they never need the private source), and the relayer lands
