@@ -57,6 +57,8 @@ def create_app_intent(
     deployer: str = "",
     fee_mode: str = "",
     contract_version: str = "",
+    owner_signature: str = "",
+    owner_deadline: int = 0,
 ) -> dict[str, Any]:
     """Define a new App Intent with developer-provided JS and Solidity code.
 
@@ -69,8 +71,17 @@ def create_app_intent(
         supported_chains: Chain IDs to deploy on (e.g. [1, 8453]).
         js_code:          JS scoring code (required).
         solidity_code:    Solidity contract code (required).
-        deployer:         Address of the deployer. Only this address can
-                          update the app's JS scoring code later.
+        deployer:         Claimed deployer address (the owner allowed to edit
+                          the app later). TRUSTED input only on the admin path;
+                          for self-serve, supply ``owner_signature`` so it is
+                          PROVEN instead of claimed.
+        owner_signature:  Optional EIP-712 ``create_app`` signature over the
+                          app content (see ``app_auth.create_owner_binding_hash``).
+                          When present, the deployer is set to the RECOVERED
+                          signer — ownership proven by key, not claimed — and a
+                          supplied ``deployer`` must match it.
+        owner_deadline:   Unix-seconds expiry the owner signature was signed
+                          with.
 
     Returns:
         Full AppIntentDefinition as a dict, including JS and Solidity
@@ -150,14 +161,42 @@ def create_app_intent(
     except Exception as exc:
         logger.warning("Pre-flight validation skipped: %s", exc)
 
-    # ── validate deployer address (if provided) ────────────────────────
+    # ── resolve the deployer (owner allowed to edit) ───────────────────
+    # Two paths:
+    #  • owner_signature present → PROVEN ownership: recover the signer over the
+    #    app content and record THAT as deployer (self-serve; can't be spoofed).
+    #    A supplied `deployer` must match the recovered signer.
+    #  • no signature → the deployer field is trusted as-is (admin path — the
+    #    create route is admin-gated, so only operators use this).
     deployer_addr = ""
-    if deployer and deployer.strip():
+    claimed = deployer.strip() if deployer else ""
+    if claimed:
         try:
-            ia = parse_address(deployer.strip())
-            deployer_addr = ia.address  # EIP-55 checksummed
+            deployer_addr = parse_address(claimed).address  # EIP-55 checksummed
         except ValueError as exc:
             return {"error": f"Invalid deployer address: {exc}"}
+
+    if owner_signature:
+        from minotaur_subnet.api.services import app_auth, developer_auth
+
+        # Binds the TRIMMED code the request carries — frontend signs
+        # keccak256(toUtf8Bytes(js.trim() + "␟" + sol.trim())).
+        binding = app_auth.create_owner_binding_hash(js_code, solidity_code)
+        signer, err = developer_auth.recover_developer_auth(
+            action=developer_auth.ACTION_CREATE_APP, app_id="",
+            params_hash=binding, nonce=0, deadline=owner_deadline,
+            signature=owner_signature,
+        )
+        if signer is None:
+            return {"error": f"Invalid owner signature: {err}"}
+        if deployer_addr and deployer_addr.lower() != signer.lower():
+            return {
+                "error": (
+                    "deployer does not match the owner signature signer "
+                    f"({signer[:10]}…) — sign with the address you claim as owner"
+                ),
+            }
+        deployer_addr = parse_address(signer).address  # proven owner
 
     # ── build definition ─────────────────────────────────────────────────
     app_id = _generate_app_id()
