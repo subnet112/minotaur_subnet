@@ -58,6 +58,20 @@ def deploy_gas_estimate() -> int:
         return DEFAULT_DEPLOY_GAS_ESTIMATE
 
 
+def deploy_fee_exempt_addresses() -> set[str]:
+    """Addresses whose deploys are exempt from the 0.5 TAO fee
+    (``DEPLOY_FEE_EXEMPT_ADDRESSES``, comma-separated, lowercased). For
+    first-party / whitelisted deployers."""
+    raw = os.environ.get("DEPLOY_FEE_EXEMPT_ADDRESSES", "")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
+
+
+def is_deploy_fee_exempt(address: str | None) -> bool:
+    """Whether ``address`` (the app's deployer) is on the fee-exempt allowlist."""
+    a = (address or "").strip().lower()
+    return bool(a) and a in deploy_fee_exempt_addresses()
+
+
 def public_deployment_enabled() -> bool:
     """Whether PUBLIC (non-admin / 3rd-party) App deployment is enabled. **DEFAULT OFF.**
 
@@ -72,6 +86,7 @@ def public_deployment_enabled() -> bool:
 def quote_deployment(
     chains: list[int],
     gas_price_wei_by_chain: dict[int, int] | None = None,
+    deployer: str | None = None,
 ) -> dict:
     """Deployment quote: estimated gas per targeted chain + the deploy fee (#238).
 
@@ -79,6 +94,10 @@ def quote_deployment(
     chains with a price get a ``gas_cost_wei``; others get the gas estimate only.
     Gas is fronted by the relayer today — the cost is informational until public
     deployment + fee collection are live.
+
+    ``deployer`` (optional): when given and on the fee-exempt allowlist, the
+    quote reports ``fee_waived`` and a zero effective fee so the frontend can
+    skip the payment step.
     """
     prices = gas_price_wei_by_chain or {}
     est = deploy_gas_estimate()
@@ -90,10 +109,12 @@ def quote_deployment(
             entry["gas_price_wei"] = int(gp)
             entry["gas_cost_wei"] = est * int(gp)
         gas[str(c)] = entry
+    waived = is_deploy_fee_exempt(deployer)
     return {
         "gas": gas,
-        "deploy_fee_tao": deploy_fee_tao(),
-        "deploy_fee_rao": deploy_fee_rao(),
+        "deploy_fee_tao": 0.0 if waived else deploy_fee_tao(),
+        "deploy_fee_rao": 0 if waived else deploy_fee_rao(),
+        "fee_waived": waived,
         "fee_collection_enabled": public_deployment_enabled(),
         "note": (
             "Deploy fee compensates the miner work to solve the new App. Gas is "
@@ -107,13 +128,14 @@ class DeploymentFeeRequired(Exception):
     """A deployment was refused by the #238 public-deployment / fee gate."""
 
 
-def require_deployment_authorized(*, is_admin: bool, fee_paid: bool = False) -> None:
-    """Hard gate (#238). Admin deploys pass (free, as today). A PUBLIC/3rd-party
-    deploy is REFUSED unless public deployment is enabled AND the deploy fee was
-    paid. Collection is not wired yet, so ``fee_paid`` is always False for public
-    callers — public deployment is structurally blocked until collection lands.
+def require_deployment_authorized(
+    *, is_admin: bool, fee_paid: bool = False, fee_exempt: bool = False,
+) -> None:
+    """Hard gate (#238). Admin deploys pass (free, as today), as do deploys by a
+    fee-exempt (whitelisted) deployer. Otherwise a PUBLIC/3rd-party deploy is
+    REFUSED unless public deployment is enabled AND the deploy fee was paid.
     """
-    if is_admin:
+    if is_admin or fee_exempt:
         return
     if not public_deployment_enabled():
         raise DeploymentFeeRequired(

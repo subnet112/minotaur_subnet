@@ -179,10 +179,18 @@ class TestConsumePaymentRefStore(unittest.TestCase):
         self.assertTrue(self.store.consume_payment_ref("ref-2", "a")[0])
 
 
-class TestRailIsAlwaysFinney(unittest.TestCase):
-    def test_verifier_is_finney_no_env(self):
-        # The rail is not configurable — always the finney verifier.
-        self.assertIsInstance(dp.get_payment_verifier(), fp.FinneyPaymentVerifier)
+class TestRailSelection(unittest.TestCase):
+    def test_default_rail_is_evm(self):
+        # Default rail is EVM (WTAO on BT EVM) — the developer's own wallet pays.
+        from minotaur_subnet.api.services.evm_payment import EvmDeployFeeVerifier
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEPLOY_FEE_RAIL", None)
+            self.assertIsInstance(dp.get_payment_verifier(), EvmDeployFeeVerifier)
+
+    def test_finney_rail_selectable(self):
+        with patch.dict(os.environ, {"DEPLOY_FEE_RAIL": "finney"}):
+            self.assertIsInstance(dp.get_payment_verifier(), fp.FinneyPaymentVerifier)
 
 
 class TestSubstrateReaderPure(unittest.TestCase):
@@ -232,10 +240,16 @@ class TestVerifyDeployFeePaymentFinneyIntegration(unittest.TestCase):
 
     def test_full_finney_authorization(self):
         verifier = fp.FinneyPaymentVerifier(reader=_FakeReader(_record()))
-        with patch.dict(os.environ, {"ENABLE_PUBLIC_DEPLOYMENT": "1", "DEPLOY_FEE_COLLECTOR_SS58": COLLECTOR}):
+        # The fee binds the payment chain; pin it to this test's CHAIN so the
+        # signature (built over CHAIN) matches the server's recomputed hash.
+        with patch.dict(os.environ, {
+            "ENABLE_PUBLIC_DEPLOYMENT": "1",
+            "DEPLOY_FEE_COLLECTOR_SS58": COLLECTOR,
+            "DEPLOY_FEE_PAYMENT_CHAIN_ID": str(CHAIN),
+        }):
             ok, err = dp.verify_deploy_fee_payment(
                 self.store, self.store.get_app(self.app_id),
-                chain_id=CHAIN, payment=self._payment(), verifier=verifier,
+                payment=self._payment(), verifier=verifier,
             )
         self.assertTrue(ok, err)
         # both the nonce and the payment are now consumed
