@@ -1639,3 +1639,31 @@ class TestBenchmarkSnapshotWiring:
         assert worker._epoch_block_number is None
         worker.set_epoch_block(19500000)
         assert worker._epoch_block_number == 19500000
+
+
+# ── Phase-2 factorization rank tie-break ──────────────────────────────────────
+
+
+def test_finalist_tiebreak_prefers_cleaner_factorization():
+    """On a performance tie the CLEANEST candidate (smallest persisted
+    max_region_nodes) ranks first — ahead of the content-addressed fallback —
+    and an UNMEASURED (None) candidate can never win a tie on cleanliness."""
+    mgr = EpochManager(
+        block_loop=_make_mock_block_loop(),
+        submission_store=_make_store_with_subs(),
+    )
+    # Same score everywhere ⇒ identical (adoptable, net) ⇒ tie.
+    dirty = _make_submission(submission_id="sub_aaa", score=0.9)   # aaa wins image_id order
+    clean = _make_submission(submission_id="sub_bbb", score=0.9)
+    unmeasured = _make_submission(submission_id="sub_000", score=0.9)  # image_id sorts FIRST
+    dirty.max_region_nodes = 900
+    clean.max_region_nodes = 120
+    unmeasured.max_region_nodes = None
+    for order in ([dirty, clean, unmeasured], [unmeasured, dirty, clean], [clean, unmeasured, dirty]):
+        ranked = mgr._eligible_candidates(list(order))
+        # cleanest first; unmeasured LAST despite winning every string tie-break.
+        assert [s.submission_id for s in ranked] == ["sub_bbb", "sub_aaa", "sub_000"]
+    # Among all-unmeasured records the legacy content-addressed order still holds.
+    a = _make_submission(submission_id="sub_aaa", score=0.9)
+    b = _make_submission(submission_id="sub_bbb", score=0.9)
+    assert [s.submission_id for s in mgr._eligible_candidates([b, a])] == ["sub_aaa", "sub_bbb"]

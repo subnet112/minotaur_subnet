@@ -375,6 +375,10 @@ def health() -> dict:
         data["round_anchor"] = dict(ctx.round_anchor_parity)
     if ctx.last_independent_vote:
         data["independent_vote"] = dict(ctx.last_independent_vote)
+    # Diagnostic shadow-vote verdict (run_shadow_vote, arbitrary image) — its own
+    # key so a probe never masquerades as the real independent vote above.
+    if ctx.last_shadow_vote:
+        data["shadow_vote"] = dict(ctx.last_shadow_vote)
     # Relative per-order adoption verdict for the latest challenger — the
     # AUTHORITATIVE leader decision (relative rule is the sole adoption path).
     # Absent until the first evaluation. Key kept for backward compatibility.

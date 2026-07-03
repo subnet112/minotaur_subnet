@@ -1105,10 +1105,14 @@ class EpochManager:
         Reuses the per-order rows already computed this round; needs no extra bench.
 
         DETERMINISM: an adoptable candidate always outranks a non-adoptable one, then
-        higher net-better wins, then a content-addressed (image_id, submission_id)
-        tie-break — so a failed-over leader on the same store nominates the SAME
-        finalist (the previous stable-sort break was the LOCAL-clock created_at, which
-        could diverge). champ_rows are the champion's STORED per-order rows (from its
+        higher net-better wins, then the CLEANEST candidate (ascending PERSISTED
+        ``max_region_nodes`` — the Phase-2 factorization tie-break; unmeasured
+        records rank last on that key and can never win a tie on it), then the
+        content-addressed (image_id, submission_id) final fallback — so a
+        failed-over leader on the same store nominates the SAME finalist (the
+        metric is persisted at screening and mirrored with the record, never
+        recomputed here; the previous stable-sort break was the LOCAL-clock
+        created_at, which could diverge). champ_rows are the champion's STORED per-order rows (from its
         last bench), which is enough for a deterministic RANK — the incumbent is only
         re-benched (for the actual adoption verdict) AFTER a finalist is picked, so an
         idle round with no candidate never pays for a re-bench.
@@ -1136,13 +1140,22 @@ class EpochManager:
                 reason,
             )
 
-        def _rank_key(s: Submission) -> tuple[int, int, str, str]:
+        # Ties on (adoptable, net) rank the CLEANEST candidate first (Phase-2
+        # factorization tie-break). None (record predates the metric / not yet
+        # screened under it) sorts BELOW every measured value via this sentinel,
+        # so an unmeasured candidate can never win a tie on cleanliness.
+        _FACTOR_UNMEASURED = 2**31
+
+        def _rank_key(s: Submission) -> tuple[int, int, int, str, str]:
             v = evaluate_relative_adoption(champ_rows, self._per_intent(s))
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
+            nodes = getattr(s, "max_region_nodes", None)
             return (
                 0 if v["adopt"] else 1,   # adoptable candidates first
                 -net,                     # then most net-better vs champion
-                str(s.image_id or ""),    # content-addressed, host-independent tie-break
+                # then best-factored (smallest persisted max region; measured-only)
+                nodes if isinstance(nodes, int) else _FACTOR_UNMEASURED,
+                str(s.image_id or ""),    # content-addressed, host-independent fallback
                 str(s.submission_id or ""),
             )
 
@@ -1341,6 +1354,7 @@ class EpochManager:
         try:
             from minotaur_subnet.epoch.relative_scoring import (
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1350,7 +1364,17 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            # Phase-2 factorization tie-break input — PERSISTED metrics only
+            # (None on either side ⇒ 0 ⇒ clause inert), IDENTICAL to the live
+            # decision (_evaluate_per_order_adoption) so this published would-be
+            # vote keeps matching the real verdict.
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+            )
             adopt = bool(verdict["adopt"])
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
@@ -1361,6 +1385,8 @@ class EpochManager:
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
             }
             logger.info(
@@ -1495,6 +1521,7 @@ class EpochManager:
         try:
             from minotaur_subnet.epoch.relative_scoring import (
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1504,7 +1531,20 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            # Phase-2 factorization tie-break: on a true all-matched tie a
+            # materially better-factored challenger dethrones. Inputs are the
+            # PERSISTED screening metrics (None on either side ⇒ delta 0 ⇒
+            # clause inert — the backfill of the standing champion's value is
+            # the deliberate fleet-wide activation lever). Never recomputed at
+            # decision time. IDENTICAL threading to the follower's
+            # _independent_adopt_vote, so leader and fleet keep deciding alike.
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+            )
 
             logger.info(
                 "[per-order-adoption] challenger=%s verdict=%s wins=%d regressions=%d "
@@ -1524,6 +1564,8 @@ class EpochManager:
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
                 "per_order": verdict["per_order"],
             }

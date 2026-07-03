@@ -485,3 +485,148 @@ def test_reason_behind_uses_matched_and_regressed():
 
 def test_reason_none_when_no_counts():
     assert relative_reason(None) is None
+
+
+# ── Phase-2 factorization tie-break (saturated-tie dethrone) ──────────────────
+#
+# factor_delta = champion.max_region_nodes - challenger.max_region_nodes (the
+# PERSISTED screening metric). The clause fires ONLY when FACTOR_MARGIN is armed
+# (a fleet-wide code promotion — None ships disarmed) AND on a true all-matched
+# tie over a non-empty comparison; performance always outranks cleanliness.
+
+import pytest  # noqa: E402
+
+from minotaur_subnet.epoch import relative_scoring as _rs  # noqa: E402
+from minotaur_subnet.epoch.relative_scoring import factor_delta_between  # noqa: E402
+
+_ARMED_MARGIN = 25
+
+
+@pytest.fixture
+def armed_margin(monkeypatch):
+    """Arm the Phase-2 tie-break the way the fleet-wide promotion would."""
+    monkeypatch.setattr(_rs, "FACTOR_MARGIN", _ARMED_MARGIN)
+    return _ARMED_MARGIN
+
+
+def test_factor_delta_between_none_safety():
+    # None on EITHER side ⇒ 0 ⇒ clause inert (the data-side rollout guard).
+    assert factor_delta_between(None, 40) == 0
+    assert factor_delta_between(100, None) == 0
+    assert factor_delta_between(None, None) == 0
+    assert factor_delta_between(100, 40) == 60
+    assert factor_delta_between(40, 100) == -60
+
+
+def test_disarmed_default_never_fires_even_with_huge_delta():
+    # FACTOR_MARGIN ships None (disarmed): natural champion turnover putting
+    # measured metrics on BOTH sides must NOT silently activate the tie-break.
+    assert _rs.FACTOR_MARGIN is None
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["adopt"] is False
+    # No hint about a rule that cannot fire.
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_all_matched_tie_with_factor_margin_dethrones(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "factorization"
+    assert "better factored" in res["reason"]
+    assert res["n_matched"] == 2 and res["n_wins"] == 0
+
+
+def test_all_matched_tie_below_margin_does_not_adopt(armed_margin):
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin - 1)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+    # Armed + cleaner-but-not-enough: the miner sees how far off they landed.
+    assert "factor delta" in res["reason"]
+
+
+def test_all_matched_tie_default_delta_unchanged(armed_margin):
+    # No factor_delta passed (a call site that predates Phase 2): behavior
+    # identical to before even when armed — a tie never adopts.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["factor_delta"] == 0
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_factor_never_buys_past_a_regression(armed_margin):
+    # 1 tolerated regression, everything else matched, huge factor delta:
+    # the factor path requires ZERO regressions — no adopt.
+    champ = [_r("o1", "10000"), _r("o2", "200")]
+    chal = [_r("o1", "9950"), _r("o2", "200")]  # -0.5%: tolerated regression
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_regressions"] == 1 and res["n_catastrophic"] == 0
+    assert res["adopt"] is False
+
+
+def test_factor_never_buys_past_a_drop(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100")]  # drops o2
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_dropped"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_never_buys_past_a_catastrophic_cut(armed_margin):
+    champ = [_r("o1", "10000")]
+    chal = [_r("o1", "9800")]  # -2%: catastrophic
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_catastrophic"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_path_requires_true_tie_not_net_zero(armed_margin):
+    # 1 win + 1 regression nets to zero but is NOT an all-matched tie: the
+    # factor clause must not fire (net-zero-with-noise is the performance
+    # rule's domain, and it rejects at DETHRONE_WIN_MARGIN=1).
+    champ = [_r("o1", "10000"), _r("o2", "10000")]
+    chal = [_r("o1", "10500"), _r("o2", "9950")]  # +5% win, -0.5% regression
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_wins"] == 1 and res["n_regressions"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_ignored_when_performance_decides(armed_margin):
+    # A clean performance win adopts via performance regardless of a NEGATIVE
+    # factor delta (dirtier challenger still wins on orders).
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "150")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=-(10**6))
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "performance"
+
+
+def test_factor_tie_requires_nonempty_comparison(armed_margin):
+    # Two no-data solvers must never adopt on cleanliness alone.
+    res = evaluate_relative_adoption([], [], factor_delta=10**6)
+    assert res["scenarios_compared"] == 0
+    assert res["adopt"] is False
+
+
+def test_negative_delta_on_tie_does_not_adopt(armed_margin):
+    # Challenger DIRTIER than champion on a tie: no adopt.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=-5)
+    assert res["adopt"] is False
+    # No misleading "factor delta" hint when the challenger isn't cleaner.
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_counts_factorization_dethrone_maps_to_dethrone_verdict(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin + 10)
+    assert res["adopt"] is True and res["factor_delta"] == armed_margin + 10

@@ -81,6 +81,31 @@ FLOOR_BPS = 100  # 1.0% hard per-order regression cap
 # net positive by one order".
 DETHRONE_WIN_MARGIN = 1
 
+# FACTOR_MARGIN — saturated-tie FACTORIZATION dethrone margin (Phase 2 of the
+# factorization rule; see harness/screening.max_region_nodes). When a challenger
+# ties the champion on EVERY compared order (all matched — zero wins, zero
+# regressions, zero blind spots, zero drops), it may still dethrone iff its
+# ``max_region_nodes`` is at least this many AST nodes SMALLER than the
+# champion's. Output saturates on this subnet, so exact ties are the common
+# case; this turns them into continuous downward pressure on the champion's
+# worst-entangled region instead of pure incumbency. Guards:
+#   * fires ONLY on a true all-matched tie — a single regression, drop, or
+#     catastrophic cut disables it (cleanliness never buys past performance);
+#   * well above 1 so a cosmetic few-node diff can't churn the throne;
+#   * each factor-win strictly LOWERS the champion's max region, so the process
+#     is monotone and self-terminating.
+# CONSENSUS-CRITICAL CODE constant (same discipline as FLOOR_BPS above — never
+# env-read) and the Phase-2 ARMING SWITCH, mirroring MAX_REGION_NODES in
+# screening: while None the tie-break clause CANNOT fire, no matter what
+# factor_delta callers pass. This must be the explicit switch — None-safety of
+# factor_delta_between alone is NOT one: natural champion turnover (a
+# performance win by a post-Phase-0, metric-carrying challenger) would
+# otherwise put measured records on BOTH sides and silently activate an
+# uncalibrated margin with no backfill ever run. Set the calibrated int (from
+# the Phase-0 soak) in the same fleet-wide promotion that precedes the champion
+# backfill — never via a leader-only deploy.
+FACTOR_MARGIN: int | None = None  # None ⇒ tie-break disarmed; Phase 2 arms an int
+
 # Basis-points denominator for the cross-multiplied comparison.
 _BPS = 10000
 
@@ -168,10 +193,34 @@ def _has_value(score: Any) -> bool:
     return parsed is not None and parsed > MIN_VALID_OUTPUT
 
 
+def factor_delta_between(
+    champion_nodes: int | None,
+    challenger_nodes: int | None,
+) -> int:
+    """``champion.max_region_nodes − challenger.max_region_nodes``, None-safe.
+
+    Positive = the challenger's worst region is SMALLER (better factored). Returns
+    0 — rendering the factor tie-break clause inert — when EITHER side's metric is
+    missing: a champion adopted before the metric existed, or a record from a
+    fleet member not yet carrying the field. That None-safety is the ROLLOUT
+    LEVER: the clause activates fleet-wide only once the standing champion's
+    value is backfilled, never piecemeal via a leader-only deploy.
+
+    Callers pass the PERSISTED ``Submission.max_region_nodes`` values (computed
+    once at screening) — never recompute the metric at decision time, so a
+    cross-CPython AST difference can never split consensus.
+    """
+    if champion_nodes is None or challenger_nodes is None:
+        return 0
+    return int(champion_nodes) - int(challenger_nodes)
+
+
 def evaluate_relative_adoption(
     champion_results: list[Any],
     challenger_results: list[Any],
     tol_bps: int = RELATIVE_TOL_BPS,
+    *,
+    factor_delta: int = 0,
 ) -> dict[str, Any]:
     """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
@@ -196,14 +245,27 @@ def evaluate_relative_adoption(
 
         adopt = (n_catastrophic == 0)                # (1) no order cut > 1% (hard floor)
                 and (n_dropped == 0)                 # (2) drop no champion-served order
-                and ((n_wins + n_blind_spots)        # (3) NET better on breadth
-                     >= n_regressions + DETHRONE_WIN_MARGIN)
+                and (((n_wins + n_blind_spots)       # (3a) NET better on breadth, OR
+                      >= n_regressions + DETHRONE_WIN_MARGIN)
+                     or (FACTOR_MARGIN is not None   # (3b) saturated-tie factorization
+                         and scenarios_compared > 0  #      (only when Phase-2 is armed)
+                         and n_wins + n_blind_spots == 0
+                         and n_regressions == 0
+                         and factor_delta >= FACTOR_MARGIN))
 
     Blind-spot covers count on the wins side of the net (covering new orders is
     rewarded). A >1% per-order cut (catastrophic) and a dropped order are each a
     HARD VETO that no number of wins can override. When ``adopt`` holds,
     ``n_catastrophic == 0`` so every counted regression is the tolerated
     <=1% kind.
+
+    ``factor_delta`` (keyword-only) is the Phase-2 factorization tie-break input:
+    ``champion.max_region_nodes − challenger.max_region_nodes`` from the PERSISTED
+    screening metric (see :func:`factor_delta_between` — 0 when either side is
+    unmeasured, keeping the clause inert). Branch (3b) fires ONLY on a true
+    all-matched tie over a non-empty comparison — a materially better-factored
+    challenger (delta >= ``FACTOR_MARGIN``) dethrones an otherwise-identical
+    champion; performance always outranks cleanliness everywhere else.
 
     ``champion_results`` / ``challenger_results`` may be ``BenchmarkResult``
     objects (unit path) or ``per_intent`` dicts (report / manager path); both are
@@ -277,15 +339,34 @@ def evaluate_relative_adoption(
 
     # BOUNDED-REGRESSION, NET-BETTER (Pareto-lite) verdict — all exact-integer.
     net_better = n_wins + n_blind_spots
+    performance_adopt = net_better >= n_regressions + DETHRONE_WIN_MARGIN
+    # Saturated-tie FACTORIZATION dethrone (Phase 2): a true all-matched tie over
+    # a non-empty comparison, broken toward the materially better-factored tree.
+    # scenarios_compared > 0 blocks the degenerate empty-vs-empty case (two
+    # no-data solvers must never adopt on cleanliness alone). With net_better and
+    # n_regressions both 0 (and n_dropped == 0 outer), compared > 0 implies every
+    # compared order MATCHED. All exact-integer, like the rest of the verdict.
+    factor_tie_adopt = (
+        FACTOR_MARGIN is not None            # Phase-2 armed (fleet-wide promotion)
+        and scenarios_compared > 0
+        and net_better == 0
+        and n_regressions == 0
+        and factor_delta >= FACTOR_MARGIN
+    )
     adopt = (
-        n_catastrophic == 0                                   # (1) no order cut > 1% (hard floor)
-        and n_dropped == 0                                    # (2) drop no champion-served order
-        and net_better >= n_regressions + DETHRONE_WIN_MARGIN  # (3) net better on breadth
+        n_catastrophic == 0                       # (1) no order cut > 1% (hard floor)
+        and n_dropped == 0                        # (2) drop no champion-served order
+        and (performance_adopt or factor_tie_adopt)  # (3) net better OR factor tie-break
     )
     if n_catastrophic > 0:
         reason = f"reject: {n_catastrophic} order(s) cut >1% (hard floor)"
     elif n_dropped > 0:
         reason = f"reject: dropped {n_dropped} order(s) the champion serves"
+    elif adopt and not performance_adopt:
+        reason = (
+            f"dethrone: matched on all {n_matched} order(s), better factored "
+            f"(max region -{factor_delta} nodes >= margin {FACTOR_MARGIN})"
+        )
     elif adopt:
         reason = (
             f"dethrone: {net_better} better, {n_regressions} minor regression(s) "
@@ -293,6 +374,11 @@ def evaluate_relative_adoption(
         )
     elif net_better == 0 and n_regressions == 0:
         reason = "matched: no order better or worse"
+        if FACTOR_MARGIN is not None and scenarios_compared > 0 and factor_delta > 0:
+            # A cleaner-but-not-clean-enough tie: tell the miner how far off the
+            # factorization tie-break they landed (display only; armed-only so a
+            # disarmed fleet never hints at a rule that cannot fire).
+            reason += f" (factor delta {factor_delta} < margin {FACTOR_MARGIN})"
     else:
         reason = (
             f"reject: net better {net_better} <= regressions {n_regressions} "
@@ -302,6 +388,16 @@ def evaluate_relative_adoption(
     return {
         "adopt": adopt,
         "reason": reason,
+        # How the adopt (if any) was won — "performance" (net-better) or
+        # "factorization" (saturated-tie factor dethrone). None when not adopting.
+        # Additive display/observability key; the boolean ``adopt`` stays the
+        # single authoritative verdict.
+        "adopt_via": (
+            "performance" if (adopt and performance_adopt)
+            else "factorization" if adopt
+            else None
+        ),
+        "factor_delta": factor_delta,
         "per_order": per_order,
         "n_wins": n_wins,
         "n_regressions": n_regressions,

@@ -399,7 +399,10 @@ async def _independent_adopt_vote(
         require_real_sim_default,
         run_benchmark,
     )
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        evaluate_relative_adoption,
+        factor_delta_between,
+    )
 
     def _counts(v: dict[str, Any]) -> dict[str, Any]:
         # Relative better/worse/matched breakdown — the display + tally shape that
@@ -417,7 +420,8 @@ async def _independent_adopt_vote(
     # same predicate at decision time (_maybe_seed_genesis_incumbent), so
     # _resolve_incumbent_submission() replicates it. The bootstrap branch below is
     # reached only at TRUE bootstrap — no champion AND no scored genesis yet.
-    has_champion = worker._resolve_incumbent_submission() is not None
+    incumbent_sub = worker._resolve_incumbent_submission()
+    has_champion = incumbent_sub is not None
     champ_image = worker._resolve_champion_image()
 
     if not has_champion:
@@ -508,7 +512,20 @@ async def _independent_adopt_vote(
     # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
     # Joins champion vs challenger BenchmarkResults by intent_id on raw_output (the
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
-    verdict = evaluate_relative_adoption(champ_results, chal_results)
+    # factor_delta: the Phase-2 factorization tie-break, from the PERSISTED
+    # screening metrics on this follower's LOCAL records (leader-computed once,
+    # mirrored: the candidate's via the round close snapshot; the incumbent's
+    # only via a champion force-sync — a leader-side BACKFILL does NOT reach
+    # here on its own, close snapshots are round-scoped, hence the mandatory
+    # post-backfill reattest in scripts/backfill_factor_metric.py). None on
+    # either side ⇒ 0 ⇒ clause inert, exactly like the leader.
+    verdict = evaluate_relative_adoption(
+        champ_results, chal_results,
+        factor_delta=factor_delta_between(
+            getattr(incumbent_sub, "max_region_nodes", None),
+            getattr(candidate, "max_region_nodes", None),
+        ),
+    )
     adopt = bool(verdict["adopt"])
     counts = _counts(verdict)
     logger.info(
