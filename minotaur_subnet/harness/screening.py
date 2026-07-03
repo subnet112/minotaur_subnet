@@ -81,13 +81,25 @@ BINARY_EXTENSIONS = {
 # nothing — the only way to lower it is to split a region into named helpers,
 # which is exactly the factorization we want to reward.
 #
-# Phase 0 computes and PERSISTS this integer but does NOT gate on it: we soak
-# the live distribution first, then (Phase 1) set MAX_REGION_NODES to a real cap
-# and flip run_stage_1 to reject, and (Phase 2) reuse the same integer as the
-# saturated-tie dethrone tie-break. `FLOOR_VERSION` stamps the metric semantics
-# so a champion clean under vN is never retro-evicted by vN+1.
+# The integer is ALWAYS computed and persisted (soak + Phase-2 tie-break input).
+# `MAX_REGION_NODES` is the Phase-1 ARMING SWITCH: while None, stage 1 only
+# observes; set to an int cap (calibrated from the Phase-0 soak distribution)
+# and stage 1 REJECTS `too_entangled` above it — and also rejects `dynamic_code`
+# (bare exec()/eval() calls, which would let a solver hide entangled logic in
+# strings the AST can't see). A CODE constant, never env-read (the FLOOR_BPS
+# discipline) — the floor must not depend on a host's environment. Only NEW
+# submissions gate; the standing champion is never re-screened. `FLOOR_VERSION`
+# stamps the metric semantics so a champion clean under vN is never
+# retro-evicted by vN+1.
 FLOOR_VERSION = 1
-MAX_REGION_NODES: int | None = None  # None ⇒ observe-only; Phase 1 sets an int cap
+MAX_REGION_NODES: int | None = None  # None ⇒ observe-only; Phase 1 arms an int cap
+
+# Bare builtin calls that defeat static analysis: code built in strings is
+# invisible to max_region_nodes, so once the floor is armed these are rejected
+# (error_code="dynamic_code"). Precise AST bare-Name check — attribute calls
+# like `re.compile(...)` or `tree.eval(...)` are NOT flagged, and `compile` is
+# deliberately not banned.
+_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval"})
 
 # Named scopes that START a new region: a nested def/class's *body* leaves its
 # parent region (its header still counts in the parent). Lambdas, comprehensions
@@ -219,6 +231,36 @@ def max_region_nodes(repo_path: str) -> int:
     return max_count
 
 
+def dynamic_code_calls(repo_path: str) -> list[str]:
+    """Locations (``relpath:line``) of bare ``exec(...)``/``eval(...)`` calls.
+
+    These build code in strings the AST can't see, so they would let a solver
+    smuggle an entangled god-region past :func:`max_region_nodes`. Flagged only
+    when the callee is the BARE builtin name (``ast.Name``) — attribute calls
+    (``re.compile``, ``obj.eval``) never match, and ``compile`` is not banned.
+    Same scan scope as the metric (in-tree ``*.py``, ``.git`` excluded,
+    unparseable files skipped — stage 2's import check backstops those).
+    Sorted for deterministic reject messages.
+    """
+    root = Path(repo_path)
+    hits: list[str] = []
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _BANNED_DYNAMIC_CALLS
+            ):
+                hits.append(f"{py.relative_to(root)}:{node.lineno}")
+    return sorted(hits)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          STAGE 1: STATIC CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,13 +356,44 @@ def run_stage_1(repo_path: str) -> StageResult:
                     error_code="suspicious_binary",
                 )
 
-    # Factorization metric — Phase 0 OBSERVE-ONLY: compute + persist + log, but
-    # do NOT gate (MAX_REGION_NODES is None until Phase 1 calibrates the cap).
+    # Factorization metric — ALWAYS computed + persisted (soak + Phase-2
+    # tie-break input). Gated only when the Phase-1 floor is ARMED
+    # (MAX_REGION_NODES set to an int cap); observe-only while None.
+    floor_armed = MAX_REGION_NODES is not None
     factor_nodes = max_region_nodes(repo_path)
     logger.info(
-        "[factorization] max_region_nodes=%d floor_version=%d (observe-only, not gated) repo=%s",
-        factor_nodes, FLOOR_VERSION, repo_path,
+        "[factorization] max_region_nodes=%d floor_version=%d (%s) repo=%s",
+        factor_nodes, FLOOR_VERSION,
+        f"floor armed, cap={MAX_REGION_NODES}" if floor_armed else "observe-only, not gated",
+        repo_path,
     )
+    if floor_armed:
+        # Bare exec()/eval() first: code built in strings is invisible to the
+        # metric, so an armed floor without this ban would be trivially dodged.
+        banned = dynamic_code_calls(repo_path)
+        if banned:
+            shown = ", ".join(banned[:5]) + (", …" if len(banned) > 5 else "")
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    f"Dynamic code execution (bare exec/eval) is not allowed: {shown}"
+                ),
+                error_code="dynamic_code",
+                max_region_nodes=factor_nodes,
+            )
+        if factor_nodes > MAX_REGION_NODES:
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    f"Largest code region has {factor_nodes} AST nodes, over the "
+                    f"cap of {MAX_REGION_NODES} (floor v{FLOOR_VERSION}) — split "
+                    f"the biggest function/class/module body into named helpers"
+                ),
+                error_code="too_entangled",
+                max_region_nodes=factor_nodes,
+            )
 
     return StageResult(
         stage=1, passed=True,
