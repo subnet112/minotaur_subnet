@@ -128,15 +128,21 @@ def _authorize_or_403(
     params_hash: bytes,
     *,
     consume_nonce: bool = True,
+    admin_only: bool = False,
 ) -> str:
     """Run the wallet-signature / admin-key authorization for one action or
-    raise 403. Returns the resolved signer ('admin' for the legacy bypass)."""
+    raise 403. Returns the resolved signer ('admin' for the legacy bypass).
+
+    ``admin_only=True`` restricts the signature path to APP_ADMIN_SIGNERS (the
+    app's own owner cannot self-authorize) — for the registration approval
+    gate."""
     from minotaur_subnet.api.services import app_auth
 
     ok, err, signer = app_auth.authorize(
         _store(), app_id,
         action=action, params_hash=params_hash,
         auth=ctx.auth, admin_ok=ctx.admin_ok, consume_nonce=consume_nonce,
+        admin_only=admin_only,
     )
     if not ok:
         raise HTTPException(status_code=403, detail=f"Unauthorized: {err}")
@@ -844,6 +850,92 @@ async def allow_developer_route(
     return await loop.run_in_executor(None, lambda: _tools.set_developer_allowed(
         _store(), app_id, chain_id, body.developer, body.allowed,
     ))
+
+
+class RequestRegistrationRequest(BaseModel):
+    note: str = Field("", description="Optional note for the reviewer")
+
+
+class RejectRegistrationRequest(BaseModel):
+    reason: str = Field("", description="Optional rejection reason")
+
+
+@router.post("/apps/{app_id}/registration/request")
+async def request_registration_route(
+    app_id: str,
+    body: RequestRegistrationRequest | None = None,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
+    """Owner submits a DEPLOYED app for registration review
+    (unrequested → requested). Registration is what admits an app to the live
+    order-routing set (on-chain _requireRegistered), so it is gated behind
+    admin approval — this is the request half.
+
+    Auth: admin key OR a wallet signature from an ALLOWED SIGNER (the app's
+    own deployer qualifies), action="request_registration"."""
+    import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    note = (body.note if body else "") or ""
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_REQUEST_REGISTRATION,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_REQUEST_REGISTRATION, app_id, None, note),
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _tools.request_registration(_store(), app_id, note=note))
+
+
+@router.post("/apps/{app_id}/registration/approve")
+async def approve_registration_route(
+    app_id: str,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
+    """ADMIN approves registration: mark approved and register every deployed
+    contract in the AppRegistry (admits it to live routing).
+
+    Auth: **admin only** — admin key OR a wallet signature whose signer is in
+    APP_ADMIN_SIGNERS. The app's own owner CANNOT approve their own app
+    (action="approve_registration")."""
+    import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    signer = _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_APPROVE_REGISTRATION,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_APPROVE_REGISTRATION, app_id, None),
+        admin_only=True,
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _tools.approve_registration(_store(), app_id, reviewer=signer))
+
+
+@router.post("/apps/{app_id}/registration/reject")
+async def reject_registration_route(
+    app_id: str,
+    body: RejectRegistrationRequest | None = None,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
+    """ADMIN rejects the registration request (→ rejected). On-chain state is
+    untouched; the app stays deployed but out of live routing.
+
+    Auth: **admin only** (as approve), action="reject_registration"."""
+    import asyncio
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    reason = (body.reason if body else "") or ""
+    signer = _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_REJECT_REGISTRATION,
+        app_auth.params_hash_for(
+            developer_auth.ACTION_REJECT_REGISTRATION, app_id, None, reason),
+        admin_only=True,
+    )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _tools.reject_registration(
+            _store(), app_id, reason=reason, reviewer=signer))
 
 
 @router.get("/apps/{app_id}/deployments/{chain_id}/registry-calldata")
