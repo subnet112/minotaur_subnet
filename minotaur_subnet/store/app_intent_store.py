@@ -133,6 +133,7 @@ def _definition_from_dict(d: dict[str, Any]) -> AppIntentDefinition:
         schema_id=d.get("schema_id", ""),
         policy_metadata=d.get("policy_metadata", {}),
         contract_version=d.get("contract_version", ""),
+        registration_status=d.get("registration_status", ""),
     )
 
 

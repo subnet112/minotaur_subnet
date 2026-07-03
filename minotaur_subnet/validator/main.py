@@ -427,11 +427,31 @@ class AppIntentsValidator:
         self._tempo_gate = None
         self._bt_wallet = None
         self._is_leader = True  # Default: standalone = always leader
+        # Bring-up parameters + attempt bookkeeping, stored so a failed
+        # init can be re-attempted by _bt_init_retry_loop instead of
+        # latching a dead daemon until the next container restart. The
+        # error string is surfaced in /health (``bt_init``) so operators —
+        # and the validator-health workflow — see the actual exception
+        # instead of guessing the cause from downstream symptoms.
+        self._netuid = netuid
+        self._bt_wallet_name = wallet_name
+        self._bt_hotkey_name = hotkey_name
+        self._validator_hotkey_ss58 = (validator_hotkey_ss58 or "").strip()
+        self._bt_init_attempts = 0
+        # _bt_init_ok is the /health "ok" signal. An explicit flag — set
+        # only AFTER a full attempt completes, always from the caller's
+        # side — rather than inferring from _metagraph_sync, so a probe
+        # can never observe ok=true while an attempt is mid-flight with a
+        # stale error still recorded.
+        self._bt_init_ok = False
+        self._bt_init_error: str | None = None
+        self._bt_init_error_at: float | None = None
+        self._bt_init_retry_task: asyncio.Task | None = None
         self._metagraph_task: asyncio.Task | None = None
         self._leader_monitor_task: asyncio.Task | None = None
         # Stored references for the periodic axon-resync loop. Populated
-        # in initialize() inside the ``if subtensor_url:`` block alongside
-        # the first serve_axon call. The loop uses them to call
+        # by _init_bittensor() alongside the first serve_axon call. The
+        # loop uses them to call
         # _auto_serve_axon_on_metagraph() on a timer for operators whose
         # public IP rotates (eg AWS ELB).
         self._bt_subtensor: Any = None
@@ -487,161 +507,26 @@ class AppIntentsValidator:
         self._queued_weights_source: str | None = None
 
         if subtensor_url:
+            # Chain-configured: fail CLOSED on leadership. The True default
+            # above exists for standalone mode, where there is no election.
+            # Here there IS one — it just hasn't run yet. Pre-fix the True
+            # default survived a failed Bittensor init, so one bad boot ran
+            # the BlockLoop as an unelected "phantom leader" until the next
+            # restart (the recurring issue #59 signature).
+            self._is_leader = False
+            self._bt_init_attempts += 1
             try:
-                import bittensor as bt
-
-                subtensor = bt.Subtensor(network=subtensor_url)
-                resolved_hotkey = (validator_hotkey_ss58 or "").strip()
-
-                # Restore logging — bittensor clears handlers, sets root to
-                # WARNING, and sets all existing loggers to CRITICAL.
-                logging.basicConfig(
-                    level=logging.INFO,
-                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-                    force=True,
-                )
-                for name in list(logging.Logger.manager.loggerDict):
-                    if name.startswith("minotaur_subnet"):
-                        logging.getLogger(name).setLevel(logging.NOTSET)
-
-                # Resolve owner_hotkey CHAIN-PRIMARY (env only as fallback).
-                # The subnet owner is public on-chain data — authoritative and
-                # identical for every validator — so the chain is queried FIRST
-                # and overrides the env value when present. Requiring the env was
-                # a misconfig hazard that silently broke weight emission for
-                # third-party operators on canonical compose (they had no
-                # SUBNET_OWNER_HOTKEY set and their daemon emitted {} → silent
-                # dead loop every epoch). The env stays only as a fallback for
-                # environments where the chain isn't queryable (e.g. a local
-                # testnet without the storage set).
-                from minotaur_subnet.weight_policy import lookup_subnet_owner_from_chain
-                chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
-                if chain_owner:
-                    self.weights.owner_hotkey = chain_owner
-                    logger.info(
-                        "Resolved subnet %d owner hotkey from chain: %s…",
-                        netuid, chain_owner[:16],
-                    )
-                elif not self.weights.owner_hotkey:
-                    logger.warning(
-                        "No SUBNET_OWNER_HOTKEY env AND chain lookup failed; "
-                        "weight emission will be empty until either resolves",
-                    )
-
-                if wallet_name and hotkey_name:
-                    try:
-                        from minotaur_subnet.shared.bt_wallet import load_hotkey_wallet
-                        # Honour BT_WALLET_PATH and log an actionable diagnostic on
-                        # failure instead of a bare "wallet load failed" — the most
-                        # common cause is a mount the SDK's $HOME/.bittensor default
-                        # doesn't see, or one uid 1000 can't read.
-                        self._bt_wallet = load_hotkey_wallet(wallet_name, hotkey_name)
-                        resolved_hotkey = self._bt_wallet.hotkey.ss58_address
-                    except Exception as exc:
-                        if not resolved_hotkey:
-                            raise
-                        logger.warning(
-                            "Failed to load wallet %s/%s; using explicit hotkey %s for metagraph-only mode: %s",
-                            wallet_name,
-                            hotkey_name,
-                            resolved_hotkey[:16],
-                            exc,
-                        )
-
-                if not resolved_hotkey:
-                    raise RuntimeError(
-                        "No validator hotkey available; set VALIDATOR_HOTKEY_SS58 or provide a wallet"
-                    )
-
-                from minotaur_subnet.validator.metagraph_sync import MetagraphSync
-                self._metagraph_sync = MetagraphSync(
-                    subtensor_url=subtensor_url,
-                    netuid=netuid,
-                    my_hotkey=resolved_hotkey,
-                    poll_interval=60.0,
-                )
-
-                if self._bt_wallet is not None:
-                    from minotaur_subnet.validator.weights_emitter import WeightsEmitter
-
-                    bt_block_time = (
-                        0.25
-                        if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url
-                        else 12.0
-                    )
-                    self._weights_emitter = WeightsEmitter(
-                        wallet=self._bt_wallet,
-                        subtensor=subtensor,
-                        netuid=netuid,
-                        block_time=bt_block_time,
-                        # Pass the URL so a failed emit can rebuild the client —
-                        # the emitter holds ONE long-lived Subtensor whose ws goes
-                        # stale on an RPC rotation and otherwise needs a restart.
-                        subtensor_url=subtensor_url,
-                    )
-
-                    # Tempo-aligned commit scheduling: one commit per chain
-                    # tempo epoch, just before the epoch step, so it is the
-                    # LAST commit of its epoch and always reveals. The legacy
-                    # wall-clock cadence made 2-3 commits per tempo epoch and
-                    # the chain silently discarded all but the last — a
-                    # champion reigning less than one tempo could earn zero
-                    # despite successful set_weights calls (live incident
-                    # 2026-07-03, uid 124). TEMPO_ALIGNED_EMIT=0 restores the
-                    # legacy cadence; the gate also self-disables (returns
-                    # "unknown") when chain state can't be queried.
-                    if os.environ.get("TEMPO_ALIGNED_EMIT", "1").strip() not in ("0", "false", "no"):
-                        from minotaur_subnet.validator.tempo_gate import TempoEmitGate
-
-                        self._tempo_gate = TempoEmitGate(
-                            # Callable so the gate follows the emitter's
-                            # stale-websocket reconnects.
-                            get_subtensor=lambda: self._weights_emitter.subtensor,
-                            netuid=netuid,
-                            block_time=bt_block_time,
-                            lead_blocks=int(
-                                os.environ.get("TEMPO_EMIT_LEAD_BLOCKS", "20")
-                            ),
-                        )
-
-                    # Auto-publish the axon URL on the metagraph. Bittensor
-                    # convention is for the validator daemon to call
-                    # ``serve_axon`` on startup so other validators' peer-
-                    # discovery loops can find us via ``metagraph.axons``.
-                    # Without this, the metagraph row stays at ``0.0.0.0:0``
-                    # and the discovery loop logs "no metagraph peers with
-                    # axon URLs" indefinitely. Gated on VALIDATOR_AXON_URL
-                    # being set — operators that prefer to publish out-of-
-                    # band can leave it unset and serve manually.
-                    axon_url = os.environ.get("VALIDATOR_AXON_URL", "").strip()
-                    if axon_url:
-                        _auto_serve_axon_on_metagraph(
-                            subtensor=subtensor,
-                            bt_module=bt,
-                            wallet=self._bt_wallet,
-                            netuid=netuid,
-                            my_hotkey=resolved_hotkey,
-                            axon_url=axon_url,
-                        )
-
-                    # Stash the bittensor handles so the periodic axon-resync
-                    # loop (started later in initialize()) can reuse them
-                    # without re-creating the Subtensor client each tick.
-                    self._bt_subtensor = subtensor
-                    self._bt_module = bt
-                    self._bt_netuid = netuid
-                    self._validator_axon_url = axon_url
-
-                logger.info(
-                    "Bittensor integration enabled (netuid=%d, hotkey=%s, wallet_loaded=%s)",
-                    netuid,
-                    resolved_hotkey[:16],
-                    self._bt_wallet is not None,
-                )
+                self._init_bittensor()
+                self._bt_init_ok = True
             except Exception as exc:
-                logger.error("Bittensor init failed: %s (continuing standalone)", exc)
-                self._metagraph_sync = None
-                self._weights_emitter = None
+                # Not latched: start() spawns _bt_init_retry_loop, which
+                # re-attempts until the chain answers. Pre-fix this except
+                # "continued standalone" permanently — one transient
+                # subtensor websocket failure at container start disabled
+                # weight emission, owner-hotkey resolution, and /identity
+                # for the life of the process (~20 recurrences of the
+                # no-emitter/phantom-leader incident since 2026-05-27).
+                self._record_bt_init_failure(exc)
 
         # ── Consensus + Peer Network ─────────────────────────────────────
         self._consensus = None
@@ -733,22 +618,308 @@ class AppIntentsValidator:
                 leader_api_url,
             )
 
-    async def start(self) -> None:
-        """Load active intents, start block loop, and start HTTP server."""
-        if self._consensus is not None:
-            logger.info(
-                "Validator starting as ORDER CONSENSUS PEER — "
-                "will re-simulate and re-score proposals from leader"
-            )
-        # Pull the leader's catalog before loading intents so the first
-        # _load_active_intents pass sees the JS. If the leader is
-        # unreachable, sync.start() logs and the background loop retries.
-        if self._app_sync is not None:
-            await self._app_sync.start()
-        await self._load_active_intents()
-        self._load_orders_from_store()
+    def _init_bittensor(self) -> None:
+        """One full Bittensor bring-up attempt.
 
-        # Initial metagraph sync (determines leader/follower role)
+        Connect subtensor → resolve subnet-owner hotkey → load wallet →
+        construct MetagraphSync / WeightsEmitter / TempoEmitGate → publish
+        the axon. Raises on any failure; callers go through
+        _record_bt_init_failure(), which resets half-built state so the
+        next attempt starts clean.
+
+        Blocking (bt.Subtensor opens its websocket eagerly): __init__ runs
+        it inline for the first attempt, _bt_init_retry_loop runs it in a
+        worker thread via asyncio.to_thread. Everything is built into
+        LOCALS and published to self in one block at the very end, so
+        event-loop readers (/health, _epoch_loop, /identity) never observe
+        a half-built attempt — in particular, _epoch_loop can never pick
+        up a WeightsEmitter from an attempt that subsequently fails.
+        """
+        import bittensor as bt
+
+        subtensor_url = self._subtensor_url
+        netuid = self._netuid
+        subtensor = bt.Subtensor(network=subtensor_url)
+        try:
+            self._init_bittensor_connected(bt, subtensor)
+        except BaseException:
+            # The constructor connected eagerly; a failed attempt must not
+            # abandon the live websocket — the retry loop repeats forever
+            # (at the 300s cap ≈ 288 clients/day on a permanent misconfig)
+            # and relying on GC to reap SDK sockets/threads is how fd
+            # exhaustion happens.
+            try:
+                subtensor.close()
+            except Exception:
+                pass
+            raise
+
+    def _init_bittensor_connected(self, bt: Any, subtensor: Any) -> None:
+        """The bring-up steps after the subtensor websocket is connected.
+
+        Split from _init_bittensor only so the caller can close the
+        eagerly-connected client on ANY failure in here. Same contract:
+        raises on failure, publishes to self only in the final block.
+        """
+        subtensor_url = self._subtensor_url
+        netuid = self._netuid
+        resolved_hotkey = self._validator_hotkey_ss58
+        bt_wallet = None
+        weights_emitter = None
+        tempo_gate = None
+
+        # Restore logging — bittensor clears handlers, sets root to
+        # WARNING, and sets all existing loggers to CRITICAL.
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+            force=True,
+        )
+        for name in list(logging.Logger.manager.loggerDict):
+            if name.startswith("minotaur_subnet"):
+                logging.getLogger(name).setLevel(logging.NOTSET)
+
+        # Resolve owner_hotkey CHAIN-PRIMARY (env only as fallback).
+        # The subnet owner is public on-chain data — authoritative and
+        # identical for every validator — so the chain is queried FIRST
+        # and overrides the env value when present. Requiring the env was
+        # a misconfig hazard that silently broke weight emission for
+        # third-party operators on canonical compose (they had no
+        # SUBNET_OWNER_HOTKEY set and their daemon emitted {} → silent
+        # dead loop every epoch). The env stays only as a fallback for
+        # environments where the chain isn't queryable (e.g. a local
+        # testnet without the storage set).
+        from minotaur_subnet.weight_policy import lookup_subnet_owner_from_chain
+        chain_owner = lookup_subnet_owner_from_chain(subtensor, netuid)
+        if chain_owner:
+            self.weights.owner_hotkey = chain_owner
+            logger.info(
+                "Resolved subnet %d owner hotkey from chain: %s…",
+                netuid, chain_owner[:16],
+            )
+        elif not self.weights.owner_hotkey:
+            logger.warning(
+                "No SUBNET_OWNER_HOTKEY env AND chain lookup failed; "
+                "weight emission will be empty until either resolves",
+            )
+
+        if self._bt_wallet_name and self._bt_hotkey_name:
+            try:
+                from minotaur_subnet.shared.bt_wallet import load_hotkey_wallet
+                # Honour BT_WALLET_PATH and log an actionable diagnostic on
+                # failure instead of a bare "wallet load failed" — the most
+                # common cause is a mount the SDK's $HOME/.bittensor default
+                # doesn't see, or one uid 1000 can't read.
+                bt_wallet = load_hotkey_wallet(
+                    self._bt_wallet_name, self._bt_hotkey_name,
+                )
+                resolved_hotkey = bt_wallet.hotkey.ss58_address
+            except Exception as exc:
+                if not resolved_hotkey:
+                    raise
+                logger.warning(
+                    "Failed to load wallet %s/%s; using explicit hotkey %s for metagraph-only mode: %s",
+                    self._bt_wallet_name,
+                    self._bt_hotkey_name,
+                    resolved_hotkey[:16],
+                    exc,
+                )
+
+        if not resolved_hotkey:
+            raise RuntimeError(
+                "No validator hotkey available; set VALIDATOR_HOTKEY_SS58 or provide a wallet"
+            )
+
+        from minotaur_subnet.validator.metagraph_sync import MetagraphSync
+        metagraph_sync = MetagraphSync(
+            subtensor_url=subtensor_url,
+            netuid=netuid,
+            my_hotkey=resolved_hotkey,
+            poll_interval=60.0,
+        )
+
+        axon_url = ""
+        if bt_wallet is not None:
+            from minotaur_subnet.validator.weights_emitter import WeightsEmitter
+
+            bt_block_time = (
+                0.25
+                if "localhost" in subtensor_url or "127.0.0.1" in subtensor_url
+                else 12.0
+            )
+            weights_emitter = WeightsEmitter(
+                wallet=bt_wallet,
+                subtensor=subtensor,
+                netuid=netuid,
+                block_time=bt_block_time,
+                # Pass the URL so a failed emit can rebuild the client —
+                # the emitter holds ONE long-lived Subtensor whose ws goes
+                # stale on an RPC rotation and otherwise needs a restart.
+                subtensor_url=subtensor_url,
+            )
+
+            # Tempo-aligned commit scheduling: one commit per chain
+            # tempo epoch, just before the epoch step, so it is the
+            # LAST commit of its epoch and always reveals. The legacy
+            # wall-clock cadence made 2-3 commits per tempo epoch and
+            # the chain silently discarded all but the last — a
+            # champion reigning less than one tempo could earn zero
+            # despite successful set_weights calls (live incident
+            # 2026-07-03, uid 124). TEMPO_ALIGNED_EMIT=0 restores the
+            # legacy cadence; the gate also self-disables (returns
+            # "unknown") when chain state can't be queried.
+            if os.environ.get("TEMPO_ALIGNED_EMIT", "1").strip() not in ("0", "false", "no"):
+                from minotaur_subnet.validator.tempo_gate import TempoEmitGate
+
+                tempo_gate = TempoEmitGate(
+                    # Callable so the gate follows the emitter's
+                    # stale-websocket reconnects. Reads self at CALL time
+                    # (from _epoch_loop, after publication), never during
+                    # this bring-up.
+                    get_subtensor=lambda: self._weights_emitter.subtensor,
+                    netuid=netuid,
+                    block_time=bt_block_time,
+                    lead_blocks=int(
+                        os.environ.get("TEMPO_EMIT_LEAD_BLOCKS", "20")
+                    ),
+                )
+
+            # Auto-publish the axon URL on the metagraph. Bittensor
+            # convention is for the validator daemon to call
+            # ``serve_axon`` on startup so other validators' peer-
+            # discovery loops can find us via ``metagraph.axons``.
+            # Without this, the metagraph row stays at ``0.0.0.0:0``
+            # and the discovery loop logs "no metagraph peers with
+            # axon URLs" indefinitely. Gated on VALIDATOR_AXON_URL
+            # being set — operators that prefer to publish out-of-
+            # band can leave it unset and serve manually.
+            axon_url = os.environ.get("VALIDATOR_AXON_URL", "").strip()
+            if axon_url:
+                _auto_serve_axon_on_metagraph(
+                    subtensor=subtensor,
+                    bt_module=bt,
+                    wallet=bt_wallet,
+                    netuid=netuid,
+                    my_hotkey=resolved_hotkey,
+                    axon_url=axon_url,
+                )
+
+        # ── Publish ──────────────────────────────────────────────────
+        # The attempt can no longer fail past this point. Assigning only
+        # here keeps concurrent /health and _epoch_loop readers from ever
+        # seeing state from an attempt that is still in flight (or about
+        # to fail). The bittensor handles feed the periodic axon-resync
+        # loop (started by _start_metagraph_tasks).
+        self._bt_wallet = bt_wallet
+        self._metagraph_sync = metagraph_sync
+        self._weights_emitter = weights_emitter
+        self._tempo_gate = tempo_gate
+        if bt_wallet is not None:
+            self._bt_subtensor = subtensor
+            self._bt_module = bt
+            self._bt_netuid = netuid
+            self._validator_axon_url = axon_url
+
+        logger.info(
+            "Bittensor integration enabled (netuid=%d, hotkey=%s, wallet_loaded=%s)",
+            netuid,
+            resolved_hotkey[:16],
+            bt_wallet is not None,
+        )
+
+    def _reset_bt_state(self) -> None:
+        """Clear every artifact of a partially-successful bring-up.
+
+        _init_bittensor can fail at any point after constructing some of
+        its objects (e.g. wallet loaded, MetagraphSync up, then the hotkey
+        resolution raises). The retry loop re-runs the whole bring-up, so
+        each attempt must start from nothing — a stale _tempo_gate
+        pointing at a dead emitter, for instance, would otherwise leak
+        into /health. ``weights.owner_hotkey`` is deliberately NOT
+        cleared: a successfully-resolved owner stays valid.
+        """
+        self._bt_init_ok = False
+        self._metagraph_sync = None
+        self._weights_emitter = None
+        self._tempo_gate = None
+        self._bt_wallet = None
+        self._bt_subtensor = None
+        self._bt_module = None
+        self._bt_netuid = None
+        self._validator_axon_url = ""
+
+    def _record_bt_init_failure(self, exc: BaseException) -> None:
+        self._reset_bt_state()
+        # Truncate like _do_emit does for last_emit.error — substrate
+        # error text can be arbitrarily long and this lands in /health.
+        self._bt_init_error = str(exc)[:300] or type(exc).__name__
+        self._bt_init_error_at = time.time()
+        logger.error(
+            "Bittensor init failed (attempt %d): %s — weight emission and "
+            "metagraph election stay disabled until a retry succeeds",
+            self._bt_init_attempts, exc,
+        )
+
+    async def _bt_init_retry_loop(self) -> None:
+        """Re-attempt the Bittensor bring-up until it succeeds.
+
+        Exponential backoff 5s → 5min with jitter (a fleet-wide image roll
+        restarts every validator at once; synchronized retries would keep
+        colliding with the same rate-limited subtensor endpoint that broke
+        the first attempt). On success, performs the same election +
+        background-task wiring start() does on the happy path, then exits —
+        from there MetagraphSync.sync_loop owns chain liveness.
+        """
+        import random
+
+        delay = 5.0
+        while True:
+            await asyncio.sleep(delay * random.uniform(0.5, 1.5))
+            delay = min(delay * 2.0, 300.0)
+            self._bt_init_attempts += 1
+            try:
+                await asyncio.to_thread(self._init_bittensor)
+            except Exception as exc:
+                self._record_bt_init_failure(exc)
+                continue
+            break
+
+        self._bt_init_ok = True
+        self._bt_init_error = None
+        self._bt_init_error_at = None
+        logger.info(
+            "Bittensor init recovered on attempt %d — running metagraph election",
+            self._bt_init_attempts,
+        )
+        try:
+            await self._apply_initial_role()
+            self._start_metagraph_tasks()
+            if self._is_leader and not self.block_loop.running:
+                await self._become_leader()
+        except Exception:
+            # Nothing above is expected to raise (_apply_initial_role
+            # swallows sync errors, _become_leader tolerates store
+            # failures) — but an escape here would kill this task
+            # SILENTLY (the strong ref in _bt_init_retry_task means GC
+            # never surfaces "Task exception was never retrieved") and
+            # could strand a recovered leader without its BlockLoop.
+            # Log loudly; _leader_monitor_loop, if it started, still
+            # owns promotion from here.
+            logger.exception(
+                "Post-recovery wiring failed after Bittensor init recovered",
+            )
+
+    async def _apply_initial_role(self) -> None:
+        """Initial metagraph sync → set the leader/follower role. Fail-closed.
+
+        When the sync fails (or the Bittensor bring-up hasn't succeeded
+        yet) we stay follower: MetagraphSync.sync_loop keeps retrying with
+        backoff and fires ``leader_changed`` on its first success (the
+        None→leader transition), so _leader_monitor_loop promotes us the
+        moment the chain actually elects us. Pre-fix this branch "assumed
+        leader" — fail-open — which turned any boot-time chain hiccup into
+        a phantom leader running the BlockLoop unelected.
+        """
         force_leader = os.environ.get("FORCE_LEADER", "").strip() in ("1", "true", "yes")
         if self._metagraph_sync is not None:
             try:
@@ -786,12 +957,85 @@ class AppIntentsValidator:
                 # process-start value — we shouldn't be emitting anyway until
                 # we're registered.
             except Exception as exc:
-                logger.error("Initial metagraph sync failed: %s (assuming leader)", exc)
-                self._is_leader = True
+                logger.error(
+                    "Initial metagraph sync failed: %s (staying follower until a sync succeeds)",
+                    exc,
+                )
+                self._is_leader = False
 
         if force_leader and not self._is_leader:
             logger.info("FORCE_LEADER override: promoting to leader despite metagraph election")
             self._is_leader = True
+
+    def _wire_chain_tasks(self) -> None:
+        """Start the chain-facing background work appropriate to the
+        bring-up outcome: the metagraph tasks when the bring-up
+        succeeded, the init-retry loop when Bittensor is configured but
+        the bring-up failed in __init__, nothing in standalone mode.
+
+        This is the retry mechanism's ONLY activation point — split out
+        of start() so the wiring itself is unit-testable.
+        """
+        if self._metagraph_sync is not None:
+            self._start_metagraph_tasks()
+        elif self._subtensor_url:
+            # Keep retrying in the background rather than running the
+            # rest of the process with weight emission permanently
+            # disabled (the pre-fix behavior; see _bt_init_retry_loop).
+            self._bt_init_retry_task = asyncio.create_task(self._bt_init_retry_loop())
+            self._bt_init_retry_task.add_done_callback(self._on_bt_init_retry_done)
+
+    @staticmethod
+    def _on_bt_init_retry_done(task: asyncio.Task) -> None:
+        """Surface an escaped retry-loop exception in the logs.
+
+        The strong reference held in _bt_init_retry_task means the task
+        is never GC'd, so asyncio's "Task exception was never retrieved"
+        warning would never fire — without this callback, a crashed retry
+        loop is invisible.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Bittensor init retry task died: %s", exc, exc_info=exc)
+
+    def _start_metagraph_tasks(self) -> None:
+        """Start the chain-facing background tasks (sync, leader monitor,
+        axon resync). Called from _wire_chain_tasks on the happy path and
+        from _bt_init_retry_loop after a late-successful bring-up.
+        """
+        self._metagraph_task = asyncio.create_task(self._metagraph_sync.sync_loop())
+        self._leader_monitor_task = asyncio.create_task(self._leader_monitor_loop())
+        # Periodic axon re-resync. Re-resolves VALIDATOR_AXON_URL on a
+        # timer and calls serve_axon if the resolved IP drifted from
+        # what's currently on the metagraph. Required for operators
+        # behind dynamic-IP setups (AWS ELB/ALB, Cloudflare proxy,
+        # rotating residential IPs, etc.) — without this they have to
+        # restart the daemon every time their public IP rotates, which
+        # they may not even detect. Gated on having both a bittensor
+        # subtensor handle AND a configured VALIDATOR_AXON_URL.
+        if self._bt_subtensor is not None and self._validator_axon_url:
+            self._axon_resync_task = asyncio.create_task(self._axon_resync_loop())
+
+    async def start(self) -> None:
+        """Load active intents, start block loop, and start HTTP server."""
+        if self._consensus is not None:
+            logger.info(
+                "Validator starting as ORDER CONSENSUS PEER — "
+                "will re-simulate and re-score proposals from leader"
+            )
+        # Pull the leader's catalog before loading intents so the first
+        # _load_active_intents pass sees the JS. If the leader is
+        # unreachable, sync.start() logs and the background loop retries.
+        if self._app_sync is not None:
+            await self._app_sync.start()
+        await self._load_active_intents()
+        self._load_orders_from_store()
+
+        # Initial metagraph sync (determines leader/follower role).
+        # Fail-closed — see _apply_initial_role.
+        await self._apply_initial_role()
 
         # Start peer network session
         if self._peer_network is not None:
@@ -823,21 +1067,9 @@ class AppIntentsValidator:
         else:
             logger.info("Follower mode — BlockLoop not started")
 
-        # Metagraph sync loop
-        if self._metagraph_sync is not None:
-            self._metagraph_task = asyncio.create_task(self._metagraph_sync.sync_loop())
-            self._leader_monitor_task = asyncio.create_task(self._leader_monitor_loop())
-
-        # Periodic axon re-resync. Re-resolves VALIDATOR_AXON_URL on a
-        # timer and calls serve_axon if the resolved IP drifted from
-        # what's currently on the metagraph. Required for operators
-        # behind dynamic-IP setups (AWS ELB/ALB, Cloudflare proxy,
-        # rotating residential IPs, etc.) — without this they have to
-        # restart the daemon every time their public IP rotates, which
-        # they may not even detect. Gated on having both a bittensor
-        # subtensor handle AND a configured VALIDATOR_AXON_URL.
-        if self._bt_subtensor is not None and self._validator_axon_url:
-            self._axon_resync_task = asyncio.create_task(self._axon_resync_loop())
+        # Metagraph sync loop (+ leader monitor + axon resync), or the
+        # bt-init retry loop when the bring-up failed in __init__.
+        self._wire_chain_tasks()
 
         # Keep running
         while True:
@@ -1287,7 +1519,17 @@ class AppIntentsValidator:
     async def _become_leader(self) -> None:
         """Transition to leader role: start the block loop."""
         logger.info("Becoming LEADER — starting BlockLoop")
-        self._load_orders_from_store()
+        try:
+            self._load_orders_from_store()
+        except Exception:
+            # Best-effort, like the per-order tolerance inside it: a
+            # locked SQLite (co-located api writes the same file) or a
+            # corrupt row must not abort the promotion — a leader with an
+            # empty in-memory working set beats no leader at all, and the
+            # store remains the durable source of truth. Pre-fix, a raise
+            # here killed _leader_monitor_loop (or the init-retry task)
+            # silently and NOTHING ever started the BlockLoop again.
+            logger.exception("Order reload failed during leader promotion (continuing)")
         if not self.block_loop.running:
             self._block_loop_task = asyncio.create_task(self.block_loop.run_loop())
 
@@ -1358,26 +1600,59 @@ class AppIntentsValidator:
         # configured). Updated atomically in _epoch_loop. See
         # self._last_emit_state initialization in __init__ for the schema.
         #
-        # weights_emitter_configured + my_uid + my_last_update_block disambiguate
-        # the failure modes that ``last_emit: null`` could indicate. The chart:
-        #   weights_emitter_configured=false → wallet didn't load at startup
-        #     (likely WALLET_NAME/HOTKEY_NAME unset or wallet dir unreadable by
-        #     uid 1000). The daemon is in "metagraph-only mode" — it can sign
-        #     /identity from VALIDATOR_PRIVATE_KEY, but cannot set_weights.
+        # bt_init + weights_emitter_configured + my_uid disambiguate the
+        # failure modes that ``last_emit: null`` could indicate. The chart:
+        #   bt_init.configured=true, bt_init.ok=false → the whole Bittensor
+        #     bring-up (subtensor connect → owner lookup → wallet load)
+        #     failed; bt_init.error carries the actual exception and the
+        #     daemon is retrying in the background (bt_init.attempts).
+        #     Until it succeeds this validator cannot set_weights.
+        #   bt_init.ok=true, weights_emitter_configured=false → bring-up
+        #     succeeded metagraph-only: WALLET_NAME/HOTKEY_NAME unset, or
+        #     the wallet failed to load and VALIDATOR_HOTKEY_SS58 covered
+        #     for it (wallet dir unreadable by uid 1000 is the classic).
+        #     The daemon can sign /identity from VALIDATOR_PRIVATE_KEY,
+        #     but cannot set_weights.
         #   weights_emitter_configured=true, my_uid=null → hotkey not on
         #     metagraph (not registered).
         #   weights_emitter_configured=true, my_uid=<int>, last_emit=null →
         #     either uptime < epoch_seconds, OR the seeding path silently
         #     failed. Compare my_last_update_block * 12s vs current chain head.
         sync_state = getattr(self._metagraph_sync, "state", None) if self._metagraph_sync is not None else None
+        bt_configured = bool(self._subtensor_url)
+        # Explicit completion flag, NOT `_metagraph_sync is not None`: the
+        # retry loop's worker thread publishes objects before the event
+        # loop clears the error, and inferring ok from the object would
+        # let a probe in that window see ok=true alongside a stale error.
+        bt_ok = self._bt_init_ok
         return web.json_response({
-            "status": "ok",
+            # "degraded" = chain integration is configured but its bring-up
+            # hasn't succeeded (details in bt_init). Still HTTP 200 on
+            # purpose: compose healthchecks gate on the status CODE, and a
+            # container restart-loop wouldn't fix a chain-side failure —
+            # the in-process retry loop owns recovery.
+            "status": "ok" if (bt_ok or not bt_configured) else "degraded",
             "service": "app-intents-validator",
             "image_sha": image_sha,
             "loaded_intents": len(loaded),
             "uptime_seconds": round(time.time() - self._start_time, 1),
             "block_loop_running": self.block_loop.running,
             "weights_emitter_configured": self._weights_emitter is not None,
+            # Bittensor bring-up state. Separates "configured but init
+            # failed, retrying" (ok=false + error) from "not configured at
+            # all" (configured=false) — pre-fix both presented identically
+            # as weights_emitter_configured=false and the health workflow
+            # had to guess the cause (issue #59 guessed wrong: the
+            # recurring culprit is the subtensor connect at boot, not the
+            # wallet mount).
+            "bt_init": {
+                "configured": bt_configured,
+                "ok": bt_ok,
+                "attempts": self._bt_init_attempts,
+                "error": self._bt_init_error,
+                "error_at": self._bt_init_error_at,
+                "retrying": bt_configured and not bt_ok,
+            },
             # Champion observability (state-consolidation): where the champion was resolved
             # (api/memo/none) and whether we emit the champion ramp vs 100% burn — so a
             # validator burning a REAL champion can no longer present as healthy (the old
