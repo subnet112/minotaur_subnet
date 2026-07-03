@@ -405,6 +405,44 @@ def comment_on_pr(
     return status in (200, 201)
 
 
+def post_intake_ack(
+    pr_number: int, *, owner_repo: tuple[str, str], token: str, round_id: str,
+) -> int:
+    """Post the intake ACK comment on a PRIVATE-path PR; return the HTTP status.
+
+    This is the write-scope probe for the miner's per-submission PAT: commenting
+    on a PR is gated by the SAME fine-grained permission (``Pull requests: Write``)
+    the post-benchmark report needs, and there is no reliable read-only way to
+    check a fine-grained token's granted permissions. Without it an under-scoped
+    (read-only) token passes intake — resolve_pr and clone only need reads — and
+    the failure surfaces days later as a silent 403 when the report posts (seen
+    live 2026-07-03: 39 x 403 across two miners' private repos).
+
+    Returns the raw status so the intake gate can distinguish a definitive
+    permission failure (401/403/404 → reject the submission with an actionable
+    message) from a transient one (0/5xx → fail open). Unlike ``comment_on_pr``
+    this never falls back to the canonical repo: the probe is only meaningful
+    against the miner's own repo with the miner's own token.
+    """
+    owner, repo = owner_repo
+    status, _ = _github_api_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        {
+            "body": (
+                "### Submission received\n\n"
+                f"Queued for screening and benchmarking in round `{round_id}`. "
+                "The benchmark report (or rejection reason) will be posted on "
+                "this PR.\n\n"
+                "_This comment also verifies your `repo_token` can post that "
+                "report (`Pull requests: Read and write`)._"
+            )
+        },
+        token=token,
+    )
+    return status
+
+
 def close_pr(pr_number: int) -> bool:
     """Close a solver-repo PR (the REJECT path — no certificate was emitted)."""
     owner_repo = _parse_github_owner_repo()
