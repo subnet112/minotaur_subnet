@@ -102,6 +102,21 @@ def params_hash_for(action: str, app_id: str, chain_id: int | None, *parts: Any)
     return keccak(_canonical(action, app_id, chain_id, *parts).encode())
 
 
+# Separator that cannot appear in Solidity/JS source (a control char), so the
+# js/solidity concatenation is unambiguous.
+_CREATE_SEP = "␟"
+
+
+def create_owner_binding_hash(js_code: str, solidity_code: str) -> bytes:
+    """paramsHash the app owner signs at CREATE time (action="create_app").
+
+    Binds the app's code so a captured signature authorizes creating THAT app
+    and nothing else. Frontend parity (ethers):
+        keccak256(toUtf8Bytes(js_code + "\\u241f" + solidity_code))
+    """
+    return keccak(((js_code or "") + _CREATE_SEP + (solidity_code or "")).encode())
+
+
 def canonical_string(action: str, app_id: str, chain_id: int | None, *parts: Any) -> str:
     """Expose the exact canonical string (for responses / frontend parity)."""
     return _canonical(action, app_id, chain_id, *parts)

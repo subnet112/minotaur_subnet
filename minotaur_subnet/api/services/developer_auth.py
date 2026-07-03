@@ -52,6 +52,12 @@ ACTION_UPDATE_SCORING: Final[str] = "update_scoring"
 ACTION_DEPLOY: Final[str] = "deploy"
 ACTION_PAY_DEPLOY_FEE: Final[str] = "pay_deploy_fee"
 ACTION_LINK_SS58: Final[str] = "link_ss58"
+# Create-time owner binding: the developer signs the app content, and the API
+# records the RECOVERED signer as the app's deployer — so ownership is proven
+# by a key, not a claimed address. appId is "" (the app doesn't exist yet); the
+# paramsHash binds the code, the deadline bounds the signature. See
+# api/services/app_auth.create_owner_binding_hash + create_app_intent.
+ACTION_CREATE_APP: Final[str] = "create_app"
 # App-management lifecycle actions (see api/services/app_auth.py). Each gates
 # a relayer-key-signed operation, so the caller must prove owner authority by
 # signing the exact parameters — otherwise the API's relayer key would move
@@ -176,3 +182,48 @@ def verify_developer_auth(
             f"deployer {expected_deployer.strip().lower()[:10]}..."
         )
     return True, ""
+
+
+def recover_developer_auth(
+    *,
+    action: str,
+    app_id: str,
+    params_hash: bytes | str,
+    nonce: int,
+    deadline: int,
+    signature: str,
+    now: int | None = None,
+) -> tuple[str | None, str]:
+    """Recover the signer of a developer-auth signature (EIP-55 address) after
+    checking freshness + binding — WITHOUT comparing to an expected address.
+
+    For actions where the signer identity is being ESTABLISHED rather than
+    checked — create-time owner binding, where the app has no deployer yet.
+    Returns ``(address, "")`` on success or ``(None, error)``.
+    """
+    if not signature:
+        return None, "signature is required"
+
+    now_ts = int(now if now is not None else time.time())
+    try:
+        deadline_i = int(deadline)
+    except (TypeError, ValueError):
+        return None, f"invalid deadline: {deadline!r}"
+    if deadline_i <= now_ts:
+        return None, (
+            f"signature deadline expired ({deadline_i} <= now {now_ts}); "
+            "re-sign with a fresh deadline"
+        )
+    if deadline_i - now_ts > MAX_DEADLINE_FUTURE_SECONDS:
+        return None, (
+            f"deadline too far in the future "
+            f"({deadline_i - now_ts}s > {MAX_DEADLINE_FUTURE_SECONDS}s)"
+        )
+
+    try:
+        signable = _signable(action, app_id, _to_bytes32(params_hash), int(nonce), deadline_i)
+        sig = signature if signature.startswith("0x") else "0x" + signature
+        recovered = Account.recover_message(signable, signature=sig)
+    except Exception as exc:
+        return None, f"signature malformed: {exc}"
+    return recovered, ""
