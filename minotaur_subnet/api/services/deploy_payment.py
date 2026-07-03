@@ -66,18 +66,26 @@ class PaymentVerifier(Protocol):
 
 
 def get_payment_verifier() -> PaymentVerifier:
-    """The deploy-fee payment verifier. The rail is always finney (native TAO) —
-    there is no rail selection; the fee is paid in TAO on Bittensor mainnet.
+    """The deploy-fee payment verifier, selected by ``DEPLOY_FEE_RAIL``:
 
-    Safe by default regardless: the finney verifier refuses unless the collector
-    (``DEPLOY_FEE_COLLECTOR_SS58``) and the app's coldkey link are configured,
-    and ``verify_deploy_fee_payment`` never calls it at all unless
-    ``ENABLE_PUBLIC_DEPLOYMENT=1``. So collection stays closed (#238) until those
-    are deliberately set.
+    - ``evm`` (default): WTAO on Bittensor EVM (chain 964). The developer's
+      OWN EVM wallet pays — no substrate coldkey / ``developer_link`` needed.
+    - ``finney``: native TAO on Bittensor mainnet (needs the app's SS58 link).
+
+    Safe by default regardless: each verifier refuses unless its collector is
+    configured, and ``verify_deploy_fee_payment`` never calls it at all unless
+    ``ENABLE_PUBLIC_DEPLOYMENT=1``. So collection stays closed (#238) until the
+    rail is deliberately configured and the gate opened.
     """
-    from minotaur_subnet.api.services.finney_payment import FinneyPaymentVerifier
+    from minotaur_subnet.api.services.evm_payment import deploy_fee_rail
 
-    return FinneyPaymentVerifier()
+    if deploy_fee_rail() == "finney":
+        from minotaur_subnet.api.services.finney_payment import FinneyPaymentVerifier
+
+        return FinneyPaymentVerifier()
+    from minotaur_subnet.api.services.evm_payment import EvmDeployFeeVerifier
+
+    return EvmDeployFeeVerifier()
 
 
 def deploy_fee_params_hash(payment_ref: str, chain_id: int, amount_rao: int) -> bytes:
@@ -94,7 +102,6 @@ def verify_deploy_fee_payment(
     store: Any,
     definition: Any,
     *,
-    chain_id: int,
     payment: DeployFeePayment,
     verifier: PaymentVerifier | None = None,
     now: int | None = None,
@@ -104,15 +111,21 @@ def verify_deploy_fee_payment(
     Returns ``(fee_paid, error)``. ``fee_paid`` is True only when ALL hold:
     public deployment is enabled, the app has a ``deployer``, the deployer's
     EIP-712 ``pay_deploy_fee`` signature is valid + fresh and binds
-    ``(app_id, payment_ref, chain_id, amount)``, and the on-chain payment is
-    confirmed by the verifier. The single-use nonce is consumed once, only on
-    full success — so a failed or disabled verification never burns a nonce.
+    ``(app_id, payment_ref, payment_chain, amount)``, and the on-chain payment
+    is confirmed by the verifier. The single-use nonce is consumed once, only
+    on full success — so a failed or disabled verification never burns a nonce.
+
+    The fee binds the **payment chain** (``DEPLOY_FEE_PAYMENT_CHAIN_ID``, 964),
+    NOT the deploy target chain: the 0.5 TAO compensates solving the app (one
+    fee), so it is paid once on BT EVM regardless of how many chains the app
+    targets. ``deploy_app_intent`` records it and skips re-charging per chain.
     """
     from minotaur_subnet.deployment.deploy_fee import (
         deploy_fee_rao,
         public_deployment_enabled,
     )
     from minotaur_subnet.api.services import developer_auth
+    from minotaur_subnet.api.services.evm_payment import deploy_fee_payment_chain_id
 
     # Structural #238 gate first, before consuming anything: while collection is
     # off the answer is always "not live", and no nonce is spent.
@@ -127,8 +140,9 @@ def verify_deploy_fee_payment(
     if not payment.signature:
         return False, "pay_deploy_fee signature is required"
 
+    payment_chain = deploy_fee_payment_chain_id()
     amount_rao = deploy_fee_rao()
-    params_hash = deploy_fee_params_hash(payment.payment_ref, chain_id, amount_rao)
+    params_hash = deploy_fee_params_hash(payment.payment_ref, payment_chain, amount_rao)
     ok, err = developer_auth.verify_developer_auth(
         expected_deployer=deployer,
         action=developer_auth.ACTION_PAY_DEPLOY_FEE,
@@ -148,7 +162,7 @@ def verify_deploy_fee_payment(
         app_id=definition.app_id,
         deployer=deployer,
         payment_ref=payment.payment_ref,
-        chain_id=int(chain_id),
+        chain_id=payment_chain,
         amount_rao=amount_rao,
     )
     if not paid:

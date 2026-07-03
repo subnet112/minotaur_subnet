@@ -84,9 +84,11 @@ class TestDeployFeePaymentAuth(unittest.TestCase):
             payment_ref=self.ref, nonce=nonce, deadline=deadline, signature=sig,
         )
 
-    def _verify(self, defn, *, chain_id=CHAIN, payment=None, verifier=_OkVerifier()):
+    def _verify(self, defn, *, payment=None, verifier=_OkVerifier()):
+        # The fee binds the payment chain (DEPLOY_FEE_PAYMENT_CHAIN_ID, 964),
+        # not a deploy target chain — no chain_id arg.
         return dp.verify_deploy_fee_payment(
-            self.store, defn, chain_id=chain_id,
+            self.store, defn,
             payment=payment if payment is not None else self._payment(),
             verifier=verifier,
         )
@@ -105,13 +107,30 @@ class TestDeployFeePaymentAuth(unittest.TestCase):
         self.assertTrue(ok, err)
         self.assertEqual(self.store.get_developer_nonce(self.app_id, DEPLOYER), 1)
 
-    def test_default_finney_verifier_refuses_unconfigured(self):
-        # No injected verifier → the (always-finney) default. With no coldkey
-        # linked it refuses, and the nonce is not burned.
+    def test_default_evm_verifier_refuses_unconfigured(self):
+        # No injected verifier → the default rail (evm/WTAO). With no collector
+        # configured it refuses, and the nonce is not burned.
         defn = self._seed()
-        with _collection_enabled():
+        with _collection_enabled(), patch.dict(
+            os.environ, {"DEPLOY_FEE_RAIL": "evm"}, clear=False
+        ), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEPLOY_FEE_COLLECTOR_EVM", None)
             ok, err = dp.verify_deploy_fee_payment(
-                self.store, defn, chain_id=CHAIN, payment=self._payment(),
+                self.store, defn, payment=self._payment(),
+            )
+        self.assertFalse(ok)
+        self.assertIn("collector", err.lower())
+        self.assertEqual(self.store.get_developer_nonce(self.app_id, DEPLOYER), 0)
+
+    def test_finney_rail_refuses_unconfigured(self):
+        # DEPLOY_FEE_RAIL=finney selects the finney verifier; with no coldkey
+        # linked it refuses and the nonce is not burned.
+        defn = self._seed()
+        with _collection_enabled(), patch.dict(
+            os.environ, {"DEPLOY_FEE_RAIL": "finney"}, clear=False
+        ):
+            ok, err = dp.verify_deploy_fee_payment(
+                self.store, defn, payment=self._payment(),
             )
         self.assertFalse(ok)
         self.assertIn("link", err.lower())
@@ -128,11 +147,11 @@ class TestDeployFeePaymentAuth(unittest.TestCase):
         defn = self._seed()
         with _collection_enabled():
             ok1, _ = dp.verify_deploy_fee_payment(
-                self.store, defn, chain_id=CHAIN, verifier=_OkVerifier(),
+                self.store, defn, verifier=_OkVerifier(),
                 payment=dp.DeployFeePayment(payment_ref="", nonce=1, deadline=self.deadline, signature="x"),
             )
             ok2, _ = dp.verify_deploy_fee_payment(
-                self.store, defn, chain_id=CHAIN, verifier=_OkVerifier(),
+                self.store, defn, verifier=_OkVerifier(),
                 payment=dp.DeployFeePayment(payment_ref=self.ref, nonce=1, deadline=self.deadline, signature=""),
             )
         self.assertFalse(ok1)
@@ -147,9 +166,10 @@ class TestDeployFeePaymentAuth(unittest.TestCase):
 
     def test_chain_binding_mismatch_rejected(self):
         defn = self._seed(chains=(CHAIN, 1))
-        # Signed for CHAIN (964) but verified for chain 1 → params_hash mismatch.
+        # The fee binds the PAYMENT chain (964). A signature over a different
+        # chain (1) doesn't match the params_hash the server recomputes.
         with _collection_enabled():
-            ok, _ = self._verify(defn, chain_id=1, payment=self._payment(chain=CHAIN))
+            ok, _ = self._verify(defn, payment=self._payment(chain=1))
         self.assertFalse(ok)
 
     def test_amount_binding_mismatch_rejected(self):
