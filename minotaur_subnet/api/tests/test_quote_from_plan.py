@@ -272,5 +272,62 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(data["estimated_output"], _raw)
 
 
+# ── Integration: the REAL _build_benchmark_intent_order address invariant ──────
+# The handler-level tests above stub the builder, so they prove get_quote pins
+# raw_params["receiver"] == order.submitted_by == _bench_receiver. These two
+# exercise the REAL builder (only the ABI byte-encoder is stubbed — it needs a
+# real manifest) to prove the OTHER half: intent_order["submitted_by"] resolves
+# to that same receiver. Together they close the revert-avoidance invariant —
+# SimulationRunner funds order.submitted_by, scoreIntent pulls from
+# intent_order["submitted_by"]; if they differ the pull reverts → 0.
+
+def test_real_builder_pins_submitted_by_to_receiver(monkeypatch):
+    from minotaur_subnet.api.services import app_service
+    from minotaur_subnet.shared.types import IntentState
+    monkeypatch.setattr(
+        app_service, "build_intent_params_hex_from_manifest",
+        lambda *a, **k: "deadbeef",  # bypass real ABI encoding (needs a manifest)
+    )
+    receiver = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    state = IntentState(
+        contract_address=_DEPLOYED, chain_id=_CHAIN, nonce=0, owner=receiver,
+        raw_params={"receiver": receiver, "token_in": _USDC, "token_out": _DONALDPUMP},
+        control={"_intent_function": "swap"},
+    )
+    plan = ExecutionPlan(
+        intent_id="app:swap", interactions=[], deadline=0, nonce=0, metadata={},
+    )
+    io = orchestrator_module._build_benchmark_intent_order(
+        state, plan, manifest={"functions": {}},
+    )
+    assert io is not None, "real builder should build an intent_order given a manifest"
+    assert io["submitted_by"] == receiver
+
+
+def test_real_builder_maps_sentinel_receiver_to_anvil_default(monkeypatch):
+    # address(1) is the scenarios' dummy receiver; the builder (and get_quote's
+    # _bench_receiver) both map it to the pre-funded Anvil default, so they agree.
+    from minotaur_subnet.api.services import app_service
+    from minotaur_subnet.shared.types import IntentState
+    monkeypatch.setattr(
+        app_service, "build_intent_params_hex_from_manifest",
+        lambda *a, **k: "deadbeef",
+    )
+    anvil = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    state = IntentState(
+        contract_address=_DEPLOYED, chain_id=_CHAIN, nonce=0, owner=anvil,
+        raw_params={"receiver": "0x0000000000000000000000000000000000000001"},
+        control={"_intent_function": "swap"},
+    )
+    plan = ExecutionPlan(
+        intent_id="app:swap", interactions=[], deadline=0, nonce=0, metadata={},
+    )
+    io = orchestrator_module._build_benchmark_intent_order(
+        state, plan, manifest={"functions": {}},
+    )
+    assert io is not None
+    assert io["submitted_by"] == anvil
+
+
 if __name__ == "__main__":
     unittest.main()
