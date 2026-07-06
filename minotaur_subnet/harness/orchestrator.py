@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -92,6 +93,29 @@ logger = logging.getLogger(__name__)
 # event loop otherwise stays healthy. Bounding the wait guarantees the lock
 # is always released; the worst case is a lingering zombie, not an outage.
 _KILL_REAP_TIMEOUT = 5.0
+
+
+async def _docker_rm_f(name: str) -> None:
+    """Best-effort ``docker rm -f <name>`` that also REAPS its own subprocess.
+
+    SIGKILL of a ``docker run`` CLI does NOT stop the container it is attached
+    to, so ``proc.wait()`` on the CLI can hang and the CLI process (each ~6 Go
+    runtime threads) leaks. Removing the *container* releases the CLI so it
+    exits and can be reaped — turning the "lingering zombie" the comment above
+    tolerates into an actual reap. Bounded + swallow-all so it can never block
+    or raise on the cleanup path. No-op without a name.
+    """
+    if not name:
+        return
+    try:
+        rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(rm.wait(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001 — cleanup path, never propagate
+        pass
 
 # Trailing stderr lines kept per session for crash diagnostics (surfaced in the
 # SolverCrashedError when a solver dies / hangs). Bounded so a chatty solver
@@ -271,9 +295,14 @@ class SolverSession:
         label: str = "solver",
         *,
         live_mode: bool = False,
+        container_name: str = "",
     ) -> None:
         self._proc = proc
         self._label = label
+        # Name of the docker container backing this session (Docker mode only).
+        # Lets kill() force-remove it so a hung `docker run` CLI reaps instead
+        # of leaking its threads. Empty for subprocess mode.
+        self._container_name = container_name
         self._start_time = time.monotonic()
         self._closed = False
         # live_mode=True disables the total elapsed-time cap. Per-command
@@ -555,11 +584,29 @@ class SolverSession:
         except ProcessLookupError:
             pass
         except asyncio.TimeoutError:
-            logger.warning(
-                "[%s] proc.wait() did not return %ss after SIGKILL; "
-                "abandoning reap (zombie may linger, but the lock is freed)",
-                self._label, _KILL_REAP_TIMEOUT,
-            )
+            # SIGKILL of the `docker run` CLI doesn't stop the attached
+            # container, so proc.wait() hangs and the CLI (+ its threads) leaks
+            # — thousands accumulate over days and starve the api. Force-remove
+            # the container to release the CLI, then retry the (now-unblocked)
+            # reap. Only lingers if docker itself is wedged.
+            if self._container_name:
+                await _docker_rm_f(self._container_name)
+                try:
+                    await asyncio.wait_for(
+                        self._proc.wait(), timeout=_KILL_REAP_TIMEOUT,
+                    )
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    logger.warning(
+                        "[%s] proc.wait() still hung after docker rm -f %s; "
+                        "abandoning reap",
+                        self._label, self._container_name,
+                    )
+            else:
+                logger.warning(
+                    "[%s] proc.wait() did not return %ss after SIGKILL; "
+                    "abandoning reap (zombie may linger, but the lock is freed)",
+                    self._label, _KILL_REAP_TIMEOUT,
+                )
         logger.info("[%s] Process terminated", self._label)
 
     @property
@@ -735,7 +782,11 @@ class SolverOrchestrator:
             except (asyncio.TimeoutError, FileNotFoundError) as exc:
                 logger.warning("Pre-pull of %s errored: %s — attempting run anyway", image, exc)
 
-        cmd = ["docker", "run", "--rm", "-i"]
+        # Name the container so a hung `docker run` CLI can be force-reaped by
+        # kill() (docker rm -f) instead of leaking. Unique per session so
+        # concurrent benchmark solvers never collide on the name.
+        container_name = f"minotaur-bench-{uuid.uuid4().hex[:12]}"
+        cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
         if labels:
             for k, v in labels.items():
                 cmd.extend(["--label", f"{k}={v}"])
@@ -825,6 +876,9 @@ class SolverOrchestrator:
         logger.info("Starting Docker solver: %s", " ".join(cmd))
 
         async def _relaunch() -> asyncio.subprocess.Process:
+            # Clear any container left over from a prior launch (name reuse on
+            # restart) so `docker run --name` can't 409 on a leftover.
+            await _docker_rm_f(container_name)
             return await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -834,7 +888,9 @@ class SolverOrchestrator:
 
         proc = await _relaunch()
         label = f"docker:{image.split(':')[0][-12:]}"
-        session = SolverSession(proc, label=label, live_mode=live)
+        session = SolverSession(
+            proc, label=label, live_mode=live, container_name=container_name,
+        )
         session._relaunch = _relaunch
         return session
 
