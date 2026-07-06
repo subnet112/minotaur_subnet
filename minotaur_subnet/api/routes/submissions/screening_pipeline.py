@@ -716,6 +716,23 @@ async def resume_stranded_screenings() -> int:
     return resumed
 
 
+def _rejected_during_screening(store: Any, submission_id: str) -> str | None:
+    """Return the reject reason if this submission was rejected while its
+    screening ran, else None.
+
+    Close-time rotation (apply_rotation_slate) rejects the round's overflow to
+    hold the benched slate at SOLVER_ROUND_MAX_SUBMISSIONS. If it fires while a
+    skipped submission is still screening — or a restart resumes an already
+    -skipped one — the pipeline must NOT re-queue it for benchmark (that
+    overwrites the terminal reject and busts the slate cap). Returns the reason
+    (possibly empty str) so the caller can log it; None means still eligible.
+    """
+    current = store.get(submission_id)
+    if current is not None and current.status == SubmissionStatus.REJECTED:
+        return current.rejection_reason or ""
+    return None
+
+
 async def _run_screening_pipeline(submission_id: str) -> None:
     """Clone repo and run the 3-stage screening pipeline.
 
@@ -884,6 +901,21 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s3.passed:
             return
 
+        # All screening passed -- move to benchmarking queue. But re-read the
+        # status first: close-time rotation (apply_rotation_slate) can REJECT
+        # this submission while its screening was still in flight (and a restart
+        # can resume an already-skipped one). Without this guard the async
+        # pipeline overwrites that terminal reject back to BENCHMARKING, so the
+        # round benches MORE than its SOLVER_ROUND_MAX_SUBMISSIONS slate — the
+        # leak that showed 9-11 "scored" in a 3-slot round on restart-heavy days.
+        rejected = _rejected_during_screening(store, submission_id)
+        if rejected is not None:
+            logger.info(
+                "Submission %s passed screening but was already rejected "
+                "(%s) — not queuing for benchmark (rotation slate full)",
+                submission_id, rejected or "rejected",
+            )
+            return
         # All screening passed -- move to benchmarking queue
         store.update_status(submission_id, SubmissionStatus.BENCHMARKING)
         logger.info(
