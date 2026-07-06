@@ -121,6 +121,24 @@ BENCHED_STATUSES = frozenset({
 })
 
 
+# Cap how many submissions keep their (heavy — ~40-70KB each) benchmark_details
+# in the persisted store. Terminal submissions beyond the N most-recent (by
+# epoch) get their details dropped on persist. Without this the store grew
+# unbounded to 142MB (3556 subs) and, because _persist re-serializes the WHOLE
+# store on every write ON THE EVENT LOOP, each write froze the api for ~25s
+# (every request — sync and async — stalled). Keeps active + recent submissions
+# intact. 0 disables the cap.
+_BENCHMARK_DETAILS_RETENTION = int(
+    os.environ.get("SUBMISSION_BENCHMARK_DETAILS_RETENTION", "300")
+)
+# Only terminal submissions are strippable — an in-flight one may still need its
+# details for the round decision / report.
+_DETAILS_STRIPPABLE_STATUSES = frozenset({
+    SubmissionStatus.SCORED,
+    SubmissionStatus.REJECTED,
+})
+
+
 @dataclass
 class Submission:
     """A solver submission and its lifecycle state."""
@@ -1101,6 +1119,7 @@ class SubmissionStore:
         if self._persist_path is None:
             return
         try:
+            self._enforce_benchmark_details_retention()
             data = {
                 sid: sub.to_dict()
                 for sid, sub in self._submissions.items()
@@ -1109,11 +1128,40 @@ class SubmissionStore:
             tmp_path = self._persist_path.with_name(
                 f".{self._persist_path.name}.{os.getpid()}.tmp"
             )
-            tmp_path.write_text(json.dumps(data, indent=2))
+            # Compact (no indent): the store is re-serialized on EVERY write, so
+            # pretty-printing ~doubles both the bytes written and the encode time
+            # on the (previously loop-blocking) hot path for zero machine benefit.
+            tmp_path.write_text(json.dumps(data))
             os.replace(tmp_path, self._persist_path)
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("Failed to persist submissions: %s", exc)
+
+    def _enforce_benchmark_details_retention(self) -> None:
+        """Drop benchmark_details from terminal submissions beyond the retention
+        cap so the persisted store stays bounded.
+
+        benchmark_details is ~40-70KB per submission; unbounded it grew the store
+        to 142MB, and _persist re-serializes the WHOLE store on every write on the
+        event loop → ~25s api-wide freezes. We keep details for all non-terminal
+        (in-flight) submissions plus the ``_BENCHMARK_DETAILS_RETENTION`` most
+        recent by epoch, and strip the rest in place. In-memory mutation is fine:
+        the field is Optional and every reader uses ``.get()``/``or {}``.
+        """
+        cap = _BENCHMARK_DETAILS_RETENTION
+        if cap <= 0:
+            return
+        # Candidates: terminal submissions that still carry details.
+        withdetails = [
+            s for s in self._submissions.values()
+            if s.status in _DETAILS_STRIPPABLE_STATUSES and s.benchmark_details
+        ]
+        if len(withdetails) <= cap:
+            return
+        # Keep the `cap` most recent by epoch; strip the older tail.
+        withdetails.sort(key=lambda s: s.epoch, reverse=True)
+        for sub in withdetails[cap:]:
+            sub.benchmark_details = None
 
     def _load(self, *, quiet: bool = False) -> None:
         """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
