@@ -1308,19 +1308,74 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                         except (ValueError, TypeError):
                             pass
                 elif _deployed and _has_sim:
+                    # Run the SAME scoreIntent path the benchmark scores (proxy
+                    # deploy, token funding, plan execution, transfer capture) so
+                    # exotic / USDC-paired tokens (e.g. DONALDPUMP) quote non-zero.
+                    # A bare-interaction sim (intent_order=None) runs each call
+                    # independently, captures no meaningful transfers, and returns
+                    # 0 for those tokens — the benchmark instead passes an
+                    # intent_order built by _build_benchmark_intent_order, so we
+                    # mirror it exactly here.
+                    #
+                    # Revert-avoidance: SimulationRunner.simulate() funds
+                    # ``order.submitted_by`` (input-token balance + allowance to the
+                    # app contract), while scoreIntent pulls the input via
+                    # safeTransferFrom(intent_order["submitted_by"], proxy, ...).
+                    # If those two addresses differ the pull reverts → 0 again. So
+                    # we derive submitted_by the SAME way the benchmark does
+                    # (params["receiver"] or the pre-funded Anvil default account)
+                    # and reuse it for BOTH the order and the intent_order — the
+                    # funded address then equals scoreIntent's source.
+                    from minotaur_subnet.harness.orchestrator import (
+                        _build_benchmark_intent_order,
+                    )
+                    _ANVIL_DEFAULT_ACCOUNT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+                    _bench_receiver = req.params.get("receiver")
+                    if (not _bench_receiver
+                            or _bench_receiver == "0x0000000000000000000000000000000000000001"):
+                        _bench_receiver = _ANVIL_DEFAULT_ACCOUNT
                     _prov_order = _Order(
                         order_id="quote-sim",
                         app_id=app_id,
                         intent_function=req.intent_function,
                         params=dict(req.params),
-                        submitted_by="0x000000000000000000000000000000000000dEaD",
+                        submitted_by=_bench_receiver,
                         chain_id=req.chain_id,
                     )
-                    # Plan-only sim (no intent_order) measures the swap gas; we add
-                    # the framework wrapper overhead (executeIntent, proxy deploy,
-                    # sig verify, fee settle) when pricing the fee below.
+                    # Build the scoreIntent intent_order exactly like the benchmark,
+                    # pinning `receiver` to the funded submitted_by so the encoded
+                    # intent and the seeded balances/allowance agree. Degrade to the
+                    # bare path (None) if the encoder can't build one — never 500.
+                    _intent_order = None
+                    try:
+                        _bench_manifest = (
+                            _js_engine.get_manifest(app_id)
+                            if (_js_engine is not None
+                                and hasattr(_js_engine, "get_manifest"))
+                            else None
+                        )
+                        _bench_state = IntentState(
+                            contract_address=_deployed,
+                            chain_id=req.chain_id,
+                            nonce=0,
+                            owner=_bench_receiver,
+                            raw_params={**req.params, "receiver": _bench_receiver},
+                            control={"_intent_function": req.intent_function},
+                        )
+                        _intent_order = _build_benchmark_intent_order(
+                            _bench_state, _plan, _bench_manifest,
+                        )
+                    except Exception as _ioexc:
+                        logger.warning(
+                            "Quote intent_order build failed for %s: %s", app_id, _ioexc,
+                        )
+                        _intent_order = None
+                    # scoreIntent sim (intent_order set) measures the swap gas AND
+                    # captures the delivered output (metadata.raw_output / transfers);
+                    # we add the framework wrapper overhead (executeIntent, proxy
+                    # deploy, sig verify, fee settle) when pricing the fee below.
                     _sim = await _sim_runner.simulate(
-                        _plan, _prov_order, None, None, False, _deployed,
+                        _plan, _prov_order, None, _intent_order, False, _deployed,
                     )
                     _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
                     if _swap_gas > 0:
