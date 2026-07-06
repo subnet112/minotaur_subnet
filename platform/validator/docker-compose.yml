@@ -554,8 +554,14 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
       interval: 10s
-      timeout: 5s
+      # /health is slow (>5s) during the heavy cold-start — the startup lifespan
+      # resumes the stranded-submission backlog, builds the live champion, and
+      # benchmarks, pegging a core for ~100s. start_period keeps those early
+      # failures from flipping the container to "unhealthy" (which reads as an
+      # outage and blocks dependents) before it has had a chance to settle.
+      timeout: 10s
       retries: 20
+      start_period: 180s
 
   # ── Watchtower — auto-update validator + api on :stable promotion ─────
   # Polls GHCR every hour for a new image SHA on the configured tag (default
