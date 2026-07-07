@@ -253,6 +253,13 @@ class BenchmarkResult:
     # consumes; NEVER feeds the aggregate `score`. (Formerly ``shadow_score`` — the
     # observe-only shadow scorer it was named after is gone.)
     raw_output: str | None = None
+    # PRE-REFUND metered scoreIntent gas from the benchmark-only GasMeter probe
+    # (anvil_simulator.GAS_METER_RUNTIME_HEX; basis "scoreintent_prerefund_v1").
+    # Set ONLY for a real (non-mock), successful simulation whose probe
+    # produced a positive value; None everywhere else (mock rows, reverted
+    # sims, probe failures). MEASUREMENT ONLY — never feeds ``score`` or any
+    # verdict; the gas clause is a separate, stacked change.
+    gas_metered: int | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
@@ -1676,6 +1683,13 @@ async def _process_scenario(
                             intent_order=intent_order,
                             token_balances=token_balances,
                             fork_block=fork_block,
+                            # BENCHMARK-ONLY: run the GasMeter probe so rows
+                            # carry pre-refund metered gas. This is THE only
+                            # call site that sets it — the live rail (order
+                            # processing / fee certification) never does, so
+                            # its direct-send path and receipt gas_used stay
+                            # byte-identical.
+                            meter_gas=True,
                         )
                         print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
                         if require_real_sim and not sim.success:
@@ -1722,6 +1736,18 @@ async def _process_scenario(
                     br.mock_simulation = used_mock
                     # Capture the unfakeable on-chain scoreIntent BPS.
                     br.on_chain_score = getattr(sim, "on_chain_score", None)
+                    # PRE-REFUND metered gas (GasMeter probe). WRITE gate:
+                    # real sim + success + positive value only — mock rows
+                    # and failed probes stay None; reverted sims never reach
+                    # here (fail_closed_miss). Display/soak only.
+                    try:
+                        _gm = int(getattr(sim, "gas_metered", None) or 0)
+                    except (TypeError, ValueError):
+                        _gm = 0
+                    br.gas_metered = (
+                        _gm if (not used_mock and sim.success and _gm > 0)
+                        else None
+                    )
                     score_result = await score_fn(
                         intent.app_id, plan, sim, state,
                     )
