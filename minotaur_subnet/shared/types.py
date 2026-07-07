@@ -460,6 +460,15 @@ class SimulationResult:
     state_changes: list[dict[str, Any]] = field(default_factory=list)
     approval_changes: list[dict[str, Any]] = field(default_factory=list)
     on_chain_score: int | None = None    # BPS (0-10000) from contract scoreIntent()
+    # PRE-REFUND scoreIntent gas from the benchmark-only GasMeter probe
+    # (simulator/anvil_simulator.py GAS_METER_RUNTIME_HEX): gasleft()-bracketed
+    # around the app call, so EIP-3529 refunds are invisible and intrinsic/
+    # calldata gas is excluded. Populated ONLY when the simulation was invoked
+    # with ``meter_gas=True`` (benchmark path) and the metered probe succeeded;
+    # None everywhere else. MEASUREMENT ONLY — never feeds scoring, fees, or
+    # any verdict. ``gas_used`` keeps its receipt semantics untouched (the live
+    # rail's fee certification depends on it).
+    gas_metered: int | None = None
     leg_results: dict[int, Any] | None = None       # leg_id -> per-leg sim result dict
     bridge_estimate: dict[str, Any] | None = None    # bridge quote data for cross-chain
 
