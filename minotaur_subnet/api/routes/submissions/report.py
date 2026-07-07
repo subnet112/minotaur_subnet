@@ -176,6 +176,38 @@ def build_submission_report(
         gas_block["order_worse"] = rel_gas.get("order_worse")
     report["gas"] = gas_block
 
+    # DEADWOOD tie-break (4th ladder key, ships ARMED — fires only once records
+    # carry same-version unproductive metrics) — RULE-state transparency,
+    # mirroring the gas block. Always emitted (it describes the RULE, not a
+    # per-submission metric). Keyed ``deadwood_rule``, NOT ``deadwood``: the
+    # #575 lineage (which implements the metric itself) adds an observe-only
+    # per-submission ``deadwood`` block (own unproductive_nodes +
+    # top_offenders) under that key — the two blocks merge into one
+    # ``deadwood`` block when the lineages converge; the distinct key avoids a
+    # semantic merge collision until then.
+    try:
+        from minotaur_subnet.epoch.relative_scoring import UNPRODUCTIVE_MARGIN
+
+        dw_margin: int | None = UNPRODUCTIVE_MARGIN
+    except Exception:  # additive surface — never break the report
+        dw_margin = None
+    dw_armed = dw_margin is not None
+    dw_block: dict[str, Any] = {
+        # The armed state is COMPUTED from the live constant — never
+        # hardcoded, so this block can't lie about whether the rule bites.
+        "armed": dw_armed,
+        "observe_only": not dw_armed,  # backward-compat alias of ``not armed``
+        "unproductive_margin": dw_margin,
+    }
+    rel_dw = rel.get("deadwood") if isinstance(rel, dict) else None
+    if isinstance(rel_dw, dict):
+        # Same-pin baseline/delta, attached by the round evaluation
+        # (_persist_round_relative_counts) when both records were in hand.
+        dw_block["candidate_nodes"] = rel_dw.get("candidate_nodes")
+        dw_block["champion_nodes"] = rel_dw.get("champion_nodes")
+        dw_block["deadwood_delta"] = rel_dw.get("deadwood_delta")
+    report["deadwood_rule"] = dw_block
+
     if rel is not None:
         report["relative"] = rel
         try:
@@ -277,6 +309,18 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                 "",
             ]
 
+        if rel.get("adopt_via") == "deadwood":
+            dz = rel.get("deadwood") if isinstance(rel.get("deadwood"), dict) else {}
+            lines += [
+                (
+                    "🪓 **Won on deadwood:** matched the champion on every order, "
+                    f"{dz.get('deadwood_delta', '?')} fewer unproductive AST nodes "
+                    f"(yours {dz.get('candidate_nodes', '?')} vs champion "
+                    f"{dz.get('champion_nodes', '?')}, margin {dz.get('margin', '?')})."
+                ),
+                "",
+            ]
+
         # The actionable part: the specific orders that DIFFER from the champion.
         # Worse rows first (that's where to focus optimization), then wins.
         # ALLOWLIST the diverging verdicts: matched orders are summarized by the
@@ -359,6 +403,28 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                     f"metered gas is {gz.get('chal_total', '?')} vs the champion's "
                     f"{gz['champ_total']}; get it below {need_gas} to win this tie "
                     f"on gas (lower is better)"
+                )
+            # Fourth way to win (when the DEADWOOD tie-break is armed and the
+            # same-pin version-guarded delta is known): dethrone on materially
+            # less dead code. Name the exact target the same way the factor
+            # and gas hints do. need_dw = margin - delta (delta is already
+            # version-guarded by the persist pass); shown only while positive
+            # — at delta >= margin the clause either won or was blocked by a
+            # factor decision, and either way "delete more" is not the ask.
+            dz = rel.get("deadwood") if isinstance(rel.get("deadwood"), dict) else None
+            if (
+                dz
+                and dz.get("armed")
+                and isinstance(dz.get("margin"), int)
+                and isinstance(dz.get("deadwood_delta"), int)
+                and dz["deadwood_delta"] < dz["margin"]
+            ):
+                need_dw = dz["margin"] - dz["deadwood_delta"]
+                hint += (
+                    f" — OR ship less dead code: your unproductive-node count "
+                    f"is {dz.get('candidate_nodes', '?')} vs the champion's "
+                    f"{dz.get('champion_nodes', '?')}; delete ≥ {need_dw} more "
+                    f"dead nodes to win this tie on deadwood (lower is better)"
                 )
             lines += [hint + "._", ""]
     else:

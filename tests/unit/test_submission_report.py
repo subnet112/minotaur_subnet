@@ -285,3 +285,98 @@ def test_matched_hint_omits_gas_target_when_disarmed():
     rep = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=5)))
     md = render_report_md(rep, submission_id="sub_gas")
     assert "less gas" not in md
+
+
+# ── DEADWOOD transparency (4th key, ships ARMED; rule state must be honest) ──
+#
+# NOTE the report key is ``deadwood_rule`` — the #575 lineage adds an
+# observe-only per-submission ``deadwood`` block (own nodes + top_offenders);
+# the two merge into one block when the lineages converge.
+
+
+def test_deadwood_rule_block_reports_armed_state():
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    rep = _report(_sub("scored", _DETAILS))
+    dz = rep["deadwood_rule"]
+    # Armed state is COMPUTED from the live constant — never hardcoded. On
+    # this branch the clause SHIPS ARMED (UNPRODUCTIVE_MARGIN = 2000).
+    expected_armed = _rs.UNPRODUCTIVE_MARGIN is not None
+    assert dz["armed"] is expected_armed
+    assert dz["observe_only"] is (not expected_armed)
+    assert dz["unproductive_margin"] == _rs.UNPRODUCTIVE_MARGIN
+    # No stored same-pin baseline -> none surfaced.
+    assert "candidate_nodes" not in dz and "champion_nodes" not in dz
+
+
+def test_deadwood_rule_block_carries_stored_baseline():
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 14_500, "champion_nodes": 15_000,
+        "deadwood_delta": 500, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    dz = rep["deadwood_rule"]
+    # Same-pin baseline merged from the stored relative block.
+    assert dz["candidate_nodes"] == 14_500
+    assert dz["champion_nodes"] == 15_000
+    assert dz["deadwood_delta"] == 500
+
+
+def test_deadwood_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("dethrone", matched=5)
+    rel["adopt_via"] = "deadwood"
+    rel["deadwood"] = {
+        "candidate_nodes": 12_000, "champion_nodes": 15_000,
+        "deadwood_delta": 3000, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("adopted", _DETAILS, relative=rel))
+    md = render_report_md(rep)
+    assert "🪓" in md and "Won on deadwood" in md
+    assert "12000" in md and "15000" in md and "3000" in md and "2000" in md
+
+
+def test_matched_hint_names_the_deadwood_target():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 14_500, "champion_nodes": 15_000,
+        "deadwood_delta": 500, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_dw")
+    # The tied miner is told the deadwood way to win, with the exact target
+    # (margin 2000 - delta 500 = 1500 more nodes to delete), like the factor
+    # and gas hints name theirs.
+    assert "OR ship less dead code" in md
+    assert "delete ≥ 1500 more dead nodes" in md
+
+
+def test_matched_hint_omits_deadwood_when_no_stored_block():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # Stored block from a round where the metric was unmeasured / the clause
+    # inert carries no deadwood sub-dict at all — the hint must not advertise
+    # a rule that cannot fire on this pair.
+    rep = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=5)))
+    md = render_report_md(rep, submission_id="sub_dw")
+    assert "dead nodes" not in md and "deadwood" not in md
+
+
+def test_matched_hint_omits_deadwood_target_when_delta_at_margin():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # delta >= margin on a stored matched block means the clause either won
+    # elsewhere or was blocked by a factor decision — "delete more dead
+    # nodes" is not the ask, so no target is named.
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 12_000, "champion_nodes": 15_000,
+        "deadwood_delta": 3000, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_dw")
+    assert "delete ≥" not in md
