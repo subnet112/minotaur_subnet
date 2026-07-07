@@ -154,6 +154,60 @@ CHAMPION_REGISTRY_ABI = [
 ]
 
 
+# Gas ceiling for the ChampionRegistry.certify() attestation. The node reserves
+# gas_limit × price up front, so this × the price is the exact balance the
+# relayer wallet must hold to even SUBMIT an attest (below it: "insufficient
+# funds for gas * price + value", champion adoption freezes).
+_ATTEST_GAS_LIMIT = 500_000
+# BT-EVM tip floor (mirrors the deploy path, #556) so a node reporting ~0 tip
+# doesn't underprice the attest.
+_ATTEST_TIP_FLOOR_WEI = 500_000_000  # 0.5 gwei
+
+
+def _attest_gas_fields(w3: Any) -> dict:
+    """EIP-1559 (type-2) gas fields for the attest tx, with a legacy fallback.
+
+    Mirrors the deploy path (#556): maxFee = base*4 + tip, tip floored so it
+    isn't underpriced when the node reports ~0. Falls back to legacy gasPrice on
+    a pre-1559 node (no baseFeePerGas)."""
+    base = None
+    try:
+        base = w3.eth.get_block("latest").get("baseFeePerGas")
+    except Exception:  # noqa: BLE001 — best-effort; fall back to legacy
+        base = None
+    if base:
+        try:
+            node_tip = int(w3.eth.max_priority_fee or 0)
+        except Exception:  # noqa: BLE001
+            node_tip = 0
+        tip = max(node_tip, _ATTEST_TIP_FLOOR_WEI)
+        return {"maxFeePerGas": int(base) * 4 + tip, "maxPriorityFeePerGas": tip}
+    return {"gasPrice": w3.eth.gas_price}
+
+
+def _warn_if_low_attest_balance(w3: Any, addr: str, gas_fields: dict) -> None:
+    """Log a LOUD warning when the relayer can't cover several more attestations.
+
+    The failure mode this surfaces: the BT-EVM wallet silently drains, the attest
+    reverts "insufficient funds", there's no on-chain quorum cert, and the
+    merge-gate refuses to adopt — champion adoption freezes with only a cryptic
+    web3 error. Best-effort; never raises."""
+    try:
+        bal = int(w3.eth.get_balance(addr))
+        price = int(gas_fields.get("maxFeePerGas") or gas_fields.get("gasPrice") or 0)
+        cost = _ATTEST_GAS_LIMIT * price
+        if cost and bal < cost * 3:
+            logger.warning(
+                "LOW ATTEST BALANCE: relayer %s holds %.6f TAO on BT-EVM — only "
+                "~%d attestation(s) of runway (each reserves %.6f TAO @ %d gas). "
+                "Fund it or champion adoption freezes (attest fails → merge gate "
+                "refuses to adopt).",
+                addr, bal / 1e18, bal // cost, cost / 1e18, _ATTEST_GAS_LIMIT,
+            )
+    except Exception:  # noqa: BLE001 — a diagnostic must never break attest
+        pass
+
+
 def attest_champion_on_chain(
     certificate: Any,
     commit_hash: str,
@@ -257,6 +311,9 @@ def attest_champion_on_chain(
         relayer_addr = Account.from_key(relayer_key).address
         nonce = w3.eth.get_transaction_count(relayer_addr, "pending")
 
+        _gas_fields = _attest_gas_fields(w3)
+        _warn_if_low_attest_balance(w3, relayer_addr, _gas_fields)
+
         tx = registry.functions.certify(
             round_id,
             committee_hash,
@@ -273,9 +330,9 @@ def attest_champion_on_chain(
         ).build_transaction({
             "from": relayer_addr,
             "nonce": nonce,
-            "gas": 500_000,
-            "gasPrice": w3.eth.gas_price,
+            "gas": _ATTEST_GAS_LIMIT,
             "chainId": w3.eth.chain_id,
+            **_gas_fields,
         })
 
         signed = w3.eth.account.sign_transaction(tx, relayer_key)
