@@ -13,9 +13,20 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from minotaur_subnet.harness import benchmark_worker as bw
 from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 from minotaur_subnet.harness.submission_store import SubmissionStore
+
+
+@pytest.fixture(autouse=True)
+def _legacy_quote_mode(monkeypatch):
+    # The checkpoint layer is legacy champion-anchored machinery: under the
+    # static-quote DEFAULT (ON) _get_or_build_reference_quotes returns {}
+    # before touching the memo/checkpoint, so these tests pin the legacy mode.
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
+
 
 QUOTES = {"app1": {"quoted_output": "123"}, "app2:swap": {"__reference_quote_failed__": "1"}}
 

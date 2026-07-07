@@ -1679,12 +1679,18 @@ class BenchmarkWorker:
         _require_real_sim = require_real_sim_default()
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
-        # Champion-anchored bar: grade BOTH the reference champion and the
-        # challenger against the SHADOW champion's OWN quote (one shared floor,
-        # ~0.5% slippage), with the champion->challenger self-quote fallback when
-        # the champion can't quote a scenario. Without this both would self-quote
-        # and tie — the saturation the product owner flagged.
-        reference_quotes = await self._build_reference_quotes(intents, image_tag=champ_image)
+        # Mirror the LIVE benchmark's quote regime via the flag-aware getter.
+        # Static quoting (the default): no pre-pass — both sides get the zero
+        # quote injection (no anchor, no CoW fee), exactly how the real rounds
+        # score. Legacy champion-anchored mode (BENCHMARK_STATIC_QUOTE=0):
+        # grade BOTH the reference champion and the challenger against the
+        # SHADOW champion's OWN quote (one shared floor, ~0.5% slippage) so the
+        # two don't self-quote and tie. A direct _build_reference_quotes call
+        # here would bypass the flag and shadow-vote on a different benchmark
+        # definition than the one the fleet scores.
+        reference_quotes = await self._get_or_build_reference_quotes(
+            intents, image_tag=champ_image,
+        )
 
         async def _bench(image: str) -> list[BenchmarkResult]:
             orch = SolverOrchestrator()
@@ -1825,10 +1831,14 @@ class BenchmarkWorker:
         or the build produced an EMPTY result (champion session failed to start:
         transient, must retry next pass, never freeze for the round).
 
-        STATIC-quote mode (``BENCHMARK_STATIC_QUOTE=1``): the pre-pass is
-        skipped entirely — the enrichment injects a static zero quote instead
-        of anchoring on the champion's, so computing champion reference quotes
-        (~30 champion-session quotes/round) would be wasted work. Returns {}.
+        STATIC-quote mode (the DEFAULT; opt out with
+        ``BENCHMARK_STATIC_QUOTE=0``): the pre-pass is skipped entirely — the
+        enrichment injects a static zero quote instead of anchoring on the
+        champion's, so computing champion reference quotes (~30
+        champion-session quotes/round) would be wasted work. Returns {}.
+        Every benchmark path MUST obtain reference quotes through THIS getter,
+        never `_build_reference_quotes` directly, or it silently benches under
+        a different quote regime than the fleet's scoring definition.
         """
         if benchmark_static_quote_enabled():
             return {}
