@@ -518,10 +518,18 @@ def test_factor_delta_between_none_safety():
     assert factor_delta_between(40, 100) == -60
 
 
-def test_disarmed_default_never_fires_even_with_huge_delta():
-    # FACTOR_MARGIN ships None (disarmed): natural champion turnover putting
-    # measured metrics on BOTH sides must NOT silently activate the tie-break.
-    assert _rs.FACTOR_MARGIN is None
+def test_factor_margin_pinned_to_calibrated_value():
+    # Consensus-critical constant, calibrated from the 2026-07-03..07 soak:
+    # tweak noise +21/+54 (must clear ~2x), real incremental refactor step 122
+    # (must pass). Changing this changes WHO WINS ties fleet-wide — bump only
+    # in a develop->main promotion window.
+    assert _rs.FACTOR_MARGIN == 100
+
+
+def test_disarmed_never_fires_even_with_huge_delta(monkeypatch):
+    # FACTOR_MARGIN=None (the disarm value): natural champion turnover putting
+    # measured metrics on BOTH sides must NOT activate the tie-break.
+    monkeypatch.setattr(_rs, "FACTOR_MARGIN", None)
     champ = [_r("o1", "100")]
     chal = [_r("o1", "100")]
     res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
