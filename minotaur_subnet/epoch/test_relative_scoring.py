@@ -485,3 +485,145 @@ def test_reason_behind_uses_matched_and_regressed():
 
 def test_reason_none_when_no_counts():
     assert relative_reason(None) is None
+
+
+# ── blind-spot REPEAT guard (BLIND_SPOT_BAR_TTL_S; Phase 0 disarmed) ──────────
+#
+# Anti-treadmill rule: a blind_spot_cover that does NOT exceed the incumbent's
+# ADOPTION-TIME value on that order (within the TTL) is a NEUTRAL
+# blind_spot_repeat, never the +1 that dethrones. Disarmed (TTL None) it only
+# observes. Armed via monkeypatch here — the live switch is a fleet-uniform
+# CODE constant.
+
+
+def _bar_case():
+    """Champion fails o2 fresh (treadmill decay); challenger re-covers it at
+    exactly the value the incumbent delivered when IT was adopted."""
+    champ = [_r("o1", "100"), _r("o2", "0")]
+    chal = [_r("o1", "100"), _r("o2", "5000")]
+    bar = {"o2": "5000"}
+    return champ, chal, bar
+
+
+def test_disarmed_default_keeps_cover_and_observes():
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    assert rs.BLIND_SPOT_BAR_TTL_S is None  # Phase 0 ships disarmed
+    champ, chal, bar = _bar_case()
+    res = evaluate_relative_adoption(champ, chal, champion_bar=bar, bar_age_s=3600.0)
+    # Verdict byte-identical to today: the cover still counts and adopts.
+    assert res["adopt"] is True
+    assert res["n_blind_spots"] == 1
+    assert res["n_blind_spot_repeats"] == 0
+    # ... but the soak counter sees the would-be repeat.
+    assert res["n_blind_spot_repeats_observed"] == 1
+    o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
+    assert o2["verdict"] == "blind_spot_cover"
+    assert o2["bar"] == "5000"
+    assert o2["bar_verdict"] == "repeat"
+
+
+def test_no_bar_kwargs_is_fully_inert():
+    champ, chal, _ = _bar_case()
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is True
+    assert res["n_blind_spots"] == 1
+    assert res["n_blind_spot_repeats_observed"] == 0
+    o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
+    assert "bar" not in o2
+
+
+def test_armed_repeat_is_neutral_and_blocks_dethrone(monkeypatch):
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ, chal, bar = _bar_case()
+    res = evaluate_relative_adoption(champ, chal, champion_bar=bar, bar_age_s=3600.0)
+    assert res["adopt"] is False  # the +1 was a photocopy — no dethrone
+    assert res["n_blind_spots"] == 0
+    assert res["n_blind_spot_repeats"] == 1
+    assert res["n_blind_spot_repeats_observed"] == 1
+    assert "repeat(s) not credited" in res["reason"]
+    o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
+    assert o2["verdict"] == "blind_spot_repeat"
+    # Repeats are compared (not skips): o1 matched + o2 repeat.
+    assert res["scenarios_compared"] == 2
+
+
+def test_armed_cover_exceeding_bar_still_dethrones(monkeypatch):
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ, chal, bar = _bar_case()
+    chal = [_r("o1", "100"), _r("o2", "5010")]  # +20 bps > 10-bps band
+    res = evaluate_relative_adoption(champ, chal, champion_bar=bar, bar_age_s=3600.0)
+    assert res["adopt"] is True
+    assert res["n_blind_spots"] == 1
+    assert res["n_blind_spot_repeats"] == 0
+    o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
+    assert o2["verdict"] == "blind_spot_cover"
+    assert o2["bar_verdict"] == "exceed"
+
+
+def test_armed_bar_within_band_is_repeat_boundary(monkeypatch):
+    # Exactly on the +tol boundary is NOT "exceed" (strict inequality, same
+    # exact-integer cross-multiply as a win).
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ = [_r("o2", "0")]
+    chal = [_r("o2", str(5000 * (10000 + RELATIVE_TOL_BPS) // 10000))]  # 5005
+    res = evaluate_relative_adoption(
+        champ, chal, champion_bar={"o2": "5000"}, bar_age_s=60.0,
+    )
+    assert res["n_blind_spot_repeats"] == 1
+    assert res["adopt"] is False
+
+
+def test_armed_expired_bar_gives_full_cover_credit(monkeypatch):
+    # Market moved on: a bar older than the TTL never downgrades a cover.
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ, chal, bar = _bar_case()
+    res = evaluate_relative_adoption(
+        champ, chal, champion_bar=bar, bar_age_s=25 * 3600.0,
+    )
+    assert res["adopt"] is True
+    assert res["n_blind_spots"] == 1
+    assert res["n_blind_spot_repeats"] == 0
+    # Observation TTL (24h) also lapsed — nothing observed either.
+    assert res["n_blind_spot_repeats_observed"] == 0
+
+
+def test_armed_unknown_age_is_inert(monkeypatch):
+    # No bar_age_s (e.g. restored champion without a snapshot) ⇒ guard inert.
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ, chal, bar = _bar_case()
+    res = evaluate_relative_adoption(champ, chal, champion_bar=bar)
+    assert res["adopt"] is True
+    assert res["n_blind_spot_repeats"] == 0
+    assert res["n_blind_spot_repeats_observed"] == 0
+
+
+def test_armed_order_without_bar_entry_unaffected(monkeypatch):
+    # A genuinely NEW blind spot (no adoption-time value) keeps full credit.
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", 24 * 3600.0)
+    champ, chal, _ = _bar_case()
+    res = evaluate_relative_adoption(
+        champ, chal, champion_bar={"other": "123"}, bar_age_s=60.0,
+    )
+    assert res["adopt"] is True
+    assert res["n_blind_spots"] == 1
+
+
+def test_blind_spot_bar_from_rows_keeps_only_delivered():
+    from minotaur_subnet.epoch.relative_scoring import blind_spot_bar_from_rows
+
+    rows = [_r("o1", "100"), _r("o2", "0"), _r("o3", None), _r("o4", 7)]
+    assert blind_spot_bar_from_rows(rows) == {"o1": "100", "o4": "7"}
+    assert blind_spot_bar_from_rows(None) == {}
