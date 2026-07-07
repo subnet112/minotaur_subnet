@@ -721,7 +721,6 @@ def _build_runtime_security_health_snapshot(
     *,
     enforce: bool,
     violations: list[str],
-    enable_source_submissions: bool,
     allow_subprocess_benchmark: bool,
     require_signed_provenance: bool,
     require_asymmetric_provenance: bool,
@@ -737,7 +736,6 @@ def _build_runtime_security_health_snapshot(
         "startup_validated": bool(startup_validated),
         "enforced": bool(enforce),
         "violations": list(violations),
-        "enable_source_submissions": bool(enable_source_submissions),
         "allow_subprocess_benchmark": bool(allow_subprocess_benchmark),
         "require_signed_provenance": bool(require_signed_provenance),
         "require_asymmetric_provenance": bool(require_asymmetric_provenance),
@@ -976,7 +974,6 @@ async def initialize(ctx: ServerContext) -> dict:
 
     # ── runtime security profile ─────────────────────────────────────────
     enforce_runtime_security = _env_true("ENFORCE_RUNTIME_SECURITY_PROFILE", default=False)
-    enable_source_submissions = _env_true("ENABLE_SOURCE_SUBMISSIONS", default=False)
     allow_subprocess_benchmark = _env_true("ALLOW_SUBPROCESS_BENCHMARK", default=False)
     submissions_api_key = os.environ.get("SUBMISSIONS_API_KEY", "").strip()
     raw_rate_limit = os.environ.get("SUBMISSIONS_RATE_LIMIT_PER_MINUTE", "60").strip()
@@ -987,7 +984,6 @@ async def initialize(ctx: ServerContext) -> dict:
 
     runtime_ok, runtime_violations = validate_runtime_security_profile(
         enforce=enforce_runtime_security,
-        enable_source_submissions=enable_source_submissions,
         allow_subprocess_benchmark=allow_subprocess_benchmark,
         require_signed=require_signed_provenance,
         require_asymmetric=require_asymmetric_provenance,
@@ -1000,7 +996,6 @@ async def initialize(ctx: ServerContext) -> dict:
     ctx.runtime_security_policy_health = _build_runtime_security_health_snapshot(
         enforce=enforce_runtime_security,
         violations=runtime_violations,
-        enable_source_submissions=enable_source_submissions,
         allow_subprocess_benchmark=allow_subprocess_benchmark,
         require_signed_provenance=require_signed_provenance,
         require_asymmetric_provenance=require_asymmetric_provenance,

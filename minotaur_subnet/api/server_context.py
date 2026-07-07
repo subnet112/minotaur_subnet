@@ -108,7 +108,6 @@ class ServerContext:
         "startup_validated": False,
         "enforced": False,
         "violations": [],
-        "enable_source_submissions": False,
         "allow_subprocess_benchmark": False,
         "require_signed_provenance": False,
         "require_asymmetric_provenance": False,
