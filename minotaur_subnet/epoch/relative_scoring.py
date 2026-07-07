@@ -428,6 +428,8 @@ def relative_counts(
     champion_results: list[Any],
     challenger_results: list[Any],
     tol_bps: int = RELATIVE_TOL_BPS,
+    *,
+    factor_delta: int = 0,
 ) -> dict[str, Any]:
     """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
 
@@ -452,7 +454,9 @@ def relative_counts(
     :func:`evaluate_relative_adoption` (``BenchmarkResult`` objects or stored
     ``per_intent`` dicts).
     """
-    res = evaluate_relative_adoption(champion_results, challenger_results, tol_bps=tol_bps)
+    res = evaluate_relative_adoption(
+        champion_results, challenger_results, tol_bps=tol_bps, factor_delta=factor_delta,
+    )
     better = res["n_wins"] + res["n_blind_spots"]
     worse = res["n_regressions"] + res["n_dropped"]
     matched = res["n_matched"]
@@ -470,6 +474,10 @@ def relative_counts(
         "new": new,
         "compared": compared,
         "verdict": verdict,
+        # How an adopt was won ("performance" | "factorization" | None) — lets
+        # the report explain a factor-tie dethrone instead of the absurd
+        # "net better — 0 better / 0 worse". Additive key.
+        "adopt_via": res["adopt_via"],
         "per_order": res["per_order"],
     }
 
@@ -521,6 +529,18 @@ def relative_reason(
         return None
     if counts.get("verdict") == "dethrone":
         who = f" {candidate_id}" if candidate_id else ""
+        if counts.get("adopt_via") == "factorization":
+            # A factor-tie dethrone has 0 better / 0 worse by definition — the
+            # performance phrasing would read as nonsense. Name the real reason.
+            fz = counts.get("factorization") or {}
+            delta = fz.get("factor_delta")
+            margin = fz.get("factor_margin")
+            return (
+                f"adopted{who}: better factored — matched all "
+                f"{counts['matched']} order(s), max region "
+                f"{delta if delta is not None else '?'} nodes smaller "
+                f"(margin {margin if margin is not None else '?'})"
+            )
         return (
             f"adopted{who}: net better — {counts['better']} better / "
             f"{counts['worse']} worse (regressions within 1% floor)"

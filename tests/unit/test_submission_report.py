@@ -127,3 +127,78 @@ def test_benchmark_failed_when_no_plans():
     details = {"errors": 3, "plans_generated": 0, "per_intent": []}
     r = _report(_sub("scored", details))
     assert r["outcome"] == "benchmark_failed"
+
+
+# ── factorization transparency (armed rule must be visible to miners) ────────
+
+
+class _FactorSub:
+    status = type("S", (), {"value": "scored"})()
+    submission_id = "sub_factor"
+    max_region_nodes = 4109
+    benchmark_details = {
+        "relative": {
+            "better": 0, "worse": 0, "matched": 5, "new": 0, "compared": 5,
+            "verdict": "matched", "adopt_via": None, "per_order": [],
+            "factorization": {
+                "candidate_nodes": 4109, "champion_nodes": 4109,
+                "factor_delta": 0, "factor_margin": 100, "armed": True,
+            },
+        }
+    }
+
+
+def test_factorization_block_reports_armed_state_and_baseline():
+    from minotaur_subnet.api.routes.submissions.report import build_submission_report
+    from minotaur_subnet.epoch import relative_scoring as _rs
+    from minotaur_subnet.harness import screening as _sc
+
+    rep = build_submission_report(_FactorSub(), reason=None)
+    fz = rep["factorization"]
+    # Armed state is COMPUTED from live constants — never hardcoded.
+    expected_armed = _sc.MAX_REGION_NODES is not None or _rs.FACTOR_MARGIN is not None
+    assert fz["armed"] is expected_armed
+    assert fz["observe_only"] is (not expected_armed)
+    assert fz["floor_cap"] == _sc.MAX_REGION_NODES
+    assert fz["factor_margin"] == _rs.FACTOR_MARGIN
+    # Same-pin champion baseline merged from the stored relative block.
+    assert fz["champion_nodes"] == 4109
+    assert fz["factor_delta"] == 0
+
+
+def test_matched_hint_names_the_factor_target():
+    from minotaur_subnet.api.routes.submissions.report import (
+        build_submission_report,
+        render_report_md,
+    )
+
+    rep = build_submission_report(_FactorSub(), reason=None)
+    md = render_report_md(rep, submission_id="sub_factor")
+    # The tied miner is told the SECOND way to win, with the exact target
+    # (champion 4109 - margin 100 = 4009), like the ❌ rows name orders.
+    assert "OR ship better-factored code" in md
+    assert "≤ 4009" in md
+
+
+def test_factor_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import (
+        build_submission_report,
+        render_report_md,
+    )
+
+    class _Winner(_FactorSub):
+        status = type("S", (), {"value": "adopted"})()
+        benchmark_details = {
+            "relative": {
+                "better": 0, "worse": 0, "matched": 5, "new": 0, "compared": 5,
+                "verdict": "dethrone", "adopt_via": "factorization", "per_order": [],
+                "factorization": {
+                    "candidate_nodes": 1212, "champion_nodes": 4109,
+                    "factor_delta": 2897, "factor_margin": 100, "armed": True,
+                },
+            }
+        }
+
+    md = render_report_md(build_submission_report(_Winner(), reason=None))
+    assert "Won on factorization" in md
+    assert "1212" in md and "4109" in md and "2897" in md
