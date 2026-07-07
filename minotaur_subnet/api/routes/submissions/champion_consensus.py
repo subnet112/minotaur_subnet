@@ -399,7 +399,11 @@ async def _independent_adopt_vote(
         require_real_sim_default,
         run_benchmark,
     )
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        deadwood_delta_between,
+        evaluate_relative_adoption,
+        factor_delta_between,
+    )
 
     def _counts(v: dict[str, Any]) -> dict[str, Any]:
         # Relative better/worse/matched breakdown — the display + tally shape that
@@ -536,8 +540,33 @@ async def _independent_adopt_vote(
     # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
     # Joins champion vs challenger BenchmarkResults by intent_id on raw_output (the
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
+    # factor_delta: the Phase-2 factorization tie-break, from the PERSISTED
+    # screening metrics on this follower's LOCAL records (leader-computed once,
+    # mirrored: the candidate's via the round close snapshot; the incumbent's
+    # only via a champion force-sync — a leader-side BACKFILL does NOT reach
+    # here on its own, close snapshots are round-scoped, hence the mandatory
+    # post-backfill reattest in scripts/backfill_factor_metric.py). None on
+    # either side ⇒ 0 ⇒ clause inert, exactly like the leader.
+    # deadwood_delta: the 4th ladder key, threaded IDENTICALLY; the
+    # metric-version guard lives in the ONE shared helper
+    # (deadwood_delta_between: 0 unless BOTH records carry SAME-VERSION
+    # unproductive metrics — cross-version node counts are not comparable, so
+    # a mismatched pair must never produce a nonzero delta). The fields ship
+    # on the #575 lineage; getattr keeps this inert until the lineages merge
+    # and records carry values (activation-by-data, exactly like factor).
     verdict = evaluate_relative_adoption(
-        champ_results, chal_results, **_bar_kwargs(incumbent_sub),
+        champ_results, chal_results,
+        factor_delta=factor_delta_between(
+            getattr(incumbent_sub, "max_region_nodes", None),
+            getattr(candidate, "max_region_nodes", None),
+        ),
+        deadwood_delta=deadwood_delta_between(
+            getattr(incumbent_sub, "unproductive_nodes", None),
+            getattr(candidate, "unproductive_nodes", None),
+            getattr(incumbent_sub, "unproductive_metric_version", None),
+            getattr(candidate, "unproductive_metric_version", None),
+        ),
+        **_bar_kwargs(incumbent_sub),
     )
     adopt = bool(verdict["adopt"])
     counts = _counts(verdict)
