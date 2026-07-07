@@ -36,6 +36,7 @@ from minotaur_subnet.harness.submission_store import (
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
+    blind_spot_bar_from_rows,
     evaluate_relative_adoption,
     has_delivered_value_rows,
 )
@@ -156,6 +157,14 @@ class ChampionInfo:
     image_tag: str | None = None
     hotkey: str | None = None
     adopted_at: float = 0.0
+    # ADOPTION-TIME per-order delivered outputs ({intent_id: exact wei string},
+    # relative_scoring.blind_spot_bar_from_rows) — the blind-spot REPEAT bar.
+    # Snapshotted at _hot_swap because the incumbent re-bench overwrites the
+    # submission record's per_intent every round (merge_benchmark_details), so
+    # the stored rows can NOT recover what the order paid when it won. In-memory
+    # only: lost on restart (guard inert until the next adoption) — persisting it
+    # in ChampionSnapshot + the consensus proposal is the ARMING-phase work.
+    adoption_outputs: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1350,7 +1359,12 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            # Same blind-spot bar kwargs as the live decision
+            # (_evaluate_per_order_adoption) so this published would-be vote
+            # keeps matching the real verdict.
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows, **self._blind_spot_bar_kwargs(),
+            )
             adopt = bool(verdict["adopt"])
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
@@ -1360,6 +1374,10 @@ class EpochManager:
                 "n_regressions": verdict["n_regressions"],
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
+                "n_blind_spot_repeats": verdict.get("n_blind_spot_repeats", 0),
+                "n_blind_spot_repeats_observed": verdict.get(
+                    "n_blind_spot_repeats_observed", 0,
+                ),
                 "scenarios_compared": verdict["scenarios_compared"],
                 "reason": verdict["reason"],
             }
@@ -1476,6 +1494,26 @@ class EpochManager:
         rows = details.get("per_intent") if isinstance(details, dict) else None
         return rows if isinstance(rows, list) else []
 
+    def _blind_spot_bar_kwargs(self) -> dict[str, Any]:
+        """``champion_bar``/``bar_age_s`` kwargs for the relative verdict.
+
+        Sourced from the ADOPTION-TIME snapshot on :class:`ChampionInfo` (see
+        ``adoption_outputs``). Empty dict — guard fully inert — when there is no
+        snapshot (pre-adoption, genesis, or a post-restart champion restored
+        without one).
+        """
+        # getattr-duck-typed (like every other _champion read on the decision
+        # path): a restored/mocked champion without the snapshot must degrade to
+        # an inert guard, never an AttributeError that reads as an abstain.
+        bar = getattr(self._champion, "adoption_outputs", None)
+        adopted_at = getattr(self._champion, "adopted_at", 0.0) or 0.0
+        if not bar or not adopted_at:
+            return {}
+        return {
+            "champion_bar": bar,
+            "bar_age_s": max(0.0, time.time() - adopted_at),
+        }
+
     def _evaluate_per_order_adoption(
         self, challenger: Submission,
     ) -> dict[str, Any] | None:
@@ -1504,7 +1542,9 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows, **self._blind_spot_bar_kwargs(),
+            )
 
             logger.info(
                 "[per-order-adoption] challenger=%s verdict=%s wins=%d regressions=%d "
@@ -1515,6 +1555,18 @@ class EpochManager:
                 verdict["n_blind_spots"], verdict["n_matched"],
                 verdict["scenarios_compared"], verdict["reason"],
             )
+            # Phase-0 soak signal: covers that merely re-deliver the incumbent's
+            # own adoption-time value (the calldata-replay treadmill signature).
+            # While BLIND_SPOT_BAR_TTL_S is None this NEVER affects the verdict.
+            if verdict.get("n_blind_spot_repeats_observed", 0) > 0:
+                logger.info(
+                    "[blind-spot-bar] challenger=%s observed %d blind-spot "
+                    "repeat(s) (cover <= incumbent's adoption-time value, bar "
+                    "age %.0fs) — observe-only, verdict unchanged",
+                    getattr(challenger, "submission_id", "?"),
+                    verdict["n_blind_spot_repeats_observed"],
+                    self._blind_spot_bar_kwargs().get("bar_age_s", -1.0),
+                )
 
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
@@ -1703,6 +1755,10 @@ class EpochManager:
             image_tag=submission.image_tag,
             hotkey=submission.hotkey,
             adopted_at=adopted_at,
+            # Blind-spot REPEAT bar: what each order paid at the moment this
+            # champion won — snapshotted NOW because the per-round incumbent
+            # re-bench overwrites the submission's stored per_intent.
+            adoption_outputs=blind_spot_bar_from_rows(self._per_intent(submission)),
         )
         if self._sub_store is not None:
             self._sub_store.adopt(submission.submission_id)

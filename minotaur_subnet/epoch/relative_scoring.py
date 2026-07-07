@@ -81,6 +81,39 @@ FLOOR_BPS = 100  # 1.0% hard per-order regression cap
 # net positive by one order".
 DETHRONE_WIN_MARGIN = 1
 
+# BLIND_SPOT_BAR_TTL_S — blind-spot REPEAT guard (the anti-treadmill rule).
+#
+# Live-observed exploit (2026-07-07): challengers copy the champion byte-for-byte
+# and win by "covering" ONE order the incumbent fails on — where the incumbent's
+# own earlier reign DELIVERED on that exact order and its canned calldata merely
+# went stale (ord_45a3a32b was the winning order on three consecutive dethrones,
+# each within ~1% of the value the displaced champion itself delivered at ITS
+# adoption). Real market adaptation looks different: the old value becomes
+# unreachable, not re-photocopiable.
+#
+# The guard: a ``blind_spot_cover`` only counts toward dethrone when the
+# challenger EXCEEDS the incumbent's ADOPTION-TIME delivered value on that order
+# by the noise band — unless that recorded value is older than this TTL (market
+# moved on; coverage credit works exactly as before). A cover that merely
+# re-delivers what the same order already paid within the TTL is a
+# ``blind_spot_repeat``: compared but NEUTRAL (neither win nor regression), so
+# it can never be the +1 that dethrones.
+#
+# CONSENSUS-CRITICAL CODE constant (same discipline as FLOOR_BPS — never
+# env-read) and the ARMING SWITCH, mirroring FACTOR_MARGIN: while ``None`` the
+# guard CANNOT down-grade a cover, no matter what bar callers pass — Phase 0
+# ships the mechanism observe-only (``n_blind_spot_repeats_observed`` in the
+# verdict + caller logs). Arm a calibrated TTL (seconds) in a fleet-wide
+# promotion ONLY — a leader-only arm would split the adoption quorum. Arming
+# also requires the bar to reach the follower vote path
+# (champion_consensus._independent_adopt_vote), which passes no bar today.
+BLIND_SPOT_BAR_TTL_S: float | None = None  # None ⇒ guard disarmed; arm seconds fleet-wide
+
+# Observation-only reference TTL for the Phase-0 soak: how old an adoption-time
+# bar may be while still COUNTING a would-be repeat into
+# ``n_blind_spot_repeats_observed``. Never affects the verdict.
+BLIND_SPOT_BAR_OBSERVE_TTL_S: float = 24 * 3600.0
+
 # Basis-points denominator for the cross-multiplied comparison.
 _BPS = 10000
 
@@ -172,6 +205,9 @@ def evaluate_relative_adoption(
     champion_results: list[Any],
     challenger_results: list[Any],
     tol_bps: int = RELATIVE_TOL_BPS,
+    *,
+    champion_bar: dict[str, Any] | None = None,
+    bar_age_s: float | None = None,
 ) -> dict[str, Any]:
     """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
@@ -187,7 +223,9 @@ def evaluate_relative_adoption(
           - a ``regression`` cut by MORE than ``FLOOR_BPS`` (1%) is ALSO counted
             ``n_catastrophic`` (the >1% subset of ``n_regressions``)
       * champion blind (no value) & challenger delivers -> ``blind_spot_cover``
-        (counts as a win — the challenger covers a case the champion can't)
+        (counts as a win — the challenger covers a case the champion can't) —
+        UNLESS the blind-spot REPEAT guard (below) downgrades it to a NEUTRAL
+        ``blind_spot_repeat``
       * champion delivers & challenger drops it (no value) -> ``dropped``
         (counted in ``n_dropped`` — a HARD VETO, NOT netted against wins)
       * neither delivers value -> ``skip`` (nothing to compare)
@@ -204,6 +242,18 @@ def evaluate_relative_adoption(
     HARD VETO that no number of wins can override. When ``adopt`` holds,
     ``n_catastrophic == 0`` so every counted regression is the tolerated
     <=1% kind.
+
+    Blind-spot REPEAT guard (keyword-only, see :data:`BLIND_SPOT_BAR_TTL_S`):
+    ``champion_bar`` maps ``intent_id`` -> the incumbent's ADOPTION-TIME
+    delivered output (exact wei string/int; build with
+    :func:`blind_spot_bar_from_rows`), ``bar_age_s`` is seconds since that
+    adoption. A cover whose output does NOT exceed the bar value by ``tol_bps``
+    while the bar is fresher than the TTL is a ``blind_spot_repeat`` — compared
+    but neutral, never the +1 that dethrones. While the switch is ``None``
+    (Phase 0) the verdict is UNCHANGED and would-be repeats are only counted
+    into ``n_blind_spot_repeats_observed`` (against
+    :data:`BLIND_SPOT_BAR_OBSERVE_TTL_S`). Omitting either kwarg keeps the
+    guard fully inert.
 
     ``champion_results`` / ``challenger_results`` may be ``BenchmarkResult``
     objects (unit path) or ``per_intent`` dicts (report / manager path); both are
@@ -223,7 +273,9 @@ def evaluate_relative_adoption(
     per_order: list[dict[str, Any]] = []
     n_wins = n_regressions = n_blind_spots = n_matched = 0
     n_catastrophic = n_dropped = 0
+    n_blind_spot_repeats = n_blind_spot_repeats_observed = 0
     scenarios_compared = 0
+    guard_armed = BLIND_SPOT_BAR_TTL_S is not None
 
     for iid in sorted(set(champ_by) | set(chal_by)):
         champ_i = _parse_output(champ_by.get(iid))
@@ -231,6 +283,8 @@ def evaluate_relative_adoption(
         champ_has = champ_i is not None and champ_i > MIN_VALID_OUTPUT
         chal_has = chal_i is not None and chal_i > MIN_VALID_OUTPUT
         ratio: float | None = None
+        bar_s: str | None = None
+        bar_verdict: str | None = None
 
         if champ_has and chal_has:
             # EXACT-INTEGER verdict — cross-multiply the BPS band, no float.
@@ -251,8 +305,35 @@ def evaluate_relative_adoption(
                 n_matched += 1
             scenarios_compared += 1
         elif chal_has and not champ_has:
-            verdict = "blind_spot_cover"
-            n_blind_spots += 1
+            # Blind-spot REPEAT guard: the incumbent's ADOPTION-TIME output on
+            # this order is the bar a cover must EXCEED (same exact-integer
+            # cross-multiply as a win) while the bar is fresher than the TTL —
+            # re-delivering what the same order already paid is a photocopy of
+            # the incumbent's own win, not new coverage. Expired / absent bar
+            # (market moved on, order never covered) ⇒ full cover credit,
+            # exactly as before.
+            bar_i = _parse_output((champion_bar or {}).get(iid))
+            bar_has = bar_i is not None and bar_i > MIN_VALID_OUTPUT
+            exceeds_bar = bar_has and (
+                chal_i * _BPS > bar_i * (_BPS + tol_bps)  # type: ignore[operator]
+            )
+            if bar_has:
+                bar_s = str(bar_i)
+                bar_verdict = "exceed" if exceeds_bar else "repeat"
+            is_repeat = bar_has and not exceeds_bar and bar_age_s is not None
+            # Phase-0 observation: what the guard WOULD do at the reference TTL.
+            if is_repeat and bar_age_s <= BLIND_SPOT_BAR_OBSERVE_TTL_S:
+                n_blind_spot_repeats_observed += 1
+            if (
+                guard_armed
+                and is_repeat
+                and bar_age_s <= BLIND_SPOT_BAR_TTL_S  # type: ignore[operator]
+            ):
+                verdict = "blind_spot_repeat"
+                n_blind_spot_repeats += 1
+            else:
+                verdict = "blind_spot_cover"
+                n_blind_spots += 1
             scenarios_compared += 1
         elif champ_has and not chal_has:
             # Challenger produced nothing on an order the champion serves: a
@@ -264,7 +345,7 @@ def evaluate_relative_adoption(
         else:
             verdict = "skip"
 
-        per_order.append({
+        row: dict[str, Any] = {
             # champ/chal as EXACT DECIMAL STRINGS so JSON consumers (logs,
             # /health) never lose precision above 2^53. None when absent. `ratio`
             # is DISPLAY-ONLY (the verdict above is exact-integer).
@@ -273,7 +354,14 @@ def evaluate_relative_adoption(
             "chal": None if chal_i is None else str(chal_i),
             "ratio": ratio,
             "verdict": verdict,
-        })
+        }
+        if bar_s is not None:
+            # Blind-spot orders with a recorded adoption-time bar carry it (exact
+            # decimal string) + how the cover graded against it, so the soak is
+            # auditable per order from stored reports alone.
+            row["bar"] = bar_s
+            row["bar_verdict"] = bar_verdict
+        per_order.append(row)
 
     # BOUNDED-REGRESSION, NET-BETTER (Pareto-lite) verdict — all exact-integer.
     net_better = n_wins + n_blind_spots
@@ -298,6 +386,11 @@ def evaluate_relative_adoption(
             f"reject: net better {net_better} <= regressions {n_regressions} "
             f"+ margin {DETHRONE_WIN_MARGIN}"
         )
+    if n_blind_spot_repeats > 0:
+        reason += (
+            f" ({n_blind_spot_repeats} blind-spot repeat(s) not credited: cover "
+            f"does not exceed the incumbent's adoption-time value)"
+        )
 
     return {
         "adopt": adopt,
@@ -309,6 +402,10 @@ def evaluate_relative_adoption(
         "n_dropped": n_dropped,
         "n_blind_spots": n_blind_spots,
         "n_matched": n_matched,
+        # Blind-spot repeat guard: enforced count (0 while BLIND_SPOT_BAR_TTL_S
+        # is None) + the Phase-0 observe-only count at the reference TTL.
+        "n_blind_spot_repeats": n_blind_spot_repeats,
+        "n_blind_spot_repeats_observed": n_blind_spot_repeats_observed,
         "scenarios_compared": scenarios_compared,
     }
 
@@ -319,6 +416,30 @@ def evaluate_relative_adoption(
 # RELATIVE COUNT vs the current champion instead of a single saturated score.
 # These pure helpers map the per-order verdict above onto that count shape and back
 # from stored submissions; every API surface emits the relative block always.
+
+
+def blind_spot_bar_from_rows(rows: list[Any] | None) -> dict[str, str]:
+    """Build the blind-spot repeat bar from per-order rows — PURE.
+
+    Maps ``intent_id`` -> the DELIVERED raw output as an exact decimal wei
+    STRING (JSON-safe above 2^53), keeping only rows that delivered value
+    (parsed output > ``MIN_VALID_OUTPUT``). Snapshot this over the winner's
+    per-order rows AT ADOPTION (its outputs are overwritten by every subsequent
+    incumbent re-bench — the whole point is remembering what the order paid
+    when it won the crown) and pass it back as ``champion_bar`` with
+    ``bar_age_s = now - adopted_at``. Same duck-typed rows as
+    :func:`evaluate_relative_adoption`; accepts the legacy ``shadow_score`` key
+    via :func:`_raw_output`.
+    """
+    bar: dict[str, str] = {}
+    for r in rows or []:
+        iid = _field(r, "intent_id")
+        if iid is None:
+            continue
+        v = _parse_output(_raw_output(r))
+        if v is not None and v > MIN_VALID_OUTPUT:
+            bar[str(iid)] = str(v)
+    return bar
 
 
 def relative_counts(
@@ -352,7 +473,10 @@ def relative_counts(
     res = evaluate_relative_adoption(champion_results, challenger_results, tol_bps=tol_bps)
     better = res["n_wins"] + res["n_blind_spots"]
     worse = res["n_regressions"] + res["n_dropped"]
-    matched = res["n_matched"]
+    # Blind-spot REPEATS (armed guard only; 0 while disarmed) are compared-but-
+    # neutral, so they surface as "matched" on the report — the miner delivered
+    # on the order but no better than the incumbent's adoption-time value.
+    matched = res["n_matched"] + res.get("n_blind_spot_repeats", 0)
     new = res["n_blind_spots"]
     compared = better + worse + matched
     verdict = (
