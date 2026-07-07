@@ -479,6 +479,49 @@ def deploy_app_intent(
     }
 
 
+def _derive_overall_status(deployments: dict[int, Any]) -> str:
+    """Collapse per-chain deployment statuses into one app-level status.
+
+    Single source of truth for BOTH the list endpoint and the per-app status
+    endpoint — they used to disagree (the list said "solved" when ANY chain
+    was solved; /status said "partial"), and a frontend rendering per-chain
+    deploy state from the chain-less list value showed an app as "deployed"
+    on chains it never reached (live confusion 2026-07-07: Base solved +
+    Ethereum draft read as "deployed on Ethereum").
+
+    PARTIAL is the honest answer for mixed states; per-chain truth lives in
+    the "deployments" map that both endpoints now carry.
+    """
+    if not deployments:
+        return AppStatus.DRAFT.value
+    statuses = [dep.status for dep in deployments.values()]
+    if all(s == AppStatus.ACTIVE for s in statuses):
+        return AppStatus.ACTIVE.value
+    if all(s == AppStatus.SOLVED for s in statuses):
+        return AppStatus.SOLVED.value
+    if all(s.is_order_ready() for s in statuses):
+        # Mix of ACTIVE + SOLVED
+        return AppStatus.SOLVED.value
+    if all(s == AppStatus.SOLVING for s in statuses):
+        return AppStatus.SOLVING.value
+    if any(s.is_operational() for s in statuses):
+        return AppStatus.PARTIAL.value
+    if any(s == AppStatus.DEPLOYING for s in statuses):
+        return AppStatus.DEPLOYING.value
+    return AppStatus.DRAFT.value
+
+
+def _deployments_summary(deployments: dict[int, Any]) -> dict[str, dict[str, Any]]:
+    """Per-chain {status, contract_address} map — the chain-attributed truth."""
+    return {
+        str(chain_id): {
+            "status": dep.status.value,
+            "contract_address": dep.contract_address,
+        }
+        for chain_id, dep in deployments.items()
+    }
+
+
 def list_minotaur_subnet(
     store: AppIntentStore,
     deployer: str | None = None,
@@ -490,26 +533,18 @@ def list_minotaur_subnet(
 
     Returns:
         Dict with "apps" key containing a list of AppIntentDefinition dicts,
-        each enriched with a "status" field derived from deployment records.
+        each enriched with a "status" field (same derivation as the per-app
+        status endpoint) and a per-chain "deployments" summary map — clients
+        MUST use the latter for any per-chain rendering; the flat status has
+        no chain attribution.
     """
     apps = store.list_apps(deployer=deployer if deployer else None)
     result = []
     for a in apps:
         d = asdict(a)
-        # Derive status from deployment records
         deployments = store.get_deployments(a.app_id)
-        if deployments:
-            statuses = [dep.status for dep in deployments.values()]
-            if any(s == AppStatus.ACTIVE for s in statuses):
-                d["status"] = "active"
-            elif any(s == AppStatus.SOLVED for s in statuses):
-                d["status"] = "solved"
-            elif any(s.is_operational() for s in statuses):
-                d["status"] = statuses[0].value
-            else:
-                d["status"] = "draft"
-        else:
-            d["status"] = "draft"
+        d["status"] = _derive_overall_status(deployments)
+        d["deployments"] = _deployments_summary(deployments)
         result.append(d)
     return {
         "apps": result,
@@ -562,26 +597,9 @@ def get_app_status(
     except Exception:
         pass  # Submission store not available -- degrade gracefully
 
-    # Determine overall status from all chain deployments
-    if deployments:
-        statuses = [d.status for d in deployments.values()]
-        if all(s == AppStatus.ACTIVE for s in statuses):
-            status = AppStatus.ACTIVE.value
-        elif all(s == AppStatus.SOLVED for s in statuses):
-            status = AppStatus.SOLVED.value
-        elif all(s.is_order_ready() for s in statuses):
-            # Mix of ACTIVE + SOLVED
-            status = AppStatus.SOLVED.value
-        elif all(s == AppStatus.SOLVING for s in statuses):
-            status = AppStatus.SOLVING.value
-        elif any(s.is_operational() for s in statuses):
-            status = AppStatus.PARTIAL.value
-        elif any(s == AppStatus.DEPLOYING for s in statuses):
-            status = AppStatus.DEPLOYING.value
-        else:
-            status = AppStatus.DRAFT.value
-    else:
-        status = AppStatus.DRAFT.value
+    # Determine overall status from all chain deployments (shared with the
+    # list endpoint so the two can never disagree again).
+    status = _derive_overall_status(deployments)
 
     result: dict[str, Any] = {
         "app_id": app_id,
@@ -599,7 +617,12 @@ def get_app_status(
         # Null: the champion is the relative baseline, not a numeric score to beat.
         "champion_score": None,
         "scenario_scores": scenario_scores,
-        # Primary deployment
+        # DEPRECATED for per-chain rendering: this is the "preferred" record
+        # (first order-ready deployment on ANY chain), so on a multi-chain app
+        # it carries another chain's contract_address — reading it while
+        # showing chain X claims deployment that never happened (live
+        # confusion 2026-07-07). Kept because follower app_sync consumes it
+        # as an upsert fallback; new clients must use "deployments".
         "deployment": {
             "contract_address": deployment.contract_address,
             "chain_id": deployment.chain_id,
