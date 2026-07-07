@@ -1728,7 +1728,12 @@ class BenchmarkWorker:
         )
         try:
             from minotaur_subnet.api.server_context import ctx
-            ctx.last_independent_vote = dict(vote)
+            # Own slot (NOT last_independent_vote): a diagnostic probe must not
+            # clobber the real fleet-tally field — e.g. a shadow REJECT (this
+            # path is deliberately un-threaded with the factor tie-break)
+            # overwriting a live follower ADOPT during a factor-tie dethrone
+            # would read as fake dissent in the tally.
+            ctx.last_shadow_vote = dict(vote)
         except Exception:  # observe-only — must never break
             pass
         return vote

@@ -127,3 +127,256 @@ def test_benchmark_failed_when_no_plans():
     details = {"errors": 3, "plans_generated": 0, "per_intent": []}
     r = _report(_sub("scored", details))
     assert r["outcome"] == "benchmark_failed"
+
+
+# ── factorization transparency (armed rule must be visible to miners) ────────
+
+
+class _FactorSub:
+    status = type("S", (), {"value": "scored"})()
+    submission_id = "sub_factor"
+    max_region_nodes = 4109
+    benchmark_details = {
+        "relative": {
+            "better": 0, "worse": 0, "matched": 5, "new": 0, "compared": 5,
+            "verdict": "matched", "adopt_via": None, "per_order": [],
+            "factorization": {
+                "candidate_nodes": 4109, "champion_nodes": 4109,
+                "factor_delta": 0, "factor_margin": 100, "armed": True,
+            },
+        }
+    }
+
+
+def test_factorization_block_reports_armed_state_and_baseline():
+    from minotaur_subnet.api.routes.submissions.report import build_submission_report
+    from minotaur_subnet.epoch import relative_scoring as _rs
+    from minotaur_subnet.harness import screening as _sc
+
+    rep = build_submission_report(_FactorSub(), reason=None)
+    fz = rep["factorization"]
+    # Armed state is COMPUTED from live constants — never hardcoded.
+    expected_armed = _sc.MAX_REGION_NODES is not None or _rs.FACTOR_MARGIN is not None
+    assert fz["armed"] is expected_armed
+    assert fz["observe_only"] is (not expected_armed)
+    assert fz["floor_cap"] == _sc.MAX_REGION_NODES
+    assert fz["factor_margin"] == _rs.FACTOR_MARGIN
+    # Same-pin champion baseline merged from the stored relative block.
+    assert fz["champion_nodes"] == 4109
+    assert fz["factor_delta"] == 0
+
+
+def test_matched_hint_names_the_factor_target():
+    from minotaur_subnet.api.routes.submissions.report import (
+        build_submission_report,
+        render_report_md,
+    )
+
+    rep = build_submission_report(_FactorSub(), reason=None)
+    md = render_report_md(rep, submission_id="sub_factor")
+    # The tied miner is told the SECOND way to win, with the exact target
+    # (champion 4109 - margin 100 = 4009), like the ❌ rows name orders.
+    assert "OR ship better-factored code" in md
+    assert "≤ 4009" in md
+
+
+def test_factor_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import (
+        build_submission_report,
+        render_report_md,
+    )
+
+    class _Winner(_FactorSub):
+        status = type("S", (), {"value": "adopted"})()
+        benchmark_details = {
+            "relative": {
+                "better": 0, "worse": 0, "matched": 5, "new": 0, "compared": 5,
+                "verdict": "dethrone", "adopt_via": "factorization", "per_order": [],
+                "factorization": {
+                    "candidate_nodes": 1212, "champion_nodes": 4109,
+                    "factor_delta": 2897, "factor_margin": 100, "armed": True,
+                },
+            }
+        }
+
+    md = render_report_md(build_submission_report(_Winner(), reason=None))
+    assert "Won on factorization" in md
+    assert "1212" in md and "4109" in md and "2897" in md
+
+
+# ── GAS-PAR transparency (C2 — ships DISARMED; rule state must be honest) ────
+
+
+def test_gas_block_reports_disarmed_state():
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    rep = _report(_sub("scored", _DETAILS))
+    gz = rep["gas"]
+    # Armed state is COMPUTED from the live constant — never hardcoded. On
+    # this branch the clause SHIPS DISARMED (GAS_MARGIN_BPS is None).
+    expected_armed = _rs.GAS_MARGIN_BPS is not None
+    assert gz["armed"] is expected_armed
+    assert gz["observe_only"] is (not expected_armed)
+    assert gz["gas_margin_bps"] == _rs.GAS_MARGIN_BPS
+    assert gz["basis"] == _rs.GAS_BASIS
+    # No stored same-pin totals -> none surfaced.
+    assert "champ_total" not in gz and "chal_total" not in gz
+
+
+def test_gas_block_armed_carries_stored_totals(monkeypatch):
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", 250)
+    rel = _rel("matched", matched=5)
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 198_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True, "basis": _rs.GAS_BASIS,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    gz = rep["gas"]
+    assert gz["armed"] is True
+    assert gz["observe_only"] is False
+    assert gz["gas_margin_bps"] == 250
+    # Same-pin totals merged from the stored relative block.
+    assert gz["champ_total"] == 200_000
+    assert gz["chal_total"] == 198_000
+    assert gz["measured_full"] is True
+
+
+def test_gas_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("dethrone", matched=5)
+    rel["adopt_via"] = "gas"
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 180_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True,
+    }
+    rep = _report(_sub("adopted", _DETAILS, relative=rel))
+    md = render_report_md(rep)
+    assert "Won on gas" in md
+    assert "180000" in md and "200000" in md and "250" in md
+
+
+def test_matched_hint_names_the_gas_target():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("matched", matched=5)
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 198_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_gas")
+    # The tied miner is told the gas way to win, with the exact target
+    # (200000 * (10000 - 250) // 10000 = 195000), like the factor hint.
+    assert "OR deliver the same outputs on less gas" in md
+    assert "below 195000" in md
+
+
+def test_matched_hint_omits_gas_target_when_disarmed():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # Stored block from a DISARMED round carries no gas sub-dict at all —
+    # the hint must not advertise a rule that cannot fire.
+    rep = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=5)))
+    md = render_report_md(rep, submission_id="sub_gas")
+    assert "less gas" not in md
+
+
+# ── DEADWOOD transparency (4th key, ships ARMED; rule state must be honest) ──
+#
+# NOTE the report key is ``deadwood_rule`` — the #575 lineage adds an
+# observe-only per-submission ``deadwood`` block (own nodes + top_offenders);
+# the two merge into one block when the lineages converge.
+
+
+def test_deadwood_rule_block_reports_armed_state():
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    rep = _report(_sub("scored", _DETAILS))
+    dz = rep["deadwood_rule"]
+    # Armed state is COMPUTED from the live constant — never hardcoded. On
+    # this branch the clause SHIPS ARMED (UNPRODUCTIVE_MARGIN = 2000).
+    expected_armed = _rs.UNPRODUCTIVE_MARGIN is not None
+    assert dz["armed"] is expected_armed
+    assert dz["observe_only"] is (not expected_armed)
+    assert dz["unproductive_margin"] == _rs.UNPRODUCTIVE_MARGIN
+    # No stored same-pin baseline -> none surfaced.
+    assert "candidate_nodes" not in dz and "champion_nodes" not in dz
+
+
+def test_deadwood_rule_block_carries_stored_baseline():
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 14_500, "champion_nodes": 15_000,
+        "deadwood_delta": 500, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    dz = rep["deadwood_rule"]
+    # Same-pin baseline merged from the stored relative block.
+    assert dz["candidate_nodes"] == 14_500
+    assert dz["champion_nodes"] == 15_000
+    assert dz["deadwood_delta"] == 500
+
+
+def test_deadwood_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("dethrone", matched=5)
+    rel["adopt_via"] = "deadwood"
+    rel["deadwood"] = {
+        "candidate_nodes": 12_000, "champion_nodes": 15_000,
+        "deadwood_delta": 3000, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("adopted", _DETAILS, relative=rel))
+    md = render_report_md(rep)
+    assert "🪓" in md and "Won on deadwood" in md
+    assert "12000" in md and "15000" in md and "3000" in md and "2000" in md
+
+
+def test_matched_hint_names_the_deadwood_target():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 14_500, "champion_nodes": 15_000,
+        "deadwood_delta": 500, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_dw")
+    # The tied miner is told the deadwood way to win, with the exact target
+    # (margin 2000 - delta 500 = 1500 more nodes to delete), like the factor
+    # and gas hints name theirs.
+    assert "OR ship less dead code" in md
+    assert "delete ≥ 1500 more dead nodes" in md
+
+
+def test_matched_hint_omits_deadwood_when_no_stored_block():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # Stored block from a round where the metric was unmeasured / the clause
+    # inert carries no deadwood sub-dict at all — the hint must not advertise
+    # a rule that cannot fire on this pair.
+    rep = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=5)))
+    md = render_report_md(rep, submission_id="sub_dw")
+    assert "dead nodes" not in md and "deadwood" not in md
+
+
+def test_matched_hint_omits_deadwood_target_when_delta_at_margin():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # delta >= margin on a stored matched block means the clause either won
+    # elsewhere or was blocked by a factor decision — "delete more dead
+    # nodes" is not the ask, so no target is named.
+    rel = _rel("matched", matched=5)
+    rel["deadwood"] = {
+        "candidate_nodes": 12_000, "champion_nodes": 15_000,
+        "deadwood_delta": 3000, "margin": 2000, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_dw")
+    assert "delete ≥" not in md
