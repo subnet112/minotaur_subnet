@@ -1009,6 +1009,20 @@ class TestEpochManager:
         assert rel["better"] == 2 and rel["worse"] == 0
         assert rel["verdict"] == "dethrone"
         assert rel["round_id"] == "round-e1-n1"
+        # Deadwood rule context attached None-safely: the metric fields
+        # (unproductive_nodes / unproductive_metric_version) live on the #575
+        # lineage and do NOT exist on Submission here — getattr ⇒ None nodes ⇒
+        # version-guarded delta 0 (clause data-inert), armed COMPUTED from the
+        # live constant.
+        from minotaur_subnet.epoch.relative_scoring import UNPRODUCTIVE_MARGIN
+
+        assert rel["deadwood"] == {
+            "candidate_nodes": None,
+            "champion_nodes": None,
+            "deadwood_delta": 0,
+            "margin": UNPRODUCTIVE_MARGIN,
+            "armed": UNPRODUCTIVE_MARGIN is not None,
+        }
         # Champion + no-shadow competitor untouched.
         assert "relative" not in store.get("champ").benchmark_details
         assert "relative" not in store.get("noshadow").benchmark_details

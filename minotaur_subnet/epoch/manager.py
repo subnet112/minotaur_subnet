@@ -1353,6 +1353,7 @@ class EpochManager:
             return
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
                 factor_delta_between,
             )
@@ -1367,12 +1368,22 @@ class EpochManager:
             # Phase-2 factorization tie-break input — PERSISTED metrics only
             # (None on either side ⇒ 0 ⇒ clause inert), IDENTICAL to the live
             # decision (_evaluate_per_order_adoption) so this published would-be
-            # vote keeps matching the real verdict.
+            # vote keeps matching the real verdict. deadwood_delta: same
+            # pattern for the 4th key, with the metric-version guard living in
+            # the ONE shared helper (deadwood_delta_between: 0 unless both
+            # sides carry SAME-VERSION unproductive metrics — fields ship on
+            # the #575 lineage, getattr keeps this inert until then).
             verdict = evaluate_relative_adoption(
                 champ_rows, chal_rows,
                 factor_delta=factor_delta_between(
                     getattr(incumbent_sub, "max_region_nodes", None),
                     getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
                 ),
             )
             adopt = bool(verdict["adopt"])
@@ -1386,6 +1397,7 @@ class EpochManager:
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
                 "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
                 "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
             }
@@ -1520,6 +1532,7 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
                 factor_delta_between,
             )
@@ -1538,11 +1551,24 @@ class EpochManager:
             # the deliberate fleet-wide activation lever). Never recomputed at
             # decision time. IDENTICAL threading to the follower's
             # _independent_adopt_vote, so leader and fleet keep deciding alike.
+            # deadwood_delta: the 4th ladder key, threaded the same way; the
+            # metric-version guard lives in the ONE shared helper
+            # (deadwood_delta_between: 0 unless BOTH records carry
+            # SAME-VERSION unproductive metrics — cross-version node counts
+            # are not comparable). The fields ship on the #575 lineage;
+            # getattr keeps this inert until the lineages merge and records
+            # carry values (activation-by-data, exactly like factor).
             verdict = evaluate_relative_adoption(
                 champ_rows, chal_rows,
                 factor_delta=factor_delta_between(
                     getattr(incumbent_sub, "max_region_nodes", None),
                     getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
                 ),
             )
 
@@ -1565,6 +1591,7 @@ class EpochManager:
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
                 "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
                 "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
                 "per_order": verdict["per_order"],
@@ -1602,6 +1629,8 @@ class EpochManager:
                 FACTOR_MARGIN,
                 GAS_BASIS,
                 GAS_MARGIN_BPS,
+                UNPRODUCTIVE_MARGIN,
+                deadwood_delta_between,
                 factor_delta_between,
                 has_raw_output_rows,
                 relative_counts,
@@ -1614,6 +1643,11 @@ class EpochManager:
             if not has_raw_output_rows(champ_rows):
                 return
             champ_nodes = getattr(champ_sub, "max_region_nodes", None)
+            # Deadwood metric fields ship on the #575 lineage — getattr keeps
+            # this None-safe (⇒ delta 0 ⇒ inert) until the lineages merge and
+            # records carry values.
+            champ_dw_nodes = getattr(champ_sub, "unproductive_nodes", None)
+            champ_dw_version = getattr(champ_sub, "unproductive_metric_version", None)
             for competitor in self._sub_store.list_by_round(round_id):
                 if competitor.submission_id == self._champion.submission_id:
                     continue
@@ -1628,13 +1662,40 @@ class EpochManager:
                     # stored as "dethrone", not a misleading "matched".
                     comp_nodes = getattr(competitor, "max_region_nodes", None)
                     delta = factor_delta_between(champ_nodes, comp_nodes)
-                    counts = relative_counts(champ_rows, comp_rows, factor_delta=delta)
+                    # Deadwood (4th ladder key): same-pin, version-guarded
+                    # delta via the ONE shared helper — 0 unless both records
+                    # carry SAME-VERSION unproductive metrics (fields on the
+                    # #575 lineage; getattr ⇒ None-safe until then).
+                    comp_dw_nodes = getattr(competitor, "unproductive_nodes", None)
+                    comp_dw_version = getattr(
+                        competitor, "unproductive_metric_version", None,
+                    )
+                    dw_delta = deadwood_delta_between(
+                        champ_dw_nodes, comp_dw_nodes,
+                        champ_dw_version, comp_dw_version,
+                    )
+                    counts = relative_counts(
+                        champ_rows, comp_rows,
+                        factor_delta=delta, deadwood_delta=dw_delta,
+                    )
                     counts["factorization"] = {
                         "candidate_nodes": comp_nodes,
                         "champion_nodes": champ_nodes,
                         "factor_delta": delta,
                         "factor_margin": FACTOR_MARGIN,
                         "armed": FACTOR_MARGIN is not None,
+                    }
+                    # Deadwood rule context beside factorization/gas — the one
+                    # display pass with both records in hand, so the report
+                    # reads it without any cross-record lookup and a
+                    # deadwood-tie dethrone is stored as "dethrone" with its
+                    # actionable numbers. None-safe by construction.
+                    counts["deadwood"] = {
+                        "candidate_nodes": comp_dw_nodes,
+                        "champion_nodes": champ_dw_nodes,
+                        "deadwood_delta": dw_delta,
+                        "margin": UNPRODUCTIVE_MARGIN,
+                        "armed": UNPRODUCTIVE_MARGIN is not None,
                     }
                     # GAS-PAR (ships DISARMED): same-pin gas context beside the
                     # factorization block. relative_counts carries the ``gas``

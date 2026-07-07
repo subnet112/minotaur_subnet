@@ -400,6 +400,7 @@ async def _independent_adopt_vote(
         run_benchmark,
     )
     from minotaur_subnet.epoch.relative_scoring import (
+        deadwood_delta_between,
         evaluate_relative_adoption,
         factor_delta_between,
     )
@@ -519,11 +520,24 @@ async def _independent_adopt_vote(
     # here on its own, close snapshots are round-scoped, hence the mandatory
     # post-backfill reattest in scripts/backfill_factor_metric.py). None on
     # either side ⇒ 0 ⇒ clause inert, exactly like the leader.
+    # deadwood_delta: the 4th ladder key, threaded IDENTICALLY; the
+    # metric-version guard lives in the ONE shared helper
+    # (deadwood_delta_between: 0 unless BOTH records carry SAME-VERSION
+    # unproductive metrics — cross-version node counts are not comparable, so
+    # a mismatched pair must never produce a nonzero delta). The fields ship
+    # on the #575 lineage; getattr keeps this inert until the lineages merge
+    # and records carry values (activation-by-data, exactly like factor).
     verdict = evaluate_relative_adoption(
         champ_results, chal_results,
         factor_delta=factor_delta_between(
             getattr(incumbent_sub, "max_region_nodes", None),
             getattr(candidate, "max_region_nodes", None),
+        ),
+        deadwood_delta=deadwood_delta_between(
+            getattr(incumbent_sub, "unproductive_nodes", None),
+            getattr(candidate, "unproductive_nodes", None),
+            getattr(incumbent_sub, "unproductive_metric_version", None),
+            getattr(candidate, "unproductive_metric_version", None),
         ),
     )
     adopt = bool(verdict["adopt"])
