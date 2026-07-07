@@ -43,7 +43,10 @@ def test_score_image_diagnostic_uses_champion_reference_anchor():
     w._build_score_fn = AsyncMock(return_value=object())
     w._enrich_intents_with_manifests = MagicMock(side_effect=lambda x: x)
     w._load_historical_scenarios = MagicMock(return_value=[])
-    w._build_reference_quotes = AsyncMock(return_value=refq)
+    # Stub the flag-aware GETTER (what the path actually calls) so the test
+    # asserts the getter→bench plumbing regardless of quote regime; under the
+    # static default the real getter returns {} without building.
+    w._get_or_build_reference_quotes = AsyncMock(return_value=refq)
 
     async def _bench(image, ints, score_fn, *, reference_quotes=None):
         seen["image"] = image
@@ -56,7 +59,8 @@ def test_score_image_diagnostic_uses_champion_reference_anchor():
 
     out = asyncio.run(w.score_image_diagnostic("king:exact"))
 
-    # benchmarked the GIVEN image against the CHAMPION reference anchor (challenger path)
+    # benchmarked the GIVEN image with the getter-provided reference set
+    # (challenger path — same anchor discipline as run_once)
     assert seen["image"] == "king:exact"
     assert seen["reference_quotes"] is refq
     # the diagnostic returns the challenger-path scorecard (raw_output rows), not a
