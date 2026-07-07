@@ -403,13 +403,40 @@ async def _independent_adopt_vote(
 
     def _counts(v: dict[str, Any]) -> dict[str, Any]:
         # Relative better/worse/matched breakdown — the display + tally shape that
-        # replaced the retired aggregate chal_score/champ_score.
+        # replaced the retired aggregate chal_score/champ_score. Armed blind-spot
+        # repeats are compared-but-neutral, folded into matched (mirroring
+        # relative_counts) with the separate count kept for the tally.
+        repeats = v.get("n_blind_spot_repeats", 0)
         return {
             "better": v["n_wins"] + v["n_blind_spots"],
             "worse": v["n_regressions"] + v["n_dropped"],
-            "matched": v["n_matched"],
+            "matched": v["n_matched"] + repeats,
+            "repeats": repeats,
             "compared": v["scenarios_compared"],
         }
+
+    def _bar_kwargs(incumbent: Any) -> dict[str, Any]:
+        # Blind-spot REPEAT bar for THIS validator's independent verdict — the
+        # SAME rule input the leader passes (_blind_spot_bar_kwargs), sourced
+        # from the local round store (persisted at adoption by _hot_swap). A
+        # follower whose store predates the bar (trust-adopted at quorum<=1 /
+        # pre-upgrade) degrades to an inert guard — identical to the leader
+        # after a snapshot-less restore. Best-effort: never blocks the vote.
+        try:
+            import time as _time
+
+            from minotaur_subnet.epoch.relative_scoring import bar_kwargs_from_record
+
+            round_store = getattr(worker, "_round_store", None)
+            if round_store is None or incumbent is None:
+                return {}
+            return bar_kwargs_from_record(
+                round_store.get_champion_adoption_bar(),
+                getattr(incumbent, "submission_id", None),
+                _time.time(),
+            )
+        except Exception:
+            return {}
 
     # has_champion mirrors the leader EXACTLY: adopted champion, active-champion
     # snapshot, OR a genesis that DELIVERED VALUE (genesis-as-bar, #242 — the
@@ -417,7 +444,8 @@ async def _independent_adopt_vote(
     # same predicate at decision time (_maybe_seed_genesis_incumbent), so
     # _resolve_incumbent_submission() replicates it. The bootstrap branch below is
     # reached only at TRUE bootstrap — no champion AND no scored genesis yet.
-    has_champion = worker._resolve_incumbent_submission() is not None
+    incumbent_sub = worker._resolve_incumbent_submission()
+    has_champion = incumbent_sub is not None
     champ_image = worker._resolve_champion_image()
 
     if not has_champion:
@@ -508,7 +536,9 @@ async def _independent_adopt_vote(
     # _meets_adoption_criteria, so leader and follower decide alike (fleet-uniform).
     # Joins champion vs challenger BenchmarkResults by intent_id on raw_output (the
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
-    verdict = evaluate_relative_adoption(champ_results, chal_results)
+    verdict = evaluate_relative_adoption(
+        champ_results, chal_results, **_bar_kwargs(incumbent_sub),
+    )
     adopt = bool(verdict["adopt"])
     counts = _counts(verdict)
     logger.info(
