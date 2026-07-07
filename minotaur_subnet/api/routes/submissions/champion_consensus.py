@@ -272,28 +272,6 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:
             logger.warning("Reactive historical sampling failed: %s", exc)
 
-    # Match the leader benchmark path EXACTLY — including the quote regime.
-    # The getter is flag-aware: under static quoting (the default) it returns
-    # {} without starting a champion session (the enrichment injects a static
-    # zero quote, same as the leader's scoring definition); under the legacy
-    # champion-anchored mode it builds the same reference pre-pass the leader
-    # graded against (this worker has no round store, so the getter falls
-    # through to a plain build — no checkpoint reuse). Calling
-    # _build_reference_quotes directly here would bypass the flag and vote on
-    # a DIFFERENT benchmark definition than the leader's. If the legacy
-    # pre-pass cannot be built, fail closed rather than vote on a different
-    # definition.
-    try:
-        reference_quotes = await worker._get_or_build_reference_quotes(intents)
-    except Exception as exc:
-        logger.error(
-            "Reactive verify for %s could not build champion reference quotes "
-            "— failing closed: %s",
-            candidate.submission_id,
-            exc,
-        )
-        return False, {}
-
     # Run the Docker benchmark. Honor the same fail-closed switch as the leader
     # (BENCHMARK_REQUIRE_REAL_SIM) so a follower never re-verifies a candidate on
     # fabricated mock data while the leader fail-closes it — that asymmetry would
@@ -312,7 +290,6 @@ async def _reactive_benchmark_candidate(
             simulator=simulator,
             require_real_sim=_require_real_sim,
             fork_block=worker._epoch_block_number,
-            reference_quotes=reference_quotes,
         )
     except RealSimulationUnavailable:
         logger.error(
@@ -367,7 +344,7 @@ async def _reactive_benchmark_candidate(
     return await _independent_adopt_vote(
         worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
         chal_results=results, candidate=candidate,
-        round_id=round_id, reference_quotes=reference_quotes,
+        round_id=round_id,
     )
 
 
@@ -380,7 +357,6 @@ async def _independent_adopt_vote(
     chal_results: list,
     candidate: Any,
     round_id: str | None,
-    reference_quotes: dict[str, dict[str, str]] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """This follower's INDEPENDENT adopt verdict over the SHARED corpus (#242).
 
@@ -514,7 +490,6 @@ async def _independent_adopt_vote(
                 simulator=simulator,
                 require_real_sim=_require_real_sim,
                 fork_block=worker._epoch_block_number,
-                reference_quotes=reference_quotes,
             )
         finally:
             await champ_session.shutdown()
@@ -532,7 +507,6 @@ async def _independent_adopt_vote(
             fork_block=worker._epoch_block_number,
             intents=intents,
             require_real_sim=_require_real_sim,
-            reference_quotes=reference_quotes,
             run=_run_champ,
         )
     except RealSimulationUnavailable:

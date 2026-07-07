@@ -71,7 +71,6 @@ _COMMON = dict(
     score_fn=None,
     fork_block=None,
     require_real_sim=False,
-    reference_quotes={},
     trigger_ground_truth={},
 )
 
