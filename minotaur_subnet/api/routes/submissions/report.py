@@ -115,16 +115,34 @@ def build_submission_report(
     factor = getattr(sub, "max_region_nodes", None)
     if factor is not None:
         try:
-            from minotaur_subnet.harness.screening import FLOOR_VERSION
+            from minotaur_subnet.epoch.relative_scoring import FACTOR_MARGIN
+            from minotaur_subnet.harness.screening import FLOOR_VERSION, MAX_REGION_NODES
 
             floor_version: int | None = FLOOR_VERSION
+            floor_cap: int | None = MAX_REGION_NODES
+            factor_margin: int | None = FACTOR_MARGIN
         except Exception:  # additive surface — never break the report
-            floor_version = None
-        report["factorization"] = {
+            floor_version = floor_cap = factor_margin = None
+        armed = floor_cap is not None or factor_margin is not None
+        block: dict[str, Any] = {
             "max_region_nodes": factor,
             "floor_version": floor_version,
-            "observe_only": True,
+            # The armed state is COMPUTED from the live constants — never
+            # hardcoded, so this block can't lie about whether the rule bites.
+            "armed": armed,
+            "observe_only": not armed,  # backward-compat alias of ``not armed``
+            "floor_cap": floor_cap,
+            "factor_margin": factor_margin,
         }
+        # Same-pin champion baseline, attached by the round evaluation
+        # (_persist_round_relative_counts) when both records were in hand —
+        # gives the miner the actionable numbers: their value, the champion's,
+        # and the delta the tie-break judged.
+        rel_fz = rel.get("factorization") if isinstance(rel, dict) else None
+        if isinstance(rel_fz, dict):
+            block["champion_nodes"] = rel_fz.get("champion_nodes")
+            block["factor_delta"] = rel_fz.get("factor_delta")
+        report["factorization"] = block
 
     if rel is not None:
         report["relative"] = rel
@@ -202,6 +220,18 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             seg += f" — _{_cell(rel['verdict'])}_"
         lines += [seg, ""]
 
+        if rel.get("adopt_via") == "factorization":
+            fz = rel.get("factorization") if isinstance(rel.get("factorization"), dict) else {}
+            lines += [
+                (
+                    "🧹 **Won on factorization:** matched the champion on every order, "
+                    f"largest code region {fz.get('factor_delta', '?')} AST nodes smaller "
+                    f"(yours {fz.get('candidate_nodes', '?')} vs champion {fz.get('champion_nodes', '?')}, "
+                    f"margin {fz.get('factor_margin', '?')})."
+                ),
+                "",
+            ]
+
         # The actionable part: the specific orders that DIFFER from the champion.
         # Worse rows first (that's where to focus optimization), then wins.
         # ALLOWLIST the diverging verdicts: matched orders are summarized by the
@@ -245,12 +275,29 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             lines.append("")
         elif rel.get("matched") and not rel.get("better") and not rel.get("worse"):
             n = rel.get("compared") or rel.get("matched")
-            lines += [
+            hint = (
                 f"_Identical output to the champion on all {n} orders. To win you need a "
                 f"strictly better route on at least one order — find pairs/sizes where a "
-                f"different route returns more output._",
-                "",
-            ]
+                f"different route returns more output"
+            )
+            # Second way to win (when the factorization tie-break is armed and
+            # the same-pin baseline is known): dethrone on cleaner code. Name
+            # the exact target the same way the ❌ rows name the orders to fix.
+            fz = rel.get("factorization") if isinstance(rel.get("factorization"), dict) else None
+            if (
+                fz
+                and fz.get("armed")
+                and isinstance(fz.get("factor_margin"), int)
+                and isinstance(fz.get("champion_nodes"), int)
+            ):
+                need = fz["champion_nodes"] - fz["factor_margin"]
+                hint += (
+                    f" — OR ship better-factored code: your largest code region is "
+                    f"{fz.get('candidate_nodes', '?')} AST nodes vs the champion's "
+                    f"{fz['champion_nodes']}; get it to ≤ {need} to win this tie on "
+                    f"factorization (lower is better)"
+                )
+            lines += [hint + "._", ""]
     else:
         lines += [
             "_Per-order detail is in the machine-readable `relative` block "

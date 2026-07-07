@@ -1599,15 +1599,19 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                FACTOR_MARGIN,
+                factor_delta_between,
                 has_raw_output_rows,
                 relative_counts,
             )
 
             if self._sub_store is None or not self._champion.submission_id:
                 return
-            champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
+            champ_sub = self._sub_store.get(self._champion.submission_id)
+            champ_rows = self._per_intent(champ_sub)
             if not has_raw_output_rows(champ_rows):
                 return
+            champ_nodes = getattr(champ_sub, "max_region_nodes", None)
             for competitor in self._sub_store.list_by_round(round_id):
                 if competitor.submission_id == self._champion.submission_id:
                     continue
@@ -1615,7 +1619,21 @@ class EpochManager:
                 if not has_raw_output_rows(comp_rows):
                     continue
                 try:
-                    counts = relative_counts(champ_rows, comp_rows)
+                    # Same-pin factor context, captured HERE because this is the
+                    # one display pass where both records are in hand — the
+                    # report then reads it without any cross-record lookup. The
+                    # delta feeds the verdict too, so a factor-tie dethrone is
+                    # stored as "dethrone", not a misleading "matched".
+                    comp_nodes = getattr(competitor, "max_region_nodes", None)
+                    delta = factor_delta_between(champ_nodes, comp_nodes)
+                    counts = relative_counts(champ_rows, comp_rows, factor_delta=delta)
+                    counts["factorization"] = {
+                        "candidate_nodes": comp_nodes,
+                        "champion_nodes": champ_nodes,
+                        "factor_delta": delta,
+                        "factor_margin": FACTOR_MARGIN,
+                        "armed": FACTOR_MARGIN is not None,
+                    }
                     counts["round_id"] = round_id
                     self._sub_store.merge_benchmark_details(
                         competitor.submission_id, {"relative": counts},

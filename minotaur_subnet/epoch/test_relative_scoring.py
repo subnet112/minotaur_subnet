@@ -638,3 +638,27 @@ def test_counts_factorization_dethrone_maps_to_dethrone_verdict(armed_margin):
     chal = [_r("o1", "100"), _r("o2", "200")]
     res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin + 10)
     assert res["adopt"] is True and res["factor_delta"] == armed_margin + 10
+
+
+def test_relative_counts_factor_delta_maps_to_dethrone(armed_margin):
+    # The stored/report counts must agree with the live verdict on a factor win:
+    # verdict "dethrone" + adopt_via "factorization", not a misleading "matched".
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    counts = relative_counts(champ, chal, factor_delta=armed_margin + 1)
+    assert counts["verdict"] == "dethrone"
+    assert counts["adopt_via"] == "factorization"
+    assert counts["better"] == 0 and counts["worse"] == 0
+
+
+def test_relative_reason_phrases_factor_win():
+    counts = {
+        "verdict": "dethrone", "adopt_via": "factorization",
+        "better": 0, "worse": 0, "matched": 5,
+        "factorization": {"factor_delta": 2897, "factor_margin": 100},
+    }
+    reason = relative_reason(counts, candidate_id="sub_x")
+    assert "better factored" in reason
+    assert "2897" in reason and "100" in reason
+    # The absurd performance phrasing must NOT appear on a factor win.
+    assert "net better — 0 better" not in reason
