@@ -723,18 +723,13 @@ def _round_intake_max() -> int:
 
 
 def _rotation_ledger_path() -> str:
-    """Path of the leader-local rotation ledger (see ``harness/rotation.py``).
+    """Path of the leader-local rotation ledger — thin alias over
+    :func:`minotaur_subnet.harness.rotation.rotation_ledger_path` (the
+    derivation lives in the harness so the benchmark worker's slate-width belt
+    reads the SAME ledger without an api import)."""
+    from minotaur_subnet.harness.rotation import rotation_ledger_path
 
-    ``SOLVER_ROTATION_LEDGER_PATH`` wins; otherwise the ledger lives next to
-    the round store (``SOLVER_ROUND_STORE_PATH``) so it lands on the same
-    persistent volume (/data in production, per #430).
-    """
-    explicit = os.environ.get("SOLVER_ROTATION_LEDGER_PATH", "").strip()
-    if explicit:
-        return explicit
-    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
-    base = os.path.dirname(round_store_path) if round_store_path else "."
-    return os.path.join(base or ".", "solver_rotation.json")
+    return rotation_ledger_path()
 
 
 def apply_round_rotation(round_id: str) -> dict[str, Any]:
@@ -749,19 +744,16 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
 
     store = get_store()
 
-    def _notify_not_selected(sub: Any, reason: str) -> None:
-        # Runs BEFORE the store's terminal reject (which purges a private
-        # submission's repo token) so the PR comment can still post. Previously
+    def _notify_not_selected(sub: Any, reason: str, repo_token: str | None = None) -> None:
+        # Runs AFTER the store's terminal reject, in apply_rotation_slate's
+        # background notify phase; ``repo_token`` is the private-repo token the
+        # rotation captured BEFORE the reject purged it (None for public
+        # submissions), so the PR comment can still post. Previously
         # rotation-skipped miners got no PR feedback at all — the reason lived
         # only on the status endpoint.
         from minotaur_subnet.relayer.solver_repo import on_round_not_selected_pr
 
-        token = None
-        try:
-            token = store.get_repo_token(getattr(sub, "submission_id", "") or "")
-        except Exception:  # noqa: BLE001
-            pass
-        on_round_not_selected_pr(sub, reason, repo_token=token)
+        on_round_not_selected_pr(sub, reason, repo_token=repo_token)
 
     return apply_rotation_slate(
         store,
