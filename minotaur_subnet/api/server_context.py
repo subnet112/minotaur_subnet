@@ -49,6 +49,11 @@ class ServerContext:
     # This validator's latest independent ADOPT/REJECT vote on a candidate,
     # published on /health for the fleet shadow tally (poll, group by candidate).
     last_independent_vote: dict = field(default_factory=dict)
+    # Latest run_shadow_vote diagnostic verdict (arbitrary image, observe-only).
+    # Its OWN slot: a diagnostic probe must never clobber the real fleet-tally
+    # field above (a shadow REJECT overwriting a live follower ADOPT would read
+    # as fake dissent in the tally). Published on /health as ``shadow_vote``.
+    last_shadow_vote: dict = field(default_factory=dict)
     # Relative per-order adoption verdict for the latest evaluated challenger: the
     # AUTHORITATIVE rule's ADOPT/REJECT + per-order breakdown (this IS the leader's
     # adoption decision; the relative rule is the sole adoption path). Published on

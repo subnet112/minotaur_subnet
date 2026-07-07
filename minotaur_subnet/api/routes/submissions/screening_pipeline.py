@@ -769,6 +769,12 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # request for the duration, and submission bursts run several
         # back-to-back.
         s1 = await asyncio.to_thread(run_stage_1, repo_dir)
+        # Factorization metric: persist BEFORE the pass-check so a rejected
+        # submission (incl. an armed-floor `too_entangled`) still records the
+        # value it was rejected at — miners see the number they must get under.
+        # Runs for BOTH the public and private clone paths (single confluence).
+        if s1.max_region_nodes is not None:
+            store.set_max_region_nodes(submission_id, s1.max_region_nodes)
         store.set_screening_result(
             submission_id, stage=1,
             passed=s1.passed,
@@ -790,12 +796,6 @@ async def _run_screening_pipeline(submission_id: str) -> None:
 
         if not s1.passed:
             return  # set_screening_result already rejected
-
-        # Phase-0 factorization metric (observe-only, not gated). Persist the
-        # value computed in stage 1 so it soaks into the live distribution; this
-        # runs for BOTH the public and private clone paths (single confluence).
-        if s1.max_region_nodes is not None:
-            store.set_max_region_nodes(submission_id, s1.max_region_nodes)
 
         # Stage 2: Build check
         store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_2)

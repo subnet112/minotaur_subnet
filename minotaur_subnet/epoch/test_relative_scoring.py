@@ -627,3 +627,896 @@ def test_blind_spot_bar_from_rows_keeps_only_delivered():
     rows = [_r("o1", "100"), _r("o2", "0"), _r("o3", None), _r("o4", 7)]
     assert blind_spot_bar_from_rows(rows) == {"o1": "100", "o4": "7"}
     assert blind_spot_bar_from_rows(None) == {}
+# ── Phase-2 factorization tie-break (saturated-tie dethrone) ──────────────────
+#
+# factor_delta = champion.max_region_nodes - challenger.max_region_nodes (the
+# PERSISTED screening metric). The clause fires ONLY when FACTOR_MARGIN is armed
+# (a fleet-wide code promotion — None ships disarmed) AND on a true all-matched
+# tie over a non-empty comparison; performance always outranks cleanliness.
+
+import pytest  # noqa: E402
+
+from minotaur_subnet.epoch import relative_scoring as _rs  # noqa: E402
+from minotaur_subnet.epoch.relative_scoring import factor_delta_between  # noqa: E402
+
+_ARMED_MARGIN = 25
+
+
+@pytest.fixture
+def armed_margin(monkeypatch):
+    """Arm the Phase-2 tie-break the way the fleet-wide promotion would."""
+    monkeypatch.setattr(_rs, "FACTOR_MARGIN", _ARMED_MARGIN)
+    return _ARMED_MARGIN
+
+
+def test_factor_delta_between_none_safety():
+    # None on EITHER side ⇒ 0 ⇒ clause inert (the data-side rollout guard).
+    assert factor_delta_between(None, 40) == 0
+    assert factor_delta_between(100, None) == 0
+    assert factor_delta_between(None, None) == 0
+    assert factor_delta_between(100, 40) == 60
+    assert factor_delta_between(40, 100) == -60
+
+
+def test_factor_margin_pinned_to_calibrated_value():
+    # Consensus-critical constant, calibrated from the 2026-07-03..07 soak:
+    # tweak noise +21/+54 (must clear ~2x), real incremental refactor step 122
+    # (must pass). Changing this changes WHO WINS ties fleet-wide — bump only
+    # in a develop->main promotion window.
+    assert _rs.FACTOR_MARGIN == 100
+
+
+def test_disarmed_never_fires_even_with_huge_delta(monkeypatch):
+    # FACTOR_MARGIN=None (the disarm value): natural champion turnover putting
+    # measured metrics on BOTH sides must NOT activate the tie-break.
+    monkeypatch.setattr(_rs, "FACTOR_MARGIN", None)
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["adopt"] is False
+    # No hint about a rule that cannot fire.
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_all_matched_tie_with_factor_margin_dethrones(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "factorization"
+    assert "better factored" in res["reason"]
+    assert res["n_matched"] == 2 and res["n_wins"] == 0
+
+
+def test_all_matched_tie_below_margin_does_not_adopt(armed_margin):
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin - 1)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+    # Armed + cleaner-but-not-enough: the miner sees how far off they landed.
+    assert "factor delta" in res["reason"]
+
+
+def test_all_matched_tie_default_delta_unchanged(armed_margin):
+    # No factor_delta passed (a call site that predates Phase 2): behavior
+    # identical to before even when armed — a tie never adopts.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["factor_delta"] == 0
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_factor_never_buys_past_a_regression(armed_margin):
+    # 1 tolerated regression, everything else matched, huge factor delta:
+    # the factor path requires ZERO regressions — no adopt.
+    champ = [_r("o1", "10000"), _r("o2", "200")]
+    chal = [_r("o1", "9950"), _r("o2", "200")]  # -0.5%: tolerated regression
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_regressions"] == 1 and res["n_catastrophic"] == 0
+    assert res["adopt"] is False
+
+
+def test_factor_never_buys_past_a_drop(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100")]  # drops o2
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_dropped"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_never_buys_past_a_catastrophic_cut(armed_margin):
+    champ = [_r("o1", "10000")]
+    chal = [_r("o1", "9800")]  # -2%: catastrophic
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_catastrophic"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_path_requires_true_tie_not_net_zero(armed_margin):
+    # 1 win + 1 regression nets to zero but is NOT an all-matched tie: the
+    # factor clause must not fire (net-zero-with-noise is the performance
+    # rule's domain, and it rejects at DETHRONE_WIN_MARGIN=1).
+    champ = [_r("o1", "10000"), _r("o2", "10000")]
+    chal = [_r("o1", "10500"), _r("o2", "9950")]  # +5% win, -0.5% regression
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["n_wins"] == 1 and res["n_regressions"] == 1
+    assert res["adopt"] is False
+
+
+def test_factor_ignored_when_performance_decides(armed_margin):
+    # A clean performance win adopts via performance regardless of a NEGATIVE
+    # factor delta (dirtier challenger still wins on orders).
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "150")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=-(10**6))
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "performance"
+
+
+def test_factor_tie_requires_nonempty_comparison(armed_margin):
+    # Two no-data solvers must never adopt on cleanliness alone.
+    res = evaluate_relative_adoption([], [], factor_delta=10**6)
+    assert res["scenarios_compared"] == 0
+    assert res["adopt"] is False
+
+
+def test_negative_delta_on_tie_does_not_adopt(armed_margin):
+    # Challenger DIRTIER than champion on a tie: no adopt.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=-5)
+    assert res["adopt"] is False
+    # No misleading "factor delta" hint when the challenger isn't cleaner.
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_counts_factorization_dethrone_maps_to_dethrone_verdict(armed_margin):
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin + 10)
+    assert res["adopt"] is True and res["factor_delta"] == armed_margin + 10
+
+
+def test_relative_counts_factor_delta_maps_to_dethrone(armed_margin):
+    # The stored/report counts must agree with the live verdict on a factor win:
+    # verdict "dethrone" + adopt_via "factorization", not a misleading "matched".
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    counts = relative_counts(champ, chal, factor_delta=armed_margin + 1)
+    assert counts["verdict"] == "dethrone"
+    assert counts["adopt_via"] == "factorization"
+    assert counts["better"] == 0 and counts["worse"] == 0
+
+
+def test_relative_reason_phrases_factor_win():
+    counts = {
+        "verdict": "dethrone", "adopt_via": "factorization",
+        "better": 0, "worse": 0, "matched": 5,
+        "factorization": {"factor_delta": 2897, "factor_margin": 100},
+    }
+    reason = relative_reason(counts, candidate_id="sub_x")
+    assert "better factored" in reason
+    assert "2897" in reason and "100" in reason
+    # The absurd performance phrasing must NOT appear on a factor win.
+    assert "net better — 0 better" not in reason
+
+
+# ── GAS-PAR clause (C2 — matched-output-less-gas dethrone, ships DISARMED) ────
+#
+# GAS_MARGIN_BPS is the arming switch AND the single materiality band. While
+# None (the shipped value) the clause is PROVABLY INERT: gas-carrying rows
+# produce a verdict bit-identical to gas-less rows (the golden tests below).
+# Armed (fleet-wide code promotion) it fires ONLY on a true all-matched
+# saturated tie with FULL gas coverage, no matched order materially gassier,
+# per-order output parity, and above the collapse floor. Precedence:
+# performance > gas > factorization; factorization can never buy a MATERIAL
+# gas regression (gas_tie_worse).
+
+_GAS_ARMED_MARGIN = 250
+
+# The additive verdict keys the clause introduced — excluded from the golden
+# bit-identity comparison (they are all-zero/False while disarmed).
+_GAS_VERDICT_KEYS = {
+    "gas_champ_total", "gas_chal_total", "gas_measured_full",
+    "gas_unmeasured", "gas_order_worse",
+}
+
+
+@pytest.fixture
+def armed_gas(monkeypatch):
+    """Arm the GAS-PAR clause the way the fleet-wide promotion would."""
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", _GAS_ARMED_MARGIN)
+    return _GAS_ARMED_MARGIN
+
+
+def _gr(intent_id, raw_output, gas=None, *, basis=None, mock=False, error=None):
+    """A per_intent-shaped dict row carrying optional metered gas."""
+    row = {
+        "intent_id": intent_id,
+        "raw_output": raw_output,
+        "mock_simulation": mock,
+        "error": error,
+    }
+    if gas is not None:
+        row["gas_metered"] = gas
+        row["gas_basis"] = basis if basis is not None else _rs.GAS_BASIS
+    return row
+
+
+def _strip_gas(verdict):
+    return {k: v for k, v in verdict.items() if k not in _GAS_VERDICT_KEYS}
+
+
+def test_gas_margin_ships_disarmed():
+    # THE arming switch: merging an int here ARMS the clause fleet-wide — that
+    # is a soak-calibrated develop->main promotion decision, never this PR.
+    assert _rs.GAS_MARGIN_BPS is None
+    assert _rs.GAS_OUT_GUARD_BPS == 2
+    assert _rs.GAS_COLLAPSE_FLOOR == 2
+    assert _rs.GAS_BASIS == "scoreintent_prerefund_v1"
+
+
+# ── DISARMED: the clause must be PROVABLY inert (golden bit-identity) ─────────
+
+
+def test_disarmed_gas_rows_bit_identical_to_gasless_rows():
+    # Rows WITH gas keys vs the SAME rows WITHOUT them: the entire verdict
+    # (minus the additive gas keys) must be byte-identical — a challenger
+    # 50% cheaper on gas changes NOTHING while disarmed.
+    champ_gas = [_gr("o1", "100", 100_000), _gr("o2", "200", 100_000)]
+    chal_gas = [_gr("o1", "100", 50_000), _gr("o2", "200", 50_000)]
+    champ_plain = [{"intent_id": "o1", "raw_output": "100"},
+                   {"intent_id": "o2", "raw_output": "200"}]
+    chal_plain = [{"intent_id": "o1", "raw_output": "100"},
+                  {"intent_id": "o2", "raw_output": "200"}]
+    with_gas = evaluate_relative_adoption(champ_gas, chal_gas)
+    without_gas = evaluate_relative_adoption(champ_plain, chal_plain)
+    assert _strip_gas(with_gas) == _strip_gas(without_gas)
+    # The additive keys themselves are inert zeros while disarmed.
+    assert with_gas["gas_champ_total"] == 0
+    assert with_gas["gas_chal_total"] == 0
+    assert with_gas["gas_measured_full"] is False
+    assert with_gas["gas_unmeasured"] == 0
+    assert with_gas["gas_order_worse"] == 0
+    # per_order rows carry NO gas keys while disarmed (pre-gas shape).
+    assert all("champ_gas" not in o and "chal_gas" not in o
+               for o in with_gas["per_order"])
+
+
+def test_disarmed_gas_rows_bit_identical_across_verdict_matrix():
+    # Same golden identity across every verdict shape (win / regression /
+    # catastrophic / blind spot / drop / skip), not just the tie.
+    pairs = [
+        ("win", "100", "120"),
+        ("regression", "10000", "9950"),
+        ("catastrophic", "10000", "9800"),
+        ("blind_spot", None, "500"),
+        ("dropped", "300", None),
+        ("skip", "0", "0"),
+        ("matched", "1000", "1000"),
+    ]
+    champ_gas = [_gr(f"o_{n}", c, 77_000) for n, c, _x in pairs]
+    chal_gas = [_gr(f"o_{n}", x, 33_000) for n, _c, x in pairs]
+    champ_plain = [{"intent_id": f"o_{n}", "raw_output": c} for n, c, _x in pairs]
+    chal_plain = [{"intent_id": f"o_{n}", "raw_output": x} for n, _c, x in pairs]
+    with_gas = evaluate_relative_adoption(champ_gas, chal_gas)
+    without_gas = evaluate_relative_adoption(champ_plain, chal_plain)
+    assert _strip_gas(with_gas) == _strip_gas(without_gas)
+
+
+def test_disarmed_never_fires_and_never_hints(armed_margin):
+    # Disarmed (default) on a tie with a huge gas advantage: no adopt, and the
+    # reason must NOT hint at a rule that cannot fire.
+    champ = [_gr("o1", "100", 100_000)]
+    chal = [_gr("o1", "100", 10_000)]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+    assert "gas" not in res["reason"]
+
+
+def test_rows_as_whole_objects_refactor_is_behavior_identical():
+    # champ_by/chal_by now keep whole ROWS instead of extracted raw_outputs.
+    # Prove zero behavior change: BenchmarkResult objects and equivalent dict
+    # rows produce IDENTICAL verdict dicts across existing scenario shapes.
+    scenarios = [
+        # (champ pairs, chal pairs) — from the existing verdict-matrix tests.
+        ([("o1", "100"), ("o2", "200")], [("o1", "120"), ("o2", "250")]),
+        ([("o1", "100"), ("o2", "100"), ("o3", "100")],
+         [("o1", "200"), ("o2", "200"), ("o3", "50")]),
+        ([("o1", "100"), ("o2", None)], [("o1", "100"), ("o2", "500")]),
+        ([("o1", "100"), ("o2", "300")], [("o1", "200"), ("o2", None)]),
+        ([("o1", "1000"), ("o2", "1000")], [("o1", "999"), ("o2", "1100")]),
+        ([("o1", "0")], [("o1", "0")]),
+        ([], [("o1", "5")]),
+    ]
+    for champ_pairs, chal_pairs in scenarios:
+        via_objects = evaluate_relative_adoption(
+            [_r(i, v) for i, v in champ_pairs],
+            [_r(i, v) for i, v in chal_pairs],
+        )
+        via_dicts = evaluate_relative_adoption(
+            [{"intent_id": i, "raw_output": v} for i, v in champ_pairs],
+            [{"intent_id": i, "raw_output": v} for i, v in chal_pairs],
+        )
+        assert via_objects == via_dicts
+
+
+def test_disarmed_relative_counts_have_no_gas_block():
+    counts = relative_counts(
+        [_gr("o1", "100", 100_000)], [_gr("o1", "100", 50_000)],
+    )
+    assert "gas" not in counts
+
+
+# ── ARMED: the tie-break fires only on the exact conjunction ──────────────────
+
+
+def _tie(champ_gas=(100_000, 100_000), chal_gas=(90_000, 90_000)):
+    """An all-matched two-order tie with per-order metered gas."""
+    champ = [_gr("o1", "100", champ_gas[0]), _gr("o2", "200", champ_gas[1])]
+    chal = [_gr("o1", "100", chal_gas[0]), _gr("o2", "200", chal_gas[1])]
+    return champ, chal
+
+
+def test_armed_tie_cheaper_beyond_margin_adopts_via_gas(armed_gas):
+    champ, chal = _tie()  # totals 180k vs 200k: -1000 bps, margin 250
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "gas"
+    assert res["gas_champ_total"] == 200_000
+    assert res["gas_chal_total"] == 180_000
+    assert res["gas_measured_full"] is True
+    assert res["gas_unmeasured"] == 0
+    assert res["gas_order_worse"] == 0
+    assert "materially cheaper" in res["reason"]
+    assert "gas 180000 vs 200000" in res["reason"]
+    assert "-1000 bps" in res["reason"]
+    assert f"margin {armed_gas}" in res["reason"]
+
+
+def test_armed_per_order_rows_carry_display_gas(armed_gas):
+    champ, chal = _tie()
+    res = evaluate_relative_adoption(champ, chal)
+    by_iid = {o["intent_id"]: o for o in res["per_order"]}
+    assert by_iid["o1"]["champ_gas"] == 100_000
+    assert by_iid["o1"]["chal_gas"] == 90_000
+
+
+def test_armed_one_unmeasured_matched_row_is_inert(armed_gas):
+    # One matched row without gas keys on the challenger side ⇒ NO cherry
+    # subsets: the whole clause goes inert (fail-safe toward incumbency).
+    champ = [_gr("o1", "100", 100_000), _gr("o2", "200", 100_000)]
+    chal = [_gr("o1", "100", 10_000), _gr("o2", "200")]  # o2 unmeasured
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["gas_unmeasured"] == 1
+    assert res["gas_measured_full"] is False
+    assert res["adopt_via"] is None
+
+
+def test_armed_mock_row_is_inert(armed_gas):
+    champ, chal = _tie(chal_gas=(10_000, 10_000))
+    chal[1]["mock_simulation"] = True  # fabricated sim gas is meaningless
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["gas_unmeasured"] == 1
+
+
+def test_armed_error_row_is_inert(armed_gas):
+    champ, chal = _tie(chal_gas=(10_000, 10_000))
+    champ[0]["error"] = "sim hiccup"
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["gas_unmeasured"] == 1
+
+
+def test_armed_basis_mismatch_is_inert(armed_gas):
+    # A re-mechanised meter becomes NON-COMPARABLE, never silently mixed.
+    champ, chal = _tie(chal_gas=(10_000, 10_000))
+    chal[0]["gas_basis"] = "receipt_gas_v0"
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["gas_unmeasured"] == 1
+
+
+def test_armed_per_order_gassier_blocks_despite_cheaper_total(armed_gas):
+    # o1 materially gassier (+30%) even though the TOTAL is 15% cheaper —
+    # the per-order Pareto arm kills one-big-order masking.
+    champ, chal = _tie(chal_gas=(130_000, 40_000))  # total 170k vs 200k
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["gas_order_worse"] == 1
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+
+
+def test_armed_output_parity_guard_blocks_band_edge_selloff(armed_gas):
+    # Outputs "matched" within the 10-bps band but the challenger shaves
+    # -4 bps (> GAS_OUT_GUARD_BPS=2) on o1: a gas win may not buy output down.
+    champ = [_gr("o1", "1000000", 100_000), _gr("o2", "200", 100_000)]
+    chal = [_gr("o1", "999600", 50_000), _gr("o2", "200", 50_000)]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_matched"] == 2  # still inside the output noise band
+    assert res["adopt"] is False  # but the gas clause refuses to fire
+    assert res["adopt_via"] is None
+
+
+def test_armed_collapse_floor_blocks_and_notes(armed_gas, caplog):
+    # >50% total-gas collapse (the stash-plan profile): clause INERT + WARN.
+    import logging as _logging
+    champ, chal = _tie(chal_gas=(40_000, 39_000))  # 79k vs 200k: >50% collapse
+    with caplog.at_level(_logging.WARNING, logger="minotaur_subnet.epoch.relative_scoring"):
+        res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert "(gas collapse >50%: implausible, gas clause inert)" in res["reason"]
+    assert any("gas clause INERT" in r.message for r in caplog.records)
+
+
+def test_armed_no_matched_orders_never_fires(armed_gas):
+    # Dropped-only comparison (compared > 0, n_matched == 0): hard veto anyway,
+    # and the gas clause cannot fire without a measured tie.
+    champ = [_gr("o1", "100", 100_000)]
+    chal = []
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_matched"] == 0 and res["n_dropped"] == 1
+    assert res["adopt"] is False
+    # Degenerate empty-vs-empty: nothing compared, nothing fires.
+    res2 = evaluate_relative_adoption([], [])
+    assert res2["adopt"] is False and res2["scenarios_compared"] == 0
+
+
+def test_armed_regression_blocks_gas(armed_gas):
+    # One tolerated (-0.5%) regression + cheap gas: the gas clause requires a
+    # TRUE all-matched tie — cheap gas never buys past a regression.
+    champ = [_gr("o1", "10000", 100_000), _gr("o2", "200", 100_000)]
+    chal = [_gr("o1", "9950", 10_000), _gr("o2", "200", 10_000)]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_regressions"] == 1
+    assert res["adopt"] is False
+
+
+def test_armed_drop_blocks_gas(armed_gas):
+    champ = [_gr("o1", "100", 100_000), _gr("o2", "200", 100_000)]
+    chal = [_gr("o1", "100", 10_000)]  # drops o2
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_dropped"] == 1
+    assert res["adopt"] is False
+
+
+def test_armed_catastrophic_blocks_gas(armed_gas):
+    champ = [_gr("o1", "10000", 100_000)]
+    chal = [_gr("o1", "9800", 10_000)]  # -2% cut
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["n_catastrophic"] == 1
+    assert res["adopt"] is False
+
+
+def test_armed_gas_tie_worse_blocks_factorization(armed_gas, armed_margin):
+    # Cleaner code cannot buy a MATERIAL gas regression: total +10% gassier
+    # (beyond the 250-bps margin) on a tie blocks the factor clause outright.
+    champ, chal = _tie(chal_gas=(110_000, 110_000))  # 220k vs 200k: +1000 bps
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+
+
+def test_armed_per_order_gassier_also_blocks_factorization(armed_gas, armed_margin):
+    # gas_tie_worse's second arm: ANY matched order materially gassier blocks
+    # the factor clause even when the totals are level.
+    champ, chal = _tie(chal_gas=(130_000, 70_000))  # total equal-ish, o1 +30%
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["gas_order_worse"] == 1
+    assert res["adopt"] is False
+
+
+def test_armed_unmeasured_gas_leaves_factorization_exactly_as_today(armed_gas, armed_margin):
+    # The accepted fail-inert case: gas unmeasured ⇒ gas_tie_worse is False by
+    # construction ⇒ the factor clause fires EXACTLY as on the base branch.
+    champ = [_r("o1", "100"), _r("o2", "200")]  # no gas fields at all
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, factor_delta=armed_margin)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "factorization"
+
+
+def test_armed_gas_beats_factor_when_both_could_fire(armed_gas, armed_margin):
+    # Precedence: performance > gas > factorization.
+    champ, chal = _tie()  # gas -1000 bps
+    res = evaluate_relative_adoption(champ, chal, factor_delta=10**6)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "gas"
+
+
+def test_armed_performance_beats_gas(armed_gas):
+    # A clean output win adopts via performance even with a huge gas edge.
+    champ = [_gr("o1", "100", 100_000), _gr("o2", "200", 100_000)]
+    chal = [_gr("o1", "150", 10_000), _gr("o2", "200", 10_000)]
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "performance"
+
+
+def test_armed_aggregate_margin_boundary_is_exact(armed_gas):
+    # Exactly AT the margin (chal*10000 == champ*(10000-250)) must NOT fire —
+    # strict inequality, exact-integer cross-multiply. One notch below fires.
+    champ = [_gr("o1", "100", 10_000)]
+    at_margin = [_gr("o1", "100", 9_750)]
+    res = evaluate_relative_adoption(champ, at_margin)
+    assert res["adopt"] is False
+    below_margin = [_gr("o1", "100", 9_749)]
+    res2 = evaluate_relative_adoption(champ, below_margin)
+    assert res2["adopt"] is True and res2["adopt_via"] == "gas"
+
+
+def test_armed_per_order_worse_boundary_is_exact(armed_gas):
+    # o1 exactly AT +250 bps is NOT worse (strict >); the total is cheap
+    # enough to adopt. One notch above IS worse and blocks.
+    champ, chal = _tie(chal_gas=(102_500, 90_000))  # o1 at the band edge
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["gas_order_worse"] == 0
+    assert res["adopt"] is True and res["adopt_via"] == "gas"
+    champ2, chal2 = _tie(chal_gas=(102_510, 89_990))
+    res2 = evaluate_relative_adoption(champ2, chal2)
+    assert res2["gas_order_worse"] == 1
+    assert res2["adopt"] is False
+
+
+def test_armed_under_margin_hint_names_the_gap(armed_gas):
+    # Cheaper-but-not-cheap-enough tie: -100 bps < margin 250 ⇒ display hint.
+    champ, chal = _tie(chal_gas=(99_000, 99_000))  # 198k vs 200k
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["reason"].startswith("matched: no order better or worse")
+    assert f"(gas -100 bps < margin {armed_gas})" in res["reason"]
+
+
+def test_armed_gassier_tie_has_no_gas_hint(armed_gas):
+    # A GASSIER challenger on a tie gets no misleading "gas -X bps" hint.
+    champ, chal = _tie(chal_gas=(110_000, 110_000))
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert "gas -" not in res["reason"]
+
+
+def test_armed_bootstrap_empty_champion_unchanged(armed_gas):
+    # Bootstrap ([], chal): all blind-spot covers ⇒ performance adopt, exactly
+    # as before the gas clause existed.
+    res = evaluate_relative_adoption([], [_gr("o1", "100", 10_000)])
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "performance"
+
+
+def test_armed_relative_counts_carry_gas_subdict(armed_gas):
+    champ, chal = _tie()
+    counts = relative_counts(champ, chal)
+    assert counts["verdict"] == "dethrone"
+    assert counts["adopt_via"] == "gas"
+    assert counts["better"] == 0 and counts["worse"] == 0
+    assert counts["gas"] == {
+        "champ_total": 200_000,
+        "chal_total": 180_000,
+        "measured_full": True,
+        "unmeasured": 0,
+        "order_worse": 0,
+    }
+
+
+def test_relative_reason_phrases_gas_win():
+    counts = {
+        "verdict": "dethrone", "adopt_via": "gas",
+        "better": 0, "worse": 0, "matched": 5,
+        "gas": {"champ_total": 200_000, "chal_total": 180_000,
+                "gas_margin_bps": 250},
+    }
+    reason = relative_reason(counts, candidate_id="sub_g")
+    assert "materially cheaper" in reason
+    assert "180000" in reason and "200000" in reason and "250" in reason
+    # The absurd performance phrasing must NOT appear on a gas win.
+    assert "net better — 0 better" not in reason
+
+
+# ── DEADWOOD tie-break (4th and FINAL ladder key — ships ARMED at 2000) ───────
+#
+# deadwood_delta = champion.unproductive_nodes - challenger.unproductive_nodes
+# (PERSISTED, version-guarded — see deadwood_delta_between). UNPRODUCTIVE_MARGIN
+# ships ARMED (measurement-grounded calibration, unlike the soak-gated gas
+# margin), but the clause is DATA-INERT until records carry same-version
+# metrics on both sides (the fields live on the #575 lineage). It fires
+# strictly AFTER factorization — only inside a genuine abs(factor_delta) <
+# FACTOR_MARGIN region-tie — and never past a performance/gas decision.
+# Ladder precedence: performance > gas > factorization > deadwood.
+
+from minotaur_subnet.epoch.relative_scoring import deadwood_delta_between  # noqa: E402
+
+_DW_MARGIN = 2000  # the shipped UNPRODUCTIVE_MARGIN (pinned below)
+
+
+def test_unproductive_margin_ships_armed_at_2000():
+    # THE arming switch, shipped ARMED: calibration is measurement-grounded
+    # (~15k dead-node backlog in the canonical repo → ≤ ~7 substantive
+    # dethrones at 2000; no salami-slicing). Changing this changes WHO WINS
+    # ties fleet-wide — bump only in a develop->main promotion window.
+    assert _rs.UNPRODUCTIVE_MARGIN == _DW_MARGIN
+
+
+def test_deadwood_delta_between_version_guard():
+    # Equal, non-None versions ⇒ delegates to the None-safe subtraction.
+    assert deadwood_delta_between(15_000, 12_000, 1, 1) == 3_000
+    assert deadwood_delta_between(12_000, 15_000, 1, 1) == -3_000
+    # None nodes on EITHER side ⇒ 0 (activation-by-data, like factor).
+    assert deadwood_delta_between(None, 12_000, 1, 1) == 0
+    assert deadwood_delta_between(15_000, None, 1, 1) == 0
+    # Version mismatch ⇒ 0 REGARDLESS of node values (cross-version node
+    # counts are not comparable — the consensus-critical guard).
+    assert deadwood_delta_between(15_000, 0, 1, 2) == 0
+    assert deadwood_delta_between(10**6, 0, 2, 1) == 0
+    # None version on EITHER side ⇒ 0 regardless of node values.
+    assert deadwood_delta_between(15_000, 0, None, 1) == 0
+    assert deadwood_delta_between(15_000, 0, 1, None) == 0
+    assert deadwood_delta_between(15_000, 0, None, None) == 0
+
+
+def test_deadwood_default_delta_is_data_inert():
+    # ARMED margin but deadwood_delta=0 (the default — i.e. what every caller
+    # passes until records carry the metric): every verdict is identical to
+    # the pre-deadwood rule across the verdict matrix, and no reason ever
+    # mentions the rule.
+    scenarios = [
+        ([("o1", "100")], [("o1", "150")], True, "performance"),       # win
+        ([("o1", "100")], [("o1", "100")], False, None),               # tie
+        ([("o1", "10000")], [("o1", "9950")], False, None),            # regression
+        ([("o1", "10000")], [("o1", "9800")], False, None),            # catastrophic
+        ([("o1", "100"), ("o2", "200")], [("o1", "100")], False, None),  # drop
+        ([("o1", None)], [("o1", "500")], True, "performance"),        # blind spot
+        ([], [], False, None),                                          # empty
+    ]
+    for champ_pairs, chal_pairs, want_adopt, want_via in scenarios:
+        champ = [_r(i, v) for i, v in champ_pairs]
+        chal = [_r(i, v) for i, v in chal_pairs]
+        res_default = evaluate_relative_adoption(champ, chal)
+        res_zero = evaluate_relative_adoption(champ, chal, deadwood_delta=0)
+        assert res_default == res_zero
+        assert res_default["adopt"] is want_adopt
+        assert res_default["adopt_via"] == want_via
+        assert res_default["deadwood_delta"] == 0
+        assert "deadwood" not in res_default["reason"]
+        assert "dead code" not in res_default["reason"]
+
+
+def test_deadwood_disarmed_never_fires_even_with_huge_delta(monkeypatch):
+    monkeypatch.setattr(_rs, "UNPRODUCTIVE_MARGIN", None)
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["adopt"] is False
+    # No hint about a rule that cannot fire.
+    assert res["reason"] == "matched: no order better or worse"
+
+
+def test_all_matched_tie_with_deadwood_margin_dethrones():
+    # Region-tied (factor_delta=0 < FACTOR_MARGIN) + delta at the margin.
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=_DW_MARGIN)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "deadwood"
+    assert res["deadwood_delta"] == _DW_MARGIN
+    assert res["n_matched"] == 2 and res["n_wins"] == 0
+    assert res["reason"] == (
+        f"dethrone: matched on all 2 order(s), less dead code "
+        f"(unproductive -{_DW_MARGIN} nodes >= margin {_DW_MARGIN})"
+    )
+
+
+def test_deadwood_under_margin_does_not_adopt_and_hints():
+    # delta 1999 (one under the shipped margin): no adopt, and the armed +
+    # cleaner-but-under-margin hint names the gap (mirrors factor/gas hints).
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=_DW_MARGIN - 1)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+    assert res["reason"].startswith("matched: no order better or worse")
+    assert f"(deadwood delta {_DW_MARGIN - 1} < margin {_DW_MARGIN})" in res["reason"]
+
+
+def test_deadwood_no_hint_when_delta_not_positive():
+    # A dirtier (negative-delta) or unmeasured (0) challenger gets no
+    # misleading deadwood hint on a tie.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    for delta in (0, -5_000):
+        res = evaluate_relative_adoption(champ, chal, deadwood_delta=delta)
+        assert res["adopt"] is False
+        assert "deadwood" not in res["reason"]
+
+
+def test_deadwood_blocked_when_factor_decides_for_challenger():
+    # abs(factor_delta) >= FACTOR_MARGIN with the challenger BETTER factored:
+    # the region race is NOT tied — the FACTOR clause decides (and wins),
+    # deadwood never fires. adopt_via must say "factorization".
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(
+        champ, chal, factor_delta=_rs.FACTOR_MARGIN, deadwood_delta=10**6,
+    )
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "factorization"
+    assert "better factored" in res["reason"]
+
+
+def test_deadwood_blocked_when_factor_decides_against_challenger():
+    # abs(factor_delta) >= FACTOR_MARGIN with the challenger WORSE factored:
+    # deadwood must NOT buy back a factor decision — no adopt, however clean.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(
+        champ, chal, factor_delta=-_rs.FACTOR_MARGIN, deadwood_delta=10**6,
+    )
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+
+
+def test_deadwood_fires_across_the_whole_region_tie_band():
+    # abs(factor_delta) < FACTOR_MARGIN in BOTH directions is a genuine
+    # region-tie: deadwood may fire (a <margin factor edge decides nothing).
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    for fd in (_rs.FACTOR_MARGIN - 1, 0, -(_rs.FACTOR_MARGIN - 1)):
+        res = evaluate_relative_adoption(
+            champ, chal, factor_delta=fd, deadwood_delta=_DW_MARGIN,
+        )
+        assert res["adopt"] is True, fd
+        assert res["adopt_via"] == "deadwood", fd
+
+
+def test_deadwood_region_tied_when_factor_disarmed(monkeypatch):
+    # FACTOR_MARGIN=None ⇒ no factor decision exists to defer to ⇒ treat as
+    # region-tied: an armed deadwood clause may still fire.
+    monkeypatch.setattr(_rs, "FACTOR_MARGIN", None)
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    res = evaluate_relative_adoption(
+        champ, chal, factor_delta=10**6, deadwood_delta=_DW_MARGIN,
+    )
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "deadwood"
+
+
+def test_deadwood_blocked_by_gas_tie_worse(armed_gas):
+    # Less dead code can never buy a MATERIAL gas regression — the same
+    # gas_tie_worse guard the factor clause carries. Total +1000 bps gassier
+    # on a measured tie blocks deadwood outright.
+    champ, chal = _tie(chal_gas=(110_000, 110_000))  # 220k vs 200k
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["adopt"] is False
+    assert res["adopt_via"] is None
+
+
+def test_deadwood_never_buys_past_a_regression():
+    champ = [_r("o1", "10000"), _r("o2", "200")]
+    chal = [_r("o1", "9950"), _r("o2", "200")]  # -0.5%: tolerated regression
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["n_regressions"] == 1
+    assert res["adopt"] is False
+
+
+def test_deadwood_never_buys_past_a_drop():
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100")]  # drops o2
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["n_dropped"] == 1
+    assert res["adopt"] is False
+
+
+def test_deadwood_never_buys_past_a_catastrophic_cut():
+    champ = [_r("o1", "10000")]
+    chal = [_r("o1", "9800")]  # -2%: catastrophic
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["n_catastrophic"] == 1
+    assert res["adopt"] is False
+
+
+def test_deadwood_requires_nonempty_comparison():
+    # Two no-data solvers must never adopt on cleanliness alone.
+    res = evaluate_relative_adoption([], [], deadwood_delta=10**6)
+    assert res["scenarios_compared"] == 0
+    assert res["adopt"] is False
+
+
+def test_deadwood_requires_matched_orders():
+    # Dropped-only comparison (compared > 0 but n_matched == 0): the clause's
+    # own n_matched > 0 arm refuses, on top of the outer drop veto.
+    champ = [_r("o1", "100")]
+    chal = []
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["n_matched"] == 0 and res["n_dropped"] == 1
+    assert res["adopt"] is False
+
+
+def test_precedence_performance_beats_deadwood():
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "150")]
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "performance"
+
+
+def test_precedence_gas_beats_deadwood(armed_gas):
+    # A measured cheaper-gas tie with a huge deadwood delta (region-tied):
+    # gas outranks deadwood on the ladder.
+    champ, chal = _tie()  # -1000 bps gas
+    res = evaluate_relative_adoption(champ, chal, deadwood_delta=10**6)
+    assert res["adopt"] is True
+    assert res["adopt_via"] == "gas"
+
+
+def test_precedence_full_ladder_performance_gas_factor_deadwood(armed_gas):
+    # Every clause's own margin satisfied at once — the ladder resolves
+    # top-down. (1) performance present ⇒ performance; (2) no performance,
+    # cheap gas + factor edge + deadwood edge ⇒ gas; (3) no gas edge, factor
+    # edge + deadwood edge ⇒ factorization (an armed factor decision also
+    # un-ties the region, so deadwood COULDN'T fire — verified by adopt_via);
+    # (4) only the deadwood edge ⇒ deadwood.
+    champ_perf = [_gr("o1", "100", 100_000)]
+    chal_perf = [_gr("o1", "150", 10_000)]
+    res1 = evaluate_relative_adoption(
+        champ_perf, chal_perf, factor_delta=10**6, deadwood_delta=10**6,
+    )
+    assert res1["adopt_via"] == "performance"
+
+    champ_gas, chal_gas = _tie()  # matched tie, -1000 bps gas
+    res2 = evaluate_relative_adoption(
+        champ_gas, chal_gas, factor_delta=10**6, deadwood_delta=10**6,
+    )
+    assert res2["adopt_via"] == "gas"
+
+    champ_tie = [_r("o1", "100")]
+    chal_tie = [_r("o1", "100")]
+    res3 = evaluate_relative_adoption(
+        champ_tie, chal_tie, factor_delta=10**6, deadwood_delta=10**6,
+    )
+    assert res3["adopt_via"] == "factorization"
+
+    res4 = evaluate_relative_adoption(
+        champ_tie, chal_tie, factor_delta=0, deadwood_delta=10**6,
+    )
+    assert res4["adopt_via"] == "deadwood"
+
+
+def test_relative_counts_deadwood_delta_maps_to_dethrone():
+    # The stored/report counts must agree with the live verdict on a deadwood
+    # win: verdict "dethrone" + adopt_via "deadwood", not a misleading
+    # "matched".
+    champ = [_r("o1", "100"), _r("o2", "200")]
+    chal = [_r("o1", "100"), _r("o2", "200")]
+    counts = relative_counts(champ, chal, deadwood_delta=_DW_MARGIN + 1)
+    assert counts["verdict"] == "dethrone"
+    assert counts["adopt_via"] == "deadwood"
+    assert counts["better"] == 0 and counts["worse"] == 0
+
+
+def test_relative_counts_deadwood_default_unchanged():
+    # No deadwood_delta passed (a call site that predates the 4th key):
+    # a tie stays "matched" even though the margin ships armed.
+    champ = [_r("o1", "100")]
+    chal = [_r("o1", "100")]
+    counts = relative_counts(champ, chal)
+    assert counts["verdict"] == "matched"
+    assert counts["adopt_via"] is None
+
+
+def test_relative_reason_phrases_deadwood_win():
+    counts = {
+        "verdict": "dethrone", "adopt_via": "deadwood",
+        "better": 0, "worse": 0, "matched": 5,
+        "deadwood": {"deadwood_delta": 2897, "margin": 2000},
+    }
+    reason = relative_reason(counts, candidate_id="sub_d")
+    assert "less dead code" in reason
+    assert "2897" in reason and "2000" in reason
+    # The absurd performance phrasing must NOT appear on a deadwood win.
+    assert "net better — 0 better" not in reason

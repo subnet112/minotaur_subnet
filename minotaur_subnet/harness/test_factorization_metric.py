@@ -155,3 +155,84 @@ def test_repo_scan_takes_max_and_skips_git(tmp_path):
 def test_empty_repo_is_zero(tmp_path):
     """No parseable Python ⇒ 0 (never raises)."""
     assert max_region_nodes(str(tmp_path)) == 0
+
+
+# ── Phase 1: dynamic-code ban + armed floor gate ──────────────────────────────
+
+from minotaur_subnet.harness import screening as _screening
+from minotaur_subnet.harness.screening import dynamic_code_calls, run_stage_1
+
+
+def _valid_repo(tmp_path, solver_src: str):
+    """A repo that passes every pre-metric stage-1 check."""
+    (tmp_path / "Dockerfile").write_text(
+        "FROM ghcr.io/subnet112/solver-base:v1\nCOPY . /app\n"
+    )
+    (tmp_path / "README.md").write_text("# solver\n")
+    (tmp_path / "solver.py").write_text(solver_src)
+    return tmp_path
+
+
+def test_dynamic_code_calls_flags_bare_exec_eval(tmp_path):
+    (tmp_path / "a.py").write_text(
+        "exec('x = 1')\n"
+        "y = eval('2 + 2')\n"
+    )
+    hits = dynamic_code_calls(str(tmp_path))
+    assert hits == ["a.py:1", "a.py:2"]
+
+
+def test_dynamic_code_calls_ignores_attribute_calls_and_compile(tmp_path):
+    (tmp_path / "b.py").write_text(
+        "import re\n"
+        "pat = re.compile('x')\n"       # attribute call — not flagged
+        "tree.eval(ctx)\n"              # attribute call — not flagged
+        "code = compile('1', '<s>', 'eval')\n"  # compile not banned
+    )
+    assert dynamic_code_calls(str(tmp_path)) == []
+
+
+def test_floor_cap_pinned_to_stage_a_backstop():
+    # Stage-A backstop from the 2026-07-03..07 soak: champion-fork monoculture
+    # at 4109 (== canonical main) with tweak outliers to 4163 — the cap blocks
+    # only NEW bloat. Stage B ratchets to ~2000-2500 under FLOOR_VERSION=2
+    # after the factor tie-break flips the throne and the fleet re-forks.
+    assert _screening.MAX_REGION_NODES == 4200
+    assert _screening.FLOOR_VERSION == 1
+
+
+def test_floor_unarmed_observes_only(tmp_path, monkeypatch):
+    # MAX_REGION_NODES=None (Phase 0): even a huge region passes.
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)
+    repo = _valid_repo(tmp_path, textwrap.dedent(GOD))
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+    assert isinstance(res.max_region_nodes, int) and res.max_region_nodes > 0
+
+
+def test_floor_armed_rejects_too_entangled(tmp_path, monkeypatch):
+    repo = _valid_repo(tmp_path, textwrap.dedent(GOD))
+    god_nodes = _mrn(GOD)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", god_nodes - 1)
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "too_entangled"
+    # The rejected value still rides on the StageResult (persisted for miners).
+    assert res.max_region_nodes == god_nodes
+
+
+def test_floor_armed_passes_clean_code(tmp_path, monkeypatch):
+    repo = _valid_repo(tmp_path, textwrap.dedent(FACTORED))
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", _mrn(GOD))
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+def test_floor_armed_rejects_dynamic_code_first(tmp_path, monkeypatch):
+    # exec/eval is checked before the cap: even TINY code with exec rejects.
+    repo = _valid_repo(tmp_path, "exec('x = 1')\n")
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "dynamic_code"
+    assert "solver.py:1" in res.details
