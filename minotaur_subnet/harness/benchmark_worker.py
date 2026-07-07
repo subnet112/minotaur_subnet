@@ -1433,6 +1433,25 @@ class BenchmarkWorker:
 
         return 1
 
+    def _blind_spot_bar_kwargs(self, incumbent: Any | None) -> dict[str, Any]:
+        """Blind-spot REPEAT bar kwargs for this worker's relative verdicts
+        (shadow vote, benchmark ranking) — round-store-sourced via
+        ``bar_kwargs_from_record``, matched to ``incumbent``; ``{}`` (inert)
+        on absence/mismatch/failure. Keeps every verdict site grading with the
+        SAME rule inputs as the leader's authoritative decision."""
+        try:
+            from minotaur_subnet.epoch.relative_scoring import bar_kwargs_from_record
+
+            if self._round_store is None or incumbent is None:
+                return {}
+            return bar_kwargs_from_record(
+                self._round_store.get_champion_adoption_bar(),
+                getattr(incumbent, "submission_id", None),
+                time.time(),
+            )
+        except Exception:
+            return {}
+
     def _resolve_incumbent_submission(self) -> Any | None:
         """The current INCUMBENT champion submission — resolved to equal the leader's
         ``bool(self._champion.submission_id)`` so the follower derives the SAME
@@ -1582,9 +1601,13 @@ class BenchmarkWorker:
             return {"error": "real simulator unavailable"}
 
         # The AUTHORITATIVE verdict is the per-order relative rule over the RAW
-        # delivered output (raw_output), IDENTICAL to the leader + followers. The
-        # vote carries the relative COUNTS (no aggregate score exists anymore).
-        verdict = evaluate_relative_adoption(champ_results, chal_results)
+        # delivered output (raw_output), IDENTICAL to the leader + followers —
+        # including the blind-spot bar kwargs (inert while the record doesn't
+        # match the adopted incumbent, e.g. a genesis reference).
+        verdict = evaluate_relative_adoption(
+            champ_results, chal_results,
+            **self._blind_spot_bar_kwargs(self._resolve_incumbent_submission()),
+        )
         adopt = bool(verdict["adopt"])
         reason = verdict["reason"]
         vote = {
@@ -2141,9 +2164,13 @@ class BenchmarkWorker:
             if incumbent is not None else None
         ) or []
 
+        bar_kwargs = self._blind_spot_bar_kwargs(incumbent)
+
         def _net_better(sub) -> int:
             rows = (sub.benchmark_details or {}).get("per_intent") or []
-            v = evaluate_relative_adoption(champ_rows, rows)
+            # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
+            # ahead of a genuine win (disarmed: no-op).
+            v = evaluate_relative_adoption(champ_rows, rows, **bar_kwargs)
             return v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
 
         # Highest net-better first; content-addressed tie-break (host-deterministic).

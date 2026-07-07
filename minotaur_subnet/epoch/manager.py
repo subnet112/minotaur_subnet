@@ -278,6 +278,9 @@ class EpochManager:
                     if restored_snapshot.submission_id == restored.submission_id
                     else restored.updated_at
                 ),
+                adoption_outputs=self._restored_adoption_outputs(
+                    restored.submission_id,
+                ),
             )
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -1146,7 +1149,11 @@ class EpochManager:
             )
 
         def _rank_key(s: Submission) -> tuple[int, int, str, str]:
-            v = evaluate_relative_adoption(champ_rows, self._per_intent(s))
+            # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
+            # candidate above one with a genuine win (disarmed: no-op).
+            v = evaluate_relative_adoption(
+                champ_rows, self._per_intent(s), **self._blind_spot_bar_kwargs(),
+            )
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
             return (
                 0 if v["adopt"] else 1,   # adoptable candidates first
@@ -1494,6 +1501,26 @@ class EpochManager:
         rows = details.get("per_intent") if isinstance(details, dict) else None
         return rows if isinstance(rows, list) else []
 
+    def _restored_adoption_outputs(self, submission_id: str | None) -> dict[str, str] | None:
+        """Boot-restore the blind-spot REPEAT bar from the round store.
+
+        The bar is persisted by ``_hot_swap`` under its own round-store key
+        (``set_champion_adoption_bar``); recover it ONLY when it belongs to the
+        champion being restored — a record from a displaced champion must never
+        gate covers against the wrong bar. ``None`` (guard inert until the next
+        adoption) on any mismatch/absence/failure.
+        """
+        if self._round_store is None or not submission_id:
+            return None
+        try:
+            record = self._round_store.get_champion_adoption_bar()
+        except Exception:  # additive restore — never break boot
+            return None
+        if not record or record.get("submission_id") != submission_id:
+            return None
+        outputs = record.get("outputs")
+        return dict(outputs) if isinstance(outputs, dict) and outputs else None
+
     def _blind_spot_bar_kwargs(self) -> dict[str, Any]:
         """``champion_bar``/``bar_age_s`` kwargs for the relative verdict.
 
@@ -1625,7 +1652,13 @@ class EpochManager:
                 if not has_raw_output_rows(comp_rows):
                     continue
                 try:
-                    counts = relative_counts(champ_rows, comp_rows)
+                    # Same bar kwargs as the authoritative verdict so the
+                    # persisted (miner-facing) counts agree with the live
+                    # decision — an armed repeat must read as "repeat", never as
+                    # a contradictory "1 better yet not adopted".
+                    counts = relative_counts(
+                        champ_rows, comp_rows, **self._blind_spot_bar_kwargs(),
+                    )
                     counts["round_id"] = round_id
                     self._sub_store.merge_benchmark_details(
                         competitor.submission_id, {"relative": counts},
@@ -1763,6 +1796,18 @@ class EpochManager:
         if self._sub_store is not None:
             self._sub_store.adopt(submission.submission_id)
         if self._round_store is not None:
+            # Persist the blind-spot REPEAT bar next to the champion snapshot so
+            # a restart restores it (see ChampionInfo.adoption_outputs). Written
+            # on EVERY swap — an empty bar on a rows-less adoption (e.g. revert)
+            # must CLEAR the displaced champion's record, never inherit it.
+            try:
+                self._round_store.set_champion_adoption_bar(
+                    submission_id=submission.submission_id,
+                    outputs=self._champion.adoption_outputs,
+                    activated_at=adopted_at,
+                )
+            except Exception:  # additive persistence — never break the swap
+                logger.warning("blind-spot bar persist failed", exc_info=True)
             # Record the champion we're displacing as the one-step rollback
             # target — but only on a genuine change (not a restore / re-adopt of
             # the same submission), and not when this swap is itself a revert.
