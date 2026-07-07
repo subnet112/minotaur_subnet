@@ -483,8 +483,12 @@ class AppIntentStore:
         return apps
 
     def delete_app(self, app_id: str) -> bool:
+        """Delete an app AND its deployment rows (a dangling deployment for a
+        deleted app is unreachable via list_apps and would otherwise linger
+        forever — the app-sync prune path relies on this cascade)."""
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM apps WHERE app_id=?", (app_id,))
+            conn.execute("DELETE FROM deployments WHERE app_id=?", (app_id,))
             return cur.rowcount > 0
 
     # ── developer-auth nonces ─────────────────────────────────────────────

@@ -279,3 +279,80 @@ def test_hash_helpers_are_deterministic():
         contract_address="0xabc", chain_id=8453,
     )
     assert _hash_deployment(d1) == _hash_deployment(d2)
+
+
+# ── prune: deletion propagation for absent non-operational apps ───────────
+
+
+def _seed_local_app(store, app_id: str, status: AppStatus, contract: str | None):
+    """A locally-known app the (fake) leader does NOT list."""
+    store.save_app(AppIntentDefinition(
+        app_id=app_id,
+        name=f"Local {app_id}",
+        version="1.0.0",
+        intent_type="swap",
+        js_code="// local",
+        solidity_code="contract L {}",
+        config=AppIntentConfig(supported_chains=[8453]),
+        deployer="0x" + "ee" * 20,
+        description="local-only app",
+        manifest={"intent_functions": ["execute"]},
+    ))
+    store.save_deployment(DeploymentResult(
+        app_id=app_id,
+        status=status,
+        contract_address=contract,
+        chain_id=8453,
+        abi=None,
+    ))
+
+
+@pytest.mark.asyncio
+async def test_prune_removes_absent_draft(store):
+    _seed_local_app(store, "app_stale_draft", AppStatus.DRAFT, None)
+    async with _RunningLeader() as leader:
+        leader.fake.add_app("app_live", js_code="// live")
+        sync = ValidatorAppCatalogSync(
+            store, leader.url, is_follower=lambda: True,
+        )
+        await sync.sync_once()
+    ids = {a.app_id for a in store.list_apps()}
+    assert "app_stale_draft" not in ids  # deletion propagated
+    assert "app_live" in ids
+    # Cascade: no dangling deployment row either.
+    assert store.get_deployment("app_stale_draft") is None
+
+
+@pytest.mark.asyncio
+async def test_prune_never_touches_operational_absent_app(store):
+    # An app this follower can actively score against is NEVER auto-deleted
+    # on the strength of one leader listing — logged for a human instead.
+    _seed_local_app(store, "app_active_local", AppStatus.ACTIVE, "0x" + "ab" * 20)
+    async with _RunningLeader() as leader:
+        leader.fake.add_app("app_live", js_code="// live")
+        sync = ValidatorAppCatalogSync(
+            store, leader.url, is_follower=lambda: True,
+        )
+        await sync.sync_once()
+    assert "app_active_local" in {a.app_id for a in store.list_apps()}
+
+
+@pytest.mark.asyncio
+async def test_prune_skips_on_empty_leader_catalog(store):
+    # A degenerate EMPTY catalog (misconfigured/bootstrapping leader) must
+    # never mass-delete a follower's store — even the non-operational rows.
+    _seed_local_app(store, "app_stale_draft", AppStatus.DRAFT, None)
+    async with _RunningLeader() as leader:
+        sync = ValidatorAppCatalogSync(
+            store, leader.url, is_follower=lambda: True,
+        )
+        await sync.sync_once()
+    assert "app_stale_draft" in {a.app_id for a in store.list_apps()}
+
+
+def test_delete_app_cascades_deployments(store):
+    _seed_local_app(store, "app_x", AppStatus.DRAFT, None)
+    assert store.get_deployment("app_x") is not None
+    assert store.delete_app("app_x") is True
+    assert store.get_app("app_x") is None
+    assert store.get_deployment("app_x") is None
