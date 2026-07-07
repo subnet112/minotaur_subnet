@@ -34,7 +34,6 @@ from .models import (  # noqa: F401
     CloseRoundRequest,
     SolverChampionResponse,
     SolverRoundResponse,
-    SourceSubmitRequest,
     StatusResponse,
     SubmitRequest,
     SubmitResponse,

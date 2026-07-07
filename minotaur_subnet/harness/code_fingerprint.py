@@ -103,8 +103,9 @@ def normalized_python_bytes(source: str) -> bytes:
 
 
 def source_fingerprint(source: str) -> str:
-    """Fingerprint for a SINGLE inline-submitted solver source (the
-    ``/submissions/source`` path, which never clones a tree)."""
+    """Fingerprint for a SINGLE solver source string — the one-file variant
+    of :func:`repo_fingerprint` (tests / tooling; the inline ``/submissions/
+    source`` endpoint that consumed it in production was removed as unused)."""
     h = hashlib.sha256()
     h.update(f"v{FINGERPRINT_VERSION}|inline|".encode())
     h.update(normalized_python_bytes(source))

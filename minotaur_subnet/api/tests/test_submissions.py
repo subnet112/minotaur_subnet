@@ -580,7 +580,6 @@ class TestSubmissionAPI(unittest.TestCase):
         # Disable benchmark worker during tests
         os.environ["DISABLE_BENCHMARK_WORKER"] = "1"
         os.environ["SUBMISSIONS_ACCEPTING"] = "1"
-        os.environ["ENABLE_SOURCE_SUBMISSIONS"] = "1"
         os.environ["SUBMISSIONS_RATE_LIMIT_PER_MINUTE"] = "0"
         # M1 (2026-05-25 audit) made the metagraph gate fail CLOSED.
         # Test fixtures don't wire a real metagraph, so opt into the
@@ -1420,52 +1419,6 @@ class TestSubmissionAPI(unittest.TestCase):
         data = resp.json()
         self.assertEqual(data["count"], 2)
         self.assertTrue(all(s["round_id"] == "round-e42-n1" for s in data["submissions"]))
-
-    def test_source_submission_creates_and_queues(self):
-        """POST /submissions/source creates a submission and sets it to BENCHMARKING."""
-        solver_code = "class MySolver:\n    pass\n"
-        resp = self.client.post("/v1/submissions/source", json={
-            "solver_source": solver_code,
-            "hotkey": "test-miner",
-            "epoch": 0,
-            "solver_name": "test-solver",
-        })
-        self.assertEqual(resp.status_code, 201)
-        data = resp.json()
-        self.assertIn("submission_id", data)
-        self.assertEqual(data["status"], "benchmarking")
-        self.assertTrue(data["round_id"].startswith("round-e0-"))
-        self.assertTrue(data["status_url"].startswith("/v1/submissions/sub_"))
-
-        # Verify internal state
-        sub = self.store.get(data["submission_id"])
-        self.assertEqual(sub.status, SubmissionStatus.BENCHMARKING)
-        self.assertIsNotNone(sub.solver_path)
-        self.assertTrue(sub.solver_path.endswith("solver.py"))
-        self.assertEqual(sub.solver_name, "test-solver")
-        self.assertEqual(sub.round_id, data["round_id"])
-
-    def test_source_submission_duplicate_returns_409(self):
-        """Duplicate source submissions for same hotkey+epoch return 409."""
-        body = {
-            "solver_source": "class X: pass",
-            "hotkey": "dup-miner",
-            "epoch": 0,
-        }
-        self.client.post("/v1/submissions/source", json=body)
-        resp = self.client.post("/v1/submissions/source", json=body)
-        self.assertEqual(resp.status_code, 409)
-
-    def test_source_submission_disabled_returns_403(self):
-        os.environ["ENABLE_SOURCE_SUBMISSIONS"] = "0"
-        resp = self.client.post("/v1/submissions/source", json={
-            "solver_source": "class X: pass",
-            "hotkey": "test-miner",
-            "epoch": 0,
-        })
-        self.assertEqual(resp.status_code, 403)
-        self.assertIn("disabled by policy", resp.json()["detail"])
-        os.environ["ENABLE_SOURCE_SUBMISSIONS"] = "1"
 
     def test_submissions_accepting_kill_switch_returns_503(self):
         os.environ["SUBMISSIONS_ACCEPTING"] = "0"

@@ -195,7 +195,6 @@ def test_parse_allowed_signers_normalizes_addresses():
 def test_validate_runtime_profile_strict_rejects_insecure_flags():
     ok, violations = validate_runtime_security_profile(
         enforce=True,
-        enable_source_submissions=True,
         allow_subprocess_benchmark=True,
         require_signed=False,
         require_asymmetric=False,
@@ -206,13 +205,12 @@ def test_validate_runtime_profile_strict_rejects_insecure_flags():
         submissions_rate_limit_per_minute=0,
     )
     assert ok is False
-    assert len(violations) >= 4
+    assert len(violations) >= 3
 
 
 def test_validate_runtime_profile_strict_accepts_safe_config():
     ok, violations = validate_runtime_security_profile(
         enforce=True,
-        enable_source_submissions=False,
         allow_subprocess_benchmark=False,
         require_signed=True,
         require_asymmetric=True,
