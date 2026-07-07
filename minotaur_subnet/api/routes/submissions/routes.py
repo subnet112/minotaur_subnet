@@ -45,7 +45,6 @@ from .models import (
     SolverRoundResponse,
     SolverRoundSummary,
     SolverRoundsResponse,
-    SourceSubmitRequest,
     StatusResponse,
     SubmitRequest,
     SubmitResponse,
@@ -109,18 +108,6 @@ def _require_submissions_enabled() -> None:
         raise HTTPException(
             status_code=503,
             detail="Submissions are temporarily disabled by operator policy",
-        )
-
-
-def _require_source_enabled() -> None:
-    """Source submissions are dangerous and must be explicitly enabled."""
-    if not _env_true("ENABLE_SOURCE_SUBMISSIONS", default=False):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Source submissions are disabled by policy. "
-                "Use signed git submissions instead."
-            ),
         )
 
 
@@ -866,114 +853,6 @@ def build_submission_message(
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
-
-
-@router.post("/submissions/source", status_code=201)
-async def create_source_submission(
-    body: SourceSubmitRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """Submit solver source code directly for benchmarking.
-
-    Lightweight alternative to git-based submission: accepts Python source
-    inline, writes it to a temp file, and queues it for benchmarking
-    immediately (no screening, no Docker build).
-
-    Designed for the local testnet workflow where miners submit strategies
-    directly without the git+Docker overhead.
-    """
-    _require_submissions_enabled()
-    _require_source_enabled()
-    _require_submission_api_key(request)
-    _enforce_rate_limit(request, body.hotkey.strip())
-    _require_registered_miner(body.hotkey)
-
-    store = get_store()
-    current_round = _require_open_submission_round(
-        epoch_hint=body.epoch,
-        requested_round_id=body.round_id,
-    )
-
-    code_hash = hashlib.sha256(body.solver_source.encode()).hexdigest()[:12]
-
-    # Same caps as the git path so SUBMISSIONS_MAX_PER_ROUND,
-    # SOLVER_ROUND_MAX_SUBMISSIONS and SUBMISSIONS_MAX_ROUNDS_PER_COMMIT apply
-    # uniformly across both ingresses. commit_hash here is the source content
-    # hash, so the per-commit cap naturally means "same code, same quota".
-    try:
-        sub = store.create(
-            repo_url="source://inline",
-            commit_hash=code_hash,
-            epoch=body.epoch,
-            hotkey=body.hotkey,
-            round_id=current_round.round_id,
-            max_per_round=_max_submissions_per_round(),
-            max_total_per_round=_round_intake_max(),
-            max_rounds_per_commit=_max_rounds_per_commit(),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-    if body.solver_name:
-        store.set_solver_info(sub.submission_id, name=body.solver_name)
-
-    # Normalized content fingerprint + the cross-hotkey resubmit quota. The
-    # inline path skips screening (no stage 1), so identity is computed here
-    # from the single source. Enforced AFTER create so per-hotkey/commit caps
-    # ran first and the rejected record still carries its fingerprint (same
-    # persist-on-reject discipline as the repo path).
-    from minotaur_subnet.harness.code_fingerprint import source_fingerprint
-    from minotaur_subnet.api.routes.submissions.screening_pipeline import (
-        _max_rounds_per_fingerprint,
-    )
-
-    fp = source_fingerprint(body.solver_source)
-    store.set_content_fingerprint(sub.submission_id, fp)
-    fp_cap = _max_rounds_per_fingerprint()
-    if fp_cap > 0:
-        benched = store.count_benched_rounds_for_fingerprint(
-            fp, exclude_submission_id=sub.submission_id,
-        )
-        if benched >= fp_cap:
-            store.reject(
-                sub.submission_id,
-                (
-                    f"identical code (normalized fingerprint {fp[:12]}…) was "
-                    f"already benchmarked in {benched} round(s) — cap {fp_cap}, "
-                    f"across all hotkeys; change the logic to participate again"
-                ),
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"identical code (normalized) already benchmarked in "
-                    f"{benched} round(s); cap {fp_cap} across all hotkeys"
-                ),
-            )
-
-    # Write source to temp file for subprocess-based benchmarking
-    solver_dir = tempfile.mkdtemp(prefix=f"solver-{code_hash}-")
-    solver_path = os.path.join(solver_dir, "solver.py")
-    with open(solver_path, "w") as f:
-        f.write(body.solver_source)
-
-    store.set_solver_path(sub.submission_id, solver_path)
-
-    # Skip screening, go straight to BENCHMARKING
-    store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
-
-    logger.info(
-        "Source submission created: %s (hotkey=%s, solver=%s, path=%s)",
-        sub.submission_id, body.hotkey[:12], body.solver_name, solver_path,
-    )
-
-    return {
-        "submission_id": sub.submission_id,
-        "status": "benchmarking",
-        "status_url": f"/v1/submissions/{sub.submission_id}/status",
-        "round_id": sub.round_id,
-        "epoch": sub.epoch,
-    }
 
 
 @router.post("/submissions", status_code=201, response_model=SubmitResponse)
