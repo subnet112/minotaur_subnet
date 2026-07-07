@@ -930,6 +930,19 @@ class SubmissionStore:
         raw_output rows), an optional display ``rank``, and the SCORED/REJECTED
         verdict. The display rank is written via :meth:`set_benchmark_rank` in a
         separate pass, so there is no longer a "don't clobber a real score" guard.
+
+        NO RESURRECTION: a terminally REJECTED submission is never flipped back
+        to SCORED, no matter what a late benchmark result says. Rotation rejects
+        the slate overflow at round close "regardless of benchmark progress" and
+        PURGES the private-repo token (irreversibly — memory AND encrypted
+        sidecar), but an in-flight bench finishing after that, or a restart
+        re-benching an orphaned round, used to resurrect the submission here.
+        The resurrected record then ranked (and under the tie-break ladder
+        frequently WON) as finalist, certified, and died at relayer-finalize
+        "no token — FAIL-CLOSED", aborting the round (observed live 2026-07-07:
+        5 consecutive merge_failed rounds). Bench details are still recorded so
+        the miner's report shows how they scored; the terminal status and its
+        reason are immutable.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
@@ -940,6 +953,17 @@ class SubmissionStore:
             sub.benchmark_rank = rank
         if details is not None:
             sub.benchmark_details = details
+
+        if sub.status == SubmissionStatus.REJECTED:
+            logger.info(
+                "set_benchmark_result: %s is terminally REJECTED (%s) — "
+                "recording bench details but NOT resurrecting to SCORED",
+                submission_id, (sub.rejection_reason or "?")[:80],
+            )
+            sub.updated_at = time.time()
+            self._persist()
+            return
+
         # The validity gate: no order delivered value -> the solver produced no
         # usable plans, reject it instead of marking it scored.
         if not valid:
@@ -951,6 +975,10 @@ class SubmissionStore:
             self.purge_token(submission_id)  # terminal — drop the secret
         else:
             sub.status = SubmissionStatus.SCORED
+            # A legitimately scored submission carries no rejection: clear any
+            # stale reason so the miner-facing headline can never contradict the
+            # outcome (a terminally rejected sub never reaches this branch).
+            sub.rejection_reason = None
         sub.updated_at = time.time()
         self._persist()
 
