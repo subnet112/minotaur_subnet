@@ -1645,8 +1645,30 @@ async def _process_scenario(
                                 plan.metadata["chain_id"] = state.chain_id
                         # Build intent_order so the simulator uses the full
                         # scoreIntent contract path instead of the bare path.
+                        # The pinned fork block's timestamp anchors the order
+                        # deadline (deterministic across validators); resolved
+                        # via the simulator's fork-anchor/header cache. A None
+                        # resolution falls back to wall clock (legacy).
+                        fork_ts: int | None = None
+                        if simulator is not None and state is not None:
+                            try:
+                                ts_fn = getattr(
+                                    simulator, "get_block_timestamp", None,
+                                )
+                                if ts_fn is not None and fork_block is not None:
+                                    fork_ts = ts_fn(state.chain_id, fork_block)
+                            except Exception as ts_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[benchmark] fork timestamp resolve failed "
+                                    "(chain=%s block=%s): %s — order deadline "
+                                    "falls back to wall clock",
+                                    getattr(state, "chain_id", "?"),
+                                    fork_block, ts_exc,
+                                )
                         intent_order = _build_benchmark_intent_order(
                             state, plan, getattr(intent, "manifest", None),
+                            fork_block=fork_block,
+                            fork_timestamp=fork_ts,
                         ) if state and state.contract_address else None
                         sim = await simulator.simulate(
                             plan,
@@ -1930,10 +1952,53 @@ class _ManifestShim:
         return self._m
 
 
+# Synthetic benchmark orders live exactly one hour past their anchor —
+# the legacy wall-clock window, now measured from the pinned fork block's
+# timestamp so every validator builds the byte-identical order.
+_BENCHMARK_ORDER_DEADLINE_SECS = 3600
+
+
+def _benchmark_order_id(
+    contract_address: str,
+    chain_id: Any,
+    scenario_name: str,
+    fn_name: str,
+    fork_block: int | None,
+) -> str:
+    """Deterministic synthetic order id for a benchmark scenario.
+
+    Replaces the legacy ``uuid4`` id (per-validator random — a cross-host
+    calldata asymmetry, since order_id is keccak'd into the scoreIntent
+    calldata's bytes32 id). Derived ONLY from round-stable scenario identity:
+    the app contract, chain, scenario name (``hist:<order_id>`` for
+    historical replays — unique per order), intent function, and the round's
+    fork pin. Identical across validators for the same round inputs AND
+    identical for the champion/challenger sims of the same scenario (the
+    per-sim fork reset makes CREATE2 proxy reuse a non-issue). Unique across
+    orders within a run for the same reason (app_id:scenario_name) is already
+    the run-wide join key (intent_id / reference_quotes).
+
+    Format matches the legacy id: ``bench_`` + 16 hex chars.
+    """
+    import hashlib
+
+    seed = "|".join((
+        str(contract_address).lower(),
+        str(chain_id),
+        str(scenario_name),
+        str(fn_name),
+        str(fork_block),
+    ))
+    return "bench_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_benchmark_intent_order(
     state: IntentState,
     plan: ExecutionPlan,
     manifest: dict[str, Any] | None = None,
+    *,
+    fork_block: int | None = None,
+    fork_timestamp: int | None = None,
 ) -> dict[str, Any] | None:
     """Build an intent_order dict for benchmark simulation.
 
@@ -1943,6 +2008,12 @@ def _build_benchmark_intent_order(
     meaningful token transfers.
 
     Mirrors the intent_order construction in order_processor.py (line ~284).
+
+    Determinism (cross-validator, per fork pin): ``fork_block`` feeds the
+    deterministic ``order_id`` and ``fork_timestamp`` (the pinned fork
+    block's timestamp) anchors the order ``deadline`` — wall clock is only a
+    fallback when no fork anchor resolved (mock/unit paths), preserving the
+    legacy behavior there.
     """
     contract_address = state.contract_address
     if not contract_address:
@@ -1992,17 +2063,32 @@ def _build_benchmark_intent_order(
     sig = _KNOWN_SIGS.get(fn_name, f"{fn_name}()")
     selector = _keccak(sig.encode())[:4].hex()
 
-    # Unique order_id per scenario to avoid CREATE2 proxy collision.
-    import uuid
+    # Deterministic order_id — unique per scenario within a run (the CREATE2
+    # proxy concern), and IDENTICAL across validators / champion-vs-challenger
+    # for the same round inputs (see _benchmark_order_id).
+    order_id = _benchmark_order_id(
+        contract_address,
+        state.chain_id,
+        control.get("_scenario_name", ""),
+        fn_name,
+        fork_block,
+    )
+
+    # Deadline anchored to the pinned fork block's timestamp (deterministic
+    # across validators); wall clock only when no fork anchor resolved.
+    if fork_timestamp is not None:
+        deadline = int(fork_timestamp) + _BENCHMARK_ORDER_DEADLINE_SECS
+    else:
+        deadline = int(time.time()) + _BENCHMARK_ORDER_DEADLINE_SECS
 
     return {
-        "order_id": f"bench_{uuid.uuid4().hex[:16]}",
+        "order_id": order_id,
         "app": contract_address,
         "intent_selector": selector,
         "intent_params": intent_params_hex,
         "submitted_by": submitted_by,
         "chain_id": state.chain_id,
-        "deadline": int(time.time()) + 3600,
+        "deadline": deadline,
         "nonce": 0,
         "perpetual": False,
         "max_executions": 1,
