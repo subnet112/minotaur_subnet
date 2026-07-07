@@ -764,7 +764,11 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_1)
 
         from minotaur_subnet.harness.screening import run_stage_1
-        s1 = run_stage_1(repo_dir)
+        # Off the event loop: the AST walk (factorization/deadwood metrics)
+        # is ~1s of pure CPU per repo — run on-loop it stalls every in-flight
+        # request for the duration, and submission bursts run several
+        # back-to-back.
+        s1 = await asyncio.to_thread(run_stage_1, repo_dir)
         store.set_screening_result(
             submission_id, stage=1,
             passed=s1.passed,
