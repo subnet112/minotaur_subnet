@@ -147,6 +147,20 @@ class NonceManager:
             self._nonces[key] = on_chain
             logger.info("Nonce reset from chain: %s nonce=%d", key, on_chain)
 
+    def invalidate(self, chain_id: int, wallet: str) -> None:
+        """Drop the cached counter so the next use re-syncs from chain.
+
+        Unlike ``reset`` this needs no RPC call, so it is safe inside
+        error handlers where the RPC itself may be the thing that failed.
+        Used after a tx attempt fails without (provably) landing on-chain:
+        the local counter may be ahead of reality, and every later tx built
+        from it would sit nonce-gapped in the mempool until dropped.
+        """
+        key = f"{chain_id}:{wallet.lower()}"
+        with self._lock:
+            if self._nonces.pop(key, None) is not None:
+                logger.info("Nonce cache invalidated: %s", key)
+
     def clear(self) -> None:
         """Clear all tracked nonces (e.g., on leader change)."""
         with self._lock:
@@ -604,28 +618,39 @@ class EvmRelayer(RelayerBase):
                         self._nonce_manager.reset(chain_id, config.relayer_wallet, w3)
                         continue
 
-                    # Underpriced: retry with gas bump
+                    # Underpriced: retry with gas bump. Reset the nonce first —
+                    # the rejected tx consumed nothing on-chain, so re-incrementing
+                    # on the next attempt would leave a permanent gap.
                     if "underpriced" in err_str or "replacement" in err_str:
                         logger.warning(
                             "TX underpriced (attempt %d/%d): %s — bumping gas",
                             attempt + 1, _MAX_RETRIES, exc,
                         )
+                        self._nonce_manager.invalidate(chain_id, config.relayer_wallet)
                         continue
 
-                    # Other transient errors: retry with delay
+                    # Other transient errors: retry with delay. Same nonce
+                    # discipline: most failures here happen pre-broadcast
+                    # (encoding, gas estimation, RPC hiccup), so the local
+                    # counter is ahead of the chain until we re-sync.
                     if attempt < _MAX_RETRIES - 1:
                         delay = _RETRY_DELAY_BASE * (2 ** attempt)
                         logger.warning(
                             "TX failed (attempt %d/%d): %s — retrying in %.1fs",
                             attempt + 1, _MAX_RETRIES, exc, delay,
                         )
+                        self._nonce_manager.invalidate(chain_id, config.relayer_wallet)
                         time.sleep(delay)
                         continue
 
                     # Final attempt failed
                     break
 
-            # All retries exhausted
+            # All retries exhausted. Drop the cached nonce so the burned local
+            # increments don't gap every subsequent tx on this chain — seen
+            # live 2026-07-07: three failed orders left the counter 6 ahead,
+            # and the next contract deploy sat unmined until dropped.
+            self._nonce_manager.invalidate(chain_id, config.relayer_wallet)
             import traceback
             tb = traceback.format_exc()
             logger.error(
@@ -689,36 +714,45 @@ class EvmRelayer(RelayerBase):
             chain_id, config.relayer_wallet, w3,
         )
 
-        # Estimate gas with safety margin so we don't OOG-revert on chains
-        # where contract creation costs grow over time. Falls back to a
-        # generous default if estimate_gas itself fails (e.g. RPC issue).
-        gas_limit = self._estimate_gas(w3, {
-            "from": config.relayer_wallet,
-            "data": bytecode,
-        })
-        # Floor at 6M for contract creation — the multiplier on a small
-        # estimate underestimates real cost when the constructor runs heavy
-        # initialisation (mappings, immutables, EIP-712 domain hashing).
-        gas_limit = max(gas_limit, 6_000_000)
+        try:
+            # Estimate gas with safety margin so we don't OOG-revert on chains
+            # where contract creation costs grow over time. Falls back to a
+            # generous default if estimate_gas itself fails (e.g. RPC issue).
+            gas_limit = self._estimate_gas(w3, {
+                "from": config.relayer_wallet,
+                "data": bytecode,
+            })
+            # Floor at 6M for contract creation — the multiplier on a small
+            # estimate underestimates real cost when the constructor runs heavy
+            # initialisation (mappings, immutables, EIP-712 domain hashing).
+            gas_limit = max(gas_limit, 6_000_000)
 
-        tx = {
-            "from": config.relayer_wallet,
-            "nonce": nonce,
-            "data": bytecode,
-            "gas": gas_limit,
-            "chainId": chain_id,
-            # EIP-1559 (type-2) gas — never a legacy gasPrice on a base-fee
-            # chain (Ethereum in particular). See _build_deploy_gas_fields.
-            **_build_deploy_gas_fields(w3, chain_id),
-        }
+            tx = {
+                "from": config.relayer_wallet,
+                "nonce": nonce,
+                "data": bytecode,
+                "gas": gas_limit,
+                "chainId": chain_id,
+                # EIP-1559 (type-2) gas — never a legacy gasPrice on a base-fee
+                # chain (Ethereum in particular). See _build_deploy_gas_fields.
+                **_build_deploy_gas_fields(w3, chain_id),
+            }
 
-        signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        # Confirmation wait — per-chain, longer for slow L1s (30s was too short
-        # for Ethereum/BT-EVM). Kept under the HttpRelayer deploy_timeout (120s).
-        receipt = w3.eth.wait_for_transaction_receipt(
-            tx_hash, timeout=_deploy_receipt_timeout(chain_id),
-        )
+            signed = w3.eth.account.sign_transaction(tx, self.private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            # Confirmation wait — per-chain, longer for slow L1s (30s was too
+            # short for Ethereum/BT-EVM). Kept under the HttpRelayer
+            # deploy_timeout (120s).
+            receipt = w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=_deploy_receipt_timeout(chain_id),
+            )
+        except Exception:
+            # The nonce consumed above may not have landed on-chain (send
+            # failure, or a nonce-gapped tx that timed out unmined — seen live
+            # 2026-07-07 on Base). Drop the cache so the next tx re-syncs from
+            # chain instead of building on a phantom counter.
+            self._nonce_manager.invalidate(chain_id, config.relayer_wallet)
+            raise
 
         tx_hash_hex = tx_hash.hex()
         if receipt.get("status", 1) != 1:

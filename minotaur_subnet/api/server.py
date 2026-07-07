@@ -59,6 +59,16 @@ _store_path = os.environ.get("APP_INTENTS_STORE_PATH")
 store = AppIntentStore(store_path=Path(_store_path) if _store_path else None)
 ctx.store = store
 
+# Deploys run synchronously inside this process, so any DEPLOYING record on
+# disk at boot is an orphan from a previous process. Roll them back to draft
+# so the deploy guard doesn't refuse redeploys forever (2026-07-07 incident).
+_stale_deploys = store.reconcile_stale_deploying()
+if _stale_deploys:
+    logger.warning(
+        "Rolled %d stale mid-deploy record(s) back to draft at boot: %s",
+        len(_stale_deploys), _stale_deploys,
+    )
+
 # ── backward-compatible module-level accessors ───────────────────────────────
 #
 # Many route files and tests do:
