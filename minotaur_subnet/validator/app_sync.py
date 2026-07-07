@@ -156,12 +156,14 @@ class ValidatorAppCatalogSync:
 
             apps_updated = 0
             deployments_updated = 0
+            leader_ids: set[str] = set()
             for app_summary in apps_summary:
                 if not isinstance(app_summary, dict):
                     continue
                 app_id = app_summary.get("app_id")
                 if not app_id:
                     continue
+                leader_ids.add(app_id)
                 status_url = f"{leader_url}/v1/apps/{app_id}/status"
                 try:
                     async with session.get(status_url) as resp:
@@ -180,12 +182,69 @@ class ValidatorAppCatalogSync:
                 apps_updated += a_updated
                 deployments_updated += d_updated
 
-        if apps_updated or deployments_updated:
+        pruned = self._prune_absent(leader_ids)
+
+        if apps_updated or deployments_updated or pruned:
             logger.info(
-                "App catalog sync: %d app(s) + %d deployment(s) updated from %s",
-                apps_updated, deployments_updated, leader_url,
+                "App catalog sync: %d app(s) + %d deployment(s) updated, "
+                "%d absent non-operational app(s) pruned from %s",
+                apps_updated, deployments_updated, pruned, leader_url,
             )
         return apps_updated, deployments_updated
+
+    def _prune_absent(self, leader_ids: set[str]) -> int:
+        """Remove local apps the leader no longer lists — deletion propagation.
+
+        The upsert loop alone is ADDITIVE-ONLY: an app deleted on the leader
+        (e.g. a mistaken draft) would linger on every follower forever. This
+        prunes those orphans under two hard guards:
+
+        * Runs only after a SUCCESSFUL catalog fetch (sync_once raises on a
+          non-200 list response before reaching this), and only when the
+          leader listed at least one app — a degenerate EMPTY catalog from a
+          misconfigured/bootstrapping leader must never mass-delete a
+          follower's store.
+        * Prunes only apps that are NON-OPERATIONAL locally (no deployment, or
+          a non-operational status). An app this follower can actively score
+          against is NEVER auto-deleted on the strength of one listing —
+          absence of an operational app is logged loudly for a human instead.
+
+        The leader itself never reaches here (sync_once's follower gate), so
+        the leader's store — the fleet's source of truth — is untouchable by
+        construction.
+        """
+        if not leader_ids:
+            return 0
+        pruned = 0
+        try:
+            local_apps = self.store.list_apps()
+        except Exception:  # pruning is hygiene — never break the sync
+            logger.warning("app-sync prune: could not list local apps", exc_info=True)
+            return 0
+        for app in local_apps:
+            if app.app_id in leader_ids:
+                continue
+            try:
+                dep = self.store.get_deployment(app.app_id)
+                if dep is not None and dep.status.is_operational():
+                    logger.warning(
+                        "app-sync prune: %s (%s) absent from the leader catalog but "
+                        "OPERATIONAL locally — refusing to auto-delete; investigate",
+                        app.app_id, app.name,
+                    )
+                    continue
+                if self.store.delete_app(app.app_id):
+                    pruned += 1
+                    logger.info(
+                        "app-sync prune: removed %s (%s) — absent from leader, "
+                        "non-operational locally",
+                        app.app_id, app.name,
+                    )
+            except Exception:
+                logger.warning(
+                    "app-sync prune: failed for %s", app.app_id, exc_info=True,
+                )
+        return pruned
 
     def _upsert(self, status_payload: dict[str, Any]) -> tuple[int, int]:
         if not isinstance(status_payload, dict):
