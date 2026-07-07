@@ -64,6 +64,95 @@ GENESIS_REPO_URL = "builtin://baseline-swap-solver"
 GENESIS_EPOCH = 0
 GENESIS_SOLVER_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
 
+# Measurement-version tag for pre-refund metered gas rows (the GasMeter probe,
+# anvil_simulator.GAS_METER_RUNTIME_HEX). Written by _results_to_details ONLY
+# next to a non-None gas_metered, so a row either carries BOTH gas keys or
+# NEITHER. Any future re-mechanism of the measurement bumps this version and
+# becomes non-comparable instead of silently mixed. Fleet-uniform CODE
+# constant — never env-read.
+GAS_BASIS = "scoreintent_prerefund_v1"
+
+
+def _gas_shadow_field(row: Any, name: str) -> Any:
+    """Duck-typed row field access (dict key or attribute), mirroring
+    relative_scoring._field: rows here are either fresh BenchmarkResult
+    objects or persisted per_intent dicts."""
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def _gas_shadow_of(row: Any) -> int | None:
+    """Metered gas of a row for [gas-shadow] display, or None (unmeasured).
+
+    None-safe eligibility: gas_metered must parse to an int > 0, the row must
+    not be a mock simulation, and — for persisted dict rows that carry a
+    basis — the basis must be the current GAS_BASIS. Display/log only; the
+    adoption-rule equivalent (_gas_of) ships with the stacked clause change.
+    """
+    if _gas_shadow_field(row, "mock_simulation"):
+        return None
+    gm = _gas_shadow_field(row, "gas_metered")
+    if gm is None:
+        return None
+    basis = _gas_shadow_field(row, "gas_basis")
+    if basis is not None and basis != GAS_BASIS:
+        return None
+    try:
+        gm = int(gm)
+    except (TypeError, ValueError):
+        return None
+    return gm if gm > 0 else None
+
+
+def log_gas_shadow(champ_rows: Any, chal_rows: Any, ctx: str = "") -> None:
+    """[gas-shadow] soak log: per-order + total champ/chal PRE-REFUND metered
+    gas with coverage counts, on rows joined by intent_id.
+
+    DISPLAY/LOG ONLY — zero influence on any verdict; this is the soak signal
+    for calibrating the (separate, stacked) gas clause's margin. Cheap and
+    None-safe: rows without gas keys count as unmeasured, any internal error
+    is swallowed so the benchmark path can never break on observability.
+    """
+    try:
+        def _by_iid(rows: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for r in rows or []:
+                iid = _gas_shadow_field(r, "intent_id")
+                if iid:
+                    out[str(iid)] = r
+            return out
+
+        champ_by = _by_iid(champ_rows)
+        chal_by = _by_iid(chal_rows)
+        joined = sorted(set(champ_by) & set(chal_by))
+        champ_total = chal_total = 0
+        n_pairs = champ_measured = chal_measured = 0
+        per_order: list[str] = []
+        for iid in joined:
+            cg = _gas_shadow_of(champ_by[iid])
+            xg = _gas_shadow_of(chal_by[iid])
+            champ_measured += cg is not None
+            chal_measured += xg is not None
+            if cg is not None and xg is not None:
+                n_pairs += 1
+                champ_total += cg
+                chal_total += xg
+            per_order.append(
+                f"{iid}:{cg if cg is not None else '-'}"
+                f"/{xg if xg is not None else '-'}"
+            )
+        logger.info(
+            "[gas-shadow] ctx=%s orders=%d champ_measured=%d chal_measured=%d "
+            "measured_pairs=%d champ_gas_total=%d chal_gas_total=%d "
+            "per_order(champ/chal)=%s",
+            ctx or "-", len(joined), champ_measured, chal_measured,
+            n_pairs, champ_total, chal_total,
+            ",".join(per_order[:64]) + ("…" if len(per_order) > 64 else ""),
+        )
+    except Exception:  # noqa: BLE001 - observability must never break the path
+        logger.debug("[gas-shadow] logging failed", exc_info=True)
+
 
 @dataclass
 class BenchmarkScorecard:
@@ -1433,6 +1522,25 @@ class BenchmarkWorker:
 
         return 1
 
+    def _blind_spot_bar_kwargs(self, incumbent: Any | None) -> dict[str, Any]:
+        """Blind-spot REPEAT bar kwargs for this worker's relative verdicts
+        (shadow vote, benchmark ranking) — round-store-sourced via
+        ``bar_kwargs_from_record``, matched to ``incumbent``; ``{}`` (inert)
+        on absence/mismatch/failure. Keeps every verdict site grading with the
+        SAME rule inputs as the leader's authoritative decision."""
+        try:
+            from minotaur_subnet.epoch.relative_scoring import bar_kwargs_from_record
+
+            if self._round_store is None or incumbent is None:
+                return {}
+            return bar_kwargs_from_record(
+                self._round_store.get_champion_adoption_bar(),
+                getattr(incumbent, "submission_id", None),
+                time.time(),
+            )
+        except Exception:
+            return {}
+
     def _resolve_incumbent_submission(self) -> Any | None:
         """The current INCUMBENT champion submission — resolved to equal the leader's
         ``bool(self._champion.submission_id)`` so the follower derives the SAME
@@ -1582,9 +1690,19 @@ class BenchmarkWorker:
             return {"error": "real simulator unavailable"}
 
         # The AUTHORITATIVE verdict is the per-order relative rule over the RAW
-        # delivered output (raw_output), IDENTICAL to the leader + followers. The
-        # vote carries the relative COUNTS (no aggregate score exists anymore).
-        verdict = evaluate_relative_adoption(champ_results, chal_results)
+        # delivered output (raw_output), IDENTICAL to the leader + followers —
+        # including the blind-spot bar kwargs (inert while the record doesn't
+        # match the adopted incumbent, e.g. a genesis reference).
+        verdict = evaluate_relative_adoption(
+            champ_results, chal_results,
+            **self._blind_spot_bar_kwargs(self._resolve_incumbent_submission()),
+        )
+        # [gas-shadow] soak observability — champion vs challenger metered
+        # gas, display/log only, zero influence on the vote above.
+        log_gas_shadow(
+            champ_results, chal_results,
+            ctx=f"shadow-vote:{challenger_image}",
+        )
         adopt = bool(verdict["adopt"])
         reason = verdict["reason"]
         vote = {
@@ -1610,7 +1728,12 @@ class BenchmarkWorker:
         )
         try:
             from minotaur_subnet.api.server_context import ctx
-            ctx.last_independent_vote = dict(vote)
+            # Own slot (NOT last_independent_vote): a diagnostic probe must not
+            # clobber the real fleet-tally field — e.g. a shadow REJECT (this
+            # path is deliberately un-threaded with the factor tie-break)
+            # overwriting a live follower ADOPT during a factor-tie dethrone
+            # would read as fake dissent in the tally.
+            ctx.last_shadow_vote = dict(vote)
         except Exception:  # observe-only — must never break
             pass
         return vote
@@ -2044,35 +2167,45 @@ class BenchmarkWorker:
     ) -> dict[str, Any]:
         """Convert benchmark results to a details dict for storage."""
         scorecard = self._build_scorecard(results)
+        per_intent: list[dict[str, Any]] = []
+        for r in results:
+            row: dict[str, Any] = {
+                "intent_id": r.intent_id,
+                "score": r.score,
+                "plan_score": r.plan_score,
+                "trigger_score": r.trigger_score,
+                "on_chain_score": getattr(r, "on_chain_score", None),
+                # RAW delivered output from the LIVE raw-output scorer's
+                # metadata.raw_output (see _build_score_fn); an EXACT DECIMAL WEI
+                # STRING, or None when the live scorer emits no raw_output. This
+                # is the per-order signal the relative adoption rule consumes.
+                # Never feeds the legacy aggregate `score`. (Readers also accept
+                # the legacy ``shadow_score`` key for rows persisted before the
+                # rename — see relative_scoring._raw_output.)
+                "raw_output": getattr(r, "raw_output", None),
+                "elapsed_ms": r.elapsed_ms,
+                "error": r.error,
+                "revert_reason": getattr(r, "revert_reason", None),
+                "revert_trace": getattr(r, "revert_trace", None),
+                "has_plan": r.plan is not None,
+                "mock_simulation": getattr(r, "mock_simulation", False),
+            }
+            # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
+            # tag — ADDITIVE keys, present ONLY when the probe measured this
+            # row (never on mock/reverted/unmeasured rows: the write gate in
+            # the bench loop already forced those to None). Measurement/soak
+            # plumbing only — nothing reads these for any verdict yet.
+            gm = getattr(r, "gas_metered", None)
+            if gm is not None:
+                row["gas_metered"] = gm
+                row["gas_basis"] = GAS_BASIS
+            per_intent.append(row)
         return {
             "total_intents": len(results),
             "plans_generated": sum(1 for r in results if r.plan is not None),
             "errors": sum(1 for r in results if r.error is not None),
             "scorecard": scorecard.to_dict(),
-            "per_intent": [
-                {
-                    "intent_id": r.intent_id,
-                    "score": r.score,
-                    "plan_score": r.plan_score,
-                    "trigger_score": r.trigger_score,
-                    "on_chain_score": getattr(r, "on_chain_score", None),
-                    # RAW delivered output from the LIVE raw-output scorer's
-                    # metadata.raw_output (see _build_score_fn); an EXACT DECIMAL WEI
-                    # STRING, or None when the live scorer emits no raw_output. This
-                    # is the per-order signal the relative adoption rule consumes.
-                    # Never feeds the legacy aggregate `score`. (Readers also accept
-                    # the legacy ``shadow_score`` key for rows persisted before the
-                    # rename — see relative_scoring._raw_output.)
-                    "raw_output": getattr(r, "raw_output", None),
-                    "elapsed_ms": r.elapsed_ms,
-                    "error": r.error,
-                    "revert_reason": getattr(r, "revert_reason", None),
-                    "revert_trace": getattr(r, "revert_trace", None),
-                    "has_plan": r.plan is not None,
-                    "mock_simulation": getattr(r, "mock_simulation", False),
-                }
-                for r in results
-            ],
+            "per_intent": per_intent,
         }
 
     def _transition_solving_apps(self, submissions: list) -> None:
@@ -2141,9 +2274,13 @@ class BenchmarkWorker:
             if incumbent is not None else None
         ) or []
 
+        bar_kwargs = self._blind_spot_bar_kwargs(incumbent)
+
         def _net_better(sub) -> int:
             rows = (sub.benchmark_details or {}).get("per_intent") or []
-            v = evaluate_relative_adoption(champ_rows, rows)
+            # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
+            # ahead of a genuine win (disarmed: no-op).
+            v = evaluate_relative_adoption(champ_rows, rows, **bar_kwargs)
             return v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
 
         # Highest net-better first; content-addressed tie-break (host-deterministic).
@@ -2155,4 +2292,12 @@ class BenchmarkWorker:
 
         for i, sub in enumerate(scored):
             self._sub_store.set_benchmark_rank(sub.submission_id, i + 1)
+            # [gas-shadow] soak observability — incumbent (stored rows) vs
+            # this challenger's fresh rows; display/log only, never feeds
+            # the rank above or any verdict.
+            log_gas_shadow(
+                champ_rows,
+                (sub.benchmark_details or {}).get("per_intent") or [],
+                ctx=f"rank{i + 1}:{sub.submission_id}",
+            )
         return scored

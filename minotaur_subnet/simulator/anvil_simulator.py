@@ -77,6 +77,148 @@ _TRANSFER_TOPIC = bytes.fromhex(
 # Default executor address (Anvil account 0, pre-funded with 10,000 ETH)
 _DEFAULT_EXECUTOR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
+# Deterministic sim-block timestamp pin (benchmark determinism).
+#
+# Without a pin, anvil stamps every block it mines with wall-clock time
+# anchored at the fork point (fork_ts + seconds elapsed since the reset), so
+# two validators simulating the same plan at the same fork pin see DIFFERENT
+# block.timestamp values — a nondeterminism channel into scoreIntent (deadline
+# math, TWAPs, any time-dependent app logic). Instead, every block mined
+# inside a simulation is pinned to ``fork_block_timestamp + this offset`` via
+# ``evm_setNextBlockTimestamp``, making block.timestamp a pure function of the
+# fork pin. +12 ≈ one L1 slot past the fork block; any fixed value works, it
+# only has to be fleet-uniform (CODE constant, never env-read).
+#
+# Empirically verified on anvil 1.5.1:
+#   - the pin is ONE-SHOT: it applies to the next mined block only, after
+#     which timestamps float back to wall clock → re-apply before EVERY
+#     block-mining operation;
+#   - a pinned timestamp EQUAL to the previous block's is accepted (only
+#     strictly-lower is rejected), so every sim block can land on the same
+#     pinned second regardless of how long the sim takes;
+#   - ``evm_revert`` discards a pending pin and restores the time state of
+#     the snapshot → the pin must be re-applied per simulation (it is: every
+#     mining site pins, and ``_reset_fork`` runs per simulate() call);
+#   - ``anvil_reset`` re-anchors time exactly to the fork block's timestamp
+#     and rewinds the last-timestamp check, so the constant pin is always
+#     applicable after the per-sim fork reset.
+SIM_BLOCK_TIMESTAMP_OFFSET = 12
+
+# ── GasMeter (benchmark-only pre-refund gas measurement) ─────────────────────
+#
+# Vendored RUNTIME bytecode of GasMeter.sol (source in PR body / spike dir).
+# Provenance: solc 0.8.24, evm_version=cancun, optimizer=true, runs=200
+# (forge build; runtime bytecode = deployedBytecode, 154 bytes). The contract
+# is a raw-assembly fallback that:
+#   - on a TOP-LEVEL call (tx.origin == msg.sender): copies calldata, brackets
+#     ``g0=gas(); call(gas(), app, callvalue(), ...); used=g0-gas()`` where
+#     ``app`` is read from storage slot 0, bubbles reverts unchanged, emits
+#     ``GasMeasured(uint256 used)`` on success, and returns the app's
+#     returndata unchanged;
+#   - on an INNER call (some contract poking the relayer address): behaves
+#     exactly like the code-less relayer EOA — accepts value, returns empty.
+#
+# It is installed via ``anvil_setCode`` AT THE RELAYER ADDRESS for the span of
+# one metered probe tx (so the app's ``onlyRelayer`` check passes with zero
+# contract changes) and never touches a live chain. ``gasleft()`` is
+# refund-invisible (EIP-3529 refunds apply at tx finalization), so the emitted
+# value is PRE-refund inner-call gas: refund farming ADDS metered cost, and
+# intrinsic/calldata gas is excluded. Empirically verified 36/36 on anvil
+# 1.5.1 (spike results.json: metered state/logs/returndata parity with the
+# direct send, refund invariance, revert bubbling, msg.value forwarding).
+GAS_METER_RUNTIME_HEX = (
+    "0x608060405236600a57005b323314601257005b5f54365f80375a5f80365f34865af1"
+    "91505a9003816032573d5f803e3d5ffd5b805f5250507f4a3f3d1bb56898b0a37c0749"
+    "5fa253797670c64bc9f0917848aebb6463f0cd9f60205fa13d5f803e3d5ff3fea26469"
+    "70667358221220c6c99b5b99ee385cd4c9242015a450a822b5e96742281e9bfa6fd8a2"
+    "ea6d1c0c64736f6c63430008180033"
+)
+
+# keccak256("GasMeasured(uint256)") — topic0 of the meter's event. Logs only
+# count when ALSO emitted from the relayer address (the meter's install
+# address), so an app emitting a same-signature event cannot spoof it.
+GAS_MEASURED_TOPIC0 = (
+    "0x4a3f3d1bb56898b0a37c07495fa253797670c64bc9f0917848aebb6463f0cd9f"
+)
+
+# Fixed, code-less, impersonated sender EOA for the metered probe tx. It must
+# differ from the relayer: with meter code installed at the relayer address, a
+# tx FROM the relayer could trip EIP-3607 (sender-has-code) depending on the
+# anvil version — a separate funded EOA is safe on every version.
+GAS_METER_SENDER_EOA = "0x2222000000000000000000000000000000002222"
+
+# Gas limit for the metered probe tx: the direct send's 2,000,000 plus
+# headroom for the meter bracket (~2.6k CALL/copy overhead + ~3.3k epilogue,
+# measured in the spike). 0x1F1FA0 == 2,040,000.
+GAS_METER_TX_GAS = 0x1F1FA0
+
+
+def _log_entry_field(entry: Any, name: str) -> Any:
+    """Field access for a receipt log entry: dict key or attribute."""
+    if isinstance(entry, dict):
+        return entry.get(name)
+    try:
+        return entry[name]  # web3 AttributeDict supports item access
+    except Exception:
+        return getattr(entry, name, None)
+
+
+def _as_hex_str(value: Any) -> str | None:
+    """Normalize HexBytes/bytes/str log fields to a 0x-prefixed lowercase hex
+    string; None when the value is missing or not hex-like."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return "0x" + bytes(value).hex().lower()
+    if isinstance(value, str):
+        v = value.lower()
+        return v if v.startswith("0x") else "0x" + v
+    hex_fn = getattr(value, "hex", None)  # HexBytes and friends
+    if callable(hex_fn):
+        try:
+            h = hex_fn()
+            return h.lower() if h.startswith("0x") else "0x" + h.lower()
+        except Exception:
+            return None
+    return None
+
+
+def parse_gas_measured(logs: Any, relayer_address: str) -> int | None:
+    """Parse the GasMeter's ``GasMeasured(uint256)`` value from receipt logs.
+
+    Pure function (the meter self-test hook): filters for logs whose
+    ``address`` equals ``relayer_address`` (the meter's install address) AND
+    whose ``topics[0]`` equals :data:`GAS_MEASURED_TOPIC0`, then decodes the
+    32-byte data word. Returns the LAST matching value (the meter emits
+    exactly one per metered tx; the address+topic filter makes app-side
+    spoofing impossible — app logs carry the app's address), or None when
+    absent — which is structural on a revert: the meter never emits before
+    bubbling a revert. Accepts web3 AttributeDict/HexBytes rows and plain
+    dict/str rows; malformed rows are skipped, never raised on.
+    """
+    if not logs:
+        return None
+    want_addr = str(relayer_address).lower()
+    if not want_addr.startswith("0x"):
+        want_addr = "0x" + want_addr
+    found: int | None = None
+    for entry in logs:
+        try:
+            addr = _as_hex_str(_log_entry_field(entry, "address"))
+            topics = _log_entry_field(entry, "topics") or []
+            if not addr or addr != want_addr or not topics:
+                continue
+            topic0 = _as_hex_str(topics[0])
+            if topic0 != GAS_MEASURED_TOPIC0:
+                continue
+            data = _as_hex_str(_log_entry_field(entry, "data"))
+            if not data or data == "0x":
+                continue
+            found = int(data, 16)
+        except Exception:  # noqa: BLE001 - malformed row: skip, never raise
+            continue
+    return found
+
 
 class AnvilSimulator:
     """Simulates execution plans on a running Anvil fork.
@@ -141,6 +283,16 @@ class AnvilSimulator:
         # our snapshot/revert window — force a re-fork or raise.
         self._baseline_probe_value: bytes | None = None
 
+        # Fork anchor cache (benchmark determinism). Refreshed by _reset_fork
+        # on every path: the current fork block's number + timestamp. The
+        # timestamp drives the per-block sim pin (_pin_next_block_timestamp)
+        # and the benchmark order deadline (via get_block_timestamp).
+        # _block_ts_cache memoizes header timestamps by block number —
+        # immutable data, so entries never go stale.
+        self._fork_block_number: int | None = None
+        self._fork_block_timestamp: int | None = None
+        self._block_ts_cache: dict[int, int] = {}
+
         if not self.w3.is_connected():
             logger.warning("Anvil not reachable at %s", rpc_url)
         else:
@@ -155,6 +307,7 @@ class AnvilSimulator:
             try:
                 self._baseline_snapshot_id = self._snapshot()
                 self._baseline_probe_value = self._read_probe_slot()
+                self._refresh_fork_anchor()
                 logger.info(
                     "AnvilSimulator baseline snapshot=%s probe=%s",
                     self._baseline_snapshot_id,
@@ -188,6 +341,8 @@ class AnvilSimulator:
         intent_order: dict | None = None,
         token_balances: dict[str, int] | None = None,
         fork_block: int | None = None,
+        *,
+        meter_gas: bool = False,
     ) -> SimulationResult:
         """Execute a plan against the Anvil fork and return results.
 
@@ -209,6 +364,12 @@ class AnvilSimulator:
                 for Stage-2 historical-order replays so pool prices
                 match the state at which the original order was filled.
                 Default None = reset to upstream latest.
+            meter_gas: BENCHMARK-ONLY. When True, the scoreIntent path
+                additionally runs the GasMeter probe (a snapshot-bracketed
+                side tx) and populates ``SimulationResult.gas_metered``
+                with the PRE-REFUND inner-call gas. The default False keeps
+                the direct-send path byte-identical to today — the live
+                rail (order processing / fee certification) never sets it.
         """
         # SIM-10: Graceful fallback when Anvil is unavailable
         if not self.is_connected():
@@ -271,6 +432,7 @@ class AnvilSimulator:
                 print(f"[SIM] scoreIntent path: contract={contract_address[:10]}... user={intent_order.get('submitted_by','?')[:10]}... intent_params_len={len(ip) if isinstance(ip, (str,bytes)) else '?'} preview={ip_preview}", flush=True)
                 result = self._simulate_via_score_intent(
                     contract_address, intent_order, plan, token_balances,
+                    meter_gas=meter_gas,
                 )
                 if result is not None:
                     print(f"[SIM] scoreIntent result: success={result.success} gas={result.gas_used} transfers={len(result.token_transfers or [])} on_chain_score={result.on_chain_score}", flush=True)
@@ -391,6 +553,8 @@ class AnvilSimulator:
         intent_order: dict,
         plan: ExecutionPlan,
         token_balances: dict[str, int] | None = None,
+        *,
+        meter_gas: bool = False,
     ) -> SimulationResult | None:
         """Call scoreIntent as a real transaction to simulate the full flow.
 
@@ -398,6 +562,12 @@ class AnvilSimulator:
         as a transaction, and captures Transfer events + gas from the receipt.
         This mirrors executeIntent exactly: proxy deploy, token pull, plan
         execution, invariant check, score return.
+
+        With ``meter_gas=True`` (benchmark path ONLY), a GasMeter probe runs
+        first inside its own snapshot/revert bracket — see
+        :meth:`_measure_gas_via_meter` — populating ``gas_metered`` on the
+        result. The direct send below is unaffected in either mode:
+        ``gas_used`` keeps its receipt semantics.
 
         Returns SimulationResult on success, None if setup fails (caller
         should fall back to manual interaction execution).
@@ -424,6 +594,7 @@ class AnvilSimulator:
             self._fund(relayer_addr, 100 * 10**18)
             # Verify impersonation works
             try:
+                self._pin_next_block_timestamp()
                 test_tx = self.w3.eth.send_transaction({"from": relayer_addr, "to": relayer_addr, "value": 0, "gas": 21000})
                 print(f"[SIM] impersonation verified: {test_tx.hex()[:16]}...", flush=True)
             except Exception as imp_err:
@@ -545,6 +716,18 @@ class AnvilSimulator:
             except Exception as _score_exc:
                 logger.warning("scoreIntent on-chain score read failed: %s", _score_exc)
 
+            # BENCHMARK-ONLY GasMeter probe: measure PRE-REFUND inner-call
+            # gas by replaying the SAME calldata through the meter inside a
+            # snapshot/revert bracket. Runs after the impersonation
+            # self-check and the pre-tx on_chain_score eth_call, before the
+            # direct send — which then sees byte-identical state.
+            gas_metered: int | None = None
+            if meter_gas:
+                gas_metered = self._measure_gas_via_meter(
+                    target, relayer_addr, calldata, tx_value,
+                )
+                print(f"[SIM] gas-meter probe: gas_metered={gas_metered}", flush=True)
+
             # Send as a raw RPC call (bypasses Web3.py's signer middleware)
             tx_params = {
                 "from": relayer_addr,
@@ -554,6 +737,9 @@ class AnvilSimulator:
             }
             if tx_value > 0:
                 tx_params["value"] = hex(tx_value)
+            # Deterministic block.timestamp for the scoreIntent tx itself —
+            # the block anvil mines for this send lands on the pinned second.
+            self._pin_next_block_timestamp()
             raw_result = self.w3.provider.make_request("eth_sendTransaction", [tx_params])
             tx_hash_hex = raw_result.get("result", "")
             if not tx_hash_hex:
@@ -611,6 +797,7 @@ class AnvilSimulator:
                 gas_used=total_gas,
                 token_transfers=all_transfers,
                 on_chain_score=on_chain_score,
+                gas_metered=gas_metered,
             )
 
         except Exception as exc:
@@ -619,6 +806,110 @@ class AnvilSimulator:
             traceback.print_exc()
             logger.warning("scoreIntent simulation failed: %s", exc)
             return None
+
+    def _measure_gas_via_meter(
+        self,
+        target: str,
+        relayer_addr: str,
+        calldata: str,
+        tx_value: int,
+    ) -> int | None:
+        """BENCHMARK-ONLY: measure PRE-REFUND scoreIntent gas via the GasMeter.
+
+        Exact sequence (spike-proven, 36/36 on anvil 1.5.1), all inside its
+        own evm_snapshot/evm_revert bracket so the direct send that follows
+        sees byte-identical state:
+
+          1. impersonate the fixed code-less :data:`GAS_METER_SENDER_EOA`
+             (≠ relayer, so EIP-3607 can never apply) + setBalance 100 ETH;
+          2. ``anvil_setCode`` the meter runtime AT the relayer address;
+          3. ``anvil_setStorageAt`` slot 0 = the app address (scoreIntent
+             target the meter forwards to);
+          4. ``eth_sendTransaction`` from the sender EOA TO the relayer with
+             the SAME calldata (+ the order's native value when present),
+             gas :data:`GAS_METER_TX_GAS`;
+          5. parse ``GasMeasured`` (topic0 :data:`GAS_MEASURED_TOPIC0`, log
+             address == relayer) from the receipt → the metered int; absent
+             (i.e. the inner call reverted) → None;
+          6. ``anvil_setCode`` the relayer back to "0x" (belt-and-braces;
+             the bracket's evm_revert restores code + storage anyway).
+
+        Measurement only: returns None on any failure, never raises, never
+        influences the simulation result beyond ``gas_metered``.
+        """
+        if relayer_addr.lower() == GAS_METER_SENDER_EOA.lower():
+            # Astronomically unlikely, but the meter model requires a sender
+            # distinct from the meter's install address.
+            logger.warning(
+                "[gas-meter] relayer == meter sender EOA (%s) — skipping",
+                relayer_addr,
+            )
+            return None
+        snap_id: str | None = None
+        try:
+            snap_id = self._snapshot()
+            self._impersonate(GAS_METER_SENDER_EOA)
+            self._fund(GAS_METER_SENDER_EOA, 100 * 10**18)
+            self.w3.provider.make_request(
+                "anvil_setCode", [relayer_addr, GAS_METER_RUNTIME_HEX],
+            )
+            self.w3.provider.make_request(
+                "anvil_setStorageAt",
+                [
+                    relayer_addr,
+                    "0x0",
+                    "0x" + "00" * 12 + target.lower().replace("0x", ""),
+                ],
+            )
+            tx_params = {
+                "from": GAS_METER_SENDER_EOA,
+                "to": relayer_addr,
+                "data": calldata,
+                "gas": hex(GAS_METER_TX_GAS),
+            }
+            if tx_value > 0:
+                tx_params["value"] = hex(tx_value)
+            # The metered block is pinned like every other sim block (the pin
+            # is one-shot; the direct-send site re-pins for its own block).
+            self._pin_next_block_timestamp()
+            raw = self.w3.provider.make_request(
+                "eth_sendTransaction", [tx_params],
+            )
+            tx_hash = raw.get("result", "")
+            if not tx_hash:
+                logger.warning("[gas-meter] metered send rejected: %s", raw)
+                return None
+            receipt = self.w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=30,
+            )
+            return parse_gas_measured(receipt.get("logs"), relayer_addr)
+        except Exception as exc:  # noqa: BLE001 - measurement only, never abort the sim
+            logger.warning("[gas-meter] metering failed (probe skipped): %s", exc)
+            return None
+        finally:
+            # Uninstall the meter, then revert the bracket: the direct send
+            # must run against the exact pre-probe state (funding, nonces,
+            # block height, relayer code+storage).
+            try:
+                self.w3.provider.make_request(
+                    "anvil_setCode", [relayer_addr, "0x"],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if snap_id is not None:
+                try:
+                    if not self._evm_revert(snap_id):
+                        logger.warning(
+                            "[gas-meter] bracket revert failed (snap=%s) — "
+                            "forcing baseline re-take next call", snap_id,
+                        )
+                        self._baseline_snapshot_id = None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[gas-meter] bracket revert raised (snap=%s): %s",
+                        snap_id, exc,
+                    )
+                    self._baseline_snapshot_id = None
 
     def pin_read_fork(self, chain_id: int, block_number: int) -> bool:
         """Pin this fork to ``block_number`` for the SOLVER's reads.
@@ -644,6 +935,103 @@ class AnvilSimulator:
         return True
 
     def _reset_fork(self, block_number: int | None = None) -> None:
+        """Reset the fork (see :meth:`_reset_fork_inner`) + refresh the fork
+        anchor cache (block number/timestamp) on EVERY exit path — including
+        the early-return failure paths, where the fork stays at its previous
+        block and the cache must describe THAT block, not the requested one.
+        """
+        try:
+            self._reset_fork_inner(block_number=block_number)
+        finally:
+            self._refresh_fork_anchor()
+
+    def _refresh_fork_anchor(self) -> None:
+        """Cache the current fork block's number + timestamp (best-effort).
+
+        One local ``eth_getBlockByNumber("latest")`` against the anvil — the
+        header is always in memory post-reset, no upstream fetch. On failure
+        the cache clears, which disables the timestamp pin (floating-time
+        behavior, exactly the pre-pin world) rather than pinning to a stale
+        anchor.
+        """
+        # Lazy-init keeps objects built via __new__ (some tests / partial
+        # construction paths) working — mirrors the _sim_lock discipline.
+        if not isinstance(getattr(self, "_block_ts_cache", None), dict):
+            self._block_ts_cache = {}
+        try:
+            block = self.w3.eth.get_block("latest")
+            self._fork_block_number = int(block["number"])
+            self._fork_block_timestamp = int(block["timestamp"])
+            if len(self._block_ts_cache) > 256:
+                self._block_ts_cache.clear()
+            self._block_ts_cache[self._fork_block_number] = self._fork_block_timestamp
+        except Exception as exc:  # noqa: BLE001 - cache is best-effort by design
+            logger.warning("fork anchor refresh failed (%s): %s", self.rpc_url, exc)
+            self._fork_block_number = None
+            self._fork_block_timestamp = None
+
+    def get_block_timestamp(
+        self, chain_id: int | None = None, block_number: int | None = None,
+    ) -> int | None:
+        """Timestamp of ``block_number`` on this fork (``None`` = the current
+        fork anchor). Serves from the fork-anchor / header caches when
+        possible; otherwise one ``eth_getBlockByNumber`` against the anvil
+        (which forwards upstream for a not-yet-pinned historical block).
+        Returns None when unresolvable. ``chain_id`` is accepted for interface
+        uniformity with :class:`MultiChainSimulator` and ignored here (single
+        fork) — mirrors :meth:`pin_read_fork`.
+        """
+        cache: dict[int, int] = getattr(self, "_block_ts_cache", None) or {}
+        if block_number is None:
+            return getattr(self, "_fork_block_timestamp", None)
+        block_number = int(block_number)
+        if block_number in cache:
+            return cache[block_number]
+        try:
+            ts = int(self.w3.eth.get_block(block_number)["timestamp"])
+        except Exception as exc:  # noqa: BLE001 - callers fall back on None
+            logger.warning(
+                "get_block_timestamp(%s) failed (%s): %s",
+                block_number, self.rpc_url, exc,
+            )
+            return None
+        if isinstance(getattr(self, "_block_ts_cache", None), dict):
+            if len(self._block_ts_cache) > 256:
+                self._block_ts_cache.clear()
+            self._block_ts_cache[block_number] = ts
+        return ts
+
+    def _pin_next_block_timestamp(self) -> None:
+        """Pin the NEXT mined block to the fork anchor's deterministic
+        timestamp (``fork_ts + SIM_BLOCK_TIMESTAMP_OFFSET``).
+
+        One-shot by anvil semantics (and discarded by ``evm_revert``), so
+        every block-mining site inside the simulation paths calls this
+        immediately before mining; equal-to-last pins are accepted, so all
+        sim blocks land on the same pinned second. Best-effort: on any
+        failure the block falls back to floating wall-clock time (the
+        pre-pin behavior) and we log rather than abort the simulation.
+        """
+        ts = getattr(self, "_fork_block_timestamp", None)
+        if ts is None:
+            return
+        pinned = int(ts) + SIM_BLOCK_TIMESTAMP_OFFSET
+        try:
+            result = self.w3.provider.make_request(
+                "evm_setNextBlockTimestamp", [pinned],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                logger.warning(
+                    "evm_setNextBlockTimestamp(%s) rejected (%s): %s",
+                    pinned, self.rpc_url, result["error"],
+                )
+        except Exception as exc:  # noqa: BLE001 - pin is best-effort by design
+            logger.warning(
+                "evm_setNextBlockTimestamp(%s) failed (%s): %s",
+                pinned, self.rpc_url, exc,
+            )
+
+    def _reset_fork_inner(self, block_number: int | None = None) -> None:
         """Reset the Anvil fork to a clean baseline.
 
         Two paths, dispatched by whether an upstream RPC is configured:
@@ -965,6 +1353,7 @@ class AnvilSimulator:
                 + spender[2:].lower().zfill(64)
                 + hex(amount)[2:].zfill(64)
             )
+            self._pin_next_block_timestamp()
             tx_hash = self.w3.eth.send_transaction({
                 "from": owner,
                 "to": token,
@@ -1220,8 +1609,13 @@ class AnvilSimulator:
             "gas": 1_000_000,
         }
 
+        self._pin_next_block_timestamp()
         tx_hash = self.w3.eth.send_transaction(tx)
-        # Mine immediately to avoid waiting for block time
+        # Mine immediately to avoid waiting for block time. The pin is
+        # one-shot (consumed by the tx's own block), so re-pin: this extra
+        # block must not float back to wall clock, or the NEXT pinned send
+        # would be "lower than previous block's timestamp" and get rejected.
+        self._pin_next_block_timestamp()
         self.w3.provider.make_request("evm_mine", [])
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=self.sim_timeout)
 
@@ -1504,6 +1898,22 @@ class MultiChainSimulator:
         if sim is None:
             return False
         return sim.pin_read_fork(cid, block_number)
+
+    def get_block_timestamp(
+        self, chain_id: int, block_number: int | None = None,
+    ) -> int | None:
+        """Timestamp of ``block_number`` on ``chain_id``'s fork (``None`` =
+        that fork's current anchor). Routes to the per-chain sub-simulator
+        like :meth:`pin_read_fork`; returns None when unresolvable.
+        """
+        try:
+            cid = int(chain_id)
+        except (TypeError, ValueError):
+            cid = self.default_chain_id
+        sim = self.simulators.get(cid) or self.simulators.get(self.default_chain_id)
+        if sim is None:
+            return None
+        return sim.get_block_timestamp(cid, block_number)
 
     async def simulate(
         self,

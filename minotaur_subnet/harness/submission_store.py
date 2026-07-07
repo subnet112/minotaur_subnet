@@ -121,6 +121,24 @@ BENCHED_STATUSES = frozenset({
 })
 
 
+# Cap how many submissions keep their (heavy — ~40-70KB each) benchmark_details
+# in the persisted store. Terminal submissions beyond the N most-recent (by
+# epoch) get their details dropped on persist. Without this the store grew
+# unbounded to 142MB (3556 subs) and, because _persist re-serializes the WHOLE
+# store on every write ON THE EVENT LOOP, each write froze the api for ~25s
+# (every request — sync and async — stalled). Keeps active + recent submissions
+# intact. 0 disables the cap.
+_BENCHMARK_DETAILS_RETENTION = int(
+    os.environ.get("SUBMISSION_BENCHMARK_DETAILS_RETENTION", "300")
+)
+# Only terminal submissions are strippable — an in-flight one may still need its
+# details for the round decision / report.
+_DETAILS_STRIPPABLE_STATUSES = frozenset({
+    SubmissionStatus.SCORED,
+    SubmissionStatus.REJECTED,
+})
+
+
 @dataclass
 class Submission:
     """A solver submission and its lifecycle state."""
@@ -163,6 +181,26 @@ class Submission:
     solver_name: str | None = None
     solver_version: str | None = None
 
+    # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
+    # any single named region (module / function / class body) across the
+    # submission's in-tree Python, computed once in screening stage 1. Persisted
+    # but NOT gated yet — we soak the live distribution to calibrate the floor and
+    # the saturated-tie dethrone tie-break. See harness/screening.max_region_nodes.
+    max_region_nodes: int | None = None
+
+    # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
+    # tree that provably does no work at runtime (unreachable files + dead
+    # bindings inside reachable files + exempt-tree overflow), computed once in
+    # screening stage 1 and never recomputed by any consumer. Persisted but NOT
+    # gated yet. None ⇔ not yet screened OR a non-exempt file was unparseable.
+    # unproductive_metric_version stamps the algorithm semantics — consumers
+    # must only compare EQUAL versions. unproductive_top_offenders is the
+    # [path, qualname-or-None, nodes] deletion list miners see in the report.
+    # See harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
+    unproductive_metric_version: int | None = None
+    unproductive_top_offenders: list | None = None
+
     # Set after benchmarking. NOTE: the scalar composite benchmark_score was
     # removed — adoption is decided by the per-order relative rule
     # (epoch/relative_scoring.evaluate_relative_adoption) and finalist ranking by
@@ -204,6 +242,10 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "max_region_nodes": self.max_region_nodes,
+            "unproductive_nodes": self.unproductive_nodes,
+            "unproductive_metric_version": self.unproductive_metric_version,
+            "unproductive_top_offenders": self.unproductive_top_offenders,
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
@@ -224,6 +266,8 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "max_region_nodes": self.max_region_nodes,
+            "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
         }
@@ -488,6 +532,10 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            max_region_nodes=record.get("max_region_nodes"),
+            unproductive_nodes=record.get("unproductive_nodes"),
+            unproductive_metric_version=record.get("unproductive_metric_version"),
+            unproductive_top_offenders=record.get("unproductive_top_offenders"),
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
@@ -717,6 +765,48 @@ class SubmissionStore:
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_id = image_id
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_max_region_nodes(self, submission_id: str, value: int) -> None:
+        """Persist the Phase-0 factorization metric computed in screening stage 1.
+
+        Observe-only: nothing gates on this yet. Stored once so every downstream
+        consumer READS the same integer (never recomputes), keeping the metric
+        consensus-safe across CPython versions.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.max_region_nodes = value
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_deadwood_metric(
+        self,
+        submission_id: str,
+        nodes: int | None,
+        version: int,
+        top_offenders: list | None,
+    ) -> None:
+        """Persist the Phase-0 deadwood metric computed in screening stage 1.
+
+        Observe-only: nothing gates on this yet. Stored once so every downstream
+        consumer READS the same values (never recomputes), keeping the metric
+        consensus-safe across CPython versions. ``nodes`` may be None (a
+        non-exempt file failed ast.parse) — persisted explicitly so consumers
+        can tell "measured unparseable" from "never measured" via ``version``.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.unproductive_nodes = nodes
+        sub.unproductive_metric_version = version
+        sub.unproductive_top_offenders = top_offenders
         sub.updated_at = time.time()
         self._persist()
 
@@ -1075,6 +1165,7 @@ class SubmissionStore:
         if self._persist_path is None:
             return
         try:
+            self._enforce_benchmark_details_retention()
             data = {
                 sid: sub.to_dict()
                 for sid, sub in self._submissions.items()
@@ -1083,11 +1174,40 @@ class SubmissionStore:
             tmp_path = self._persist_path.with_name(
                 f".{self._persist_path.name}.{os.getpid()}.tmp"
             )
-            tmp_path.write_text(json.dumps(data, indent=2))
+            # Compact (no indent): the store is re-serialized on EVERY write, so
+            # pretty-printing ~doubles both the bytes written and the encode time
+            # on the (previously loop-blocking) hot path for zero machine benefit.
+            tmp_path.write_text(json.dumps(data))
             os.replace(tmp_path, self._persist_path)
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
             logger.warning("Failed to persist submissions: %s", exc)
+
+    def _enforce_benchmark_details_retention(self) -> None:
+        """Drop benchmark_details from terminal submissions beyond the retention
+        cap so the persisted store stays bounded.
+
+        benchmark_details is ~40-70KB per submission; unbounded it grew the store
+        to 142MB, and _persist re-serializes the WHOLE store on every write on the
+        event loop → ~25s api-wide freezes. We keep details for all non-terminal
+        (in-flight) submissions plus the ``_BENCHMARK_DETAILS_RETENTION`` most
+        recent by epoch, and strip the rest in place. In-memory mutation is fine:
+        the field is Optional and every reader uses ``.get()``/``or {}``.
+        """
+        cap = _BENCHMARK_DETAILS_RETENTION
+        if cap <= 0:
+            return
+        # Candidates: terminal submissions that still carry details.
+        withdetails = [
+            s for s in self._submissions.values()
+            if s.status in _DETAILS_STRIPPABLE_STATUSES and s.benchmark_details
+        ]
+        if len(withdetails) <= cap:
+            return
+        # Keep the `cap` most recent by epoch; strip the older tail.
+        withdetails.sort(key=lambda s: s.epoch, reverse=True)
+        for sub in withdetails[cap:]:
+            sub.benchmark_details = None
 
     def _load(self, *, quiet: bool = False) -> None:
         """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
@@ -1120,6 +1240,10 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    max_region_nodes=d.get("max_region_nodes"),
+                    unproductive_nodes=d.get("unproductive_nodes"),
+                    unproductive_metric_version=d.get("unproductive_metric_version"),
+                    unproductive_top_offenders=d.get("unproductive_top_offenders"),
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),

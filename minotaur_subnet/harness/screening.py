@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -72,6 +73,57 @@ BINARY_EXTENSIONS = {
     ".whl", ".tar", ".gz", ".zip", ".bz2",
 }
 
+# ── Factorization metric (Phase 0: OBSERVE-ONLY, not gated) ──────────────────
+# `max_region_nodes` is the largest AST-node count of any single *named region*
+# (module top-level body / function body / class body) across a submission's
+# in-tree Python. It is a golf-immune proxy for "worst entanglement": counting
+# AST nodes is invariant to formatting, so minifying a god-function changes
+# nothing — the only way to lower it is to split a region into named helpers,
+# which is exactly the factorization we want to reward.
+#
+# The integer is ALWAYS computed and persisted (soak + Phase-2 tie-break input).
+# `MAX_REGION_NODES` is the Phase-1 ARMING SWITCH: while None, stage 1 only
+# observes; with an int cap, stage 1 REJECTS `too_entangled` above it — and also
+# rejects `dynamic_code` (bare exec()/eval() calls, which would let a solver
+# hide entangled logic in strings the AST can't see). A CODE constant, never
+# env-read (the FLOOR_BPS discipline). Only NEW submissions gate; the standing
+# champion is never re-screened. `FLOOR_VERSION` stamps the metric semantics so
+# a champion clean under vN is never retro-evicted by vN+1.
+#
+# CALIBRATED = 4200 (STAGE-A BACKSTOP) from the 2026-07-03..07 soak: the live
+# distribution is a champion-fork monoculture at 4109 (== canonical main,
+# verified: 4109 nodes, zero bare exec/eval) with tweak outliers at 4130/4163
+# and one genuinely refactored solver at 1212. A tight cap (~2000) as the FIRST
+# arming would reject essentially every live submission and empty the
+# challenger pipeline — so Stage A only blocks NEW bloat above today's worst
+# (4163 passes, the champion tree keeps 91 nodes of headroom), while the
+# FACTOR_MARGIN tie-break flips the throne to the cleaner tree. Once the
+# monoculture re-forks that champion (it demonstrably forks whatever holds the
+# throne), Stage B ratchets this to ~2000–2500 under FLOOR_VERSION = 2 —
+# painlessly, because the fleet is already under it.
+FLOOR_VERSION = 1
+MAX_REGION_NODES: int | None = 4200  # ARMED Stage-A backstop; None ⇒ observe-only
+
+# Bare builtin calls that defeat static analysis: code built in strings is
+# invisible to max_region_nodes, so once the floor is armed these are rejected
+# (error_code="dynamic_code"). Precise AST bare-Name check — attribute calls
+# like `re.compile(...)` or `tree.eval(...)` are NOT flagged, and `compile` is
+# deliberately not banned.
+_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval"})
+
+# Named scopes that START a new region: a nested def/class's *body* leaves its
+# parent region (its header still counts in the parent). Lambdas, comprehensions
+# and data literals deliberately do NOT appear here — their nodes count into the
+# enclosing region so logic can't be relocated into them to dodge the metric.
+_NAMED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+# Directories excluded from the scan. `.git` is VCS metadata; everything else
+# in-tree is treated as miner code (deps arrive via the pinned base image behind
+# the FROM allowlist, so a large in-tree *.py is the miner's own). Whether a
+# subnet-declared vendor path should be exempted is a Phase-1 decision — see the
+# rollout's open decision on in-tree vendored third-party *.py.
+_METRIC_EXCLUDE_DIRS = {".git"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          SCREENING RESULT
@@ -86,6 +138,19 @@ class StageResult:
     duration_ms: int = 0
     details: str = ""
     error_code: str | None = None
+    # Factorization metric, set by stage 1 only (None on other stages / errors).
+    # Computed once here so downstream consumers READ the persisted value and
+    # never recompute — a cross-CPython AST difference can't then split consensus.
+    max_region_nodes: int | None = None
+    # Deadwood metric (Phase 0, OBSERVE-ONLY), set by stage 1 only. Same
+    # compute-once-read-forever discipline as max_region_nodes. None on other
+    # stages / errors, and None (with version still set) when a non-exempt file
+    # failed ast.parse — see harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
+    unproductive_metric_version: int | None = None
+    # (path, qualname-or-None, nodes) — what a miner should delete. Max 20,
+    # sorted desc by nodes then path; persisted so the report can show it.
+    unproductive_top_offenders: list | None = None
 
 
 @dataclass
@@ -114,10 +179,106 @@ class ScreeningResult:
                     "duration_ms": s.duration_ms,
                     "details": s.details,
                     "error_code": s.error_code,
+                    "max_region_nodes": s.max_region_nodes,
+                    "unproductive_nodes": s.unproductive_nodes,
                 }
                 for s in self.stages
             },
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                       FACTORIZATION METRIC (max_region_nodes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _module_max_region(tree: ast.Module) -> int:
+    """Largest region node-count within one parsed module.
+
+    A *region* is the body of a named scope: the module top level, or the body
+    of a FunctionDef / AsyncFunctionDef / ClassDef. Counting a region walks every
+    descendant AST node EXCEPT it does not descend into the body of a nested
+    named scope — that body forms its own region (the nested def's header still
+    counts in the parent, but its body "leaves"). So extracting a block into a
+    named helper strictly lowers the enclosing region, while hiding logic in a
+    lambda / comprehension / data literal does not (those don't start a region).
+    """
+    max_count = 0
+    regions: list[list[ast.stmt]] = [list(tree.body)]
+    while regions:
+        body = regions.pop()
+        count = 0
+        stack: list[ast.AST] = list(body)
+        while stack:
+            node = stack.pop()
+            count += 1
+            if isinstance(node, _NAMED_SCOPES):
+                # Body spins off its own region; header children (args,
+                # decorators, bases, returns) still count in THIS region.
+                regions.append(list(node.body))
+                for child in ast.iter_child_nodes(node):
+                    if any(child is stmt for stmt in node.body):
+                        continue
+                    stack.append(child)
+            else:
+                stack.extend(ast.iter_child_nodes(node))
+        if count > max_count:
+            max_count = count
+    return max_count
+
+
+def max_region_nodes(repo_path: str) -> int:
+    """Largest AST region across all in-tree Python — the factorization metric.
+
+    Golf-immune (counts AST nodes, so formatting/minification can't move it) and
+    a pure function of the candidate tree (no baseline diff, no champion source).
+    Returns 0 when the repo has no parseable Python. Unparseable files are
+    skipped in observe mode — stage 2's import check is the backstop for code
+    that cannot even be parsed.
+    """
+    root = Path(repo_path)
+    max_count = 0
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        m = _module_max_region(tree)
+        if m > max_count:
+            max_count = m
+    return max_count
+
+
+def dynamic_code_calls(repo_path: str) -> list[str]:
+    """Locations (``relpath:line``) of bare ``exec(...)``/``eval(...)`` calls.
+
+    These build code in strings the AST can't see, so they would let a solver
+    smuggle an entangled god-region past :func:`max_region_nodes`. Flagged only
+    when the callee is the BARE builtin name (``ast.Name``) — attribute calls
+    (``re.compile``, ``obj.eval``) never match, and ``compile`` is not banned.
+    Same scan scope as the metric (in-tree ``*.py``, ``.git`` excluded,
+    unparseable files skipped — stage 2's import check backstops those).
+    Sorted for deterministic reject messages.
+    """
+    root = Path(repo_path)
+    hits: list[str] = []
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _BANNED_DYNAMIC_CALLS
+            ):
+                hits.append(f"{py.relative_to(root)}:{node.lineno}")
+    return sorted(hits)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -215,10 +376,75 @@ def run_stage_1(repo_path: str) -> StageResult:
                     error_code="suspicious_binary",
                 )
 
+    # Factorization metric — ALWAYS computed + persisted (soak + Phase-2
+    # tie-break input). Gated only when the Phase-1 floor is ARMED
+    # (MAX_REGION_NODES set to an int cap); observe-only while None.
+    floor_armed = MAX_REGION_NODES is not None
+    factor_nodes = max_region_nodes(repo_path)
+    logger.info(
+        "[factorization] max_region_nodes=%d floor_version=%d (%s) repo=%s",
+        factor_nodes, FLOOR_VERSION,
+        f"floor armed, cap={MAX_REGION_NODES}" if floor_armed else "observe-only, not gated",
+        repo_path,
+    )
+
+    # Deadwood metric — computed in the same pass, observe-only until its own
+    # floor arms (deadwood.UNPRODUCTIVE_NODES_MAX, a later separately-reviewed
+    # PR). Computed BEFORE the factor floor gates so a floor-rejected
+    # submission still records its deadwood values (persist-on-reject). An
+    # unparseable non-exempt file yields unproductive_nodes=None (logged inside
+    # the analyzer) — persisted as None, every consumer skips it; stage 2's
+    # import check remains the backstop for code that cannot even be parsed.
+    from minotaur_subnet.harness import deadwood
+
+    dw = deadwood.unproductive_nodes(repo_path)
+    if not dw.unparseable:
+        logger.info(
+            "[deadwood] unproductive_nodes=%d version=%d (observe-only) repo=%s",
+            dw.unproductive_nodes, dw.version, repo_path,
+        )
+    _dw_fields: dict[str, Any] = dict(
+        unproductive_nodes=dw.unproductive_nodes,
+        unproductive_metric_version=dw.version,
+        unproductive_top_offenders=[list(t) for t in dw.top_offenders],
+    )
+
+    if floor_armed:
+        # Bare exec()/eval() first: code built in strings is invisible to the
+        # metric, so an armed floor without this ban would be trivially dodged.
+        banned = dynamic_code_calls(repo_path)
+        if banned:
+            shown = ", ".join(banned[:5]) + (", …" if len(banned) > 5 else "")
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    f"Dynamic code execution (bare exec/eval) is not allowed: {shown}"
+                ),
+                error_code="dynamic_code",
+                max_region_nodes=factor_nodes,
+                **_dw_fields,
+            )
+        if factor_nodes > MAX_REGION_NODES:
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    f"Largest code region has {factor_nodes} AST nodes, over the "
+                    f"cap of {MAX_REGION_NODES} (floor v{FLOOR_VERSION}) — split "
+                    f"the biggest function/class/module body into named helpers"
+                ),
+                error_code="too_entangled",
+                max_region_nodes=factor_nodes,
+                **_dw_fields,
+            )
+
     return StageResult(
         stage=1, passed=True,
         duration_ms=_elapsed(start),
         details="All static checks passed",
+        max_region_nodes=factor_nodes,
+        **_dw_fields,
     )
 
 
@@ -276,6 +502,26 @@ def _solver_build_command(image_tag: str, repo_path: str) -> list[str]:
     ]
 
 
+# Global bound on concurrent stage-2 runs (docker build + import/init
+# containers). Submission intake spawns one screening pipeline per submission
+# with NO concurrency cap, so a submission burst used to run N builds at once:
+# at 2 CPUs per build on the leader's 4-core host (plus bench containers and
+# anvil forks) the host saturated and the api process went silent for 40-60s
+# at a time — nginx "upstream timed out" storms, browsers seeing dead CORS
+# preflights (live incident 2026-07-07; ~10k timeouts/day during the 07-05/06
+# submission-spam wave). Serialized by default; raise only on hosts with
+# spare cores. Lazily created so the Semaphore binds to the running loop.
+_stage2_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_stage2_semaphore() -> asyncio.Semaphore:
+    global _stage2_semaphore
+    if _stage2_semaphore is None:
+        limit = int(os.environ.get("SCREENING_BUILD_CONCURRENCY", "1") or "1")
+        _stage2_semaphore = asyncio.Semaphore(max(1, limit))
+    return _stage2_semaphore
+
+
 async def run_stage_2(
     repo_path: str,
     image_tag: str,
@@ -283,6 +529,11 @@ async def run_stage_2(
     init_timeout: float = 60.0,
 ) -> StageResult:
     """Build the Docker image and verify solver can be imported and initialized.
+
+    Concurrency-bounded by SCREENING_BUILD_CONCURRENCY (default 1): the CPU
+    caps in _solver_build_command are per-build, so only a global bound stops
+    a burst of submissions from stacking builds past the host's core count.
+    Queue wait is excluded from the reported duration_ms.
 
     Steps:
     1. Build Docker image from repo's Dockerfile
@@ -299,6 +550,18 @@ async def run_stage_2(
     Returns:
         StageResult with pass/fail and details.
     """
+    async with _get_stage2_semaphore():
+        return await _run_stage_2_locked(
+            repo_path, image_tag, build_timeout, init_timeout,
+        )
+
+
+async def _run_stage_2_locked(
+    repo_path: str,
+    image_tag: str,
+    build_timeout: float,
+    init_timeout: float,
+) -> StageResult:
     start = time.monotonic()
 
     # Step 1: Build the untrusted miner image on the LEGACY builder (see build_env

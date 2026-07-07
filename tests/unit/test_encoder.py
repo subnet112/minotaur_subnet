@@ -67,6 +67,40 @@ class TestEncodeExecutionPlan:
         assert result[0][0][1] == 100
         assert result[0][1][1] == 200
 
+    def test_target_checksum_normalized(self):
+        """Solver targets with wrong/mixed casing must be normalized.
+
+        Regression for the 2026-07-07 Base incident: this exact
+        wrong-checksum target (lowercase 'c' in '5E9bc251') made web3
+        reject every executeIntent build for the order.
+        """
+        bad = "0x1601843c5E9bc251A3272907010AFa41Fa18347E"   # invalid EIP-55
+        good = "0x1601843c5E9bC251A3272907010AFa41Fa18347E"  # canonical
+        plan = ExecutionPlan(
+            intent_id="test",
+            interactions=[
+                Interaction(target=bad, value="0", call_data="0x"),
+                Interaction(target=good.lower(), value="0", call_data="0x"),
+            ],
+            deadline=0,
+            nonce=0,
+        )
+        calls = encode_execution_plan(plan)[0]
+        assert calls[0][0] == good
+        assert calls[1][0] == good
+
+    def test_target_checksum_same_plan_hash(self):
+        """Normalizing target casing must not change the signed plan hash."""
+        bad = "0x1601843c5E9bc251A3272907010AFa41Fa18347E"
+        good = "0x1601843c5E9bC251A3272907010AFa41Fa18347E"
+        mk = lambda t: ExecutionPlan(
+            intent_id="test",
+            interactions=[Interaction(target=t, value="0", call_data="0xaa")],
+            deadline=1,
+            nonce=1,
+        )
+        assert hash_execution_plan(mk(bad)) == hash_execution_plan(mk(good))
+
 
 class TestHashExecutionPlan:
     def test_deterministic(self):

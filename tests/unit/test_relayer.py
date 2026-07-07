@@ -573,5 +573,75 @@ class TestSubmitResult(unittest.TestCase):
         self.assertEqual(r.gas_used, 0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#                          NONCE MANAGER TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestNonceManager(unittest.TestCase):
+    """Tests for NonceManager, in particular the failure-path cache hygiene.
+
+    Live incident 2026-07-07 (Base): failed pre-broadcast submissions
+    incremented the local counter without landing a tx, so every later tx
+    (including a contract deploy) was built nonce-gapped and sat unmined
+    until dropped. ``invalidate`` is the no-RPC recovery used in error
+    handlers.
+    """
+
+    WALLET = "0x63AeEF526406be8d1aF89023422A455b4d8e130B"
+
+    def _w3_with_nonce(self, value):
+        w3 = MagicMock()
+        w3.eth.get_transaction_count.return_value = value
+        return w3
+
+    def test_syncs_from_chain_then_increments_locally(self):
+        from minotaur_subnet.relayer.evm_relayer import NonceManager
+
+        nm = NonceManager()
+        w3 = self._w3_with_nonce(123)
+        self.assertEqual(nm.get_and_increment(8453, self.WALLET, w3), 123)
+        self.assertEqual(nm.get_and_increment(8453, self.WALLET, w3), 124)
+        # Only the first call hits the chain
+        w3.eth.get_transaction_count.assert_called_once_with(self.WALLET, "pending")
+
+    def test_invalidate_forces_resync_on_next_use(self):
+        from minotaur_subnet.relayer.evm_relayer import NonceManager
+
+        nm = NonceManager()
+        w3 = self._w3_with_nonce(123)
+        # Burn a few nonces locally (failed attempts that never broadcast)
+        for _ in range(3):
+            nm.get_and_increment(8453, self.WALLET, w3)
+
+        nm.invalidate(8453, self.WALLET)
+
+        # Chain never moved — next use must re-sync to 123, not continue at 126
+        self.assertEqual(nm.get_and_increment(8453, self.WALLET, w3), 123)
+
+    def test_invalidate_needs_no_rpc(self):
+        from minotaur_subnet.relayer.evm_relayer import NonceManager
+
+        nm = NonceManager()
+        nm.get_and_increment(8453, self.WALLET, self._w3_with_nonce(7))
+        # No w3 argument at all — must not raise even for unknown keys
+        nm.invalidate(8453, self.WALLET)
+        nm.invalidate(1, self.WALLET)
+
+    def test_invalidate_scoped_per_chain(self):
+        from minotaur_subnet.relayer.evm_relayer import NonceManager
+
+        nm = NonceManager()
+        nm.get_and_increment(8453, self.WALLET, self._w3_with_nonce(10))
+        nm.get_and_increment(1, self.WALLET, self._w3_with_nonce(50))
+
+        nm.invalidate(8453, self.WALLET)
+
+        # Chain 1 counter untouched (no re-sync: still local 51)
+        w3_eth = self._w3_with_nonce(999)
+        self.assertEqual(nm.get_and_increment(1, self.WALLET, w3_eth), 51)
+        w3_eth.eth.get_transaction_count.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

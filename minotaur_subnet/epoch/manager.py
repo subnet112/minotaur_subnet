@@ -36,6 +36,7 @@ from minotaur_subnet.harness.submission_store import (
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
+    blind_spot_bar_from_rows,
     evaluate_relative_adoption,
     has_delivered_value_rows,
 )
@@ -156,6 +157,14 @@ class ChampionInfo:
     image_tag: str | None = None
     hotkey: str | None = None
     adopted_at: float = 0.0
+    # ADOPTION-TIME per-order delivered outputs ({intent_id: exact wei string},
+    # relative_scoring.blind_spot_bar_from_rows) — the blind-spot REPEAT bar.
+    # Snapshotted at _hot_swap because the incumbent re-bench overwrites the
+    # submission record's per_intent every round (merge_benchmark_details), so
+    # the stored rows can NOT recover what the order paid when it won. In-memory
+    # only: lost on restart (guard inert until the next adoption) — persisting it
+    # in ChampionSnapshot + the consensus proposal is the ARMING-phase work.
+    adoption_outputs: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +277,9 @@ class EpochManager:
                     restored_snapshot.activated_at
                     if restored_snapshot.submission_id == restored.submission_id
                     else restored.updated_at
+                ),
+                adoption_outputs=self._restored_adoption_outputs(
+                    restored.submission_id,
                 ),
             )
 
@@ -1105,10 +1117,14 @@ class EpochManager:
         Reuses the per-order rows already computed this round; needs no extra bench.
 
         DETERMINISM: an adoptable candidate always outranks a non-adoptable one, then
-        higher net-better wins, then a content-addressed (image_id, submission_id)
-        tie-break — so a failed-over leader on the same store nominates the SAME
-        finalist (the previous stable-sort break was the LOCAL-clock created_at, which
-        could diverge). champ_rows are the champion's STORED per-order rows (from its
+        higher net-better wins, then the CLEANEST candidate (ascending PERSISTED
+        ``max_region_nodes`` — the Phase-2 factorization tie-break; unmeasured
+        records rank last on that key and can never win a tie on it), then the
+        content-addressed (image_id, submission_id) final fallback — so a
+        failed-over leader on the same store nominates the SAME finalist (the
+        metric is persisted at screening and mirrored with the record, never
+        recomputed here; the previous stable-sort break was the LOCAL-clock
+        created_at, which could diverge). champ_rows are the champion's STORED per-order rows (from its
         last bench), which is enough for a deterministic RANK — the incumbent is only
         re-benched (for the actual adoption verdict) AFTER a finalist is picked, so an
         idle round with no candidate never pays for a re-bench.
@@ -1136,13 +1152,26 @@ class EpochManager:
                 reason,
             )
 
-        def _rank_key(s: Submission) -> tuple[int, int, str, str]:
-            v = evaluate_relative_adoption(champ_rows, self._per_intent(s))
+        # Ties on (adoptable, net) rank the CLEANEST candidate first (Phase-2
+        # factorization tie-break). None (record predates the metric / not yet
+        # screened under it) sorts BELOW every measured value via this sentinel,
+        # so an unmeasured candidate can never win a tie on cleanliness.
+        _FACTOR_UNMEASURED = 2**31
+
+        def _rank_key(s: Submission) -> tuple[int, int, int, str, str]:
+            # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
+            # candidate above one with a genuine win (disarmed: no-op).
+            v = evaluate_relative_adoption(
+                champ_rows, self._per_intent(s), **self._blind_spot_bar_kwargs(),
+            )
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
+            nodes = getattr(s, "max_region_nodes", None)
             return (
                 0 if v["adopt"] else 1,   # adoptable candidates first
                 -net,                     # then most net-better vs champion
-                str(s.image_id or ""),    # content-addressed, host-independent tie-break
+                # then best-factored (smallest persisted max region; measured-only)
+                nodes if isinstance(nodes, int) else _FACTOR_UNMEASURED,
+                str(s.image_id or ""),    # content-addressed, host-independent fallback
                 str(s.submission_id or ""),
             )
 
@@ -1340,7 +1369,9 @@ class EpochManager:
             return
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1350,7 +1381,28 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            # Phase-2 factorization tie-break input — PERSISTED metrics only
+            # (None on either side ⇒ 0 ⇒ clause inert), IDENTICAL to the live
+            # decision (_evaluate_per_order_adoption) so this published would-be
+            # vote keeps matching the real verdict. deadwood_delta: same
+            # pattern for the 4th key, with the metric-version guard living in
+            # the ONE shared helper (deadwood_delta_between: 0 unless both
+            # sides carry SAME-VERSION unproductive metrics — fields ship on
+            # the #575 lineage, getattr keeps this inert until then).
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
+                ),
+                **self._blind_spot_bar_kwargs(),
+            )
             adopt = bool(verdict["adopt"])
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
@@ -1360,7 +1412,14 @@ class EpochManager:
                 "n_regressions": verdict["n_regressions"],
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
+                "n_blind_spot_repeats": verdict.get("n_blind_spot_repeats", 0),
+                "n_blind_spot_repeats_observed": verdict.get(
+                    "n_blind_spot_repeats_observed", 0,
+                ),
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
             }
             logger.info(
@@ -1476,6 +1535,46 @@ class EpochManager:
         rows = details.get("per_intent") if isinstance(details, dict) else None
         return rows if isinstance(rows, list) else []
 
+    def _restored_adoption_outputs(self, submission_id: str | None) -> dict[str, str] | None:
+        """Boot-restore the blind-spot REPEAT bar from the round store.
+
+        The bar is persisted by ``_hot_swap`` under its own round-store key
+        (``set_champion_adoption_bar``); recover it ONLY when it belongs to the
+        champion being restored — a record from a displaced champion must never
+        gate covers against the wrong bar. ``None`` (guard inert until the next
+        adoption) on any mismatch/absence/failure.
+        """
+        if self._round_store is None or not submission_id:
+            return None
+        try:
+            record = self._round_store.get_champion_adoption_bar()
+        except Exception:  # additive restore — never break boot
+            return None
+        if not record or record.get("submission_id") != submission_id:
+            return None
+        outputs = record.get("outputs")
+        return dict(outputs) if isinstance(outputs, dict) and outputs else None
+
+    def _blind_spot_bar_kwargs(self) -> dict[str, Any]:
+        """``champion_bar``/``bar_age_s`` kwargs for the relative verdict.
+
+        Sourced from the ADOPTION-TIME snapshot on :class:`ChampionInfo` (see
+        ``adoption_outputs``). Empty dict — guard fully inert — when there is no
+        snapshot (pre-adoption, genesis, or a post-restart champion restored
+        without one).
+        """
+        # getattr-duck-typed (like every other _champion read on the decision
+        # path): a restored/mocked champion without the snapshot must degrade to
+        # an inert guard, never an AttributeError that reads as an abstain.
+        bar = getattr(self._champion, "adoption_outputs", None)
+        adopted_at = getattr(self._champion, "adopted_at", 0.0) or 0.0
+        if not bar or not adopted_at:
+            return {}
+        return {
+            "champion_bar": bar,
+            "bar_age_s": max(0.0, time.time() - adopted_at),
+        }
+
     def _evaluate_per_order_adoption(
         self, challenger: Submission,
     ) -> dict[str, Any] | None:
@@ -1494,7 +1593,9 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1504,7 +1605,34 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            verdict = evaluate_relative_adoption(champ_rows, chal_rows)
+            # Phase-2 factorization tie-break: on a true all-matched tie a
+            # materially better-factored challenger dethrones. Inputs are the
+            # PERSISTED screening metrics (None on either side ⇒ delta 0 ⇒
+            # clause inert — the backfill of the standing champion's value is
+            # the deliberate fleet-wide activation lever). Never recomputed at
+            # decision time. IDENTICAL threading to the follower's
+            # _independent_adopt_vote, so leader and fleet keep deciding alike.
+            # deadwood_delta: the 4th ladder key, threaded the same way; the
+            # metric-version guard lives in the ONE shared helper
+            # (deadwood_delta_between: 0 unless BOTH records carry
+            # SAME-VERSION unproductive metrics — cross-version node counts
+            # are not comparable). The fields ship on the #575 lineage;
+            # getattr keeps this inert until the lineages merge and records
+            # carry values (activation-by-data, exactly like factor).
+            verdict = evaluate_relative_adoption(
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
+                ),
+                **self._blind_spot_bar_kwargs(),
+            )
 
             logger.info(
                 "[per-order-adoption] challenger=%s verdict=%s wins=%d regressions=%d "
@@ -1515,6 +1643,18 @@ class EpochManager:
                 verdict["n_blind_spots"], verdict["n_matched"],
                 verdict["scenarios_compared"], verdict["reason"],
             )
+            # Phase-0 soak signal: covers that merely re-deliver the incumbent's
+            # own adoption-time value (the calldata-replay treadmill signature).
+            # While BLIND_SPOT_BAR_TTL_S is None this NEVER affects the verdict.
+            if verdict.get("n_blind_spot_repeats_observed", 0) > 0:
+                logger.info(
+                    "[blind-spot-bar] challenger=%s observed %d blind-spot "
+                    "repeat(s) (cover <= incumbent's adoption-time value, bar "
+                    "age %.0fs) — observe-only, verdict unchanged",
+                    getattr(challenger, "submission_id", "?"),
+                    verdict["n_blind_spot_repeats_observed"],
+                    self._blind_spot_bar_kwargs().get("bar_age_s", -1.0),
+                )
 
             vote = {
                 "candidate_id": getattr(challenger, "submission_id", None),
@@ -1524,6 +1664,9 @@ class EpochManager:
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
                 "per_order": verdict["per_order"],
             }
@@ -1557,15 +1700,28 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                FACTOR_MARGIN,
+                GAS_BASIS,
+                GAS_MARGIN_BPS,
+                UNPRODUCTIVE_MARGIN,
+                deadwood_delta_between,
+                factor_delta_between,
                 has_raw_output_rows,
                 relative_counts,
             )
 
             if self._sub_store is None or not self._champion.submission_id:
                 return
-            champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
+            champ_sub = self._sub_store.get(self._champion.submission_id)
+            champ_rows = self._per_intent(champ_sub)
             if not has_raw_output_rows(champ_rows):
                 return
+            champ_nodes = getattr(champ_sub, "max_region_nodes", None)
+            # Deadwood metric fields ship on the #575 lineage — getattr keeps
+            # this None-safe (⇒ delta 0 ⇒ inert) until the lineages merge and
+            # records carry values.
+            champ_dw_nodes = getattr(champ_sub, "unproductive_nodes", None)
+            champ_dw_version = getattr(champ_sub, "unproductive_metric_version", None)
             for competitor in self._sub_store.list_by_round(round_id):
                 if competitor.submission_id == self._champion.submission_id:
                     continue
@@ -1573,7 +1729,70 @@ class EpochManager:
                 if not has_raw_output_rows(comp_rows):
                     continue
                 try:
-                    counts = relative_counts(champ_rows, comp_rows)
+                    # Same-pin factor context, captured HERE because this is the
+                    # one display pass where both records are in hand — the
+                    # report then reads it without any cross-record lookup. The
+                    # delta feeds the verdict too, so a factor-tie dethrone is
+                    # stored as "dethrone", not a misleading "matched".
+                    comp_nodes = getattr(competitor, "max_region_nodes", None)
+                    delta = factor_delta_between(champ_nodes, comp_nodes)
+                    # Deadwood (4th ladder key): same-pin, version-guarded
+                    # delta via the ONE shared helper — 0 unless both records
+                    # carry SAME-VERSION unproductive metrics (fields on the
+                    # #575 lineage; getattr ⇒ None-safe until then).
+                    comp_dw_nodes = getattr(competitor, "unproductive_nodes", None)
+                    comp_dw_version = getattr(
+                        competitor, "unproductive_metric_version", None,
+                    )
+                    dw_delta = deadwood_delta_between(
+                        champ_dw_nodes, comp_dw_nodes,
+                        champ_dw_version, comp_dw_version,
+                    )
+                    # Same bar kwargs as the authoritative verdict so the
+                    # persisted (miner-facing) counts agree with the live
+                    # decision — an armed repeat must read as "repeat", never as
+                    # a contradictory "1 better yet not adopted".
+                    counts = relative_counts(
+                        champ_rows, comp_rows,
+                        factor_delta=delta, deadwood_delta=dw_delta,
+                        **self._blind_spot_bar_kwargs(),
+                    )
+                    counts["factorization"] = {
+                        "candidate_nodes": comp_nodes,
+                        "champion_nodes": champ_nodes,
+                        "factor_delta": delta,
+                        "factor_margin": FACTOR_MARGIN,
+                        "armed": FACTOR_MARGIN is not None,
+                    }
+                    # Deadwood rule context beside factorization/gas — the one
+                    # display pass with both records in hand, so the report
+                    # reads it without any cross-record lookup and a
+                    # deadwood-tie dethrone is stored as "dethrone" with its
+                    # actionable numbers. None-safe by construction.
+                    counts["deadwood"] = {
+                        "candidate_nodes": comp_dw_nodes,
+                        "champion_nodes": champ_dw_nodes,
+                        "deadwood_delta": dw_delta,
+                        "margin": UNPRODUCTIVE_MARGIN,
+                        "armed": UNPRODUCTIVE_MARGIN is not None,
+                    }
+                    # GAS-PAR (ships DISARMED): same-pin gas context beside the
+                    # factorization block. relative_counts carries the ``gas``
+                    # sub-dict (verdict totals/coverage) ONLY when the clause is
+                    # armed (GAS_MARGIN_BPS is not None); disarmed ⇒ no key, so
+                    # the persisted counts stay byte-identical to pre-gas
+                    # rounds. Enriched here with the rule context (margin /
+                    # armed / basis), mirroring the factorization attach.
+                    # NOTHING else threads — gas rides on the per_intent rows
+                    # themselves, unlike factor_delta.
+                    gas_ctx = counts.get("gas")
+                    if isinstance(gas_ctx, dict):
+                        counts["gas"] = {
+                            **gas_ctx,
+                            "gas_margin_bps": GAS_MARGIN_BPS,
+                            "armed": GAS_MARGIN_BPS is not None,
+                            "basis": GAS_BASIS,
+                        }
                     counts["round_id"] = round_id
                     self._sub_store.merge_benchmark_details(
                         competitor.submission_id, {"relative": counts},
@@ -1703,10 +1922,26 @@ class EpochManager:
             image_tag=submission.image_tag,
             hotkey=submission.hotkey,
             adopted_at=adopted_at,
+            # Blind-spot REPEAT bar: what each order paid at the moment this
+            # champion won — snapshotted NOW because the per-round incumbent
+            # re-bench overwrites the submission's stored per_intent.
+            adoption_outputs=blind_spot_bar_from_rows(self._per_intent(submission)),
         )
         if self._sub_store is not None:
             self._sub_store.adopt(submission.submission_id)
         if self._round_store is not None:
+            # Persist the blind-spot REPEAT bar next to the champion snapshot so
+            # a restart restores it (see ChampionInfo.adoption_outputs). Written
+            # on EVERY swap — an empty bar on a rows-less adoption (e.g. revert)
+            # must CLEAR the displaced champion's record, never inherit it.
+            try:
+                self._round_store.set_champion_adoption_bar(
+                    submission_id=submission.submission_id,
+                    outputs=self._champion.adoption_outputs,
+                    activated_at=adopted_at,
+                )
+            except Exception:  # additive persistence — never break the swap
+                logger.warning("blind-spot bar persist failed", exc_info=True)
             # Record the champion we're displacing as the one-step rollback
             # target — but only on a genuine change (not a restore / re-adopt of
             # the same submission), and not when this swap is itself a revert.

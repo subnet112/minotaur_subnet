@@ -14,6 +14,7 @@ import base64
 import io
 import logging
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -532,7 +533,16 @@ async def _verify_digest_retrievable(
     return None
 
 
-async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
+def _safe_image_tag(value: str) -> str:
+    """Sanitize an arbitrary id into a valid Docker/OCI tag component
+    ([A-Za-z0-9_.-], ≤128 chars, not leading with ``.``/``-``)."""
+    t = re.sub(r"[^A-Za-z0-9_.-]", "-", value or "")[:128].lstrip(".-")
+    return t or "unknown"
+
+
+async def _push_candidate_image(
+    image_tag: str, pr_number: int, submission_id: str = "",
+) -> str | None:
     """Retag the locally-built screening image to the candidate repo, push it
     (single-arch — the local build is already single-arch), and return the
     resolved ``<repo>@sha256:<digest>`` manifest ref.
@@ -544,6 +554,18 @@ async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
     local build; only fleet distribution is affected). Only the leader runs this,
     gated by ``leader_pushes_digests()`` at the call site, so it is inert until a
     ``CANDIDATE_IMAGE_REPO`` is configured.
+
+    The image is pushed under TWO tags:
+      * ``pr-<pr_number>`` — human-friendly, but REUSED across every candidate
+        from the same PR (many champions come from one long-lived private PR), so
+        each new push moves this tag off the prior digest.
+      * ``sub-<submission_id>`` — a per-submission tag that is NEVER reused, so
+        every pushed digest keeps at least one tag for the life of the package.
+    The second tag fixes a real outage: GHCR retention DELETES untagged package
+    versions, so once ``pr-<N>`` moved to a newer candidate the prior (possibly
+    still-adopted CHAMPION) digest became untagged and was pruned — its incumbent
+    re-benchmark then failed "image not found", aborting every round. A stable
+    per-submission tag keeps the champion's image retention-safe.
     """
     from minotaur_subnet.harness.image_transport import candidate_repo, is_digest_ref
 
@@ -572,6 +594,24 @@ async def _push_candidate_image(image_tag: str, pr_number: int) -> str | None:
     if rc != 0:
         logger.warning("Candidate push %s failed: %s", ref, msg[:300])
         return None
+
+    # Also push a per-submission tag so this digest is NEVER left untagged (and
+    # thus retention-prunable) when a later candidate from the same PR moves the
+    # ``pr-<N>`` tag off it. Best-effort: a failure here doesn't fail the push
+    # (the pr-<N> tag + returned digest still work short-term), but it re-opens
+    # the retention-GC window, so warn loudly.
+    if submission_id:
+        stable_ref = f"{repo}:sub-{_safe_image_tag(submission_id)}"
+        rc_s, msg_s = await _docker("tag", image_tag, stable_ref, timeout=30)
+        if rc_s == 0:
+            rc_s, msg_s = await _docker("push", stable_ref, timeout=600)
+        if rc_s != 0:
+            logger.warning(
+                "Stable per-submission tag push %s failed (digest is now "
+                "retention-prunable once pr-%s moves): %s",
+                stable_ref, pr_number, msg_s[:200],
+            )
+
     # RepoDigests is populated by the registry after a successful push. An image
     # built FROM a base carries MULTIPLE RepoDigests (the base repo + ours), so we
     # must pick the entry for the repo we just pushed to — NOT index 0, which can
@@ -676,6 +716,23 @@ async def resume_stranded_screenings() -> int:
     return resumed
 
 
+def _rejected_during_screening(store: Any, submission_id: str) -> str | None:
+    """Return the reject reason if this submission was rejected while its
+    screening ran, else None.
+
+    Close-time rotation (apply_rotation_slate) rejects the round's overflow to
+    hold the benched slate at SOLVER_ROUND_MAX_SUBMISSIONS. If it fires while a
+    skipped submission is still screening — or a restart resumes an already
+    -skipped one — the pipeline must NOT re-queue it for benchmark (that
+    overwrites the terminal reject and busts the slate cap). Returns the reason
+    (possibly empty str) so the caller can log it; None means still eligible.
+    """
+    current = store.get(submission_id)
+    if current is not None and current.status == SubmissionStatus.REJECTED:
+        return current.rejection_reason or ""
+    return None
+
+
 async def _run_screening_pipeline(submission_id: str) -> None:
     """Clone repo and run the 3-stage screening pipeline.
 
@@ -707,7 +764,17 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_1)
 
         from minotaur_subnet.harness.screening import run_stage_1
-        s1 = run_stage_1(repo_dir)
+        # Off the event loop: the AST walk (factorization/deadwood metrics)
+        # is ~1s of pure CPU per repo — run on-loop it stalls every in-flight
+        # request for the duration, and submission bursts run several
+        # back-to-back.
+        s1 = await asyncio.to_thread(run_stage_1, repo_dir)
+        # Factorization metric: persist BEFORE the pass-check so a rejected
+        # submission (incl. an armed-floor `too_entangled`) still records the
+        # value it was rejected at — miners see the number they must get under.
+        # Runs for BOTH the public and private clone paths (single confluence).
+        if s1.max_region_nodes is not None:
+            store.set_max_region_nodes(submission_id, s1.max_region_nodes)
         store.set_screening_result(
             submission_id, stage=1,
             passed=s1.passed,
@@ -715,6 +782,18 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             details=s1.details,
             error_code=s1.error_code,
         )
+        # Phase-0 deadwood metric (observe-only, not gated). Persisted BEFORE
+        # the pass-check so any stage-1 result that carried a measurement is
+        # recorded even when the submission is rejected. unproductive_nodes may
+        # be None (unparseable non-exempt file) — persisted as None on purpose.
+        if s1.unproductive_metric_version is not None:
+            store.set_deadwood_metric(
+                submission_id,
+                s1.unproductive_nodes,
+                s1.unproductive_metric_version,
+                s1.unproductive_top_offenders,
+            )
+
         if not s1.passed:
             return  # set_screening_result already rejected
 
@@ -753,7 +832,9 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # local build above is what the leader benchmarks; this just distributes it.
         from minotaur_subnet.harness.image_transport import leader_pushes_digests
         if leader_pushes_digests() and sub.pr_number:
-            digest_ref = await _push_candidate_image(image_tag, sub.pr_number)
+            digest_ref = await _push_candidate_image(
+                image_tag, sub.pr_number, submission_id,
+            )
             if digest_ref:
                 store.set_image_digest(submission_id, digest_ref)
                 logger.info("Candidate image pushed for %s: %s", submission_id, digest_ref)
@@ -836,6 +917,21 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s3.passed:
             return
 
+        # All screening passed -- move to benchmarking queue. But re-read the
+        # status first: close-time rotation (apply_rotation_slate) can REJECT
+        # this submission while its screening was still in flight (and a restart
+        # can resume an already-skipped one). Without this guard the async
+        # pipeline overwrites that terminal reject back to BENCHMARKING, so the
+        # round benches MORE than its SOLVER_ROUND_MAX_SUBMISSIONS slate — the
+        # leak that showed 9-11 "scored" in a 3-slot round on restart-heavy days.
+        rejected = _rejected_during_screening(store, submission_id)
+        if rejected is not None:
+            logger.info(
+                "Submission %s passed screening but was already rejected "
+                "(%s) — not queuing for benchmark (rotation slate full)",
+                submission_id, rejected or "rejected",
+            )
+            return
         # All screening passed -- move to benchmarking queue
         store.update_status(submission_id, SubmissionStatus.BENCHMARKING)
         logger.info(
