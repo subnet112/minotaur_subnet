@@ -128,6 +128,19 @@ class StatusResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
+    # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
+    # any single named region (module / function / class body) in the submission's
+    # in-tree Python — a golf-immune proxy for worst entanglement. Measured and
+    # surfaced, NOT gated yet. Present once screening stage 1 completes; None while
+    # queued. See harness/screening.max_region_nodes.
+    max_region_nodes: int | None = None
+    # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
+    # that provably does no work at runtime (unreachable files + dead bindings
+    # in reachable files + exempt-tree overflow). Measured and surfaced, NOT
+    # gated. Present once screening stage 1 completes; None while queued or
+    # when a non-exempt file was unparseable. The top-offender deletion list is
+    # in report.deadwood. See harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
     # benchmark_score (the retired scalar composite) was removed; benchmark_rank is
     # the DISPLAY rank derived from relative net-better vs the champion.
     benchmark_rank: int | None = None

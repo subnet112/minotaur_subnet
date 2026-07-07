@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -92,6 +93,29 @@ logger = logging.getLogger(__name__)
 # event loop otherwise stays healthy. Bounding the wait guarantees the lock
 # is always released; the worst case is a lingering zombie, not an outage.
 _KILL_REAP_TIMEOUT = 5.0
+
+
+async def _docker_rm_f(name: str) -> None:
+    """Best-effort ``docker rm -f <name>`` that also REAPS its own subprocess.
+
+    SIGKILL of a ``docker run`` CLI does NOT stop the container it is attached
+    to, so ``proc.wait()`` on the CLI can hang and the CLI process (each ~6 Go
+    runtime threads) leaks. Removing the *container* releases the CLI so it
+    exits and can be reaped — turning the "lingering zombie" the comment above
+    tolerates into an actual reap. Bounded + swallow-all so it can never block
+    or raise on the cleanup path. No-op without a name.
+    """
+    if not name:
+        return
+    try:
+        rm = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(rm.wait(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001 — cleanup path, never propagate
+        pass
 
 # Trailing stderr lines kept per session for crash diagnostics (surfaced in the
 # SolverCrashedError when a solver dies / hangs). Bounded so a chatty solver
@@ -229,6 +253,13 @@ class BenchmarkResult:
     # consumes; NEVER feeds the aggregate `score`. (Formerly ``shadow_score`` — the
     # observe-only shadow scorer it was named after is gone.)
     raw_output: str | None = None
+    # PRE-REFUND metered scoreIntent gas from the benchmark-only GasMeter probe
+    # (anvil_simulator.GAS_METER_RUNTIME_HEX; basis "scoreintent_prerefund_v1").
+    # Set ONLY for a real (non-mock), successful simulation whose probe
+    # produced a positive value; None everywhere else (mock rows, reverted
+    # sims, probe failures). MEASUREMENT ONLY — never feeds ``score`` or any
+    # verdict; the gas clause is a separate, stacked change.
+    gas_metered: int | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
@@ -271,9 +302,14 @@ class SolverSession:
         label: str = "solver",
         *,
         live_mode: bool = False,
+        container_name: str = "",
     ) -> None:
         self._proc = proc
         self._label = label
+        # Name of the docker container backing this session (Docker mode only).
+        # Lets kill() force-remove it so a hung `docker run` CLI reaps instead
+        # of leaking its threads. Empty for subprocess mode.
+        self._container_name = container_name
         self._start_time = time.monotonic()
         self._closed = False
         # live_mode=True disables the total elapsed-time cap. Per-command
@@ -555,11 +591,29 @@ class SolverSession:
         except ProcessLookupError:
             pass
         except asyncio.TimeoutError:
-            logger.warning(
-                "[%s] proc.wait() did not return %ss after SIGKILL; "
-                "abandoning reap (zombie may linger, but the lock is freed)",
-                self._label, _KILL_REAP_TIMEOUT,
-            )
+            # SIGKILL of the `docker run` CLI doesn't stop the attached
+            # container, so proc.wait() hangs and the CLI (+ its threads) leaks
+            # — thousands accumulate over days and starve the api. Force-remove
+            # the container to release the CLI, then retry the (now-unblocked)
+            # reap. Only lingers if docker itself is wedged.
+            if self._container_name:
+                await _docker_rm_f(self._container_name)
+                try:
+                    await asyncio.wait_for(
+                        self._proc.wait(), timeout=_KILL_REAP_TIMEOUT,
+                    )
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    logger.warning(
+                        "[%s] proc.wait() still hung after docker rm -f %s; "
+                        "abandoning reap",
+                        self._label, self._container_name,
+                    )
+            else:
+                logger.warning(
+                    "[%s] proc.wait() did not return %ss after SIGKILL; "
+                    "abandoning reap (zombie may linger, but the lock is freed)",
+                    self._label, _KILL_REAP_TIMEOUT,
+                )
         logger.info("[%s] Process terminated", self._label)
 
     @property
@@ -735,7 +789,11 @@ class SolverOrchestrator:
             except (asyncio.TimeoutError, FileNotFoundError) as exc:
                 logger.warning("Pre-pull of %s errored: %s — attempting run anyway", image, exc)
 
-        cmd = ["docker", "run", "--rm", "-i"]
+        # Name the container so a hung `docker run` CLI can be force-reaped by
+        # kill() (docker rm -f) instead of leaking. Unique per session so
+        # concurrent benchmark solvers never collide on the name.
+        container_name = f"minotaur-bench-{uuid.uuid4().hex[:12]}"
+        cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
         if labels:
             for k, v in labels.items():
                 cmd.extend(["--label", f"{k}={v}"])
@@ -825,6 +883,9 @@ class SolverOrchestrator:
         logger.info("Starting Docker solver: %s", " ".join(cmd))
 
         async def _relaunch() -> asyncio.subprocess.Process:
+            # Clear any container left over from a prior launch (name reuse on
+            # restart) so `docker run --name` can't 409 on a leftover.
+            await _docker_rm_f(container_name)
             return await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -834,7 +895,9 @@ class SolverOrchestrator:
 
         proc = await _relaunch()
         label = f"docker:{image.split(':')[0][-12:]}"
-        session = SolverSession(proc, label=label, live_mode=live)
+        session = SolverSession(
+            proc, label=label, live_mode=live, container_name=container_name,
+        )
         session._relaunch = _relaunch
         return session
 
@@ -1589,8 +1652,30 @@ async def _process_scenario(
                                 plan.metadata["chain_id"] = state.chain_id
                         # Build intent_order so the simulator uses the full
                         # scoreIntent contract path instead of the bare path.
+                        # The pinned fork block's timestamp anchors the order
+                        # deadline (deterministic across validators); resolved
+                        # via the simulator's fork-anchor/header cache. A None
+                        # resolution falls back to wall clock (legacy).
+                        fork_ts: int | None = None
+                        if simulator is not None and state is not None:
+                            try:
+                                ts_fn = getattr(
+                                    simulator, "get_block_timestamp", None,
+                                )
+                                if ts_fn is not None and fork_block is not None:
+                                    fork_ts = ts_fn(state.chain_id, fork_block)
+                            except Exception as ts_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[benchmark] fork timestamp resolve failed "
+                                    "(chain=%s block=%s): %s — order deadline "
+                                    "falls back to wall clock",
+                                    getattr(state, "chain_id", "?"),
+                                    fork_block, ts_exc,
+                                )
                         intent_order = _build_benchmark_intent_order(
                             state, plan, getattr(intent, "manifest", None),
+                            fork_block=fork_block,
+                            fork_timestamp=fork_ts,
                         ) if state and state.contract_address else None
                         sim = await simulator.simulate(
                             plan,
@@ -1598,6 +1683,13 @@ async def _process_scenario(
                             intent_order=intent_order,
                             token_balances=token_balances,
                             fork_block=fork_block,
+                            # BENCHMARK-ONLY: run the GasMeter probe so rows
+                            # carry pre-refund metered gas. This is THE only
+                            # call site that sets it — the live rail (order
+                            # processing / fee certification) never does, so
+                            # its direct-send path and receipt gas_used stay
+                            # byte-identical.
+                            meter_gas=True,
                         )
                         print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
                         if require_real_sim and not sim.success:
@@ -1644,6 +1736,18 @@ async def _process_scenario(
                     br.mock_simulation = used_mock
                     # Capture the unfakeable on-chain scoreIntent BPS.
                     br.on_chain_score = getattr(sim, "on_chain_score", None)
+                    # PRE-REFUND metered gas (GasMeter probe). WRITE gate:
+                    # real sim + success + positive value only — mock rows
+                    # and failed probes stay None; reverted sims never reach
+                    # here (fail_closed_miss). Display/soak only.
+                    try:
+                        _gm = int(getattr(sim, "gas_metered", None) or 0)
+                    except (TypeError, ValueError):
+                        _gm = 0
+                    br.gas_metered = (
+                        _gm if (not used_mock and sim.success and _gm > 0)
+                        else None
+                    )
                     score_result = await score_fn(
                         intent.app_id, plan, sim, state,
                     )
@@ -1874,10 +1978,53 @@ class _ManifestShim:
         return self._m
 
 
+# Synthetic benchmark orders live exactly one hour past their anchor —
+# the legacy wall-clock window, now measured from the pinned fork block's
+# timestamp so every validator builds the byte-identical order.
+_BENCHMARK_ORDER_DEADLINE_SECS = 3600
+
+
+def _benchmark_order_id(
+    contract_address: str,
+    chain_id: Any,
+    scenario_name: str,
+    fn_name: str,
+    fork_block: int | None,
+) -> str:
+    """Deterministic synthetic order id for a benchmark scenario.
+
+    Replaces the legacy ``uuid4`` id (per-validator random — a cross-host
+    calldata asymmetry, since order_id is keccak'd into the scoreIntent
+    calldata's bytes32 id). Derived ONLY from round-stable scenario identity:
+    the app contract, chain, scenario name (``hist:<order_id>`` for
+    historical replays — unique per order), intent function, and the round's
+    fork pin. Identical across validators for the same round inputs AND
+    identical for the champion/challenger sims of the same scenario (the
+    per-sim fork reset makes CREATE2 proxy reuse a non-issue). Unique across
+    orders within a run for the same reason (app_id:scenario_name) is already
+    the run-wide join key (intent_id / reference_quotes).
+
+    Format matches the legacy id: ``bench_`` + 16 hex chars.
+    """
+    import hashlib
+
+    seed = "|".join((
+        str(contract_address).lower(),
+        str(chain_id),
+        str(scenario_name),
+        str(fn_name),
+        str(fork_block),
+    ))
+    return "bench_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_benchmark_intent_order(
     state: IntentState,
     plan: ExecutionPlan,
     manifest: dict[str, Any] | None = None,
+    *,
+    fork_block: int | None = None,
+    fork_timestamp: int | None = None,
 ) -> dict[str, Any] | None:
     """Build an intent_order dict for benchmark simulation.
 
@@ -1887,6 +2034,12 @@ def _build_benchmark_intent_order(
     meaningful token transfers.
 
     Mirrors the intent_order construction in order_processor.py (line ~284).
+
+    Determinism (cross-validator, per fork pin): ``fork_block`` feeds the
+    deterministic ``order_id`` and ``fork_timestamp`` (the pinned fork
+    block's timestamp) anchors the order ``deadline`` — wall clock is only a
+    fallback when no fork anchor resolved (mock/unit paths), preserving the
+    legacy behavior there.
     """
     contract_address = state.contract_address
     if not contract_address:
@@ -1936,17 +2089,32 @@ def _build_benchmark_intent_order(
     sig = _KNOWN_SIGS.get(fn_name, f"{fn_name}()")
     selector = _keccak(sig.encode())[:4].hex()
 
-    # Unique order_id per scenario to avoid CREATE2 proxy collision.
-    import uuid
+    # Deterministic order_id — unique per scenario within a run (the CREATE2
+    # proxy concern), and IDENTICAL across validators / champion-vs-challenger
+    # for the same round inputs (see _benchmark_order_id).
+    order_id = _benchmark_order_id(
+        contract_address,
+        state.chain_id,
+        control.get("_scenario_name", ""),
+        fn_name,
+        fork_block,
+    )
+
+    # Deadline anchored to the pinned fork block's timestamp (deterministic
+    # across validators); wall clock only when no fork anchor resolved.
+    if fork_timestamp is not None:
+        deadline = int(fork_timestamp) + _BENCHMARK_ORDER_DEADLINE_SECS
+    else:
+        deadline = int(time.time()) + _BENCHMARK_ORDER_DEADLINE_SECS
 
     return {
-        "order_id": f"bench_{uuid.uuid4().hex[:16]}",
+        "order_id": order_id,
         "app": contract_address,
         "intent_selector": selector,
         "intent_params": intent_params_hex,
         "submitted_by": submitted_by,
         "chain_id": state.chain_id,
-        "deadline": int(time.time()) + 3600,
+        "deadline": deadline,
         "nonce": 0,
         "perpetual": False,
         "max_executions": 1,

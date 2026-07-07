@@ -408,13 +408,35 @@ def deploy_app_intent(
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(_run_in_new_loop).result(timeout=300)
         except concurrent.futures.TimeoutError:
+            # The executor's __exit__ has already joined the worker thread by
+            # the time we get here, so the deploy is truly over and nothing
+            # will save a result. Roll the record back to DRAFT — leaving it
+            # DEPLOYING wedges the app: the already-deployed guard above
+            # refuses redeploys and retire_deployment refuses mid-deploy
+            # (seen live 2026-07-07 after a relayer-side deploy failure).
+            store.save_deployment(DeploymentResult(
+                app_id=app_id,
+                status=AppStatus.DRAFT,
+                js_code_hash=js_hash,
+                chain_id=chain_id,
+                error="Deploy timed out (compilation may be slow)",
+            ))
             return {
                 "app_id": app_id,
-                "status": "deploying",
+                "status": "draft",
                 "error": "Deploy timed out (compilation may be slow)",
                 "chain_id": chain_id,
             }
         except Exception as exc:
+            # Same rollback as the timeout path: a failed deploy must not
+            # leave a permanent DEPLOYING record.
+            store.save_deployment(DeploymentResult(
+                app_id=app_id,
+                status=AppStatus.DRAFT,
+                js_code_hash=js_hash,
+                chain_id=chain_id,
+                error=f"Deploy failed: {exc}",
+            ))
             return {
                 "app_id": app_id,
                 "status": "draft",

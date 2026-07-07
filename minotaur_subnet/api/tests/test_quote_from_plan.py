@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 
 from minotaur_subnet.api.server import app
 from minotaur_subnet.api.routes import orders as orders_module
+from minotaur_subnet.harness import orchestrator as orchestrator_module
 from minotaur_subnet.shared.types import (
     ExecutionPlan,
     Interaction,
@@ -79,12 +80,25 @@ class _FakeSolver:
 
 
 class _FakeSimRunner:
-    """Returns a SimulationResult whose token_transfers deliver the output."""
+    """Returns a SimulationResult whose token_transfers deliver the output.
 
-    def __init__(self) -> None:
+    Spies on every simulate() call so tests can assert the handler now runs the
+    benchmark's scoreIntent path (non-None ``intent_order``). An optional
+    ``result`` override lets a test inject a sim carrying ``metadata.raw_output``.
+    """
+
+    def __init__(self, result: SimulationResult | None = None) -> None:
         self.simulator = object()  # truthy → _has_sim is True
+        self.calls: list[SimpleNamespace] = []
+        self._result = result
 
     async def simulate(self, plan, order, contract_address, intent_order, is_cross_chain, deployed):
+        self.calls.append(SimpleNamespace(
+            plan=plan, order=order, contract_address=contract_address,
+            intent_order=intent_order, is_cross_chain=is_cross_chain, deployed=deployed,
+        ))
+        if self._result is not None:
+            return self._result
         return SimulationResult(
             success=True,
             gas_used=180000,
@@ -124,11 +138,16 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = "0"
         orders_module.set_js_engine(None)
         orders_module._QUOTE_PLAN_CACHE.clear()
+        # Preserve the real benchmark intent-order builder — some tests patch it
+        # to return a sentinel (the handler lazy-imports it from orchestrator, so
+        # patching the module attribute is what the import resolves at call time).
+        self._real_build_intent_order = orchestrator_module._build_benchmark_intent_order
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def tearDown(self):
         orders_module.set_block_loop(None)
         orders_module.set_app_store(None)
+        orchestrator_module._build_benchmark_intent_order = self._real_build_intent_order
         orders_module._QUOTE_PLAN_CACHE.clear()
         if self._prev_rl is None:
             os.environ.pop("QUOTE_RATE_LIMIT_PER_MINUTE", None)
@@ -185,6 +204,129 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(data["estimated_output"], _DELIVERED)
         # The quote attempt is recorded as a success (non-zero output).
         self.assertTrue(store.attempts and store.attempts[-1][1] is True)
+
+    def test_passes_scoreintent_intent_order_to_sim(self):
+        """The handler must run the benchmark's scoreIntent path — i.e. pass a
+        NON-None intent_order (4th positional arg) to _sim_runner.simulate, not
+        the bare-interaction path (None) which delivers 0 for exotic tokens."""
+        # Sentinel intent_order so we don't need a real manifest/encoder here.
+        _sentinel = {
+            "order_id": "bench_test",
+            "app": _DEPLOYED,
+            "submitted_by": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        }
+        _captured: dict = {}
+
+        def _fake_builder(state, plan, manifest=None):
+            # The handler must pin the encoded receiver to the funded submitted_by.
+            _captured["receiver"] = state.raw_params_view().get("receiver")
+            return _sentinel
+
+        orchestrator_module._build_benchmark_intent_order = _fake_builder
+
+        runner = _FakeSimRunner()
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        resp = self._post_quote()
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # scoreIntent path: exactly one simulate() call with a non-None intent_order.
+        self.assertEqual(len(runner.calls), 1)
+        self.assertIsNotNone(runner.calls[0].intent_order)
+        self.assertEqual(runner.calls[0].intent_order, _sentinel)
+        # Revert-avoidance: the order's submitted_by == the intent_order's source
+        # == the receiver the encoder was handed (the pre-funded Anvil default).
+        self.assertEqual(
+            runner.calls[0].order.submitted_by,
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        )
+        self.assertEqual(
+            _captured["receiver"], "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        )
+
+    def test_estimated_output_from_scoreintent_raw_output_metadata(self):
+        """estimated_output must read the scoreIntent gained value the live scorer
+        emits on ``sim.metadata['raw_output']`` (now populated by the scoreIntent
+        path) — not just the token-transfer fallback."""
+        _raw = "99999999999999999999999999"  # exact-wei scoreIntent output
+        sim = SimulationResult(success=True, gas_used=180000)
+        sim.metadata = {"raw_output": _raw}  # what the live raw-output scorer emits
+
+        orchestrator_module._build_benchmark_intent_order = (
+            lambda state, plan, manifest=None: {"submitted_by": "0xabc"}
+        )
+
+        runner = _FakeSimRunner(result=sim)
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        resp = self._post_quote()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["estimated_output_gross"], _raw)
+        self.assertEqual(data["estimated_output"], _raw)
+
+
+# ── Integration: the REAL _build_benchmark_intent_order address invariant ──────
+# The handler-level tests above stub the builder, so they prove get_quote pins
+# raw_params["receiver"] == order.submitted_by == _bench_receiver. These two
+# exercise the REAL builder (only the ABI byte-encoder is stubbed — it needs a
+# real manifest) to prove the OTHER half: intent_order["submitted_by"] resolves
+# to that same receiver. Together they close the revert-avoidance invariant —
+# SimulationRunner funds order.submitted_by, scoreIntent pulls from
+# intent_order["submitted_by"]; if they differ the pull reverts → 0.
+
+def test_real_builder_pins_submitted_by_to_receiver(monkeypatch):
+    from minotaur_subnet.api.services import app_service
+    from minotaur_subnet.shared.types import IntentState
+    monkeypatch.setattr(
+        app_service, "build_intent_params_hex_from_manifest",
+        lambda *a, **k: "deadbeef",  # bypass real ABI encoding (needs a manifest)
+    )
+    receiver = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    state = IntentState(
+        contract_address=_DEPLOYED, chain_id=_CHAIN, nonce=0, owner=receiver,
+        raw_params={"receiver": receiver, "token_in": _USDC, "token_out": _DONALDPUMP},
+        control={"_intent_function": "swap"},
+    )
+    plan = ExecutionPlan(
+        intent_id="app:swap", interactions=[], deadline=0, nonce=0, metadata={},
+    )
+    io = orchestrator_module._build_benchmark_intent_order(
+        state, plan, manifest={"functions": {}},
+    )
+    assert io is not None, "real builder should build an intent_order given a manifest"
+    assert io["submitted_by"] == receiver
+
+
+def test_real_builder_maps_sentinel_receiver_to_anvil_default(monkeypatch):
+    # address(1) is the scenarios' dummy receiver; the builder (and get_quote's
+    # _bench_receiver) both map it to the pre-funded Anvil default, so they agree.
+    from minotaur_subnet.api.services import app_service
+    from minotaur_subnet.shared.types import IntentState
+    monkeypatch.setattr(
+        app_service, "build_intent_params_hex_from_manifest",
+        lambda *a, **k: "deadbeef",
+    )
+    anvil = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    state = IntentState(
+        contract_address=_DEPLOYED, chain_id=_CHAIN, nonce=0, owner=anvil,
+        raw_params={"receiver": "0x0000000000000000000000000000000000000001"},
+        control={"_intent_function": "swap"},
+    )
+    plan = ExecutionPlan(
+        intent_id="app:swap", interactions=[], deadline=0, nonce=0, metadata={},
+    )
+    io = orchestrator_module._build_benchmark_intent_order(
+        state, plan, manifest={"functions": {}},
+    )
+    assert io is not None
+    assert io["submitted_by"] == anvil
 
 
 if __name__ == "__main__":
