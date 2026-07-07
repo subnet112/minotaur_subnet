@@ -692,6 +692,38 @@ class AppIntentStore:
             for r in rows
         }
 
+    def reconcile_stale_deploying(self) -> list[tuple[str, int]]:
+        """Roll persisted DEPLOYING records back to DRAFT; return those flipped.
+
+        Deploys run synchronously inside the API process, so a DEPLOYING
+        record found at process boot is always stale — the deploy died with
+        the previous process (or its failure path predates the rollback in
+        deploy_app_intent). Left in place it wedges the app: the
+        already-deployed guard refuses redeploys and retire_deployment
+        refuses mid-deploy. Call this ONLY from the deploy-owning process's
+        startup, never from a second process that could race a live deploy.
+        """
+        flipped: list[tuple[str, int]] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT app_id, chain_id, data FROM deployments"
+            ).fetchall()
+            for r in rows:
+                dep = _deployment_from_dict(json.loads(r["data"]))
+                if dep.status != AppStatus.DEPLOYING:
+                    continue
+                dep.status = AppStatus.DRAFT
+                dep.error = dep.error or (
+                    "stale mid-deploy record found at boot "
+                    "(process restarted during deploy)"
+                )
+                conn.execute(
+                    "UPDATE deployments SET data=? WHERE app_id=? AND chain_id=?",
+                    (_dumps(dep), r["app_id"], r["chain_id"]),
+                )
+                flipped.append((r["app_id"], int(r["chain_id"])))
+        return flipped
+
     # ── orders (OrderBook persistence) ──────────────────────────────────
 
     def save_order(self, order_dict: dict[str, Any]) -> None:
