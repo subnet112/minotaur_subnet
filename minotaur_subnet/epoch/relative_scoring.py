@@ -97,14 +97,21 @@ DETHRONE_WIN_MARGIN = 1
 # CONSENSUS-CRITICAL CODE constant (same discipline as FLOOR_BPS above — never
 # env-read) and the Phase-2 ARMING SWITCH, mirroring MAX_REGION_NODES in
 # screening: while None the tie-break clause CANNOT fire, no matter what
-# factor_delta callers pass. This must be the explicit switch — None-safety of
-# factor_delta_between alone is NOT one: natural champion turnover (a
-# performance win by a post-Phase-0, metric-carrying challenger) would
-# otherwise put measured records on BOTH sides and silently activate an
-# uncalibrated margin with no backfill ever run. Set the calibrated int (from
-# the Phase-0 soak) in the same fleet-wide promotion that precedes the champion
-# backfill — never via a leader-only deploy.
-FACTOR_MARGIN: int | None = None  # None ⇒ tie-break disarmed; Phase 2 arms an int
+# factor_delta callers pass. The explicit switch matters — None-safety of
+# factor_delta_between alone is NOT one: natural champion turnover puts
+# measured records on BOTH sides (observed live 2026-07-06: the standing
+# champion carried a measured value with no backfill ever run).
+#
+# CALIBRATED = 100 from the 2026-07-03..07 Phase-0 soak (leader, ~2900
+# measured submissions): champion-fork tweak noise moved the worst region by
+# +21/+54 nodes (margin must clear ~2x that), while the one GENUINE
+# incremental refactor step observed in the wild was 122 nodes (1334 -> 1212;
+# a 200 margin would have blocked a real improvement from winning a tie).
+# 100 sits between. MERGING THIS ARMS THE TIE-BREAK — land it only in a
+# develop->main promotion window (leader + followers together; a leader-only
+# deploy splits a factor-tie vote at quorum > 1), followed by the champion
+# reattest so follower stores carry the champion's metric. None disarms.
+FACTOR_MARGIN: int | None = 100  # ARMED, soak-calibrated; None ⇒ disarmed
 
 # Basis-points denominator for the cross-multiplied comparison.
 _BPS = 10000

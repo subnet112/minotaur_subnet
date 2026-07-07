@@ -192,6 +192,15 @@ def test_dynamic_code_calls_ignores_attribute_calls_and_compile(tmp_path):
     assert dynamic_code_calls(str(tmp_path)) == []
 
 
+def test_floor_cap_pinned_to_stage_a_backstop():
+    # Stage-A backstop from the 2026-07-03..07 soak: champion-fork monoculture
+    # at 4109 (== canonical main) with tweak outliers to 4163 — the cap blocks
+    # only NEW bloat. Stage B ratchets to ~2000-2500 under FLOOR_VERSION=2
+    # after the factor tie-break flips the throne and the fleet re-forks.
+    assert _screening.MAX_REGION_NODES == 4200
+    assert _screening.FLOOR_VERSION == 1
+
+
 def test_floor_unarmed_observes_only(tmp_path, monkeypatch):
     # MAX_REGION_NODES=None (Phase 0): even a huge region passes.
     monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)

@@ -83,16 +83,26 @@ BINARY_EXTENSIONS = {
 #
 # The integer is ALWAYS computed and persisted (soak + Phase-2 tie-break input).
 # `MAX_REGION_NODES` is the Phase-1 ARMING SWITCH: while None, stage 1 only
-# observes; set to an int cap (calibrated from the Phase-0 soak distribution)
-# and stage 1 REJECTS `too_entangled` above it — and also rejects `dynamic_code`
-# (bare exec()/eval() calls, which would let a solver hide entangled logic in
-# strings the AST can't see). A CODE constant, never env-read (the FLOOR_BPS
-# discipline) — the floor must not depend on a host's environment. Only NEW
-# submissions gate; the standing champion is never re-screened. `FLOOR_VERSION`
-# stamps the metric semantics so a champion clean under vN is never
-# retro-evicted by vN+1.
+# observes; with an int cap, stage 1 REJECTS `too_entangled` above it — and also
+# rejects `dynamic_code` (bare exec()/eval() calls, which would let a solver
+# hide entangled logic in strings the AST can't see). A CODE constant, never
+# env-read (the FLOOR_BPS discipline). Only NEW submissions gate; the standing
+# champion is never re-screened. `FLOOR_VERSION` stamps the metric semantics so
+# a champion clean under vN is never retro-evicted by vN+1.
+#
+# CALIBRATED = 4200 (STAGE-A BACKSTOP) from the 2026-07-03..07 soak: the live
+# distribution is a champion-fork monoculture at 4109 (== canonical main,
+# verified: 4109 nodes, zero bare exec/eval) with tweak outliers at 4130/4163
+# and one genuinely refactored solver at 1212. A tight cap (~2000) as the FIRST
+# arming would reject essentially every live submission and empty the
+# challenger pipeline — so Stage A only blocks NEW bloat above today's worst
+# (4163 passes, the champion tree keeps 91 nodes of headroom), while the
+# FACTOR_MARGIN tie-break flips the throne to the cleaner tree. Once the
+# monoculture re-forks that champion (it demonstrably forks whatever holds the
+# throne), Stage B ratchets this to ~2000–2500 under FLOOR_VERSION = 2 —
+# painlessly, because the fleet is already under it.
 FLOOR_VERSION = 1
-MAX_REGION_NODES: int | None = None  # None ⇒ observe-only; Phase 1 arms an int cap
+MAX_REGION_NODES: int | None = 4200  # ARMED Stage-A backstop; None ⇒ observe-only
 
 # Bare builtin calls that defeat static analysis: code built in strings is
 # invisible to max_region_nodes, so once the floor is armed these are rejected
