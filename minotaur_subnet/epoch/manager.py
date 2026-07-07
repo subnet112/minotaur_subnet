@@ -1117,10 +1117,14 @@ class EpochManager:
         Reuses the per-order rows already computed this round; needs no extra bench.
 
         DETERMINISM: an adoptable candidate always outranks a non-adoptable one, then
-        higher net-better wins, then a content-addressed (image_id, submission_id)
-        tie-break — so a failed-over leader on the same store nominates the SAME
-        finalist (the previous stable-sort break was the LOCAL-clock created_at, which
-        could diverge). champ_rows are the champion's STORED per-order rows (from its
+        higher net-better wins, then the CLEANEST candidate (ascending PERSISTED
+        ``max_region_nodes`` — the Phase-2 factorization tie-break; unmeasured
+        records rank last on that key and can never win a tie on it), then the
+        content-addressed (image_id, submission_id) final fallback — so a
+        failed-over leader on the same store nominates the SAME finalist (the
+        metric is persisted at screening and mirrored with the record, never
+        recomputed here; the previous stable-sort break was the LOCAL-clock
+        created_at, which could diverge). champ_rows are the champion's STORED per-order rows (from its
         last bench), which is enough for a deterministic RANK — the incumbent is only
         re-benched (for the actual adoption verdict) AFTER a finalist is picked, so an
         idle round with no candidate never pays for a re-bench.
@@ -1148,17 +1152,26 @@ class EpochManager:
                 reason,
             )
 
-        def _rank_key(s: Submission) -> tuple[int, int, str, str]:
+        # Ties on (adoptable, net) rank the CLEANEST candidate first (Phase-2
+        # factorization tie-break). None (record predates the metric / not yet
+        # screened under it) sorts BELOW every measured value via this sentinel,
+        # so an unmeasured candidate can never win a tie on cleanliness.
+        _FACTOR_UNMEASURED = 2**31
+
+        def _rank_key(s: Submission) -> tuple[int, int, int, str, str]:
             # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
             # candidate above one with a genuine win (disarmed: no-op).
             v = evaluate_relative_adoption(
                 champ_rows, self._per_intent(s), **self._blind_spot_bar_kwargs(),
             )
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
+            nodes = getattr(s, "max_region_nodes", None)
             return (
                 0 if v["adopt"] else 1,   # adoptable candidates first
                 -net,                     # then most net-better vs champion
-                str(s.image_id or ""),    # content-addressed, host-independent tie-break
+                # then best-factored (smallest persisted max region; measured-only)
+                nodes if isinstance(nodes, int) else _FACTOR_UNMEASURED,
+                str(s.image_id or ""),    # content-addressed, host-independent fallback
                 str(s.submission_id or ""),
             )
 
@@ -1356,7 +1369,9 @@ class EpochManager:
             return
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1366,11 +1381,27 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
-            # Same blind-spot bar kwargs as the live decision
-            # (_evaluate_per_order_adoption) so this published would-be vote
-            # keeps matching the real verdict.
+            # Phase-2 factorization tie-break input — PERSISTED metrics only
+            # (None on either side ⇒ 0 ⇒ clause inert), IDENTICAL to the live
+            # decision (_evaluate_per_order_adoption) so this published would-be
+            # vote keeps matching the real verdict. deadwood_delta: same
+            # pattern for the 4th key, with the metric-version guard living in
+            # the ONE shared helper (deadwood_delta_between: 0 unless both
+            # sides carry SAME-VERSION unproductive metrics — fields ship on
+            # the #575 lineage, getattr keeps this inert until then).
             verdict = evaluate_relative_adoption(
-                champ_rows, chal_rows, **self._blind_spot_bar_kwargs(),
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
+                ),
+                **self._blind_spot_bar_kwargs(),
             )
             adopt = bool(verdict["adopt"])
             vote = {
@@ -1386,6 +1417,9 @@ class EpochManager:
                     "n_blind_spot_repeats_observed", 0,
                 ),
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
             }
             logger.info(
@@ -1559,7 +1593,9 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                deadwood_delta_between,
                 evaluate_relative_adoption,
+                factor_delta_between,
             )
 
             incumbent_sub = (
@@ -1569,8 +1605,33 @@ class EpochManager:
             )
             champ_rows = self._per_intent(incumbent_sub)
             chal_rows = self._per_intent(challenger)
+            # Phase-2 factorization tie-break: on a true all-matched tie a
+            # materially better-factored challenger dethrones. Inputs are the
+            # PERSISTED screening metrics (None on either side ⇒ delta 0 ⇒
+            # clause inert — the backfill of the standing champion's value is
+            # the deliberate fleet-wide activation lever). Never recomputed at
+            # decision time. IDENTICAL threading to the follower's
+            # _independent_adopt_vote, so leader and fleet keep deciding alike.
+            # deadwood_delta: the 4th ladder key, threaded the same way; the
+            # metric-version guard lives in the ONE shared helper
+            # (deadwood_delta_between: 0 unless BOTH records carry
+            # SAME-VERSION unproductive metrics — cross-version node counts
+            # are not comparable). The fields ship on the #575 lineage;
+            # getattr keeps this inert until the lineages merge and records
+            # carry values (activation-by-data, exactly like factor).
             verdict = evaluate_relative_adoption(
-                champ_rows, chal_rows, **self._blind_spot_bar_kwargs(),
+                champ_rows, chal_rows,
+                factor_delta=factor_delta_between(
+                    getattr(incumbent_sub, "max_region_nodes", None),
+                    getattr(challenger, "max_region_nodes", None),
+                ),
+                deadwood_delta=deadwood_delta_between(
+                    getattr(incumbent_sub, "unproductive_nodes", None),
+                    getattr(challenger, "unproductive_nodes", None),
+                    getattr(incumbent_sub, "unproductive_metric_version", None),
+                    getattr(challenger, "unproductive_metric_version", None),
+                ),
+                **self._blind_spot_bar_kwargs(),
             )
 
             logger.info(
@@ -1603,6 +1664,9 @@ class EpochManager:
                 "n_blind_spots": verdict["n_blind_spots"],
                 "n_matched": verdict["n_matched"],
                 "scenarios_compared": verdict["scenarios_compared"],
+                "factor_delta": verdict["factor_delta"],
+                "deadwood_delta": verdict["deadwood_delta"],
+                "adopt_via": verdict["adopt_via"],
                 "reason": verdict["reason"],
                 "per_order": verdict["per_order"],
             }
@@ -1636,15 +1700,28 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
+                FACTOR_MARGIN,
+                GAS_BASIS,
+                GAS_MARGIN_BPS,
+                UNPRODUCTIVE_MARGIN,
+                deadwood_delta_between,
+                factor_delta_between,
                 has_raw_output_rows,
                 relative_counts,
             )
 
             if self._sub_store is None or not self._champion.submission_id:
                 return
-            champ_rows = self._per_intent(self._sub_store.get(self._champion.submission_id))
+            champ_sub = self._sub_store.get(self._champion.submission_id)
+            champ_rows = self._per_intent(champ_sub)
             if not has_raw_output_rows(champ_rows):
                 return
+            champ_nodes = getattr(champ_sub, "max_region_nodes", None)
+            # Deadwood metric fields ship on the #575 lineage — getattr keeps
+            # this None-safe (⇒ delta 0 ⇒ inert) until the lineages merge and
+            # records carry values.
+            champ_dw_nodes = getattr(champ_sub, "unproductive_nodes", None)
+            champ_dw_version = getattr(champ_sub, "unproductive_metric_version", None)
             for competitor in self._sub_store.list_by_round(round_id):
                 if competitor.submission_id == self._champion.submission_id:
                     continue
@@ -1652,13 +1729,70 @@ class EpochManager:
                 if not has_raw_output_rows(comp_rows):
                     continue
                 try:
+                    # Same-pin factor context, captured HERE because this is the
+                    # one display pass where both records are in hand — the
+                    # report then reads it without any cross-record lookup. The
+                    # delta feeds the verdict too, so a factor-tie dethrone is
+                    # stored as "dethrone", not a misleading "matched".
+                    comp_nodes = getattr(competitor, "max_region_nodes", None)
+                    delta = factor_delta_between(champ_nodes, comp_nodes)
+                    # Deadwood (4th ladder key): same-pin, version-guarded
+                    # delta via the ONE shared helper — 0 unless both records
+                    # carry SAME-VERSION unproductive metrics (fields on the
+                    # #575 lineage; getattr ⇒ None-safe until then).
+                    comp_dw_nodes = getattr(competitor, "unproductive_nodes", None)
+                    comp_dw_version = getattr(
+                        competitor, "unproductive_metric_version", None,
+                    )
+                    dw_delta = deadwood_delta_between(
+                        champ_dw_nodes, comp_dw_nodes,
+                        champ_dw_version, comp_dw_version,
+                    )
                     # Same bar kwargs as the authoritative verdict so the
                     # persisted (miner-facing) counts agree with the live
                     # decision — an armed repeat must read as "repeat", never as
                     # a contradictory "1 better yet not adopted".
                     counts = relative_counts(
-                        champ_rows, comp_rows, **self._blind_spot_bar_kwargs(),
+                        champ_rows, comp_rows,
+                        factor_delta=delta, deadwood_delta=dw_delta,
+                        **self._blind_spot_bar_kwargs(),
                     )
+                    counts["factorization"] = {
+                        "candidate_nodes": comp_nodes,
+                        "champion_nodes": champ_nodes,
+                        "factor_delta": delta,
+                        "factor_margin": FACTOR_MARGIN,
+                        "armed": FACTOR_MARGIN is not None,
+                    }
+                    # Deadwood rule context beside factorization/gas — the one
+                    # display pass with both records in hand, so the report
+                    # reads it without any cross-record lookup and a
+                    # deadwood-tie dethrone is stored as "dethrone" with its
+                    # actionable numbers. None-safe by construction.
+                    counts["deadwood"] = {
+                        "candidate_nodes": comp_dw_nodes,
+                        "champion_nodes": champ_dw_nodes,
+                        "deadwood_delta": dw_delta,
+                        "margin": UNPRODUCTIVE_MARGIN,
+                        "armed": UNPRODUCTIVE_MARGIN is not None,
+                    }
+                    # GAS-PAR (ships DISARMED): same-pin gas context beside the
+                    # factorization block. relative_counts carries the ``gas``
+                    # sub-dict (verdict totals/coverage) ONLY when the clause is
+                    # armed (GAS_MARGIN_BPS is not None); disarmed ⇒ no key, so
+                    # the persisted counts stay byte-identical to pre-gas
+                    # rounds. Enriched here with the rule context (margin /
+                    # armed / basis), mirroring the factorization attach.
+                    # NOTHING else threads — gas rides on the per_intent rows
+                    # themselves, unlike factor_delta.
+                    gas_ctx = counts.get("gas")
+                    if isinstance(gas_ctx, dict):
+                        counts["gas"] = {
+                            **gas_ctx,
+                            "gas_margin_bps": GAS_MARGIN_BPS,
+                            "armed": GAS_MARGIN_BPS is not None,
+                            "basis": GAS_BASIS,
+                        }
                     counts["round_id"] = round_id
                     self._sub_store.merge_benchmark_details(
                         competitor.submission_id, {"relative": counts},
