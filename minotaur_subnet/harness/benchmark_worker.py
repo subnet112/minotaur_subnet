@@ -793,6 +793,23 @@ class BenchmarkWorker:
 
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
+            # FRESH-STATUS GUARD: ``benchmarking`` is a snapshot; rotation at
+            # round close terminally rejects the slate overflow "regardless of
+            # benchmark progress" (and purges its private token), and a restart
+            # can re-queue an orphaned round mid-pass. Re-fetch and skip any
+            # submission that is no longer BENCHMARKING — benching a rejected
+            # sub wastes ~1-2 min of serialized sim time on a structurally dead
+            # entry (the store's no-resurrection guard would refuse the SCORED
+            # flip anyway; this saves the compute).
+            fresh = self._sub_store.get(sub.submission_id)
+            if fresh is None or fresh.status != SubmissionStatus.BENCHMARKING:
+                logger.info(
+                    "Skipping %s: status changed to %s since queue snapshot "
+                    "(rotation/restart) — not benching",
+                    sub.submission_id,
+                    getattr(getattr(fresh, "status", None), "value", "gone"),
+                )
+                continue
             # Skip already-benchmarked submissions (may appear in BENCHMARKING
             # from a previous pass that benched then persisted). "Already
             # benchmarked" = it delivered value on >= 1 order (the validity gate).
