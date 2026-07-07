@@ -772,6 +772,18 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             details=s1.details,
             error_code=s1.error_code,
         )
+        # Phase-0 deadwood metric (observe-only, not gated). Persisted BEFORE
+        # the pass-check so any stage-1 result that carried a measurement is
+        # recorded even when the submission is rejected. unproductive_nodes may
+        # be None (unparseable non-exempt file) — persisted as None on purpose.
+        if s1.unproductive_metric_version is not None:
+            store.set_deadwood_metric(
+                submission_id,
+                s1.unproductive_nodes,
+                s1.unproductive_metric_version,
+                s1.unproductive_top_offenders,
+            )
+
         if not s1.passed:
             return  # set_screening_result already rejected
 

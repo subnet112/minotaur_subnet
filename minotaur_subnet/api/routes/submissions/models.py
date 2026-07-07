@@ -134,6 +134,13 @@ class StatusResponse(BaseModel):
     # surfaced, NOT gated yet. Present once screening stage 1 completes; None while
     # queued. See harness/screening.max_region_nodes.
     max_region_nodes: int | None = None
+    # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
+    # that provably does no work at runtime (unreachable files + dead bindings
+    # in reachable files + exempt-tree overflow). Measured and surfaced, NOT
+    # gated. Present once screening stage 1 completes; None while queued or
+    # when a non-exempt file was unparseable. The top-offender deletion list is
+    # in report.deadwood. See harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
     # benchmark_score (the retired scalar composite) was removed; benchmark_rank is
     # the DISPLAY rank derived from relative net-better vs the champion.
     benchmark_rank: int | None = None
