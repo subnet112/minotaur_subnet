@@ -69,7 +69,6 @@ def test_build_runtime_security_health_snapshot_fields():
     snapshot = api_server._build_runtime_security_health_snapshot(
         enforce=True,
         violations=["x", "y"],
-        enable_source_submissions=False,
         allow_subprocess_benchmark=False,
         require_signed_provenance=True,
         require_asymmetric_provenance=True,
@@ -114,7 +113,6 @@ def test_health_includes_security_sections():
                 "startup_validated": True,
                 "enforced": False,
                 "violations": [],
-                "enable_source_submissions": False,
                 "allow_subprocess_benchmark": False,
                 "require_signed_provenance": False,
                 "require_asymmetric_provenance": False,
@@ -148,7 +146,7 @@ def _health_with_store(store_obj):
     }
     runtime = {
         "valid": True, "startup_validated": True, "enforced": False,
-        "violations": [], "enable_source_submissions": False,
+        "violations": [],
         "allow_subprocess_benchmark": False, "require_signed_provenance": False,
         "require_asymmetric_provenance": False, "allowed_signers_count": 0,
         "hmac_configured": False, "submissions_accepting": True,

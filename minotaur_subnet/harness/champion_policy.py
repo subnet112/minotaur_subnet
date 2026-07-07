@@ -34,7 +34,7 @@ def is_submission_champion_eligible(submission: Any) -> tuple[bool, str | None]:
     # Reject inline-source / subprocess submissions. Two independent signals
     # catch this: a non-None solver_path (the local file the source harness
     # ran from) and a repo_url starting with ``source://`` (the marker the
-    # /v1/submissions/source endpoint uses). A real Docker-built submission
+    # retired /v1/submissions/source endpoint used). A real Docker-built submission
     # has neither.
     if getattr(submission, "solver_path", None):
         return False, "source/subprocess submission is not champion-eligible by policy"

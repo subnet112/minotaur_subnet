@@ -158,23 +158,6 @@ class StatusResponse(BaseModel):
     report: dict[str, Any] | None = None
 
 
-class SourceSubmitRequest(BaseModel):
-    """Request body for source-based submission (no git/Docker)."""
-    solver_source: str = Field(
-        ...,
-        description="Complete Python source of the solver",
-        max_length=500_000,
-    )
-    hotkey: str = Field("local-miner", description="Miner identifier")
-    round_id: str | None = Field(
-        default=None,
-        description="Current solver round ID",
-        min_length=1,
-    )
-    epoch: int = Field(0, description="Epoch number", ge=0)
-    solver_name: str = Field("", description="Solver name")
-
-
 class SolverRoundResponse(BaseModel):
     # ``extra="allow"`` lets the round-state builder ATTACH the additive relative
     # fields (``scoring_mode``, ``finalist_relative``, ``reason_relative``) — the

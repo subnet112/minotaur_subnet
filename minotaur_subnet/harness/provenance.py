@@ -93,7 +93,6 @@ def validate_provenance_policy(
 def validate_runtime_security_profile(
     *,
     enforce: bool,
-    enable_source_submissions: bool,
     allow_subprocess_benchmark: bool,
     require_signed: bool,
     require_asymmetric: bool,
@@ -110,8 +109,6 @@ def validate_runtime_security_profile(
     violations: list[str] = []
     allowed = {s.lower() for s in (allowed_signers or set()) if s}
 
-    if enable_source_submissions:
-        violations.append("ENABLE_SOURCE_SUBMISSIONS must be disabled")
     if allow_subprocess_benchmark:
         violations.append("ALLOW_SUBPROCESS_BENCHMARK must be disabled")
     if not require_asymmetric:
