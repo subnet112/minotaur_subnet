@@ -418,6 +418,36 @@ def evaluate_relative_adoption(
 # from stored submissions; every API surface emits the relative block always.
 
 
+def bar_kwargs_from_record(
+    record: dict[str, Any] | None,
+    incumbent_submission_id: str | None,
+    now: float,
+) -> dict[str, Any]:
+    """``champion_bar``/``bar_age_s`` kwargs from a PERSISTED bar record — PURE.
+
+    ``record`` is the round-store shape ``{"submission_id", "outputs",
+    "activated_at"}`` (see ``RoundStore.set_champion_adoption_bar``). Returns
+    ``{}`` — guard fully inert — unless the record matches the CURRENT incumbent
+    (a stale record from a displaced champion must never gate a cover against
+    the wrong bar) and carries non-empty outputs + a positive timestamp. The
+    single kwarg-builder for round-store-sourced callers (follower vote, worker
+    shadow vote / ranking); the leader's in-memory ``ChampionInfo`` path builds
+    the same shape in ``EpochManager._blind_spot_bar_kwargs``.
+    """
+    if not record or not incumbent_submission_id:
+        return {}
+    if record.get("submission_id") != incumbent_submission_id:
+        return {}
+    outputs = record.get("outputs")
+    activated_at = record.get("activated_at") or 0.0
+    if not isinstance(outputs, dict) or not outputs or not activated_at:
+        return {}
+    return {
+        "champion_bar": outputs,
+        "bar_age_s": max(0.0, now - float(activated_at)),
+    }
+
+
 def blind_spot_bar_from_rows(rows: list[Any] | None) -> dict[str, str]:
     """Build the blind-spot repeat bar from per-order rows — PURE.
 
@@ -446,6 +476,9 @@ def relative_counts(
     champion_results: list[Any],
     challenger_results: list[Any],
     tol_bps: int = RELATIVE_TOL_BPS,
+    *,
+    champion_bar: dict[str, Any] | None = None,
+    bar_age_s: float | None = None,
 ) -> dict[str, Any]:
     """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
 
@@ -470,13 +503,19 @@ def relative_counts(
     :func:`evaluate_relative_adoption` (``BenchmarkResult`` objects or stored
     ``per_intent`` dicts).
     """
-    res = evaluate_relative_adoption(champion_results, challenger_results, tol_bps=tol_bps)
+    res = evaluate_relative_adoption(
+        champion_results, challenger_results, tol_bps=tol_bps,
+        champion_bar=champion_bar, bar_age_s=bar_age_s,
+    )
     better = res["n_wins"] + res["n_blind_spots"]
     worse = res["n_regressions"] + res["n_dropped"]
     # Blind-spot REPEATS (armed guard only; 0 while disarmed) are compared-but-
     # neutral, so they surface as "matched" on the report — the miner delivered
-    # on the order but no better than the incumbent's adoption-time value.
-    matched = res["n_matched"] + res.get("n_blind_spot_repeats", 0)
+    # on the order but no better than the incumbent's adoption-time value. The
+    # separate ``repeats`` count keeps the report honest about WHY the cover
+    # earned nothing (rendered by report.py / relative_reason).
+    repeats = res.get("n_blind_spot_repeats", 0)
+    matched = res["n_matched"] + repeats
     new = res["n_blind_spots"]
     compared = better + worse + matched
     verdict = (
@@ -489,6 +528,7 @@ def relative_counts(
         "worse": worse,
         "matched": matched,
         "new": new,
+        "repeats": repeats,
         "compared": compared,
         "verdict": verdict,
         "per_order": res["per_order"],
@@ -546,7 +586,14 @@ def relative_reason(
             f"adopted{who}: net better — {counts['better']} better / "
             f"{counts['worse']} worse (regressions within 1% floor)"
         )
-    return (
+    reason = (
         f"not adopted: {counts['better']} better / {counts['worse']} worse / "
         f"{counts['matched']} matched"
     )
+    repeats = counts.get("repeats") or 0
+    if repeats:
+        reason += (
+            f" ({repeats} blind-spot repeat(s) not credited — cover must exceed "
+            f"the incumbent's adoption-time value on that order)"
+        )
+    return reason
