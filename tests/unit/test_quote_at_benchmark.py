@@ -201,7 +201,9 @@ def _run(session, reference_quotes):
     return results, session, captured
 
 
-def test_run_benchmark_enriches_from_reference_quote():
+def test_run_benchmark_enriches_from_reference_quote(monkeypatch):
+    # LEGACY champion-anchored mode (explicit opt-out of the static default).
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
     # Reference quote provided → no self-quote call, params enriched.
     session = _FakeSession(self_quote=None)
     ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
@@ -219,7 +221,9 @@ def test_run_benchmark_enriches_from_reference_quote():
     assert captured["intent_order"] is not None
 
 
-def test_run_benchmark_falls_back_to_self_quote():
+def test_run_benchmark_falls_back_to_self_quote(monkeypatch):
+    # LEGACY champion-anchored mode (explicit opt-out of the static default).
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
     # No reference → self-quote via the session, mapped through the helper.
     self_quote = QuoteResult(
         estimated_output="2000000", platform_fee_wei="50", gas_estimate=1
@@ -238,7 +242,9 @@ def test_run_benchmark_falls_back_to_self_quote():
     assert scored["platform_fee_wei"] == "50"
 
 
-def test_run_benchmark_no_crash_when_self_quote_returns_none():
+def test_run_benchmark_no_crash_when_self_quote_returns_none(monkeypatch):
+    # LEGACY champion-anchored mode (explicit opt-out of the static default).
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
     # Defensive: quote unavailable → score on the legacy layout, no crash.
     session = _FakeSession(self_quote=None)
     results, sess, _ = _run(session, reference_quotes={})
@@ -251,7 +257,9 @@ def test_run_benchmark_no_crash_when_self_quote_returns_none():
     assert "quoted_output" not in scored
 
 
-def test_run_benchmark_self_quotes_on_champion_blind_spot():
+def test_run_benchmark_self_quotes_on_champion_blind_spot(monkeypatch):
+    # LEGACY champion-anchored mode (explicit opt-out of the static default).
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
     # Champion BLIND SPOT: the pre-pass marked this scenario as one the champion
     # could not quote. run_benchmark must NOT zero it — instead the solver
     # SELF-QUOTES, so a challenger that CAN quote + execute the order reveals a
@@ -332,10 +340,12 @@ def test_run_benchmark_fails_loud_without_rpc_when_real_sim_required(monkeypatch
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# BENCHMARK_STATIC_QUOTE flag — inject a static zero quote, skip quoting.
-# The score is the relative RAW output; scoreIntent gates its CoW fee on
-# quotedOutput>0, so 0 = no anchor/no fee, full output. Default OFF preserves
-# the champion-anchored behavior exactly (instant-revert switch).
+# BENCHMARK_STATIC_QUOTE — inject a static zero quote, skip quoting. DEFAULT ON:
+# this is the benchmark's scoring definition. The score is the relative RAW
+# output; scoreIntent gates its CoW fee on quotedOutput>0, so 0 = no anchor/no
+# fee, full output. BENCHMARK_STATIC_QUOTE=0 is the instant-revert switch back
+# to the legacy champion-anchored behavior (slated for removal after the fleet
+# soaks ON).
 # ════════════════════════════════════════════════════════════════════════════
 def test_static_quote_flag_injects_zero_and_never_quotes(monkeypatch):
     monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "1")
@@ -354,11 +364,25 @@ def test_static_quote_flag_injects_zero_and_never_quotes(monkeypatch):
     assert captured["intent_order"] is not None
 
 
-def test_static_quote_flag_off_is_unchanged_reference_behavior(monkeypatch):
-    monkeypatch.delenv("BENCHMARK_STATIC_QUOTE", raising=False)  # default OFF
+def test_static_quote_default_on_injects_zero(monkeypatch):
+    # NO env set — the DEFAULT must be static quoting (the fleet's scoring
+    # definition). A validator with no host env must score identically to the
+    # leader (which has run ON since 2026-07-03).
+    monkeypatch.delenv("BENCHMARK_STATIC_QUOTE", raising=False)
+    session = _FakeSession(self_quote=QuoteResult(estimated_output="2000000"))
+    ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
+    _results, sess, _ = _run(session, ref)
+    assert sess.quote_calls == 0, "default must NOT call solver.quote()"
+    assert sess.scored_states[0]["quoted_output"] == "0"
+    assert sess.scored_states[0]["min_output_amount"] == "0"
+
+
+def test_static_quote_env_zero_reverts_to_reference_behavior(monkeypatch):
+    # Instant-revert switch: env=0 restores the legacy champion-anchored path.
+    monkeypatch.setenv("BENCHMARK_STATIC_QUOTE", "0")
     session = _FakeSession(self_quote=None)
     ref = {"dex:small_swap": {"quoted_output": "999", "min_output_amount": "990"}}
     _results, sess, _ = _run(session, ref)
-    # Current champion-anchored path: reference wins, no self-quote — unchanged.
+    # Legacy champion-anchored path: reference wins, no self-quote — unchanged.
     assert sess.quote_calls == 0
     assert sess.scored_states[0]["quoted_output"] == "999"

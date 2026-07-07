@@ -272,12 +272,19 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:
             logger.warning("Reactive historical sampling failed: %s", exc)
 
-    # Match the leader benchmark path: challenger and incumbent/champion are both
-    # scored against the current champion's quote anchor for the same shared corpus.
-    # If the reference pre-pass cannot be built on the follower, fail closed rather
-    # than vote on a different benchmark definition.
+    # Match the leader benchmark path EXACTLY — including the quote regime.
+    # The getter is flag-aware: under static quoting (the default) it returns
+    # {} without starting a champion session (the enrichment injects a static
+    # zero quote, same as the leader's scoring definition); under the legacy
+    # champion-anchored mode it builds the same reference pre-pass the leader
+    # graded against (this worker has no round store, so the getter falls
+    # through to a plain build — no checkpoint reuse). Calling
+    # _build_reference_quotes directly here would bypass the flag and vote on
+    # a DIFFERENT benchmark definition than the leader's. If the legacy
+    # pre-pass cannot be built, fail closed rather than vote on a different
+    # definition.
     try:
-        reference_quotes = await worker._build_reference_quotes(intents)
+        reference_quotes = await worker._get_or_build_reference_quotes(intents)
     except Exception as exc:
         logger.error(
             "Reactive verify for %s could not build champion reference quotes "

@@ -988,13 +988,17 @@ def benchmark_static_quote_enabled() -> bool:
     The zero is only there to keep the 12-field on-chain ABI valid (omitting
     the field reverts on decode).
 
-    DEFAULT OFF — the current champion-anchored reference-quote behavior is
-    unchanged. This is the instant-revert switch for the sensitive scoring
-    path: flip the env, no code change, to re-enable either mode at will.
+    DEFAULT ON — static quoting is the benchmark's scoring definition (#543,
+    soaked on the leader since 2026-07-03). ``BENCHMARK_STATIC_QUOTE=0`` is
+    the instant-revert switch back to the legacy champion-anchored
+    reference-quote pre-pass: flip the env, no code change. The legacy path
+    is slated for removal once the fleet has soaked ON — a per-validator env
+    on a scoring-relevant knob is a consensus hazard (see the
+    STAGE2_CORPUS_SAMPLES history in order_sampler.py).
     """
     import os
 
-    return os.environ.get("BENCHMARK_STATIC_QUOTE", "0").strip().lower() in (
+    return os.environ.get("BENCHMARK_STATIC_QUOTE", "1").strip().lower() in (
         "1", "true", "yes", "on",
     )
 

@@ -147,7 +147,10 @@ async def _run_dissent(
             BenchmarkWorker, "_load_historical_scenarios", return_value=[],
         ),
         patch.object(
-            BenchmarkWorker, "_build_reference_quotes",
+            # The reactive path goes through the flag-aware getter (static
+            # default: no pre-pass). Patch the getter so these tests are
+            # quote-regime-independent — run_benchmark is fully faked anyway.
+            BenchmarkWorker, "_get_or_build_reference_quotes",
             new=AsyncMock(return_value={"dex": {"quoted_output": "1"}}),
         ),
         patch.object(
