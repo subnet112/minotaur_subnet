@@ -7,7 +7,7 @@ on a FRESHLY-constructed worker). Both score the SAME round-seeded corpus, so th
 champion's result is identical. The memo lets the second path reuse the first's
 result — across worker instances (process-wide cache) — but ONLY on an exact key
 match (round_id, image, fork_block, real-sim, corpus fingerprint, scoring-JS
-fingerprint, reference-quote fingerprint), so a hit is provably the same
+fingerprint), so a hit is provably the same
 deterministic computation and the verdict never shifts.
 """
 
@@ -62,11 +62,11 @@ _CORPUS = lambda: _intents(("a", ""), ("b", "swap1"))  # noqa: E731
 
 
 def _call(w, run, *, round_id="r1", image="img", fork_block=100, intents=None,
-          real_sim=True, reference_quotes=None):
+          real_sim=True):
     return asyncio.run(w.memo_champion_bench(
         round_id=round_id, image=image, fork_block=fork_block,
         intents=intents if intents is not None else _CORPUS(),
-        require_real_sim=real_sim, reference_quotes=reference_quotes, run=run,
+        require_real_sim=real_sim, run=run,
     ))
 
 
@@ -146,21 +146,6 @@ def test_js_version_change_invalidates(monkeypatch):
     assert c["n"] == 1
     w._loaded_js_hashes = {"a": "v2", "b": "v1"}  # app 'a' scoring updated
     _call(w, run)                       # different JS fingerprint → recompute
-    assert c["n"] == 2
-
-
-def test_reference_quote_change_invalidates(monkeypatch):
-    # A self-quoted champion run and a champion-reference-quoted run can share the
-    # same round/image/fork/corpus/JS, but they are different scoring computations.
-    monkeypatch.setenv("CONSOLIDATE_CHAMPION_BENCH", "1")
-    w, c = _worker(), {"n": 0}
-    run = _counting_run(["R"], c)
-
-    _call(w, run, reference_quotes={"a": {"quoted_output": "100"}})
-    _call(w, run, reference_quotes={"a": {"quoted_output": "100"}})  # hit
-    assert c["n"] == 1
-
-    _call(w, run, reference_quotes={"a": {"quoted_output": "101"}})
     assert c["n"] == 2
 
 
