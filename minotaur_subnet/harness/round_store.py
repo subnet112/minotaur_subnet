@@ -331,6 +331,18 @@ class RoundStore:
         # EpochManager.revert_to_previous_champion). Persisted so the rollback
         # target survives a restart.
         self._previous_champion = ChampionSnapshot()
+        # Blind-spot REPEAT bar (relative_scoring.BLIND_SPOT_BAR_TTL_S): the
+        # active champion's ADOPTION-TIME per-order delivered outputs —
+        # {"submission_id", "outputs" ({intent_id: exact wei string}),
+        # "activated_at"}. Written by EpochManager._hot_swap at adoption; its
+        # OWN top-level key, NOT a ChampionSnapshot field — the snapshot is
+        # rebuilt from the adopted submission (whose per_intent is overwritten
+        # by every incumbent re-bench, so the bar is unrecoverable there) and
+        # compared via to_dict() in _sync_round_incumbent_from_submission_store;
+        # embedding the bar would make every comparison mismatch and clobber it
+        # with None. Persisted so a watchtower restart doesn't disarm the guard
+        # until the next adoption.
+        self._champion_adoption_bar: dict[str, Any] = {}
 
         if persist_path and persist_path.exists():
             self._load()
@@ -379,6 +391,35 @@ class RoundStore:
         self._previous_champion = copy.deepcopy(champion)
         self._persist()
         return self.get_previous_champion()
+
+    def get_champion_adoption_bar(self) -> dict[str, Any]:
+        """The active champion's adoption-time bar record (blind-spot REPEAT
+        guard) — ``{"submission_id", "outputs", "activated_at"}``, ``{}`` when
+        never set. Feed to ``relative_scoring.bar_kwargs_from_record``."""
+        self._maybe_reload()
+        return copy.deepcopy(self._champion_adoption_bar)
+
+    def set_champion_adoption_bar(
+        self,
+        *,
+        submission_id: str | None,
+        outputs: dict[str, str] | None,
+        activated_at: float,
+    ) -> None:
+        """Record the adoption-time bar for the champion just activated.
+
+        Call alongside ``set_active_champion`` (EpochManager._hot_swap). An
+        empty/None ``outputs`` still overwrites — a champion adopted without
+        rows must CLEAR the displaced champion's bar, never inherit it (the
+        record is matched to the incumbent by submission_id at read time as the
+        second guard)."""
+        self._maybe_reload()
+        self._champion_adoption_bar = {
+            "submission_id": submission_id,
+            "outputs": dict(outputs or {}),
+            "activated_at": float(activated_at),
+        }
+        self._persist()
 
     def ensure_open_round(
         self,
@@ -707,6 +748,7 @@ class RoundStore:
                 "current_round_id": self._current_round_id,
                 "active_champion": self._active_champion.to_dict(),
                 "previous_champion": self._previous_champion.to_dict(),
+                "champion_adoption_bar": self._champion_adoption_bar,
                 "rounds": {
                     round_id: state.to_dict()
                     for round_id, state in self._rounds.items()
@@ -805,6 +847,8 @@ class RoundStore:
             self._current_round_id = current_round_id
             self._active_champion = active_champion
             self._previous_champion = previous_champion
+            bar_raw = data.get("champion_adoption_bar")
+            self._champion_adoption_bar = bar_raw if isinstance(bar_raw, dict) else {}
             self._rounds = rounds
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
             logger.info(

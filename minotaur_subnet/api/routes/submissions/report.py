@@ -198,6 +198,11 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             f"{rel.get('worse', 0)} worse · {rel.get('matched', 0)} matched · "
             f"{rel.get('new', 0)} new"
         )
+        if rel.get("repeats"):
+            # Armed blind-spot REPEAT guard: covers that only re-delivered the
+            # incumbent's adoption-time value — counted in matched, called out
+            # so the miner knows the cover earned nothing and why.
+            seg += f" · {rel['repeats']} repeat (not credited)"
         if rel.get("verdict"):
             seg += f" — _{_cell(rel['verdict'])}_"
         lines += [seg, ""]
@@ -213,10 +218,14 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         per_order = rel.get("per_order")
         _worse = {"worse", "regression", "dropped"}
         _better = {"better", "win", "new", "blind_spot_cover"}
+        # blind_spot_repeat (armed guard): delivered on a champion-blind order
+        # but did NOT exceed the incumbent's adoption-time value — neutral, and
+        # the single most actionable row for the miner, so render it.
+        _neutral = {"blind_spot_repeat"}
         diffs = (
             [
                 o for o in per_order
-                if isinstance(o, dict) and o.get("verdict") in _worse | _better
+                if isinstance(o, dict) and o.get("verdict") in _worse | _better | _neutral
             ]
             if isinstance(per_order, list)
             else []
@@ -235,6 +244,10 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                     mark = "❌ dropped"  # no plan on a champion-served order (hard veto)
                 elif verdict in ("new", "blind_spot_cover"):
                     mark = "✅ new"  # covered an order the champion delivers nothing on
+                elif verdict == "blind_spot_repeat":
+                    # Neutral: must EXCEED the incumbent's adoption-time value
+                    # on this order to earn cover credit.
+                    mark = "➖ repeat (beat the recorded value to credit)"
                 else:
                     mark = "❌" if verdict in _worse else "✅"
                 lines.append(
