@@ -144,6 +144,38 @@ def build_submission_report(
             block["factor_delta"] = rel_fz.get("factor_delta")
         report["factorization"] = block
 
+    # GAS-PAR clause (ships DISARMED) — rule-state transparency, mirroring the
+    # factorization block. Always emitted (the block describes the RULE, not a
+    # per-submission metric): a miner sees whether matched-output-less-gas is a
+    # live way to win, at what margin, and — when the stored relative block
+    # carries the same-pin totals — the actual numbers the tie-break judged.
+    try:
+        from minotaur_subnet.epoch.relative_scoring import GAS_BASIS, GAS_MARGIN_BPS
+
+        gas_margin: int | None = GAS_MARGIN_BPS
+        gas_basis: str | None = GAS_BASIS
+    except Exception:  # additive surface — never break the report
+        gas_margin = gas_basis = None
+    gas_armed = gas_margin is not None
+    gas_block: dict[str, Any] = {
+        # The armed state is COMPUTED from the live constant — never
+        # hardcoded, so this block can't lie about whether the rule bites.
+        "armed": gas_armed,
+        "observe_only": not gas_armed,  # backward-compat alias of ``not armed``
+        "gas_margin_bps": gas_margin,
+        "basis": gas_basis,
+    }
+    rel_gas = rel.get("gas") if isinstance(rel, dict) else None
+    if isinstance(rel_gas, dict):
+        # Same-pin totals/coverage, attached by the round evaluation
+        # (_persist_round_relative_counts) when the clause was armed.
+        gas_block["champ_total"] = rel_gas.get("champ_total")
+        gas_block["chal_total"] = rel_gas.get("chal_total")
+        gas_block["measured_full"] = rel_gas.get("measured_full")
+        gas_block["unmeasured"] = rel_gas.get("unmeasured")
+        gas_block["order_worse"] = rel_gas.get("order_worse")
+    report["gas"] = gas_block
+
     if rel is not None:
         report["relative"] = rel
         try:
@@ -219,6 +251,19 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         if rel.get("verdict"):
             seg += f" — _{_cell(rel['verdict'])}_"
         lines += [seg, ""]
+
+        if rel.get("adopt_via") == "gas":
+            gz = rel.get("gas") if isinstance(rel.get("gas"), dict) else {}
+            lines += [
+                (
+                    "⛽ **Won on gas:** matched the champion on every order, "
+                    f"delivered the same outputs on materially less total gas "
+                    f"(yours {gz.get('chal_total', '?')} vs champion "
+                    f"{gz.get('champ_total', '?')}, "
+                    f"margin {gz.get('gas_margin_bps', '?')} bps)."
+                ),
+                "",
+            ]
 
         if rel.get("adopt_via") == "factorization":
             fz = rel.get("factorization") if isinstance(rel.get("factorization"), dict) else {}
@@ -296,6 +341,24 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                     f"{fz.get('candidate_nodes', '?')} AST nodes vs the champion's "
                     f"{fz['champion_nodes']}; get it to ≤ {need} to win this tie on "
                     f"factorization (lower is better)"
+                )
+            # Third way to win (when the GAS-PAR tie-break is armed and the
+            # same-pin totals are known): dethrone on materially less total
+            # gas. Name the exact target the same way the factor hint does.
+            gz = rel.get("gas") if isinstance(rel.get("gas"), dict) else None
+            if (
+                gz
+                and gz.get("armed")
+                and isinstance(gz.get("gas_margin_bps"), int)
+                and isinstance(gz.get("champ_total"), int)
+                and gz["champ_total"] > 0
+            ):
+                need_gas = gz["champ_total"] * (10000 - gz["gas_margin_bps"]) // 10000
+                hint += (
+                    f" — OR deliver the same outputs on less gas: your total "
+                    f"metered gas is {gz.get('chal_total', '?')} vs the champion's "
+                    f"{gz['champ_total']}; get it below {need_gas} to win this tie "
+                    f"on gas (lower is better)"
                 )
             lines += [hint + "._", ""]
     else:

@@ -1600,6 +1600,8 @@ class EpochManager:
         try:
             from minotaur_subnet.epoch.relative_scoring import (
                 FACTOR_MARGIN,
+                GAS_BASIS,
+                GAS_MARGIN_BPS,
                 factor_delta_between,
                 has_raw_output_rows,
                 relative_counts,
@@ -1634,6 +1636,23 @@ class EpochManager:
                         "factor_margin": FACTOR_MARGIN,
                         "armed": FACTOR_MARGIN is not None,
                     }
+                    # GAS-PAR (ships DISARMED): same-pin gas context beside the
+                    # factorization block. relative_counts carries the ``gas``
+                    # sub-dict (verdict totals/coverage) ONLY when the clause is
+                    # armed (GAS_MARGIN_BPS is not None); disarmed ⇒ no key, so
+                    # the persisted counts stay byte-identical to pre-gas
+                    # rounds. Enriched here with the rule context (margin /
+                    # armed / basis), mirroring the factorization attach.
+                    # NOTHING else threads — gas rides on the per_intent rows
+                    # themselves, unlike factor_delta.
+                    gas_ctx = counts.get("gas")
+                    if isinstance(gas_ctx, dict):
+                        counts["gas"] = {
+                            **gas_ctx,
+                            "gas_margin_bps": GAS_MARGIN_BPS,
+                            "armed": GAS_MARGIN_BPS is not None,
+                            "basis": GAS_BASIS,
+                        }
                     counts["round_id"] = round_id
                     self._sub_store.merge_benchmark_details(
                         competitor.submission_id, {"relative": counts},

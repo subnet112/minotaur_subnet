@@ -202,3 +202,86 @@ def test_factor_win_line_renders():
     md = render_report_md(build_submission_report(_Winner(), reason=None))
     assert "Won on factorization" in md
     assert "1212" in md and "4109" in md and "2897" in md
+
+
+# ── GAS-PAR transparency (C2 — ships DISARMED; rule state must be honest) ────
+
+
+def test_gas_block_reports_disarmed_state():
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    rep = _report(_sub("scored", _DETAILS))
+    gz = rep["gas"]
+    # Armed state is COMPUTED from the live constant — never hardcoded. On
+    # this branch the clause SHIPS DISARMED (GAS_MARGIN_BPS is None).
+    expected_armed = _rs.GAS_MARGIN_BPS is not None
+    assert gz["armed"] is expected_armed
+    assert gz["observe_only"] is (not expected_armed)
+    assert gz["gas_margin_bps"] == _rs.GAS_MARGIN_BPS
+    assert gz["basis"] == _rs.GAS_BASIS
+    # No stored same-pin totals -> none surfaced.
+    assert "champ_total" not in gz and "chal_total" not in gz
+
+
+def test_gas_block_armed_carries_stored_totals(monkeypatch):
+    from minotaur_subnet.epoch import relative_scoring as _rs
+
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", 250)
+    rel = _rel("matched", matched=5)
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 198_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True, "basis": _rs.GAS_BASIS,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    gz = rep["gas"]
+    assert gz["armed"] is True
+    assert gz["observe_only"] is False
+    assert gz["gas_margin_bps"] == 250
+    # Same-pin totals merged from the stored relative block.
+    assert gz["champ_total"] == 200_000
+    assert gz["chal_total"] == 198_000
+    assert gz["measured_full"] is True
+
+
+def test_gas_win_line_renders():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("dethrone", matched=5)
+    rel["adopt_via"] = "gas"
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 180_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True,
+    }
+    rep = _report(_sub("adopted", _DETAILS, relative=rel))
+    md = render_report_md(rep)
+    assert "Won on gas" in md
+    assert "180000" in md and "200000" in md and "250" in md
+
+
+def test_matched_hint_names_the_gas_target():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    rel = _rel("matched", matched=5)
+    rel["gas"] = {
+        "champ_total": 200_000, "chal_total": 198_000,
+        "measured_full": True, "unmeasured": 0, "order_worse": 0,
+        "gas_margin_bps": 250, "armed": True,
+    }
+    rep = _report(_sub("scored", _DETAILS, relative=rel))
+    md = render_report_md(rep, submission_id="sub_gas")
+    # The tied miner is told the gas way to win, with the exact target
+    # (200000 * (10000 - 250) // 10000 = 195000), like the factor hint.
+    assert "OR deliver the same outputs on less gas" in md
+    assert "below 195000" in md
+
+
+def test_matched_hint_omits_gas_target_when_disarmed():
+    from minotaur_subnet.api.routes.submissions.report import render_report_md
+
+    # Stored block from a DISARMED round carries no gas sub-dict at all —
+    # the hint must not advertise a rule that cannot fire.
+    rep = _report(_sub("scored", _DETAILS, relative=_rel("matched", matched=5)))
+    md = render_report_md(rep, submission_id="sub_gas")
+    assert "less gas" not in md
