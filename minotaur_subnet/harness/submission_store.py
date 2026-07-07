@@ -188,6 +188,19 @@ class Submission:
     # the saturated-tie dethrone tie-break. See harness/screening.max_region_nodes.
     max_region_nodes: int | None = None
 
+    # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
+    # tree that provably does no work at runtime (unreachable files + dead
+    # bindings inside reachable files + exempt-tree overflow), computed once in
+    # screening stage 1 and never recomputed by any consumer. Persisted but NOT
+    # gated yet. None ⇔ not yet screened OR a non-exempt file was unparseable.
+    # unproductive_metric_version stamps the algorithm semantics — consumers
+    # must only compare EQUAL versions. unproductive_top_offenders is the
+    # [path, qualname-or-None, nodes] deletion list miners see in the report.
+    # See harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
+    unproductive_metric_version: int | None = None
+    unproductive_top_offenders: list | None = None
+
     # Set after benchmarking. NOTE: the scalar composite benchmark_score was
     # removed — adoption is decided by the per-order relative rule
     # (epoch/relative_scoring.evaluate_relative_adoption) and finalist ranking by
@@ -230,6 +243,9 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "unproductive_nodes": self.unproductive_nodes,
+            "unproductive_metric_version": self.unproductive_metric_version,
+            "unproductive_top_offenders": self.unproductive_top_offenders,
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
@@ -251,6 +267,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
         }
@@ -516,6 +533,9 @@ class SubmissionStore:
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
             max_region_nodes=record.get("max_region_nodes"),
+            unproductive_nodes=record.get("unproductive_nodes"),
+            unproductive_metric_version=record.get("unproductive_metric_version"),
+            unproductive_top_offenders=record.get("unproductive_top_offenders"),
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
@@ -761,6 +781,32 @@ class SubmissionStore:
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.max_region_nodes = value
+        sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_deadwood_metric(
+        self,
+        submission_id: str,
+        nodes: int | None,
+        version: int,
+        top_offenders: list | None,
+    ) -> None:
+        """Persist the Phase-0 deadwood metric computed in screening stage 1.
+
+        Observe-only: nothing gates on this yet. Stored once so every downstream
+        consumer READS the same values (never recomputes), keeping the metric
+        consensus-safe across CPython versions. ``nodes`` may be None (a
+        non-exempt file failed ast.parse) — persisted explicitly so consumers
+        can tell "measured unparseable" from "never measured" via ``version``.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.unproductive_nodes = nodes
+        sub.unproductive_metric_version = version
+        sub.unproductive_top_offenders = top_offenders
         sub.updated_at = time.time()
         self._persist()
 
@@ -1195,6 +1241,9 @@ class SubmissionStore:
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
                     max_region_nodes=d.get("max_region_nodes"),
+                    unproductive_nodes=d.get("unproductive_nodes"),
+                    unproductive_metric_version=d.get("unproductive_metric_version"),
+                    unproductive_top_offenders=d.get("unproductive_top_offenders"),
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),

@@ -120,6 +120,15 @@ class StageResult:
     # Computed once here so downstream consumers READ the persisted value and
     # never recompute — a cross-CPython AST difference can't then split consensus.
     max_region_nodes: int | None = None
+    # Deadwood metric (Phase 0, OBSERVE-ONLY), set by stage 1 only. Same
+    # compute-once-read-forever discipline as max_region_nodes. None on other
+    # stages / errors, and None (with version still set) when a non-exempt file
+    # failed ast.parse — see harness/deadwood.unproductive_nodes.
+    unproductive_nodes: int | None = None
+    unproductive_metric_version: int | None = None
+    # (path, qualname-or-None, nodes) — what a miner should delete. Max 20,
+    # sorted desc by nodes then path; persisted so the report can show it.
+    unproductive_top_offenders: list | None = None
 
 
 @dataclass
@@ -149,6 +158,7 @@ class ScreeningResult:
                     "details": s.details,
                     "error_code": s.error_code,
                     "max_region_nodes": s.max_region_nodes,
+                    "unproductive_nodes": s.unproductive_nodes,
                 }
                 for s in self.stages
             },
@@ -322,11 +332,29 @@ def run_stage_1(repo_path: str) -> StageResult:
         factor_nodes, FLOOR_VERSION, repo_path,
     )
 
+    # Deadwood metric — Phase 0 OBSERVE-ONLY: compute + persist + log in the
+    # same pass, do NOT gate (deadwood.UNPRODUCTIVE_NODES_MAX is None until a
+    # later, separately-reviewed PR arms the floor). An unparseable non-exempt
+    # file yields unproductive_nodes=None (logged inside the analyzer) — the
+    # value is persisted as None and every consumer skips it; stage 2's import
+    # check remains the backstop for code that cannot even be parsed.
+    from minotaur_subnet.harness import deadwood
+
+    dw = deadwood.unproductive_nodes(repo_path)
+    if not dw.unparseable:
+        logger.info(
+            "[deadwood] unproductive_nodes=%d version=%d (observe-only) repo=%s",
+            dw.unproductive_nodes, dw.version, repo_path,
+        )
+
     return StageResult(
         stage=1, passed=True,
         duration_ms=_elapsed(start),
         details="All static checks passed",
         max_region_nodes=factor_nodes,
+        unproductive_nodes=dw.unproductive_nodes,
+        unproductive_metric_version=dw.version,
+        unproductive_top_offenders=[list(t) for t in dw.top_offenders],
     )
 
 

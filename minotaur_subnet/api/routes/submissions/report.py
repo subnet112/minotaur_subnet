@@ -126,6 +126,27 @@ def build_submission_report(
             "observe_only": True,
         }
 
+    # Deadwood metric (Phase 0, OBSERVE-ONLY) — this submission's OWN persisted
+    # unproductive_nodes plus the top-offender deletion list, so a miner can see
+    # exactly WHAT to delete. Never recomputed here; champion comparison arrives
+    # with the (future) margin PR. Measured, not gated.
+    dw_version = getattr(sub, "unproductive_metric_version", None)
+    if dw_version is not None:
+        try:
+            from minotaur_subnet.harness.deadwood import UNPRODUCTIVE_NODES_MAX
+
+            # Phase 0: always True — the floor is disarmed (None) and no
+            # tie-break margin exists yet.
+            observe_only = UNPRODUCTIVE_NODES_MAX is None
+        except Exception:  # additive surface — never break the report
+            observe_only = True
+        report["deadwood"] = {
+            "unproductive_nodes": getattr(sub, "unproductive_nodes", None),
+            "metric_version": dw_version,
+            "observe_only": observe_only,
+            "top_offenders": getattr(sub, "unproductive_top_offenders", None),
+        }
+
     if rel is not None:
         report["relative"] = rel
         try:
