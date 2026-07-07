@@ -187,6 +187,10 @@ class Submission:
     # but NOT gated yet — we soak the live distribution to calibrate the floor and
     # the saturated-tie dethrone tie-break. See harness/screening.max_region_nodes.
     max_region_nodes: int | None = None
+    # Normalized content fingerprint (harness/code_fingerprint, screening stage 1)
+    # — the "same code, same quota" identity that comment/whitespace/nonce
+    # rotation cannot refresh. None on records that predate the metric.
+    content_fingerprint: str | None = None
 
     # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
     # tree that provably does no work at runtime (unreachable files + dead
@@ -243,6 +247,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "unproductive_metric_version": self.unproductive_metric_version,
             "unproductive_top_offenders": self.unproductive_top_offenders,
@@ -267,6 +272,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
@@ -533,6 +539,7 @@ class SubmissionStore:
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
             max_region_nodes=record.get("max_region_nodes"),
+            content_fingerprint=record.get("content_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
             unproductive_metric_version=record.get("unproductive_metric_version"),
             unproductive_top_offenders=record.get("unproductive_top_offenders"),
@@ -769,6 +776,46 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
+    def set_content_fingerprint(self, submission_id: str, value: str) -> None:
+        """Persist the normalized content fingerprint from screening stage 1.
+
+        Same compute-once-read-forever discipline as ``set_max_region_nodes`` —
+        every consumer reads the stored value, never recomputes.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.content_fingerprint = value
+        sub.updated_at = time.time()
+        self._persist()
+
+    def count_benched_rounds_for_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> int:
+        """DISTINCT rounds in which this normalized fingerprint occupied a
+        benchmark slot — ACROSS ALL HOTKEYS.
+
+        The cross-hotkey scope is the point: the per-(hotkey, commit) cap gives
+        every sybil hotkey its own quota for the same bytes; this counter gives
+        the CODE one quota, however many hotkeys ship it. Mirrors the commit
+        cap's accounting: only BENCHED statuses count, so rotation-not-selected
+        and screening rejections don't burn quota.
+        """
+        self._maybe_reload()
+        rounds: set[str] = set()
+        for sub in self._submissions.values():
+            if sub.content_fingerprint != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            if sub.status in BENCHED_STATUSES and sub.round_id:
+                rounds.add(sub.round_id)
+        return len(rounds)
+
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
         """Persist the Phase-0 factorization metric computed in screening stage 1.
 
@@ -1241,6 +1288,7 @@ class SubmissionStore:
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
                     max_region_nodes=d.get("max_region_nodes"),
+                    content_fingerprint=d.get("content_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
                     unproductive_metric_version=d.get("unproductive_metric_version"),
                     unproductive_top_offenders=d.get("unproductive_top_offenders"),

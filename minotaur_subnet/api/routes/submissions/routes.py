@@ -917,6 +917,40 @@ async def create_source_submission(
     if body.solver_name:
         store.set_solver_info(sub.submission_id, name=body.solver_name)
 
+    # Normalized content fingerprint + the cross-hotkey resubmit quota. The
+    # inline path skips screening (no stage 1), so identity is computed here
+    # from the single source. Enforced AFTER create so per-hotkey/commit caps
+    # ran first and the rejected record still carries its fingerprint (same
+    # persist-on-reject discipline as the repo path).
+    from minotaur_subnet.harness.code_fingerprint import source_fingerprint
+    from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+        _max_rounds_per_fingerprint,
+    )
+
+    fp = source_fingerprint(body.solver_source)
+    store.set_content_fingerprint(sub.submission_id, fp)
+    fp_cap = _max_rounds_per_fingerprint()
+    if fp_cap > 0:
+        benched = store.count_benched_rounds_for_fingerprint(
+            fp, exclude_submission_id=sub.submission_id,
+        )
+        if benched >= fp_cap:
+            store.reject(
+                sub.submission_id,
+                (
+                    f"identical code (normalized fingerprint {fp[:12]}…) was "
+                    f"already benchmarked in {benched} round(s) — cap {fp_cap}, "
+                    f"across all hotkeys; change the logic to participate again"
+                ),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"identical code (normalized) already benchmarked in "
+                    f"{benched} round(s); cap {fp_cap} across all hotkeys"
+                ),
+            )
+
     # Write source to temp file for subprocess-based benchmarking
     solver_dir = tempfile.mkdtemp(prefix=f"solver-{code_hash}-")
     solver_path = os.path.join(solver_dir, "solver.py")
