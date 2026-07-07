@@ -88,7 +88,12 @@ def encode_execution_plan(plan: ExecutionPlan) -> tuple:
     for ix in plan.interactions:
         call_data = bytes.fromhex(ix.call_data.replace("0x", "")) if ix.call_data != "0x" else b""
         calls.append((
-            ix.target,
+            # Solver-produced targets arrive with arbitrary casing (seen live
+            # 2026-07-07: a wrong-checksum mixed-case target failed every
+            # submit for the order on chain 8453). The address encodes to the
+            # same 20 bytes either way, so this never changes the signed plan
+            # hash — it only satisfies web3's strict checksum validation.
+            _safe_checksum(ix.target),
             int(ix.value),
             call_data,
         ))
