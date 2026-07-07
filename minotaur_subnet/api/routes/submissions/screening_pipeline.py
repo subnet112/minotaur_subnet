@@ -120,6 +120,22 @@ def _build_git_process_env(repo_url: str) -> tuple[dict[str, str], str | None]:
     return env, askpass_path
 
 
+def _max_rounds_per_fingerprint() -> int:
+    """Cross-hotkey benched-round cap per NORMALIZED content fingerprint.
+
+    ``SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT`` (default 0 = disabled so the
+    merge is inert; the leader arms it via env). Complements the per-(hotkey,
+    commit) cap: that one stops naive same-SHA resubmit automation, this one
+    stops the two evasions it explicitly cannot — cosmetic hash rotation
+    (nonce comments) and sybil spread (one tree, many hotkeys).
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT", "0").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def _cleanup_temp_file(path: str | None) -> None:
     """Best-effort cleanup for temporary helper files."""
     if not path:
@@ -793,9 +809,42 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 s1.unproductive_metric_version,
                 s1.unproductive_top_offenders,
             )
+        # Normalized content fingerprint — persisted BEFORE the pass-check
+        # (persist-on-reject, like the metrics above) so rejected submissions
+        # still record the identity they were rejected under.
+        if s1.content_fingerprint:
+            store.set_content_fingerprint(submission_id, s1.content_fingerprint)
 
         if not s1.passed:
             return  # set_screening_result already rejected
+
+        # Cross-hotkey resubmit quota on the NORMALIZED identity. The
+        # per-(hotkey, commit) cap keys on the git SHA — refreshed for free by
+        # a nonce comment — and gives each sybil hotkey its own allowance for
+        # the same bytes. This cap keys on what the code MEANS and counts
+        # benched rounds ACROSS hotkeys, so identical trees share ONE quota
+        # bucket however they're wrapped or distributed. Enforced pre-build:
+        # a capped resubmit never costs a Docker build or a bench slot.
+        # Operator-local admission control (leader gateway), like the other
+        # submission caps — not fleet-consensus.
+        fp_cap = _max_rounds_per_fingerprint()
+        if fp_cap > 0 and s1.content_fingerprint:
+            benched = store.count_benched_rounds_for_fingerprint(
+                s1.content_fingerprint, exclude_submission_id=submission_id,
+            )
+            if benched >= fp_cap:
+                store.reject(
+                    submission_id,
+                    (
+                        f"identical code (normalized fingerprint "
+                        f"{s1.content_fingerprint[:12]}…) was already benchmarked "
+                        f"in {benched} round(s) — the cap is {fp_cap}, counted "
+                        f"across ALL hotkeys. Comment, whitespace, docstring and "
+                        f"nonce edits do not make code new; change the logic or "
+                        f"data to participate again."
+                    ),
+                )
+                return
 
         # Stage 2: Build check
         store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_2)
