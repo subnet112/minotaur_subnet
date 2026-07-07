@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -40,6 +41,23 @@ _TERMINAL_STATUSES = ("rejected", "adopted")
 def _status_value(sub: Any) -> str:
     st = getattr(sub, "status", None)
     return str(getattr(st, "value", None) or st or "")
+
+
+def rotation_ledger_path() -> str:
+    """Path of the leader-local rotation ledger.
+
+    ``SOLVER_ROTATION_LEDGER_PATH`` wins; otherwise the ledger lives next to
+    the round store (``SOLVER_ROUND_STORE_PATH``) so it lands on the same
+    persistent volume (/data in production, per #430). Shared by the api's
+    close-time rotation and the benchmark worker's slate-width belt so both
+    read the SAME ledger.
+    """
+    explicit = os.environ.get("SOLVER_ROTATION_LEDGER_PATH", "").strip()
+    if explicit:
+        return explicit
+    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
+    base = os.path.dirname(round_store_path) if round_store_path else "."
+    return os.path.join(base or ".", "solver_rotation.json")
 
 
 def rotation_sort_key(
@@ -131,6 +149,46 @@ class RotationLedger:
                     pass
 
 
+def _notify_skipped_in_background(
+    notify: Any,
+    items: list[tuple[Any, str | None]],
+    reason: str,
+    round_id: str,
+) -> threading.Thread:
+    """Fire the per-submission not-selected notifications OFF the close path.
+
+    Each ``notify(sub, reason, repo_token)`` posts a GitHub PR comment —
+    seconds of blocking network per private submission. Run serially inline
+    (the pre-fix behaviour), a 20-candidate round freezes the event loop for a
+    minute+: /health goes dark, uvicorn's SIGTERM handler can never run, and a
+    container stop escalates to SIGKILL mid-close (observed 2026-07-07,
+    round-e29724243-n1). A daemon thread keeps the feedback best-effort without
+    holding the round close hostage; a crash mid-thread only loses PR comments,
+    never rejects (those already landed in phase 1).
+    """
+    def _run() -> None:
+        posted = 0
+        for sub, token in items:
+            try:
+                notify(sub, reason, token)
+                posted += 1
+            except Exception:
+                logger.warning(
+                    "rotation notify failed for %s (ignored)",
+                    getattr(sub, "submission_id", "?"), exc_info=True,
+                )
+        logger.info(
+            "rotation notify for %s: %d/%d not-selected comments attempted",
+            round_id, posted, len(items),
+        )
+
+    thread = threading.Thread(
+        target=_run, name=f"rotation-notify-{round_id}", daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def apply_rotation_slate(
     sub_store: Any,
     round_id: str,
@@ -151,10 +209,27 @@ def apply_rotation_slate(
     convention). Selected miners' ledger entries advance even when the round is
     uncontested, so seniority always reflects the last actual bench.
 
-    ``notify`` (optional, ``fn(submission, reason)``) is fired for each skipped
-    submission BEFORE its terminal reject — reject purges a private submission's
-    repo token, and the caller's PR notification needs the token to post.
-    Best-effort: a notify failure never blocks the reject.
+    TRUNCATION-PROOF DESIGN (two phases). The old shape interleaved a slow
+    network call per skipped submission (notify → GitHub PR comment, seconds
+    each) with its store reject; killing the process mid-sweep abandoned the
+    tail of the rejects and the un-rejected survivors were benched, busting the
+    slate width (2026-07-07: 12 of 19 rejects landed, 10 scored on 3 slots).
+    Now:
+
+      Phase 1 — REJECT (fast, local-only, no network): for every skipped
+      submission, capture its private-repo token (reject purges it, and the PR
+      comment needs it), then ``store.reject``. Per-submission failures are
+      contained; a ``CancelledError``/``BaseException`` mid-sweep still lands
+      every remaining reject via a tight store-only loop before re-raising.
+
+      Phase 2 — NOTIFY (best-effort, background thread): post the
+      not-selected PR comments with the tokens retained from phase 1, off the
+      close path, so the event loop is never blocked and a slow/failing GitHub
+      never delays or truncates anything.
+
+    ``notify`` (optional) is called as ``notify(submission, reason,
+    repo_token)`` where ``repo_token`` is the token captured BEFORE the
+    terminal reject purged it (None for public submissions).
     """
     if slots <= 0:
         return {"applied": False, "reason": "rotation disabled (slots <= 0)"}
@@ -168,31 +243,61 @@ def apply_rotation_slate(
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
         f"next round; miners benched longest ago go first"
     )
-    for sub in skipped:
-        if notify is not None:
+    # ── Phase 1: land every reject (fast, no network) ────────────────────────
+    to_notify: list[tuple[Any, str | None]] = []
+    get_token = getattr(sub_store, "get_repo_token", None)
+    done = 0
+    try:
+        for sub in skipped:
+            token = None
+            if notify is not None and callable(get_token):
+                try:
+                    # Captured BEFORE reject: reject purges the private token,
+                    # and the phase-2 PR comment needs it to post.
+                    token = get_token(sub.submission_id)
+                except Exception:
+                    logger.warning(
+                        "rotation token capture failed for %s (comment may "
+                        "not post; reject unaffected)",
+                        getattr(sub, "submission_id", "?"), exc_info=True,
+                    )
             try:
-                notify(sub, reject_reason)
+                sub_store.reject(sub.submission_id, reject_reason)
             except Exception:
                 logger.warning(
-                    "rotation notify failed for %s (ignored)",
+                    "rotation reject failed for %s (ignored)",
                     getattr(sub, "submission_id", "?"), exc_info=True,
                 )
-        try:
-            sub_store.reject(sub.submission_id, reject_reason)
-        except Exception:
-            logger.warning(
-                "rotation reject failed for %s (ignored)",
-                getattr(sub, "submission_id", "?"), exc_info=True,
-            )
+            done += 1
+            if notify is not None:
+                to_notify.append((sub, token))
+    except BaseException:
+        # Cancellation / interpreter teardown mid-sweep: the reject set is the
+        # round's INTEGRITY (an un-rejected survivor gets benched and busts the
+        # slate width) — finish the remaining rejects with a tight store-only
+        # loop (no token capture, no notify bookkeeping) before re-raising.
+        for sub in skipped[done:]:
+            try:
+                sub_store.reject(sub.submission_id, reject_reason)
+            except BaseException:  # noqa: BLE001 — best-effort cleanup path
+                pass
+        raise
     if selected:
         ledger.mark_selected(
             [getattr(s, "hotkey", "") or "" for s in selected],
             time.time() if now is None else now,
         )
+    # ── Phase 2: best-effort miner feedback, off the close path ─────────────
+    notify_thread = (
+        _notify_skipped_in_background(notify, to_notify, reject_reason, round_id)
+        if (notify is not None and to_notify)
+        else None
+    )
     return {
         "applied": True,
         "candidates": len(candidates),
         "slots": slots,
         "selected": [getattr(s, "submission_id", "?") for s in selected],
         "skipped": [getattr(s, "submission_id", "?") for s in skipped],
+        "notify_thread": notify_thread,
     }

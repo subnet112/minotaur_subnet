@@ -630,6 +630,79 @@ class BenchmarkWorker:
             return current
         return None
 
+    def _cap_to_rotation_slate(self, benchmarking: list, round_id: str) -> list:
+        """BELT for the rotation slate width: never bench a closed round past
+        ``SOLVER_ROUND_MAX_SUBMISSIONS``.
+
+        After rotation runs at close, every non-slate submission is REJECTED —
+        so normally at most ``slots`` submissions are BENCHMARKING here and
+        this is a no-op. If the close-time reject sweep was truncated (the api
+        process killed mid-close — observed live 2026-07-07, round-e29724243-n1:
+        12 of 19 overflow rejects landed and the round benched 10 submissions
+        on 3 slots), the un-rejected overflow is still BENCHMARKING. Cap the
+        pass at the slate width, in the SAME deterministic order the close-time
+        selection uses (``rotation_sort_key`` over the shared ledger — reused,
+        not reinvented). Rejecting the overflow is NOT this worker's call: it
+        only refuses to spend serialized sim time past the slate, loudly.
+
+        Ledger note: ``apply_rotation_slate`` sequences ``mark_selected`` AFTER
+        the reject sweep, so any truncation that leaves overflow BENCHMARKING
+        also left the ledger at its pre-close state — this re-selection
+        therefore reproduces exactly the slate the close-time rotation chose
+        (or would have chosen, when rotation never ran at all and the round
+        closed with every submission).
+        """
+        from minotaur_subnet.harness.rotation import (
+            RotationLedger,
+            rotation_ledger_path,
+            select_rotation_slate,
+        )
+
+        slots = _rotation_slate_slots()
+        if slots <= 0 or len(benchmarking) <= slots:
+            return benchmarking
+        # The slate is a per-ROUND budget, not per-pass: select it over every
+        # submission of the round that occupies (or already consumed) a slate
+        # slot, so a slate member that got benched — SCORED, or benched-and-
+        # validity-REJECTED (it has benchmark_details) — keeps holding its slot
+        # and the overflow can never trickle in `slots`-sized bites across
+        # passes. Excluded: ADOPTED (an old round's incumbent, never a mid-round
+        # state) and rejects WITHOUT bench details (rotation/screening rejects —
+        # they never occupied a slot; this mirrors rotation's candidate filter).
+        def _occupies_slot(s: Any) -> bool:
+            st = str(getattr(getattr(s, "status", None), "value", None)
+                     or getattr(s, "status", "") or "")
+            if st == "adopted":
+                return False
+            if st == "rejected":
+                return bool(getattr(s, "benchmark_details", None))
+            return True
+
+        try:
+            round_subs = self._sub_store.list_by_round(round_id)
+        except Exception:  # noqa: BLE001 — belt must never break the pass
+            round_subs = list(benchmarking)
+        live = [s for s in round_subs if _occupies_slot(s)]
+        if len(live) <= slots:
+            return benchmarking
+        last_selected = RotationLedger(rotation_ledger_path()).load()
+        slate, _ = select_rotation_slate(live, slots, last_selected, round_id)
+        slate_ids = {s.submission_id for s in slate}
+        kept = [s for s in benchmarking if s.submission_id in slate_ids]
+        dropped = [s for s in benchmarking if s.submission_id not in slate_ids]
+        if dropped:
+            logger.warning(
+                "[benchmark] round %s has %d live submissions but the rotation "
+                "slate is %d — the close-time reject sweep must have been "
+                "truncated (or rotation never ran). Benching only the slate: "
+                "kept=%s not-benched=%s (the overflow stays un-benched; this "
+                "belt does not reject it).",
+                round_id, len(live), slots,
+                [s.submission_id for s in kept],
+                [s.submission_id for s in dropped],
+            )
+        return kept
+
     async def run_once(self) -> int:
         """Process all BENCHMARKING submissions in a single pass.
 
@@ -696,6 +769,12 @@ class BenchmarkWorker:
                 sub for sub in benchmarking
                 if sub.round_id == replay_round.round_id
             ]
+            # BELT: a CLOSED/REPLAYING round must never bench past the
+            # rotation slate, even when the close-time reject sweep was
+            # truncated (see _cap_to_rotation_slate).
+            benchmarking = self._cap_to_rotation_slate(
+                benchmarking, replay_round.round_id,
+            )
         elif self._round_store is not None:
             current_round = self._round_store.get_current_round()
             if current_round is not None:
