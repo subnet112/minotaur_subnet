@@ -115,26 +115,33 @@ class _RotSub:
 
 
 class _RotStore:
-    """Minimal store: records the call ORDER so tests can assert the notify
-    fires before the (token-purging) reject."""
+    """Minimal store: records the call ORDER so tests can assert every reject
+    lands BEFORE the (best-effort, background) notify phase, and that the
+    token is captured before the reject purges it."""
 
-    def __init__(self, subs: list[_RotSub]) -> None:
+    def __init__(self, subs: list[_RotSub], tokens: dict[str, str] | None = None) -> None:
         self._subs = subs
+        self._tokens = dict(tokens or {})
         self.events: list[tuple[str, str]] = []
 
     def list_by_round(self, round_id: str):
         return list(self._subs)
 
+    def get_repo_token(self, submission_id: str):
+        return self._tokens.get(submission_id)
+
     def reject(self, submission_id: str, reason: str) -> None:
+        self._tokens.pop(submission_id, None)  # terminal — purges the secret
         self.events.append(("reject", submission_id))
 
 
-def test_rotation_notifies_before_reject(tmp_path):
+def test_rotation_rejects_first_then_notifies_with_retained_token(tmp_path):
     subs = [_RotSub(f"sub_{i}", f"hk{i}") for i in range(3)]
-    store = _RotStore(subs)
+    store = _RotStore(subs, tokens={s.submission_id: f"ghp_{s.submission_id}" for s in subs})
+    notified: list[tuple[str, str | None]] = []
 
-    def notify(sub, reason):
-        store.events.append(("notify", sub.submission_id))
+    def notify(sub, reason, repo_token=None):
+        notified.append((sub.submission_id, repo_token))
         assert "not selected for r1" in reason
 
     res = apply_rotation_slate(
@@ -144,20 +151,28 @@ def test_rotation_notifies_before_reject(tmp_path):
     assert res["applied"] is True
     assert len(res["skipped"]) == 1
     (skipped_id,) = res["skipped"]
-    assert store.events == [("notify", skipped_id), ("reject", skipped_id)]
+    # Every reject landed synchronously, before any notify could run/fail.
+    assert store.events == [("reject", skipped_id)]
+    # Notify runs in the background phase with the token captured BEFORE the
+    # reject purged it — so the private-PR comment can still post.
+    res["notify_thread"].join(timeout=10)
+    assert notified == [(skipped_id, f"ghp_{skipped_id}")]
+    assert store.get_repo_token(skipped_id) is None  # purge still happened
 
 
 def test_rotation_notify_failure_never_blocks_reject(tmp_path):
     subs = [_RotSub(f"sub_{i}", f"hk{i}") for i in range(3)]
     store = _RotStore(subs)
 
-    def notify(sub, reason):
+    def notify(sub, reason, repo_token=None):
         raise RuntimeError("github down")
 
     res = apply_rotation_slate(
         store, "r1", 1, RotationLedger(str(tmp_path / "ledger.json")),
         now=100.0, notify=notify,
     )
+    if res["notify_thread"] is not None:
+        res["notify_thread"].join(timeout=10)
     rejected = [sid for ev, sid in store.events if ev == "reject"]
     assert sorted(rejected) == sorted(res["skipped"])
     assert len(rejected) == 2
