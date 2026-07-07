@@ -412,6 +412,26 @@ def _solver_build_command(image_tag: str, repo_path: str) -> list[str]:
     ]
 
 
+# Global bound on concurrent stage-2 runs (docker build + import/init
+# containers). Submission intake spawns one screening pipeline per submission
+# with NO concurrency cap, so a submission burst used to run N builds at once:
+# at 2 CPUs per build on the leader's 4-core host (plus bench containers and
+# anvil forks) the host saturated and the api process went silent for 40-60s
+# at a time — nginx "upstream timed out" storms, browsers seeing dead CORS
+# preflights (live incident 2026-07-07; ~10k timeouts/day during the 07-05/06
+# submission-spam wave). Serialized by default; raise only on hosts with
+# spare cores. Lazily created so the Semaphore binds to the running loop.
+_stage2_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_stage2_semaphore() -> asyncio.Semaphore:
+    global _stage2_semaphore
+    if _stage2_semaphore is None:
+        limit = int(os.environ.get("SCREENING_BUILD_CONCURRENCY", "1") or "1")
+        _stage2_semaphore = asyncio.Semaphore(max(1, limit))
+    return _stage2_semaphore
+
+
 async def run_stage_2(
     repo_path: str,
     image_tag: str,
@@ -419,6 +439,11 @@ async def run_stage_2(
     init_timeout: float = 60.0,
 ) -> StageResult:
     """Build the Docker image and verify solver can be imported and initialized.
+
+    Concurrency-bounded by SCREENING_BUILD_CONCURRENCY (default 1): the CPU
+    caps in _solver_build_command are per-build, so only a global bound stops
+    a burst of submissions from stacking builds past the host's core count.
+    Queue wait is excluded from the reported duration_ms.
 
     Steps:
     1. Build Docker image from repo's Dockerfile
@@ -435,6 +460,18 @@ async def run_stage_2(
     Returns:
         StageResult with pass/fail and details.
     """
+    async with _get_stage2_semaphore():
+        return await _run_stage_2_locked(
+            repo_path, image_tag, build_timeout, init_timeout,
+        )
+
+
+async def _run_stage_2_locked(
+    repo_path: str,
+    image_tag: str,
+    build_timeout: float,
+    init_timeout: float,
+) -> StageResult:
     start = time.monotonic()
 
     # Step 1: Build the untrusted miner image on the LEGACY builder (see build_env
