@@ -1828,3 +1828,131 @@ async def internal_diagnostic_score_image_result(job_id: str, request: Request):
     if res is None:
         raise HTTPException(status_code=404, detail="Unknown diagnostic job_id")
     return res
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Distributed benchmark veto — wire endpoints (Phase 0, observe-only).
+# INERT until armed: the receiver needs a LEADER-SIGNED assignment (nothing
+# fans out until the coordinator gate lands + DISTRIBUTED_VETO is on), and the
+# response endpoint only accepts responses for registry-known assignments.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _reject_oversized_body(request: Request, max_bytes: int) -> None:
+    """Reject on the declared Content-Length BEFORE the body is read (411 if
+    absent — chunked bodies can't be size-bounded pre-read; 413 if oversized).
+    uvicorn/h11 delivers at most the declared length, so a spoofed-small header
+    can't stream past it. The 142MB submissions.json event-loop-freeze class."""
+    raw = request.headers.get("content-length")
+    try:
+        declared = int(raw) if raw is not None else None
+    except ValueError:
+        declared = None
+    if declared is None:
+        raise HTTPException(status_code=411, detail="Content-Length required")
+    if declared > max_bytes:
+        raise HTTPException(status_code=413, detail="request body too large")
+
+
+@router.post("/solver/round/internal/veto-assignment")
+async def receive_veto_assignment(request: Request):
+    """Follower receiver: a leader-signed slice assignment.
+
+    Auth is the SAME leader-signature scheme as round-lifecycle sync (no
+    shared-key fallback). A node with DISTRIBUTED_VETO off answers 409 — the
+    leader records terminal-UNSUPPORTED (= abstain), so a mixed/unarmed fleet
+    degrades to today's behavior. The bench itself runs async; this handler
+    only ACKs (the proposal endpoint's inline bench is the anti-pattern —
+    it's why the harvest needs 300s/peer timeouts).
+
+    ORDERING: the flag check and Content-Length reject run BEFORE the body is
+    read (auth parses the whole body to verify the signature) — so when the
+    kill switch is OFF this endpoint is truly inert (no body touched), and an
+    armed follower still caps the pre-auth parse.
+    """
+    from . import veto_wire
+
+    if not veto_wire.distributed_veto_enabled():
+        raise HTTPException(status_code=409, detail="distributed veto disabled")
+    _reject_oversized_body(request, veto_wire.MAX_VETO_ASSIGNMENT_BYTES)
+
+    await _authorize_internal_round_sync(request)
+    payload = await request.json()
+    from .round_manager import _current_solver_round_epoch
+
+    ack = veto_wire.accept_assignment(
+        payload,
+        current_epoch=_current_solver_round_epoch(),
+        own_evm=veto_wire.own_validator_evm(),
+        runner_factory=veto_wire._production_runner,
+    )
+    if not ack.get("accepted"):
+        raise HTTPException(status_code=422, detail=ack.get("reason", "rejected"))
+    return ack
+
+
+@router.get("/solver/round/{round_id}/veto-assignment")
+async def get_veto_assignment(round_id: str, validator: str = Query(...)):
+    """Serve the persisted assignment for one validator (leader side).
+
+    Public like the champion sync-bundle: the payload is leader-signed, so
+    possession proves nothing and tampering requires the leader key. This is
+    the re-send/pull fallback surface — the primary delivery is the
+    coordinator's re-send-per-tick loop. The signed bytes are cached per
+    assignment_id so repeated calls can't force per-request leader-key signs
+    onto the event loop.
+    """
+    from . import veto_wire
+    from .round_manager import _sign_internal_round_payload
+    from .state import get_champion_peer_network
+
+    network = get_champion_peer_network()
+    signed = veto_wire.serve_signed_assignment(
+        round_id, validator,
+        sign_payload=lambda p: _sign_internal_round_payload(network, p),
+    )
+    if signed is None:
+        raise HTTPException(status_code=404, detail="no assignment for round/validator")
+    return signed
+
+
+@router.post("/solver/round/internal/veto-response")
+async def receive_veto_response(request: Request):
+    """Leader receiver: a follower-signed slice verdict.
+
+    ORDERING IS THE DEFENSE: (1) fast-reject when the feature is disabled, then
+    Content-Length reject BEFORE the body is read — an unbounded request.json()
+    on the event loop is the 142MB submissions.json incident class, and the
+    flag gate keeps signature recovery off the event loop while unarmed;
+    (2) signature recovery + authorized-signer check via the champion consensus
+    manager's validator set (the routes-layer verifiers are leader-locked and
+    would 401 every follower); (3) assignment binding + caps + idempotent record.
+    """
+    from . import veto_wire
+
+    if not veto_wire.distributed_veto_enabled():
+        raise HTTPException(status_code=409, detail="distributed veto disabled")
+    _reject_oversized_body(request, veto_wire.MAX_VETO_RESPONSE_BYTES)
+
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="body is not valid JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    from .state import get_champion_consensus_manager
+
+    manager = get_champion_consensus_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=503, detail="champion consensus manager not wired",
+        )
+
+    status, body = veto_wire.ingest_response(
+        raw,
+        registry=veto_wire.REGISTRY,
+        is_authorized_signer=manager._is_authorized_signer,
+    )
+    if status != 200:
+        raise HTTPException(status_code=status, detail=body.get("reason", "rejected"))
+    return body

@@ -48,11 +48,14 @@ def _assignment(validator="0xAbCd", order_ids=None, deadline=100) -> SliceAssign
         candidate_submission_id="sub_123",
         candidate_image_id="a" * 64,
         incumbent_image_id="b" * 64,
+        candidate_image_ref="ghcr.io/x@sha256:" + "a" * 64,
+        incumbent_image_ref="ghcr.io/x@sha256:" + "b" * 64,
         order_ids=list(ids),
-        order_hashes={oid: f"h_{oid}" for oid in ids},
+        order_hashes={oid: f"h_{oid}" for oid in ids + ["cal_1"]},
         calibration_order_ids=["cal_1"],
         fork_pins={"8453": 28000000},
         deadline_epoch=deadline,
+        leader_api_url="http://leader:8080",
     )
 
 
@@ -108,6 +111,21 @@ class TestAssignmentIdentity:
         # validator is the same assignment content.
         other_validator = _assignment(validator="0xFFFF")
         assert a.assignment_id == other_validator.assignment_id
+
+    def test_hashes_must_cover_calibration_and_no_overlap(self):
+        # hashes must cover slice + calibration ids
+        payload = _assignment().to_payload()
+        payload["order_hashes"] = {
+            k: v for k, v in payload["order_hashes"].items() if k != "cal_1"
+        }
+        ok, reason = verify_assignment_integrity(payload)
+        assert not ok and "calibration" in reason
+        # a calibration id that is ALSO a slice id is a malformed partition
+        a = _assignment()
+        a.calibration_order_ids = ["ord_a"]
+        a.order_hashes = {oid: f"h_{oid}" for oid in a.order_ids}
+        ok, reason = verify_assignment_integrity(a.to_payload())
+        assert not ok and "overlap" in reason
 
     def test_empty_slice_rejected(self):
         payload = _assignment(order_ids=[]).to_payload()
