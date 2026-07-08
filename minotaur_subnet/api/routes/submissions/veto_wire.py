@@ -47,11 +47,13 @@ from minotaur_subnet.epoch.distributed_veto import (
     STATUS_REFUSED,
     VERDICT_OK,
     VERDICT_VETO,
+    VETO_VERIFY_BUDGET_ORDERS,
     SliceAssignment,
     SliceViolation,
     VetoPhaseState,
     VetoResponse,
     assign_slices,
+    plan_reverification,
     resolve_phase,  # noqa: F401 — re-exported for the Phase-0 coordinator gate
     validate_response,
     verify_assignment_integrity,
@@ -136,6 +138,7 @@ class VetoPhaseRegistry:
         while len(self._phases) > self._MAX_ROUNDS:
             oldest = next(iter(self._phases))
             self._phases.pop(oldest, None)
+            forget_round_send_state(oldest)  # don't leak per-round send state
             logger.info("[distributed-veto] evicted phase for %s (bound)", oldest)
 
     def get(self, round_id: str) -> VetoPhaseState | None:
@@ -311,37 +314,58 @@ def build_assignments(
     return assignments
 
 
+# A validator is marked terminal-UNSUPPORTED only after this many CONSECUTIVE
+# deterministic rejects (LOCKED DECISION 12): a one-off 404 mid-watchtower-
+# recreate or an epoch-skewed 422 is transient and must not drop a capable
+# follower's slice.
+K_CONSECUTIVE_UNSUPPORTED: int = 3
+
+# (round_id, validator_evm) -> consecutive deterministic-reject count.
+_SEND_REJECT_STREAKS: dict[tuple[str, str], int] = {}
+
+
+def _reset_send_streaks() -> None:
+    _SEND_REJECT_STREAKS.clear()
+
+
 async def fan_out_assignments(
     assignments: list[SliceAssignment],
     *,
     peer_urls: dict[str, str],  # validator_evm(lower) -> api base url
     sign_payload: Callable[[dict], dict],
+    exclude: set[str] | None = None,
+    timeout_s: float = 5.0,
     post_json: Callable[..., Awaitable[tuple[int, Any]]] | None = None,
 ) -> dict[str, str]:
-    """Send each validator ITS assignment. Single-shot, skip-on-fail — the
-    coordinator re-calls every tick until response-or-deadline (there is no
-    follower-side pull trigger; the re-send loop IS the delivery guarantee).
+    """Send each validator ITS assignment — CONCURRENTLY, short per-peer
+    timeout. Single-shot, skip-on-fail; the coordinator re-calls every tick
+    until response-or-deadline (there is no follower-side pull trigger; the
+    re-send loop IS the delivery guarantee).
 
-    Returns {validator_evm: SEND_*}. A single deterministic HTTP reject
-    (endpoint missing on :stable, feature disabled, auth reject) maps to
-    SEND_UNSUPPORTED for THIS tick — but the coordinator (PR 3) must only mark
-    a validator terminal-UNSUPPORTED after K CONSECUTIVE such rejects
-    (LOCKED DECISION 12): a one-off 404 mid-watchtower-recreate or an
-    epoch-skewed 'deadline elapsed' 422 is transient, and marking it terminal
-    on the first reject would drop a capable follower's slice. Network
-    failures map to UNREACHABLE (always retry next tick). PR 3 must ALSO pass
-    an exclude set of already-responded validators so a completed slice is
-    never re-sent (which would re-spawn a duplicate bench once the follower's
-    task idempotency window has rolled over).
+    Concurrency + a short ``timeout_s`` are load-bearing: a black-hole peer
+    (accepts TCP, never answers) must NOT serialize-block the caller — the whole
+    fan-out is bounded by ``timeout_s``, not N×timeout, so it stays safe even on
+    the coordinator loop. ``exclude`` (already-responded or already-terminal
+    validators) are skipped so a completed slice is never re-sent.
+
+    Returns {validator_evm: SEND_*}. A deterministic HTTP reject maps to
+    SEND_UNSUPPORTED for THIS tick but only becomes terminal after
+    K_CONSECUTIVE_UNSUPPORTED consecutive rejects (tracked per round+validator);
+    a network failure/timeout maps to UNREACHABLE and resets the streak.
     """
-    poster = post_json or _post_json
-    results: dict[str, str] = {}
-    for assignment in assignments:
+    async def _default(url, payload):
+        return await _post_json(url, payload, timeout_s)
+
+    poster = post_json or _default
+    skip = {e.lower() for e in (exclude or set())}
+
+    async def _send_one(assignment: SliceAssignment) -> tuple[str, str]:
         evm = assignment.validator_evm.lower()
+        key = (assignment.round_id, evm)
         base = (peer_urls.get(evm) or "").rstrip("/")
         if not base:
-            results[evm] = SEND_UNREACHABLE
-            continue
+            _SEND_REJECT_STREAKS.pop(key, None)
+            return evm, SEND_UNREACHABLE
         payload = sign_payload(assignment.to_payload())
         try:
             status, _body = await poster(f"{base}{ASSIGNMENT_PATH}", payload)
@@ -349,15 +373,50 @@ async def fan_out_assignments(
             logger.info(
                 "[distributed-veto] assignment send to %s failed: %s", evm, exc,
             )
-            results[evm] = SEND_UNREACHABLE
-            continue
+            _SEND_REJECT_STREAKS.pop(key, None)
+            return evm, SEND_UNREACHABLE
         if status in (200, 202):
-            results[evm] = SEND_ACKED
-        elif status in (401, 403, 404, 405, 409, 410, 422):
-            results[evm] = SEND_UNSUPPORTED
+            _SEND_REJECT_STREAKS.pop(key, None)
+            return evm, SEND_ACKED
+        if status in (401, 403, 404, 405, 409, 410, 422):
+            _SEND_REJECT_STREAKS[key] = _SEND_REJECT_STREAKS.get(key, 0) + 1
+            return evm, SEND_UNSUPPORTED
+        _SEND_REJECT_STREAKS.pop(key, None)
+        return evm, SEND_UNREACHABLE
+
+    targets = [a for a in assignments if a.validator_evm.lower() not in skip]
+    if not targets:
+        return {}
+    settled = await asyncio.gather(
+        *(_send_one(a) for a in targets), return_exceptions=True,
+    )
+    results: dict[str, str] = {}
+    for a, outcome in zip(targets, settled):
+        if isinstance(outcome, BaseException):
+            results[a.validator_evm.lower()] = SEND_UNREACHABLE
         else:
-            results[evm] = SEND_UNREACHABLE
+            evm, status = outcome
+            results[evm] = status
     return results
+
+
+def consecutive_reject_terminal(round_id: str, validator_evm: str) -> bool:
+    """Whether a validator has hit K_CONSECUTIVE_UNSUPPORTED rejects this round
+    (so the coordinator marks it terminal-UNSUPPORTED)."""
+    return (
+        _SEND_REJECT_STREAKS.get((round_id, validator_evm.lower()), 0)
+        >= K_CONSECUTIVE_UNSUPPORTED
+    )
+
+
+def forget_round_send_state(round_id: str) -> None:
+    """Drop all per-round send bookkeeping (reject streaks + signed-serve cache)
+    when a phase resolves or is evicted — else these module dicts leak one entry
+    per (round, validator) for the whole leader uptime."""
+    for key in [k for k in _SEND_REJECT_STREAKS if k[0] == round_id]:
+        _SEND_REJECT_STREAKS.pop(key, None)
+    for key in [k for k in _SIGNED_SERVE_CACHE if k[0] == round_id]:
+        _SIGNED_SERVE_CACHE.pop(key, None)
 
 
 async def _post_json(
@@ -582,35 +641,69 @@ async def run_slice_bench(
         return _failed(assignment, f"bench_error:{exc}")
 
     # 5. Slice-local verdict with the AUTHORITATIVE rule, then extract the
-    #    hard-veto evidence. Calibration rows report both sides' outputs but
-    #    NEVER contribute violations (validate_response enforces it too).
+    #    hard-veto evidence.
     from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
 
     verdict = evaluate_relative_adoption(champ_results, chal_results)
+    violations, counts, calibration_rows, matched_rows = extract_slice_evidence(
+        verdict, slice_orders, calib_orders, chal_results,
+    )
 
-    # The harness labels every row f"{app_id}:{scenario_name}" =
-    # "{app_id}:hist:{order_id}". Map rows back to order_id via the RESOLVED
-    # records (their app_id + order_id), never by string-stripping — a shape
-    # drift must fail the coverage assert below, not silently skip every row
-    # into a vacuous OK.
+    # Coverage assert: every slice + calibration order MUST have produced a
+    # matched row. A shortfall means label drift or a lost row — REFUSE loudly
+    # rather than emit a partial/vacuous verdict (the whole point of the strict
+    # explicit-order path).
+    expected = len(slice_orders) + len(calib_orders)
+    if matched_rows != expected:
+        return _refused(assignment, f"row_coverage:{matched_rows}/{expected}")
+
+    return VetoResponse(
+        assignment_id=assignment.assignment_id,
+        round_id=assignment.round_id,
+        validator_evm=assignment.validator_evm,
+        status=STATUS_COMPLETED,
+        verdict=VERDICT_VETO if violations else VERDICT_OK,
+        violations=violations,
+        counts=counts,
+        calibration=calibration_rows,
+    )
+
+
+def _order_label(order: dict[str, Any]) -> str:
+    """The harness row label for a historical order: f'{app_id}:hist:{order_id}'
+    (orchestrator builds intent_id = f'{app_id}:{scenario_name}', scenario_name
+    = f'hist:{order_id}'). Map rows back via the RESOLVED records — never by
+    string-stripping — so a shape drift fails the coverage assert, not silently
+    skips every row into a vacuous OK."""
+    return f"{order.get('app_id')}:hist:{order.get('order_id')}"
+
+
+def extract_slice_evidence(
+    verdict: dict[str, Any],
+    slice_orders: list[dict[str, Any]],
+    calib_orders: list[dict[str, Any]],
+    chal_results: list[Any],
+) -> tuple[list[SliceViolation], dict[str, int], list[dict[str, str]], int]:
+    """Turn an ``evaluate_relative_adoption`` verdict into (violations, counts,
+    calibration_rows, matched_rows). Shared by the follower slice bench and the
+    leader re-verification so both read the rule the same way.
+
+    Calibration rows report both sides' outputs but NEVER contribute violations.
+    A challenger row that produced nothing via a HARNESS failure (error!=None,
+    raw_output None — timeout / respawn / run-budget tail) is infra noise, not a
+    dropped order: bucketed into counts['bench_error'] so it never becomes a
+    hard-veto claim that burns re-verify budget and strikes an honest-but-slow
+    follower. A genuine no-plan (no error) still counts as dropped.
+    """
     label_to_oid: dict[str, str] = {}
-    slice_ids: set[str] = set()
     calib_ids: set[str] = set()
     for o in slice_orders:
-        oid = str(o.get("order_id"))
-        label_to_oid[f"{o.get('app_id')}:hist:{oid}"] = oid
-        slice_ids.add(oid)
+        label_to_oid[_order_label(o)] = str(o.get("order_id"))
     for o in calib_orders:
         oid = str(o.get("order_id"))
-        label_to_oid[f"{o.get('app_id')}:hist:{oid}"] = oid
+        label_to_oid[_order_label(o)] = oid
         calib_ids.add(oid)
 
-    # A challenger side that produced NOTHING via a HARNESS failure (timeout,
-    # respawn exhaustion, run-budget tail) rather than a real no-plan — the row
-    # carries error!=None + raw_output None. That is infra noise, not a dropped
-    # order: bucket it into counts['bench_error'] so it never becomes a
-    # hard-veto claim that burns the leader's re-verify budget and strikes an
-    # honest-but-slow follower.
     chal_errored = {
         str(getattr(r, "intent_id", "")): bool(getattr(r, "error", None))
         for r in chal_results
@@ -649,7 +742,7 @@ async def run_slice_bench(
             counts["matched"] += 1
         elif v == "dropped":
             if chal_errored.get(iid):
-                counts["bench_error"] += 1  # infra noise, not a real drop
+                counts["bench_error"] += 1
                 continue
             counts["dropped"] += 1
             violations.append(SliceViolation(
@@ -665,25 +758,7 @@ async def run_slice_bench(
                     order_id=oid, kind="catastrophic",
                     champ_raw=str(champ_raw), chal_raw=str(chal_raw),
                 ))
-
-    # Coverage assert: every slice + calibration order MUST have produced a
-    # matched row. A shortfall means label drift or a lost row — REFUSE loudly
-    # rather than emit a partial/vacuous verdict (the whole point of the strict
-    # explicit-order path).
-    expected = len(slice_ids) + len(calib_ids)
-    if matched_rows != expected:
-        return _refused(assignment, f"row_coverage:{matched_rows}/{expected}")
-
-    return VetoResponse(
-        assignment_id=assignment.assignment_id,
-        round_id=assignment.round_id,
-        validator_evm=assignment.validator_evm,
-        status=STATUS_COMPLETED,
-        verdict=VERDICT_VETO if violations else VERDICT_OK,
-        violations=violations,
-        counts=counts,
-        calibration=calibration_rows,
-    )
+    return violations, counts, calibration_rows, matched_rows
 
 
 async def submit_response(
@@ -922,3 +997,140 @@ async def _production_runner(assignment: SliceAssignment) -> None:
             "[distributed-veto] response submission for %s failed: %s",
             assignment.round_id, exc,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Leader re-verification + observe summary (Phase 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def distributed_veto_reverify_enabled() -> bool:
+    """Leader re-verification sub-switch (default OFF, independent of the main
+    kill switch). When OFF the leader records what followers CLAIM without
+    re-benching — so the initial observe soak measures fan-out + follower
+    verdicts with ZERO added docker load on the leader (which also runs the
+    canonical benchmark). Turn on deliberately, later in the soak, to measure
+    trust-but-verify reproduction."""
+    return (os.environ.get("DISTRIBUTED_VETO_REVERIFY", "0").strip().lower()) in (
+        "1", "true", "yes", "on",
+    )
+
+
+async def reverify_dissents(
+    phase: VetoPhaseState,
+    *,
+    order_lookup: Callable[[str], dict[str, Any] | None],
+    worker_factory: Callable[[], Any],
+    pull_image: Callable[[str], Awaitable[bool]],
+    budget_orders: int = VETO_VERIFY_BUDGET_ORDERS,
+) -> dict[str, Any]:
+    """Leader-side re-verification of the round's claimed vetoes.
+
+    Unions the per-response re-verify plans (dropped-first, largest-cut,
+    deduped, capped at ``budget_orders``), benches incumbent + candidate on
+    exactly those orders at the round's pin, and recomputes the hard-violation
+    set with the SAME rule the follower used (``extract_slice_evidence``). A
+    veto STANDS only on a leader-reproduced violation. Returns a summary dict;
+    the caller (Phase 0) only LOGS it — it never gates certification.
+
+    Any resolution/bench gap is a swallowed no-op (returns ran=False) — an
+    observe pass must never raise into the coordinator.
+    """
+    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.harness.benchmark_worker import ExplicitOrderUnavailable
+    from minotaur_subnet.harness.image_transport import is_digest_ref
+    from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
+
+    empty = {"ran": False, "planned": 0, "confirmed": 0, "discarded": 0, "orders": {}}
+    if not phase.assignments:
+        return empty
+
+    planned: list[SliceViolation] = []
+    seen: set[str] = set()
+    for resp in phase.responses.values():
+        for v in plan_reverification(resp, budget_orders):
+            if v.order_id not in seen:
+                seen.add(v.order_id)
+                planned.append(v)
+    planned = planned[:budget_orders]
+    if not planned:
+        return empty
+
+    # Images + pin are round-constant; any assignment carries them.
+    a0 = phase.assignments[0]
+    if not (is_digest_ref(a0.candidate_image_ref) and is_digest_ref(a0.incumbent_image_ref)):
+        return empty
+
+    orders: list[dict[str, Any]] = []
+    for v in planned:
+        rec = order_lookup(v.order_id)
+        if rec is not None:
+            orders.append(rec)
+    if not orders:
+        return empty
+
+    chains = {o.get("chain_id") for o in orders}
+    if len(chains) != 1:
+        return empty
+    pin = a0.fork_pins.get(str(next(iter(chains))))
+    if not pin:
+        return empty
+
+    try:
+        for ref in (a0.candidate_image_ref, a0.incumbent_image_ref):
+            if not await pull_image(ref):
+                return empty
+        worker = worker_factory()
+        worker._epoch_block_number = int(pin)
+        champ = await worker.benchmark_explicit_orders(a0.incumbent_image_ref, orders)
+        chal = await worker.benchmark_explicit_orders(a0.candidate_image_ref, orders)
+    except (ExplicitOrderUnavailable, RealSimulationUnavailable):
+        return empty
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — observe must never raise
+        logger.warning("[distributed-veto] re-verify bench failed: %s", exc)
+        return empty
+
+    verdict = evaluate_relative_adoption(champ, chal)
+    violations, _c, _cal, _m = extract_slice_evidence(verdict, orders, [], chal)
+    confirmed_ids = {v.order_id for v in violations}
+    per_order = {v.order_id: (v.order_id in confirmed_ids) for v in planned}
+    n_confirmed = sum(1 for ok in per_order.values() if ok)
+    return {
+        "ran": True,
+        "planned": len(planned),
+        "confirmed": n_confirmed,
+        "discarded": len(planned) - n_confirmed,
+        "orders": per_order,
+    }
+
+
+def observe_summary(
+    round_id: str,
+    phase: VetoPhaseState,
+    resolution: str,
+    reverify: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compact, JSON/round-store-safe observe record for /health + durability.
+
+    TWO explicit gate signals so the soak is not misread (LD 8: Phase 1 gates
+    ONLY on leader-confirmed violations, never on a raw follower claim):
+      - ``would_gate_claims``: any follower CLAIMED a veto (an UPPER BOUND — this
+        is NOT the Phase-1 rate; it includes irreproducible/flaky claims).
+      - ``would_gate_confirmed``: the leader re-verified a violation (the actual
+        Phase-1 predictor). Null when re-verification did not run.
+    Observe-only: nothing acts on either.
+    """
+    from minotaur_subnet.epoch.distributed_veto import phase_observe_counts
+
+    counts = phase_observe_counts(phase)
+    ran = bool(reverify and reverify.get("ran"))
+    return {
+        "round_id": round_id,
+        "candidate_submission_id": phase.candidate_submission_id,
+        "resolution": resolution,
+        **counts,
+        "reverify": reverify or {"ran": False},
+        "would_gate_claims": counts["n_veto"] > 0,
+        "would_gate_confirmed": (reverify.get("confirmed", 0) > 0) if ran else None,
+    }

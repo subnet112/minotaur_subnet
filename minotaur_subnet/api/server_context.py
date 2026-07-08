@@ -45,6 +45,10 @@ class ServerContext:
     round_anchor_parity: dict = field(default_factory=dict)
     round_anchor_task: Any = None
 
+    # Distributed-veto Phase 0: in-flight leader re-verification tasks (armed
+    # sub-flag only) — tracked so shutdown can cancel a mid-bench task.
+    veto_reverify_tasks: Any = None
+
     # ── independent adopt vote (CHALLENGER_QUORUM_MODE observability) ─────
     # This validator's latest independent ADOPT/REJECT vote on a candidate,
     # published on /health for the fleet shadow tally (poll, group by candidate).

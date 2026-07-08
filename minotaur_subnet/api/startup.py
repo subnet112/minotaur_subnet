@@ -2870,6 +2870,251 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 return True
 
+            # ── Distributed-veto Phase 0 (OBSERVE-ONLY, non-blocking) ────────
+            # Opens a veto phase when a round enters CERTIFYING, fans out slice
+            # assignments to reachable peers, collects verdicts, optionally
+            # re-verifies on the leader, and records a compact observe summary
+            # on the round + /health. It NEVER holds certification (returns
+            # None, runs before _maybe_certify_round) and NEVER changes round
+            # status — so it cannot add latency to or destabilize champion
+            # adoption. Entirely gated on DISTRIBUTED_VETO (default OFF): when
+            # unarmed this is a single env check per tick.
+            # NO synchronous RPC on the event loop. Phase 0 is observe-only and
+            # does not need real anti-collusion entropy — a degraded (predictable)
+            # seed is acceptable and documented. Phase 1 enforcement MUST fetch a
+            # genuine post-close block hash OFF the loop (loop.run_in_executor, as
+            # the round-anchor parity probe does) and refuse to enforce on a
+            # degraded seed. Keeping any RPC off this path is what makes the
+            # observe pass safe to run on the leader (a hanging Base RPC here
+            # would freeze certification, the BlockLoop, and /health).
+            _VETO_ENTROPY = "degraded:observe-only-phase0"
+            # Fire-and-forget leader re-verification tasks (armed sub-flag only).
+            # Tracked so shutdown can cancel an in-flight bench; self-discarded on
+            # completion. Stored on ctx so the shutdown path can reach it.
+            _VETO_REVERIFY_TASKS: set = set()
+            ctx.veto_reverify_tasks = _VETO_REVERIFY_TASKS
+
+            def _veto_peer_urls() -> dict:
+                net = submissions.get_champion_peer_network()
+                if net is None:
+                    return {}
+                out = {}
+                for p in net.peers:
+                    vid = getattr(p, "validator_id", None)
+                    url = getattr(p, "url", None)
+                    if vid and url:
+                        out[vid.lower()] = url
+                return out
+
+            def _veto_bare_digest(submission_id: str | None) -> str | None:
+                """Resolve a submission's pushed bare GHCR digest (from its stored
+                image_digest ref). Read-only; None when the image was never pushed
+                (legacy id only) → the phase honestly skips."""
+                if not submission_id:
+                    return None
+                try:
+                    from minotaur_subnet.harness.image_transport import bare_hex
+
+                    sub = submissions.get_store().get_submission(submission_id)
+                    return bare_hex(getattr(sub, "image_digest", None)) if sub else None
+                except Exception:  # noqa: BLE001 — never break the observe pass
+                    return None
+
+            def _record_veto_skip(round_id, finalist_sub, candidate_digest, reason) -> None:
+                from minotaur_subnet.api.routes.submissions import veto_wire
+                from minotaur_subnet.epoch.distributed_veto import VetoPhaseState
+
+                veto_wire.REGISTRY.open_phase(round_id, VetoPhaseState(
+                    candidate_submission_id=finalist_sub or "",
+                    candidate_image_id=candidate_digest or "",
+                    deadline_epoch=_current_solver_round_epoch(ctx),
+                    resolved=True, resolution=reason,
+                ))
+                round_store.set_round_veto_observe(round_id, {
+                    "round_id": round_id, "resolution": reason,
+                    "would_gate_claims": False, "would_gate_confirmed": False,
+                })
+                logger.info("[distributed-veto] round %s: %s", round_id, reason)
+
+            def _open_veto_phase(current) -> None:
+                # CHEAP + non-blocking (no RPC): resolve pushed digests from the
+                # submission store, partition the corpus, build signed assignments.
+                from minotaur_subnet.api.routes.submissions import veto_wire
+                from minotaur_subnet.epoch.distributed_veto import VetoPhaseState
+
+                round_id = current.round_id
+                finalist_sub = current.finalist_submission_id
+                candidate_digest = _veto_bare_digest(finalist_sub)
+                incumbent_digest = _veto_bare_digest(current.incumbent_submission_id)
+                # Both images must be pushed as bare digests (mirrors the quorum>1
+                # cert gate) — the follower pulls by digest. finalist_image_id /
+                # incumbent_image_id are local sha256: ids, NOT pullable digests,
+                # so we resolve the pushed digest from each submission's stored
+                # image_digest ref; a missing one is an honest skip (surfaced on
+                # /health so an operator sees WHY there's no coverage).
+                if not (candidate_digest and incumbent_digest):
+                    _record_veto_skip(
+                        round_id, finalist_sub, candidate_digest, "skipped_no_digest",
+                    )
+                    return
+
+                # Interior deadline: strictly below the round's decision deadline
+                # (LD 5/12), and bounded so a phase can't linger.
+                now = _current_solver_round_epoch(ctx)
+                ddl = current.decision_deadline_epoch
+                upper = now + 20 if ddl is None else min(now + 20, int(ddl) - 1)
+                deadline = max(now + 1, upper)
+
+                assignments = veto_wire.build_assignments(
+                    ctx.store,
+                    round_id=round_id,
+                    candidate_submission_id=finalist_sub or "",
+                    candidate_image_id=candidate_digest,
+                    incumbent_image_id=incumbent_digest,
+                    # Pins are sealed at close (current.fork_pins); never re-derive
+                    # here (that would be a synchronous multi-chain RPC on the loop).
+                    fork_pins=(current.fork_pins or {}),
+                    deadline_epoch=deadline,
+                    validator_evms=list(_veto_peer_urls().keys()),
+                    entropy=_VETO_ENTROPY,
+                    leader_api_url=(os.environ.get("API_URL", "") or "").strip(),
+                )
+                veto_wire.REGISTRY.open_phase(round_id, VetoPhaseState(
+                    candidate_submission_id=finalist_sub or "",
+                    candidate_image_id=candidate_digest,
+                    deadline_epoch=deadline,
+                    assignments=assignments,
+                ))
+                round_store.set_round_veto_observe(round_id, {
+                    "round_id": round_id, "resolution": "opened",
+                    "n_assignments": len(assignments),
+                    "would_gate_claims": False, "would_gate_confirmed": False,
+                })
+                logger.info(
+                    "[distributed-veto] round %s: opened observe phase, %d "
+                    "assignment(s), deadline_epoch=%d", round_id,
+                    len(assignments), deadline,
+                )
+
+            def _spawn_veto_reverify(round_id, phase, resolution) -> None:
+                """Leader re-verification runs FIRE-AND-FORGET (never on the
+                coordinator's critical path): it benches on the shared sim lock
+                for minutes. On completion it writes the observe summary. The
+                summary is observe-only — it gates nothing — so a background write
+                is safe. Only spawned when the sub-flag is armed AND a real veto
+                exists."""
+                from minotaur_subnet.api.routes.submissions import veto_wire
+
+                async def _run():
+                    reverify = None
+                    try:
+                        reverify = await veto_wire.reverify_dissents(
+                            phase,
+                            order_lookup=veto_wire._production_order_lookup,
+                            worker_factory=veto_wire._production_worker_factory,
+                            pull_image=_pull_image_for_veto,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[distributed-veto] reverify task failed: %s", exc)
+                    summary = veto_wire.observe_summary(round_id, phase, resolution, reverify)
+                    round_store.set_round_veto_observe(round_id, summary)
+                    logger.info(
+                        "[distributed-veto] round %s observe (reverified): %s",
+                        round_id, summary,
+                    )
+                    _VETO_REVERIFY_TASKS.discard(asyncio.current_task())
+
+                _VETO_REVERIFY_TASKS.add(asyncio.create_task(_run()))
+
+            async def _drive_veto_observe(current) -> None:
+                # OBSERVE-ONLY, NON-BLOCKING. Called at the END of the coordinator
+                # tick (after certify/activate), so it can never delay them. Its
+                # only awaited I/O is a PARALLEL, short-timeout fan-out; leader
+                # re-verification (when armed) is fire-and-forget. Fully inert
+                # (two guard reads) when DISTRIBUTED_VETO is unset.
+                from minotaur_subnet.api.routes.submissions import veto_wire
+
+                if not veto_wire.distributed_veto_enabled():
+                    return
+                if not _is_solver_round_leader():
+                    return
+                try:
+                    if (
+                        current is not None
+                        and current.status in (
+                            RoundStatus.CERTIFYING, RoundStatus.CERTIFIED,
+                        )
+                        and current.finalist_submission_id
+                        and veto_wire.REGISTRY.get(current.round_id) is None
+                    ):
+                        _open_veto_phase(current)
+
+                    now = _current_solver_round_epoch(ctx)
+                    peer_urls = _veto_peer_urls()
+                    network = submissions.get_champion_peer_network()
+
+                    def _sign(p):
+                        from minotaur_subnet.api.routes.submissions.round_manager import (
+                            _sign_internal_round_payload,
+                        )
+                        return _sign_internal_round_payload(network, p)
+
+                    for round_id, phase in list(veto_wire.REGISTRY._phases.items()):
+                        if phase.resolved:
+                            continue
+                        responded = set(phase.responses) | set(phase.unsupported)
+                        if network is not None and phase.assignments:
+                            # Parallel + short per-peer timeout: a black-hole peer
+                            # cannot serialize-block the loop.
+                            await veto_wire.fan_out_assignments(
+                                phase.assignments, peer_urls=peer_urls,
+                                sign_payload=_sign, exclude=responded,
+                                timeout_s=5.0,
+                            )
+                            for a in phase.assignments:
+                                if veto_wire.consecutive_reject_terminal(
+                                    round_id, a.validator_evm,
+                                ):
+                                    veto_wire.REGISTRY.mark_unsupported(
+                                        round_id, a.validator_evm,
+                                    )
+
+                        action, resolution = veto_wire.resolve_phase(phase, now)
+                        if action != "resolve":
+                            continue
+
+                        phase.resolved = True
+                        phase.resolution = resolution
+                        veto_wire.forget_round_send_state(round_id)
+                        if (
+                            veto_wire.distributed_veto_reverify_enabled()
+                            and any(
+                                r.verdict == "veto" for r in phase.responses.values()
+                            )
+                        ):
+                            _spawn_veto_reverify(round_id, phase, resolution)
+                        else:
+                            summary = veto_wire.observe_summary(
+                                round_id, phase, resolution, None,
+                            )
+                            round_store.set_round_veto_observe(round_id, summary)
+                            logger.info(
+                                "[distributed-veto] round %s observe: %s",
+                                round_id, summary,
+                            )
+                except Exception as exc:  # noqa: BLE001 — observe must never break the loop
+                    logger.warning(
+                        "[distributed-veto] observe pass failed (ignored): %s", exc,
+                    )
+
+            async def _pull_image_for_veto(ref: str) -> bool:
+                from minotaur_subnet.api.routes.submissions.champion_consensus import (
+                    _pull_image_by_digest,
+                )
+                return await _pull_image_by_digest(ref)
+
             async def _solver_round_loop() -> None:
                 logger.info(
                     "Solver round coordinator started (poll_interval=%.1f)",
@@ -2964,6 +3209,13 @@ async def initialize(ctx: ServerContext) -> dict:
                                 incumbent=incumbent if incumbent.submission_id else None,
                             )
                             continue
+
+                        # Distributed-veto Phase 0 observe pass — runs ONLY on a
+                        # QUIET tick (nothing closed/evaluated/certified/activated/
+                        # reopened above `continue`d), so it is structurally OFF
+                        # the champion-adoption critical path and cannot delay it.
+                        if current is not None:
+                            await _drive_veto_observe(current)
 
                         await asyncio.sleep(solver_round_poll_interval)
                     except asyncio.CancelledError:
@@ -3063,6 +3315,17 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Round-anchor parity probe stopped")
+    # Cancel any in-flight distributed-veto leader re-verification bench.
+    veto_tasks = getattr(ctx, "veto_reverify_tasks", None)
+    if veto_tasks:
+        for t in list(veto_tasks):
+            t.cancel()
+        for t in list(veto_tasks):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        logger.info("Distributed-veto re-verify tasks stopped")
     if ctx.solver_round_task is not None:
         ctx.solver_round_task.cancel()
         try:
