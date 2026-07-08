@@ -206,3 +206,95 @@ def test_round_anchor_ts_applies_one_epoch_lookback():
     assert round_anchor_ts(100, 60) == epoch_anchor_ts(99, 60) == 5940
     # exactly one epoch_seconds earlier than the naive close-epoch anchor
     assert round_anchor_ts(100, 60) == epoch_anchor_ts(100, 60) - 60
+
+
+# ── #632: per-chain lookback (slow chains anchor deeper so they bracket at open) ──
+
+from minotaur_subnet.consensus.round_anchor import (  # noqa: E402
+    ROUND_ANCHOR_LOOKBACK_EPOCHS,
+    round_anchor_lookback_epochs,
+    round_anchor_ts,
+    round_anchor_ts_for_chain,
+)
+
+BASE, ETH = 8453, 1
+_EPOCH_SECONDS, _EPOCH = 60, 100
+
+
+def _fleet_chains():
+    """Base (~2s blocks) + Ethereum (~12s blocks) at a common wall-clock == the
+    round-open timestamp (E*epoch_seconds), so only `lookback` epochs of buffer
+    exist — the exact condition that froze the leader on 2026-07-08."""
+    now = _EPOCH * _EPOCH_SECONDS  # 6000
+    chains = {
+        BASE: _Chain(t0=0, spacing=2, head=now // 2),    # 3000
+        ETH:  _Chain(t0=0, spacing=12, head=now // 12),  # 500
+    }
+    head_of = lambda c: chains[c].head
+    ts_of = lambda c, b: chains[c].ts(b)
+    return chains, head_of, ts_of
+
+
+def test_lookback_is_per_chain():
+    assert round_anchor_lookback_epochs(BASE) == ROUND_ANCHOR_LOOKBACK_EPOCHS == 1
+    assert round_anchor_lookback_epochs(ETH) == 3
+    assert round_anchor_lookback_epochs(999999) == ROUND_ANCHOR_LOOKBACK_EPOCHS  # unknown → default
+
+
+def test_per_chain_anchor_ts_matches_default_for_base():
+    # Base uses the default lookback → its anchor is byte-identical to round_anchor_ts
+    # (so the Base pin, and the Base-only pack hash, are unchanged).
+    assert round_anchor_ts_for_chain(BASE, _EPOCH, _EPOCH_SECONDS) == round_anchor_ts(_EPOCH, _EPOCH_SECONDS)
+    # Ethereum anchors 3 epochs back instead of 1.
+    assert round_anchor_ts_for_chain(ETH, _EPOCH, _EPOCH_SECONDS) == (_EPOCH - 3) * _EPOCH_SECONDS
+
+
+def test_shared_anchor_defers_ethereum_the_pre_fix_freeze():
+    # Reproduces the incident: with ONE shared anchor (1 epoch back), Ethereum's
+    # 12-confirmation tip is still BEFORE the anchor → the whole round defers.
+    _, head_of, ts_of = _fleet_chains()
+    anchor = round_anchor_ts(_EPOCH, _EPOCH_SECONDS)  # 5940
+    with pytest.raises(ForkPinUnavailable) as ei:
+        derive_fork_pins(anchor, [BASE, ETH], head_of=head_of,
+                         block_timestamp_of=ts_of, confirmations=12)
+    assert "chain 1" in str(ei.value)
+
+
+def test_per_chain_anchor_pins_both_chains_the_fix():
+    # With the per-chain anchor, Ethereum anchors deep enough to bracket → both pin.
+    _, head_of, ts_of = _fleet_chains()
+    anchor = round_anchor_ts(_EPOCH, _EPOCH_SECONDS)
+    pins = derive_fork_pins(
+        anchor, [BASE, ETH], head_of=head_of, block_timestamp_of=ts_of,
+        confirmations=12,
+        anchor_ts_of=lambda c: round_anchor_ts_for_chain(c, _EPOCH, _EPOCH_SECONDS),
+    )
+    assert set(pins) == {BASE, ETH}
+    # Deterministic exact blocks: highest b with ts(b) <= that chain's anchor.
+    assert pins[BASE] == 2970   # 2*2970 = 5940 (anchor 5940)
+    assert pins[ETH] == 485     # 12*485 = 5820 (anchor 5820)
+
+
+def test_base_pin_unchanged_by_the_fix_pack_hash_stability():
+    # The Base pin must be identical whether derived alone (scalar, old path) or
+    # under the per-chain map — otherwise the default Base-only pack hash would
+    # shift and force a needless fleet re-sync.
+    _, head_of, ts_of = _fleet_chains()
+    anchor = round_anchor_ts(_EPOCH, _EPOCH_SECONDS)
+    base_only = derive_fork_pins(anchor, [BASE], head_of=head_of,
+                                 block_timestamp_of=ts_of, confirmations=12)
+    per_chain = derive_fork_pins(
+        anchor, [BASE, ETH], head_of=head_of, block_timestamp_of=ts_of, confirmations=12,
+        anchor_ts_of=lambda c: round_anchor_ts_for_chain(c, _EPOCH, _EPOCH_SECONDS),
+    )
+    assert base_only[BASE] == per_chain[BASE]
+
+
+def test_no_anchor_ts_of_is_byte_identical_scalar_backcompat():
+    # Omitting anchor_ts_of → every chain uses the scalar anchor (pre-#632).
+    _, head_of, ts_of = _fleet_chains()
+    anchor = round_anchor_ts(_EPOCH, _EPOCH_SECONDS)
+    a = derive_fork_pins(anchor, [BASE], head_of=head_of, block_timestamp_of=ts_of, confirmations=12)
+    b = derive_fork_pins(anchor, [BASE], head_of=head_of, block_timestamp_of=ts_of,
+                         confirmations=12, anchor_ts_of=None)
+    assert a == b
