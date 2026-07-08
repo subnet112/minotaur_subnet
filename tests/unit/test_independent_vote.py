@@ -52,7 +52,6 @@ class _Worker:
         fork_block,
         intents,
         require_real_sim,
-        reference_quotes=None,
         run,
     ):
         # Return the champion per-order results directly (a cache-hit-shaped stub);

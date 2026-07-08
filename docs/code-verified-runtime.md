@@ -24,8 +24,7 @@ Minotaur currently runs as a set of cooperating services:
 - **Relayer service** at `:8091` (optional separate process)
   - Submits approved plans on-chain.
 - **Miner CLI**
-  - `agent` mode discovers apps and submits source strategies to `/v1/submissions/source`.
-  - `submit/status` use `/v1/submissions*` (git-based workflow).
+  - `submit/status` use `/v1/submissions*` (git-based workflow). The inline source-submission endpoint (`/v1/submissions/source`) was removed in PR #599 — all submissions go through the git PR path.
 
 ## Active Contract Path
 
@@ -70,11 +69,29 @@ Mounted routers in `api/server.py`:
 
 ### Apps
 
-- `POST /v1/apps/`
-- `POST /v1/apps/validate`
-- `POST /v1/apps/{app_id}/deploy`
-- `GET /v1/apps/`
+Create / validate / deploy:
+
+- `POST /v1/apps/` (create; `X-Admin-Key` **or** EIP-712 `owner_signature`, rate-limited via `APP_CREATE_RATE_PER_MIN`)
+- `POST /v1/apps/validate` (open preflight — no longer admin-gated; rate-limited via `APP_VALIDATE_RATE_PER_MIN`)
+- `POST /v1/apps/{app_id}/deploy` (**async by default**; `?wait=true` for the synchronous body. Wallet-signature or fee-payment authorized)
+- `GET /v1/apps/`  (per-chain `deployments` map + unified `status`, `partial` for mixed states)
 - `GET /v1/apps/{app_id}/status`
+
+App-management, lifecycle & registry (wallet-signature auth — headers `X-App-Auth-Signer/Signature/Nonce/Deadline`; see the [App-management API reference](./api/app-management.md)):
+
+- `GET /v1/apps/{app_id}/admin-state`
+- `GET /v1/apps/{app_id}/auth-nonce`
+- `PUT /v1/apps/{app_id}/solidity`
+- `POST /v1/apps/{app_id}/deployments/{chain_id}/retire`
+- `POST /v1/apps/{app_id}/deployments/{chain_id}/float/deposit`
+- `POST /v1/apps/{app_id}/deployments/{chain_id}/float/withdraw`
+- `PATCH /v1/apps/{app_id}/deployments/{chain_id}/config`
+- `POST /v1/apps/{app_id}/deployments/{chain_id}/registry/allow-developer`
+- `GET /v1/apps/{app_id}/deployments/{chain_id}/registry-calldata`
+- `POST /v1/apps/{app_id}/registration/request` · `.../approve` (admin) · `.../reject` (admin)
+
+Other:
+
 - `PUT /v1/apps/{app_id}/scoring`
 - `GET /v1/apps/{app_id}/manifest`
 - `GET /v1/apps/manifests`
@@ -96,9 +113,10 @@ Mounted routers in `api/server.py`:
 ### Submissions
 
 - `POST /v1/submissions` (git-based; signature required)
-- `POST /v1/submissions/source` (direct source; queued straight to benchmarking)
 - `GET /v1/submissions/{submission_id}/status`
 - `GET /v1/submissions`
+
+`GET /v1/submissions` rows and the status payload now include `outcome_code` (machine-readable terminal-transition taxonomy — switch on this, not on the free-text reason), `miner_uid` (current-metagraph UID, null when unsynced/deregistered, PR #522), and a `waitlist` object when the status is `waitlisted` (PR #620). The `waitlisted` status is distinct from `rejected` (rotation-not-selected / benchmark-window-elapsed carry a next-round priority). The inline source endpoint was removed in PR #599.
 
 ### Wallets / Chains / Monitoring
 
@@ -109,7 +127,7 @@ Mounted routers in `api/server.py`:
 - `POST /v1/apps/{app_id}/fund`
 - `POST /v1/testnet/faucet`
 - `POST /v1/testnet/faucet_erc20`
-- `GET /v1/chains`
+- `GET /v1/chains` (each chain now carries `app_registry_address` — the AppRegistry gate on that chain — alongside `registry_address`, PR #553)
 - `GET /v1/apps/{app_id}/monitor`
 
 ## Validator Service Surface (`:9100`)
@@ -176,14 +194,16 @@ Pipeline:
 4. Benchmarking
 5. Ranking + champion adoption
 
-Adoption is **relative (reference-bar)**: the challenger is compared to the champion **per order** at the same pin (`win` / `regression` / `matched` within a ±0.1% / 10 bps band, plus `blind_spot_cover` and `dropped`) and dethrones only with **zero regressions/drops and at least one strict win or blind-spot cover**. There is no absolute score or fixed percentage margin.
+Adoption is **relative** and resolved by a fixed ladder (`epoch/relative_scoring.py`), high→low priority:
 
-### Source-based (`POST /v1/submissions/source`)
+1. **Output (primary, always armed).** Per-order `win` / `regression` / `matched` (within ±0.1% / `RELATIVE_TOL_BPS=10`) / `blind_spot_cover` / `dropped`; adopt if net better on breadth: `(wins + blind_spot_covers) − regressions ≥ DETHRONE_WIN_MARGIN (1)`. Regressions are **tolerated within a 1% floor** (`FLOOR_BPS=100`) and netted against wins — the older "any regression = reject / matching everywhere rejected" rule is gone.
+2. **Tie-breaks (fully-matched saturated tie only):** gas (`GAS_MARGIN_BPS=200`, pre-refund metered gas) → factorization (`FACTOR_MARGIN=100`, `max_region_nodes`) → deadwood (`UNPRODUCTIVE_MARGIN=2000`, `unproductive_nodes`). All armed on `develop`; each fires "by data" (inert until both champion and challenger carry the metric). The verdict dict carries `adopt_via` (`performance`/`gas`/`factorization`/`deadwood`), `factor_delta`, `deadwood_delta`.
 
-- Accepts inline Python source.
-- Writes temporary solver file.
-- Skips screening/Docker.
-- Moves directly to `BENCHMARKING`.
+**Hard vetoes** (override every rung): `n_catastrophic == 0` (no order cut > 1%) and `n_dropped == 0`. The blind-spot *repeat* bar is wired but disarmed (`BLIND_SPOT_BAR_TTL_S = None`).
+
+**Scoring definition — static quote.** The benchmark no longer calls `solver.quote()` or runs a champion reference-quote pre-pass; it injects a static zero quote purely to satisfy the on-chain ABI, and scores on the raw per-order delivered output. The `BENCHMARK_STATIC_QUOTE` / `BENCHMARK_REFQUOTE_CHECKPOINT` flags and the legacy quote path were deleted (PRs #595/#600) — those host envs and `/data/refquote_checkpoints.json` are now inert.
+
+**Stage-1 screening floor (PR #585):** new submissions are rejected `too_entangled` when their largest AST region exceeds `MAX_REGION_NODES=4200`, or `dynamic_code` on bare `exec()`/`eval()`. The metric is persisted even on reject so the miner sees the number. The standing champion is never re-screened.
 
 ## Local Testnet Reality
 
@@ -217,8 +237,12 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 - `SUBMISSIONS_API_KEY` (unset by default) — if set, requires header `x-submission-api-key` on submission create endpoints.
 - `SOLVER_ROUND_INTERNAL_API_KEY` (unset by default) — shared secret for validator-to-validator round control and champion proposal traffic via header `x-solver-round-internal-key`.
 - `SUBMISSIONS_RATE_LIMIT_PER_MINUTE` (default `60`) — per-route/per-principal create limit.
-- `ENABLE_SOURCE_SUBMISSIONS` (default `false`) — required to use `/v1/submissions/source`.
 - `ALLOW_SUBPROCESS_BENCHMARK` (default `false`) — required for `solver_path` benchmarking.
+- `SCREENING_BUILD_CONCURRENCY` (default `1`) — bounds concurrent stage-2 Docker builds (PR #583; AST metrics also moved off the event loop).
+- `SUBMISSION_BENCHMARK_DETAILS_RETENTION` (default `300`) — caps stored `benchmark_details` to the N most-recent terminal submissions so the store can't freeze the event loop (PR #569). In-flight submissions always keep details.
+- `SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT` (default `0` = OFF) — leader-gateway quota on distinct benched rounds per normalized code fingerprint, **across all hotkeys** (PR #594). Only benched statuses burn quota; a comment-only / nonce-only resubmit of an identical tree is rejected pre-build (`fingerprint_repeat`).
+- `SUBMISSION_INTAKE_ACK` (default on; `0` disables) — posts a "Submission received" ACK on the miner's PR to probe `Pull requests: Write` scope, so an under-scoped private-repo PAT is rejected at intake with a clear 400 rather than silently 403-ing days later (PR #526).
+- **Removed:** `ENABLE_SOURCE_SUBMISSIONS` and the `/v1/submissions/source` endpoint (PR #599); `BENCHMARK_STATIC_QUOTE` and `BENCHMARK_REFQUOTE_CHECKPOINT` (PR #600). These envs are now inert.
 - `ALLOW_CHAMPION_HOT_SWAP` (default `false`) — enables runtime champion swaps when explicitly set.
 - `CHAMPION_SWAP_TIMEOUT_SECONDS` (default `90`) — timeout when starting champion Docker runtime.
 - `SUBMISSION_PROVENANCE_SIGNING_PRIVATE_KEY` (unset by default) — if set, submission screening signs provenance with EIP-191 secp256k1.
@@ -229,7 +253,7 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 - `REQUIRE_ASYMMETRIC_PROVENANCE` (default `false`) — asymmetric-only policy: disallows HMAC provenance and requires allowed signer verification.
 - `VALIDATOR_HOTKEY_SS58` (optional) — explicit hotkey override for solver-round metagraph leader election when the API service cannot load a local Bittensor wallet.
 - API startup now performs a provenance policy self-check and fails fast on inconsistent signer/verifier config.
-- `ENFORCE_RUNTIME_SECURITY_PROFILE` (default `false`) — strict production guardrail; startup fails if unsafe runtime flags are enabled (source submissions, subprocess benchmarking, weak provenance verifier, missing API key/rate limit when accepting submissions).
+- `ENFORCE_RUNTIME_SECURITY_PROFILE` (default `false`) — strict production guardrail; startup fails if unsafe runtime flags are enabled (subprocess benchmarking, weak provenance verifier, missing API key/rate limit when accepting submissions).
 - Champion adoption policy only allows `GENESIS` or Docker-screened submissions with an immutable local `image_id` (`sha256:...`).
 - Source (`solver_path`) submissions can be benchmarked when enabled, but are never champion-eligible.
 - The benchmark worker performs replay scoring only; live champion activation is handled by the solver round coordinator via `EpochManager`.
@@ -246,7 +270,7 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 
 Recommended production posture:
 
-- Disable source submissions and subprocess benchmarking.
+- Disable subprocess benchmarking (`ALLOW_SUBPROCESS_BENCHMARK=0`).
 - Require asymmetric signed provenance (no HMAC fallback).
 - Require submission API key and non-zero rate limiting if submissions are enabled.
 - Enable strict runtime profile validation so startup fails on insecure config.
@@ -263,7 +287,6 @@ SUBMISSIONS_ACCEPTING=1
 SUBMISSIONS_API_KEY=__set_strong_shared_secret__
 SOLVER_ROUND_INTERNAL_API_KEY=__set_distinct_internal_shared_secret__
 SUBMISSIONS_RATE_LIMIT_PER_MINUTE=60
-ENABLE_SOURCE_SUBMISSIONS=0
 ALLOW_SUBPROCESS_BENCHMARK=0
 
 # Champion/runtime hardening

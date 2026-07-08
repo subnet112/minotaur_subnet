@@ -155,13 +155,29 @@ FACTOR_MARGIN: int | None = 100  # ARMED, soak-calibrated; None ⇒ disarmed
 # margin, and the gas_tie_worse margin. While ``None`` (the shipped value) all
 # gas classification is SKIPPED — every gas counter is 0/False and verdicts
 # are bit-identical to the pre-gas rule (proved by the golden tests). To be
-# SOAK-CALIBRATED before arming (working straw 200-300; the soak number wins,
-# exactly as the 07-03..07 soak picked FACTOR_MARGIN=100). CONSENSUS-CRITICAL
-# CODE constant (same discipline as FLOOR_BPS/FACTOR_MARGIN — never env-read):
-# MERGING AN INT HERE ARMS THE CLAUSE — land it only in a develop->main
-# promotion window (leader + followers together), after the C1 gas plumbing is
-# fleet-deployed and the anvil version is fleet-pinned.
-GAS_MARGIN_BPS: int | None = None  # DISARMED; soak-calibrated int arms it
+# CONSENSUS-CRITICAL CODE constant (same discipline as FLOOR_BPS/FACTOR_MARGIN
+# — never env-read): MERGING AN INT HERE ARMS THE CLAUSE — land it only in a
+# develop->main promotion window (leader + followers together).
+#
+# ARMED = 200, calibrated from the 2026-07-07/08 soak (172 [gas-shadow]
+# comparisons over 10.5h vs the 2462-region champion) + a full simulation of
+# THIS clause over that data:
+#   * same-pin comparison noise is ZERO (69/172 identical-fork comparisons tie
+#     to the exact wei), so 200 bps is far above measurement noise;
+#   * cross-pin route-flip jitter (median 2,836 bps/order) NEVER fires the
+#     clause: the per-order Pareto gate demands no-worse on EVERY matched
+#     order, and pin luck always leaves some orders gassier — the simulation
+#     produced 0 would-be dethrones at margins 100/200/300 across all 172 real
+#     comparisons. Arming is therefore incentive-first (the factorization
+#     precedent: signal appears only under enforcement), not churn-tolerant:
+#     nothing fires until a genuinely Pareto-dominant, materially-cheaper
+#     solver exists.
+#   * 200 = bottom of the straw band: the most reachable bounty that is still
+#     100x the observed noise floor; observed best-case genuine improvements
+#     (~600-833 bps) clear it comfortably.
+# Post-arm churn backstops: per-pair dethrone-rate tripwire (#582), sub-tempo
+# reigns earn nothing, and None disarms in one constant.
+GAS_MARGIN_BPS: int | None = 200  # ARMED, soak-calibrated; None ⇒ disarmed
 
 # GAS_OUT_GUARD_BPS — per-order OUTPUT-parity band inside a gas dethrone: a
 # gas win may not shave delivered output by more than this many bps on any

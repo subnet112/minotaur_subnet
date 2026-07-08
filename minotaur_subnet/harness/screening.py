@@ -151,6 +151,11 @@ class StageResult:
     # (path, qualname-or-None, nodes) — what a miner should delete. Max 20,
     # sorted desc by nodes then path; persisted so the report can show it.
     unproductive_top_offenders: list | None = None
+    # Normalized content fingerprint (harness/code_fingerprint) — comments /
+    # formatting / docstrings / .git noise stripped, semantics + data hashed.
+    # Set by stage 1 only; same compute-once-read-forever discipline as
+    # max_region_nodes. Feeds the cross-hotkey resubmit quota.
+    content_fingerprint: str | None = None
 
 
 @dataclass
@@ -408,6 +413,22 @@ def run_stage_1(repo_path: str) -> StageResult:
         unproductive_metric_version=dw.version,
         unproductive_top_offenders=[list(t) for t in dw.top_offenders],
     )
+
+    # Normalized content fingerprint — same pass, same persist-on-reject
+    # discipline as the metrics above (a floor-rejected submission still
+    # records the identity it was rejected under).
+    from minotaur_subnet.harness.code_fingerprint import (
+        FINGERPRINT_VERSION,
+        repo_fingerprint,
+    )
+
+    fingerprint = repo_fingerprint(repo_path)
+    if fingerprint:
+        logger.info(
+            "[fingerprint] content_fingerprint=%s version=%d repo=%s",
+            fingerprint[:16], FINGERPRINT_VERSION, repo_path,
+        )
+        _dw_fields["content_fingerprint"] = fingerprint
 
     if floor_armed:
         # Bare exec()/eval() first: code built in strings is invisible to the

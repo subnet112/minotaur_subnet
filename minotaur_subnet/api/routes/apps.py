@@ -556,10 +556,26 @@ async def validate_app(
 async def deploy_app(
     app_id: str,
     chain_id: int | None = None,
+    wait: bool = False,
     body: DeployRequest | None = None,
     ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain (or first supported chain).
+
+    ASYNC BY DEFAULT (#609): guards + fee authorization run in-request, the
+    chain's record flips to ``deploying``, and the response returns
+    immediately — the compile → relayer tx → confirmation chain (~85s on
+    mainnet, worse under congestion) continues server-side. Poll
+    ``GET /v1/apps/{app_id}/status`` until ``deployments[chain].status``
+    flips to ``solving`` (success — ``contract_address`` set) or back to
+    ``draft`` with an ``error`` (failure). Holding the connection open for
+    the whole deploy outlived proxy/client timeouts: browsers saw a dropped
+    connection ("CORS request did not succeed") while the deploy actually
+    succeeded server-side (live 2026-07-07).
+
+    ``?wait=true`` preserves the legacy synchronous behavior for scripts
+    that read ``contract_address`` from the response body (leader nginx
+    allows this route 320s).
 
     Auth model — deploy is authorized by ONE of:
       * ``X-Admin-Key`` (legacy operator path) → free deploy;
@@ -611,12 +627,15 @@ async def deploy_app(
 
     # No payment claim → free/exempt deploy (authorized above). Payment claim →
     # public/3rd-party deploy authorized via the fee payment.
+    # Still offloaded to the executor even in async mode: the pre-dispatch
+    # work (fee verification can hit the chain) must not block the loop.
     return await loop.run_in_executor(
         None,
         lambda: _tools.deploy_app_intent(
             _store(), app_id, chain_id=chain_id,
             is_admin=is_admin,
             payment=payment,
+            background=not wait,
         ),
     )
 

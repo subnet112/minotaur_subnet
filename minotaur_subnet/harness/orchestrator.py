@@ -264,6 +264,11 @@ class BenchmarkResult:
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
     revert_trace: dict[str, Any] | None = None
+    # Chain the scenario's deployment lives on (``state.chain_id``). Lets the
+    # SOLVING→SOLVED transition promote the correct per-chain deployment when an
+    # app is deployed on more than one chain (BENCHMARK_ALL_DEPLOYMENT_CHAINS);
+    # the ``intent_id`` label alone (app_id:scenario) does not identify the chain.
+    chain_id: int | None = None
 
 
 @dataclass
@@ -956,14 +961,6 @@ class BenchmarkConfig:
     plan_quality_weight: float = 0.6
 
 
-# Sentinel a reference-quote pre-pass writes into ``reference_quotes[label]``
-# when the CHAMPION solver FAILED to quote that scenario. ``run_benchmark``
-# detects it and surfaces an explicit error + scores 0 instead of silently
-# self-quoting (which would fabricate a non-comparable pass and mask the
-# champion-reference failure). Cannot collide with real mapped quote params —
-# those are keyed by manifest param names, never this dunder key.
-REFERENCE_QUOTE_FAILED_SENTINEL = "__reference_quote_failed__"
-
 # Slippage applied to a BENCHMARK scenario's quote-derived min_output_amount.
 # Deliberately generous (50%): scoring is anchored on quotedOutput (the full
 # quote), NOT on min, so the min is purely the execution slippage guard here.
@@ -976,50 +973,27 @@ REFERENCE_QUOTE_FAILED_SENTINEL = "__reference_quote_failed__"
 BENCHMARK_MIN_SLIPPAGE_BPS = 5000
 
 
-def benchmark_static_quote_enabled() -> bool:
-    """Flag: benchmark the STATIC-quote way (``BENCHMARK_STATIC_QUOTE=1``).
-
-    When ON, the benchmark injects a static zero quote (``quotedOutput=0``,
-    ``min=0``) instead of calling ``solver.quote()`` or the champion
-    reference-quote pre-pass. This is safe because the authoritative score is
-    the relative per-order RAW delivered output (no quote anchor), and the dex
-    ``scoreIntent`` gates its CoW fee on ``quotedOutput > 0`` — so ``0`` means
-    "no anchor, no fee, full output executes", which the raw scorer reads.
-    The zero is only there to keep the 12-field on-chain ABI valid (omitting
-    the field reverts on decode).
-
-    DEFAULT OFF — the current champion-anchored reference-quote behavior is
-    unchanged. This is the instant-revert switch for the sensitive scoring
-    path: flip the env, no code change, to re-enable either mode at will.
-    """
-    import os
-
-    return os.environ.get("BENCHMARK_STATIC_QUOTE", "0").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
 
 
-async def _enrich_state_with_quote(
-    session: "SolverSession",
+def _enrich_state_with_quote(
     intent: AppIntentDefinition,
     state: IntentState,
-    snapshot: MarketSnapshot,
-    reference_params: dict[str, str] | None,
 ) -> IntentState:
-    """Populate a swap scenario's source:"quote" params from a real quote.
+    """Populate a swap scenario's source:"quote" params with the static zero quote.
 
     Synthetic benchmark scenarios never run a quote, so their on-chain
     intentParams omit the CoW ``quoted_output`` field — the deployed
-    12-field DexAggregator scoreIntent then reverts. This mirrors the live
-    get_quote path: obtain a quote (a provided reference, else the solver's
-    own), map it via the shared ``map_quote_result_to_params`` helper, and
-    rebuild the IntentState with those quote VALUES winning over the
-    scenario's params.
+    12-field DexAggregator scoreIntent then reverts on decode. Inject a
+    static ZERO quote (``quotedOutput=0``, ``min=0``) via the shared
+    ``map_quote_result_to_params`` helper: scoreIntent gates its CoW fee on
+    ``quotedOutput > 0``, so 0 = no anchor, no fee, full output executes,
+    and the authoritative relative scorer reads the RAW delivered output —
+    the quote is not in the score (#543). The zero exists only to keep the
+    12-field ABI valid.
 
-    Returns the original ``state`` unchanged when: it isn't a swap intent,
-    the params already carry ``quoted_output``, no manifest/quote params
-    apply, or quoting fails (the scenario then scores 0 as it does today —
-    never a crash).
+    Returns the original ``state`` unchanged when: it isn't a quote-sourced
+    intent, or the params already carry ``quoted_output`` (real/historical
+    orders — their stored quote values are replayed verbatim).
     """
     raw = state.raw_params_view()
     intent_function = state.control_view().get("_intent_function", "swap")
@@ -1045,44 +1019,16 @@ async def _enrich_state_with_quote(
     from minotaur_subnet.api.services.app_service import (
         map_quote_result_to_params,
     )
+    from minotaur_subnet.shared.types import QuoteResult
 
-    if benchmark_static_quote_enabled():
-        # STATIC-quote mode (flag): skip quoting entirely. Inject a zero quote
-        # so the 12-field ABI stays valid; scoreIntent gates its CoW fee on
-        # quotedOutput>0 (so 0 = no fee, full output executes), and the
-        # relative scorer reads the RAW delivered output — the quote is not in
-        # the score. No solver.quote() call, no champion reference needed.
-        from minotaur_subnet.shared.types import QuoteResult
-
-        quote_params = map_quote_result_to_params(
-            QuoteResult(estimated_output="0"), intent.manifest, intent_function,
-            slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,
-        )
-    else:
-        quote_params = reference_params
-        if not quote_params:
-            # Fallback: self-quote via the solver session, mapped through the
-            # one shared helper so there is no second quote implementation.
-            try:
-                quote_result = await session.quote(intent, state, snapshot)
-            except Exception as exc:  # noqa: BLE001 — defensive, never crash a run
-                logger.error(
-                    "[quote-FAILED] self-quote raised for %s (%s); scenario keeps "
-                    "the legacy (un-quoted) layout and will revert/score 0 — a real "
-                    "failure, not a silent pass", intent.app_id, exc,
-                )
-                return state
-            if quote_result is None:
-                logger.error(
-                    "[quote-FAILED] self-quote returned None for %s; scenario keeps "
-                    "the legacy (un-quoted) layout and will revert/score 0 — a real "
-                    "failure, not a silent pass", intent.app_id,
-                )
-                return state
-            quote_params = map_quote_result_to_params(
-                quote_result, intent.manifest, intent_function,
-                slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
-            )
+    # Static zero quote — the benchmark's scoring definition (#543). No
+    # solver.quote() call, no champion reference pre-pass: scoreIntent gates
+    # its CoW fee on quotedOutput>0 (so 0 = no fee, full output executes) and
+    # the relative scorer reads the RAW delivered output.
+    quote_params = map_quote_result_to_params(
+        QuoteResult(estimated_output="0"), intent.manifest, intent_function,
+        slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,
+    )
 
     if not quote_params:
         return state
@@ -1237,8 +1183,8 @@ async def run_benchmark(
     score_fn: ScoreFn | None = None,
     simulator: Any | None = None,
     fork_block: int | None = None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool = False,
-    reference_quotes: dict[str, dict[str, str]] | None = None,
     session_factory: "Callable[[], Awaitable[SolverSession]] | None" = None,
     session_count: int | None = None,
 ) -> list[BenchmarkResult]:
@@ -1263,6 +1209,13 @@ async def run_benchmark(
             fork at upstream head — the existing live-head behavior. This is
             the keystone that makes a benchmark round reproducible across
             validators: all of them re-simulate at the same pinned block.
+        fork_blocks: Optional ``{chain_id: block}`` map for multi-chain rounds —
+            each scenario is pinned (solver read fork AND simulator fork) at ITS
+            OWN chain's canonical block, instead of the single scalar ``fork_block``
+            applied to whatever chain a plan routes to. ``None`` (default) keeps
+            the scalar path (Base-only), byte-identical to before. When present,
+            ``fork_block`` should still be set to the primary chain's block (used
+            as the fallback for any chain absent from the map).
         require_real_sim: Fail-closed switch (default ``False``). When ``True``,
             the benchmark refuses to substitute the fabricated mock for a real
             simulation: if no simulator is injected it raises
@@ -1271,16 +1224,6 @@ async def run_benchmark(
             scored 0 — never laundered into a ~min*1.05 mock pass nor a
             lenient-app-scorer pass on a plan that could not execute. Default
             keeps today's silent mock fallback.
-        reference_quotes: Optional pre-computed quote params keyed by a stable
-            per-scenario key (the intent's intent_id label). Each value is the
-            ``map_quote_result_to_params`` output for that scenario (the CoW
-            ``quoted_output`` and friends). Synthetic benchmark scenarios carry
-            no quote, so without this the on-chain encoder emits the legacy
-            layout and the deployed CoW scoreIntent reverts. When a scenario's
-            swap params lack ``quoted_output``, the reference quote is applied;
-            absent a reference, the solver session is asked for its own quote
-            as a fallback. ``None``/``{}`` = always self-quote (still fixes the
-            revert; the reference path just makes the quote champion-anchored).
 
     Returns:
         List of BenchmarkResult, one per intent.
@@ -1289,8 +1232,6 @@ async def run_benchmark(
         config = BenchmarkConfig()
     if trigger_ground_truth is None:
         trigger_ground_truth = {}
-    if reference_quotes is None:
-        reference_quotes = {}
 
     # Fail-closed: when a real simulation is required but none was injected,
     # refuse to run rather than score every scenario on the fabricated mock
@@ -1348,7 +1289,15 @@ async def run_benchmark(
             "(non-deterministic, silent cross-host divergence)."
         )
     if _read_proxy is not None and fork_block is not None and rpc_map:
-        pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+        # Per-chain pins when a map is supplied (multi-chain round); else the
+        # scalar. A missing per-chain pin (determinism hole) surfaces from
+        # build_pin_blocks as ValueError — translate to the fail-loud defer.
+        try:
+            pin_blocks = build_pin_blocks(
+                _read_proxy, rpc_map, fork_blocks if fork_blocks else fork_block,
+            )
+        except ValueError as exc:
+            raise RealSimulationUnavailable(str(exc)) from exc
         # Fail-CLOSED on a non-routed chain — BEFORE opening any session (no leak)
         # AND before the `if pin_blocks:` branch, so an all-unrouted benchmark (no
         # routed chain → empty pin_blocks) ALSO fails loud rather than silently
@@ -1468,8 +1417,8 @@ async def run_benchmark(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
-            reference_quotes=reference_quotes,
             trigger_ground_truth=trigger_ground_truth,
         )
 
@@ -1539,8 +1488,8 @@ async def _process_scenario(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
-    reference_quotes: dict[str, dict[str, str]],
     trigger_ground_truth: dict[str, bool],
     trace_budget: list[int],
 ) -> tuple[BenchmarkResult, bool]:
@@ -1558,22 +1507,21 @@ async def _process_scenario(
     start = time.monotonic()
     scenario_name = state.control_view().get("_scenario_name", "")
     intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
-    br = BenchmarkResult(intent_id=intent_label)
+    br = BenchmarkResult(
+        intent_id=intent_label, chain_id=getattr(state, "chain_id", None),
+    )
     need_respawn = False
 
-    # Champion BLIND SPOT. The reference pre-pass marked this scenario as one the
-    # CHAMPION could not quote. We do NOT zero it: each solver SELF-QUOTES, so a
-    # challenger that CAN quote + execute reveals a real capability the champion
-    # lacks. The champion self-quotes the same way (fails → 0), so its 0 is the
-    # floor and any real execution here is unambiguous progress.
-    _ref = reference_quotes.get(intent_label)
-    if _ref and _ref.get(REFERENCE_QUOTE_FAILED_SENTINEL):
-        logger.warning(
-            "[champion-blind-spot] %s: champion could not quote; this solver "
-            "self-quotes to reveal capability (champion scores 0 here)",
-            intent_label,
-        )
-        _ref = None  # fall through to the self-quote path below
+    # Effective fork block for THIS scenario's chain: the per-chain pin when a
+    # map is supplied (multi-chain round), else the scalar (Base-only). Every
+    # fork pin below (solver read pin + simulator fork) uses this so each chain
+    # is scored at ITS OWN canonical block, not whichever chain the scalar named.
+    _chain_id = getattr(state, "chain_id", None)
+    fork_block = (
+        fork_blocks.get(_chain_id, fork_block)
+        if fork_blocks and _chain_id is not None
+        else fork_block
+    )
 
     # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE it
     # quotes/routes, so it reads the SAME state the simulator scores at: cross-host
@@ -1598,13 +1546,7 @@ async def _process_scenario(
             )
 
     try:
-        # Keep quote-enrich inside the try: _enrich_state_with_quote swallows its
-        # own quote exceptions, but on an already-dead solver the next
-        # generate_plan raises SolverCrashedError — which the respawn path
-        # recovers from instead of aborting the whole run.
-        state = await _enrich_state_with_quote(
-            session, intent, state, snapshot, _ref,
-        )
+        state = _enrich_state_with_quote(intent, state)
 
         from minotaur_subnet.shared.types import TriggerType
 
@@ -1810,8 +1752,8 @@ async def _scenario_pool_worker(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
-    reference_quotes: dict[str, dict[str, str]],
     trigger_ground_truth: dict[str, bool],
 ) -> None:
     """Drain the shared scenario queue on ONE isolated runtime.
@@ -1873,7 +1815,9 @@ async def _scenario_pool_worker(
             intent_label = (
                 f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
             )
-            br = BenchmarkResult(intent_id=intent_label)
+            br = BenchmarkResult(
+                intent_id=intent_label, chain_id=getattr(state, "chain_id", None),
+            )
             br.error = dead_reason
             br.elapsed_ms = 0
             results[idx] = br
@@ -1888,8 +1832,8 @@ async def _scenario_pool_worker(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
-            reference_quotes=reference_quotes,
             trigger_ground_truth=trigger_ground_truth,
             trace_budget=trace_budget,
         )
@@ -1911,8 +1855,8 @@ async def _run_scenarios(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
-    reference_quotes: dict[str, dict[str, str]],
     trigger_ground_truth: dict[str, bool],
 ) -> list[BenchmarkResult]:
     """Run every scenario across ``len(runtimes)`` isolated runtimes concurrently.
@@ -1949,8 +1893,8 @@ async def _run_scenarios(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
-            reference_quotes=reference_quotes,
             trigger_ground_truth=trigger_ground_truth,
         )
         for rt in runtimes
@@ -2002,7 +1946,7 @@ def _benchmark_order_id(
     identical for the champion/challenger sims of the same scenario (the
     per-sim fork reset makes CREATE2 proxy reuse a non-issue). Unique across
     orders within a run for the same reason (app_id:scenario_name) is already
-    the run-wide join key (intent_id / reference_quotes).
+    the run-wide join key (intent_id).
 
     Format matches the legacy id: ``bench_`` + 16 hex chars.
     """

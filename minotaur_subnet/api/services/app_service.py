@@ -280,6 +280,7 @@ def deploy_app_intent(
     is_admin: bool = True,
     fee_paid: bool = False,
     payment: Any = None,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Deploy an App Intent to a specific chain.
 
@@ -301,9 +302,17 @@ def deploy_app_intent(
                   deploy is treated as payment-backed (``is_admin=False``) and
                   authorized via the deployer's EIP-712 ``pay_deploy_fee``
                   signature + on-chain payment proof. ``None`` → admin deploy.
+        background: False (default) blocks until the deploy finishes and
+                  returns the full result — direct/script callers keep their
+                  synchronous contract. True (#609) runs guards + fee auth
+                  inline, persists the DEPLOYING record, dispatches the
+                  compile/tx chain to a daemon thread, and returns
+                  ``{"status": "deploying", "poll": ...}`` immediately.
 
     Returns:
-        DeploymentResult dict with status, contract address, and js_code_hash.
+        DeploymentResult dict with status, contract address, and js_code_hash
+        (synchronous), or the immediate ``deploying`` acknowledgement
+        (``background=True``).
     """
     from ._state import _deploy_service
     from minotaur_subnet.deployment.deploy_fee import (
@@ -388,9 +397,9 @@ def deploy_app_intent(
 
     # ── Real deployment path ────────────────────────────────────────────
     if _deploy_service is not None:
-        import asyncio
-
-        # Mark as deploying
+        # Mark as deploying BEFORE dispatch — this is what /status polls see,
+        # and what the already-deployed guard above keys on for concurrent
+        # deploy attempts.
         deploying = DeploymentResult(
             app_id=app_id,
             status=AppStatus.DEPLOYING,
@@ -399,76 +408,65 @@ def deploy_app_intent(
         )
         store.save_deployment(deploying)
 
-        import concurrent.futures
+        if background:
+            # Async mode (#609): the compile → relayer tx → confirmation chain
+            # takes ~85s on mainnet (worse under congestion) — longer than any
+            # sane proxy/client timeout. Run it in a daemon thread and return
+            # immediately; callers poll GET /v1/apps/{id}/status until the
+            # chain's record flips to solving/solved (success) or back to
+            # draft with an error (failure — the rollback paths inside
+            # _execute_deploy_and_persist). An orphaned DEPLOYING record from
+            # a process death mid-deploy is swept by reconcile_stale_deploying
+            # at boot.
+            import threading
 
-        def _run_in_new_loop():
-            return asyncio.run(_deploy_service.deploy(definition, chain_id))
+            def _run_and_log() -> None:
+                try:
+                    out = _execute_deploy_and_persist(
+                        store, definition, app_id, chain_id, js_hash, fee_exempt,
+                    )
+                    logger.info(
+                        "Background deploy finished for %s on chain %s: %s",
+                        app_id, chain_id,
+                        out.get("error") or out.get("contract_address") or out.get("status"),
+                    )
+                except Exception:
+                    # _execute_deploy_and_persist handles (and persists) its
+                    # own failures; this guards the guard — e.g. the store
+                    # itself failing — so the thread never dies silently with
+                    # the record stuck in DEPLOYING.
+                    logger.exception(
+                        "Background deploy crashed for %s on chain %s",
+                        app_id, chain_id,
+                    )
+                    try:
+                        store.save_deployment(DeploymentResult(
+                            app_id=app_id,
+                            status=AppStatus.DRAFT,
+                            js_code_hash=js_hash,
+                            chain_id=chain_id,
+                            error="Deploy crashed (see api logs)",
+                        ))
+                    except Exception:
+                        pass
 
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = pool.submit(_run_in_new_loop).result(timeout=300)
-        except concurrent.futures.TimeoutError:
-            # The executor's __exit__ has already joined the worker thread by
-            # the time we get here, so the deploy is truly over and nothing
-            # will save a result. Roll the record back to DRAFT — leaving it
-            # DEPLOYING wedges the app: the already-deployed guard above
-            # refuses redeploys and retire_deployment refuses mid-deploy
-            # (seen live 2026-07-07 after a relayer-side deploy failure).
-            store.save_deployment(DeploymentResult(
-                app_id=app_id,
-                status=AppStatus.DRAFT,
-                js_code_hash=js_hash,
-                chain_id=chain_id,
-                error="Deploy timed out (compilation may be slow)",
-            ))
+            threading.Thread(
+                target=_run_and_log,
+                name=f"deploy-{app_id}-{chain_id}",
+                daemon=True,
+            ).start()
             return {
                 "app_id": app_id,
-                "status": "draft",
-                "error": "Deploy timed out (compilation may be slow)",
+                "status": "deploying",
                 "chain_id": chain_id,
-            }
-        except Exception as exc:
-            # Same rollback as the timeout path: a failed deploy must not
-            # leave a permanent DEPLOYING record.
-            store.save_deployment(DeploymentResult(
-                app_id=app_id,
-                status=AppStatus.DRAFT,
-                js_code_hash=js_hash,
-                chain_id=chain_id,
-                error=f"Deploy failed: {exc}",
-            ))
-            return {
-                "app_id": app_id,
-                "status": "draft",
-                "error": f"Deploy failed: {exc}",
-                "chain_id": chain_id,
+                "js_code_hash": js_hash,
+                "fee_exempt": fee_exempt,
+                "poll": f"/v1/apps/{app_id}/status",
             }
 
-        store.save_deployment(result)
-        out = asdict(result)
-        out["fee_exempt"] = fee_exempt
-        # Post-deploy AppRegistry registration (best-effort, never fatal).
-        # Gated by the moderation state: only APPROVED (or legacy "") apps
-        # auto-register — a new, unapproved app deploys but stays OUT of the
-        # live routing set (_requireRegistered reverts its orders) until an
-        # admin approves it (api/services/app_registration.py). This is the
-        # permissionless-deploy / gated-activation boundary.
-        if result.contract_address and not result.error:
-            from .app_lifecycle import auto_register_deployment
-            from .app_registration import registration_allows_autoregister
-
-            if registration_allows_autoregister(definition.registration_status):
-                out["registry"] = auto_register_deployment(
-                    store, app_id, chain_id, result.contract_address,
-                )
-            else:
-                out["registry"] = {
-                    "registered": False,
-                    "pending_approval": True,
-                    "registration_status": definition.registration_status,
-                    "note": "app not approved — request registration for admin review",
-                }
-        return out
+        return _execute_deploy_and_persist(
+            store, definition, app_id, chain_id, js_hash, fee_exempt,
+        )
 
     # ── No relayer configured ────────────────────────────────────────────
     return {
@@ -476,6 +474,137 @@ def deploy_app_intent(
             "No EVM relayer configured — cannot deploy on-chain. "
             "Set USE_EVM_RELAYER=1 with RELAYER_PRIVATE_KEY to enable."
         ),
+    }
+
+
+def _execute_deploy_and_persist(
+    store: AppIntentStore,
+    definition: AppIntentDefinition,
+    app_id: str,
+    chain_id: int,
+    js_hash: str,
+    fee_exempt: bool,
+) -> dict[str, Any]:
+    """Compile → deploy → persist the result (or roll back to DRAFT).
+
+    Runs after the DEPLOYING record is saved. Called inline for a
+    synchronous (``wait=true``) deploy, or from a daemon thread for the
+    default async deploy. Every exit path persists a terminal record.
+    """
+    from ._state import _deploy_service
+    import asyncio
+    import concurrent.futures
+
+    def _run_in_new_loop():
+        return asyncio.run(_deploy_service.deploy(definition, chain_id))
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(_run_in_new_loop).result(timeout=300)
+    except concurrent.futures.TimeoutError:
+        # The executor's __exit__ has already joined the worker thread by
+        # the time we get here, so the deploy is truly over and nothing
+        # will save a result. Roll the record back to DRAFT — leaving it
+        # DEPLOYING wedges the app: the already-deployed guard refuses
+        # redeploys and retire_deployment refuses mid-deploy
+        # (seen live 2026-07-07 after a relayer-side deploy failure).
+        store.save_deployment(DeploymentResult(
+            app_id=app_id,
+            status=AppStatus.DRAFT,
+            js_code_hash=js_hash,
+            chain_id=chain_id,
+            error="Deploy timed out (compilation may be slow)",
+        ))
+        return {
+            "app_id": app_id,
+            "status": "draft",
+            "error": "Deploy timed out (compilation may be slow)",
+            "chain_id": chain_id,
+        }
+    except Exception as exc:
+        # Same rollback as the timeout path: a failed deploy must not
+        # leave a permanent DEPLOYING record.
+        store.save_deployment(DeploymentResult(
+            app_id=app_id,
+            status=AppStatus.DRAFT,
+            js_code_hash=js_hash,
+            chain_id=chain_id,
+            error=f"Deploy failed: {exc}",
+        ))
+        return {
+            "app_id": app_id,
+            "status": "draft",
+            "error": f"Deploy failed: {exc}",
+            "chain_id": chain_id,
+        }
+
+    store.save_deployment(result)
+    out = asdict(result)
+    out["fee_exempt"] = fee_exempt
+    # Post-deploy AppRegistry registration (best-effort, never fatal).
+    # Gated by the moderation state: only APPROVED (or legacy "") apps
+    # auto-register — a new, unapproved app deploys but stays OUT of the
+    # live routing set (_requireRegistered reverts its orders) until an
+    # admin approves it (api/services/app_registration.py). This is the
+    # permissionless-deploy / gated-activation boundary.
+    if result.contract_address and not result.error:
+        from .app_lifecycle import auto_register_deployment
+        from .app_registration import registration_allows_autoregister
+
+        if registration_allows_autoregister(definition.registration_status):
+            out["registry"] = auto_register_deployment(
+                store, app_id, chain_id, result.contract_address,
+            )
+        else:
+            out["registry"] = {
+                "registered": False,
+                "pending_approval": True,
+                "registration_status": definition.registration_status,
+                "note": "app not approved — request registration for admin review",
+            }
+    return out
+
+
+def _derive_overall_status(deployments: dict[int, Any]) -> str:
+    """Collapse per-chain deployment statuses into one app-level status.
+
+    Single source of truth for BOTH the list endpoint and the per-app status
+    endpoint — they used to disagree (the list said "solved" when ANY chain
+    was solved; /status said "partial"), and a frontend rendering per-chain
+    deploy state from the chain-less list value showed an app as "deployed"
+    on chains it never reached (live confusion 2026-07-07: Base solved +
+    Ethereum draft read as "deployed on Ethereum").
+
+    PARTIAL is the honest answer for mixed states; per-chain truth lives in
+    the "deployments" map that both endpoints now carry.
+    """
+    if not deployments:
+        return AppStatus.DRAFT.value
+    statuses = [dep.status for dep in deployments.values()]
+    if all(s == AppStatus.ACTIVE for s in statuses):
+        return AppStatus.ACTIVE.value
+    if all(s == AppStatus.SOLVED for s in statuses):
+        return AppStatus.SOLVED.value
+    if all(s.is_order_ready() for s in statuses):
+        # Mix of ACTIVE + SOLVED
+        return AppStatus.SOLVED.value
+    if all(s == AppStatus.SOLVING for s in statuses):
+        return AppStatus.SOLVING.value
+    if any(s.is_operational() for s in statuses):
+        return AppStatus.PARTIAL.value
+    if any(s == AppStatus.DEPLOYING for s in statuses):
+        return AppStatus.DEPLOYING.value
+    return AppStatus.DRAFT.value
+
+
+def _deployments_summary(deployments: dict[int, Any]) -> dict[str, dict[str, Any]]:
+    """Per-chain {status, contract_address} map — the chain-attributed truth."""
+    return {
+        str(chain_id): {
+            "status": dep.status.value,
+            "contract_address": dep.contract_address,
+        }
+        for chain_id, dep in deployments.items()
     }
 
 
@@ -490,26 +619,18 @@ def list_minotaur_subnet(
 
     Returns:
         Dict with "apps" key containing a list of AppIntentDefinition dicts,
-        each enriched with a "status" field derived from deployment records.
+        each enriched with a "status" field (same derivation as the per-app
+        status endpoint) and a per-chain "deployments" summary map — clients
+        MUST use the latter for any per-chain rendering; the flat status has
+        no chain attribution.
     """
     apps = store.list_apps(deployer=deployer if deployer else None)
     result = []
     for a in apps:
         d = asdict(a)
-        # Derive status from deployment records
         deployments = store.get_deployments(a.app_id)
-        if deployments:
-            statuses = [dep.status for dep in deployments.values()]
-            if any(s == AppStatus.ACTIVE for s in statuses):
-                d["status"] = "active"
-            elif any(s == AppStatus.SOLVED for s in statuses):
-                d["status"] = "solved"
-            elif any(s.is_operational() for s in statuses):
-                d["status"] = statuses[0].value
-            else:
-                d["status"] = "draft"
-        else:
-            d["status"] = "draft"
+        d["status"] = _derive_overall_status(deployments)
+        d["deployments"] = _deployments_summary(deployments)
         result.append(d)
     return {
         "apps": result,
@@ -562,26 +683,9 @@ def get_app_status(
     except Exception:
         pass  # Submission store not available -- degrade gracefully
 
-    # Determine overall status from all chain deployments
-    if deployments:
-        statuses = [d.status for d in deployments.values()]
-        if all(s == AppStatus.ACTIVE for s in statuses):
-            status = AppStatus.ACTIVE.value
-        elif all(s == AppStatus.SOLVED for s in statuses):
-            status = AppStatus.SOLVED.value
-        elif all(s.is_order_ready() for s in statuses):
-            # Mix of ACTIVE + SOLVED
-            status = AppStatus.SOLVED.value
-        elif all(s == AppStatus.SOLVING for s in statuses):
-            status = AppStatus.SOLVING.value
-        elif any(s.is_operational() for s in statuses):
-            status = AppStatus.PARTIAL.value
-        elif any(s == AppStatus.DEPLOYING for s in statuses):
-            status = AppStatus.DEPLOYING.value
-        else:
-            status = AppStatus.DRAFT.value
-    else:
-        status = AppStatus.DRAFT.value
+    # Determine overall status from all chain deployments (shared with the
+    # list endpoint so the two can never disagree again).
+    status = _derive_overall_status(deployments)
 
     result: dict[str, Any] = {
         "app_id": app_id,
@@ -599,7 +703,12 @@ def get_app_status(
         # Null: the champion is the relative baseline, not a numeric score to beat.
         "champion_score": None,
         "scenario_scores": scenario_scores,
-        # Primary deployment
+        # DEPRECATED for per-chain rendering: this is the "preferred" record
+        # (first order-ready deployment on ANY chain), so on a multi-chain app
+        # it carries another chain's contract_address — reading it while
+        # showing chain X claims deployment that never happened (live
+        # confusion 2026-07-07). Kept because follower app_sync consumes it
+        # as an upsert fallback; new clients must use "deployments".
         "deployment": {
             "contract_address": deployment.contract_address,
             "chain_id": deployment.chain_id,

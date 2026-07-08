@@ -237,6 +237,21 @@ class RoundState:
     # but later certifies a DIFFERENT candidate B can never make the follower weight B
     # it never benchmarked (closes the quorum>1 propose-A / certify-B gap).
     self_verified_submission_id: str | None = None
+    # The submission_ids the close-time LRU rotation selected onto the benched
+    # slate (harness/rotation.apply_rotation_slate). RECORDED at close so it is
+    # the single source of truth for "who gets benched this round" — the
+    # benchmark worker's slate belt READS this instead of recomputing the
+    # rotation, which raced the ledger it had already advanced (mark_selected)
+    # and double-benched a disjoint trio (2026-07-08, round-e29724975-n1: 4
+    # scored on 3 slots). None on rounds closed before this field existed /
+    # rounds where rotation was disabled — the belt falls back to recomputation
+    # only then.
+    benched_slate: list[str] | None = None
+    # Distributed-veto Phase 0 OBSERVE record (compact — counts + resolution,
+    # never per-order rows). Written by the leader coordinator's non-blocking
+    # observe pass; consumed only by /health and the durable soak record. Never
+    # gates certification (Phase 0). See api/routes/submissions/veto_wire.py.
+    veto_observe: dict[str, Any] | None = None
 
     def accepting_submissions(self) -> bool:
         return self.status == RoundStatus.OPEN
@@ -276,6 +291,10 @@ class RoundState:
             "abort_reason": self.abort_reason,
             "self_verified": self.self_verified,
             "self_verified_submission_id": self.self_verified_submission_id,
+            "benched_slate": (
+                list(self.benched_slate) if self.benched_slate is not None else None
+            ),
+            "veto_observe": self.veto_observe,
         }
 
     @classmethod
@@ -307,6 +326,11 @@ class RoundState:
             abort_reason=raw.get("abort_reason"),
             self_verified=bool(raw.get("self_verified")),
             self_verified_submission_id=raw.get("self_verified_submission_id"),
+            benched_slate=(
+                list(raw["benched_slate"])
+                if isinstance(raw.get("benched_slate"), list) else None
+            ),
+            veto_observe=raw.get("veto_observe"),
         )
 
 
@@ -566,6 +590,23 @@ class RoundStore:
         self._record(state)
         return copy.deepcopy(state)
 
+    def set_round_veto_observe(
+        self, round_id: str, summary: dict[str, Any] | None,
+    ) -> RoundState:
+        """Store the round's distributed-veto Phase-0 observe record (compact
+        counts + resolution). Best-effort durability for /health and the soak;
+        never gates anything. Missing round is a no-op (the round may have been
+        pruned/reopened by the time an observe pass resolves)."""
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            return RoundState(round_id=round_id)
+        state.veto_observe = summary
+        state.updated_at = time.time()
+        self._persist()
+        self._record(state)
+        return copy.deepcopy(state)
+
     def set_round_finalist(
         self,
         round_id: str,
@@ -696,6 +737,23 @@ class RoundStore:
             raise KeyError(f"Round not found: {round_id}")
         state.self_verified = True
         state.self_verified_submission_id = submission_id
+        state.updated_at = time.time()
+        self._persist()
+        return copy.deepcopy(state)
+
+    def set_benched_slate(self, round_id: str, submission_ids: list[str]) -> RoundState:
+        """Record the close-time rotation's selected slate — the single source of
+        truth for which submissions get benched this round.
+
+        Written by ``apply_rotation_slate`` right after selection so the
+        benchmark worker's belt reads THIS instead of recomputing the rotation
+        against a ledger the close already advanced (the double-bench race).
+        Idempotent; stores a copy."""
+        self._maybe_reload()
+        state = self._rounds.get(round_id)
+        if state is None:
+            raise KeyError(f"Round not found: {round_id}")
+        state.benched_slate = list(submission_ids)
         state.updated_at = time.time()
         self._persist()
         return copy.deepcopy(state)

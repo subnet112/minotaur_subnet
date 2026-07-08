@@ -38,6 +38,8 @@ from .state import (
 )
 from .round_manager import (
     _adopt_leader_round_if_behind,
+    _broadcast_internal_round_sync,
+    _close_round_sync_payload,
     _current_solver_round_epoch,
     _round_certification_deadline_elapsed,
 )
@@ -231,18 +233,29 @@ async def _reactive_benchmark_candidate(
     # off (unset env -> live head, unchanged). Without parity a follower would
     # re-verify at its own live head — exactly the divergence the band papers over.
     _round_pin = None
+    _round_pins: dict[int, int] | None = None
     if round_id:
         try:
             from minotaur_subnet.api.startup import (
                 _resolve_round_fork_pins,
                 _round_anchor_chains,
             )
+            from minotaur_subnet.consensus.round_anchor import (
+                benchmark_all_deployment_chains_enabled,
+            )
             _pins = _resolve_round_fork_pins(round_id)
             if _pins:
                 _round_pin = _pins.get(_round_anchor_chains()[0])
+                # Per-chain map when multi-chain benchmarking is armed, so the
+                # follower re-verifies each chain at ITS OWN block (parity with
+                # the leader's per-chain pins). Off → scalar Base-only, unchanged.
+                if benchmark_all_deployment_chains_enabled():
+                    _round_pins = dict(_pins)
         except Exception as exc:
             logger.warning("fork-pins: follower resolve failed for %s: %s", round_id, exc)
-    if _round_pin is not None:
+    if _round_pins:
+        worker.set_fork_pins(_round_pins)
+    elif _round_pin is not None:
         worker.set_epoch_block(int(_round_pin))
     else:
         worker._apply_epoch_block_pin()
@@ -272,21 +285,6 @@ async def _reactive_benchmark_candidate(
         except Exception as exc:
             logger.warning("Reactive historical sampling failed: %s", exc)
 
-    # Match the leader benchmark path: challenger and incumbent/champion are both
-    # scored against the current champion's quote anchor for the same shared corpus.
-    # If the reference pre-pass cannot be built on the follower, fail closed rather
-    # than vote on a different benchmark definition.
-    try:
-        reference_quotes = await worker._build_reference_quotes(intents)
-    except Exception as exc:
-        logger.error(
-            "Reactive verify for %s could not build champion reference quotes "
-            "— failing closed: %s",
-            candidate.submission_id,
-            exc,
-        )
-        return False, {}
-
     # Run the Docker benchmark. Honor the same fail-closed switch as the leader
     # (BENCHMARK_REQUIRE_REAL_SIM) so a follower never re-verifies a candidate on
     # fabricated mock data while the leader fail-closes it — that asymmetry would
@@ -305,7 +303,6 @@ async def _reactive_benchmark_candidate(
             simulator=simulator,
             require_real_sim=_require_real_sim,
             fork_block=worker._epoch_block_number,
-            reference_quotes=reference_quotes,
         )
     except RealSimulationUnavailable:
         logger.error(
@@ -360,7 +357,7 @@ async def _reactive_benchmark_candidate(
     return await _independent_adopt_vote(
         worker=worker, intents=intents, score_fn=score_fn, simulator=simulator,
         chal_results=results, candidate=candidate,
-        round_id=round_id, reference_quotes=reference_quotes,
+        round_id=round_id,
     )
 
 
@@ -373,7 +370,6 @@ async def _independent_adopt_vote(
     chal_results: list,
     candidate: Any,
     round_id: str | None,
-    reference_quotes: dict[str, dict[str, str]] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """This follower's INDEPENDENT adopt verdict over the SHARED corpus (#242).
 
@@ -507,7 +503,6 @@ async def _independent_adopt_vote(
                 simulator=simulator,
                 require_real_sim=_require_real_sim,
                 fork_block=worker._epoch_block_number,
-                reference_quotes=reference_quotes,
             )
         finally:
             await champ_session.shutdown()
@@ -525,7 +520,6 @@ async def _independent_adopt_vote(
             fork_block=worker._epoch_block_number,
             intents=intents,
             require_real_sim=_require_real_sim,
-            reference_quotes=reference_quotes,
             run=_run_champ,
         )
     except RealSimulationUnavailable:
@@ -542,11 +536,14 @@ async def _independent_adopt_vote(
     # RAW delivered output the live raw-output scorer emits via metadata.raw_output).
     # factor_delta: the Phase-2 factorization tie-break, from the PERSISTED
     # screening metrics on this follower's LOCAL records (leader-computed once,
-    # mirrored: the candidate's via the round close snapshot; the incumbent's
-    # only via a champion force-sync — a leader-side BACKFILL does NOT reach
-    # here on its own, close snapshots are round-scoped, hence the mandatory
-    # post-backfill reattest in scripts/backfill_factor_metric.py). None on
-    # either side ⇒ 0 ⇒ clause inert, exactly like the leader.
+    # mirrored: the candidate's via the round close snapshot + the leader's
+    # pre-proposal refresh (_refresh_round_submission_mirror — the close-time
+    # snapshot can predate screening stage 1, e.g. a restart-requeued screening
+    # on a round closed at boot); the incumbent's only via a champion
+    # force-sync — a leader-side BACKFILL does NOT reach here on its own, close
+    # snapshots are round-scoped, hence the mandatory post-backfill reattest in
+    # scripts/backfill_factor_metric.py). None on either side ⇒ 0 ⇒ clause
+    # inert, exactly like the leader.
     # deadwood_delta: the 4th ladder key, threaded IDENTICALLY; the
     # metric-version guard lives in the ONE shared helper
     # (deadwood_delta_between: 0 unless BOTH records carry SAME-VERSION
@@ -554,18 +551,35 @@ async def _independent_adopt_vote(
     # a mismatched pair must never produce a nonzero delta). The fields ship
     # on the #575 lineage; getattr keeps this inert until the lineages merge
     # and records carry values (activation-by-data, exactly like factor).
+    #
+    # Read the metrics off the FRESHEST store record for the candidate: the
+    # `candidate` reference was fetched at proposal receipt
+    # (_build_champion_proposal_for_round → store.get), and the reactive
+    # benchmark above runs for MINUTES in between — a snapshot heal landing
+    # meanwhile REPLACES the store object (upsert builds a new Submission), so
+    # the in-hand reference can be a stale pre-metrics copy. Best-effort with
+    # the passed candidate as fallback: a missing store/record degrades to the
+    # exact pre-refresh behavior (None ⇒ 0 ⇒ inert), never a crash.
+    try:
+        candidate_rec = get_store().get(
+            getattr(candidate, "submission_id", "") or ""
+        ) or candidate
+    except Exception:  # noqa: BLE001 — the passed candidate is always usable
+        candidate_rec = candidate
+    factor_delta = factor_delta_between(
+        getattr(incumbent_sub, "max_region_nodes", None),
+        getattr(candidate_rec, "max_region_nodes", None),
+    )
+    deadwood_delta = deadwood_delta_between(
+        getattr(incumbent_sub, "unproductive_nodes", None),
+        getattr(candidate_rec, "unproductive_nodes", None),
+        getattr(incumbent_sub, "unproductive_metric_version", None),
+        getattr(candidate_rec, "unproductive_metric_version", None),
+    )
     verdict = evaluate_relative_adoption(
         champ_results, chal_results,
-        factor_delta=factor_delta_between(
-            getattr(incumbent_sub, "max_region_nodes", None),
-            getattr(candidate, "max_region_nodes", None),
-        ),
-        deadwood_delta=deadwood_delta_between(
-            getattr(incumbent_sub, "unproductive_nodes", None),
-            getattr(candidate, "unproductive_nodes", None),
-            getattr(incumbent_sub, "unproductive_metric_version", None),
-            getattr(candidate, "unproductive_metric_version", None),
-        ),
+        factor_delta=factor_delta,
+        deadwood_delta=deadwood_delta,
         **_bar_kwargs(incumbent_sub),
     )
     adopt = bool(verdict["adopt"])
@@ -573,14 +587,15 @@ async def _independent_adopt_vote(
     logger.info(
         "[independent-vote] role=follower candidate=%s round=%s vote=%s "
         "fork_block=%s better=%d worse=%d wins=%d regressions=%d blind_spots=%d "
-        "compared=%d: %s",
+        "compared=%d factor_delta=%d deadwood_delta=%d: %s",
         candidate.submission_id,
         round_id,
         "ADOPT" if adopt else "REJECT",
         worker._epoch_block_number,
         counts["better"], counts["worse"],
         verdict["n_wins"], verdict["n_regressions"], verdict["n_blind_spots"],
-        verdict["scenarios_compared"], verdict["reason"],
+        verdict["scenarios_compared"], factor_delta, deadwood_delta,
+        verdict["reason"],
     )
     # Publish for the fleet tally (/health independent_vote). Best-effort.
     try:
@@ -1169,6 +1184,58 @@ async def _run_best_effort_champion_quorum(
         pass
 
 
+async def _refresh_round_submission_mirror(round_state: RoundState) -> None:
+    """Re-broadcast the round's CURRENT submission records (force-close snapshot)
+    so follower votes compute factor/deadwood deltas from the SAME persisted
+    metrics the leader's decision read.
+
+    Root cause this closes: the close-time snapshot is the ONLY path that
+    mirrors a candidate's ladder metrics (max_region_nodes / unproductive_*) to
+    followers, but it is serialized AT CLOSE — and screening stage 1 (which
+    computes those metrics) can complete AFTER close. Rotation deliberately
+    keeps not-yet-screened submissions in the slate, and a leader restart
+    re-kicks screening from scratch (resume_stranded_screenings) while the
+    coordinator closes the elapsed round within seconds of boot. The leader's
+    adopt decision then reads its LIVE record (metrics present by decision
+    time), while every follower's mirrored record still carries the close-time
+    None ⇒ factor_delta/deadwood_delta 0 ⇒ a factor-tie dethrone the leader
+    adopts collects BENCHMARK_MISMATCH dissents fleet-wide (observed 2026-07-07
+    19:16Z: round-e29724169-n1 / sub_c2ea85aa9641, leader factor_delta=-1647
+    vs both followers "0 better / 0 worse").
+
+    Re-sending the close payload with ``force=True`` re-delivers the snapshot
+    through the follower's existing force-heal branch
+    (``_sync_close_solver_round_state``), which upserts the records on an
+    already-closed round WITHOUT touching its FSM — the exact mechanism the
+    champion re-attest lever uses, live fleet-wide, so followers need NO new
+    code (leader-only deploys via :latest fix the whole fleet). The lifecycle
+    payload is signed over the RAW dict, so this carries no request-model /
+    signature-canonical hazard (unlike extending the champion-proposal model).
+
+    AWAITED by the caller BEFORE the proposal fan-out, so the heal lands before
+    any follower's ``_independent_adopt_vote`` reads its store. Best-effort: a
+    refresh failure must never block certification — followers then vote on the
+    close-time mirror, exactly the pre-fix behavior.
+    """
+    try:
+        payload = _close_round_sync_payload(round_state)
+        payload["force"] = True
+        await _broadcast_internal_round_sync(
+            "/v1/solver/round/internal/close", payload,
+        )
+        logger.info(
+            "[candidate-metric-refresh] round=%s: re-broadcast the submission "
+            "snapshot (%d record(s)) before collecting champion votes",
+            round_state.round_id, len(payload.get("submissions") or []),
+        )
+    except Exception:  # noqa: BLE001 — never block certification on the refresh
+        logger.warning(
+            "[candidate-metric-refresh] round=%s: snapshot re-broadcast failed "
+            "(followers will vote on the close-time mirror)",
+            round_state.round_id, exc_info=True,
+        )
+
+
 async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
     """Internal helper to certify a round without HTTP context."""
     round_store = get_round_store()
@@ -1315,6 +1382,14 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                 ),
             )
         peer_network = get_champion_peer_network()
+        # Vote-input parity: refresh the fleet's submission mirror BEFORE asking
+        # peers to vote, so every follower's factor/deadwood deltas are computed
+        # from the SAME persisted metrics the leader's decision read (the
+        # close-time snapshot can predate screening stage 1 — see
+        # _refresh_round_submission_mirror). Awaited so the heal lands before
+        # the proposal fan-out below triggers any _independent_adopt_vote.
+        if peer_network is not None:
+            await _refresh_round_submission_mirror(round_state)
         broadcast_task = None
         if peer_network is not None:
             broadcast_task = asyncio.create_task(
