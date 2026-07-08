@@ -199,7 +199,7 @@ def _benchmark_pin_chains() -> list[int]:
     every operational deployment chain, so a multi-chain app (e.g. deployed on
     Base AND Ethereum) gets each chain pinned at ITS OWN canonical block. The set
     MUST be fleet-uniform (it binds the pack hash), which the gate guarantees:
-    default-off, flipped fleet-wide like ROUND_ANCHORED_PIN.
+    DEFAULT ON, fleet-uniform like ROUND_ANCHORED_PIN (folds into the pack hash).
     """
     from minotaur_subnet.consensus.round_anchor import (
         benchmark_all_deployment_chains_enabled,
@@ -2968,18 +2968,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 return out
 
             def _veto_bare_digest(submission_id: str | None) -> str | None:
-                """Resolve a submission's pushed bare GHCR digest (from its stored
-                image_digest ref). Read-only; None when the image was never pushed
-                (legacy id only) → the phase honestly skips."""
-                if not submission_id:
-                    return None
-                try:
-                    from minotaur_subnet.harness.image_transport import bare_hex
-
-                    sub = submissions.get_store().get_submission(submission_id)
-                    return bare_hex(getattr(sub, "image_digest", None)) if sub else None
-                except Exception:  # noqa: BLE001 — never break the observe pass
-                    return None
+                # Resolve via the extracted + tested helper (SubmissionStore's
+                # lookup is .get(id); the old inline .get_submission() did not
+                # exist and was swallowed, skipping every round).
+                from minotaur_subnet.api.routes.submissions import veto_wire
+                return veto_wire.resolve_bare_digest(
+                    submissions.get_store(), submission_id,
+                )
 
             def _record_veto_skip(round_id, finalist_sub, candidate_digest, reason) -> None:
                 from minotaur_subnet.api.routes.submissions import veto_wire
