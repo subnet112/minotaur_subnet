@@ -25,6 +25,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from mcp.server.fastmcp import FastMCP
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
 
 server = FastMCP(
@@ -478,12 +480,9 @@ def _initialize_with_rpc(strategy, chain_id: int) -> None:
     # strategy that reads os.environ.get("BASE_RPC_URL") at runtime
     # picks it up. Also call initialize directly when the strategy
     # supports it.
-    if int(chain_id) in (1, 31337):
-        os.environ.setdefault("ANVIL_RPC_URL", rpc_url)
-    elif int(chain_id) == 8453:
-        os.environ.setdefault("BASE_RPC_URL", rpc_url)
-    elif int(chain_id) == 964:
-        os.environ.setdefault("BITTENSOR_EVM_RPC_URL", rpc_url)
+    spec = registry.spec(int(chain_id))
+    if spec is not None and spec.boot_rpc_env:
+        os.environ.setdefault(spec.boot_rpc_env, rpc_url)
     init = getattr(strategy, "initialize", None)
     if callable(init):
         try:

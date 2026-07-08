@@ -1512,6 +1512,7 @@ from minotaur_subnet.shared.types import (
 )
 from minotaur_subnet.sdk.intent_solver import IntentSolver, MarketSnapshot, SolverMetadata
 from minotaur_subnet.sdk.strategy import Strategy
+from minotaur_subnet.chains import registry
 
 logger = logging.getLogger(__name__)
 '''
@@ -1561,12 +1562,9 @@ class BundledRoutingSolver(IntentSolver):
                     cid = int(chain_str)
                 except (ValueError, TypeError):
                     continue
-                if cid in (1, 31337):
-                    _os.environ.setdefault("ANVIL_RPC_URL", url)
-                elif cid == 8453:
-                    _os.environ.setdefault("BASE_RPC_URL", url)
-                elif cid == 964:
-                    _os.environ.setdefault("BITTENSOR_EVM_RPC_URL", url)
+                _spec = registry.spec(cid)
+                if _spec is not None and _spec.boot_rpc_env:
+                    _os.environ.setdefault(_spec.boot_rpc_env, url)
         # Propagate the full config to every registered strategy so
         # Strategy.rpc_for(chain_id) works inside generate_plan. This is
         # the canonical contract — strategies should NEVER hardcode RPC

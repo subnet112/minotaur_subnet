@@ -52,6 +52,8 @@ class ChainSpec:
     # Canonical single live-RPC env (blockchain.chains.get_web3 / relayer chain_config).
     rpc_env: str
     is_poa: bool = False
+    # Block-explorer base URL (blockchain.chains.get_explorer_url / get_tx_url).
+    explorer: str = ""
 
     # ── env-resolved RPC ladders (ordered env-var names) ──────────────────────
     # Strict live-chain reads (registry / validator-set / score caches): the
@@ -109,6 +111,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         slug="eth",
         rpc_env="ETHEREUM_RPC_URL",
         is_poa=False,
+        explorer="https://etherscan.io",
         live_rpc_envs=("ETH_UPSTREAM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
         gas_rpc_envs=(
             "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL",
@@ -133,6 +136,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         slug="base",
         rpc_env="BASE_RPC_URL",
         is_poa=True,
+        explorer="https://basescan.org",
         live_rpc_envs=("BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL"),
         gas_rpc_envs=("BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL"),
         consensus_rpc_envs=("BASE_UPSTREAM_RPC_URL",),
@@ -156,6 +160,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         slug="btevm",
         rpc_env="BITTENSOR_EVM_RPC_URL",
         is_poa=False,
+        explorer="https://evm.taostats.io",
         live_rpc_envs=(
             "BITTENSOR_EVM_UPSTREAM_RPC_URL",
             "BITTENSOR_EVM_RPC_URL",
@@ -187,6 +192,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         slug="eth",   # legacy CHAIN_NAMES routed 31337 through the "eth" proxy slug
         rpc_env="ANVIL_RPC_URL",
         is_poa=False,
+        explorer="http://localhost:8545",
         live_rpc_envs=(),   # the live-read caches only knew 8453/1/964 -> "" here
         gas_rpc_envs=(),
         consensus_rpc_envs=(),
@@ -205,11 +211,11 @@ _SPECS: tuple[ChainSpec, ...] = (
     # ── Dormant: metadata present (explorer/name/gas), not wired into sim/benchmark. ──
     ChainSpec(
         chain_id=42161, name="Arbitrum", slug="arbitrum", rpc_env="ARBITRUM_RPC_URL",
-        is_poa=True, fallback_gas_price_wei=10_000_000, wired=False,
+        is_poa=True, explorer="https://arbiscan.io", fallback_gas_price_wei=10_000_000, wired=False,
     ),
     ChainSpec(
         chain_id=10, name="Optimism", slug="optimism", rpc_env="OPTIMISM_RPC_URL",
-        is_poa=True, fallback_gas_price_wei=10_000_000, wired=False,
+        is_poa=True, explorer="https://optimistic.etherscan.io", fallback_gas_price_wei=10_000_000, wired=False,
     ),
 )
 
