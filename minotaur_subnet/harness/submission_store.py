@@ -104,10 +104,37 @@ class SubmissionStatus(str, Enum):
     SCREENING_STAGE_1 = "screening_stage_1"
     SCREENING_STAGE_2 = "screening_stage_2"
     SCREENING_STAGE_3 = "screening_stage_3"
+    # Screening passed; awaiting the close-time rotation slate decision (PR-C
+    # promotes this into the flow). Terminal-for-this-round only via WAITLISTED.
+    PENDING_SELECTION = "pending_selection"
     BENCHMARKING = "benchmarking"
     SCORED = "scored"
+    # NOT selected onto this round's benched slate, OR the bench window elapsed
+    # before scoring — a NON-fault, NON-terminal-across-rounds outcome carrying
+    # next-round priority. Distinct from REJECTED (for-cause) so miners and the
+    # UI never read "didn't get a slot" as "your code was refused".
+    WAITLISTED = "waitlisted"
     REJECTED = "rejected"
     ADOPTED = "adopted"
+
+
+# Machine-readable terminal-outcome taxonomy (persisted as Submission.
+# outcome_code). The frontend switches on THIS, never on the human
+# rejection_reason prose. Grouped by the status they accompany:
+#   REJECTED (for-cause — miner must change something):
+OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
+OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
+OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
+OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
+OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
+OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
+OUTCOME_BUILD_FAILED = "build_failed"          # stage-2 docker build
+OUTCOME_INVALID_PLANS = "invalid_plans"        # stage-3 plan validation
+OUTCOME_BENCHMARK_FAILED = "benchmark_failed"  # bench produced no usable rows
+OUTCOME_SCREENING_ERROR = "screening_error"    # unexpected pipeline error
+#   WAITLISTED (no-fault — resubmit keeps seniority):
+OUTCOME_ROTATION_NOT_SELECTED = "rotation_not_selected"
+OUTCOME_WINDOW_ELAPSED = "window_elapsed"
 
 
 # Statuses meaning the submission actually occupied a benchmark slate slot (was
@@ -214,8 +241,16 @@ class Submission:
     benchmark_rank: int | None = None
     benchmark_details: dict[str, Any] | None = None
 
-    # Set on rejection
+    # Set on any terminal outcome (rejected / waitlisted).
     rejection_reason: str | None = None
+    # Machine-readable terminal outcome (one of the OUTCOME_* codes). The
+    # miner-facing surfaces (frontend, PR comment router) switch on THIS, not on
+    # the human rejection_reason. None while in-flight or on legacy records.
+    outcome_code: str | None = None
+    # Waitlist context for a WAITLISTED submission — {"position", "contenders",
+    # "slots"} + is priority for next round. Lets the UI say "queued for next
+    # round, #2 of 13". None for every non-waitlisted state.
+    waitlist: dict[str, Any] | None = None
 
     # Local path to cloned repo (transient, not persisted)
     _repo_path: str | None = field(default=None, repr=False)
@@ -254,6 +289,8 @@ class Submission:
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
+            "outcome_code": self.outcome_code,
+            "waitlist": self.waitlist,
         }
 
     def status_dict(self) -> dict[str, Any]:
@@ -276,6 +313,8 @@ class Submission:
             "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
+            "outcome_code": self.outcome_code,
+            "waitlist": self.waitlist,
         }
 
 
@@ -546,6 +585,8 @@ class SubmissionStore:
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
+            outcome_code=record.get("outcome_code"),
+            waitlist=record.get("waitlist"),
         )
         # _submissions is the source of truth for list_by_round / the pack hash;
         # the indexes are best-effort lookups (last-wins is fine, they aren't
@@ -749,6 +790,17 @@ class SubmissionStore:
         if not passed:
             sub.status = SubmissionStatus.REJECTED
             sub.rejection_reason = f"Stage {stage}: {error_code} — {details}"
+            # Machine-readable outcome derived from the stage + error_code:
+            # stage 1 = static policy (or the armed factorization floor), stage 2
+            # = build, stage 3 = plan validation.
+            if stage == 1 and error_code == "too_entangled":
+                sub.outcome_code = OUTCOME_TOO_ENTANGLED
+            elif stage == 1:
+                sub.outcome_code = OUTCOME_STATIC_CHECKS
+            elif stage == 2:
+                sub.outcome_code = OUTCOME_BUILD_FAILED
+            elif stage == 3:
+                sub.outcome_code = OUTCOME_INVALID_PLANS
             self.purge_token(submission_id)  # terminal — drop the secret
 
         self._persist()
@@ -1023,16 +1075,63 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
-    def reject(self, submission_id: str, reason: str) -> None:
-        """Reject a submission with a reason."""
+    def reject(
+        self, submission_id: str, reason: str, *, outcome_code: str | None = None,
+    ) -> None:
+        """Reject a submission FOR CAUSE (the miner must change something).
+
+        ``outcome_code`` is the machine-readable OUTCOME_* the frontend switches
+        on; ``reason`` is the human prose. Kept optional so the many existing
+        call sites keep compiling — sites are being tagged with a code
+        incrementally.
+        """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.status = SubmissionStatus.REJECTED
         sub.rejection_reason = reason
+        sub.outcome_code = outcome_code
         sub.updated_at = time.time()
         self.purge_token(submission_id)  # terminal — drop the secret
+        self._persist()
+
+    @_write_locked
+    def waitlist(
+        self,
+        submission_id: str,
+        reason: str,
+        *,
+        outcome_code: str,
+        position: int | None = None,
+        contenders: int | None = None,
+        slots: int | None = None,
+    ) -> None:
+        """Mark a submission WAITLISTED — a NO-FAULT outcome (not selected onto
+        this round's slate, or the bench window elapsed).
+
+        Distinct from :meth:`reject`: the miner did nothing wrong, keeps
+        next-round seniority, and the UI must render it as "queued for next
+        round", never as a refusal. ``position``/``contenders``/``slots`` (when
+        known — rotation supplies them) populate the ``waitlist`` context the
+        status API and PR comment surface. The private token is purged like any
+        terminal-for-this-round state (a resubmit next round carries its own).
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.status = SubmissionStatus.WAITLISTED
+        sub.rejection_reason = reason
+        sub.outcome_code = outcome_code
+        sub.waitlist = {
+            "position": position,
+            "contenders": contenders,
+            "slots": slots,
+            "next_round_priority": True,
+        }
+        sub.updated_at = time.time()
+        self.purge_token(submission_id)
         self._persist()
 
     @_write_locked
@@ -1323,6 +1422,8 @@ class SubmissionStore:
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),
+                    outcome_code=d.get("outcome_code"),
+                    waitlist=d.get("waitlist"),
                 )
                 submissions[sid] = sub
                 round_key = f"{sub.hotkey}:{sub.round_id}"
