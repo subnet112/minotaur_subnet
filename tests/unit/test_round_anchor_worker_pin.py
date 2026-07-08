@@ -128,7 +128,6 @@ async def test_run_once_defers_when_pin_unavailable_gate_on(monkeypatch):
 
 def test_leader_resolver_extracts_benchmark_chain(monkeypatch):
     monkeypatch.delenv("ROUND_ANCHOR_CHAINS", raising=False)  # default [8453]
-    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "0")  # scalar path (default now ON → map)
     with patch.object(startup, "_resolve_round_fork_pins", return_value={8453: 3000, 964: 7}):
         assert _leader_fork_pin_resolver("r1") == 3000
 
