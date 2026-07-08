@@ -114,7 +114,11 @@ def test_relative_counts_repeat_folds_into_matched(monkeypatch):
     assert "1 blind-spot repeat(s) not credited" in reason
 
 
-def test_relative_counts_disarmed_unchanged():
+def test_relative_counts_disarmed_unchanged(monkeypatch):
+    # Disarmed (revert to None): a within-bar cover still dethrones, no repeat.
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", None)
     champ = _rows([("o1", "100"), ("o2", "0")])
     chal = _rows([("o1", "100"), ("o2", "5000")])
     counts = relative_counts(champ, chal, champion_bar={"o2": "5000"}, bar_age_s=60.0)
