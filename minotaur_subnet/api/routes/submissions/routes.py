@@ -1858,10 +1858,11 @@ async def receive_veto_assignment(request: Request):
     """Follower receiver: a leader-signed slice assignment.
 
     Auth is the SAME leader-signature scheme as round-lifecycle sync (no
-    shared-key fallback). A node with DISTRIBUTED_VETO off answers 409 — the
-    leader records terminal-UNSUPPORTED (= abstain), so a mixed/unarmed fleet
-    degrades to today's behavior. The bench itself runs async; this handler
-    only ACKs (the proposal endpoint's inline bench is the anti-pattern —
+    shared-key fallback). Participation is DEFAULT ON; a node opted out
+    (DISTRIBUTED_VETO=0) or pre-dating the code answers 409/404 — the leader
+    records terminal-UNSUPPORTED (= abstain), so a mixed/partial fleet degrades
+    gracefully. The bench itself runs async; this handler only ACKs (the
+    proposal endpoint's inline bench is the anti-pattern —
     it's why the harvest needs 300s/peer timeouts).
 
     ORDERING: the flag check and Content-Length reject run BEFORE the body is
