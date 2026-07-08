@@ -234,11 +234,15 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         ForkPinUnavailable,
         derive_fork_pins,
         round_anchor_ts,
+        round_anchor_ts_for_chain,
     )
 
     epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
     # round_anchor_ts (NOT epoch_anchor_ts): anchors one epoch back so the
     # confirmation-margin can confirm-bracket the anchor by round close (#anchor-back).
+    # anchor_ts is the DEFAULT (Base) anchor, kept for logging / the scalar
+    # fallback; the per-chain anchor_ts_of below is what actually pins each chain
+    # (slow chains anchor deeper so they bracket at open — #632).
     anchor_ts = round_anchor_ts(anchor_epoch, epoch_seconds)
     # Base only by default; the deployment-chain union when
     # BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed (each chain pinned independently).
@@ -274,6 +278,10 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
             head_of=lambda c: int(_w3(c).eth.block_number),
             block_timestamp_of=lambda c, b: int(_w3(c).eth.get_block(b)["timestamp"]),
             confirmations=confirmations,
+            # PER-CHAIN anchor: slow chains (e.g. Ethereum) anchor deeper so
+            # find_pin_block confirm-brackets them at round open instead of
+            # deferring forever (#632). Base is unchanged (default lookback).
+            anchor_ts_of=lambda c: round_anchor_ts_for_chain(c, anchor_epoch, epoch_seconds),
         )
     except ForkPinUnavailable as exc:
         logger.info("fork-pins: deferring for epoch %s: %s", anchor_epoch, exc)
