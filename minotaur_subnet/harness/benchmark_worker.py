@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import time
-from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -46,10 +44,6 @@ from minotaur_subnet.harness.orchestrator import (
     SolverTimeoutError,
     SolverCrashedError,
     run_benchmark,
-    benchmark_static_quote_enabled,
-    REFERENCE_QUOTE_FAILED_SENTINEL,
-    BENCHMARK_MIN_SLIPPAGE_BPS,
-    build_rpc_url_map,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 from minotaur_subnet.epoch.relative_scoring import (
@@ -332,38 +326,6 @@ def _clear_champion_bench_cache() -> None:
     _CHAMPION_BENCH_CACHE.clear()
 
 
-def _refquote_checkpoint_enabled() -> bool:
-    """Whether the reference-quote pre-pass is checkpointed (memory + /data).
-
-    Default ON; ``BENCHMARK_REFQUOTE_CHECKPOINT=0`` disables (recompute every
-    pass — the pre-#496 behavior).
-    """
-    import os
-
-    return os.environ.get("BENCHMARK_REFQUOTE_CHECKPOINT", "1").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
-
-
-# PROCESS-WIDE reference-quote memo, same sharing rationale as the champion
-# memo above (fresh BenchmarkWorker instances must share it). Additionally
-# PERSISTED next to the submission store (/data) so an api restart resumes the
-# round with the SAME reference quotes instead of re-running the champion
-# pre-pass — both a rework saving (the pre-pass ran ~3x/round: once per
-# run_once pass as submissions trickle in, once per incumbent re-score) and a
-# within-round consistency improvement (every challenger in the round is graded
-# against ONE reference set, not whichever pass happened to produce it).
-_REFERENCE_QUOTES_CACHE: dict[str, dict] = {}
-_REFERENCE_QUOTES_CACHE_MAX = 8
-_REFQUOTE_CHECKPOINT_FILENAME = "refquote_checkpoints.json"
-_REFQUOTE_CHECKPOINT_KEEP = 4  # last N keys on disk (a round has 1; margin for overlap)
-
-
-def _clear_reference_quotes_cache() -> None:
-    """Reset the process-wide reference-quote memo (test hook)."""
-    _REFERENCE_QUOTES_CACHE.clear()
-
-
 class BenchmarkWorker:
     """Processes BENCHMARKING submissions by scoring them against active intents.
 
@@ -422,9 +384,9 @@ class BenchmarkWorker:
 
     def _corpus_fingerprint(self, intents: list) -> str:
         """Stable hash of the corpus IDENTITY (ordered scenario labels), using the
-        same ``app_id[:scenario_name]`` labelling as the reference-quote pre-pass.
-        Guards the champion memo: a different corpus → different fingerprint → no
-        reuse. Robust to missing fields (label degrades to app_id)."""
+        same ``app_id[:scenario_name]`` labelling as ``run_benchmark``'s per-scenario
+        ``intent_label``. Guards the champion memo: a different corpus → different
+        fingerprint → no reuse. Robust to missing fields (label degrades to app_id)."""
         import hashlib
 
         labels = []
@@ -452,28 +414,6 @@ class BenchmarkWorker:
         parts = [f"{a}={self._loaded_js_hashes.get(a, '')}" for a in app_ids]
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
-    def _reference_quotes_fingerprint(
-        self,
-        reference_quotes: dict[str, dict[str, str]] | None,
-    ) -> str:
-        """Stable hash of the reference quote anchor used for a champion run.
-
-        Champion benchmark memoization is only valid when the quote anchor is the
-        same. A self-quoted champion run and a champion-reference-quoted run can
-        share the same round/image/fork/corpus/JS, but they are different scoring
-        computations and must not reuse one another.
-        """
-        if not reference_quotes:
-            return ""
-
-        parts: list[str] = []
-        for label in sorted(reference_quotes):
-            params = reference_quotes.get(label) or {}
-            parts.append(label)
-            for key in sorted(params):
-                parts.append(f"{key}={params[key]}")
-        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-
     async def memo_champion_bench(
         self,
         *,
@@ -482,7 +422,6 @@ class BenchmarkWorker:
         fork_block: int | None,
         intents: list,
         require_real_sim: bool,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
         run: Any,
     ) -> list[BenchmarkResult]:
         """Run (or reuse) the champion benchmark for this round, via the PROCESS-WIDE
@@ -491,12 +430,11 @@ class BenchmarkWorker:
 
         ``run`` is the caller's own async benchmark thunk (it owns session setup +
         exception semantics). Returns the cached result ONLY on an exact key match —
-        round_id, image, fork_block, real-sim, corpus fingerprint, scoring-JS
-        fingerprint, AND reference-quote fingerprint — i.e. the identical
-        deterministic computation, so a follower's verdict and persisted score are
-        unchanged. Disabled (always recompute) when the flag is off, the key is
-        incomplete (no round_id/image), or fork_block is None — a None pin means
-        live-head (dev), where reuse across blocks is unsafe.
+        round_id, image, fork_block, real-sim, corpus fingerprint, AND scoring-JS
+        fingerprint — i.e. the identical deterministic computation, so a follower's
+        verdict and persisted score are unchanged. Disabled (always recompute) when
+        the flag is off, the key is incomplete (no round_id/image), or fork_block is
+        None — a None pin means live-head (dev), where reuse across blocks is unsafe.
         """
         if (
             not _consolidate_champion_bench()
@@ -507,7 +445,6 @@ class BenchmarkWorker:
             round_id, image, int(fork_block), bool(require_real_sim),
             self._corpus_fingerprint(intents),
             self._loaded_js_fingerprint(intents),
-            self._reference_quotes_fingerprint(reference_quotes),
         )
         hit = _CHAMPION_BENCH_CACHE.get(key)
         if hit is not None:
@@ -921,12 +858,6 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
-        # Champion quote pre-pass: anchor each scenario's on-chain quote params
-        # (CoW quoted_output etc.) to the champion solver so every challenger is
-        # graded against the same reference output. Falls back to per-submission
-        # self-quoting when no champion is available (still fixes the revert).
-        reference_quotes = await self._get_or_build_reference_quotes(intents)
-
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
             # FRESH-STATUS GUARD: ``benchmarking`` is a snapshot; rotation at
@@ -979,7 +910,6 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_solver_path(
                         sub.solver_path, intents, score_fn,
-                        reference_quotes=reference_quotes,
                     )
                     details = self._results_to_details(results)
                     valid = has_delivered_value_rows(details["per_intent"])
@@ -1011,7 +941,6 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_submission(
                         sub.image_tag, intents, score_fn,
-                        reference_quotes=reference_quotes,
                     )
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
@@ -1069,8 +998,8 @@ class BenchmarkWorker:
         Mirrors ``run_once``'s per-submission setup: applies the SAME epoch/round
         fork-pin a real challenger gets (the incumbent re-score historically did NOT
         apply the round-anchored pin), builds the same flat intents corpus (synthetic
-        ∪ the round's historical order draw) and the same champion reference-quote
-        anchor, then runs the same ``_benchmark_submission`` / ``_results_to_details``.
+        ∪ the round's historical order draw), then runs the same
+        ``_benchmark_submission`` / ``_results_to_details``.
         Nothing is persisted or made adoption-eligible here — the caller decides what
         to do with the returned ``details`` (whose ``per_intent[*].raw_output`` rows
         are what the relative rule consumes).
@@ -1103,12 +1032,8 @@ class BenchmarkWorker:
                         intents.extend(historical)
                 except Exception as exc:
                     logger.warning("[%s] historical load failed: %s", context, exc)
-        reference_quotes = await self._get_or_build_reference_quotes(intents)
-
         logger.info("[%s] scoring image %s via challenger path (%d intents)", context, image_tag, len(intents))
-        results = await self._benchmark_submission(
-            image_tag, intents, score_fn, reference_quotes=reference_quotes,
-        )
+        results = await self._benchmark_submission(image_tag, intents, score_fn)
         details = self._results_to_details(results)
         # DISPLAY/logging only — the authoritative payload is `details`
         # (per_intent raw_output rows). Adoption/ranking never read this count.
@@ -1138,7 +1063,6 @@ class BenchmarkWorker:
         image_tag: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against one submission's Docker image."""
         orch = SolverOrchestrator()
@@ -1161,7 +1085,6 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
-                reference_quotes=reference_quotes,
                 session_factory=lambda: orch.start_docker(image_tag),
             )
             return results
@@ -1173,7 +1096,6 @@ class BenchmarkWorker:
         solver_path: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against a local solver file (subprocess mode)."""
         orch = SolverOrchestrator()
@@ -1186,7 +1108,6 @@ class BenchmarkWorker:
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
                 require_real_sim=self._require_real_sim,
-                reference_quotes=reference_quotes,
                 session_factory=lambda: orch.start_subprocess(solver_path),
             )
             return results
@@ -1817,19 +1738,6 @@ class BenchmarkWorker:
         _require_real_sim = require_real_sim_default()
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
-        # Mirror the LIVE benchmark's quote regime via the flag-aware getter.
-        # Static quoting (the default): no pre-pass — both sides get the zero
-        # quote injection (no anchor, no CoW fee), exactly how the real rounds
-        # score. Legacy champion-anchored mode (BENCHMARK_STATIC_QUOTE=0):
-        # grade BOTH the reference champion and the challenger against the
-        # SHADOW champion's OWN quote (one shared floor, ~0.5% slippage) so the
-        # two don't self-quote and tie. A direct _build_reference_quotes call
-        # here would bypass the flag and shadow-vote on a different benchmark
-        # definition than the one the fleet scores.
-        reference_quotes = await self._get_or_build_reference_quotes(
-            intents, image_tag=champ_image,
-        )
-
         async def _bench(image: str) -> list[BenchmarkResult]:
             orch = SolverOrchestrator()
             sess = await orch.start_docker(image)
@@ -1838,7 +1746,6 @@ class BenchmarkWorker:
                     sess, intents, config=cfg, score_fn=score_fn,
                     simulator=self._simulator, require_real_sim=_require_real_sim,
                     fork_block=self._epoch_block_number,
-                    reference_quotes=reference_quotes,
                     session_factory=lambda: orch.start_docker(image),
                 )
             finally:
@@ -1898,303 +1805,6 @@ class BenchmarkWorker:
         except Exception:  # observe-only — must never break
             pass
         return vote
-    def _refquote_checkpoint_path(self) -> Path | None:
-        """The on-disk checkpoint file, colocated with the submission store
-        (which already defaults onto the /data volume — #430), or None when the
-        store is memory-only (tests/dev)."""
-        p = getattr(self._sub_store, "_persist_path", None)
-        return p.with_name(_REFQUOTE_CHECKPOINT_FILENAME) if p is not None else None
-
-    def _refquote_checkpoint_key(
-        self, intents: list, image: str, fork_block: int, round_id: str,
-    ) -> str:
-        """Fully-deterministic identity of one pre-pass result — same components
-        as the champion-bench memo key, flattened for JSON storage."""
-        return "|".join((
-            round_id, image, str(int(fork_block)),
-            str(self._corpus_fingerprint(intents)),
-            str(self._loaded_js_fingerprint(intents)),
-        ))
-
-    def _refquote_disk_load(self, key: str) -> dict[str, dict[str, str]] | None:
-        path = self._refquote_checkpoint_path()
-        if path is None:
-            return None
-        try:
-            entries = json.loads(path.read_text()).get("entries", [])
-        except (OSError, ValueError):
-            return None
-        for e in entries:
-            if isinstance(e, dict) and e.get("key") == key:
-                quotes = e.get("quotes")
-                return quotes if isinstance(quotes, dict) else None
-        return None
-
-    def _refquote_disk_save(self, key: str, quotes: dict) -> None:
-        """Best-effort atomic append-and-trim; a failed save only costs a
-        recompute after the next restart, never correctness."""
-        path = self._refquote_checkpoint_path()
-        if path is None:
-            return
-        try:
-            try:
-                entries = json.loads(path.read_text()).get("entries", [])
-            except (OSError, ValueError):
-                entries = []
-            entries = [e for e in entries if isinstance(e, dict) and e.get("key") != key]
-            entries.append({"key": key, "quotes": quotes})
-            entries = entries[-_REFQUOTE_CHECKPOINT_KEEP:]
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps({"version": 1, "entries": entries}))
-            tmp.replace(path)
-        except OSError as exc:
-            logger.warning("[reference-quote] checkpoint save failed: %s", exc)
-
-    async def _get_or_build_reference_quotes(
-        self,
-        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
-        *,
-        image_tag: str | None = None,
-    ) -> dict[str, dict[str, str]]:
-        """Memoized + /data-checkpointed :meth:`_build_reference_quotes`.
-
-        The pre-pass is fully determined by (round, champion image, fork block,
-        corpus, scoring-JS) — the same key discipline as ``memo_champion_bench``
-        — so reuse is the identical computation, and an api restart mid-round
-        picks the round back up with the SAME reference set instead of paying a
-        fresh champion session (~30 quotes) per run_once pass.
-
-        Falls through to a plain build when: checkpointing is disabled, any key
-        component is unavailable (no round / no pin / no champion — dev paths),
-        or the build produced an EMPTY result (champion session failed to start:
-        transient, must retry next pass, never freeze for the round).
-
-        STATIC-quote mode (the DEFAULT; opt out with
-        ``BENCHMARK_STATIC_QUOTE=0``): the pre-pass is skipped entirely — the
-        enrichment injects a static zero quote instead of anchoring on the
-        champion's, so computing champion reference quotes (~30
-        champion-session quotes/round) would be wasted work. Returns {}.
-        Every benchmark path MUST obtain reference quotes through THIS getter,
-        never `_build_reference_quotes` directly, or it silently benches under
-        a different quote regime than the fleet's scoring definition.
-        """
-        if benchmark_static_quote_enabled():
-            return {}
-
-        round_id = None
-        if self._round_store is not None:
-            current = self._round_store.get_current_round()
-            round_id = getattr(current, "round_id", None)
-        image = image_tag
-        if image is None and self._use_docker:
-            image = self._resolve_champion_image()
-        fork_block = self._epoch_block_number
-        if (
-            not _refquote_checkpoint_enabled()
-            or not round_id or not image or fork_block is None
-        ):
-            return await self._build_reference_quotes(intents, image_tag=image_tag)
-
-        key = self._refquote_checkpoint_key(intents, image, fork_block, round_id)
-        hit = _REFERENCE_QUOTES_CACHE.get(key)
-        if hit is not None:
-            logger.info(
-                "[reference-quote] reuse memoized pre-pass round=%s (skipped a "
-                "champion session)", round_id,
-            )
-            return hit
-        disk = self._refquote_disk_load(key)
-        if disk is not None:
-            logger.info(
-                "[reference-quote] resumed pre-pass from /data checkpoint "
-                "round=%s (survived a restart)", round_id,
-            )
-            _REFERENCE_QUOTES_CACHE[key] = disk
-            return disk
-
-        quotes = await self._build_reference_quotes(intents, image_tag=image)
-        if quotes:  # {} = transient champion-session failure: retry next pass
-            if len(_REFERENCE_QUOTES_CACHE) >= _REFERENCE_QUOTES_CACHE_MAX:
-                _REFERENCE_QUOTES_CACHE.clear()
-            _REFERENCE_QUOTES_CACHE[key] = quotes
-            self._refquote_disk_save(key, quotes)
-        return quotes
-
-    async def _build_reference_quotes(
-        self,
-        intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
-        *,
-        image_tag: str | None = None,
-    ) -> dict[str, dict[str, str]]:
-        """Quote every scenario with the CHAMPION solver as the reference.
-
-        Runs a short champion pre-pass before benchmarking submissions: start a
-        champion Docker session, ask it to quote each scenario, map the result
-        via the shared ``map_quote_result_to_params`` helper, and key the output
-        by the same per-scenario label ``run_benchmark`` uses (``app_id`` or
-        ``app_id:scenario_name``). This anchors the on-chain ``quoted_output``
-        (the CoW fee reference) to the champion so every challenger is graded
-        against the same reference output — the champion→challenger fallback the
-        product owner specified.
-
-        Returns ``{}`` (every scenario self-quotes, which still fixes the
-        revert) when no champion image is available, Docker is disabled, or the
-        champion session can't be started.
-
-        Per-scenario: when the champion session is up but FAILS to quote a
-        specific scenario (raises or returns ``None``), that scenario's entry is
-        set to the ``REFERENCE_QUOTE_FAILED_SENTINEL`` marker instead of being
-        omitted. ``run_benchmark`` detects the marker and treats the scenario as
-        a CHAMPION BLIND-SPOT: every solver SELF-QUOTES it (see the
-        ``[champion-blind-spot]`` path in ``orchestrator.run_benchmark``). The
-        champion — which can't quote it — scores 0 there, while a challenger that
-        CAN quote + execute reveals real capability the champion lacks. The
-        marker exists so this is a *surfaced, logged* blind spot, not a silently
-        masked self-quote.
-        """
-        if not self._use_docker:
-            return {}
-        if image_tag is None:
-            image_tag = self._resolve_champion_image()
-        if image_tag is None:
-            logger.info("Reference-quote pre-pass skipped: no champion image")
-            return {}
-
-        from minotaur_subnet.api.services.app_service import (
-            map_quote_result_to_params,
-            source_quote_param_names,
-        )
-
-        reference: dict[str, dict[str, str]] = {}
-        failed: set[str] = set()
-        orch = SolverOrchestrator()
-        try:
-            session = await orch.start_docker(image_tag)
-        except Exception as exc:
-            logger.warning(
-                "Reference-quote pre-pass: failed to start champion session "
-                "(%s); scenarios will self-quote", exc,
-            )
-            return {}
-        from minotaur_subnet.harness.solver_read_proxy import (
-            CHAIN_NAMES,
-            build_pin_blocks,
-            close_session,
-            open_session,
-            proxy_rpc_url,
-            read_proxy_config,
-        )
-        _read_proxy = read_proxy_config()
-        _proxy_session_id: str | None = None
-        try:
-            chain_ids = list({s.chain_id for _, s, _ in intents} or {1})
-            rpc_map = build_rpc_url_map(chain_ids)
-            missing_rpc = [c for c in chain_ids if c not in rpc_map]
-            if missing_rpc:
-                # Fail loud, not silent: without a live RPC the champion quotes
-                # against an INCOMPLETE snapshot (missing pools → false "No route"
-                # → false blind spots → corrupt reference quotes that EVERY
-                # challenger is then graded against). Refuse rather than build the
-                # network's scoring bar on degraded data.
-                raise RuntimeError(
-                    f"Reference-quote pre-pass: no benchmark RPC for chain(s) "
-                    f"{missing_rpc} — refusing to build champion reference quotes "
-                    f"on snapshot fallback (incomplete pools). Set "
-                    f"BENCHMARK_ANVIL_RPC_* / *_SIM_RPC_URL / *_RPC_URL."
-                )
-            # Route the champion's reads through the SAME block-pin proxy the
-            # challenger benchmark uses (orchestrator.run_benchmark), pinned at the
-            # round's fork block. Without this the champion dials the RAW anvil fork
-            # — unreachable on the sealed sandbox net (BENCHMARK_ALLOWED_HOSTS only
-            # permits the proxy) → "Web3 not connected" → 0 reference quotes → every
-            # challenger self-quotes (champion scores 0 everywhere, so the benchmark
-            # measures nothing). This was the migration gap: the challenger path
-            # moved to the proxy, the champion pre-pass kept the raw-anvil wiring.
-            fork_block = self._epoch_block_number
-            if _read_proxy is not None and fork_block is not None and rpc_map:
-                pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
-                if pin_blocks:
-                    _proxy_session_id = f"refquote-{id(session):x}-{fork_block}"
-                    await open_session(_read_proxy, _proxy_session_id, pin_blocks)
-                    for cid in list(rpc_map):
-                        if cid in _read_proxy.chain_ids and cid in CHAIN_NAMES:
-                            rpc_map[cid] = proxy_rpc_url(
-                                _read_proxy, _proxy_session_id, cid,
-                            )
-                    logger.info(
-                        "[reference-quote] champion reads routed via block-pin "
-                        "proxy session=%s pinned=%s", _proxy_session_id, pin_blocks,
-                    )
-            await session.initialize({
-                "chain_ids": chain_ids,
-                "rpc_urls": {str(k): v for k, v in rpc_map.items()},
-            })
-            for intent, state, snapshot in intents:
-                intent_function = state.control_view().get("_intent_function", "swap")
-                # Same manifest-driven gate as run_benchmark's enrichment.
-                if not source_quote_param_names(intent.manifest, intent_function):
-                    continue
-                if state.raw_params_view().get("quoted_output") not in (None, ""):
-                    continue
-                scenario_name = state.control_view().get("_scenario_name", "")
-                label = (
-                    f"{intent.app_id}:{scenario_name}"
-                    if scenario_name else intent.app_id
-                )
-                try:
-                    quote_result = await session.quote(intent, state, snapshot)
-                except Exception as exc:
-                    # Surface, don't mask: a champion that can't quote a scenario
-                    # is a real failure (broken solver, bad scenario, RPC issue).
-                    # Mark it as a champion blind-spot so run_benchmark SELF-QUOTES
-                    # it per-solver (champion scores 0 there; a challenger that can
-                    # quote + execute reveals capability) instead of masking the
-                    # champion failure behind a comparable pass.
-                    logger.error(
-                        "[reference-quote-FAILED] champion quote raised for %s "
-                        "(%s); champion blind-spot — solvers SELF-QUOTE this "
-                        "scenario, champion scores 0 here", label, exc,
-                    )
-                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
-                    failed.add(label)
-                    continue
-                if quote_result is None:
-                    logger.error(
-                        "[reference-quote-FAILED] champion quote returned None "
-                        "for %s; champion blind-spot — solvers SELF-QUOTE this "
-                        "scenario, champion scores 0 here", label,
-                    )
-                    reference[label] = {REFERENCE_QUOTE_FAILED_SENTINEL: "1"}
-                    failed.add(label)
-                    continue
-                mapped = map_quote_result_to_params(
-                    quote_result, intent.manifest, intent_function,
-                    slippage_bps=BENCHMARK_MIN_SLIPPAGE_BPS,  # loose benchmark floor
-                )
-                if mapped:
-                    reference[label] = mapped
-            built = len(reference) - len(failed)
-            if failed:
-                logger.error(
-                    "Reference-quote pre-pass: built %d champion reference "
-                    "quotes; %d scenario(s) FAILED to quote (champion blind-spots "
-                    "— solvers self-quote these, champion scores 0): %s",
-                    built, len(failed), sorted(failed),
-                )
-            else:
-                logger.info(
-                    "Reference-quote pre-pass: built %d champion reference quotes",
-                    built,
-                )
-        finally:
-            await session.shutdown()
-            if _proxy_session_id is not None and _read_proxy is not None:
-                try:
-                    await close_session(_read_proxy, _proxy_session_id)
-                except Exception:  # noqa: BLE001 — cleanup must not mask the result
-                    pass
-        return reference
-
     async def _maybe_bootstrap_solving_apps_with_champion(self) -> int:
         """Benchmark the current champion against newly deployed solving apps.
 
