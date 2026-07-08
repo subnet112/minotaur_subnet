@@ -773,7 +773,10 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             sub.repo_url, sub.commit_hash, repo_dir, token=repo_token,
         )
         if not clone_ok:
-            store.reject(submission_id, "Failed to clone repository")
+            store.reject(
+                submission_id, "Failed to clone repository",
+                outcome_code="clone_failed",
+            )
             return
 
         # Stage 1: Static checks
@@ -843,6 +846,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                         f"nonce edits do not make code new; change the logic or "
                         f"data to participate again."
                     ),
+                    outcome_code="fingerprint_repeat",
                 )
                 return
 
@@ -990,7 +994,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
 
     except Exception as exc:
         logger.exception("Screening pipeline error for %s", submission_id)
-        store.reject(submission_id, f"Screening error: {exc}")
+        store.reject(submission_id, f"Screening error: {exc}", outcome_code="screening_error")
 
     finally:
         if repo_dir and os.path.exists(repo_dir):
