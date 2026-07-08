@@ -199,7 +199,7 @@ def _benchmark_pin_chains() -> list[int]:
     every operational deployment chain, so a multi-chain app (e.g. deployed on
     Base AND Ethereum) gets each chain pinned at ITS OWN canonical block. The set
     MUST be fleet-uniform (it binds the pack hash), which the gate guarantees:
-    default-off, flipped fleet-wide like ROUND_ANCHORED_PIN.
+    DEFAULT ON, fleet-uniform like ROUND_ANCHORED_PIN (folds into the pack hash).
     """
     from minotaur_subnet.consensus.round_anchor import (
         benchmark_all_deployment_chains_enabled,

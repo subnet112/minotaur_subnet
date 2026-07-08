@@ -874,6 +874,20 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
 class TestGenesisBootstrap(unittest.TestCase):
     """Tests for the genesis auto-bootstrap mechanism."""
 
+    def setUp(self):
+        # These test SINGLE-chain bootstrap logic. BENCHMARK_ALL_DEPLOYMENT_CHAINS
+        # is now default-ON, which makes the benchmark path require a resolvable
+        # per-chain round-anchored pin (absent in this test env -> deferral).
+        # Pin it OFF so the bootstrap behaviour under test is isolated.
+        self._prev_badc = os.environ.get("BENCHMARK_ALL_DEPLOYMENT_CHAINS")
+        os.environ["BENCHMARK_ALL_DEPLOYMENT_CHAINS"] = "0"
+
+    def tearDown(self):
+        if self._prev_badc is None:
+            os.environ.pop("BENCHMARK_ALL_DEPLOYMENT_CHAINS", None)
+        else:
+            os.environ["BENCHMARK_ALL_DEPLOYMENT_CHAINS"] = self._prev_badc
+
     def test_genesis_runs_when_no_champion_and_solving_apps(self):
         """Genesis creates a baseline submission when conditions are met."""
         store = SubmissionStore()
@@ -1045,6 +1059,20 @@ class TestGenesisBootstrap(unittest.TestCase):
 
 class TestChampionBootstrap(unittest.TestCase):
     """Tests for champion-driven SOLVING -> SOLVED bootstrap."""
+
+    def setUp(self):
+        # These test SINGLE-chain bootstrap logic. BENCHMARK_ALL_DEPLOYMENT_CHAINS
+        # is now default-ON, which makes the benchmark path require a resolvable
+        # per-chain round-anchored pin (absent in this test env -> deferral).
+        # Pin it OFF so the bootstrap behaviour under test is isolated.
+        self._prev_badc = os.environ.get("BENCHMARK_ALL_DEPLOYMENT_CHAINS")
+        os.environ["BENCHMARK_ALL_DEPLOYMENT_CHAINS"] = "0"
+
+    def tearDown(self):
+        if self._prev_badc is None:
+            os.environ.pop("BENCHMARK_ALL_DEPLOYMENT_CHAINS", None)
+        else:
+            os.environ["BENCHMARK_ALL_DEPLOYMENT_CHAINS"] = self._prev_badc
 
     def test_champion_bootstraps_new_solving_apps(self):
         """An existing champion should validate new solving apps automatically."""
