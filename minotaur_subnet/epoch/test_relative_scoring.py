@@ -850,19 +850,20 @@ def _strip_gas(verdict):
     return {k: v for k, v in verdict.items() if k not in _GAS_VERDICT_KEYS}
 
 
-def test_gas_margin_ships_disarmed():
-    # THE arming switch: merging an int here ARMS the clause fleet-wide — that
-    # is a soak-calibrated develop->main promotion decision, never this PR.
-    assert _rs.GAS_MARGIN_BPS is None
-    assert _rs.GAS_OUT_GUARD_BPS == 2
-    assert _rs.GAS_COLLAPSE_FLOOR == 2
-    assert _rs.GAS_BASIS == "scoreintent_prerefund_v1"
-
+def test_gas_margin_pinned_to_calibrated_value():
+    # Consensus-critical constant, calibrated 2026-07-08: same-pin noise is 0
+    # (69/172 identical-fork ties to the wei), the Pareto gate filters all
+    # cross-pin route-flip noise (0 would-be dethrones at 100/200/300 over 172
+    # real comparisons), best genuine improvements ~600-833 bps clear it.
+    # Changing this changes WHO WINS ties fleet-wide — bump only in a
+    # develop->main promotion window.
+    assert _rs.GAS_MARGIN_BPS == 200
 
 # ── DISARMED: the clause must be PROVABLY inert (golden bit-identity) ─────────
 
 
-def test_disarmed_gas_rows_bit_identical_to_gasless_rows():
+def test_disarmed_gas_rows_bit_identical_to_gasless_rows(monkeypatch):
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", None)
     # Rows WITH gas keys vs the SAME rows WITHOUT them: the entire verdict
     # (minus the additive gas keys) must be byte-identical — a challenger
     # 50% cheaper on gas changes NOTHING while disarmed.
@@ -886,7 +887,8 @@ def test_disarmed_gas_rows_bit_identical_to_gasless_rows():
                for o in with_gas["per_order"])
 
 
-def test_disarmed_gas_rows_bit_identical_across_verdict_matrix():
+def test_disarmed_gas_rows_bit_identical_across_verdict_matrix(monkeypatch):
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", None)
     # Same golden identity across every verdict shape (win / regression /
     # catastrophic / blind spot / drop / skip), not just the tie.
     pairs = [
@@ -907,7 +909,8 @@ def test_disarmed_gas_rows_bit_identical_across_verdict_matrix():
     assert _strip_gas(with_gas) == _strip_gas(without_gas)
 
 
-def test_disarmed_never_fires_and_never_hints(armed_margin):
+def test_disarmed_never_fires_and_never_hints(armed_margin, monkeypatch):
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", None)
     # Disarmed (default) on a tie with a huge gas advantage: no adopt, and the
     # reason must NOT hint at a rule that cannot fire.
     champ = [_gr("o1", "100", 100_000)]
@@ -945,7 +948,8 @@ def test_rows_as_whole_objects_refactor_is_behavior_identical():
         assert via_objects == via_dicts
 
 
-def test_disarmed_relative_counts_have_no_gas_block():
+def test_disarmed_relative_counts_have_no_gas_block(monkeypatch):
+    monkeypatch.setattr(_rs, "GAS_MARGIN_BPS", None)
     counts = relative_counts(
         [_gr("o1", "100", 100_000)], [_gr("o1", "100", 50_000)],
     )

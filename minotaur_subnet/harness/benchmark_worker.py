@@ -142,6 +142,26 @@ def log_gas_shadow(champ_rows: Any, chal_rows: Any, ctx: str = "") -> None:
                 f"{iid}:{cg if cg is not None else '-'}"
                 f"/{xg if xg is not None else '-'}"
             )
+        # Durable tee: container logs die with every recreate (three separate
+        # forensic gaps on 2026-07-07 alone), so the soak/monitoring signal is
+        # ALSO appended as JSONL on the persistent volume. Best-effort — an
+        # unwritable path must never break the benchmark path.
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            _dir = _Path(os.environ.get("APP_INTENTS_STORE_PATH", "/data/store.json")).parent
+            if _dir.is_dir():
+                with open(_dir / "gas_shadow.jsonl", "a") as _f:
+                    _f.write(_json.dumps({
+                        "ts": time.time(), "ctx": ctx or "-",
+                        "orders": len(joined), "champ_measured": champ_measured,
+                        "chal_measured": chal_measured, "measured_pairs": n_pairs,
+                        "champ_gas_total": champ_total, "chal_gas_total": chal_total,
+                        "per_order": per_order,
+                    }) + "\n")
+        except Exception:  # noqa: BLE001 — observability must never break benching
+            pass
         logger.info(
             "[gas-shadow] ctx=%s orders=%d champ_measured=%d chal_measured=%d "
             "measured_pairs=%d champ_gas_total=%d chal_gas_total=%d "
