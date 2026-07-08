@@ -9,6 +9,7 @@ from minotaur_subnet.harness.round_store import (
     ChampionApproval,
     ChampionCertificate,
     ChampionSnapshot,
+    RoundState,
     RoundStatus,
     RoundStore,
 )
@@ -152,3 +153,37 @@ def test_set_finalist_and_certificate():
     assert certified.certificate is not None
     assert certified.certificate.candidate_submission_id == "sub_finalist"
     assert len(certified.certificate.approvals) == 2
+
+
+def test_veto_observe_field_round_trips_and_defaults_none():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persist_path = Path(tmpdir) / "solver_rounds.json"
+        store1 = RoundStore(persist_path=persist_path)
+        state = store1.ensure_open_round(opened_epoch=7)
+        # default is None (feature inert / never observed)
+        assert state.veto_observe is None
+
+        summary = {
+            "round_id": state.round_id, "resolution": "all_terminal",
+            "n_assignments": 3, "n_veto": 1, "would_gate": True,
+        }
+        store1.set_round_veto_observe(state.round_id, summary)
+
+        # survives a reload (compact dict, no per-order rows)
+        store2 = RoundStore(persist_path=persist_path)
+        reloaded = store2.get_round(state.round_id)
+        assert reloaded.veto_observe == summary
+
+        # missing round is a no-op, never raises
+        store2.set_round_veto_observe("round-nope-n9", {"x": 1})
+
+
+def test_veto_observe_missing_key_loads_as_none():
+    # An old persisted file without the field must load cleanly (additive).
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persist_path = Path(tmpdir) / "solver_rounds.json"
+        store1 = RoundStore(persist_path=persist_path)
+        st = store1.ensure_open_round(opened_epoch=3)
+        raw = st.to_dict()
+        del raw["veto_observe"]
+        assert RoundState.from_dict(raw).veto_observe is None

@@ -535,3 +535,41 @@ def plan_reverification(
         seen.add(v.order_id)
         deduped.append(v)
     return deduped[: max(0, budget)]
+
+
+def phase_observe_counts(state: "VetoPhaseState") -> dict[str, int]:
+    """Pure tally across a phase's responses — the observe-summary core.
+
+    Counts by response status/verdict and sums claimed violations. No bench,
+    no I/O; the coordinator wraps this with (optional) leader re-verification
+    for the /health surface. ``n_unsupported`` counts assignments whose
+    validator is marked terminal-UNSUPPORTED (endpoint 404/disabled) and did
+    not otherwise respond.
+    """
+    responded = set(state.responses)
+    counts = {
+        "n_assignments": len(state.assignments),
+        "n_responses": len(state.responses),
+        "n_completed": 0,
+        "n_ok": 0,
+        "n_veto": 0,
+        "n_failed": 0,
+        "n_refused": 0,
+        "n_claimed_violations": 0,
+        "n_unsupported": sum(
+            1 for evm in state.unsupported if evm not in responded
+        ),
+    }
+    for r in state.responses.values():
+        if r.status == STATUS_COMPLETED:
+            counts["n_completed"] += 1
+            if r.verdict == VERDICT_VETO:
+                counts["n_veto"] += 1
+                counts["n_claimed_violations"] += len(r.violations)
+            elif r.verdict == VERDICT_OK:
+                counts["n_ok"] += 1
+        elif r.status == STATUS_FAILED:
+            counts["n_failed"] += 1
+        elif r.status == STATUS_REFUSED:
+            counts["n_refused"] += 1
+    return counts
