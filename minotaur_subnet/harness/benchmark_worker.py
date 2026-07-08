@@ -942,6 +942,7 @@ class BenchmarkWorker:
                             "Subprocess benchmarking is disabled by policy. "
                             "Use signed git/docker submissions."
                         ),
+                        outcome_code="benchmark_failed",
                     )
                     logger.warning(
                         "Rejected %s: subprocess benchmarking disabled by policy",
@@ -1028,6 +1029,7 @@ class BenchmarkWorker:
                 self._sub_store.reject(
                     sub.submission_id,
                     "No solver_path or image_tag available for benchmarking",
+                    outcome_code="benchmark_failed",
                 )
 
         # Transition SOLVING → SOLVED for apps that got a positive score
