@@ -151,6 +151,13 @@ class StatusResponse(BaseModel):
     # hotkey, so old submissions from churned hotkeys resolve to null by design.
     miner_uid: int | None = None
     rejection_reason: str | None = None
+    # Machine-readable terminal outcome (submission_store.OUTCOME_*). Switch on
+    # THIS, never on rejection_reason prose. None while in-flight / legacy.
+    outcome_code: str | None = None
+    # Waitlist context when status == "waitlisted": {position, contenders,
+    # slots, next_round_priority}. Render as "queued for next round, #position
+    # of contenders" — a no-fault state, NOT a rejection. None otherwise.
+    waitlist: dict[str, Any] | None = None
     # Feedback report (P1): the same-pin per-order ``relative`` block (better /
     # worse / matched / new + per-order deltas) and a verdict-derived outcome.
     # The legacy aggregate-vs-champion scalars were removed (see report.py).

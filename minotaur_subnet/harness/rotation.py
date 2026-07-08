@@ -34,8 +34,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Statuses OUT of the running for slate selection: already-rejected submissions
-# (screening fail etc.) don't occupy a slot; ADOPTED can't occur pre-close.
-_TERMINAL_STATUSES = ("rejected", "adopted")
+# (screening fail etc.) don't occupy a slot; ADOPTED can't occur pre-close;
+# WAITLISTED is a prior rotation pass's decision (re-running must not re-process
+# it).
+_TERMINAL_STATUSES = ("rejected", "adopted", "waitlisted")
 
 
 def _status_value(sub: Any) -> str:
@@ -243,42 +245,61 @@ def apply_rotation_slate(
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
         f"next round; miners benched longest ago go first"
     )
-    # ── Phase 1: land every reject (fast, no network) ────────────────────────
+    n_skipped = len(skipped)
+
+    # skipped is in seniority order (best next-round priority FIRST), so the
+    # 1-based index is the waitlist position. WAITLIST (not reject): not being
+    # selected is a no-fault outcome that keeps next-round seniority. Falls back
+    # to reject for stores without the method (older/test doubles).
+    _waitlist = getattr(sub_store, "waitlist", None)
+
+    def _park(sub: Any, position: int) -> None:
+        if callable(_waitlist):
+            _waitlist(
+                sub.submission_id, reject_reason,
+                outcome_code="rotation_not_selected",
+                position=position, contenders=len(candidates), slots=slots,
+            )
+        else:
+            sub_store.reject(sub.submission_id, reject_reason)
+
+    # ── Phase 1: park every skipped submission (fast, no network) ────────────
     to_notify: list[tuple[Any, str | None]] = []
     get_token = getattr(sub_store, "get_repo_token", None)
     done = 0
     try:
-        for sub in skipped:
+        for idx, sub in enumerate(skipped):
             token = None
             if notify is not None and callable(get_token):
                 try:
-                    # Captured BEFORE reject: reject purges the private token,
-                    # and the phase-2 PR comment needs it to post.
+                    # Captured BEFORE the terminal transition purges the private
+                    # token, which the phase-2 PR comment needs.
                     token = get_token(sub.submission_id)
                 except Exception:
                     logger.warning(
                         "rotation token capture failed for %s (comment may "
-                        "not post; reject unaffected)",
+                        "not post; waitlist unaffected)",
                         getattr(sub, "submission_id", "?"), exc_info=True,
                     )
             try:
-                sub_store.reject(sub.submission_id, reject_reason)
+                _park(sub, idx + 1)
             except Exception:
                 logger.warning(
-                    "rotation reject failed for %s (ignored)",
+                    "rotation waitlist failed for %s (ignored)",
                     getattr(sub, "submission_id", "?"), exc_info=True,
                 )
             done += 1
             if notify is not None:
                 to_notify.append((sub, token))
     except BaseException:
-        # Cancellation / interpreter teardown mid-sweep: the reject set is the
-        # round's INTEGRITY (an un-rejected survivor gets benched and busts the
-        # slate width) — finish the remaining rejects with a tight store-only
-        # loop (no token capture, no notify bookkeeping) before re-raising.
-        for sub in skipped[done:]:
+        # Cancellation / interpreter teardown mid-sweep: parking the skipped set
+        # is the round's INTEGRITY (an un-parked survivor gets benched and busts
+        # the slate width) — finish the rest with a tight store-only loop (no
+        # token capture, no notify bookkeeping) before re-raising.
+        for idx in range(done, n_skipped):
+            sub = skipped[idx]
             try:
-                sub_store.reject(sub.submission_id, reject_reason)
+                _park(sub, idx + 1)
             except BaseException:  # noqa: BLE001 — best-effort cleanup path
                 pass
         raise

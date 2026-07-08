@@ -947,6 +947,26 @@ class EpochManager:
         except Exception as exc:
             logger.warning("on_champion_rejected callback failed: %s", exc)
 
+    def _notify_round_waitlisted(
+        self, submission: Any, reason: str, *, repo_token: str | None = None,
+    ) -> None:
+        """Post the ⏭️ waitlist PR comment for a window-elapsed submission —
+        the SAME not-selected surface rotation uses, so a no-fault outcome never
+        renders as a ❌ rejection. Leader-gated + best-effort, like the reject
+        notify. ``repo_token`` was captured before the terminal purge."""
+        _is_leader = getattr(self, "_is_leader", None)
+        if _is_leader is not None and not _is_leader():
+            return
+        if not getattr(submission, "pr_number", None):
+            return
+        try:
+            from minotaur_subnet.relayer.solver_repo import on_round_not_selected_pr
+
+            on_round_not_selected_pr(submission, reason, repo_token=repo_token)
+        except Exception as exc:  # noqa: BLE001 — feedback must never break the reaper
+            logger.warning("waitlist notify failed for %s: %s",
+                           getattr(submission, "submission_id", "?"), exc)
+
     def _notify_champion_finalist(self, submission: Any, reason: str) -> None:
         """WIN mirror of ``_notify_champion_rejected``: best-effort fire the
         finalist callback (PR comment only — posts the full scored report). NEVER
@@ -2391,17 +2411,32 @@ class EpochManager:
             if sub.status != SubmissionStatus.BENCHMARKING:
                 continue
             try:
-                self._sub_store.reject(
-                    sub.submission_id,
-                    "benchmark_window_elapsed: round closed before scoring — "
-                    "resubmit to a fresh open round",
+                # WAITLIST, not reject: a slate-selected submission that ran out
+                # of bench window did nothing wrong — it keeps next-round
+                # priority, same no-fault class as rotation not-selected. Falls
+                # back to reject on stores without the method.
+                reason = (
+                    "benchmark window elapsed before scoring — resubmit to a "
+                    "fresh open round; you keep next-round priority"
                 )
-                self._notify_champion_rejected(
-                    sub, "benchmark window elapsed before scoring",
-                )
+                # Capture the private token BEFORE the terminal transition purges
+                # it, so the waitlist PR comment can still post (mirrors rotation).
+                token = None
+                try:
+                    token = self._sub_store.get_repo_token(sub.submission_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                _waitlist = getattr(self._sub_store, "waitlist", None)
+                if callable(_waitlist):
+                    _waitlist(
+                        sub.submission_id, reason, outcome_code="window_elapsed",
+                    )
+                else:
+                    self._sub_store.reject(sub.submission_id, reason)
+                self._notify_round_waitlisted(sub, reason, repo_token=token)
                 logger.info(
-                    "Reaped orphaned BENCHMARKING submission %s (round %s terminal)",
-                    sub.submission_id, round_id,
+                    "Waitlisted orphaned BENCHMARKING submission %s (round %s "
+                    "window elapsed)", sub.submission_id, round_id,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Reaper: failed to reject %s: %s", sub.submission_id, exc)

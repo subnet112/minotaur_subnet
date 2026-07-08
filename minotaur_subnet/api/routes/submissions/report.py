@@ -63,7 +63,8 @@ def build_submission_report(
 
     benchmarked = bool(details)
     rejected_in_screening = status == "rejected" and not benchmarked
-    if not benchmarked and not rejected_in_screening:
+    waitlisted = status == "waitlisted"
+    if not benchmarked and not rejected_in_screening and not waitlisted:
         return None  # queued / screening / benchmarking — no report yet
 
     # SAME-PIN per-order counts, READ from this submission's OWN persisted
@@ -81,6 +82,8 @@ def build_submission_report(
     # ── outcome: derived from the PER-ORDER verdict, never a scalar ──
     if status == "adopted":
         outcome = "adopted"
+    elif waitlisted:
+        outcome = "waitlisted"
     elif rejected_in_screening:
         outcome = "rejected_screening"
     elif details.get("errors") and not details.get("plans_generated"):
@@ -106,6 +109,11 @@ def build_submission_report(
         "outcome": outcome,
         "reason": reason,
         "scoring_mode": "relative",
+        # Machine-readable terminal code + waitlist context, mirrored onto the
+        # report so the PR-comment renderer and any report consumer switch on
+        # the code, never the prose. None while in-flight / on legacy records.
+        "outcome_code": getattr(sub, "outcome_code", None),
+        "waitlist": getattr(sub, "waitlist", None),
     }
 
     # Factorization metric (Phase 0, OBSERVE-ONLY) — surfaced next to the per-order
@@ -288,11 +296,31 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
         "regressed": "### ❌ Regressed vs the champion on >=1 order",
         "rejected_screening": "### ❌ Screening rejected",
         "benchmark_failed": "### ❌ Benchmark produced no plans",
+        # No-fault: not a rejection. ⏭️, and never appended with a scary reason.
+        "waitlisted": "### ⏭️ Waitlisted — no slot this round",
     }
     header = _headers.get(outcome, "### ❌ Submission rejected")
-    if reason and outcome not in ("adopted", "won"):
+    if reason and outcome not in ("adopted", "won", "waitlisted"):
         header += f" — {reason}"
     lines = [header, ""]
+    if outcome == "waitlisted":
+        wl = report.get("waitlist") or {}
+        pos, contenders, slots = (
+            wl.get("position"), wl.get("contenders"), wl.get("slots"),
+        )
+        if pos and contenders:
+            lines.append(
+                f"You're **#{pos} of {contenders}** for the next round's "
+                f"{slots} slot(s). This is slate rotation (fair round entry), "
+                f"**not** a verdict on your solver — no benchmark was run. "
+                f"Resubmit to the next open round; your seniority carries over."
+            )
+        else:
+            lines.append(
+                f"{reason or 'Not selected this round.'} This is slate rotation "
+                f"(fair round entry), not a rejection — resubmit next round."
+            )
+        lines.append("")
 
     rel = report.get("relative")
     if isinstance(rel, dict):

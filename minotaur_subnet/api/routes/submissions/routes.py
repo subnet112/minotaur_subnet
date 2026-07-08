@@ -755,13 +755,29 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
 
         on_round_not_selected_pr(sub, reason, repo_token=repo_token)
 
-    return apply_rotation_slate(
+    result = apply_rotation_slate(
         store,
         round_id,
         _max_submissions_per_round_total(),
         RotationLedger(_rotation_ledger_path()),
         notify=_notify_not_selected,
     )
+
+    # Record the selected slate on the round as the SINGLE SOURCE OF TRUTH for
+    # who gets benched — the benchmark worker's belt reads this instead of
+    # recomputing the rotation against a ledger this close already advanced
+    # (the double-bench race, round-e29724975-n1). Best-effort: a persist hiccup
+    # must not fail the close (the belt falls back to recomputation on None).
+    if result.get("applied") and result.get("selected") is not None:
+        try:
+            get_round_store().set_benched_slate(round_id, list(result["selected"]))
+        except Exception:
+            logger.warning(
+                "recording benched slate for %s failed (belt will recompute)",
+                round_id, exc_info=True,
+            )
+
+    return result
 
 
 def _enforce_rate_limit(request: Request, principal: str) -> None:
