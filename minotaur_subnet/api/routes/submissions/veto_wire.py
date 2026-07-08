@@ -5,18 +5,17 @@ Phase-0 worker primitive (``benchmark_explicit_orders``): assignment fan-out,
 the follower's slice-bench runner, response signing, and the leader's
 size-capped idempotent ingestion.
 
-INERT UNTIL ARMED. ``DISTRIBUTED_VETO`` (default OFF) gates whether this node
-PARTICIPATES — it is a wire kill switch, not a consensus knob: a disabled or
+OBSERVE-ONLY, NEVER GATES. ``DISTRIBUTED_VETO`` (DEFAULT ON; set to 0 to opt a
+node out) gates whether this node PARTICIPATES — a participation switch, not a
+consensus knob. Default-ON so third-party validators (whose env we can't set)
+join the observe soak automatically once they have the code; an opted-out or
 not-yet-upgraded follower answers 404/409, which the leader records as
-terminal-UNSUPPORTED (= abstain), so a mixed fleet degrades to exactly
-today's behavior. Nothing in this module is called by the coordinator until
-the Phase-0 gate lands (next PR); the endpoints are registered but can only
-no-op:
+terminal-UNSUPPORTED (= abstain), so a mixed fleet degrades gracefully.
 
-- the follower receiver requires a LEADER-SIGNED assignment (there is no
-  leader code that fans out yet);
-- the leader receiver only accepts responses for assignments in its registry
-  (nothing opens a phase yet).
+Participation is NOT enforcement: the leader's observe pass runs off the
+certify critical path and never gates champion adoption. Actual gating is a
+separate future Phase-1 step; the expensive leader re-verification stays
+behind its own default-OFF ``DISTRIBUTED_VETO_REVERIFY``.
 
 Trust posture (see epoch/distributed_veto for the full protocol rationale):
 - Assignments are leader-signed via the SAME personal-sign canonical-JSON
@@ -102,14 +101,29 @@ def own_validator_evm() -> str | None:
 
 
 def distributed_veto_enabled() -> bool:
-    """Wire kill switch (default OFF) — participation, not consensus.
+    """Participation switch — DEFAULT ON. Set ``DISTRIBUTED_VETO=0`` to opt a
+    node out.
+
+    Default-ON because the fleet includes third-party validators whose env we
+    can't set: the distributed-veto observe soak only gets fleet-wide coverage
+    if every node that HAS the code participates by default (the leader fans
+    out slice assignments; followers bench their slice + report). A node that
+    opts out — or one that pre-dates the code — answers 409/404, which the
+    leader records as terminal-UNSUPPORTED (= abstain), so a mixed/partial
+    fleet still degrades gracefully.
+
+    This turns on PARTICIPATION only, never ENFORCEMENT. Phase 0 is
+    observe-only and non-blocking: the leader's observe pass runs off the
+    certify critical path and NEVER gates champion adoption, whatever the veto
+    outcome. Actual gating is a separate, still-unbuilt Phase-1 arming step;
+    and the expensive leader re-verification stays behind its own default-OFF
+    switch (:func:`distributed_veto_reverify_enabled`). So default-ON adds
+    fleet observe coverage at zero risk to adoption.
 
     Deliberately NOT a consensus-relevant constant: it never changes what any
-    benchmark computes, only whether this node takes part in the veto phase.
-    A node with it off answers 409; the leader maps that to
-    terminal-UNSUPPORTED = abstain, which is today's behavior exactly.
+    benchmark computes, only whether this node takes part.
     """
-    return (os.environ.get("DISTRIBUTED_VETO", "0").strip().lower()) in (
+    return (os.environ.get("DISTRIBUTED_VETO", "1").strip().lower()) in (
         "1", "true", "yes", "on",
     )
 
@@ -1004,12 +1018,12 @@ async def _production_runner(assignment: SliceAssignment) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def distributed_veto_reverify_enabled() -> bool:
-    """Leader re-verification sub-switch (default OFF, independent of the main
-    kill switch). When OFF the leader records what followers CLAIM without
-    re-benching — so the initial observe soak measures fan-out + follower
-    verdicts with ZERO added docker load on the leader (which also runs the
-    canonical benchmark). Turn on deliberately, later in the soak, to measure
-    trust-but-verify reproduction."""
+    """Leader re-verification sub-switch — DEFAULT OFF, independent of (and NOT
+    flipped by) the default-ON participation switch. When OFF the leader records
+    what followers CLAIM without re-benching — so the initial observe soak
+    measures fan-out + follower verdicts with ZERO added docker load on the
+    leader (which also runs the canonical benchmark). Turn on deliberately,
+    later in the soak, to measure trust-but-verify reproduction."""
     return (os.environ.get("DISTRIBUTED_VETO_REVERIFY", "0").strip().lower()) in (
         "1", "true", "yes", "on",
     )

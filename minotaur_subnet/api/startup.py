@@ -2934,11 +2934,12 @@ async def initialize(ctx: ServerContext) -> dict:
             # Opens a veto phase when a round enters CERTIFYING, fans out slice
             # assignments to reachable peers, collects verdicts, optionally
             # re-verifies on the leader, and records a compact observe summary
-            # on the round + /health. It NEVER holds certification (returns
-            # None, runs before _maybe_certify_round) and NEVER changes round
+            # on the round + /health. It runs only on a QUIET tick (after
+            # certify/activate/reopen), returns None, and NEVER changes round
             # status — so it cannot add latency to or destabilize champion
-            # adoption. Entirely gated on DISTRIBUTED_VETO (default OFF): when
-            # unarmed this is a single env check per tick.
+            # adoption. Gated on DISTRIBUTED_VETO (DEFAULT ON — participation
+            # only, never enforcement; set to 0 to opt this node out): one env
+            # check per tick when opted out.
             # NO synchronous RPC on the event loop. Phase 0 is observe-only and
             # does not need real anti-collusion entropy — a degraded (predictable)
             # seed is acceptable and documented. Phase 1 enforcement MUST fetch a
@@ -3092,8 +3093,8 @@ async def initialize(ctx: ServerContext) -> dict:
                 # OBSERVE-ONLY, NON-BLOCKING. Called at the END of the coordinator
                 # tick (after certify/activate), so it can never delay them. Its
                 # only awaited I/O is a PARALLEL, short-timeout fan-out; leader
-                # re-verification (when armed) is fire-and-forget. Fully inert
-                # (two guard reads) when DISTRIBUTED_VETO is unset.
+                # re-verification (default OFF) is fire-and-forget. Two guard
+                # reads (participation + leader) when opted out of DISTRIBUTED_VETO.
                 from minotaur_subnet.api.routes.submissions import veto_wire
 
                 if not veto_wire.distributed_veto_enabled():
