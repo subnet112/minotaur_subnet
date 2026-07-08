@@ -22,6 +22,8 @@ import os
 import threading
 from typing import Any
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,21 +35,8 @@ _CACHE_LOCK = threading.Lock()
 
 
 def _chain_rpc_env(chain_id: int) -> str:
-    """Resolve the RPC URL for chain_id from env. Mirrors app_registry_cache."""
-    # Live reads use the operator's *_UPSTREAM_RPC_URL (live), falling back to
-    # the plain RPC — never a hardcoded URL, never the sim fork.
-    if chain_id == 8453:
-        return (os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BASE_RPC_URL", "").strip())
-    if chain_id == 1:
-        return (os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("ETH_RPC_URL", "").strip()
-                or os.environ.get("ANVIL_RPC_URL", "").strip())
-    if chain_id == 964:
-        return (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
-                or os.environ.get("BITTENSOR_EVM_FORK_RPC_URL", "").strip())
-    return ""
+    """Resolve the LIVE RPC URL for chain_id (the shared registry ladder)."""
+    return registry.live_rpc(chain_id)
 
 
 def score_threshold_for(
