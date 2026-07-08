@@ -135,20 +135,34 @@ def budget_enforced() -> bool:
 
 
 def build_pin_blocks(
-    cfg: ReadProxyConfig, rpc_map: dict[int, str], fork_block: int
+    cfg: ReadProxyConfig,
+    rpc_map: dict[int, str],
+    fork_block: int | dict[int, int],
 ) -> dict[str, int]:
-    """The ``{chain_name: block}`` to pin: the routed chains present in ``rpc_map``,
-    each at ``fork_block``.
+    """The ``{chain_name: block}`` to pin for the routed chains present in ``rpc_map``.
 
-    NOTE: a single ``fork_block`` is correct only while the routed chains share
-    one anchor (today: Base-only). Routing multiple chains with distinct heights
-    would need a per-chain block map — guarded by the single-anchor default.
+    ``fork_block`` is either a single int (every routed chain pinned at the same
+    block — the Base-only case) or a ``{chain_id: block}`` map (multi-chain
+    rounds; each chain pinned at ITS OWN canonical block). With a map, EVERY
+    routed chain MUST have an entry — a missing pin is a determinism hole (the
+    solver would read that chain unpinned), so raise ``ValueError`` rather than
+    silently drop it; the caller (``run_benchmark``) translates that into a
+    fail-loud defer.
     """
-    return {
-        CHAIN_NAMES[cid]: fork_block
-        for cid in rpc_map
-        if cid in cfg.chain_ids and cid in CHAIN_NAMES
-    }
+    out: dict[str, int] = {}
+    for cid in rpc_map:
+        if cid not in cfg.chain_ids or cid not in CHAIN_NAMES:
+            continue
+        if isinstance(fork_block, dict):
+            if cid not in fork_block:
+                raise ValueError(
+                    f"build_pin_blocks: no fork pin for routed chain {cid} in "
+                    f"{sorted(fork_block)} — refusing to pin it unpinned"
+                )
+            out[CHAIN_NAMES[cid]] = int(fork_block[cid])
+        else:
+            out[CHAIN_NAMES[cid]] = int(fork_block)
+    return out
 
 
 def proxy_rpc_url(cfg: ReadProxyConfig, session_id: str, chain_id: int) -> str:

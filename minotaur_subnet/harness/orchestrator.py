@@ -264,6 +264,11 @@ class BenchmarkResult:
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
     revert_trace: dict[str, Any] | None = None
+    # Chain the scenario's deployment lives on (``state.chain_id``). Lets the
+    # SOLVING→SOLVED transition promote the correct per-chain deployment when an
+    # app is deployed on more than one chain (BENCHMARK_ALL_DEPLOYMENT_CHAINS);
+    # the ``intent_id`` label alone (app_id:scenario) does not identify the chain.
+    chain_id: int | None = None
 
 
 @dataclass
@@ -1178,6 +1183,7 @@ async def run_benchmark(
     score_fn: ScoreFn | None = None,
     simulator: Any | None = None,
     fork_block: int | None = None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool = False,
     session_factory: "Callable[[], Awaitable[SolverSession]] | None" = None,
     session_count: int | None = None,
@@ -1203,6 +1209,13 @@ async def run_benchmark(
             fork at upstream head — the existing live-head behavior. This is
             the keystone that makes a benchmark round reproducible across
             validators: all of them re-simulate at the same pinned block.
+        fork_blocks: Optional ``{chain_id: block}`` map for multi-chain rounds —
+            each scenario is pinned (solver read fork AND simulator fork) at ITS
+            OWN chain's canonical block, instead of the single scalar ``fork_block``
+            applied to whatever chain a plan routes to. ``None`` (default) keeps
+            the scalar path (Base-only), byte-identical to before. When present,
+            ``fork_block`` should still be set to the primary chain's block (used
+            as the fallback for any chain absent from the map).
         require_real_sim: Fail-closed switch (default ``False``). When ``True``,
             the benchmark refuses to substitute the fabricated mock for a real
             simulation: if no simulator is injected it raises
@@ -1276,7 +1289,15 @@ async def run_benchmark(
             "(non-deterministic, silent cross-host divergence)."
         )
     if _read_proxy is not None and fork_block is not None and rpc_map:
-        pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+        # Per-chain pins when a map is supplied (multi-chain round); else the
+        # scalar. A missing per-chain pin (determinism hole) surfaces from
+        # build_pin_blocks as ValueError — translate to the fail-loud defer.
+        try:
+            pin_blocks = build_pin_blocks(
+                _read_proxy, rpc_map, fork_blocks if fork_blocks else fork_block,
+            )
+        except ValueError as exc:
+            raise RealSimulationUnavailable(str(exc)) from exc
         # Fail-CLOSED on a non-routed chain — BEFORE opening any session (no leak)
         # AND before the `if pin_blocks:` branch, so an all-unrouted benchmark (no
         # routed chain → empty pin_blocks) ALSO fails loud rather than silently
@@ -1396,6 +1417,7 @@ async def run_benchmark(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
             trigger_ground_truth=trigger_ground_truth,
         )
@@ -1466,6 +1488,7 @@ async def _process_scenario(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
     trigger_ground_truth: dict[str, bool],
     trace_budget: list[int],
@@ -1484,8 +1507,21 @@ async def _process_scenario(
     start = time.monotonic()
     scenario_name = state.control_view().get("_scenario_name", "")
     intent_label = f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
-    br = BenchmarkResult(intent_id=intent_label)
+    br = BenchmarkResult(
+        intent_id=intent_label, chain_id=getattr(state, "chain_id", None),
+    )
     need_respawn = False
+
+    # Effective fork block for THIS scenario's chain: the per-chain pin when a
+    # map is supplied (multi-chain round), else the scalar (Base-only). Every
+    # fork pin below (solver read pin + simulator fork) uses this so each chain
+    # is scored at ITS OWN canonical block, not whichever chain the scalar named.
+    _chain_id = getattr(state, "chain_id", None)
+    fork_block = (
+        fork_blocks.get(_chain_id, fork_block)
+        if fork_blocks and _chain_id is not None
+        else fork_block
+    )
 
     # Phase 0 — pin the SOLVER's read fork to the round's fork_block BEFORE it
     # quotes/routes, so it reads the SAME state the simulator scores at: cross-host
@@ -1716,6 +1752,7 @@ async def _scenario_pool_worker(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
     trigger_ground_truth: dict[str, bool],
 ) -> None:
@@ -1778,7 +1815,9 @@ async def _scenario_pool_worker(
             intent_label = (
                 f"{intent.app_id}:{scenario_name}" if scenario_name else intent.app_id
             )
-            br = BenchmarkResult(intent_id=intent_label)
+            br = BenchmarkResult(
+                intent_id=intent_label, chain_id=getattr(state, "chain_id", None),
+            )
             br.error = dead_reason
             br.elapsed_ms = 0
             results[idx] = br
@@ -1793,6 +1832,7 @@ async def _scenario_pool_worker(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
             trigger_ground_truth=trigger_ground_truth,
             trace_budget=trace_budget,
@@ -1815,6 +1855,7 @@ async def _run_scenarios(
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
     fork_block: int | None,
+    fork_blocks: dict[int, int] | None = None,
     require_real_sim: bool,
     trigger_ground_truth: dict[str, bool],
 ) -> list[BenchmarkResult]:
@@ -1852,6 +1893,7 @@ async def _run_scenarios(
             config=config,
             score_fn=score_fn,
             fork_block=fork_block,
+            fork_blocks=fork_blocks,
             require_real_sim=require_real_sim,
             trigger_ground_truth=trigger_ground_truth,
         )
