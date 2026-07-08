@@ -3134,12 +3134,16 @@ async def initialize(ctx: ServerContext) -> dict:
                             continue
                         responded = set(phase.responses) | set(phase.unsupported)
                         if network is not None and phase.assignments:
-                            # Parallel + short per-peer timeout: a black-hole peer
-                            # cannot serialize-block the loop.
+                            # Parallel + bounded per-peer timeout (15s): a real
+                            # follower ACKs a signed assignment in ~3s idle but
+                            # slower under event-loop load, so 5s falsely timed
+                            # out live sends. A black-hole peer still can't
+                            # serialize-block the loop (parallel gather; runs on
+                            # a quiet tick after certify/activate).
                             await veto_wire.fan_out_assignments(
                                 phase.assignments, peer_urls=peer_urls,
                                 sign_payload=_sign, exclude=responded,
-                                timeout_s=5.0,
+                                timeout_s=15.0,
                             )
                             for a in phase.assignments:
                                 if veto_wire.consecutive_reject_terminal(
