@@ -56,6 +56,24 @@ logger = logging.getLogger(__name__)
 # Genesis submission sentinel values
 GENESIS_REPO_URL = "builtin://baseline-swap-solver"
 GENESIS_EPOCH = 0
+
+
+class ExplicitOrderUnavailable(Exception):
+    """An explicit-order bench (veto slice / dissent re-verify / audit) cannot
+    faithfully rebuild a requested order on this node — REFUSED semantics.
+
+    The canonical corpus path silently skips unresolvable orders (every
+    validator derives the same set, so a skip is fleet-uniform); an EXPLICIT
+    list must not — a silently short slice benches less than it was asked to
+    and returns a vacuous OK. Callers surface this as REFUSED(reason), which
+    the veto protocol counts as ABSTAIN, never a round failure.
+    """
+
+    def __init__(self, order_id: str, reason: str):
+        self.order_id = order_id
+        self.reason = reason
+        super().__init__(f"{reason} (order {order_id})")
+
 GENESIS_SOLVER_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
 
 # Measurement-version tag for pre-refund metered gas rows (the GasMeter probe,
@@ -1441,52 +1459,133 @@ class BenchmarkWorker:
         if not sampled:
             return []
 
-        # Group sampled orders by app_id to reuse AppIntentDefinition + snapshot
+        # Canonical corpus path: unresolvable orders are SKIPPED (fleet-uniform —
+        # every validator derives the same set, so a skip is symmetric).
         apps_by_id = {app.app_id: app for app in self._app_store.list_apps()}
         snapshots_by_chain: dict[int, MarketSnapshot] = {}
 
         scenarios: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
         for order in sampled:
-            app_id = order.get("app_id")
-            chain_id = order.get("chain_id")
-            if not app_id or chain_id is None:
-                continue
-            app_def = apps_by_id.get(app_id)
-            if app_def is None:
-                continue
-            deployment = self._app_store.get_deployment(app_id)
-            contract_address = deployment.contract_address if deployment else ""
-
-            # Snapshot per chain (cached). Use synthetic snapshot here —
-            # the solver re-queries live pool state via RPC anyway.
-            if chain_id not in snapshots_by_chain:
-                from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-                snapshots_by_chain[chain_id] = build_synthetic_snapshot(chain_id)
-            snapshot = snapshots_by_chain[chain_id]
-
-            # Build IntentState from the historical order's params
-            state = IntentState(
-                contract_address=contract_address,
-                chain_id=chain_id,
-                nonce=0,
-                owner="",
-                raw_params=dict(order.get("params", {})),
-                control={
-                    # hist: prefix is the per-order JOIN id the relative rule keys
-                    # on, NOT a stage marker — benchmarking is one flat set now.
-                    "_scenario_name": f"hist:{order.get('order_id', '?')}",
-                    "_intent_function": order.get("intent_function", "swap"),
-                    "_original_block_number": order.get("block_number"),
-                    "_original_tx_hash": order.get("tx_hash"),
-                },
-            )
-            scenarios.append((app_def, state, snapshot))
+            scenario = self._order_to_scenario(order, apps_by_id, snapshots_by_chain)
+            if scenario is not None:
+                scenarios.append(scenario)
 
         logger.info(
             "Loaded %d historical scenarios for round %s",
             len(scenarios), round_id,
         )
         return scenarios
+
+    def _order_to_scenario(
+        self,
+        order: dict,
+        apps_by_id: dict,
+        snapshots_by_chain: dict[int, MarketSnapshot],
+    ) -> tuple[AppIntentDefinition, IntentState, MarketSnapshot] | None:
+        """Build ONE (app_def, IntentState, snapshot) replay tuple from an order
+        record — the shared builder for the canonical historical draw AND the
+        explicit-order benches (veto slices / re-verify / audits). Returns None
+        when the order cannot be rebuilt here (missing app_id/chain/app record);
+        callers decide skip-vs-refuse."""
+        app_id = order.get("app_id")
+        chain_id = order.get("chain_id")
+        if not app_id or chain_id is None:
+            return None
+        app_def = apps_by_id.get(app_id)
+        if app_def is None:
+            return None
+        deployment = self._app_store.get_deployment(app_id)
+        contract_address = deployment.contract_address if deployment else ""
+
+        # Snapshot per chain (cached). Use synthetic snapshot here —
+        # the solver re-queries live pool state via RPC anyway.
+        if chain_id not in snapshots_by_chain:
+            from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+            snapshots_by_chain[chain_id] = build_synthetic_snapshot(chain_id)
+        snapshot = snapshots_by_chain[chain_id]
+
+        # Build IntentState from the historical order's params
+        state = IntentState(
+            contract_address=contract_address,
+            chain_id=chain_id,
+            nonce=0,
+            owner="",
+            raw_params=dict(order.get("params", {})),
+            control={
+                # hist: prefix is the per-order JOIN id the relative rule keys
+                # on, NOT a stage marker — benchmarking is one flat set now.
+                "_scenario_name": f"hist:{order.get('order_id', '?')}",
+                "_intent_function": order.get("intent_function", "swap"),
+                "_original_block_number": order.get("block_number"),
+                "_original_tx_hash": order.get("tx_hash"),
+            },
+        )
+        return (app_def, state, snapshot)
+
+    def build_explicit_scenarios(
+        self,
+        orders: list[dict],
+    ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
+        """STRICT scenario building for an EXPLICIT order list (veto slices,
+        dissent re-verification, audits — distributed-veto Phase 0).
+
+        Unlike the canonical draw, any unresolvable order raises
+        :class:`ExplicitOrderUnavailable` (REFUSED semantics): a silently short
+        slice would bench less than assigned and return a vacuous OK, which is
+        exactly the failure the veto protocol's REFUSED/abstain path exists to
+        make loud."""
+        if self._app_store is None:
+            raise ExplicitOrderUnavailable("<all>", "no app store on this node")
+        apps_by_id = {app.app_id: app for app in self._app_store.list_apps()}
+        snapshots_by_chain: dict[int, MarketSnapshot] = {}
+
+        scenarios: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
+        for order in orders:
+            order_id = str(order.get("order_id", "?"))
+            app_id = order.get("app_id")
+            chain_id = order.get("chain_id")
+            if not app_id or chain_id is None:
+                raise ExplicitOrderUnavailable(order_id, "order lacks app_id/chain_id")
+            if app_id not in apps_by_id:
+                raise ExplicitOrderUnavailable(order_id, f"missing_app:{app_id}")
+            try:
+                scenario = self._order_to_scenario(
+                    order, apps_by_id, snapshots_by_chain,
+                )
+            except ExplicitOrderUnavailable:
+                raise
+            except Exception as exc:  # e.g. params=None → dict(None) TypeError
+                raise ExplicitOrderUnavailable(order_id, f"unbuildable: {exc}")
+            if scenario is None:
+                raise ExplicitOrderUnavailable(order_id, "unbuildable order record")
+            scenarios.append(scenario)
+        return scenarios
+
+    async def benchmark_explicit_orders(
+        self,
+        image_tag: str,
+        orders: list[dict],
+    ) -> list[BenchmarkResult]:
+        """Bench ONE image over an EXPLICIT order list at this worker's pins —
+        the distributed-veto primitive (follower slice bench; leader dissent
+        re-verify; audits). Strict: raises :class:`ExplicitOrderUnavailable`
+        when any order cannot be faithfully rebuilt (callers answer REFUSED).
+
+        Pins are the caller's responsibility: wire-layer callers must have
+        applied the ASSIGNMENT's fork pins to this worker before calling —
+        never a live-head fallback (an unpinned bench produces unconfirmable
+        claims and honest-validator strikes)."""
+        if not orders:
+            raise ExplicitOrderUnavailable("<all>", "empty order list")
+        if self._use_docker and self._simulator is None:
+            # Fail-closed regardless of the per-validator BENCHMARK_REQUIRE_
+            # REAL_SIM env: a mock-sim slice bench fabricates rows → false veto
+            # claims → discarded veto + an honest-validator strike. REFUSED is
+            # the correct answer when no real simulator is wired.
+            raise ExplicitOrderUnavailable("<all>", "no real simulator wired")
+        scenarios = self.build_explicit_scenarios(orders)
+        score_fn = await self._build_score_fn(scenarios)
+        return await self._benchmark_submission(image_tag, scenarios, score_fn)
 
     def _has_solving_apps(self) -> bool:
         """Check if any deployed apps are operational (SOLVING/SOLVED/ACTIVE)."""
