@@ -106,6 +106,37 @@ def resolve_bare_digest(store: Any, submission_id: str | None) -> str | None:
         return None
 
 
+VETO_OPEN = "open"
+VETO_DEFER = "defer"
+VETO_SKIP = "skip"
+
+
+def veto_open_decision(
+    *,
+    is_certify_state: bool,
+    has_finalist: bool,
+    phase_exists: bool,
+    has_peers: bool,
+) -> str:
+    """Decide whether the coordinator opens a veto observe phase for the current
+    round: ``open`` / ``defer`` / ``skip``.
+
+    ``defer`` (the boot-timing fix): the round is a fresh open candidate but NO
+    champion peers are discovered yet — e.g. right after a restart, before the
+    ~60s discovery loop populates. If we opened anyway, ``build_assignments``
+    would return [] → the phase resolves ``no_assignments`` PERMANENTLY and that
+    round's coverage is lost. On a watchtower-restarting leader (rounds sit
+    CERTIFIED ~tens of minutes), that eats a lot of soak coverage. Deferring
+    re-checks next tick and opens once peers appear. A node that genuinely has
+    no peers simply never opens — correct (no followers = no veto coverage).
+    """
+    if phase_exists or not is_certify_state or not has_finalist:
+        return VETO_SKIP
+    if not has_peers:
+        return VETO_DEFER
+    return VETO_OPEN
+
+
 def own_validator_evm() -> str | None:
     """This node's EVM address from the champion peer network's signing key —
     the identity a leader-signed assignment must be addressed to. None (no key

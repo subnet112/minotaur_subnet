@@ -3105,19 +3105,23 @@ async def initialize(ctx: ServerContext) -> dict:
                 if not _is_solver_round_leader():
                     return
                 try:
-                    if (
-                        current is not None
-                        and current.status in (
-                            RoundStatus.CERTIFYING, RoundStatus.CERTIFIED,
-                        )
-                        and current.finalist_submission_id
-                        and veto_wire.REGISTRY.get(current.round_id) is None
-                    ):
-                        _open_veto_phase(current)
-
                     now = _current_solver_round_epoch(ctx)
                     peer_urls = _veto_peer_urls()
                     network = submissions.get_champion_peer_network()
+
+                    # DEFER opening until champion peers are discovered — right
+                    # after a restart the discovery loop hasn't populated yet, and
+                    # opening with zero peers resolves no_assignments permanently,
+                    # losing that round's coverage. Retry next tick.
+                    if current is not None and veto_wire.veto_open_decision(
+                        is_certify_state=current.status in (
+                            RoundStatus.CERTIFYING, RoundStatus.CERTIFIED,
+                        ),
+                        has_finalist=bool(current.finalist_submission_id),
+                        phase_exists=veto_wire.REGISTRY.get(current.round_id) is not None,
+                        has_peers=bool(peer_urls),
+                    ) == veto_wire.VETO_OPEN:
+                        _open_veto_phase(current)
 
                     def _sign(p):
                         from minotaur_subnet.api.routes.submissions.round_manager import (

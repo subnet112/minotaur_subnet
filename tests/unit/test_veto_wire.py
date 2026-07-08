@@ -772,3 +772,35 @@ class TestResolveBareDigest:
         })
         assert not hasattr(store, "get_submission")
         assert veto_wire.resolve_bare_digest(store, "sub_x") == "b" * 64
+
+
+# ── phase-open decision (the defer-until-peers boot-timing fix) ──
+
+class TestVetoOpenDecision:
+    def _d(self, **kw):
+        base = dict(is_certify_state=True, has_finalist=True,
+                    phase_exists=False, has_peers=True)
+        base.update(kw)
+        return veto_wire.veto_open_decision(**base)
+
+    def test_open_when_all_conditions_met(self):
+        assert self._d() == veto_wire.VETO_OPEN
+
+    def test_defer_when_no_peers(self):
+        # The boot-timing case: a fresh certified round but discovery hasn't
+        # populated peers yet — DEFER (retry next tick), don't open+resolve
+        # no_assignments and lose the round.
+        assert self._d(has_peers=False) == veto_wire.VETO_DEFER
+
+    def test_skip_when_not_certify_state(self):
+        assert self._d(is_certify_state=False) == veto_wire.VETO_SKIP
+
+    def test_skip_when_no_finalist(self):
+        assert self._d(has_finalist=False) == veto_wire.VETO_SKIP
+
+    def test_skip_when_phase_already_exists(self):
+        assert self._d(phase_exists=True) == veto_wire.VETO_SKIP
+
+    def test_phase_exists_wins_over_no_peers(self):
+        # An already-open phase is never re-opened, regardless of peers.
+        assert self._d(phase_exists=True, has_peers=False) == veto_wire.VETO_SKIP
