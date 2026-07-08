@@ -152,13 +152,23 @@ class SliceAssignment:
     slice_index: int
     validator_evm: str  # lowercase 0x…
     candidate_submission_id: str
-    candidate_image_id: str  # bare GHCR digest (pull-by-digest is the verifier)
+    candidate_image_id: str  # bare GHCR digest (binds assignment_id; on-chain compat)
     incumbent_image_id: str
+    # Full pullable refs (<repo>@sha256:D) built by the LEADER from ITS repo and
+    # signed with the payload — so a follower pulls exactly what the leader
+    # points at, never rebuilding from its own CANDIDATE_IMAGE_REPO env (the
+    # champion-certificate convention: the repo travels with the digest).
+    candidate_image_ref: str
+    incumbent_image_ref: str
     order_ids: list[str]
-    order_hashes: dict[str, str]  # order_id -> order_replay_hash
+    order_hashes: dict[str, str]  # order_id -> order_replay_hash (slice + calib)
     calibration_order_ids: list[str]
     fork_pins: dict[str, int]  # str(chain_id) -> block
     deadline_epoch: int
+    # Where the follower POSTs its VetoResponse. Advisory in shape (like the
+    # /identity api_url hint) but LEADER-SIGNED with the rest of the payload,
+    # so redirecting it requires the leader key.
+    leader_api_url: str = ""
 
     @property
     def slice_hash(self) -> str:
@@ -185,11 +195,14 @@ class SliceAssignment:
             "candidate_submission_id": self.candidate_submission_id,
             "candidate_image_id": self.candidate_image_id,
             "incumbent_image_id": self.incumbent_image_id,
+            "candidate_image_ref": self.candidate_image_ref,
+            "incumbent_image_ref": self.incumbent_image_ref,
             "order_ids": list(self.order_ids),
             "order_hashes": dict(self.order_hashes),
             "calibration_order_ids": list(self.calibration_order_ids),
             "fork_pins": dict(self.fork_pins),
             "deadline_epoch": self.deadline_epoch,
+            "leader_api_url": self.leader_api_url,
             "slice_hash": self.slice_hash,
             "assignment_id": self.assignment_id,
         }
@@ -203,6 +216,8 @@ class SliceAssignment:
             candidate_submission_id=str(d.get("candidate_submission_id", "")),
             candidate_image_id=str(d.get("candidate_image_id", "")),
             incumbent_image_id=str(d.get("incumbent_image_id", "")),
+            candidate_image_ref=str(d.get("candidate_image_ref", "")),
+            incumbent_image_ref=str(d.get("incumbent_image_ref", "")),
             order_ids=[str(x) for x in (d.get("order_ids") or [])],
             order_hashes={
                 str(k): str(v) for k, v in (d.get("order_hashes") or {}).items()
@@ -214,6 +229,7 @@ class SliceAssignment:
                 str(k): int(v) for k, v in (d.get("fork_pins") or {}).items()
             },
             deadline_epoch=int(d.get("deadline_epoch", 0)),
+            leader_api_url=str(d.get("leader_api_url", "")),
         )
 
 
@@ -231,8 +247,15 @@ def verify_assignment_integrity(payload: dict[str, Any]) -> tuple[bool, str]:
         return False, "assignment_id mismatch"
     if not assignment.order_ids:
         return False, "empty slice"
-    if set(assignment.order_hashes) != set(assignment.order_ids):
-        return False, "order_hashes keys != order_ids"
+    slice_ids = set(assignment.order_ids)
+    calib_ids = set(assignment.calibration_order_ids)
+    if slice_ids & calib_ids:
+        # Calibration orders come from the LEADER DRAW, slices from the
+        # remainder — overlap means a malformed partition (and would let
+        # calibration rows double as veto evidence).
+        return False, "calibration ids overlap slice ids"
+    if set(assignment.order_hashes) != slice_ids | calib_ids:
+        return False, "order_hashes keys != order_ids + calibration ids"
     return True, ""
 
 
