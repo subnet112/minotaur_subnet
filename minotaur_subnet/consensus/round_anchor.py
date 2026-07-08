@@ -72,7 +72,39 @@ ROUND_ANCHOR_CONFIRMATIONS: int = 12
 # forever (benchmark never runs → round aborts benchmarked=0). One epoch back
 # (= epoch_seconds, 60s) buries the anchor comfortably past the confirmation depth by
 # close, while staying a pure deterministic function of the epoch (no chain read).
+#
+# This DEFAULT is tuned for FAST chains (Base, ~2s blocks): 1 epoch (60s) back is
+# ~30 blocks, comfortably past the 12-confirmation margin even at round OPEN.
 ROUND_ANCHOR_LOOKBACK_EPOCHS: int = 1
+
+# PER-CHAIN lookback override for SLOW chains. find_pin_block requires a confirmed
+# block (head - ROUND_ANCHOR_CONFIRMATIONS) STRICTLY AFTER the anchor, and that
+# must hold at round OPEN — when only `lookback` epochs of buffer exist yet. A
+# chain with T-second blocks buries 12 confirmations ~12*T seconds deep, so the
+# anchor must sit ≥ that far back or the round DEFERS FOREVER (froze the leader
+# 2026-07-08 with Ethereum: 12*~12s = ~144s > the 60s one-epoch anchor — see
+# issue #632). INVARIANT when adding a chain or changing epoch length:
+#   lookback_epochs * EPOCH_SECONDS  >  ROUND_ANCHOR_CONFIRMATIONS * chain_block_secs
+# At the production EPOCH_SECONDS=60, Ethereum (12*12s=144s) needs >=3 epochs
+# (180s, ~36s jitter margin). A shorter epoch or a slower chain needs a larger
+# value here or it re-freezes (fails loud / defers, never mis-scores). PER-CHAIN so
+# the DEFAULT (Base) anchor — and therefore the Base-only benchmark_pack_hash —
+# is byte-identical to before; ONLY the chains listed here change, and only when
+# BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed. Fleet-uniform CODE constant (never a
+# per-validator env, same discipline as the rest of this module).
+ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN: dict[int, int] = {
+    1: 3,  # Ethereum mainnet (~12s blocks): 3 epochs = 180s clears 12 conf (~144s)
+}
+
+
+def round_anchor_lookback_epochs(chain_id: int) -> int:
+    """Per-chain confirmation-margin lookback in epochs (see
+    ``ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN``). Fast chains use the default 1;
+    slow chains anchor deeper so ``find_pin_block`` can confirm-bracket them at
+    round open. Pure/deterministic — every validator resolves it identically."""
+    return ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN.get(
+        int(chain_id), ROUND_ANCHOR_LOOKBACK_EPOCHS,
+    )
 
 
 def benchmark_all_deployment_chains_enabled() -> bool:
@@ -124,8 +156,23 @@ def round_anchor_ts(epoch: int, epoch_seconds: int) -> int:
     a pure function of ``(epoch, epoch_seconds)``: fleet-deterministic, no chain read.
     Every pin-derivation / pack-hash site MUST use this (not the raw
     ``epoch_anchor_ts``) so leader and followers compute the identical pin.
+
+    Uses the DEFAULT (fast-chain) lookback. For the per-chain anchor a slow chain
+    needs, use :func:`round_anchor_ts_for_chain`; this stays the Base/default
+    value so existing scalar callers are byte-identical.
     """
     return epoch_anchor_ts(int(epoch) - ROUND_ANCHOR_LOOKBACK_EPOCHS, epoch_seconds)
+
+
+def round_anchor_ts_for_chain(chain_id: int, epoch: int, epoch_seconds: int) -> int:
+    """:func:`round_anchor_ts` with THIS chain's per-chain lookback applied (see
+    :func:`round_anchor_lookback_epochs`). Equals ``round_anchor_ts`` exactly for
+    any chain using the default lookback (e.g. Base), so the default pin is
+    unchanged; a slow chain (e.g. Ethereum) anchors proportionally deeper so it
+    confirm-brackets at round open. Pure/deterministic — no chain read."""
+    return epoch_anchor_ts(
+        int(epoch) - round_anchor_lookback_epochs(chain_id), epoch_seconds,
+    )
 
 
 class ForkPinUnavailable(Exception):
@@ -207,19 +254,28 @@ def derive_fork_pins(
     block_timestamp_of: BlockTimestampFn,
     confirmations: int = 0,
     lo_of: LoFn | None = None,
+    anchor_ts_of: Callable[[int], int] | None = None,
 ) -> dict[int, int]:
     """Per-chain canonical fork pins for a round, keyed by ``chain_id``.
 
     Raises :class:`ForkPinUnavailable` if *any* chain cannot be pinned
     deterministically — a partially-pinned round would let validators diverge, so
     the whole round defers rather than pin some chains and not others.
+
+    ``anchor_ts_of`` (optional): a PER-CHAIN anchor timestamp
+    (``chain_id -> anchor_ts``). When given it supersedes the scalar ``anchor_ts``
+    so a slow chain can anchor deeper (see
+    :func:`round_anchor_ts_for_chain` / issue #632); when None every chain uses
+    the scalar ``anchor_ts`` — byte-identical to the pre-#632 behaviour, so a
+    single-chain (Base-only) round is unchanged.
     """
     pins: dict[int, int] = {}
     for chain_id in chains:
         lo = lo_of(chain_id) if lo_of is not None else 0
+        chain_anchor = anchor_ts_of(chain_id) if anchor_ts_of is not None else anchor_ts
         try:
             pins[chain_id] = find_pin_block(
-                anchor_ts,
+                chain_anchor,
                 head=head_of(chain_id),
                 block_timestamp=lambda b, _c=chain_id: block_timestamp_of(_c, b),
                 confirmations=confirmations,
