@@ -733,3 +733,42 @@ class TestParticipationDefault:
         monkeypatch.delenv("DISTRIBUTED_VETO_REVERIFY", raising=False)
         assert veto_wire.distributed_veto_enabled() is True
         assert veto_wire.distributed_veto_reverify_enabled() is False
+
+
+# ── digest resolution (the get_submission→get bug that skipped every round) ──
+
+class TestResolveBareDigest:
+    class _FakeSub:
+        def __init__(self, digest):
+            self.image_digest = digest
+
+    class _RealShapeStore:
+        # Mirrors SubmissionStore: the lookup is `.get(id)`, NOT `.get_submission`.
+        def __init__(self, subs):
+            self._subs = subs
+
+        def get(self, sid):
+            return self._subs.get(sid)
+
+    def test_resolves_full_ref_to_bare_hex(self):
+        store = self._RealShapeStore({
+            "sub_x": self._FakeSub("ghcr.io/subnet112/minotaur-solver@sha256:" + "a" * 64),
+        })
+        assert veto_wire.resolve_bare_digest(store, "sub_x") == "a" * 64
+
+    def test_none_when_no_digest_or_missing(self):
+        store = self._RealShapeStore({"sub_x": self._FakeSub(None)})
+        assert veto_wire.resolve_bare_digest(store, "sub_x") is None      # no digest
+        assert veto_wire.resolve_bare_digest(store, "sub_absent") is None  # missing
+        assert veto_wire.resolve_bare_digest(store, None) is None          # no id
+        assert veto_wire.resolve_bare_digest(None, "sub_x") is None        # no store
+
+    def test_does_not_call_get_submission(self):
+        # A store WITHOUT get_submission (like the real SubmissionStore) must
+        # still resolve — guards against the shipped bug where the wrong method
+        # name was swallowed and skipped every round.
+        store = self._RealShapeStore({
+            "sub_x": self._FakeSub("sha256:" + "b" * 64),
+        })
+        assert not hasattr(store, "get_submission")
+        assert veto_wire.resolve_bare_digest(store, "sub_x") == "b" * 64
