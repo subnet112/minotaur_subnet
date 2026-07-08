@@ -57,10 +57,11 @@ def round_anchored_pin_enabled() -> bool:
 # 3rd party could override to split the fleet (a different value -> a different pin
 # -> PACK_HASH_MISMATCH -> drops out of quorum). They are constants, not env reads.
 #
-# Base only: the benchmark fork_block is a SINGLE scalar applied to whichever chain
-# a plan routes to (anvil_simulator), so a second anchor chain would fold its pin
-# into the pack hash yet apply the Base block number to a non-Base fork. Do NOT
-# widen without a per-chain fork_block map.
+# Base is the primary anchor chain. Additional chains join the anchor set ONLY
+# via the BENCHMARK_ALL_DEPLOYMENT_CHAINS gate below (per-deployment chains),
+# now that the fork pin is a per-chain map end-to-end (run_benchmark
+# ``fork_blocks``, build_pin_blocks, per-scenario simulate) — the old scalar
+# hazard (a Base block number applied to a non-Base fork) is structurally gone.
 ROUND_ANCHOR_CHAINS: tuple[int, ...] = (8453,)
 # Finality margin for the bracketing guard in find_pin_block (head - confirmations).
 ROUND_ANCHOR_CONFIRMATIONS: int = 12
@@ -72,6 +73,29 @@ ROUND_ANCHOR_CONFIRMATIONS: int = 12
 # (= epoch_seconds, 60s) buries the anchor comfortably past the confirmation depth by
 # close, while staying a pure deterministic function of the epoch (no chain read).
 ROUND_ANCHOR_LOOKBACK_EPOCHS: int = 1
+
+
+def benchmark_all_deployment_chains_enabled() -> bool:
+    """Gate for benchmarking EVERY operational deployment chain of an app
+    (not just the app's primary deployment). **DEFAULT OFF.**
+
+    CONSENSUS-RELEVANT: turning this on adds each deployment chain's scenarios
+    to the flat benchmark set (they join the relative adoption rule) and folds
+    that chain's round-anchored pin into ``benchmark_pack_hash``. Like
+    BENCHMARK_STATIC_QUOTE / ROUND_ANCHORED_PIN it must be flipped
+    FLEET-UNIFORMLY: a split value surfaces as PACK_HASH_MISMATCH (fail-loud),
+    never a silent mis-score. Ships OFF so it can soak on the lead first.
+
+    Operational prerequisites on every node that arms it: the extra chains must
+    be routed through the block-pin proxy (``SOLVER_READ_PROXY_CHAINS``), have a
+    live upstream RPC for pin derivation (``*_UPSTREAM_RPC_URL``), and a
+    dedicated sim fork (e.g. ``ETH_SIM_RPC_URL`` → the eth anvil) — otherwise
+    the benchmark fails loud (RealSimulationUnavailable / ForkPinUnavailable)
+    rather than scoring degraded.
+    """
+    return os.environ.get(
+        "BENCHMARK_ALL_DEPLOYMENT_CHAINS", "",
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:

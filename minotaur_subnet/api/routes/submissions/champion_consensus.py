@@ -233,18 +233,29 @@ async def _reactive_benchmark_candidate(
     # off (unset env -> live head, unchanged). Without parity a follower would
     # re-verify at its own live head — exactly the divergence the band papers over.
     _round_pin = None
+    _round_pins: dict[int, int] | None = None
     if round_id:
         try:
             from minotaur_subnet.api.startup import (
                 _resolve_round_fork_pins,
                 _round_anchor_chains,
             )
+            from minotaur_subnet.consensus.round_anchor import (
+                benchmark_all_deployment_chains_enabled,
+            )
             _pins = _resolve_round_fork_pins(round_id)
             if _pins:
                 _round_pin = _pins.get(_round_anchor_chains()[0])
+                # Per-chain map when multi-chain benchmarking is armed, so the
+                # follower re-verifies each chain at ITS OWN block (parity with
+                # the leader's per-chain pins). Off → scalar Base-only, unchanged.
+                if benchmark_all_deployment_chains_enabled():
+                    _round_pins = dict(_pins)
         except Exception as exc:
             logger.warning("fork-pins: follower resolve failed for %s: %s", round_id, exc)
-    if _round_pin is not None:
+    if _round_pins:
+        worker.set_fork_pins(_round_pins)
+    elif _round_pin is not None:
         worker.set_epoch_block(int(_round_pin))
     else:
         worker._apply_epoch_block_pin()
