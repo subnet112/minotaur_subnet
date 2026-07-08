@@ -60,7 +60,7 @@ def _app_store(deployments_by_chain: dict[int, object]):
 
 
 def test_deployments_for_app_primary_only_when_flag_off(monkeypatch):
-    monkeypatch.delenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", raising=False)
+    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "0")  # default is now ON; test explicit OFF
     store = _app_store({BASE: _dep(BASE, AppStatus.SOLVED), ETH: _dep(ETH, AppStatus.SOLVING)})
     worker = BenchmarkWorker(SubmissionStore(), app_store=store)
     deps = worker._benchmark_deployments_for_app("app_x")
@@ -88,7 +88,7 @@ def test_load_intents_one_per_chain_when_armed(monkeypatch):
 
 
 def test_load_intents_primary_only_when_off(monkeypatch):
-    monkeypatch.delenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", raising=False)
+    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "0")  # default is now ON; test explicit OFF
     store = _app_store({BASE: _dep(BASE, AppStatus.SOLVED), ETH: _dep(ETH, AppStatus.SOLVING)})
     worker = BenchmarkWorker(SubmissionStore(), app_store=store)
     intents = worker._load_benchmark_intents()
@@ -218,7 +218,7 @@ def test_apply_round_anchored_pin_accepts_scalar(monkeypatch):
 
 def test_benchmark_pin_chains_base_only_when_off(monkeypatch):
     from minotaur_subnet.api import startup
-    monkeypatch.delenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", raising=False)
+    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "0")  # default now ON
     with patch.object(startup, "_deployment_chains", return_value=[ETH, BASE]):
         # Off → the deployment chains are ignored; anchor set (Base) only.
         assert startup._benchmark_pin_chains() == [BASE]
@@ -240,7 +240,17 @@ def test_leader_resolver_returns_map_when_on(monkeypatch):
 
 def test_leader_resolver_returns_scalar_when_off(monkeypatch):
     from minotaur_subnet.api import startup
-    monkeypatch.delenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", raising=False)
+    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "0")  # default now ON
     with patch.object(startup, "_resolve_round_fork_pins", return_value={BASE: 500, ETH: 900}):
         # Off → the bare primary-chain (Base) block, byte-identical to before.
         assert startup._leader_fork_pin_resolver("r1") == 500
+
+
+def test_flag_default_is_on(monkeypatch):
+    """2026-07-08 operator decision: BENCHMARK_ALL_DEPLOYMENT_CHAINS default ON.
+    Unset ⇒ enabled (multi-chain corpus); explicit {0,false,no,off} disables."""
+    from minotaur_subnet.consensus.round_anchor import benchmark_all_deployment_chains_enabled
+    monkeypatch.delenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", raising=False)
+    assert benchmark_all_deployment_chains_enabled() is True
+    monkeypatch.setenv("BENCHMARK_ALL_DEPLOYMENT_CHAINS", "off")
+    assert benchmark_all_deployment_chains_enabled() is False
