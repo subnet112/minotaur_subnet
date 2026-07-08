@@ -1438,21 +1438,11 @@ async def initialize(ctx: ServerContext) -> dict:
         except Exception as exc:
             logger.warning("BridgeRegistry unavailable: %s", exc)
 
-        # RPC URLs
-        anvil_url = os.environ.get("ANVIL_RPC_URL")
-        base_url = os.environ.get("BASE_RPC_URL")
-        rpc_urls: dict[int, str] = {}
-        chain_ids: list[int] = [1, 31337]
-        if anvil_url:
-            rpc_urls[31337] = anvil_url
-            rpc_urls[1] = anvil_url
-        if base_url:
-            rpc_urls[8453] = base_url
-            chain_ids.append(8453)
-        btevm_url = os.environ.get("BITTENSOR_EVM_RPC_URL")
-        if btevm_url:
-            rpc_urls[964] = btevm_url
-            chain_ids.append(964)
+        # RPC URLs — derived from the chain registry (chains/wiring.py) so the api
+        # and validator share ONE definition and a new chain is just a registry row.
+        from minotaur_subnet.chains import wiring as chain_wiring
+        rpc_urls: dict[int, str] = chain_wiring.boot_rpc_urls()
+        chain_ids: list[int] = chain_wiring.runtime_chain_ids()
 
         # Solver — boot from a Docker image. FORCE_SOLVER_IMAGE (operator break-glass)
         # wins over GENESIS_SOLVER_IMAGE; otherwise genesis.
@@ -1488,25 +1478,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 "until champion is adopted",
             )
 
-        # Simulator
+        # Simulator — per-chain sim fork targets from the registry (registry.sim_rpc).
+        # Chain 1 prefers the dedicated ETH_SIM_RPC_URL (the eth anvil) so chain-1
+        # scoreIntent runs on the ETHEREUM fork, not the Base anvil (ANVIL_RPC_URL is
+        # the Base anvil on the leader, misnamed legacy) — required before arming
+        # BENCHMARK_ALL_DEPLOYMENT_CHAINS with a chain-1 deployment.
         simulator = None
-        sim_rpc_urls: dict[int, str] = {}
-        if anvil_url:
-            sim_rpc_urls[31337] = anvil_url
-            # Chain 1 (Ethereum mainnet) sim fork. PREFER a dedicated
-            # ETH_SIM_RPC_URL (→ the eth anvil, e.g. http://anvil-eth:8545) so
-            # chain-1 scoreIntent runs on the ETHEREUM fork. Fall back to
-            # ANVIL_RPC_URL only for back-compat: on the leader ANVIL_RPC_URL
-            # points at the BASE anvil (misnamed legacy), so without the dedicated
-            # var a chain-1 sim would reset the Base fork to an Ethereum block
-            # number — a wrong/nonexistent block. Required before arming
-            # BENCHMARK_ALL_DEPLOYMENT_CHAINS with a chain-1 deployment.
-            sim_rpc_urls[1] = os.environ.get("ETH_SIM_RPC_URL") or anvil_url
-        base_sim_url = os.environ.get("BASE_SIM_RPC_URL") or base_url
-        if base_sim_url:
-            sim_rpc_urls[8453] = base_sim_url
-        if btevm_url:
-            sim_rpc_urls[964] = btevm_url
+        sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
 
         # Upstream RPC URLs — the same endpoints the anvil containers
         # are forking from. Used by AnvilSimulator._reset_fork to advance
@@ -1516,16 +1494,7 @@ async def initialize(ctx: ServerContext) -> dict:
         # Optional: when unset for a given chain, that chain's fork stays
         # static (acceptable for local-testnet chain 31337 which isn't
         # forked from anything).
-        upstream_rpc_urls: dict[int, str] = {}
-        eth_upstream = (os.environ.get("ETH_UPSTREAM_RPC_URL") or "").strip()
-        if eth_upstream:
-            upstream_rpc_urls[1] = eth_upstream
-        base_upstream = (os.environ.get("BASE_UPSTREAM_RPC_URL") or "").strip()
-        if base_upstream:
-            upstream_rpc_urls[8453] = base_upstream
-        btevm_upstream = (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL") or "").strip()
-        if btevm_upstream:
-            upstream_rpc_urls[964] = btevm_upstream
+        upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
 
         if sim_rpc_urls:
             try:

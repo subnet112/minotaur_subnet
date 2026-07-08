@@ -1828,10 +1828,13 @@ class MultiChainSimulator:
     def __init__(
         self,
         rpc_urls: dict[int, str],
-        default_chain_id: int = 31337,
+        default_chain_id: int | None = None,
         upstream_rpc_urls: dict[int, str] | None = None,
         **kwargs: Any,
     ) -> None:
+        if default_chain_id is None:
+            from minotaur_subnet.chains import registry
+            default_chain_id = registry.default_chain_id()
         self.simulators: dict[int, AnvilSimulator] = {}
         self.default_chain_id = default_chain_id
         upstream_rpc_urls = upstream_rpc_urls or {}
