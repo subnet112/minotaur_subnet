@@ -376,6 +376,32 @@ def health() -> dict:
             }
     except Exception:
         logger.warning("Failed to load solver round for /health", exc_info=True)
+    # Distributed-veto Phase 0 OBSERVE surface (leader only; absent until armed
+    # + the first phase resolves). The most recent per-round observe records
+    # from the in-memory registry — coverage/response/would-gate counts for the
+    # soak. Never reflects any enforcement (Phase 0 never gates).
+    try:
+        from minotaur_subnet.api.routes.submissions import veto_wire
+
+        if veto_wire.distributed_veto_enabled():
+            from minotaur_subnet.epoch.distributed_veto import phase_observe_counts
+
+            recent = list(veto_wire.REGISTRY._phases.items())[-5:]
+            data["distributed_veto"] = {
+                "armed": True,
+                "reverify": veto_wire.distributed_veto_reverify_enabled(),
+                "phases": [
+                    {
+                        "round_id": rid,
+                        "resolved": ph.resolved,
+                        "resolution": ph.resolution,
+                        **phase_observe_counts(ph),
+                    }
+                    for rid, ph in recent
+                ],
+            }
+    except Exception:
+        logger.debug("distributed-veto /health surface failed", exc_info=True)
     # Round-anchor parity probe: this node's independently-derived fork pin for
     # the current epoch anchor. Poll across the fleet and diff ``pins`` grouped
     # by ``anchor_epoch`` to confirm every validator derives the identical pin
