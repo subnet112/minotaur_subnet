@@ -104,13 +104,32 @@ DETHRONE_WIN_MARGIN = 1
 #
 # CONSENSUS-CRITICAL CODE constant (same discipline as FLOOR_BPS — never
 # env-read) and the ARMING SWITCH, mirroring FACTOR_MARGIN: while ``None`` the
-# guard CANNOT down-grade a cover, no matter what bar callers pass — Phase 0
-# ships the mechanism observe-only (``n_blind_spot_repeats_observed`` in the
-# verdict + caller logs). Arm a calibrated TTL (seconds) in a fleet-wide
-# promotion ONLY — a leader-only arm would split the adoption quorum. Arming
-# also requires the bar to reach the follower vote path
-# (champion_consensus._independent_adopt_vote), which passes no bar today.
-BLIND_SPOT_BAR_TTL_S: float | None = None  # None ⇒ guard disarmed; arm seconds fleet-wide
+# guard CANNOT down-grade a cover, no matter what bar callers pass.
+#
+# ARMED 2026-07-08 at 24h after the Phase-0 soak. The soak fired the first live
+# observations (15:16Z: challengers sub_70027ead0699 + sub_2e9c590c1476 each did
+# ONE blind_spot_cover that did NOT exceed the incumbent's adoption-time value,
+# bar age ~1223s — textbook photocopy-covers the guard now blocks). 24h ≫ the
+# treadmill's ~1–3h decay-and-recover cycle, so a stale-then-refreshed cover is
+# always caught, while a genuinely improved route (which EXCEEDS the bar) is
+# never blocked.
+#
+# QUORUM SAFETY — why leader-only is correct HERE. The general rule is "arm
+# fleet-wide only; a leader-only arm splits the adoption quorum" — because at
+# quorum>1 followers run champion_consensus._independent_adopt_vote with THEIR
+# constant (disarmed on :stable) while the leader is armed → divergent verdicts →
+# no quorum. That hazard is ABSENT at quorum==1 (verified live 2026-07-08: every
+# round quorum_required=1), where the leader is the SOLE certifying voter and
+# followers trust-adopt its signed champion (FOLLOWER_TRUST_LEADER_QUORUM1) —
+# they cast no counted vote to diverge. So arming the leader arms the live rule
+# cleanly.
+#   HARD INVARIANT: quorum MUST NOT be raised above 1 until the ENTIRE fleet
+#   carries BOTH this armed constant AND #578's follower-vote bar wiring
+#   (bar_kwargs_from_record in _independent_adopt_vote), i.e. after a
+#   develop→main promotion reaches :stable. Raising quorum before that splits
+#   consensus on the first contested round. See memory: DON'T raise quorum until
+#   fleet-wide.
+BLIND_SPOT_BAR_TTL_S: float | None = 24 * 3600.0  # ARMED (24h); None disarms
 
 # Observation-only reference TTL for the Phase-0 soak: how old an adoption-time
 # bar may be while still COUNTING a would-be repeat into

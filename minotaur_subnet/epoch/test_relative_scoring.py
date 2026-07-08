@@ -505,17 +505,33 @@ def _bar_case():
     return champ, chal, bar
 
 
-def test_disarmed_default_keeps_cover_and_observes():
+def test_armed_by_default_blocks_repeat():
+    # ARMED 2026-07-08 at 24h: the DEFAULT constant now blocks a within-TTL
+    # photocopy cover (no monkeypatch — this is the shipped value).
     from minotaur_subnet.epoch import relative_scoring as rs
 
-    assert rs.BLIND_SPOT_BAR_TTL_S is None  # Phase 0 ships disarmed
+    assert rs.BLIND_SPOT_BAR_TTL_S == 24 * 3600.0  # shipped armed
     champ, chal, bar = _bar_case()
     res = evaluate_relative_adoption(champ, chal, champion_bar=bar, bar_age_s=3600.0)
-    # Verdict byte-identical to today: the cover still counts and adopts.
+    assert res["adopt"] is False           # photocopy no longer dethrones
+    assert res["n_blind_spots"] == 0
+    assert res["n_blind_spot_repeats"] == 1
+    o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
+    assert o2["verdict"] == "blind_spot_repeat"
+    assert o2["bar_verdict"] == "repeat"
+
+
+def test_disarmed_keeps_cover_and_observes(monkeypatch):
+    # The disarmed path stays testable (a revert sets the constant back to None):
+    # the cover still counts + adopts, and only the soak counter sees the repeat.
+    from minotaur_subnet.epoch import relative_scoring as rs
+
+    monkeypatch.setattr(rs, "BLIND_SPOT_BAR_TTL_S", None)
+    champ, chal, bar = _bar_case()
+    res = evaluate_relative_adoption(champ, chal, champion_bar=bar, bar_age_s=3600.0)
     assert res["adopt"] is True
     assert res["n_blind_spots"] == 1
     assert res["n_blind_spot_repeats"] == 0
-    # ... but the soak counter sees the would-be repeat.
     assert res["n_blind_spot_repeats_observed"] == 1
     o2 = [o for o in res["per_order"] if o["intent_id"] == "o2"][0]
     assert o2["verdict"] == "blind_spot_cover"
