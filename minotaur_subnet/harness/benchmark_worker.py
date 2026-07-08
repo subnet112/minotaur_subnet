@@ -630,6 +630,20 @@ class BenchmarkWorker:
             return current
         return None
 
+    def _recorded_benched_slate(self, round_id: str) -> list[str] | None:
+        """The round's RECORDED rotation slate (``RoundState.benched_slate``),
+        or ``None`` when unavailable (no round store, round not found, field
+        unset on a pre-field / rotation-disabled round). The caller falls back
+        to recomputation only on ``None``."""
+        if self._round_store is None:
+            return None
+        try:
+            state = self._round_store.get_round(round_id)
+        except Exception:  # noqa: BLE001 — belt must never break the pass
+            return None
+        slate = getattr(state, "benched_slate", None) if state is not None else None
+        return list(slate) if slate is not None else None
+
     def _cap_to_rotation_slate(self, benchmarking: list, round_id: str) -> list:
         """BELT for the rotation slate width: never bench a closed round past
         ``SOLVER_ROUND_MAX_SUBMISSIONS``.
@@ -640,17 +654,18 @@ class BenchmarkWorker:
         process killed mid-close — observed live 2026-07-07, round-e29724243-n1:
         12 of 19 overflow rejects landed and the round benched 10 submissions
         on 3 slots), the un-rejected overflow is still BENCHMARKING. Cap the
-        pass at the slate width, in the SAME deterministic order the close-time
-        selection uses (``rotation_sort_key`` over the shared ledger — reused,
-        not reinvented). Rejecting the overflow is NOT this worker's call: it
-        only refuses to spend serialized sim time past the slate, loudly.
+        pass at the slate width.
 
-        Ledger note: ``apply_rotation_slate`` sequences ``mark_selected`` AFTER
-        the reject sweep, so any truncation that leaves overflow BENCHMARKING
-        also left the ledger at its pre-close state — this re-selection
-        therefore reproduces exactly the slate the close-time rotation chose
-        (or would have chosen, when rotation never ran at all and the round
-        closed with every submission).
+        SOURCE OF TRUTH: the round's RECORDED ``benched_slate``
+        (``apply_rotation_slate`` writes it at close). Reading the recorded
+        slate — instead of RECOMPUTING the rotation here — fixes the
+        double-bench race: rotation advances the ledger (``mark_selected``) at
+        close, so a belt that recomputed ``select_rotation_slate`` against that
+        already-advanced ledger picked a DISJOINT slate and benched a second
+        trio (2026-07-08, round-e29724975-n1: rotation selected {A,B,C}, the
+        belt recomputed {D,B,C} and D scored too → 4 on 3 slots). Recomputation
+        survives ONLY as the fallback for rounds with no recorded slate (closed
+        before this field existed, or rotation genuinely never ran).
         """
         from minotaur_subnet.harness.rotation import (
             RotationLedger,
@@ -661,6 +676,28 @@ class BenchmarkWorker:
         slots = _rotation_slate_slots()
         if slots <= 0 or len(benchmarking) <= slots:
             return benchmarking
+
+        # ── Preferred path: the RECORDED slate (single source of truth) ──────
+        recorded = self._recorded_benched_slate(round_id)
+        if recorded is not None:
+            slate_ids = set(recorded)
+            kept = [s for s in benchmarking if s.submission_id in slate_ids]
+            dropped = [s for s in benchmarking if s.submission_id not in slate_ids]
+            if dropped:
+                logger.warning(
+                    "[benchmark] round %s: %d BENCHMARKING submission(s) are "
+                    "not on the recorded rotation slate %s — benching only the "
+                    "slate (close-time reject sweep truncated). kept=%s "
+                    "not-benched=%s",
+                    round_id, len(dropped), sorted(slate_ids),
+                    [s.submission_id for s in kept],
+                    [s.submission_id for s in dropped],
+                )
+            return kept
+
+        # ── Fallback: recompute (no recorded slate — pre-field / rotation
+        # never ran). Kept for those rounds only; the recorded path above is
+        # race-free.
         # The slate is a per-ROUND budget, not per-pass: select it over every
         # submission of the round that occupies (or already consumed) a slate
         # slot, so a slate member that got benched — SCORED, or benched-and-
