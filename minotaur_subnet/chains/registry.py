@@ -71,6 +71,10 @@ class ChainSpec:
     # Plain-RPC ladder for health / contract-presence probes (contract_checks,
     # metrics) — just needs *a* working RPC, upstream not required.
     check_rpc_envs: tuple[str, ...] = ()
+    # Upstream the read-proxy sidecar dials for this chain (read_proxy_manager
+    # UPSTREAMS): plain RPC preferred, then the fork upstream. Falls back to
+    # ``consensus_public_fallback`` (e.g. the BT-EVM lite endpoint) when set.
+    proxy_upstream_envs: tuple[str, ...] = ()
     # Live-RPC used to build the faucet + boot-solver rpc_urls (startup/validator).
     boot_rpc_env: str | None = None
 
@@ -85,6 +89,10 @@ class ChainSpec:
     # ── membership flags ──────────────────────────────────────────────────────
     # Local testnet / the MultiChainSimulator default fallback chain.
     is_local: bool = False
+    # Always present in the solver's chain_ids set even without a configured RPC
+    # (legacy: the base set was seeded [1, 31337] unconditionally). Ethereum +
+    # local Anvil; other chains join only when their boot RPC env is set.
+    always_in_chain_set: bool = False
     # Wired into the running stack today (vs dormant registry-only entries like
     # Arbitrum/Optimism that have metadata but no sim/benchmark plumbing).
     wired: bool = True
@@ -111,11 +119,13 @@ _SPECS: tuple[ChainSpec, ...] = (
         upstream_rpc_env="ETH_UPSTREAM_RPC_URL",
         benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
         check_rpc_envs=("ETH_RPC_URL", "ANVIL_RPC_URL"),
+        proxy_upstream_envs=("ETH_RPC_URL", "ETH_UPSTREAM_RPC_URL"),
         boot_rpc_env="ANVIL_RPC_URL",
         is_anchor=False,
         lookback_epochs=3,   # ~12s blocks: 3 epochs clears 12-conf by round open
         fee_floor_wei=33_000_000_000_000,
         fallback_gas_price_wei=25_000_000_000,
+        always_in_chain_set=True,
     ),
     ChainSpec(
         chain_id=8453,
@@ -133,6 +143,7 @@ _SPECS: tuple[ChainSpec, ...] = (
             "BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL",
         ),
         check_rpc_envs=("BASE_RPC_URL",),
+        proxy_upstream_envs=("BASE_RPC_URL", "BASE_UPSTREAM_RPC_URL"),
         boot_rpc_env="BASE_RPC_URL",
         is_anchor=True,          # the primary benchmark anchor (was ROUND_ANCHOR_CHAINS)
         lookback_epochs=1,
@@ -163,6 +174,7 @@ _SPECS: tuple[ChainSpec, ...] = (
             "BITTENSOR_EVM_RPC_URL",
         ),
         check_rpc_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_FORK_RPC_URL"),
+        proxy_upstream_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_UPSTREAM_RPC_URL"),
         boot_rpc_env="BITTENSOR_EVM_RPC_URL",
         is_anchor=False,
         lookback_epochs=1,
@@ -188,6 +200,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         fee_floor_wei=0,
         fallback_gas_price_wei=1_000_000_000,
         is_local=True,
+        always_in_chain_set=True,
     ),
     # ── Dormant: metadata present (explorer/name/gas), not wired into sim/benchmark. ──
     ChainSpec(
@@ -339,6 +352,21 @@ def check_rpc(chain_id: int) -> str:
     """Plain-RPC for health / contract-presence probes (contract_checks, metrics)."""
     s = spec(chain_id)
     return _first_env(s.check_rpc_envs) if s is not None else ""
+
+
+def proxy_upstream(chain_id: int) -> str:
+    """Upstream the read-proxy sidecar dials for *chain_id* (its ``UPSTREAMS`` value).
+
+    Plain RPC preferred, then the fork upstream, then the chain's public fallback
+    (e.g. the BT-EVM lite endpoint). ``""`` when nothing is configured.
+    """
+    s = spec(chain_id)
+    if s is None:
+        return ""
+    url = _first_env(s.proxy_upstream_envs)
+    if url:
+        return url
+    return s.consensus_public_fallback or ""
 
 
 def boot_rpc(chain_id: int) -> str:

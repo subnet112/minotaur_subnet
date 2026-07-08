@@ -23,11 +23,19 @@ import os
 import urllib.request
 from dataclasses import dataclass
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
 
 # chain_id -> the proxy/UPSTREAMS chain key (matches the sidecar's UPSTREAMS map
-# and the ``/rpc/<session>/<chain>`` path segment).
-CHAIN_NAMES: dict[int, str] = {1: "eth", 31337: "eth", 8453: "base", 964: "btevm"}
+# and the ``/rpc/<session>/<chain>`` path segment). Derived from the chain
+# registry's ``slug`` so the proxy route, the read_proxy_manager UPSTREAMS keys,
+# and this map cannot drift apart. Wired chains only (== the legacy 4 entries).
+CHAIN_NAMES: dict[int, str] = {
+    cid: registry.slug(cid)
+    for cid in registry.wired_chain_ids()
+    if registry.slug(cid)
+}
 
 
 @dataclass(frozen=True)

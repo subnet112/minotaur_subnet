@@ -41,6 +41,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from minotaur_subnet.chains import registry
 from minotaur_subnet.shared.types import (
     AppIntentDefinition,
     ExecutionPlan,
@@ -856,27 +857,30 @@ class SolverOrchestrator:
         # production env vars (BASE_RPC_URL etc.) instead.
         _use_sandbox = bool(bench_network) and not live
         _overrides = rpc_overrides or {}
-        # ETH (chain 1 / Anvil 31337)
-        anvil_rpc = _overrides.get(1) or _overrides.get(31337) or (
-            os.environ.get("BENCHMARK_ANVIL_RPC_ETH", "").strip()
-            if _use_sandbox else ""
-        ) or os.environ.get("ANVIL_RPC_URL", "").strip()
-        if anvil_rpc:
-            cmd.extend(["-e", f"ANVIL_RPC_URL={anvil_rpc}"])
-        # Base (chain 8453)
-        base_rpc = _overrides.get(8453) or (
-            os.environ.get("BENCHMARK_ANVIL_RPC_BASE", "").strip()
-            if _use_sandbox else ""
-        ) or os.environ.get("BASE_RPC_URL", "").strip()
-        if base_rpc:
-            cmd.extend(["-e", f"BASE_RPC_URL={base_rpc}"])
-        # BT EVM (chain 964)
-        btevm_rpc = _overrides.get(964) or (
-            os.environ.get("BENCHMARK_ANVIL_RPC_BTEVM", "").strip()
-            if _use_sandbox else ""
-        ) or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
-        if btevm_rpc:
-            cmd.extend(["-e", f"BITTENSOR_EVM_RPC_URL={btevm_rpc}"])
+        # Forward each wired chain's solver RPC into the container under its boot env
+        # name, sourced from the chain registry (add a chain = a registry row).
+        # Priority per chain: caller override, then the sandbox benchmark-anvil IP
+        # (only on the sealed benchmark net), then the plain live RPC. Chains that
+        # share a boot env name (Ethereum 1 + local Anvil 31337 both use
+        # ANVIL_RPC_URL) collapse to one container var; an override on EITHER applies.
+        _by_env: dict[str, list[int]] = {}
+        for _cid in registry.wired_chain_ids():
+            _s = registry.spec(_cid)
+            if _s is not None and _s.boot_rpc_env:
+                _by_env.setdefault(_s.boot_rpc_env, []).append(_cid)
+        for _env_name, _cids in _by_env.items():
+            override = next((_overrides[c] for c in _cids if _overrides.get(c)), "")
+            sandbox = ""
+            if _use_sandbox:
+                for c in _cids:
+                    _bs = registry.spec(c)
+                    if _bs is not None and _bs.benchmark_rpc_envs:
+                        sandbox = os.environ.get(_bs.benchmark_rpc_envs[0], "").strip()
+                        if sandbox:
+                            break
+            value = override or sandbox or os.environ.get(_env_name, "").strip()
+            if value:
+                cmd.extend(["-e", f"{_env_name}={value}"])
 
         if extra_args:
             cmd.extend(extra_args)
@@ -1055,20 +1059,13 @@ def _enrich_state_with_quote(
     )
 
 
-# Per-chain benchmark RPC sources, in priority order: sandbox-specific
-# BENCHMARK_ANVIL_RPC_* IPs (reachable on BENCHMARK_DOCKER_NETWORK) first, then
-# the standard env vars. Shared by run_benchmark AND the champion reference
-# pre-pass so BOTH score against the SAME live chain state.
-_BENCHMARK_RPC_SOURCES: dict[int, tuple[str, ...]] = {
-    1:     ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-    31337: ("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-    8453:  ("BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL"),
-    964:   ("BENCHMARK_ANVIL_RPC_BTEVM", "BITTENSOR_EVM_SIM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
-}
-
-
 def build_rpc_url_map(chain_ids) -> dict[int, str]:
-    """Resolve per-chain RPC URLs from the environment for benchmarking.
+    """Resolve per-chain benchmark RPC URLs from the environment.
+
+    Per-chain priority order (sandbox-specific ``BENCHMARK_ANVIL_RPC_*`` IPs
+    first, then the standard env vars) lives in the chain registry
+    (``registry.benchmark_rpc``). Shared by run_benchmark AND the champion
+    reference pre-pass so BOTH score against the SAME live chain state.
 
     Returns ``{chain_id: url}`` only for chains with a resolved RPC. A chain
     ABSENT from the result has NO live RPC — and a solver run without it would
@@ -1078,11 +1075,12 @@ def build_rpc_url_map(chain_ids) -> dict[int, str]:
     """
     rpc_map: dict[int, str] = {}
     for cid in chain_ids:
-        for env_name in _BENCHMARK_RPC_SOURCES.get(cid, ("ANVIL_RPC_URL",)):
-            url = os.environ.get(env_name, "").strip()
-            if url:
-                rpc_map[cid] = url
-                break
+        url = registry.benchmark_rpc(cid)
+        if not url and not registry.is_supported(cid):
+            # Unknown chain: last-resort local anvil (legacy default).
+            url = os.environ.get("ANVIL_RPC_URL", "").strip()
+        if url:
+            rpc_map[cid] = url
     return rpc_map
 
 
