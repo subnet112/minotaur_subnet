@@ -168,6 +168,48 @@ def _round_anchor_chains() -> list[int]:
     return list(ROUND_ANCHOR_CHAINS)
 
 
+def _deployment_chains() -> list[int]:
+    """Chains that appear in any OPERATIONAL deployment, from the shared app store.
+
+    Fleet-deterministic: the deployment set is consensus-replicated via app-sync,
+    so every validator derives the same chains (a lagging follower momentarily
+    differs → PACK_HASH_MISMATCH → it defers and catches up, never a silent
+    mis-score). Empty on any store/access failure (fail-safe to Base-only).
+    """
+    try:
+        from minotaur_subnet.api.server import store
+        if store is None:
+            return []
+        chains: set[int] = set()
+        for app in store.list_apps():
+            for dep in store.get_deployments(app.app_id).values():
+                if dep is not None and dep.status.is_operational() and dep.chain_id:
+                    chains.add(int(dep.chain_id))
+        return sorted(chains)
+    except Exception as exc:  # noqa: BLE001 — never break pin derivation on store access
+        logger.warning("fork-pins: deployment-chain discovery failed: %s", exc)
+        return []
+
+
+def _benchmark_pin_chains() -> list[int]:
+    """Chains to derive round-anchored fork pins for (folds into the pack hash).
+
+    Default: ``ROUND_ANCHOR_CHAINS`` (Base only) — byte-identical to before. With
+    ``BENCHMARK_ALL_DEPLOYMENT_CHAINS`` armed: the union of the anchor chains and
+    every operational deployment chain, so a multi-chain app (e.g. deployed on
+    Base AND Ethereum) gets each chain pinned at ITS OWN canonical block. The set
+    MUST be fleet-uniform (it binds the pack hash), which the gate guarantees:
+    default-off, flipped fleet-wide like ROUND_ANCHORED_PIN.
+    """
+    from minotaur_subnet.consensus.round_anchor import (
+        benchmark_all_deployment_chains_enabled,
+    )
+    anchor = _round_anchor_chains()
+    if not benchmark_all_deployment_chains_enabled():
+        return anchor
+    return sorted(set(anchor) | set(_deployment_chains()))
+
+
 def _round_anchor_rpc_timeout() -> float:
     """Per-request timeout (seconds) for fork-pin RPC reads. Default 10s."""
     try:
@@ -198,7 +240,9 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     # round_anchor_ts (NOT epoch_anchor_ts): anchors one epoch back so the
     # confirmation-margin can confirm-bracket the anchor by round close (#anchor-back).
     anchor_ts = round_anchor_ts(anchor_epoch, epoch_seconds)
-    chains = _round_anchor_chains()
+    # Base only by default; the deployment-chain union when
+    # BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed (each chain pinned independently).
+    chains = _benchmark_pin_chains()
     confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
     from web3 import Web3
@@ -310,18 +354,26 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     return pins
 
 
-def _leader_fork_pin_resolver(round_id: str) -> int | None:
-    """Benchmark-chain fork block for the leader's run_once, or None.
+def _leader_fork_pin_resolver(round_id: str) -> int | dict[int, int] | None:
+    """Benchmark fork pin(s) for the leader's run_once, or None.
 
     Thin adapter over `_resolve_round_fork_pins` for injection into the
     BenchmarkWorker (keeps the harness worker free of any API-layer import).
-    Returns the pin for the primary benchmark chain; None when the gate is off or
-    unresolved. The leader and every follower derive the same value from the same
-    anchor — that is the parity.
+
+    Returns the FULL ``{chain_id: block}`` map when BENCHMARK_ALL_DEPLOYMENT_CHAINS
+    is armed (so the worker pins each chain at its own block); otherwise the bare
+    primary-chain block (legacy Base-only scalar — byte-identical to before).
+    None when the gate is off or unresolved. Leader and followers derive the same
+    values from the same anchor — that is the parity.
     """
     pins = _resolve_round_fork_pins(round_id)
     if not pins:
         return None
+    from minotaur_subnet.consensus.round_anchor import (
+        benchmark_all_deployment_chains_enabled,
+    )
+    if benchmark_all_deployment_chains_enabled():
+        return dict(pins)
     return pins.get(_round_anchor_chains()[0])
 
 
@@ -1433,7 +1485,15 @@ async def initialize(ctx: ServerContext) -> dict:
         sim_rpc_urls: dict[int, str] = {}
         if anvil_url:
             sim_rpc_urls[31337] = anvil_url
-            sim_rpc_urls[1] = anvil_url
+            # Chain 1 (Ethereum mainnet) sim fork. PREFER a dedicated
+            # ETH_SIM_RPC_URL (→ the eth anvil, e.g. http://anvil-eth:8545) so
+            # chain-1 scoreIntent runs on the ETHEREUM fork. Fall back to
+            # ANVIL_RPC_URL only for back-compat: on the leader ANVIL_RPC_URL
+            # points at the BASE anvil (misnamed legacy), so without the dedicated
+            # var a chain-1 sim would reset the Base fork to an Ethereum block
+            # number — a wrong/nonexistent block. Required before arming
+            # BENCHMARK_ALL_DEPLOYMENT_CHAINS with a chain-1 deployment.
+            sim_rpc_urls[1] = os.environ.get("ETH_SIM_RPC_URL") or anvil_url
         base_sim_url = os.environ.get("BASE_SIM_RPC_URL") or base_url
         if base_sim_url:
             sim_rpc_urls[8453] = base_sim_url
