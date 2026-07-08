@@ -21,6 +21,10 @@
   - [Configuration](validator/configuration.md)
   - [Troubleshooting](validator/troubleshooting.md)
 
+## API
+
+- [App-Management API](api/app-management.md)
+
 ## Operator
 
 - [Network Reference](operator/network-reference.md)
