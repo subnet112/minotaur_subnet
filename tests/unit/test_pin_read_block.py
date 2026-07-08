@@ -81,8 +81,8 @@ def test_pin_called_before_generate_plan_when_enabled(monkeypatch):
 
 
 def test_pin_not_called_when_disabled(monkeypatch):
-    sim, _ = _run(None, monkeypatch)
-    assert sim.pins == []                             # default OFF — inert
+    sim, _ = _run("0", monkeypatch)                   # explicit OFF (default is now ON)
+    assert sim.pins == []                             # disabled — inert
 
 
 def test_run_benchmark_fail_loud_when_proxy_configured_but_no_fork_block(monkeypatch):
@@ -165,3 +165,13 @@ def test_anvil_pin_read_fork_noop_when_already_at_block():
     assert resets == []
     assert sim.pin_read_fork(1, 1000) is True          # different block → re-fork
     assert resets == [1000]
+
+
+def test_pin_read_block_default_is_on(monkeypatch):
+    """2026-07-08: PIN_SOLVER_READ_BLOCK flipped to default ON. Unset ⇒ enabled;
+    explicit {0,false,no,off} disables."""
+    from minotaur_subnet.harness.orchestrator import _pin_solver_read_block_enabled
+    monkeypatch.delenv("PIN_SOLVER_READ_BLOCK", raising=False)
+    assert _pin_solver_read_block_enabled() is True
+    monkeypatch.setenv("PIN_SOLVER_READ_BLOCK", "off")
+    assert _pin_solver_read_block_enabled() is False
