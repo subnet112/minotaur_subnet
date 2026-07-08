@@ -93,16 +93,9 @@ def benchmark_all_deployment_chains_enabled() -> bool:
     the benchmark fails loud (RealSimulationUnavailable / ForkPinUnavailable)
     rather than scoring degraded.
     """
-    # DEFAULT ON (2026-07-08, operator decision). PRECONDITION: every validator
-    # must have the per-chain benchmark infra (SOLVER_READ_PROXY_CHAINS routing,
-    # *_UPSTREAM_RPC_URL pin derivation, a dedicated sim fork) for EVERY chain a
-    # live app deploys on — else that validator fails loud
-    # (RealSimulationUnavailable / ForkPinUnavailable) BY DESIGN (never a
-    # degraded/divergent corpus). Folds into the pack hash. Emergency disable:
-    # set to {0,false,no,off}.
     return os.environ.get(
         "BENCHMARK_ALL_DEPLOYMENT_CHAINS", "",
-    ).strip().lower() not in ("0", "false", "no", "off")
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:
