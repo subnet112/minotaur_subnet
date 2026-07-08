@@ -1094,10 +1094,14 @@ def _pin_solver_read_block_enabled() -> bool:
     routes/quotes/scores. Must be fleet-uniform — ships OFF so it can soak
     inert on the lead (observe the revert/score effect under the adoption
     freeze) and be flipped fleet-wide together (folded into the pack hash) once
-    proven, exactly like ROUND_ANCHORED_PIN. Default OFF.
+    proven, exactly like ROUND_ANCHORED_PIN. DEFAULT ON (2026-07-08, soaked
+    inert on the lead under the adoption freeze). Folds into the pack hash, so
+    it MUST be flipped fleet-uniformly (develop->main promotion) — a split
+    value surfaces as PACK_HASH_MISMATCH. Emergency override: set to one of
+    {0,false,no,off} to disable fleet-wide via compose without a code revert.
     """
-    return os.environ.get("PIN_SOLVER_READ_BLOCK", "").strip().lower() in (
-        "1", "true", "yes", "on",
+    return os.environ.get("PIN_SOLVER_READ_BLOCK", "").strip().lower() not in (
+        "0", "false", "no", "off",
     )
 
 
