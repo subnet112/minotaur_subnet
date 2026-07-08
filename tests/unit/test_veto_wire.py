@@ -704,3 +704,32 @@ class TestSubmitResponse:
             _completed(a), leader_api_url="http://x", private_key=None,
             deadline_epoch=10, current_epoch_fn=lambda: 1,
         )
+
+
+# ── participation switch: DEFAULT ON (fleet-wide observe without per-node env) ──
+
+class TestParticipationDefault:
+    def test_default_on_when_env_unset(self, monkeypatch):
+        # Third-party validators won't set the env; the observe soak needs
+        # fleet-wide participation, so a node with the code participates by
+        # DEFAULT (Phase 0 is observe-only — this never gates adoption).
+        monkeypatch.delenv("DISTRIBUTED_VETO", raising=False)
+        assert veto_wire.distributed_veto_enabled() is True
+
+    def test_explicit_zero_opts_out(self, monkeypatch):
+        for val in ("0", "false", "no", "off"):
+            monkeypatch.setenv("DISTRIBUTED_VETO", val)
+            assert veto_wire.distributed_veto_enabled() is False, val
+
+    def test_explicit_on_values(self, monkeypatch):
+        for val in ("1", "true", "yes", "on"):
+            monkeypatch.setenv("DISTRIBUTED_VETO", val)
+            assert veto_wire.distributed_veto_enabled() is True, val
+
+    def test_reverify_stays_default_off(self, monkeypatch):
+        # The expensive leader re-bench must NOT be flipped on by the
+        # default-ON participation switch — it stays independently opt-in.
+        monkeypatch.delenv("DISTRIBUTED_VETO", raising=False)
+        monkeypatch.delenv("DISTRIBUTED_VETO_REVERIFY", raising=False)
+        assert veto_wire.distributed_veto_enabled() is True
+        assert veto_wire.distributed_veto_reverify_enabled() is False

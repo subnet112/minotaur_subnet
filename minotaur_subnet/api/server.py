@@ -376,10 +376,12 @@ def health() -> dict:
             }
     except Exception:
         logger.warning("Failed to load solver round for /health", exc_info=True)
-    # Distributed-veto Phase 0 OBSERVE surface (leader only; absent until armed
-    # + the first phase resolves). The most recent per-round observe records
-    # from the in-memory registry — coverage/response/would-gate counts for the
-    # soak. Never reflects any enforcement (Phase 0 never gates).
+    # Distributed-veto Phase 0 OBSERVE surface (leader accumulates records;
+    # participation is default-ON, so this block is present unless the node
+    # opted out with DISTRIBUTED_VETO=0; phases list is empty until the first
+    # round resolves). The most recent per-round observe records from the
+    # in-memory registry — coverage/response/would-gate counts for the soak.
+    # Never reflects any enforcement (Phase 0 never gates).
     try:
         from minotaur_subnet.api.routes.submissions import veto_wire
 
