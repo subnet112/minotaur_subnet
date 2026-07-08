@@ -36,6 +36,8 @@ import time
 from threading import RLock
 from typing import Any
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
 
 # Per (chain_id, contract_address.lower()) -> (expires_at, is_registered)
@@ -45,27 +47,14 @@ _CACHE_TTL_SECONDS = 5.0
 
 
 def _chain_registry_env(chain_id: int) -> str:
-    return os.environ.get(f"APP_REGISTRY_{chain_id}", "").strip()
+    return registry.app_registry_address(chain_id)
 
 
 def _chain_rpc_env(chain_id: int) -> str:
     # Live-chain reads (registry / validator set / score) must hit the LIVE
-    # chain, never the sim fork. Prefer the operator's *_UPSTREAM_RPC_URL — the
-    # live RPC they already supply for Anvil's --fork-url — then fall back to
-    # the plain RPC (direct-live or local-dev, where "live" IS the local node).
-    # No hardcoded URLs; if none is set the caller fails open with a WARN.
-    if chain_id == 8453:
-        return (os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BASE_RPC_URL", "").strip())
-    if chain_id == 1:
-        return (os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("ETH_RPC_URL", "").strip()
-                or os.environ.get("ANVIL_RPC_URL", "").strip())
-    if chain_id == 964:
-        return (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
-                or os.environ.get("BITTENSOR_EVM_FORK_RPC_URL", "").strip())
-    return ""
+    # chain, never the sim fork — the operator's *_UPSTREAM_RPC_URL, then plain
+    # RPC. Ladder is defined once in the chain registry (registry.live_rpc).
+    return registry.live_rpc(chain_id)
 
 
 def enforce_enabled(chain_id: int) -> bool:
