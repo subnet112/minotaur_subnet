@@ -31,7 +31,7 @@ Every plan must pass two independent scoring layers:
 | **JavaScript** | Validator (off-chain) | `score(plan, state, context)` validates the plan and emits the real per-order result (for swaps, the raw delivered output in wei) |
 | **Solidity** | On-chain (`AppIntentBase`) | Enforces invariants, gates execution via `scoreIntent` |
 
-Both layers must pass. Champions are then chosen by **relative reference-bar scoring** — a challenger is compared to the current champion **per order** (more delivered = better), not against an absolute number.
+Both layers must pass. Champions are then chosen by **relative, per-order scoring** — a challenger is compared to the current champion order by order (more delivered = better), not against an absolute number. Adoption resolves a fixed ladder: **output** (net better on breadth, regressions bounded to a 1% floor), then, on a fully-matched tie, **gas → factorization → deadwood** tie-breaks. See the [miner champion/challenger model](./miner/README.md#championchallenger-model).
 
 ### Consensus
 
@@ -104,6 +104,10 @@ AppIntentBase.executeIntent() verifies quorum + user sig + executes via proxy
 - **[Validator Configuration](./validator/configuration.md)** — Complete configuration reference
 - **[Validator Troubleshooting](./validator/troubleshooting.md)** — Common issues and solutions
 
+### API
+
+- **[App-Management API](./api/app-management.md)** — Create, validate, deploy, and manage App Intents; wallet-signature auth model
+
 ### Operator
 
 - **[Network reference](./operator/network-reference.md)** — Mainnet addresses, endpoints, cluster expectations
@@ -172,7 +176,7 @@ current `DexAggregatorApp` ABI and execution path.
 
 ## Current Status
 
-Minotaur is in **Alpha** on Bittensor Subnet 112 (NETUID `112`) with real mainnet execution. The flagship `DexAggregatorApp` is live on **Base**; Bittensor EVM and Ethereum follow within Phase 4. Permissionless App deployment opens in Phase 6 (Jun 23, 2026); cross-chain settlement opens in Phase 5 (Jun 9, 2026). The champion miner's emission share **scales with network usage** — a **5% floor** (95% burns to the subnet owner) at low volume, ramping linearly to **100%** at **1,000 orders in the trailing 24h**. A challenger is adopted by **relative reference-bar scoring**: it must out-deliver the champion per order (zero regressions, ≥1 strict win), not beat an absolute score. See [`ROADMAP.md`](../ROADMAP.md) for the phase-by-phase plan.
+Minotaur is in **Alpha** on Bittensor Subnet 112 (NETUID `112`) with real mainnet execution. The flagship `DexAggregatorApp` is live on **Base**; Bittensor EVM and Ethereum follow within Phase 4. The **permissionless deployment path** — wallet-signature auth (no shared admin key), a once-per-app WTAO deploy fee, and permissionless-deploy / admin-gated-activation moderation — has landed and is gated behind go-live flags (`ENABLE_PUBLIC_DEPLOYMENT`); cross-chain settlement opens in Phase 5 (Jun 9, 2026). The champion miner's emission share **scales with network usage** — a **5% floor** (95% burns to the subnet owner) at low volume, ramping linearly to **100%** at **1,000 orders in the trailing 24h**. A challenger is adopted by **relative, per-order scoring** resolved on a ladder: net-better delivered output (regressions bounded to a 1% floor), then, on a fully-matched tie, gas / factorization / deadwood tie-breaks — not an absolute score. See [`ROADMAP.md`](../ROADMAP.md) for the phase-by-phase plan.
 
 ## Getting Help
 
