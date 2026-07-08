@@ -14,9 +14,9 @@ Validators perform six core functions:
 
 1. **Run the Solving Engine** -- Execute miner-submitted solver code to generate execution plans for user orders in the Intent OrderBook.
 2. **Simulate on Anvil forks** -- Plans are executed on Ethereum mainnet forks via Anvil, using snapshot/revert isolation so no real state is modified.
-3. **Dual scoring** -- Every plan passes two layers: the app's JS module (validity + the real per-order result it emits, e.g. raw delivered output) and the on-chain `scoreIntent` gate. Champion adoption then compares challenger-vs-champion **per order** (relative reference-bar), not by an absolute number.
-4. **N-of-M consensus** -- The leader validator proposes plans; follower validators independently re-simulate, re-score, and sign EIP-712 approvals. Exact score match is not required -- followers sign if both scores pass their threshold.
-5. **Weight emission** -- Champion-takes-all model. The miner who submitted the currently active (best-performing) solver receives 100% of emissions via `set_weights()`.
+3. **Dual scoring** -- Every plan passes two layers: the app's JS module (validity + the real per-order result it emits, e.g. raw delivered output) and the on-chain `scoreIntent` gate. Champion adoption then compares challenger-vs-champion **per order** at the same fork pin, resolved by a fixed ladder — **output** (net better on breadth, with regressions bounded to a 1% floor), then, on a fully-matched tie, **gas → factorization → deadwood** tie-breaks. See [Champion adoption](#dual-scoring) below and the [miner champion/challenger model](../miner/README.md#championchallenger-model).
+4. **N-of-M consensus** -- The leader validator proposes plans; follower validators independently re-simulate, re-score, and sign EIP-712 approvals. Exact score match is not required -- followers sign if both scores pass their threshold. For champion certification, the leader now re-broadcasts the round's current submission snapshot before the proposal fan-out, so followers vote on the candidate's ladder metrics (gas / factorization / deadwood) rather than close-time `None` values — leader-only deploy heals the whole fleet (PR #601).
+5. **Weight emission** -- Champion-takes-all model. The miner who submitted the currently active (best-performing) solver receives 100% of emissions via `set_weights()`. Weight commits are now **tempo-aligned** (PR #524): SN112 uses commit-reveal and the chain keeps only one pending commit per validator per tempo epoch, so emission is scheduled into a short window just before the epoch step (`TEMPO_ALIGNED_EMIT=1` by default, lead window `TEMPO_EMIT_LEAD_BLOCKS=20` blocks). This replaces the old wall-clock cadence that could commit 2–3×/tempo and leave a freshly-dethroned champion earning nothing.
 6. **Accept miner solver submissions** -- Validate incoming solver code, screen it through three stages, benchmark performance, and adopt the champion solver.
 
 ## Architecture
@@ -56,7 +56,12 @@ Every execution plan is scored at two layers:
 | **JavaScript** | Validator Node.js sandbox | App-defined module via `score(plan, state, context)`. Reads simulation data (token transfers, gas, state changes) and emits the real per-order result the relative comparison uses — for `DexAggregatorApp`, a validity sentinel plus the **raw delivered output** (exact wei) in `metadata.raw_output`. |
 | **Solidity** | Anvil fork (simulated on-chain) | Contract-enforced invariants, user signature verification, validator quorum checks. Executed via ephemeral proxy (`CREATE2`) for state isolation. |
 
-Both layers must pass. Champion adoption is then **relative**: the challenger's per-order result is compared to the champion's at the same pin (more delivered = better; dethrone needs zero regressions/drops and ≥1 strict win or blind-spot cover), not measured against an absolute threshold.
+Both layers must pass. Champion adoption is then **relative** and resolved by a fixed ladder, highest priority first (source of truth: `epoch/relative_scoring.py`):
+
+1. **Output (primary, always armed).** Adopt if net better on breadth: `(wins + blind-spot covers) − regressions ≥ 1`. Regressions are **tolerated within a 1% per-order floor** and netted against wins — this is a bounded-regression, net-better rule, not the older "any regression = reject".
+2. **Gas → Factorization → Deadwood tie-breaks** — fire only on a *fully-matched, saturated tie* (every compared order matched, zero regressions): cheaper total metered (pre-refund) gas by ≥200 bps, then smaller worst AST region (`max_region_nodes`) by ≥100, then less dead code (`unproductive_nodes`) by ≥2000. All three are **armed** on `develop` but fire "by data" — inert until both the champion and challenger records carry the metric.
+
+**Hard vetoes** (override every rung): no order cut by more than 1% and no dropped order the champion serves. The blind-spot *repeat* bar is wired but **disarmed** (`BLIND_SPOT_BAR_TTL_S = None`), so it does not yet affect adoption.
 
 ### Intent OrderBook
 
@@ -98,15 +103,17 @@ The canonical third-party validator stack exposes HTTP on two ports.
 |--------|------|-------------|
 | `GET` | `/health` | Service health + champion-consensus state |
 | `GET` | `/identity` | Same EIP-712 binding as 9100 (api-side peer discovery) |
-| `GET` | `/v1/apps/` | List App Intents (read endpoint, no auth) |
-| `POST` | `/v1/apps/` | Create an App Intent (gated by `X-Admin-Key` header when `ADMIN_API_KEY` is set) |
-| `POST` | `/v1/apps/{app_id}/deploy` | Deploy an App Intent on-chain (admin-gated) |
+| `GET` | `/v1/apps/` | List App Intents (read; each item now carries a per-chain `deployments` map + a unified `status` — `partial` for mixed multi-chain states, PR #598) |
+| `POST` | `/v1/apps/` | Create an App Intent — `X-Admin-Key` **or** a self-serve EIP-712 `owner_signature` binding the recovered signer as the app `deployer` (PR #535). Non-admin create is rate-limited (`APP_CREATE_RATE_PER_MIN`, default 5/min). |
+| `POST` | `/v1/apps/{app_id}/deploy` | Deploy on-chain. **Async by default** (`?wait=true` for the legacy synchronous body); wallet-signature or fee-payment authorized, no shared admin key required (PRs #611/#555/#534). See the [API reference](../api/app-management.md). |
 | `POST` | `/v1/solver/round/consensus/proposal` | Receive a champion-consensus proposal from the leader (followers) |
 | `POST` | `/v1/solver/round/certify` | Submit a certified champion (leader-only) |
 
+App-management (create/validate/deploy) and the app-lifecycle, registry, and registration endpoints now use a wallet-signature auth model that retires the shared admin key. The full endpoint set, headers, and env flags are documented in the [App-management API reference](../api/app-management.md).
+
 Both ports must be reachable from the public internet so the current leader can deliver proposals; see [quickstart.md](./quickstart.md#ports) for the full firewall guidance.
 
-Git/source solver submissions are currently served by the API server (`/v1/submissions*`), not by the standalone validator endpoint set above.
+Git-based solver submissions are served by the API server (`/v1/submissions*`), not by the standalone validator endpoint set above. (The inline source-submission endpoint `/v1/submissions/source` was removed in PR #599.)
 
 ## Entry Points
 

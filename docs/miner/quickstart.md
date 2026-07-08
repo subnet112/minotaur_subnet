@@ -147,24 +147,7 @@ Notes:
   `main` (preserving canonical CI) and you become champion — your code only becomes
   public once you've already won. No need to resubmit publicly.
 
-## 6) Optional: direct source submission (local/dev)
-
-You can submit inline solver code directly:
-
-```bash
-curl -X POST http://localhost:8080/v1/submissions/source \
-  -H "Content-Type: application/json" \
-  -d '{
-    "solver_source": "from minotaur_subnet.sdk.intent_solver import IntentSolver\nclass S(IntentSolver):\n    def initialize(self, config):\n        pass\n    def generate_plan(self, intent, state, snapshot=None):\n        raise NotImplementedError\n    def metadata(self):\n        from minotaur_subnet.sdk.intent_solver import SolverMetadata\n        return SolverMetadata(name=\"s\", version=\"0.1.0\", author=\"local\")\nSOLVER_CLASS = S",
-    "hotkey": "local-miner",
-    "epoch": 0,
-    "solver_name": "local-dev"
-  }'
-```
-
-This route skips screening and queues directly into benchmarking.
-
-## 7) Check submission status
+## 6) Check submission status
 
 ```bash
 python -m minotaur_subnet.miner.main status \
@@ -180,8 +163,9 @@ Common statuses:
 - `screening_stage_3` — smoke-test run on a benchmark scenario
 - `benchmarking` — full replay against the current scenario suite
 - `scored` — benchmark complete; ranked against current champion
+- `waitlisted` — no fault of yours: not selected for this round's benchmark slate, or the round's benchmark window elapsed before your turn. Carries a next-round priority and is **distinct from `rejected`** (PR #620). The status payload includes a `waitlist` object `{position, contenders, slots, next_round_priority}`.
 - `adopted` — promoted to champion; running in BlockLoop
-- `rejected` — failed screening or scored below threshold
+- `rejected` — failed screening or lost the champion comparison. Every terminal transition also carries a machine-readable `outcome_code` (e.g. `too_entangled`, `fingerprint_repeat`, `rotation_not_selected`, `benchmark_failed`) — switch on that, not on the free-text reason.
 
 ## What happens after submission
 
@@ -189,9 +173,9 @@ Once `submit` returns, the API queues your solver for evaluation. The lifecycle 
 
 1. **Screening (seconds–minutes)**: three stages run in sequence. Most failures show up here — Docker build errors, missing `SOLVER_CLASS`, banned imports.
 2. **Benchmarking (minutes)**: the benchmark worker runs your solver against the active scenario suite for each live App. Each order produces a real result — for swaps, the raw delivered output in wei.
-3. **Champion comparison (relative reference-bar)**: your result is compared to the champion **per order** — `win` / `regression` / `matched` within a ±0.1% (10 bps) band, plus `blind_spot_cover` and `dropped`. You dethrone the champion only with **zero regressions/drops and at least one strict win or blind-spot cover**. There is no absolute score or fixed percentage margin.
+3. **Champion comparison (relative, per order)**: your result is compared to the champion **per order at the same pin** — `win` / `regression` / `matched` within a ±0.1% (10 bps) band, plus `blind_spot_cover` and `dropped`. Adoption runs a ladder: you dethrone on **output** if you are net better on breadth — `(wins + blind_spot_covers) − regressions ≥ 1` — where each tolerated regression must stay within the **1% hard floor** (a cut beyond 1%, or dropping any order the champion serves, is a hard veto regardless of wins). On a **fully-matched tie** (every order matched, zero regressions) you can still dethrone on the tie-break rungs — **gas** (≥200 bps cheaper total metered gas), then **factorization** (`max_region_nodes` smaller by ≥100), then **deadwood** (`unproductive_nodes` smaller by ≥2000). See [Champion/challenger model](./README.md#championchallenger-model) for the full rule. Scoring is raw delivered output only — quote quality no longer matters.
 4. **Adoption**: champion adoption requires N-of-M validator signatures via champion-certification consensus (separate from order consensus). This typically completes in seconds once the leader proposes the new champion.
-5. **Weight emission**: the active champion's submitter earns a share of miner emission weight that **scales with network usage** — a 5% floor (95% burns to the subnet owner) at low volume, ramping linearly to 100% at 1,000 orders in the trailing 24h — applied on the next subtensor epoch (~60s).
+5. **Weight emission**: the active champion's submitter receives **100% of miner emissions** (champion-takes-all; before a real miner champion exists, emissions burn to the subnet owner), committed on the tempo-aligned schedule (see [validator config](../validator/configuration.md#weight-emission)).
 
 Wall-clock times depend on the live network's queue depth. On a quiet network, screening + benchmarking takes 1–3 minutes. During a benchmark spike (multiple submissions queued), it can stretch to 10+ minutes.
 

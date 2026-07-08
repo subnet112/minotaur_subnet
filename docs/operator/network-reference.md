@@ -53,6 +53,8 @@ Miners pointing the agent loop at production use `--validator-url https://api.mi
 
 ChampionRegistry holds its own independent `quorumBps` for champion-certification consensus. The validator-side env var `CHAMPION_QUORUM_BPS` should mirror whatever `cast call $CHAMPION_REGISTRY 'quorumBps()(uint256)' --rpc-url https://lite.chain.opentensor.ai` returns (currently `6666`).
 
+Each chain's `AppRegistry` address is now published on `GET /v1/chains` as `app_registry_address` (PR #553), so app deployers and frontends can read the gate without hardcoding it. The app-deployment, fee, and moderation env flags (`ENABLE_PUBLIC_DEPLOYMENT`, `DEPLOY_FEE_*`, `APP_ADMIN_SIGNERS`, `REQUIRE_APP_ACTION_SIGNATURE`, `AUTO_REGISTER_APPS`) are documented in the [App-Management API reference](../api/app-management.md#related-operator-env).
+
 ### Ethereum mainnet (chain `1`)
 
 The platform supports Ethereum mainnet execution, but the canonical DexAggregator deployment currently lives on Base. ValidatorRegistry on Ethereum mainnet TBD — operators running only Base do not need it; operators planning to support ETH-mainnet flows should ask before assuming an address.
@@ -65,7 +67,7 @@ The platform supports Ethereum mainnet execution, but the canonical DexAggregato
 | Quorum threshold (`quorumBps` on `ValidatorRegistry`) | `6666` (2-of-3 BFT). Read live with `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $BASE_RPC`. |
 | Champion quorum (`quorumBps` on `ChampionRegistry`) | `6666` — mirror the on-chain value with `CHAMPION_QUORUM_BPS` |
 | Tick interval | `12s` (matches Ethereum block time) |
-| Weight emission cadence | `1200s` (20 min) — matches Bittensor's `weights_set_rate_limit` of 100 blocks. Pass `--epoch-seconds 1200` to the validator daemon. The 60s default spam-rejects ~95% of attempts on subnet 112. |
+| Weight emission cadence | **Tempo-aligned by default** (`TEMPO_ALIGNED_EMIT=1`, PR #524): one commit-reveal per tempo epoch, fired ~`TEMPO_EMIT_LEAD_BLOCKS` (20) blocks before the epoch step. The chain keeps only one pending commit per validator per tempo, so this replaces tuning `--epoch-seconds` for cadence. Set `TEMPO_ALIGNED_EMIT=0` to fall back to the legacy wall-clock cadence (`--epoch-seconds 1200`). |
 | `ProtocolConfig` refresh cadence | `60s` — how often the daemon re-reads `quorumBps` and the validator set from `ValidatorRegistry`. Independent of weight emission. |
 | Stake requirement for emissions | (TBD — set by Bittensor subnet rules; check current `metagraph` output) |
 
