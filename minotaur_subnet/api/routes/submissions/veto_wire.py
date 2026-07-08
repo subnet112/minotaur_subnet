@@ -84,6 +84,28 @@ SEND_UNSUPPORTED = "unsupported"  # deterministic reject → terminal abstain
 SEND_UNREACHABLE = "unreachable"  # transient → re-send next tick
 
 
+def resolve_bare_digest(store: Any, submission_id: str | None) -> str | None:
+    """Resolve a submission's pushed bare GHCR digest from its stored
+    ``image_digest`` ref via the submission store. Returns None when the
+    submission is absent or was never pushed (legacy id only) → the veto
+    digest gate honestly skips.
+
+    Extracted + tested (SubmissionStore's lookup is ``.get(id)``, NOT
+    ``.get_submission`` — a wrong method name would be swallowed by the caller's
+    broad except and silently skip EVERY round, which is exactly what shipped in
+    the untested startup closure).
+    """
+    if not submission_id or store is None:
+        return None
+    try:
+        from minotaur_subnet.harness.image_transport import bare_hex
+
+        sub = store.get(submission_id)
+        return bare_hex(getattr(sub, "image_digest", None)) if sub else None
+    except Exception:  # noqa: BLE001 — never break the observe pass
+        return None
+
+
 def own_validator_evm() -> str | None:
     """This node's EVM address from the champion peer network's signing key —
     the identity a leader-signed assignment must be addressed to. None (no key
