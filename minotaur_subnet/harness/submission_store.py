@@ -104,10 +104,37 @@ class SubmissionStatus(str, Enum):
     SCREENING_STAGE_1 = "screening_stage_1"
     SCREENING_STAGE_2 = "screening_stage_2"
     SCREENING_STAGE_3 = "screening_stage_3"
+    # Screening passed; awaiting the close-time rotation slate decision (PR-C
+    # promotes this into the flow). Terminal-for-this-round only via WAITLISTED.
+    PENDING_SELECTION = "pending_selection"
     BENCHMARKING = "benchmarking"
     SCORED = "scored"
+    # NOT selected onto this round's benched slate, OR the bench window elapsed
+    # before scoring — a NON-fault, NON-terminal-across-rounds outcome carrying
+    # next-round priority. Distinct from REJECTED (for-cause) so miners and the
+    # UI never read "didn't get a slot" as "your code was refused".
+    WAITLISTED = "waitlisted"
     REJECTED = "rejected"
     ADOPTED = "adopted"
+
+
+# Machine-readable terminal-outcome taxonomy (persisted as Submission.
+# outcome_code). The frontend switches on THIS, never on the human
+# rejection_reason prose. Grouped by the status they accompany:
+#   REJECTED (for-cause — miner must change something):
+OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
+OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
+OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
+OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
+OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
+OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
+OUTCOME_BUILD_FAILED = "build_failed"          # stage-2 docker build
+OUTCOME_INVALID_PLANS = "invalid_plans"        # stage-3 plan validation
+OUTCOME_BENCHMARK_FAILED = "benchmark_failed"  # bench produced no usable rows
+OUTCOME_SCREENING_ERROR = "screening_error"    # unexpected pipeline error
+#   WAITLISTED (no-fault — resubmit keeps seniority):
+OUTCOME_ROTATION_NOT_SELECTED = "rotation_not_selected"
+OUTCOME_WINDOW_ELAPSED = "window_elapsed"
 
 
 # Statuses meaning the submission actually occupied a benchmark slate slot (was
@@ -187,6 +214,10 @@ class Submission:
     # but NOT gated yet — we soak the live distribution to calibrate the floor and
     # the saturated-tie dethrone tie-break. See harness/screening.max_region_nodes.
     max_region_nodes: int | None = None
+    # Normalized content fingerprint (harness/code_fingerprint, screening stage 1)
+    # — the "same code, same quota" identity that comment/whitespace/nonce
+    # rotation cannot refresh. None on records that predate the metric.
+    content_fingerprint: str | None = None
 
     # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
     # tree that provably does no work at runtime (unreachable files + dead
@@ -210,8 +241,16 @@ class Submission:
     benchmark_rank: int | None = None
     benchmark_details: dict[str, Any] | None = None
 
-    # Set on rejection
+    # Set on any terminal outcome (rejected / waitlisted).
     rejection_reason: str | None = None
+    # Machine-readable terminal outcome (one of the OUTCOME_* codes). The
+    # miner-facing surfaces (frontend, PR comment router) switch on THIS, not on
+    # the human rejection_reason. None while in-flight or on legacy records.
+    outcome_code: str | None = None
+    # Waitlist context for a WAITLISTED submission — {"position", "contenders",
+    # "slots"} + is priority for next round. Lets the UI say "queued for next
+    # round, #2 of 13". None for every non-waitlisted state.
+    waitlist: dict[str, Any] | None = None
 
     # Local path to cloned repo (transient, not persisted)
     _repo_path: str | None = field(default=None, repr=False)
@@ -243,12 +282,15 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "unproductive_metric_version": self.unproductive_metric_version,
             "unproductive_top_offenders": self.unproductive_top_offenders,
             "benchmark_rank": self.benchmark_rank,
             "benchmark_details": self.benchmark_details,
             "rejection_reason": self.rejection_reason,
+            "outcome_code": self.outcome_code,
+            "waitlist": self.waitlist,
         }
 
     def status_dict(self) -> dict[str, Any]:
@@ -267,9 +309,12 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "max_region_nodes": self.max_region_nodes,
+            "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
+            "outcome_code": self.outcome_code,
+            "waitlist": self.waitlist,
         }
 
 
@@ -533,12 +578,15 @@ class SubmissionStore:
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
             max_region_nodes=record.get("max_region_nodes"),
+            content_fingerprint=record.get("content_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
             unproductive_metric_version=record.get("unproductive_metric_version"),
             unproductive_top_offenders=record.get("unproductive_top_offenders"),
             benchmark_rank=record.get("benchmark_rank"),
             benchmark_details=record.get("benchmark_details"),
             rejection_reason=record.get("rejection_reason"),
+            outcome_code=record.get("outcome_code"),
+            waitlist=record.get("waitlist"),
         )
         # _submissions is the source of truth for list_by_round / the pack hash;
         # the indexes are best-effort lookups (last-wins is fine, they aren't
@@ -742,6 +790,17 @@ class SubmissionStore:
         if not passed:
             sub.status = SubmissionStatus.REJECTED
             sub.rejection_reason = f"Stage {stage}: {error_code} — {details}"
+            # Machine-readable outcome derived from the stage + error_code:
+            # stage 1 = static policy (or the armed factorization floor), stage 2
+            # = build, stage 3 = plan validation.
+            if stage == 1 and error_code == "too_entangled":
+                sub.outcome_code = OUTCOME_TOO_ENTANGLED
+            elif stage == 1:
+                sub.outcome_code = OUTCOME_STATIC_CHECKS
+            elif stage == 2:
+                sub.outcome_code = OUTCOME_BUILD_FAILED
+            elif stage == 3:
+                sub.outcome_code = OUTCOME_INVALID_PLANS
             self.purge_token(submission_id)  # terminal — drop the secret
 
         self._persist()
@@ -769,6 +828,46 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
+    def set_content_fingerprint(self, submission_id: str, value: str) -> None:
+        """Persist the normalized content fingerprint from screening stage 1.
+
+        Same compute-once-read-forever discipline as ``set_max_region_nodes`` —
+        every consumer reads the stored value, never recomputes.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.content_fingerprint = value
+        sub.updated_at = time.time()
+        self._persist()
+
+    def count_benched_rounds_for_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> int:
+        """DISTINCT rounds in which this normalized fingerprint occupied a
+        benchmark slot — ACROSS ALL HOTKEYS.
+
+        The cross-hotkey scope is the point: the per-(hotkey, commit) cap gives
+        every sybil hotkey its own quota for the same bytes; this counter gives
+        the CODE one quota, however many hotkeys ship it. Mirrors the commit
+        cap's accounting: only BENCHED statuses count, so rotation-not-selected
+        and screening rejections don't burn quota.
+        """
+        self._maybe_reload()
+        rounds: set[str] = set()
+        for sub in self._submissions.values():
+            if sub.content_fingerprint != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            if sub.status in BENCHED_STATUSES and sub.round_id:
+                rounds.add(sub.round_id)
+        return len(rounds)
+
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
         """Persist the Phase-0 factorization metric computed in screening stage 1.
 
@@ -883,6 +982,19 @@ class SubmissionStore:
         raw_output rows), an optional display ``rank``, and the SCORED/REJECTED
         verdict. The display rank is written via :meth:`set_benchmark_rank` in a
         separate pass, so there is no longer a "don't clobber a real score" guard.
+
+        NO RESURRECTION: a terminally REJECTED submission is never flipped back
+        to SCORED, no matter what a late benchmark result says. Rotation rejects
+        the slate overflow at round close "regardless of benchmark progress" and
+        PURGES the private-repo token (irreversibly — memory AND encrypted
+        sidecar), but an in-flight bench finishing after that, or a restart
+        re-benching an orphaned round, used to resurrect the submission here.
+        The resurrected record then ranked (and under the tie-break ladder
+        frequently WON) as finalist, certified, and died at relayer-finalize
+        "no token — FAIL-CLOSED", aborting the round (observed live 2026-07-07:
+        5 consecutive merge_failed rounds). Bench details are still recorded so
+        the miner's report shows how they scored; the terminal status and its
+        reason are immutable.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
@@ -893,6 +1005,17 @@ class SubmissionStore:
             sub.benchmark_rank = rank
         if details is not None:
             sub.benchmark_details = details
+
+        if sub.status == SubmissionStatus.REJECTED:
+            logger.info(
+                "set_benchmark_result: %s is terminally REJECTED (%s) — "
+                "recording bench details but NOT resurrecting to SCORED",
+                submission_id, (sub.rejection_reason or "?")[:80],
+            )
+            sub.updated_at = time.time()
+            self._persist()
+            return
+
         # The validity gate: no order delivered value -> the solver produced no
         # usable plans, reject it instead of marking it scored.
         if not valid:
@@ -904,6 +1027,10 @@ class SubmissionStore:
             self.purge_token(submission_id)  # terminal — drop the secret
         else:
             sub.status = SubmissionStatus.SCORED
+            # A legitimately scored submission carries no rejection: clear any
+            # stale reason so the miner-facing headline can never contradict the
+            # outcome (a terminally rejected sub never reaches this branch).
+            sub.rejection_reason = None
         sub.updated_at = time.time()
         self._persist()
 
@@ -948,16 +1075,63 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
-    def reject(self, submission_id: str, reason: str) -> None:
-        """Reject a submission with a reason."""
+    def reject(
+        self, submission_id: str, reason: str, *, outcome_code: str | None = None,
+    ) -> None:
+        """Reject a submission FOR CAUSE (the miner must change something).
+
+        ``outcome_code`` is the machine-readable OUTCOME_* the frontend switches
+        on; ``reason`` is the human prose. Kept optional so the many existing
+        call sites keep compiling — sites are being tagged with a code
+        incrementally.
+        """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.status = SubmissionStatus.REJECTED
         sub.rejection_reason = reason
+        sub.outcome_code = outcome_code
         sub.updated_at = time.time()
         self.purge_token(submission_id)  # terminal — drop the secret
+        self._persist()
+
+    @_write_locked
+    def waitlist(
+        self,
+        submission_id: str,
+        reason: str,
+        *,
+        outcome_code: str,
+        position: int | None = None,
+        contenders: int | None = None,
+        slots: int | None = None,
+    ) -> None:
+        """Mark a submission WAITLISTED — a NO-FAULT outcome (not selected onto
+        this round's slate, or the bench window elapsed).
+
+        Distinct from :meth:`reject`: the miner did nothing wrong, keeps
+        next-round seniority, and the UI must render it as "queued for next
+        round", never as a refusal. ``position``/``contenders``/``slots`` (when
+        known — rotation supplies them) populate the ``waitlist`` context the
+        status API and PR comment surface. The private token is purged like any
+        terminal-for-this-round state (a resubmit next round carries its own).
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.status = SubmissionStatus.WAITLISTED
+        sub.rejection_reason = reason
+        sub.outcome_code = outcome_code
+        sub.waitlist = {
+            "position": position,
+            "contenders": contenders,
+            "slots": slots,
+            "next_round_priority": True,
+        }
+        sub.updated_at = time.time()
+        self.purge_token(submission_id)
         self._persist()
 
     @_write_locked
@@ -1241,12 +1415,15 @@ class SubmissionStore:
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
                     max_region_nodes=d.get("max_region_nodes"),
+                    content_fingerprint=d.get("content_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
                     unproductive_metric_version=d.get("unproductive_metric_version"),
                     unproductive_top_offenders=d.get("unproductive_top_offenders"),
                     benchmark_rank=d.get("benchmark_rank"),
                     benchmark_details=d.get("benchmark_details"),
                     rejection_reason=d.get("rejection_reason"),
+                    outcome_code=d.get("outcome_code"),
+                    waitlist=d.get("waitlist"),
                 )
                 submissions[sid] = sub
                 round_key = f"{sub.hotkey}:{sub.round_id}"

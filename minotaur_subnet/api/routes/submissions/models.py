@@ -151,28 +151,18 @@ class StatusResponse(BaseModel):
     # hotkey, so old submissions from churned hotkeys resolve to null by design.
     miner_uid: int | None = None
     rejection_reason: str | None = None
+    # Machine-readable terminal outcome (submission_store.OUTCOME_*). Switch on
+    # THIS, never on rejection_reason prose. None while in-flight / legacy.
+    outcome_code: str | None = None
+    # Waitlist context when status == "waitlisted": {position, contenders,
+    # slots, next_round_priority}. Render as "queued for next round, #position
+    # of contenders" — a no-fault state, NOT a rejection. None otherwise.
+    waitlist: dict[str, Any] | None = None
     # Feedback report (P1): the same-pin per-order ``relative`` block (better /
     # worse / matched / new + per-order deltas) and a verdict-derived outcome.
     # The legacy aggregate-vs-champion scalars were removed (see report.py).
     # Present once benchmarked (or screening-rejected); None while in-flight.
     report: dict[str, Any] | None = None
-
-
-class SourceSubmitRequest(BaseModel):
-    """Request body for source-based submission (no git/Docker)."""
-    solver_source: str = Field(
-        ...,
-        description="Complete Python source of the solver",
-        max_length=500_000,
-    )
-    hotkey: str = Field("local-miner", description="Miner identifier")
-    round_id: str | None = Field(
-        default=None,
-        description="Current solver round ID",
-        min_length=1,
-    )
-    epoch: int = Field(0, description="Epoch number", ge=0)
-    solver_name: str = Field("", description="Solver name")
 
 
 class SolverRoundResponse(BaseModel):

@@ -416,7 +416,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         # Mock the actual benchmarking to avoid Docker. raw_output>0 makes the
         # order deliver value, so the submission passes the validity gate -> SCORED.
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             return [BenchmarkResult(
                 intent_id="test",
                 plan=_make_plan("test"),
@@ -452,7 +452,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         worker = BenchmarkWorker(store, use_docker=True, round_store=round_store)
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             raise AssertionError("benchmark should not run while round is open")
 
         worker._benchmark_submission = mock_benchmark_submission
@@ -544,7 +544,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
             sub2.submission_id: [("test_a", "1000"), ("test_b", "1000")],
         }
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             for sid, orders in value_orders.items():
                 sub = store.get(sid)
                 if sub and sub.image_tag == image_tag:
@@ -620,7 +620,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         worker = BenchmarkWorker(store, use_docker=False)
 
         # Challenger beats the champion on the shared order (2000 > 1000).
-        async def mock_benchmark(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark(image_tag, intents, score_fn):
             return [BenchmarkResult(
                 intent_id="test", plan=_make_plan(), score=0.99, raw_output="2000",
             )]
@@ -652,7 +652,7 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
 
         worker = BenchmarkWorker(store, on_champion_adopted=on_adopted)
 
-        async def mock_benchmark(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark(image_tag, intents, score_fn):
             return [BenchmarkResult(intent_id="test", plan=_make_plan(), score=0.85)]
 
         worker._benchmark_submission = mock_benchmark
@@ -839,7 +839,7 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
 
         worker = BenchmarkWorker(store, use_docker=False)
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             self.fail("Docker benchmark should not be called when solver_path exists")
 
         worker._benchmark_submission = mock_benchmark_submission
@@ -898,7 +898,7 @@ class TestGenesisBootstrap(unittest.TestCase):
         )
 
         # Mock the actual (Docker) benchmarking; raw_output>0 => delivered value.
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
                 raw_output="1000",
@@ -937,7 +937,7 @@ class TestGenesisBootstrap(unittest.TestCase):
             use_docker=False,
         )
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
                 raw_output="1000",
@@ -1007,7 +1007,7 @@ class TestGenesisBootstrap(unittest.TestCase):
             use_docker=False,
         )
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             return [BenchmarkResult(
                 intent_id="dex-app", plan=_make_plan("dex-app"), score=0.6,
                 raw_output="1000",
@@ -1084,7 +1084,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             self.assertEqual(image_tag, "solver-champ:screening")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
@@ -1143,7 +1143,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             self.assertEqual(image_tag, "genesis:latest")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(
@@ -1199,7 +1199,7 @@ class TestChampionBootstrap(unittest.TestCase):
         async def mock_build_score_fn(intents):
             return lambda _plan, _state, _snapshot: 0.0
 
-        async def mock_benchmark_submission(image_tag, intents, score_fn, reference_quotes=None):
+        async def mock_benchmark_submission(image_tag, intents, score_fn):
             self.assertEqual(image_tag, "genesis:latest")
             self.assertEqual([app.app_id for app, _, _ in intents], ["solving-app"])
             return [BenchmarkResult(

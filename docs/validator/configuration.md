@@ -9,7 +9,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--port` | `9100` | HTTP listen port for the validator API |
-| `--epoch-seconds` | `60` | Epoch duration in seconds for weight emission |
+| `--epoch-seconds` | `60` | Epoch duration in seconds for the local emit clock. **Note:** since PR #524, weight *commit* timing is tempo-aligned (one commit per chain tempo epoch, ~360 blocks), not driven by this wall-clock value — see `TEMPO_ALIGNED_EMIT` under [Weight Emission](#weight-emission). This still governs the fallback wall-clock cadence when tempo state is unqueryable. |
 | `--store-path` | `None` | Path to the `store.json` persistence file. If omitted, uses in-memory store. |
 | `--tick-interval` | `12.0` | BlockLoop tick interval in seconds (matches Ethereum block time) |
 | `--subtensor-url` | `None` | Subtensor WebSocket URL (e.g., `wss://entrypoint-finney.opentensor.ai:443`) |
@@ -74,12 +74,41 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 
 The follower validator pulls `AppIntentDefinition` (including `js_code`) and `DeploymentResult` records from the leader's API on a poll interval and writes them into the local `AppIntentStore`. Without this, a third-party validator's `JsExecutionEngine` has no scoring code loaded and cannot re-score incoming consensus proposals.
 
+Since PR #584, sync also **propagates deletions**: after a successful, non-empty catalog fetch a follower prunes local apps the leader no longer lists — but only *non-operational* ones (no deployment / non-operational status); an app the follower can actively score against is never auto-deleted on a single listing (it logs a loud warning instead), and an empty catalog never mass-deletes. Deleting an app now cascades its deployment rows. The leader never self-syncs, so the source-of-truth store is untouched.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LEADER_API_URL` | -- | Leader API base URL (e.g. `https://api.minotaursubnet.com`). Set on every third-party validator. Leaders should leave this **unset** — they are the source of truth and would otherwise sync from themselves. |
 | `--app-sync-interval` (CLI only) | `60.0` | Seconds between sync ticks. |
 
 **Trust model (MVP):** `js_code` is fetched from the leader and trusted as-is. There is no on-chain hash anchor at this layer, so a compromised leader could push malicious JS to followers. Anchoring `keccak256(js_code)` on-chain via `AppRegistry` is a tracked follow-up; until then the daemon emits a `SECURITY NOTICE` log at startup whenever sync is enabled.
+
+### Weight Emission
+
+SN112 weights are commit-reveal: the chain keeps only **one** pending commit per validator per tempo epoch (≈360 blocks) and silently discards earlier commits in the same epoch. PR #524 schedules all emission into a short window just before the epoch step so the commit is the last of its tempo and reveals with the freshest champion snapshot.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TEMPO_ALIGNED_EMIT` | `1` (ON) | Tempo-aligned weight commits. Set to `0`/`false`/`no` to restore the legacy wall-clock cadence (every `--epoch-seconds`, plus an immediate emit on each round activation). When the chain tempo state can't be queried, the gate falls back to exact legacy behavior automatically. |
+| `TEMPO_EMIT_LEAD_BLOCKS` | `20` | Size of the pre-step emit window in blocks (~4 min). The commit fires this many blocks before the tempo boundary. |
+
+`/health` reports the current `emit_schedule` (mode / active / tempo / next boundary); mode is `"wall_clock"` when tempo alignment is disabled or unavailable.
+
+### Deployment Benchmarking
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_ALL_DEPLOYMENT_CHAINS` | `0` (OFF) | **Consensus flag — must be fleet-uniform.** OFF keeps byte-identical Base-only benchmarking. When ON, submissions are benchmarked per-deployment-chain with per-chain fork pins; the setting folds into `benchmark_pack_hash`, so a mixed fleet computes different scores. Arm across the whole fleet at once or not at all (PR #621). |
+| `ETH_SIM_RPC_URL` | -- | Optional chain-1 (Ethereum) simulation fork URL used when deployment benchmarking spans Ethereum. |
+
+### Distributed Veto (Phase 0 — observe-only)
+
+Phase 0 of distributed veto is **observe-only soak instrumentation**. It never gates certification and never changes round status; it only measures what a future enforcement phase would do. Leave it OFF unless you are helping the subnet team collect soak data.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DISTRIBUTED_VETO` | `0` (OFF) | Master arm for the observe-only veto pass. Even when ON, Phase 0 cannot veto or gate anything (enforcement requires further code). When ON, `/health` surfaces the last few observe records under `distributed_veto`. |
+| `DISTRIBUTED_VETO_REVERIFY` | `0` (OFF) | Sub-flag: when on (and `DISTRIBUTED_VETO` is on), the leader fire-and-forget re-verifies dissents off the coordinator loop. Observe-only. |
 
 ### Chain Configuration
 

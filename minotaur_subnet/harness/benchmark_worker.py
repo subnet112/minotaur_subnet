@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import time
-from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -46,10 +44,6 @@ from minotaur_subnet.harness.orchestrator import (
     SolverTimeoutError,
     SolverCrashedError,
     run_benchmark,
-    benchmark_static_quote_enabled,
-    REFERENCE_QUOTE_FAILED_SENTINEL,
-    BENCHMARK_MIN_SLIPPAGE_BPS,
-    build_rpc_url_map,
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 from minotaur_subnet.epoch.relative_scoring import (
@@ -62,6 +56,24 @@ logger = logging.getLogger(__name__)
 # Genesis submission sentinel values
 GENESIS_REPO_URL = "builtin://baseline-swap-solver"
 GENESIS_EPOCH = 0
+
+
+class ExplicitOrderUnavailable(Exception):
+    """An explicit-order bench (veto slice / dissent re-verify / audit) cannot
+    faithfully rebuild a requested order on this node — REFUSED semantics.
+
+    The canonical corpus path silently skips unresolvable orders (every
+    validator derives the same set, so a skip is fleet-uniform); an EXPLICIT
+    list must not — a silently short slice benches less than it was asked to
+    and returns a vacuous OK. Callers surface this as REFUSED(reason), which
+    the veto protocol counts as ABSTAIN, never a round failure.
+    """
+
+    def __init__(self, order_id: str, reason: str):
+        self.order_id = order_id
+        self.reason = reason
+        super().__init__(f"{reason} (order {order_id})")
+
 GENESIS_SOLVER_IMAGE = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip()
 
 # Measurement-version tag for pre-refund metered gas rows (the GasMeter probe,
@@ -142,6 +154,26 @@ def log_gas_shadow(champ_rows: Any, chal_rows: Any, ctx: str = "") -> None:
                 f"{iid}:{cg if cg is not None else '-'}"
                 f"/{xg if xg is not None else '-'}"
             )
+        # Durable tee: container logs die with every recreate (three separate
+        # forensic gaps on 2026-07-07 alone), so the soak/monitoring signal is
+        # ALSO appended as JSONL on the persistent volume. Best-effort — an
+        # unwritable path must never break the benchmark path.
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            _dir = _Path(os.environ.get("APP_INTENTS_STORE_PATH", "/data/store.json")).parent
+            if _dir.is_dir():
+                with open(_dir / "gas_shadow.jsonl", "a") as _f:
+                    _f.write(_json.dumps({
+                        "ts": time.time(), "ctx": ctx or "-",
+                        "orders": len(joined), "champ_measured": champ_measured,
+                        "chal_measured": chal_measured, "measured_pairs": n_pairs,
+                        "champ_gas_total": champ_total, "chal_gas_total": chal_total,
+                        "per_order": per_order,
+                    }) + "\n")
+        except Exception:  # noqa: BLE001 — observability must never break benching
+            pass
         logger.info(
             "[gas-shadow] ctx=%s orders=%d champ_measured=%d chal_measured=%d "
             "measured_pairs=%d champ_gas_total=%d chal_gas_total=%d "
@@ -312,38 +344,6 @@ def _clear_champion_bench_cache() -> None:
     _CHAMPION_BENCH_CACHE.clear()
 
 
-def _refquote_checkpoint_enabled() -> bool:
-    """Whether the reference-quote pre-pass is checkpointed (memory + /data).
-
-    Default ON; ``BENCHMARK_REFQUOTE_CHECKPOINT=0`` disables (recompute every
-    pass — the pre-#496 behavior).
-    """
-    import os
-
-    return os.environ.get("BENCHMARK_REFQUOTE_CHECKPOINT", "1").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
-
-
-# PROCESS-WIDE reference-quote memo, same sharing rationale as the champion
-# memo above (fresh BenchmarkWorker instances must share it). Additionally
-# PERSISTED next to the submission store (/data) so an api restart resumes the
-# round with the SAME reference quotes instead of re-running the champion
-# pre-pass — both a rework saving (the pre-pass ran ~3x/round: once per
-# run_once pass as submissions trickle in, once per incumbent re-score) and a
-# within-round consistency improvement (every challenger in the round is graded
-# against ONE reference set, not whichever pass happened to produce it).
-_REFERENCE_QUOTES_CACHE: dict[str, dict] = {}
-_REFERENCE_QUOTES_CACHE_MAX = 8
-_REFQUOTE_CHECKPOINT_FILENAME = "refquote_checkpoints.json"
-_REFQUOTE_CHECKPOINT_KEEP = 4  # last N keys on disk (a round has 1; margin for overlap)
-
-
-def _clear_reference_quotes_cache() -> None:
-    """Reset the process-wide reference-quote memo (test hook)."""
-    _REFERENCE_QUOTES_CACHE.clear()
-
-
 class BenchmarkWorker:
     """Processes BENCHMARKING submissions by scoring them against active intents.
 
@@ -363,7 +363,7 @@ class BenchmarkWorker:
         genesis_solver_image: str | None = None,  # Docker image for genesis benchmarking
         simulator: Any = None,  # AnvilSimulator / MultiChainSimulator for real simulation
         require_real_sim: bool = False,  # fail-closed: refuse the mock fallback
-        pin_resolver: Any = None,  # Callable[[round_id], int|None] -> round-anchored fork block
+        pin_resolver: Any = None,  # Callable[[round_id], int | dict[int, int] | None] -> round-anchored fork pin(s)
         validator_identity: str | None = None,  # this validator's stable id (observability label)
     ) -> None:
         self._sub_store = submission_store
@@ -378,8 +378,15 @@ class BenchmarkWorker:
         self._simulator = simulator
         self._require_real_sim = require_real_sim
         # Injected by the API layer (keeps the harness free of API imports):
-        # round_id -> the round-anchored benchmark-chain fork block, or None.
+        # round_id -> the round-anchored fork pin(s): a {chain_id: block} map
+        # (preferred), a bare int for the primary anchor chain (legacy), or None.
         self._pin_resolver = pin_resolver
+        # Per-chain round-anchored fork pins ({chain_id: block}). None = legacy
+        # scalar-only mode: run_benchmark applies _epoch_block_number to every
+        # chain a plan routes to (unchanged Base-only behavior). Set whenever the
+        # resolver yields a map, so multi-chain rounds pin each chain at ITS OWN
+        # canonical block instead of leaking the Base height onto other forks.
+        self._fork_pins: dict[int, int] | None = None
         # Stable per-validator id (hotkey ss58) — observability label only; the
         # Stage-2 corpus is a single round-seeded SHARED draw for every validator
         # (#242), so it no longer seeds the sample.
@@ -402,9 +409,9 @@ class BenchmarkWorker:
 
     def _corpus_fingerprint(self, intents: list) -> str:
         """Stable hash of the corpus IDENTITY (ordered scenario labels), using the
-        same ``app_id[:scenario_name]`` labelling as the reference-quote pre-pass.
-        Guards the champion memo: a different corpus → different fingerprint → no
-        reuse. Robust to missing fields (label degrades to app_id)."""
+        same ``app_id[:scenario_name]`` labelling as ``run_benchmark``'s per-scenario
+        ``intent_label``. Guards the champion memo: a different corpus → different
+        fingerprint → no reuse. Robust to missing fields (label degrades to app_id)."""
         import hashlib
 
         labels = []
@@ -432,28 +439,6 @@ class BenchmarkWorker:
         parts = [f"{a}={self._loaded_js_hashes.get(a, '')}" for a in app_ids]
         return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
-    def _reference_quotes_fingerprint(
-        self,
-        reference_quotes: dict[str, dict[str, str]] | None,
-    ) -> str:
-        """Stable hash of the reference quote anchor used for a champion run.
-
-        Champion benchmark memoization is only valid when the quote anchor is the
-        same. A self-quoted champion run and a champion-reference-quoted run can
-        share the same round/image/fork/corpus/JS, but they are different scoring
-        computations and must not reuse one another.
-        """
-        if not reference_quotes:
-            return ""
-
-        parts: list[str] = []
-        for label in sorted(reference_quotes):
-            params = reference_quotes.get(label) or {}
-            parts.append(label)
-            for key in sorted(params):
-                parts.append(f"{key}={params[key]}")
-        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
-
     async def memo_champion_bench(
         self,
         *,
@@ -462,7 +447,6 @@ class BenchmarkWorker:
         fork_block: int | None,
         intents: list,
         require_real_sim: bool,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
         run: Any,
     ) -> list[BenchmarkResult]:
         """Run (or reuse) the champion benchmark for this round, via the PROCESS-WIDE
@@ -471,12 +455,11 @@ class BenchmarkWorker:
 
         ``run`` is the caller's own async benchmark thunk (it owns session setup +
         exception semantics). Returns the cached result ONLY on an exact key match —
-        round_id, image, fork_block, real-sim, corpus fingerprint, scoring-JS
-        fingerprint, AND reference-quote fingerprint — i.e. the identical
-        deterministic computation, so a follower's verdict and persisted score are
-        unchanged. Disabled (always recompute) when the flag is off, the key is
-        incomplete (no round_id/image), or fork_block is None — a None pin means
-        live-head (dev), where reuse across blocks is unsafe.
+        round_id, image, fork_block, real-sim, corpus fingerprint, AND scoring-JS
+        fingerprint — i.e. the identical deterministic computation, so a follower's
+        verdict and persisted score are unchanged. Disabled (always recompute) when
+        the flag is off, the key is incomplete (no round_id/image), or fork_block is
+        None — a None pin means live-head (dev), where reuse across blocks is unsafe.
         """
         if (
             not _consolidate_champion_bench()
@@ -487,7 +470,6 @@ class BenchmarkWorker:
             round_id, image, int(fork_block), bool(require_real_sim),
             self._corpus_fingerprint(intents),
             self._loaded_js_fingerprint(intents),
-            self._reference_quotes_fingerprint(reference_quotes),
         )
         hit = _CHAMPION_BENCH_CACHE.get(key)
         if hit is not None:
@@ -515,6 +497,24 @@ class BenchmarkWorker:
         a specific block for deterministic benchmarking.
         """
         self._epoch_block_number = block_number
+
+    def set_fork_pins(self, pins: dict[int, int] | None) -> None:
+        """Set the per-chain round-anchored fork pins ({chain_id: block}).
+
+        The primary anchor chain's pin also updates ``_epoch_block_number`` so
+        the scalar ``fork_block`` path (Base-only) is unchanged when no other
+        chain is pinned. ``None`` / empty clears the map (legacy scalar mode).
+        Called by the follower verification path (input parity with the leader),
+        mirroring how ``set_epoch_block`` sets the scalar.
+        """
+        if not pins:
+            self._fork_pins = None
+            return
+        self._fork_pins = dict(pins)
+        from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CHAINS
+        primary = ROUND_ANCHOR_CHAINS[0]
+        if primary in pins:
+            self._epoch_block_number = int(pins[primary])
 
     def _apply_epoch_block_pin(self) -> None:
         """DEV/TEST-ONLY manual fork pin via BENCHMARK_EPOCH_BLOCK.
@@ -592,6 +592,16 @@ class BenchmarkWorker:
                     f"round-anchored pin unavailable (deferred) for {round_id}"
                 )
             return
+        # The resolver may return either a per-chain {chain_id: block} map
+        # (multi-chain rounds) or a bare int for the primary anchor chain
+        # (legacy Base-only). set_fork_pins handles the map (and updates the
+        # scalar for the primary chain); a bare int keeps the scalar-only path.
+        if isinstance(pin, dict):
+            self.set_fork_pins(pin)
+            logger.info("[fork-pin] benchmark pinned per-chain %s (round-anchored, %s)",
+                        {c: int(b) for c, b in pin.items()}, round_id)
+            return
+        self._fork_pins = None
         if int(pin) != self._epoch_block_number:
             self.set_epoch_block(int(pin))
             logger.info("[fork-pin] benchmark pinned to Base block %d (round-anchored, %s)",
@@ -629,6 +639,116 @@ class BenchmarkWorker:
         if current.status in (RoundStatus.CLOSED, RoundStatus.REPLAYING):
             return current
         return None
+
+    def _recorded_benched_slate(self, round_id: str) -> list[str] | None:
+        """The round's RECORDED rotation slate (``RoundState.benched_slate``),
+        or ``None`` when unavailable (no round store, round not found, field
+        unset on a pre-field / rotation-disabled round). The caller falls back
+        to recomputation only on ``None``."""
+        if self._round_store is None:
+            return None
+        try:
+            state = self._round_store.get_round(round_id)
+        except Exception:  # noqa: BLE001 — belt must never break the pass
+            return None
+        slate = getattr(state, "benched_slate", None) if state is not None else None
+        return list(slate) if slate is not None else None
+
+    def _cap_to_rotation_slate(self, benchmarking: list, round_id: str) -> list:
+        """BELT for the rotation slate width: never bench a closed round past
+        ``SOLVER_ROUND_MAX_SUBMISSIONS``.
+
+        After rotation runs at close, every non-slate submission is REJECTED —
+        so normally at most ``slots`` submissions are BENCHMARKING here and
+        this is a no-op. If the close-time reject sweep was truncated (the api
+        process killed mid-close — observed live 2026-07-07, round-e29724243-n1:
+        12 of 19 overflow rejects landed and the round benched 10 submissions
+        on 3 slots), the un-rejected overflow is still BENCHMARKING. Cap the
+        pass at the slate width.
+
+        SOURCE OF TRUTH: the round's RECORDED ``benched_slate``
+        (``apply_rotation_slate`` writes it at close). Reading the recorded
+        slate — instead of RECOMPUTING the rotation here — fixes the
+        double-bench race: rotation advances the ledger (``mark_selected``) at
+        close, so a belt that recomputed ``select_rotation_slate`` against that
+        already-advanced ledger picked a DISJOINT slate and benched a second
+        trio (2026-07-08, round-e29724975-n1: rotation selected {A,B,C}, the
+        belt recomputed {D,B,C} and D scored too → 4 on 3 slots). Recomputation
+        survives ONLY as the fallback for rounds with no recorded slate (closed
+        before this field existed, or rotation genuinely never ran).
+        """
+        from minotaur_subnet.harness.rotation import (
+            RotationLedger,
+            rotation_ledger_path,
+            select_rotation_slate,
+        )
+
+        slots = _rotation_slate_slots()
+        if slots <= 0 or len(benchmarking) <= slots:
+            return benchmarking
+
+        # ── Preferred path: the RECORDED slate (single source of truth) ──────
+        recorded = self._recorded_benched_slate(round_id)
+        if recorded is not None:
+            slate_ids = set(recorded)
+            kept = [s for s in benchmarking if s.submission_id in slate_ids]
+            dropped = [s for s in benchmarking if s.submission_id not in slate_ids]
+            if dropped:
+                logger.warning(
+                    "[benchmark] round %s: %d BENCHMARKING submission(s) are "
+                    "not on the recorded rotation slate %s — benching only the "
+                    "slate (close-time reject sweep truncated). kept=%s "
+                    "not-benched=%s",
+                    round_id, len(dropped), sorted(slate_ids),
+                    [s.submission_id for s in kept],
+                    [s.submission_id for s in dropped],
+                )
+            return kept
+
+        # ── Fallback: recompute (no recorded slate — pre-field / rotation
+        # never ran). Kept for those rounds only; the recorded path above is
+        # race-free.
+        # The slate is a per-ROUND budget, not per-pass: select it over every
+        # submission of the round that occupies (or already consumed) a slate
+        # slot, so a slate member that got benched — SCORED, or benched-and-
+        # validity-REJECTED (it has benchmark_details) — keeps holding its slot
+        # and the overflow can never trickle in `slots`-sized bites across
+        # passes. Excluded: ADOPTED (an old round's incumbent, never a mid-round
+        # state) and rejects WITHOUT bench details (rotation/screening rejects —
+        # they never occupied a slot; this mirrors rotation's candidate filter).
+        def _occupies_slot(s: Any) -> bool:
+            st = str(getattr(getattr(s, "status", None), "value", None)
+                     or getattr(s, "status", "") or "")
+            if st == "adopted":
+                return False
+            if st == "rejected":
+                return bool(getattr(s, "benchmark_details", None))
+            return True
+
+        try:
+            round_subs = self._sub_store.list_by_round(round_id)
+        except Exception:  # noqa: BLE001 — belt must never break the pass
+            round_subs = list(benchmarking)
+        live = [s for s in round_subs if _occupies_slot(s)]
+        if len(live) <= slots:
+            return benchmarking
+        last_selected = RotationLedger(rotation_ledger_path()).load()
+        slate, _ = select_rotation_slate(live, slots, last_selected, round_id)
+        slate_ids = {s.submission_id for s in slate}
+        kept = [s for s in benchmarking if s.submission_id in slate_ids]
+        dropped = [s for s in benchmarking if s.submission_id not in slate_ids]
+        if dropped:
+            logger.warning(
+                "[benchmark] round %s has %d live submissions but the rotation "
+                "slate is %d — the close-time reject sweep must have been "
+                "truncated (or rotation never ran). Benching only the slate: "
+                "kept=%s not-benched=%s (the overflow stays un-benched; this "
+                "belt does not reject it).",
+                round_id, len(live), slots,
+                [s.submission_id for s in kept],
+                [s.submission_id for s in dropped],
+            )
+        return kept
 
     async def run_once(self) -> int:
         """Process all BENCHMARKING submissions in a single pass.
@@ -696,6 +816,12 @@ class BenchmarkWorker:
                 sub for sub in benchmarking
                 if sub.round_id == replay_round.round_id
             ]
+            # BELT: a CLOSED/REPLAYING round must never bench past the
+            # rotation slate, even when the close-time reject sweep was
+            # truncated (see _cap_to_rotation_slate).
+            benchmarking = self._cap_to_rotation_slate(
+                benchmarking, replay_round.round_id,
+            )
         elif self._round_store is not None:
             current_round = self._round_store.get_current_round()
             if current_round is not None:
@@ -785,14 +911,25 @@ class BenchmarkWorker:
                 except Exception as exc:
                     logger.warning("Failed to load historical scenarios: %s", exc)
 
-        # Champion quote pre-pass: anchor each scenario's on-chain quote params
-        # (CoW quoted_output etc.) to the champion solver so every challenger is
-        # graded against the same reference output. Falls back to per-submission
-        # self-quoting when no champion is available (still fixes the revert).
-        reference_quotes = await self._get_or_build_reference_quotes(intents)
-
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
+            # FRESH-STATUS GUARD: ``benchmarking`` is a snapshot; rotation at
+            # round close terminally rejects the slate overflow "regardless of
+            # benchmark progress" (and purges its private token), and a restart
+            # can re-queue an orphaned round mid-pass. Re-fetch and skip any
+            # submission that is no longer BENCHMARKING — benching a rejected
+            # sub wastes ~1-2 min of serialized sim time on a structurally dead
+            # entry (the store's no-resurrection guard would refuse the SCORED
+            # flip anyway; this saves the compute).
+            fresh = self._sub_store.get(sub.submission_id)
+            if fresh is None or fresh.status != SubmissionStatus.BENCHMARKING:
+                logger.info(
+                    "Skipping %s: status changed to %s since queue snapshot "
+                    "(rotation/restart) — not benching",
+                    sub.submission_id,
+                    getattr(getattr(fresh, "status", None), "value", "gone"),
+                )
+                continue
             # Skip already-benchmarked submissions (may appear in BENCHMARKING
             # from a previous pass that benched then persisted). "Already
             # benchmarked" = it delivered value on >= 1 order (the validity gate).
@@ -809,6 +946,7 @@ class BenchmarkWorker:
                             "Subprocess benchmarking is disabled by policy. "
                             "Use signed git/docker submissions."
                         ),
+                        outcome_code="benchmark_failed",
                     )
                     logger.warning(
                         "Rejected %s: subprocess benchmarking disabled by policy",
@@ -825,7 +963,6 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_solver_path(
                         sub.solver_path, intents, score_fn,
-                        reference_quotes=reference_quotes,
                     )
                     details = self._results_to_details(results)
                     valid = has_delivered_value_rows(details["per_intent"])
@@ -857,7 +994,6 @@ class BenchmarkWorker:
                 try:
                     results = await self._benchmark_submission(
                         sub.image_tag, intents, score_fn,
-                        reference_quotes=reference_quotes,
                     )
                     print(f"[BENCHMARK] Docker benchmark returned {len(results)} results", flush=True)
                     for r in results[:3]:
@@ -895,6 +1031,7 @@ class BenchmarkWorker:
                 self._sub_store.reject(
                     sub.submission_id,
                     "No solver_path or image_tag available for benchmarking",
+                    outcome_code="benchmark_failed",
                 )
 
         # Transition SOLVING → SOLVED for apps that got a positive score
@@ -914,8 +1051,8 @@ class BenchmarkWorker:
         Mirrors ``run_once``'s per-submission setup: applies the SAME epoch/round
         fork-pin a real challenger gets (the incumbent re-score historically did NOT
         apply the round-anchored pin), builds the same flat intents corpus (synthetic
-        ∪ the round's historical order draw) and the same champion reference-quote
-        anchor, then runs the same ``_benchmark_submission`` / ``_results_to_details``.
+        ∪ the round's historical order draw), then runs the same
+        ``_benchmark_submission`` / ``_results_to_details``.
         Nothing is persisted or made adoption-eligible here — the caller decides what
         to do with the returned ``details`` (whose ``per_intent[*].raw_output`` rows
         are what the relative rule consumes).
@@ -948,12 +1085,8 @@ class BenchmarkWorker:
                         intents.extend(historical)
                 except Exception as exc:
                     logger.warning("[%s] historical load failed: %s", context, exc)
-        reference_quotes = await self._get_or_build_reference_quotes(intents)
-
         logger.info("[%s] scoring image %s via challenger path (%d intents)", context, image_tag, len(intents))
-        results = await self._benchmark_submission(
-            image_tag, intents, score_fn, reference_quotes=reference_quotes,
-        )
+        results = await self._benchmark_submission(image_tag, intents, score_fn)
         details = self._results_to_details(results)
         # DISPLAY/logging only — the authoritative payload is `details`
         # (per_intent raw_output rows). Adoption/ranking never read this count.
@@ -983,7 +1116,6 @@ class BenchmarkWorker:
         image_tag: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against one submission's Docker image."""
         orch = SolverOrchestrator()
@@ -1005,8 +1137,8 @@ class BenchmarkWorker:
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
+                fork_blocks=self._fork_pins,
                 require_real_sim=self._require_real_sim,
-                reference_quotes=reference_quotes,
                 session_factory=lambda: orch.start_docker(image_tag),
             )
             return results
@@ -1018,7 +1150,6 @@ class BenchmarkWorker:
         solver_path: str,
         intents: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]],
         score_fn: Any,
-        reference_quotes: dict[str, dict[str, str]] | None = None,
     ) -> list[BenchmarkResult]:
         """Run the benchmark harness against a local solver file (subprocess mode)."""
         orch = SolverOrchestrator()
@@ -1030,8 +1161,8 @@ class BenchmarkWorker:
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
+                fork_blocks=self._fork_pins,
                 require_real_sim=self._require_real_sim,
-                reference_quotes=reference_quotes,
                 session_factory=lambda: orch.start_subprocess(solver_path),
             )
             return results
@@ -1241,6 +1372,28 @@ class BenchmarkWorker:
         from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
         return build_synthetic_snapshot(chain_id)
 
+    def _benchmark_deployments_for_app(self, app_id: str) -> list[Any]:
+        """The deployment(s) of ``app_id`` to benchmark this round.
+
+        Default: the single primary (order-ready-preferred) deployment —
+        ``get_deployment`` — so Base-only behavior is byte-identical. When
+        ``BENCHMARK_ALL_DEPLOYMENT_CHAINS`` is armed: EVERY per-chain deployment,
+        so an app deployed on Base AND Ethereum gets each chain's scenarios
+        benchmarked (and each chain can independently transition SOLVING→SOLVED).
+
+        The old chain-less ``get_deployment`` is exactly why a second-chain
+        deployment could never be promoted: it prefers the already-order-ready
+        chain, so the SOLVING one on another chain was never seen by
+        ``_transition_solving_apps``.
+        """
+        from minotaur_subnet.consensus.round_anchor import (
+            benchmark_all_deployment_chains_enabled,
+        )
+        if benchmark_all_deployment_chains_enabled():
+            return list(self._app_store.get_deployments(app_id).values())
+        dep = self._app_store.get_deployment(app_id)
+        return [dep] if dep is not None else []
+
     def _load_benchmark_intents(
         self,
         *,
@@ -1248,7 +1401,10 @@ class BenchmarkWorker:
     ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
         """Load active intents from the app store for benchmarking.
 
-        Returns (intent_definition, state, snapshot) tuples.
+        Returns (intent_definition, state, snapshot) tuples — one per
+        (app, benchmarked-deployment). With ``BENCHMARK_ALL_DEPLOYMENT_CHAINS``
+        off this is one per app (the primary deployment, unchanged); on, it is
+        one per operational per-chain deployment.
         """
         if self._app_store is None:
             # Fallback: use synthetic intents for testing/MVP
@@ -1257,42 +1413,42 @@ class BenchmarkWorker:
 
         intents = []
         for app in self._app_store.list_apps():
-            deployment = self._app_store.get_deployment(app.app_id)
-            if deployment is None:
-                continue
-            if not deployment.status.is_operational():
-                continue
-            if (
-                deployment_statuses is not None
-                and deployment.status not in deployment_statuses
-            ):
-                continue
+            for deployment in self._benchmark_deployments_for_app(app.app_id):
+                if deployment is None:
+                    continue
+                if not deployment.status.is_operational():
+                    continue
+                if (
+                    deployment_statuses is not None
+                    and deployment.status not in deployment_statuses
+                ):
+                    continue
 
-            chain_id = deployment.chain_id or 1
-            state = IntentState(
-                contract_address=deployment.contract_address or "",
-                chain_id=chain_id,
-                nonce=0,
-                owner="",
-            )
+                chain_id = deployment.chain_id or 1
+                state = IntentState(
+                    contract_address=deployment.contract_address or "",
+                    chain_id=chain_id,
+                    nonce=0,
+                    owner="",
+                )
 
-            # Use _build_snapshot (async) — but we're in a sync method.
-            # Build snapshot synchronously via event loop for compatibility.
-            try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're already in an async context — use synthetic fallback
-                    # (the async caller should use _build_snapshot directly)
+                # Use _build_snapshot (async) — but we're in a sync method.
+                # Build snapshot synchronously via event loop for compatibility.
+                try:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # We're already in an async context — use synthetic fallback
+                        # (the async caller should use _build_snapshot directly)
+                        from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+                        snapshot = build_synthetic_snapshot(chain_id)
+                    else:
+                        snapshot = loop.run_until_complete(self._build_snapshot(chain_id))
+                except Exception:
                     from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
                     snapshot = build_synthetic_snapshot(chain_id)
-                else:
-                    snapshot = loop.run_until_complete(self._build_snapshot(chain_id))
-            except Exception:
-                from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-                snapshot = build_synthetic_snapshot(chain_id)
 
-            intents.append((app, state, snapshot))
+                intents.append((app, state, snapshot))
 
         return intents
 
@@ -1365,52 +1521,133 @@ class BenchmarkWorker:
         if not sampled:
             return []
 
-        # Group sampled orders by app_id to reuse AppIntentDefinition + snapshot
+        # Canonical corpus path: unresolvable orders are SKIPPED (fleet-uniform —
+        # every validator derives the same set, so a skip is symmetric).
         apps_by_id = {app.app_id: app for app in self._app_store.list_apps()}
         snapshots_by_chain: dict[int, MarketSnapshot] = {}
 
         scenarios: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
         for order in sampled:
-            app_id = order.get("app_id")
-            chain_id = order.get("chain_id")
-            if not app_id or chain_id is None:
-                continue
-            app_def = apps_by_id.get(app_id)
-            if app_def is None:
-                continue
-            deployment = self._app_store.get_deployment(app_id)
-            contract_address = deployment.contract_address if deployment else ""
-
-            # Snapshot per chain (cached). Use synthetic snapshot here —
-            # the solver re-queries live pool state via RPC anyway.
-            if chain_id not in snapshots_by_chain:
-                from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
-                snapshots_by_chain[chain_id] = build_synthetic_snapshot(chain_id)
-            snapshot = snapshots_by_chain[chain_id]
-
-            # Build IntentState from the historical order's params
-            state = IntentState(
-                contract_address=contract_address,
-                chain_id=chain_id,
-                nonce=0,
-                owner="",
-                raw_params=dict(order.get("params", {})),
-                control={
-                    # hist: prefix is the per-order JOIN id the relative rule keys
-                    # on, NOT a stage marker — benchmarking is one flat set now.
-                    "_scenario_name": f"hist:{order.get('order_id', '?')}",
-                    "_intent_function": order.get("intent_function", "swap"),
-                    "_original_block_number": order.get("block_number"),
-                    "_original_tx_hash": order.get("tx_hash"),
-                },
-            )
-            scenarios.append((app_def, state, snapshot))
+            scenario = self._order_to_scenario(order, apps_by_id, snapshots_by_chain)
+            if scenario is not None:
+                scenarios.append(scenario)
 
         logger.info(
             "Loaded %d historical scenarios for round %s",
             len(scenarios), round_id,
         )
         return scenarios
+
+    def _order_to_scenario(
+        self,
+        order: dict,
+        apps_by_id: dict,
+        snapshots_by_chain: dict[int, MarketSnapshot],
+    ) -> tuple[AppIntentDefinition, IntentState, MarketSnapshot] | None:
+        """Build ONE (app_def, IntentState, snapshot) replay tuple from an order
+        record — the shared builder for the canonical historical draw AND the
+        explicit-order benches (veto slices / re-verify / audits). Returns None
+        when the order cannot be rebuilt here (missing app_id/chain/app record);
+        callers decide skip-vs-refuse."""
+        app_id = order.get("app_id")
+        chain_id = order.get("chain_id")
+        if not app_id or chain_id is None:
+            return None
+        app_def = apps_by_id.get(app_id)
+        if app_def is None:
+            return None
+        deployment = self._app_store.get_deployment(app_id)
+        contract_address = deployment.contract_address if deployment else ""
+
+        # Snapshot per chain (cached). Use synthetic snapshot here —
+        # the solver re-queries live pool state via RPC anyway.
+        if chain_id not in snapshots_by_chain:
+            from minotaur_subnet.harness.snapshot import build_synthetic_snapshot
+            snapshots_by_chain[chain_id] = build_synthetic_snapshot(chain_id)
+        snapshot = snapshots_by_chain[chain_id]
+
+        # Build IntentState from the historical order's params
+        state = IntentState(
+            contract_address=contract_address,
+            chain_id=chain_id,
+            nonce=0,
+            owner="",
+            raw_params=dict(order.get("params", {})),
+            control={
+                # hist: prefix is the per-order JOIN id the relative rule keys
+                # on, NOT a stage marker — benchmarking is one flat set now.
+                "_scenario_name": f"hist:{order.get('order_id', '?')}",
+                "_intent_function": order.get("intent_function", "swap"),
+                "_original_block_number": order.get("block_number"),
+                "_original_tx_hash": order.get("tx_hash"),
+            },
+        )
+        return (app_def, state, snapshot)
+
+    def build_explicit_scenarios(
+        self,
+        orders: list[dict],
+    ) -> list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]]:
+        """STRICT scenario building for an EXPLICIT order list (veto slices,
+        dissent re-verification, audits — distributed-veto Phase 0).
+
+        Unlike the canonical draw, any unresolvable order raises
+        :class:`ExplicitOrderUnavailable` (REFUSED semantics): a silently short
+        slice would bench less than assigned and return a vacuous OK, which is
+        exactly the failure the veto protocol's REFUSED/abstain path exists to
+        make loud."""
+        if self._app_store is None:
+            raise ExplicitOrderUnavailable("<all>", "no app store on this node")
+        apps_by_id = {app.app_id: app for app in self._app_store.list_apps()}
+        snapshots_by_chain: dict[int, MarketSnapshot] = {}
+
+        scenarios: list[tuple[AppIntentDefinition, IntentState, MarketSnapshot]] = []
+        for order in orders:
+            order_id = str(order.get("order_id", "?"))
+            app_id = order.get("app_id")
+            chain_id = order.get("chain_id")
+            if not app_id or chain_id is None:
+                raise ExplicitOrderUnavailable(order_id, "order lacks app_id/chain_id")
+            if app_id not in apps_by_id:
+                raise ExplicitOrderUnavailable(order_id, f"missing_app:{app_id}")
+            try:
+                scenario = self._order_to_scenario(
+                    order, apps_by_id, snapshots_by_chain,
+                )
+            except ExplicitOrderUnavailable:
+                raise
+            except Exception as exc:  # e.g. params=None → dict(None) TypeError
+                raise ExplicitOrderUnavailable(order_id, f"unbuildable: {exc}")
+            if scenario is None:
+                raise ExplicitOrderUnavailable(order_id, "unbuildable order record")
+            scenarios.append(scenario)
+        return scenarios
+
+    async def benchmark_explicit_orders(
+        self,
+        image_tag: str,
+        orders: list[dict],
+    ) -> list[BenchmarkResult]:
+        """Bench ONE image over an EXPLICIT order list at this worker's pins —
+        the distributed-veto primitive (follower slice bench; leader dissent
+        re-verify; audits). Strict: raises :class:`ExplicitOrderUnavailable`
+        when any order cannot be faithfully rebuilt (callers answer REFUSED).
+
+        Pins are the caller's responsibility: wire-layer callers must have
+        applied the ASSIGNMENT's fork pins to this worker before calling —
+        never a live-head fallback (an unpinned bench produces unconfirmable
+        claims and honest-validator strikes)."""
+        if not orders:
+            raise ExplicitOrderUnavailable("<all>", "empty order list")
+        if self._use_docker and self._simulator is None:
+            # Fail-closed regardless of the per-validator BENCHMARK_REQUIRE_
+            # REAL_SIM env: a mock-sim slice bench fabricates rows → false veto
+            # claims → discarded veto + an honest-validator strike. REFUSED is
+            # the correct answer when no real simulator is wired.
+            raise ExplicitOrderUnavailable("<all>", "no real simulator wired")
+        scenarios = self.build_explicit_scenarios(orders)
+        score_fn = await self._build_score_fn(scenarios)
+        return await self._benchmark_submission(image_tag, scenarios, score_fn)
 
     def _has_solving_apps(self) -> bool:
         """Check if any deployed apps are operational (SOLVING/SOLVED/ACTIVE)."""
@@ -1662,13 +1899,6 @@ class BenchmarkWorker:
         _require_real_sim = require_real_sim_default()
         cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
 
-        # Champion-anchored bar: grade BOTH the reference champion and the
-        # challenger against the SHADOW champion's OWN quote (one shared floor,
-        # ~0.5% slippage), with the champion->challenger self-quote fallback when
-        # the champion can't quote a scenario. Without this both would self-quote
-        # and tie — the saturation the product owner flagged.
-        reference_quotes = await self._build_reference_quotes(intents, image_tag=champ_image)
-
         async def _bench(image: str) -> list[BenchmarkResult]:
             orch = SolverOrchestrator()
             sess = await orch.start_docker(image)
@@ -1677,7 +1907,6 @@ class BenchmarkWorker:
                     sess, intents, config=cfg, score_fn=score_fn,
                     simulator=self._simulator, require_real_sim=_require_real_sim,
                     fork_block=self._epoch_block_number,
-                    reference_quotes=reference_quotes,
                     session_factory=lambda: orch.start_docker(image),
                 )
             finally:
@@ -1808,10 +2037,14 @@ class BenchmarkWorker:
         or the build produced an EMPTY result (champion session failed to start:
         transient, must retry next pass, never freeze for the round).
 
-        STATIC-quote mode (``BENCHMARK_STATIC_QUOTE=1``): the pre-pass is
-        skipped entirely — the enrichment injects a static zero quote instead
-        of anchoring on the champion's, so computing champion reference quotes
-        (~30 champion-session quotes/round) would be wasted work. Returns {}.
+        STATIC-quote mode (the DEFAULT; opt out with
+        ``BENCHMARK_STATIC_QUOTE=0``): the pre-pass is skipped entirely — the
+        enrichment injects a static zero quote instead of anchoring on the
+        champion's, so computing champion reference quotes (~30
+        champion-session quotes/round) would be wasted work. Returns {}.
+        Every benchmark path MUST obtain reference quotes through THIS getter,
+        never `_build_reference_quotes` directly, or it silently benches under
+        a different quote regime than the fleet's scoring definition.
         """
         if benchmark_static_quote_enabled():
             return {}
@@ -1947,7 +2180,15 @@ class BenchmarkWorker:
             # moved to the proxy, the champion pre-pass kept the raw-anvil wiring.
             fork_block = self._epoch_block_number
             if _read_proxy is not None and fork_block is not None and rpc_map:
-                pin_blocks = build_pin_blocks(_read_proxy, rpc_map, fork_block)
+                # Per-chain pins (multi-chain round) so the champion quotes each
+                # chain at ITS OWN block — same map the challenger benchmark uses,
+                # so both are graded against identical pinned state. A missing
+                # per-chain pin raises ValueError (build_pin_blocks); surface it
+                # rather than pin one chain at another's block.
+                pin_blocks = build_pin_blocks(
+                    _read_proxy, rpc_map,
+                    self._fork_pins if self._fork_pins else fork_block,
+                )
                 if pin_blocks:
                     _proxy_session_id = f"refquote-{id(session):x}-{fork_block}"
                     await open_session(_read_proxy, _proxy_session_id, pin_blocks)
@@ -2091,30 +2332,35 @@ class BenchmarkWorker:
             )
             return 1
 
-        app_best: dict[str, float] = {}
+        # Best score per (app_id, chain_id) so each per-chain SOLVING deployment
+        # promotes independently (mirrors _transition_solving_apps).
+        app_chain_best: dict[tuple[str, int | None], float] = {}
         for result in results:
             bare_app_id = (
                 result.intent_id.split(":")[0]
                 if ":" in result.intent_id
                 else result.intent_id
             )
-            if result.score > app_best.get(bare_app_id, 0.0):
-                app_best[bare_app_id] = result.score
+            key = (bare_app_id, getattr(result, "chain_id", None))
+            if result.score > app_chain_best.get(key, 0.0):
+                app_chain_best[key] = result.score
 
         transitioned = 0
-        for app_id, best_score in app_best.items():
+        for (app_id, cid), best_score in app_chain_best.items():
             if best_score <= 0:
                 continue
-            dep = self._app_store.get_deployment(app_id)
+            dep = self._app_store.get_deployment(
+                app_id, chain_id=cid if cid is not None else None,
+            )
             if dep is not None and dep.status == AppStatus.SOLVING:
                 self._app_store.update_deployment_status(
                     app_id, dep.chain_id, AppStatus.SOLVED,
                 )
                 transitioned += 1
                 logger.info(
-                    "Champion bootstrap: app %s transitioned SOLVING -> SOLVED (best_score=%.4f)",
-                    app_id,
-                    best_score,
+                    "Champion bootstrap: app %s (chain %s) transitioned SOLVING -> "
+                    "SOLVED (best_score=%.4f)",
+                    app_id, dep.chain_id, best_score,
                 )
 
         return 1 if results or transitioned else 0
@@ -2189,6 +2435,11 @@ class BenchmarkWorker:
                 "revert_trace": getattr(r, "revert_trace", None),
                 "has_plan": r.plan is not None,
                 "mock_simulation": getattr(r, "mock_simulation", False),
+                # Chain the scenario ran on — lets the per-chain SOLVING→SOLVED
+                # transition promote the correct deployment when an app is
+                # deployed on more than one chain. None on legacy rows / single
+                # -chain apps (transition falls back to the primary deployment).
+                "chain_id": getattr(r, "chain_id", None),
             }
             # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
             # tag — ADDITIVE keys, present ONLY when the probe measured this
@@ -2209,18 +2460,23 @@ class BenchmarkWorker:
         }
 
     def _transition_solving_apps(self, submissions: list) -> None:
-        """Transition SOLVING → SOLVED for apps proven by benchmark results.
+        """Transition SOLVING → SOLVED for deployments proven by benchmark results.
 
-        After benchmarking, check per-app scores in the best submission's
-        details. If any SOLVING app scored > 0 on any scenario, transition it.
+        After benchmarking, check per-scenario scores in the submissions'
+        details. A deployment transitions when ANY scenario for its (app, chain)
+        scored > 0. Keyed per (app_id, chain_id) — NOT per app — so an app
+        deployed on multiple chains promotes each chain independently as its
+        scenarios pass (the chain-less lookup used to promote only the primary,
+        order-ready deployment and leave a second chain stuck SOLVING forever).
         """
         if self._app_store is None:
             return
 
         from minotaur_subnet.shared.types import AppStatus
 
-        # Collect the best per-app scores across all submissions
-        app_best: dict[str, float] = {}
+        # Best score per (app_id, chain_id). chain_id None (legacy/single-chain
+        # rows) folds into the app's primary deployment via get_deployment below.
+        app_chain_best: dict[tuple[str, int | None], float] = {}
         for sub in submissions:
             refreshed = self._sub_store.get(sub.submission_id)
             if refreshed is None or not refreshed.benchmark_details:
@@ -2228,24 +2484,31 @@ class BenchmarkWorker:
             per_intent = refreshed.benchmark_details.get("per_intent", [])
             for entry in per_intent:
                 aid = entry.get("intent_id", "")
+                if not aid:
+                    continue
+                bare_app_id = aid.split(":")[0] if ":" in aid else aid
+                cid = entry.get("chain_id")
                 sc = entry.get("score", 0.0)
-                if aid and sc > app_best.get(aid, 0.0):
-                    app_best[aid] = sc
+                key = (bare_app_id, cid)
+                if sc > app_chain_best.get(key, 0.0):
+                    app_chain_best[key] = sc
 
-        # Transition SOLVING apps that scored > 0
-        for app_id, best_sc in app_best.items():
+        # Transition each proven (app, chain) SOLVING deployment.
+        for (bare_app_id, cid), best_sc in app_chain_best.items():
             if best_sc <= 0:
                 continue
-            # Strip scenario suffix (e.g., "app_xxx:WETH_to_USDC" → "app_xxx")
-            bare_app_id = app_id.split(":")[0] if ":" in app_id else app_id
-            dep = self._app_store.get_deployment(bare_app_id)
+            # cid None (legacy rows) → the app's primary deployment; else the
+            # specific per-chain deployment.
+            dep = self._app_store.get_deployment(
+                bare_app_id, chain_id=cid if cid is not None else None,
+            )
             if dep and dep.status == AppStatus.SOLVING:
                 self._app_store.update_deployment_status(
                     bare_app_id, dep.chain_id, AppStatus.SOLVED,
                 )
                 logger.info(
-                    "App %s transitioned SOLVING → SOLVED (best_score=%.4f)",
-                    bare_app_id, best_sc,
+                    "App %s (chain %s) transitioned SOLVING → SOLVED (best_score=%.4f)",
+                    bare_app_id, dep.chain_id, best_sc,
                 )
 
     def _rank_scored_submissions(

@@ -26,7 +26,7 @@
 
 ## Overview
 
-Miners on Minotaur compete by writing the best **Solving Engine** — code that generates optimal execution plans for App Intents. The Solving Engine is a single engine that handles all Apps across the entire network. Validators run the winning solver in sandboxed Docker containers, benchmark it against active intents, and adopt a challenger that **delivers strictly more than the current champion** (see [Benchmarking](#benchmarking)).
+Miners on Minotaur compete by writing the best **Solving Engine** — code that generates optimal execution plans for App Intents. The Solving Engine is a single engine that handles all Apps across the entire network. Validators run the winning solver in sandboxed Docker containers, benchmark it against active intents, and adopt a challenger that is **net better than the current champion** on delivered output — or, on a fully-matched tie, cheaper/cleaner on the tie-break ladder (see [Benchmarking](#benchmarking)).
 
 The competition surface is the `IntentSolver` abstract base class. Miners extend it, package their code in a Docker image, and submit it. Validators screen the submission (3 stages), benchmark it against the current champion, and adopt it if it scores better.
 
@@ -435,22 +435,27 @@ After passing screening, solvers enter the benchmarking phase where they compete
 - The **champion** is the currently active solver used for live order processing
 - A new submission is the **challenger**
 - Both are benchmarked against the same set of active intents
-- Scoring is **relative (reference-bar)**: the challenger is compared to the champion **per order**, not by an absolute number. The champion is the baseline — it has no score of its own.
+- Scoring is **relative and per-order**: the challenger is compared to the champion order by order, not by an absolute number. The champion is the baseline — it has no score of its own.
 
-### Relative (reference-bar) scoring
+### Relative, per-order scoring
 
-There is no absolute 0–1 score and no fixed percentage margin. For every order in the benchmark set the challenger's result is compared to the champion's at the **same block pin**:
+There is no absolute 0–1 score. For every order in the benchmark set the challenger's result is compared to the champion's at the **same block pin**:
 
 | Per-order outcome | Meaning |
 |-------------------|---------|
 | `win` | challenger delivered **more** (beyond the ±0.1% / 10 bps tie band) |
-| `regression` | challenger delivered **less** (beyond the band) |
+| `regression` | challenger delivered **less** (beyond the band; tolerated only within the 1% floor) |
 | `matched` | within the ±0.1% band (effectively tied) |
 | `blind_spot_cover` | champion can't serve this order at all; the challenger can (counts as a win) |
-| `dropped` | champion serves it; the challenger produced nothing (counts as a regression) |
+| `dropped` | champion serves it; the challenger produced nothing (a hard veto) |
 | `skip` | neither side produced comparable output |
 
-The challenger **dethrones** the champion only with **zero regressions/drops and at least one strict win or blind-spot cover** (verdict `dethrone`). Matching everywhere is rejected (`matched`); any regression makes it `behind`. The comparison is exact-integer (cross-multiplied wei), so the verdict is identical on every validator.
+Adoption resolves a fixed ladder (exact-integer, cross-multiplied wei — so the verdict is identical on every validator):
+
+1. **Output (primary).** Dethrone if net better on breadth: `(wins + blind_spot_covers) − regressions ≥ 1`. A challenger **may** regress some orders and still win, provided each regression stays within the **1% hard floor** and its wins outnumber its regressions by at least one. (This replaces the older "any regression = reject / matching everywhere rejected" rule.)
+2. **Tie-breaks (fully-matched, saturated tie only):** cheaper total metered (pre-refund) gas (≥200 bps), then smaller worst AST region `max_region_nodes` (by ≥100), then less dead code `unproductive_nodes` (by ≥2000). Armed, but each fires only once both champion and challenger carry the metric.
+
+**Hard vetoes** override every rung: no order may be cut by more than 1%, and the challenger may not drop any order the champion serves. The verdict dict carries `adopt_via` (`performance`/`gas`/`factorization`/`deadwood`).
 
 ### Scoring Pipeline
 

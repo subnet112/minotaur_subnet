@@ -131,7 +131,7 @@ Discovery requires four things to line up. Check each in order:
 
 **Symptom**: Validator runs but never emits weights on-chain.
 
-- Weights are emitted once per epoch (default: 60 seconds, configurable via `--epoch-seconds`).
+- Weight *commits* are now **tempo-aligned** (PR #524): they fire in a short window (`TEMPO_EMIT_LEAD_BLOCKS`, default 20 blocks) just before each tempo epoch step, not every `--epoch-seconds`. This is expected — do not read "no commit this minute" as a fault. Check `/health` → `emit_schedule` for the mode and next boundary.
 - A champion miner must exist -- weights are only emitted when a solver has been submitted and accepted:
   ```bash
   curl http://localhost:9100/weights
@@ -139,8 +139,16 @@ Discovery requires four things to line up. Check each in order:
   ```
 - Verify Bittensor wallet configuration:
   - `WALLET_NAME` and `HOTKEY_NAME` must match a wallet with a registered hotkey on subnet 112.
-  - The wallet directory must be accessible (default: `~/.bittensor/wallets/`).
-- On Bittensor 10.x, `set_weights` uses commit-reveal. On fast local chains, you may need to wait a few blocks between weight emissions.
+  - The wallet directory must be accessible (default: `~/.bittensor/wallets/`). A wallet mount not readable by uid 1000 is the classic cause of `weights_emitter_configured=false` (a silent dead emitter) — see `BT_WALLET_PATH` in [Configuration](./configuration.md#bittensor-identity).
+- On Bittensor 10.x, `set_weights` uses commit-reveal, and the chain keeps only **one** pending commit per validator per tempo epoch — earlier commits in the same tempo are silently discarded. That is exactly why emission is tempo-aligned; the old wall-clock cadence could commit 2–3×/tempo and a champion dethroned mid-tempo could reveal nothing. On fast local chains you may still need to wait a few blocks between emissions.
+
+### Boot-time chain hiccup / phantom leader (PR #542)
+
+**Symptom**: `/identity` returns 503, `weights_emitter_configured=false`, or the validator behaves as an unelected "leader" after a transient chain error at container start.
+
+- Bittensor bring-up now **retries forever** with jittered exponential backoff (5s → 5min) on a background thread instead of latching a dead daemon on the first websocket failure. Check `/health` → `bt_init` (`{configured, ok, attempts, error, error_at, retrying}`); status reports `"degraded"` (still HTTP 200) while configured-but-broken.
+- **Leadership now fails closed**: whenever `SUBTENSOR_URL` is configured, `_is_leader` is `False` until a metagraph sync actually succeeds — a failed initial sync stays follower (it no longer "assumes leader"). The real leader is promoted at most one sync cycle late. `FORCE_LEADER=1` still overrides for local testnets.
+- If `bt_init.ok` never flips true, fix the underlying `SUBTENSOR_URL` / wallet issue; the daemon self-heals once the dependency recovers — no restart needed.
 
 ## Miner Submissions Rejected (leader-only)
 

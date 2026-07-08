@@ -14,7 +14,7 @@ my-solver/
 └── README.md         # Description of your solver's approach
 ```
 
-The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it **delivers strictly more than the current champion** under the relative reference-bar rule (per-order: zero regressions/drops and at least one strict win or blind-spot cover).
+The validator clones this repo, runs it through a three-stage screening pipeline, benchmarks it against active App Intents, and adopts it if it is **net better on breadth** than the current champion — or, on a fully-matched tie, cheaper/cleaner on the gas → factorization → deadwood ladder. See the [champion/challenger model](./README.md#championchallenger-model) for the exact rule.
 
 ## Dockerfile Requirements
 
@@ -242,7 +242,8 @@ Plans are scored by each app's JS scoring function (`score(plan, state, context)
 - The currently active solver is the **champion** — the relative-scoring **baseline** (no score of its own).
 - A new submission is a **challenger**.
 - Each order is compared champion-vs-challenger at the same pin → `win` / `regression` / `matched` (within a ±0.1% / 10 bps tie band), plus `blind_spot_cover` (challenger serves an order the champion can't → win) and `dropped` (the reverse → regression).
-- The challenger **dethrones** only with **zero regressions/drops and at least one strict win or blind-spot cover**. Matching everywhere is rejected; any regression makes the verdict `behind`.
+- The challenger **dethrones on output** if it is net better on breadth — `(wins + blind_spot_covers) − regressions ≥ 1` — with each tolerated regression bounded to a **1% hard floor**. Cutting any order by more than 1%, or dropping an order the champion serves, is a hard veto regardless of wins.
+- On a **fully-matched tie** (every order matched, zero regressions) the challenger can still dethrone on the tie-break ladder: cheaper total metered gas (≥200 bps), then smaller worst AST region (`max_region_nodes`, by ≥100), then less dead code (`unproductive_nodes`, by ≥2000).
 - Once adopted, the challenger becomes the new champion and processes real orders.
 
 ### Auto-Triggered Intents
@@ -325,15 +326,12 @@ The `RoutingSolver` generates a minimal fallback plan for any intent that does n
 
 ## Testing Before Submission
 
-### 1. Local smoke submission
+> The inline source-submission endpoint (`POST /v1/submissions/source`) was
+> removed (PR #599). Test locally with the static/screening helpers below, or run
+> the full local testnet, then submit through the git PR path
+> (`minotaur_subnet.miner.main submit`).
 
-```bash
-curl -X POST http://localhost:8080/v1/submissions/source \
-  -H "Content-Type: application/json" \
-  -d '{"solver_source":"<python source>", "hotkey":"local-miner", "epoch":0, "solver_name":"local-smoke"}'
-```
-
-### 2. Static Check Only
+### 1. Static Check Only
 
 Run just Stage 1 on your repo directory to verify file structure before pushing:
 
@@ -343,7 +341,7 @@ result = run_stage_1("/path/to/my-solver")
 print(result.passed, result.details)
 ```
 
-### 3. Full Screening Locally
+### 2. Full Screening Locally
 
 If you have Docker available, run the full screening pipeline:
 
@@ -370,6 +368,6 @@ asyncio.run(test())
 - [ ] `check_trigger()` returns `bool`
 - [ ] Solver works offline (no network access at runtime)
 - [ ] Total repo size is under 100MB
-- [ ] Local source submission passes through benchmarking (`POST /v1/submissions/source`)
+- [ ] Largest AST region is under 4,200 nodes and there is no bare `exec()`/`eval()` (stage-1 rejects `too_entangled` / `dynamic_code`)
 
 See also: [Solver API](./solver-api.md), [Configuration](./configuration.md), [Troubleshooting](./troubleshooting.md).

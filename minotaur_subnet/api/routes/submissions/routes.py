@@ -45,7 +45,6 @@ from .models import (
     SolverRoundResponse,
     SolverRoundSummary,
     SolverRoundsResponse,
-    SourceSubmitRequest,
     StatusResponse,
     SubmitRequest,
     SubmitResponse,
@@ -109,18 +108,6 @@ def _require_submissions_enabled() -> None:
         raise HTTPException(
             status_code=503,
             detail="Submissions are temporarily disabled by operator policy",
-        )
-
-
-def _require_source_enabled() -> None:
-    """Source submissions are dangerous and must be explicitly enabled."""
-    if not _env_true("ENABLE_SOURCE_SUBMISSIONS", default=False):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Source submissions are disabled by policy. "
-                "Use signed git submissions instead."
-            ),
         )
 
 
@@ -736,18 +723,13 @@ def _round_intake_max() -> int:
 
 
 def _rotation_ledger_path() -> str:
-    """Path of the leader-local rotation ledger (see ``harness/rotation.py``).
+    """Path of the leader-local rotation ledger — thin alias over
+    :func:`minotaur_subnet.harness.rotation.rotation_ledger_path` (the
+    derivation lives in the harness so the benchmark worker's slate-width belt
+    reads the SAME ledger without an api import)."""
+    from minotaur_subnet.harness.rotation import rotation_ledger_path
 
-    ``SOLVER_ROTATION_LEDGER_PATH`` wins; otherwise the ledger lives next to
-    the round store (``SOLVER_ROUND_STORE_PATH``) so it lands on the same
-    persistent volume (/data in production, per #430).
-    """
-    explicit = os.environ.get("SOLVER_ROTATION_LEDGER_PATH", "").strip()
-    if explicit:
-        return explicit
-    round_store_path = os.environ.get("SOLVER_ROUND_STORE_PATH", "").strip()
-    base = os.path.dirname(round_store_path) if round_store_path else "."
-    return os.path.join(base or ".", "solver_rotation.json")
+    return rotation_ledger_path()
 
 
 def apply_round_rotation(round_id: str) -> dict[str, Any]:
@@ -762,27 +744,40 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
 
     store = get_store()
 
-    def _notify_not_selected(sub: Any, reason: str) -> None:
-        # Runs BEFORE the store's terminal reject (which purges a private
-        # submission's repo token) so the PR comment can still post. Previously
+    def _notify_not_selected(sub: Any, reason: str, repo_token: str | None = None) -> None:
+        # Runs AFTER the store's terminal reject, in apply_rotation_slate's
+        # background notify phase; ``repo_token`` is the private-repo token the
+        # rotation captured BEFORE the reject purged it (None for public
+        # submissions), so the PR comment can still post. Previously
         # rotation-skipped miners got no PR feedback at all — the reason lived
         # only on the status endpoint.
         from minotaur_subnet.relayer.solver_repo import on_round_not_selected_pr
 
-        token = None
-        try:
-            token = store.get_repo_token(getattr(sub, "submission_id", "") or "")
-        except Exception:  # noqa: BLE001
-            pass
-        on_round_not_selected_pr(sub, reason, repo_token=token)
+        on_round_not_selected_pr(sub, reason, repo_token=repo_token)
 
-    return apply_rotation_slate(
+    result = apply_rotation_slate(
         store,
         round_id,
         _max_submissions_per_round_total(),
         RotationLedger(_rotation_ledger_path()),
         notify=_notify_not_selected,
     )
+
+    # Record the selected slate on the round as the SINGLE SOURCE OF TRUTH for
+    # who gets benched — the benchmark worker's belt reads this instead of
+    # recomputing the rotation against a ledger this close already advanced
+    # (the double-bench race, round-e29724975-n1). Best-effort: a persist hiccup
+    # must not fail the close (the belt falls back to recomputation on None).
+    if result.get("applied") and result.get("selected") is not None:
+        try:
+            get_round_store().set_benched_slate(round_id, list(result["selected"]))
+        except Exception:
+            logger.warning(
+                "recording benched slate for %s failed (belt will recompute)",
+                round_id, exc_info=True,
+            )
+
+    return result
 
 
 def _enforce_rate_limit(request: Request, principal: str) -> None:
@@ -866,80 +861,6 @@ def build_submission_message(
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
-
-
-@router.post("/submissions/source", status_code=201)
-async def create_source_submission(
-    body: SourceSubmitRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """Submit solver source code directly for benchmarking.
-
-    Lightweight alternative to git-based submission: accepts Python source
-    inline, writes it to a temp file, and queues it for benchmarking
-    immediately (no screening, no Docker build).
-
-    Designed for the local testnet workflow where miners submit strategies
-    directly without the git+Docker overhead.
-    """
-    _require_submissions_enabled()
-    _require_source_enabled()
-    _require_submission_api_key(request)
-    _enforce_rate_limit(request, body.hotkey.strip())
-    _require_registered_miner(body.hotkey)
-
-    store = get_store()
-    current_round = _require_open_submission_round(
-        epoch_hint=body.epoch,
-        requested_round_id=body.round_id,
-    )
-
-    code_hash = hashlib.sha256(body.solver_source.encode()).hexdigest()[:12]
-
-    # Same caps as the git path so SUBMISSIONS_MAX_PER_ROUND,
-    # SOLVER_ROUND_MAX_SUBMISSIONS and SUBMISSIONS_MAX_ROUNDS_PER_COMMIT apply
-    # uniformly across both ingresses. commit_hash here is the source content
-    # hash, so the per-commit cap naturally means "same code, same quota".
-    try:
-        sub = store.create(
-            repo_url="source://inline",
-            commit_hash=code_hash,
-            epoch=body.epoch,
-            hotkey=body.hotkey,
-            round_id=current_round.round_id,
-            max_per_round=_max_submissions_per_round(),
-            max_total_per_round=_round_intake_max(),
-            max_rounds_per_commit=_max_rounds_per_commit(),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-    if body.solver_name:
-        store.set_solver_info(sub.submission_id, name=body.solver_name)
-
-    # Write source to temp file for subprocess-based benchmarking
-    solver_dir = tempfile.mkdtemp(prefix=f"solver-{code_hash}-")
-    solver_path = os.path.join(solver_dir, "solver.py")
-    with open(solver_path, "w") as f:
-        f.write(body.solver_source)
-
-    store.set_solver_path(sub.submission_id, solver_path)
-
-    # Skip screening, go straight to BENCHMARKING
-    store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
-
-    logger.info(
-        "Source submission created: %s (hotkey=%s, solver=%s, path=%s)",
-        sub.submission_id, body.hotkey[:12], body.solver_name, solver_path,
-    )
-
-    return {
-        "submission_id": sub.submission_id,
-        "status": "benchmarking",
-        "status_url": f"/v1/submissions/{sub.submission_id}/status",
-        "round_id": sub.round_id,
-        "epoch": sub.epoch,
-    }
 
 
 @router.post("/submissions", status_code=201, response_model=SubmitResponse)
@@ -1907,3 +1828,132 @@ async def internal_diagnostic_score_image_result(job_id: str, request: Request):
     if res is None:
         raise HTTPException(status_code=404, detail="Unknown diagnostic job_id")
     return res
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Distributed benchmark veto — wire endpoints (Phase 0, observe-only).
+# INERT until armed: the receiver needs a LEADER-SIGNED assignment (nothing
+# fans out until the coordinator gate lands + DISTRIBUTED_VETO is on), and the
+# response endpoint only accepts responses for registry-known assignments.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _reject_oversized_body(request: Request, max_bytes: int) -> None:
+    """Reject on the declared Content-Length BEFORE the body is read (411 if
+    absent — chunked bodies can't be size-bounded pre-read; 413 if oversized).
+    uvicorn/h11 delivers at most the declared length, so a spoofed-small header
+    can't stream past it. The 142MB submissions.json event-loop-freeze class."""
+    raw = request.headers.get("content-length")
+    try:
+        declared = int(raw) if raw is not None else None
+    except ValueError:
+        declared = None
+    if declared is None:
+        raise HTTPException(status_code=411, detail="Content-Length required")
+    if declared > max_bytes:
+        raise HTTPException(status_code=413, detail="request body too large")
+
+
+@router.post("/solver/round/internal/veto-assignment")
+async def receive_veto_assignment(request: Request):
+    """Follower receiver: a leader-signed slice assignment.
+
+    Auth is the SAME leader-signature scheme as round-lifecycle sync (no
+    shared-key fallback). Participation is DEFAULT ON; a node opted out
+    (DISTRIBUTED_VETO=0) or pre-dating the code answers 409/404 — the leader
+    records terminal-UNSUPPORTED (= abstain), so a mixed/partial fleet degrades
+    gracefully. The bench itself runs async; this handler only ACKs (the
+    proposal endpoint's inline bench is the anti-pattern —
+    it's why the harvest needs 300s/peer timeouts).
+
+    ORDERING: the flag check and Content-Length reject run BEFORE the body is
+    read (auth parses the whole body to verify the signature) — so when the
+    kill switch is OFF this endpoint is truly inert (no body touched), and an
+    armed follower still caps the pre-auth parse.
+    """
+    from . import veto_wire
+
+    if not veto_wire.distributed_veto_enabled():
+        raise HTTPException(status_code=409, detail="distributed veto disabled")
+    _reject_oversized_body(request, veto_wire.MAX_VETO_ASSIGNMENT_BYTES)
+
+    await _authorize_internal_round_sync(request)
+    payload = await request.json()
+    from .round_manager import _current_solver_round_epoch
+
+    ack = veto_wire.accept_assignment(
+        payload,
+        current_epoch=_current_solver_round_epoch(),
+        own_evm=veto_wire.own_validator_evm(),
+        runner_factory=veto_wire._production_runner,
+    )
+    if not ack.get("accepted"):
+        raise HTTPException(status_code=422, detail=ack.get("reason", "rejected"))
+    return ack
+
+
+@router.get("/solver/round/{round_id}/veto-assignment")
+async def get_veto_assignment(round_id: str, validator: str = Query(...)):
+    """Serve the persisted assignment for one validator (leader side).
+
+    Public like the champion sync-bundle: the payload is leader-signed, so
+    possession proves nothing and tampering requires the leader key. This is
+    the re-send/pull fallback surface — the primary delivery is the
+    coordinator's re-send-per-tick loop. The signed bytes are cached per
+    assignment_id so repeated calls can't force per-request leader-key signs
+    onto the event loop.
+    """
+    from . import veto_wire
+    from .round_manager import _sign_internal_round_payload
+    from .state import get_champion_peer_network
+
+    network = get_champion_peer_network()
+    signed = veto_wire.serve_signed_assignment(
+        round_id, validator,
+        sign_payload=lambda p: _sign_internal_round_payload(network, p),
+    )
+    if signed is None:
+        raise HTTPException(status_code=404, detail="no assignment for round/validator")
+    return signed
+
+
+@router.post("/solver/round/internal/veto-response")
+async def receive_veto_response(request: Request):
+    """Leader receiver: a follower-signed slice verdict.
+
+    ORDERING IS THE DEFENSE: (1) fast-reject when the feature is disabled, then
+    Content-Length reject BEFORE the body is read — an unbounded request.json()
+    on the event loop is the 142MB submissions.json incident class, and the
+    flag gate keeps signature recovery off the event loop while unarmed;
+    (2) signature recovery + authorized-signer check via the champion consensus
+    manager's validator set (the routes-layer verifiers are leader-locked and
+    would 401 every follower); (3) assignment binding + caps + idempotent record.
+    """
+    from . import veto_wire
+
+    if not veto_wire.distributed_veto_enabled():
+        raise HTTPException(status_code=409, detail="distributed veto disabled")
+    _reject_oversized_body(request, veto_wire.MAX_VETO_RESPONSE_BYTES)
+
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="body is not valid JSON")
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    from .state import get_champion_consensus_manager
+
+    manager = get_champion_consensus_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=503, detail="champion consensus manager not wired",
+        )
+
+    status, body = veto_wire.ingest_response(
+        raw,
+        registry=veto_wire.REGISTRY,
+        is_authorized_signer=manager._is_authorized_signer,
+    )
+    if status != 200:
+        raise HTTPException(status_code=status, detail=body.get("reason", "rejected"))
+    return body
