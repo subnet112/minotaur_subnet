@@ -582,6 +582,14 @@ services:
   # ``profiles: [autoupdate]`` directive below makes this service opt-out)
   # and run `docker compose pull && docker compose up -d` manually on the
   # cadence we publish.
+  #
+  # ROBUSTNESS NOTE (recommended for high-stake validators): Watchtower
+  # recreates on a tag move WITHOUT honouring the anvil ``service_healthy``
+  # depends_on above, and never rolls back a broken update — so a new :stable
+  # can start the api/validator against cold anvil forks and leave the node
+  # down. Prefer the health-gated updater ``./update.sh`` (pulls, recreates
+  # with ``up -d --wait``, auto-rolls-back on failure). Drop the
+  # ``autoupdate`` profile and cron it instead. See docs/validator/updating.md.
 
   watchtower:
     # Pinned by digest (audit H10). Without this a hostile re-push to
