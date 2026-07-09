@@ -179,6 +179,62 @@ def test_cert_refuses_fast_on_unconfigured_env(monkeypatch):
     assert calls["n"] == 0  # config error refused before any read/retry
 
 
+# ── attest-confirmed fast path (receipt-based, zero-RPC) ──────────────────────
+
+def test_cert_attest_confirmed_skips_registry_read(monkeypatch):
+    """A status=1 attest for this EXACT sha short-circuits — no registry read at
+    all, so there is nothing to 429."""
+    _env(monkeypatch)
+
+    def _should_not_run():
+        raise AssertionError("registry read must not happen on the attest fast path")
+
+    monkeypatch.setattr(sr, "_read_champion_registry", _should_not_run)
+    assert sr._onchain_cert_binds(SHA, "round-1", attest_confirmed_sha=SHA) is True
+    assert sr._onchain_cert_binds(SHA.upper(), "round-1", attest_confirmed_sha=SHA) is True  # case-insensitive
+
+
+def test_cert_attest_confirmed_mismatch_falls_through_to_read(monkeypatch):
+    """attest_confirmed for a DIFFERENT sha must NOT short-circuit the checked
+    head — the gate still runs its authoritative read (which here refuses)."""
+    _env(monkeypatch); _registry(monkeypatch, latest_commit=OTHER)  # on-chain binds OTHER, not SHA
+    # head=SHA, attest_confirmed=OTHER (≠SHA) → no short-circuit → read → SHA unbound → False
+    assert sr._onchain_cert_binds(SHA, "round-1", attest_confirmed_sha=OTHER) is False
+
+
+def test_cert_no_attest_confirmed_still_reads(monkeypatch):
+    """Absent attest confirmation, behavior is unchanged: authoritative read."""
+    _env(monkeypatch); _registry(monkeypatch)
+    assert sr._onchain_cert_binds(SHA, "round-1", attest_confirmed_sha=None) is True
+
+
+def test_cert_attest_confirmed_case_skew_does_not_falsely_bind(monkeypatch):
+    """_str_to_bytes32 is case-sensitive for a 40-char SHA, so an UPPERCASE
+    attest_confirmed_sha encodes to a DIFFERENT on-chain commitHash than the
+    lowercased head target — it must NOT short-circuit (that would claim a bind
+    the chain doesn't have). Falls through to the read, which here refuses."""
+    _env(monkeypatch)
+    monkeypatch.setattr(sr, "_read_champion_registry", lambda: None)  # read down → refuse
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 1)
+    assert sr._onchain_cert_binds(SHA, "round-1", attest_confirmed_sha=SHA.upper()) is False
+
+
+def test_cert_trust_receipt_disabled_forces_read(monkeypatch):
+    """MERGE_GATE_TRUST_ATTEST_RECEIPT off → fast path disabled, always reads."""
+    _env(monkeypatch)
+    monkeypatch.setattr(sr, "_TRUST_ATTEST_RECEIPT", False)
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(sr, "_read_champion_registry", counted)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 1)
+    assert sr._onchain_cert_binds(SHA, "round-1", attest_confirmed_sha=SHA) is False
+    assert calls["n"] == 1  # did the authoritative read, not the fast path
+
+
 # ── merge_miner_pr_when_certified ────────────────────────────────────────────
 
 def _resolved(head):
