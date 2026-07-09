@@ -71,17 +71,24 @@ async def _docker(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
 
 
 def _build_upstreams() -> str:
-    """``UPSTREAMS`` from the api's live read RPCs (the same upstreams the anvils fork)."""
-    eth = os.environ.get("ETH_RPC_URL") or os.environ.get("ETH_UPSTREAM_RPC_URL") or ""
-    base = os.environ.get("BASE_RPC_URL") or os.environ.get("BASE_UPSTREAM_RPC_URL") or ""
-    btevm = (
-        os.environ.get("BITTENSOR_EVM_RPC_URL")
-        or os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL")
-        or "https://lite.chain.opentensor.ai"
-    )
-    return ",".join(
-        f"{k}={v}" for k, v in (("eth", eth), ("base", base), ("btevm", btevm)) if v
-    )
+    """``UPSTREAMS`` from the api's live read RPCs (the same upstreams the anvils fork).
+
+    ``slug=url`` for each real (non-local) wired chain, sourced from the chain
+    registry so the sidecar's UPSTREAMS keys stay in lockstep with the proxy
+    route slugs (``solver_read_proxy.CHAIN_NAMES``) — the two used to be
+    independently hand-maintained and could silently drift.
+    """
+    from minotaur_subnet.chains import registry
+
+    parts: list[str] = []
+    for cid in registry.wired_chain_ids():
+        s = registry.spec(cid)
+        if s is None or s.is_local:  # local Anvil (31337) shares the "eth" slug; skip
+            continue
+        url = registry.proxy_upstream(cid)
+        if url:
+            parts.append(f"{s.slug}={url}")
+    return ",".join(parts)
 
 
 def _export_env(token: str) -> None:
