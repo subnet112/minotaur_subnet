@@ -234,11 +234,15 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         ForkPinUnavailable,
         derive_fork_pins,
         round_anchor_ts,
+        round_anchor_ts_for_chain,
     )
 
     epoch_seconds = SolverRoundEpochClock.from_env().epoch_seconds
     # round_anchor_ts (NOT epoch_anchor_ts): anchors one epoch back so the
     # confirmation-margin can confirm-bracket the anchor by round close (#anchor-back).
+    # anchor_ts is the DEFAULT (Base) anchor, kept for logging / the scalar
+    # fallback; the per-chain anchor_ts_of below is what actually pins each chain
+    # (slow chains anchor deeper so they bracket at open — #632).
     anchor_ts = round_anchor_ts(anchor_epoch, epoch_seconds)
     # Base only by default; the deployment-chain union when
     # BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed (each chain pinned independently).
@@ -274,6 +278,10 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
             head_of=lambda c: int(_w3(c).eth.block_number),
             block_timestamp_of=lambda c, b: int(_w3(c).eth.get_block(b)["timestamp"]),
             confirmations=confirmations,
+            # PER-CHAIN anchor: slow chains (e.g. Ethereum) anchor deeper so
+            # find_pin_block confirm-brackets them at round open instead of
+            # deferring forever (#632). Base is unchanged (default lookback).
+            anchor_ts_of=lambda c: round_anchor_ts_for_chain(c, anchor_epoch, epoch_seconds),
         )
     except ForkPinUnavailable as exc:
         logger.info("fork-pins: deferring for epoch %s: %s", anchor_epoch, exc)
@@ -3097,19 +3105,23 @@ async def initialize(ctx: ServerContext) -> dict:
                 if not _is_solver_round_leader():
                     return
                 try:
-                    if (
-                        current is not None
-                        and current.status in (
-                            RoundStatus.CERTIFYING, RoundStatus.CERTIFIED,
-                        )
-                        and current.finalist_submission_id
-                        and veto_wire.REGISTRY.get(current.round_id) is None
-                    ):
-                        _open_veto_phase(current)
-
                     now = _current_solver_round_epoch(ctx)
                     peer_urls = _veto_peer_urls()
                     network = submissions.get_champion_peer_network()
+
+                    # DEFER opening until champion peers are discovered — right
+                    # after a restart the discovery loop hasn't populated yet, and
+                    # opening with zero peers resolves no_assignments permanently,
+                    # losing that round's coverage. Retry next tick.
+                    if current is not None and veto_wire.veto_open_decision(
+                        is_certify_state=current.status in (
+                            RoundStatus.CERTIFYING, RoundStatus.CERTIFIED,
+                        ),
+                        has_finalist=bool(current.finalist_submission_id),
+                        phase_exists=veto_wire.REGISTRY.get(current.round_id) is not None,
+                        has_peers=bool(peer_urls),
+                    ) == veto_wire.VETO_OPEN:
+                        _open_veto_phase(current)
 
                     def _sign(p):
                         from minotaur_subnet.api.routes.submissions.round_manager import (
@@ -3122,12 +3134,16 @@ async def initialize(ctx: ServerContext) -> dict:
                             continue
                         responded = set(phase.responses) | set(phase.unsupported)
                         if network is not None and phase.assignments:
-                            # Parallel + short per-peer timeout: a black-hole peer
-                            # cannot serialize-block the loop.
+                            # Parallel + bounded per-peer timeout (15s): a real
+                            # follower ACKs a signed assignment in ~3s idle but
+                            # slower under event-loop load, so 5s falsely timed
+                            # out live sends. A black-hole peer still can't
+                            # serialize-block the loop (parallel gather; runs on
+                            # a quiet tick after certify/activate).
                             await veto_wire.fan_out_assignments(
                                 phase.assignments, peer_urls=peer_urls,
                                 sign_payload=_sign, exclude=responded,
-                                timeout_s=5.0,
+                                timeout_s=15.0,
                             )
                             for a in phase.assignments:
                                 if veto_wire.consecutive_reject_terminal(

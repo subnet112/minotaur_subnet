@@ -106,6 +106,37 @@ def resolve_bare_digest(store: Any, submission_id: str | None) -> str | None:
         return None
 
 
+VETO_OPEN = "open"
+VETO_DEFER = "defer"
+VETO_SKIP = "skip"
+
+
+def veto_open_decision(
+    *,
+    is_certify_state: bool,
+    has_finalist: bool,
+    phase_exists: bool,
+    has_peers: bool,
+) -> str:
+    """Decide whether the coordinator opens a veto observe phase for the current
+    round: ``open`` / ``defer`` / ``skip``.
+
+    ``defer`` (the boot-timing fix): the round is a fresh open candidate but NO
+    champion peers are discovered yet — e.g. right after a restart, before the
+    ~60s discovery loop populates. If we opened anyway, ``build_assignments``
+    would return [] → the phase resolves ``no_assignments`` PERMANENTLY and that
+    round's coverage is lost. On a watchtower-restarting leader (rounds sit
+    CERTIFIED ~tens of minutes), that eats a lot of soak coverage. Deferring
+    re-checks next tick and opens once peers appear. A node that genuinely has
+    no peers simply never opens — correct (no followers = no veto coverage).
+    """
+    if phase_exists or not is_certify_state or not has_finalist:
+        return VETO_SKIP
+    if not has_peers:
+        return VETO_DEFER
+    return VETO_OPEN
+
+
 def own_validator_evm() -> str | None:
     """This node's EVM address from the champion peer network's signing key —
     the identity a leader-signed assignment must be addressed to. None (no key
@@ -370,19 +401,24 @@ async def fan_out_assignments(
     peer_urls: dict[str, str],  # validator_evm(lower) -> api base url
     sign_payload: Callable[[dict], dict],
     exclude: set[str] | None = None,
-    timeout_s: float = 5.0,
+    timeout_s: float = 15.0,
     post_json: Callable[..., Awaitable[tuple[int, Any]]] | None = None,
 ) -> dict[str, str]:
-    """Send each validator ITS assignment — CONCURRENTLY, short per-peer
+    """Send each validator ITS assignment — CONCURRENTLY, bounded per-peer
     timeout. Single-shot, skip-on-fail; the coordinator re-calls every tick
     until response-or-deadline (there is no follower-side pull trigger; the
     re-send loop IS the delivery guarantee).
 
-    Concurrency + a short ``timeout_s`` are load-bearing: a black-hole peer
+    Concurrency + a BOUNDED ``timeout_s`` are load-bearing: a black-hole peer
     (accepts TCP, never answers) must NOT serialize-block the caller — the whole
     fan-out is bounded by ``timeout_s``, not N×timeout, so it stays safe even on
-    the coordinator loop. ``exclude`` (already-responded or already-terminal
-    validators) are skipped so a completed slice is never re-sent.
+    the coordinator loop. The default is 15s: a real follower ACKs a signed
+    assignment in ~3s idle but MORE under event-loop load (validators are busy),
+    so 5s falsely timed out live sends → UNREACHABLE and no coverage. 15s covers
+    the loaded case; a genuinely-hung peer still blocks a QUIET tick at most once
+    (fan-out runs after certify/activate), and retries next tick.
+    ``exclude`` (already-responded or already-terminal validators) are skipped so
+    a completed slice is never re-sent.
 
     Returns {validator_evm: SEND_*}. A deterministic HTTP reject maps to
     SEND_UNSUPPORTED for THIS tick but only becomes terminal after

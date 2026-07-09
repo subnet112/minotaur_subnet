@@ -6,6 +6,7 @@ The Minotaur validator is the backbone of **Bittensor Subnet 112** -- a distribu
 
 - [Quickstart](./quickstart.md) -- Get up and running
 - [Configuration](./configuration.md) -- Full CLI and environment variable reference
+- [Updating safely](./updating.md) -- Health-gated updates with auto-rollback (recommended over Watchtower for high-stake validators)
 - [Troubleshooting](./troubleshooting.md) -- Common issues and solutions
 
 ## What Validators Do
