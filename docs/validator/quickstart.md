@@ -350,9 +350,13 @@ If `/consensus/info` returns `quorum_bps=0` or the api's
 - **Auto-updates from `:stable`.** New code is promoted to the
   `:stable` tag by the subnet team after soak-testing on prod.
   Watchtower (if you enabled the `autoupdate` profile) pulls on its
-  poll interval and recreates your containers. To pin to a specific
-  build, set `MINOTAUR_IMAGE_TAG=sha-<short_sha>` in `.env` and skip
-  the `autoupdate` profile.
+  poll interval and recreates your containers. **High-stake validators
+  should prefer the health-gated updater** (`platform/validator/update.sh`)
+  over Watchtower — Watchtower ignores the Anvil health-ordering and never
+  rolls back a bad recreate, so a new build can leave your node down. See
+  [Updating safely](./updating.md). To pin to a specific build, set
+  `MINOTAUR_IMAGE_TAG=sha-<short_sha>` in `.env` and skip the
+  `autoupdate` profile.
 
 ---
 
