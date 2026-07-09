@@ -32,6 +32,8 @@ from typing import Awaitable, Callable, Sequence
 import aiohttp
 from web3 import Web3
 
+from minotaur_subnet.chains import registry
+
 from .peer_discovery import MetagraphPeer, PeerInfo, discover_peers
 
 logger = logging.getLogger(__name__)
@@ -59,31 +61,11 @@ def consensus_chain_rpc_url(chain_id: int) -> str:
 
     Falls back to the local Anvil URL whenever the appropriate upstream
     env is not set, to keep local-testnet behaviour unchanged.
-    """
-    if chain_id == 8453:
-        u = os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
-        if u:
-            return u
-    elif chain_id == 964:
-        u = (
-            os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
-            or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip()
-        )
-        if u:
-            return u
-        return "https://lite.chain.opentensor.ai"
-    elif chain_id == 1:
-        u = os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
-        if u:
-            return u
 
-    # Local testnet (31337/1337) or no upstream configured: the local
-    # Anvil IS the live chain, so its URL is correct here.
-    return (
-        os.environ.get("ANVIL_RPC_URL", "").strip()
-        or os.environ.get("BASE_RPC_URL", "").strip()
-        or "http://localhost:8545"
-    )
+    The per-chain upstream ladder + public/local fallback are defined once in
+    the chain registry (``registry.consensus_rpc``).
+    """
+    return registry.consensus_rpc(chain_id)
 
 
 # Minimal ABI for the views ProtocolConfig needs. Kept in-file rather than

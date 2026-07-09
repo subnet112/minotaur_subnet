@@ -38,24 +38,19 @@ from __future__ import annotations
 
 import os
 
+from minotaur_subnet.chains import registry
+
 # ---------------------------------------------------------------------------
 # Per-chain revenue floor in native-token wei (~$0.10-equivalent).
 #
-# Governance-tuned, native-denominated (no price oracle). Re-tune via env
+# Governance-tuned, native-denominated (no price oracle); the per-chain values
+# live in the chain registry (registry.fee_floor_wei). Re-tune at RUNTIME via env
 # PROTOCOL_FEE_FLOOR_WEI_<chain_id> as token prices drift. Each value MUST lie
 # within that chain's on-chain [minPlatformFeeWei, maxPlatformFeeWei] clamp.
 #
 # Defaults below assume ETH≈$3000, TAO≈$300 — adjust as needed; on Base/BT EVM
 # this floor dominates the gas term and therefore IS the fee in practice.
 # ---------------------------------------------------------------------------
-_DEFAULT_FLOOR_WEI: dict[int, int] = {
-    1:      33_000_000_000_000,    # Ethereum  ~$0.10 @ $3000  (0.0000333 ETH)
-    8453:   33_000_000_000_000,    # Base      ~$0.10 (WETH, 18 dp)
-    964:   330_000_000_000_000,    # BT EVM    ~$0.10 @ $300    (0.000333 TAO)
-    31337:                  0,     # Anvil/local — no floor
-}
-_GENERIC_FLOOR_WEI = 0
-
 # Universal tip over measured gas cost. 50% per the agreed design.
 _DEFAULT_MARGIN_BPS = 5000
 
@@ -97,7 +92,7 @@ def floor_wei(chain_id: int) -> int:
     override = _env_int(f"PROTOCOL_FEE_FLOOR_WEI_{chain_id}")
     if override is not None:
         return override
-    return _DEFAULT_FLOOR_WEI.get(chain_id, _GENERIC_FLOOR_WEI)
+    return registry.fee_floor_wei(chain_id)
 
 
 def margin_bps(chain_id: int) -> int:
@@ -186,18 +181,10 @@ def certify_fee(
     return True, ""
 
 
-# Fallback gas prices in wei, used ONLY when the live RPC query fails.
-# Deliberately conservative (≈ each chain's typical baseline). Daemon-side
-# twin of the solver's table — the fee math must not depend on miner code.
-_FALLBACK_GAS_PRICE_WEI: dict[int, int] = {
-    1:     25_000_000_000,   # Ethereum: 25 gwei
-    8453:      20_000_000,   # Base: 0.02 gwei
-    42161:     10_000_000,   # Arbitrum: 0.01 gwei
-    10:        10_000_000,   # Optimism: 0.01 gwei
-    964:   25_000_000_000,   # BT EVM: 25 gwei
-    31337:  1_000_000_000,   # Anvil/local: 1 gwei
-}
-_GENERIC_FALLBACK_GAS_PRICE_WEI = 1_000_000_000
+# Fallback gas prices in wei, used ONLY when the live RPC query fails. Deliberately
+# conservative (≈ each chain's typical baseline); the per-chain values live in the
+# chain registry (registry.fallback_gas_price_wei). Daemon-side twin of the solver's
+# table — the fee math must not depend on miner code.
 
 
 def _live_gas_rpc_url(chain_id: int) -> str:
@@ -208,18 +195,7 @@ def _live_gas_rpc_url(chain_id: int) -> str:
     fee as not-covering-gas (FEE_NOT_CERTIFIED). Mirrors the consensus caches.
     Falls back to the plain chain RPC for local/dev where "live" IS the node.
     """
-    if chain_id == 8453:
-        return (os.environ.get("BASE_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BASE_RPC_URL", "").strip())
-    if chain_id == 1:
-        return (os.environ.get("ETH_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("ETHEREUM_RPC_URL", "").strip()
-                or os.environ.get("ETH_RPC_URL", "").strip()
-                or os.environ.get("ANVIL_RPC_URL", "").strip())
-    if chain_id == 964:
-        return (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL", "").strip()
-                or os.environ.get("BITTENSOR_EVM_RPC_URL", "").strip())
-    return ""
+    return registry.gas_rpc(chain_id)
 
 
 # Cache Web3 instances by RPC URL so the gas-price read doesn't reconnect each call.
@@ -260,7 +236,7 @@ def current_gas_price_wei(chain_id: int) -> int:
                     return price
     except Exception:
         pass
-    return _FALLBACK_GAS_PRICE_WEI.get(chain_id, _GENERIC_FALLBACK_GAS_PRICE_WEI)
+    return registry.fallback_gas_price_wei(chain_id)
 
 
 def max_gas_price_wei(locked_fee_wei: int, gas_units: int) -> int:
