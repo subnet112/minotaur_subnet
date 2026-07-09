@@ -24,25 +24,39 @@ Symptom: *"every time a new version ships and my node pulls it, it breaks."*
 
 ## The safe path: `update.sh`
 
-`platform/validator/update.sh` is a drop-in replacement that fixes both:
+`platform/validator/update.sh` is a drop-in replacement AND a one-click repair
+tool — run it any time the stack is unhappy; it is idempotent and safe to re-run.
+It:
 
+- **preflights the mandatory env vars** — a signing key or fork-upstream RPC left
+  at a `YOUR_*` placeholder is the #1 cause of a stuck stack, so it fails fast with
+  a clear list instead of a cryptic "anvil is unhealthy" 20 minutes later,
 - pulls the new image for the tag-tracked services **only** (so foundry/Anvil
-  never churns underneath you),
-- recreates with `docker compose up -d --wait`, which **honours the Anvil
-  health-ordering** and returns non-zero if anything fails to go healthy,
-- **rolls back** to the previous image automatically if the new one is unhealthy,
-  so a bad release never leaves you down.
+  never churns underneath a healthy fork),
+- **heals the Anvil forks first** — the forks are what `api`/`validator` depend on
+  with `condition: service_healthy`, and a plain `docker compose up` aborts in ~1s
+  if a fork is *already* unhealthy (it won't wait for a stuck container to
+  recover). So it force-recreates any missing/unhealthy fork to reset its health
+  grace period and waits for all three to cold-fork and go healthy (btevm is
+  slowest) — **before** bringing up `api`/`validator`,
+- **rolls back** to the previous image automatically if the new one is unhealthy;
+  and if the node was already fully down (nothing to roll back to), it prints a
+  targeted diagnosis (which fork, its logs, the likely upstream) instead of just
+  giving up.
 
-### One-off update
+### One-off update / repair
 
 ```bash
 cd platform/validator
-./update.sh
+./update.sh                  # repair + update to current :stable
+./update.sh --no-pull        # repair only, don't pull a newer image
+./update.sh --skip-env-check # bypass the mandatory-env preflight (not advised)
 ```
 
-Exit codes: `0` updated & healthy · `1` update failed and was **rolled back**
-(node healthy on the OLD image — investigate before retrying) · `2` precondition
-error · `3` rollback also failed (node down, manual intervention).
+Exit codes: `0` healthy · `1` failed — rolled back to the previous image if one
+existed (investigate before retrying), else the node is still down and a diagnosis
+was printed · `2` precondition error (bad/placeholder env, missing compose, Docker
+unreachable) · `3` rollback also failed (node down, manual intervention).
 
 ### Recommended for high-stake validators: disable Watchtower + cron the updater
 
@@ -62,9 +76,19 @@ the previous build and the new `:stable` needs a look before you retry).
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `MINOTAUR_UPDATE_WAIT` | `240` | Seconds to wait for services to reach healthy before rolling back. Raise it on slow hosts (cold Anvil forks). |
+| `MINOTAUR_ANVIL_WAIT` | `300` | Seconds to wait for the Anvil forks to go healthy. Raise it if btevm cold-forks slowly (shared-IP / public upstream). |
+| `MINOTAUR_UPDATE_WAIT` | `240` | Seconds to wait for `api`/`validator` to reach healthy before rolling back. |
 | `MINOTAUR_UPDATE_SERVICES` | `fork-cache validator api` | Tag-tracked services to pull/recreate. |
+| `MINOTAUR_SKIP_ENV_CHECK` | `0` | `1` (or `--skip-env-check`) bypasses the mandatory-env preflight. Not advised. |
+| `MINOTAUR_ENV_FILE` | `<dir>/.env` | Path to the env file the preflight reads. |
 | `MINOTAUR_COMPOSE_DIR` | script dir | Where the compose file lives, if not run from `platform/validator/`. |
+
+The env preflight requires these to be set to real values (not `YOUR_*`
+placeholders): `VALIDATOR_PRIVATE_KEY`, `ADMIN_API_KEY`,
+`SOLVER_ROUND_INTERNAL_API_KEY`, `WALLET_NAME`, `HOTKEY_NAME`,
+`VALIDATOR_AXON_URL`, `ETH_UPSTREAM_RPC_URL`, `BASE_UPSTREAM_RPC_URL`. It *warns*
+(but continues) when `BITTENSOR_EVM_UPSTREAM_RPC_URL` or `LEADER_API_URL` are
+unset.
 
 ## Pinning to a specific build
 
