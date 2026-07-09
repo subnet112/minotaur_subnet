@@ -12,48 +12,24 @@ from typing import Any
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
+from minotaur_subnet.chains import registry as _registry
+
 
 # ---------------------------------------------------------------------------
 # Chain registry
 # ---------------------------------------------------------------------------
 
+# Projected from the canonical chain registry (minotaur_subnet.chains.registry)
+# so the name / rpc_env / explorer / is_poa metadata lives in exactly one place.
+# get_web3 below reads ``rpc_env`` from here exactly as before.
 CHAIN_CONFIG: dict[int, dict[str, Any]] = {
-    1: {
-        "name": "Ethereum",
-        "rpc_env": "ETHEREUM_RPC_URL",
-        "explorer": "https://etherscan.io",
-        "is_poa": False,
-    },
-    8453: {
-        "name": "Base",
-        "rpc_env": "BASE_RPC_URL",
-        "explorer": "https://basescan.org",
-        "is_poa": True,
-    },
-    42161: {
-        "name": "Arbitrum",
-        "rpc_env": "ARBITRUM_RPC_URL",
-        "explorer": "https://arbiscan.io",
-        "is_poa": True,
-    },
-    10: {
-        "name": "Optimism",
-        "rpc_env": "OPTIMISM_RPC_URL",
-        "explorer": "https://optimistic.etherscan.io",
-        "is_poa": True,
-    },
-    31337: {
-        "name": "Anvil",
-        "rpc_env": "ANVIL_RPC_URL",
-        "explorer": "http://localhost:8545",
-        "is_poa": False,
-    },
-    964: {
-        "name": "Bittensor EVM",
-        "rpc_env": "BITTENSOR_EVM_RPC_URL",
-        "explorer": "https://evm.taostats.io",
-        "is_poa": False,
-    },
+    cid: {
+        "name": s.name,
+        "rpc_env": s.rpc_env,
+        "explorer": s.explorer,
+        "is_poa": s.is_poa,
+    }
+    for cid, s in _registry.CHAINS.items()
 }
 
 # Cache instantiated Web3 objects so we don't reconnect on every call.

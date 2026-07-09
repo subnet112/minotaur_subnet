@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 from typing import Callable
 
+from minotaur_subnet.chains import registry
+
 # Accessor signatures injected by the caller.
 HeadFn = Callable[[int], int]               # chain_id -> current head block number
 BlockTimestampFn = Callable[[int, int], int]  # (chain_id, block) -> unix timestamp
@@ -62,7 +64,11 @@ def round_anchored_pin_enabled() -> bool:
 # now that the fork pin is a per-chain map end-to-end (run_benchmark
 # ``fork_blocks``, build_pin_blocks, per-scenario simulate) — the old scalar
 # hazard (a Base block number applied to a non-Base fork) is structurally gone.
-ROUND_ANCHOR_CHAINS: tuple[int, ...] = (8453,)
+#
+# The anchor set is the ``is_anchor`` flag in the chain registry (a CODE constant
+# there — never env — so it stays fleet-uniform). Kept as a module constant here
+# for the existing readers (startup, benchmark_worker, veto_wire).
+ROUND_ANCHOR_CHAINS: tuple[int, ...] = registry.anchor_chains()
 # Finality margin for the bracketing guard in find_pin_block (head - confirmations).
 ROUND_ANCHOR_CONFIRMATIONS: int = 12
 # Anchor the round's fork-pin this many epochs BEFORE the round's (close) epoch.
@@ -87,22 +93,21 @@ ROUND_ANCHOR_LOOKBACK_EPOCHS: int = 1
 #   lookback_epochs * EPOCH_SECONDS  >  ROUND_ANCHOR_CONFIRMATIONS * chain_block_secs
 # At the production EPOCH_SECONDS=60, Ethereum (12*12s=144s) needs >=3 epochs
 # (180s, ~36s jitter margin). A shorter epoch or a slower chain needs a larger
-# value here or it re-freezes (fails loud / defers, never mis-scores). PER-CHAIN so
-# the DEFAULT (Base) anchor — and therefore the Base-only benchmark_pack_hash —
-# is byte-identical to before; ONLY the chains listed here change, and only when
-# BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed. Fleet-uniform CODE constant (never a
-# per-validator env, same discipline as the rest of this module).
-ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN: dict[int, int] = {
-    1: 3,  # Ethereum mainnet (~12s blocks): 3 epochs = 180s clears 12 conf (~144s)
-}
+# value here or it re-freezes (fails loud / defers, never mis-scores). The DEFAULT
+# (Base) anchor — and therefore the Base-only benchmark_pack_hash — is byte-identical
+# to before; only chains whose registry ``lookback_epochs`` differs from the default
+# change, and only when BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed. The per-chain value
+# lives in the chain registry as a CODE constant (never a per-validator env, same
+# discipline as the rest of this module): Ethereum is 3 there (12s blocks: 3 epochs =
+# 180s clears the 12-conf ~144s margin), every other chain is the default 1.
 
 
 def round_anchor_lookback_epochs(chain_id: int) -> int:
-    """Per-chain confirmation-margin lookback in epochs (see
-    ``ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN``). Fast chains use the default 1;
-    slow chains anchor deeper so ``find_pin_block`` can confirm-bracket them at
-    round open. Pure/deterministic — every validator resolves it identically."""
-    return ROUND_ANCHOR_LOOKBACK_EPOCHS_BY_CHAIN.get(
+    """Per-chain confirmation-margin lookback in epochs. Fast chains use the
+    default 1; slow chains anchor deeper so ``find_pin_block`` can confirm-bracket
+    them at round open. Sourced from the chain registry (fleet-uniform CODE
+    constant) — every validator resolves it identically."""
+    return registry.lookback_epochs(
         int(chain_id), ROUND_ANCHOR_LOOKBACK_EPOCHS,
     )
 

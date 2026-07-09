@@ -49,3 +49,21 @@ def test_sufficient_balance_no_warn(caplog):
     with caplog.at_level(logging.WARNING, logger="minotaur_subnet.relayer.solver_repo"):
         s._warn_if_low_attest_balance(_W3(balance=10**18), "0xrelayer", {"gasPrice": 10*GWEI})
     assert not any("LOW ATTEST BALANCE" in r.message for r in caplog.records)
+
+
+def test_attest_receipt_poll_latency_default_and_env(monkeypatch):
+    # The BT-EVM attest polls the receipt at this cadence instead of web3's
+    # 0.1s default — the fix for the 429 burst on the public RPC.
+    import importlib
+
+    import minotaur_subnet.relayer.solver_repo as sr
+    monkeypatch.delenv("ATTEST_RECEIPT_POLL_LATENCY_S", raising=False)
+    importlib.reload(sr)
+    assert sr._ATTEST_RECEIPT_POLL_LATENCY_S == 3.0  # sane default (~4 polls/BT-EVM block)
+    assert sr._ATTEST_RECEIPT_POLL_LATENCY_S >= 1.0  # never the 0.1s hammer
+
+    monkeypatch.setenv("ATTEST_RECEIPT_POLL_LATENCY_S", "5.0")
+    importlib.reload(sr)
+    assert sr._ATTEST_RECEIPT_POLL_LATENCY_S == 5.0
+    monkeypatch.delenv("ATTEST_RECEIPT_POLL_LATENCY_S", raising=False)
+    importlib.reload(sr)

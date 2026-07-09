@@ -30,6 +30,7 @@ from minotaur_subnet.shared.types import (
 )
 from minotaur_subnet.sdk.intent_solver import IntentSolver, MarketSnapshot, SolverMetadata
 from minotaur_subnet.sdk.strategy import Strategy
+from minotaur_subnet.chains import registry
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +91,9 @@ class RoutingSolver(IntentSolver):
         import os
         for chain_str, url in self._rpc_urls.items():
             chain_id = int(chain_str)
-            if chain_id in (1, 31337):
-                os.environ.setdefault("ANVIL_RPC_URL", url)
-            elif chain_id == 8453:
-                os.environ.setdefault("BASE_RPC_URL", url)
-            elif chain_id == 964:
-                os.environ.setdefault("BITTENSOR_EVM_RPC_URL", url)
+            spec = registry.spec(chain_id)
+            if spec is not None and spec.boot_rpc_env:
+                os.environ.setdefault(spec.boot_rpc_env, url)
         # Propagate the full config (rpc_urls included) to every
         # registered strategy so Strategy.rpc_for(chain_id) works inside
         # generate_plan. Validator passes URLs once, strategies read via

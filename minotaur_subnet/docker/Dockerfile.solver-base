@@ -45,6 +45,9 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
 
 # Copy SDK and shared types (what solvers import)
 COPY minotaur_subnet/__init__.py /app/minotaur_subnet/__init__.py
+# The canonical chain registry — import-cheap (stdlib only). blockchain/chains.py
+# and the SDK/generated solvers read it, so it MUST ship in the solver image.
+COPY minotaur_subnet/chains/ /app/minotaur_subnet/chains/
 COPY minotaur_subnet/shared/ /app/minotaur_subnet/shared/
 COPY minotaur_subnet/sdk/ /app/minotaur_subnet/sdk/
 COPY minotaur_subnet/v3/ /app/minotaur_subnet/v3/

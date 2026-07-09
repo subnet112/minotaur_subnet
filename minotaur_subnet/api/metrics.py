@@ -23,16 +23,14 @@ import shutil
 import time
 from typing import Any
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
 
 NAMESPACE = "Minotaur/Production"
 
-# Chain env → RPC URL lookup, matches the rest of the codebase.
-_CHAIN_RPC_ENV: dict[str, tuple[str, ...]] = {
-    "eth": ("ETH_RPC_URL", "ANVIL_RPC_URL"),
-    "base": ("BASE_RPC_URL",),
-    "btevm": ("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_FORK_RPC_URL"),
-}
+# Metrics probe targets: proxy slug → chain id (the registry holds the RPC ladder).
+_SLUG_TO_CHAIN: dict[str, int] = {"eth": 1, "base": 8453, "btevm": 964}
 
 
 def _enabled() -> bool:
@@ -42,11 +40,10 @@ def _enabled() -> bool:
 
 
 def _resolve_rpc(chain: str) -> str | None:
-    for var in _CHAIN_RPC_ENV.get(chain, ()):
-        v = os.environ.get(var, "").strip()
-        if v:
-            return v
-    return None
+    chain_id = _SLUG_TO_CHAIN.get(chain)
+    if chain_id is None:
+        return None
+    return registry.check_rpc(chain_id) or None
 
 
 def _anvil_healthy(rpc_url: str) -> bool:
