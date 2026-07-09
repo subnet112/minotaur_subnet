@@ -174,6 +174,28 @@ _ATTEST_RECEIPT_POLL_LATENCY_S = float(
     os.environ.get("ATTEST_RECEIPT_POLL_LATENCY_S", "3.0")
 )
 
+# Merge-gate cert-read resilience. By the time the merge gate re-reads the
+# ChampionRegistry to confirm a quorum cert binds the head SHA, the attest has
+# ALREADY landed on-chain — so a transient 429/timeout on that READ must not
+# throw away a certified, already-attested win (the merge_failed churn: attest
+# succeeds, cert-read 429s on the public BT-EVM endpoint, merge refused, champion
+# frozen; diagnosed live 2026-07-09). Retry the read with exponential backoff
+# before fail-closing. A read that SUCCEEDS but does not bind (or quorum < 1) is
+# a DEFINITIVE negative and is never retried — the gate stays fail-closed against
+# an uncertified head. Env-tunable, same discipline as the attest retry.
+_CERT_READ_ATTEMPTS = int(os.environ.get("MERGE_GATE_CERT_READ_ATTEMPTS", "4"))
+_CERT_READ_BACKOFF_S = float(os.environ.get("MERGE_GATE_CERT_READ_BACKOFF_S", "2.0"))
+
+# Trust this round's own status=1 certify() receipt as proof the cert binds the
+# head, skipping the registry re-read entirely (there's no read to 429). DEFAULT
+# ON. Trade-off: unlike a fresh read, it can't observe a chain reorg that orphans
+# the certify() tx between the receipt and the merge — a rare, non-attacker
+# robustness gap that self-heals (the leader re-attests next round). Set to 0 to
+# force the authoritative (retrying) read on every merge.
+_TRUST_ATTEST_RECEIPT = os.environ.get(
+    "MERGE_GATE_TRUST_ATTEST_RECEIPT", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 def _attest_gas_fields(w3: Any) -> dict:
     """EIP-1559 (type-2) gas fields for the attest tx, with a legacy fallback.
@@ -1046,7 +1068,9 @@ def _pr_touches_ci(owner: str, repo: str, pr_number: int) -> bool:
     return any((f.get("filename") or "").startswith(".github/") for f in files)
 
 
-def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
+def _onchain_cert_binds(
+    head_sha: str, round_id: str | None, *, attest_confirmed_sha: str | None = None,
+) -> bool:
     """Leader's OWN authority check: does a quorum cert on-chain bind this head SHA?
 
     Asserts exists AND commitHash == keccak(utf8(lowercase head_sha)) AND
@@ -1054,31 +1078,104 @@ def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
     common case — the leader attests immediately before merging), then falls back
     to getChampion(round_id) if latest has already moved past this round. The PR
     body/comments are NEVER an input — only the on-chain record.
+
+    Transient RPC failures on the read (registry unreadable, 429/timeout/5xx from
+    the public BT-EVM endpoint) are RETRIED with exponential backoff before the
+    gate fail-closes — the attest has already landed on-chain by now, so a
+    rate-limited read must not discard a certified win. A read that SUCCEEDS but
+    does not bind — or reports quorum < 1 — is a DEFINITIVE negative and returns
+    immediately, never retried: the gate stays fail-closed against an uncertified
+    head regardless of RPC weather.
+
+    ``attest_confirmed_sha`` is the head this round's certify() tx just wrote with
+    a status=1 receipt (verified in attest_champion_on_chain). certify() is
+    contract-enforced quorum, so a successful receipt IS proof the cert exists and
+    binds ``_str_to_bytes32(commit_hash)`` with approvalCount >= quorum. When its
+    on-chain commitHash byte-encoding equals ``target``, we trust that receipt and
+    SKIP the registry re-read entirely — the exact read that 429s on the public
+    BT-EVM endpoint. It is set ONLY on a confirmed attest (tx_hash != None) for
+    this same SHA; any mismatch, or no attest, falls through to the authoritative
+    (retrying) read below. Gated by MERGE_GATE_TRUST_ATTEST_RECEIPT (default on).
     """
-    reg = _read_champion_registry()
-    if reg is None:
-        logger.error("merge gate: ChampionRegistry unreadable — refusing merge")
-        return False
     target = _str_to_bytes32(head_sha.strip().lower())  # == keccak(utf8(head_sha))
-    try:
-        quorum = int(reg.functions.getQuorumRequired().call())
-        if quorum < 1:
-            logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+
+    # Fast path: skip the RPC entirely when this round's own attest already
+    # confirmed this head on-chain (see attest_confirmed_sha above) — the merge is
+    # resilient to a rate-limited read-back because there is no read to rate-limit.
+    # Compare with the SAME byte derivation the on-chain bind + the read use
+    # (_str_to_bytes32), NOT a lowercased string == : _str_to_bytes32 does not
+    # lowercase a non-64-char value, so a case/format-skewed attest_confirmed_sha
+    # that would NOT actually bind on-chain must NOT short-circuit — it falls
+    # through to the authoritative read. Equivalent to the read's commitHash check.
+    if (
+        _TRUST_ATTEST_RECEIPT
+        and attest_confirmed_sha
+        and _str_to_bytes32(attest_confirmed_sha) == target
+    ):
+        logger.info(
+            "merge gate: head %s confirmed by this round's on-chain attest receipt "
+            "(status=1 certify) — skipping registry re-read", head_sha,
+        )
+        return True
+
+    # A missing registry address / RPC URL is a PERSISTENT config error, never a
+    # transient RPC blip — refuse immediately rather than burning the whole
+    # backoff budget on every finalize (retrying a misconfig can never succeed).
+    # Mirrors the env gate in _read_champion_registry (CHAMPION_REGISTRY_964 +
+    # BITTENSOR_EVM_RPC_URL) so it stays a fast, definitive refusal.
+    if not os.environ.get("CHAMPION_REGISTRY_964", "").strip() or not os.environ.get(
+        "BITTENSOR_EVM_RPC_URL", ""
+    ).strip():
+        logger.error("merge gate: ChampionRegistry env unconfigured — refusing merge")
+        return False
+
+    def _binds(rec: Any, quorum: int) -> bool:
+        # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
+        # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7]).
+        # A successful read that yields an empty/malformed record (e.g. a
+        # never-certified round decodes to a zero-tuple, or None) DOES NOT BIND —
+        # a definitive negative, NOT a transient RPC error to retry on.
+        try:
+            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
+        except (TypeError, IndexError, ValueError):
             return False
 
-        def _binds(rec: Any) -> bool:
-            # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
-            # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7])
-            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
-
-        if _binds(reg.functions.getLatestChampion().call()):
-            return True
-        if round_id:
-            return _binds(reg.functions.getChampion(_str_to_bytes32(round_id)).call())
-        return False
-    except Exception as exc:
-        logger.error("merge gate: on-chain cert read failed: %s — refusing merge", exc)
-        return False
+    attempts = max(1, _CERT_READ_ATTEMPTS)
+    last_exc: Any = None
+    for attempt in range(attempts):
+        try:
+            reg = _read_champion_registry()
+            if reg is None:
+                # Provider/registry could not be built — transient (RPC down /
+                # rate-limited). Raise into the retry path rather than fail-close.
+                raise ConnectionError("ChampionRegistry unreadable")
+            quorum = int(reg.functions.getQuorumRequired().call())
+            if quorum < 1:
+                logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+                return False  # DEFINITIVE — read succeeded
+            if _binds(reg.functions.getLatestChampion().call(), quorum):
+                return True
+            if round_id and _binds(
+                reg.functions.getChampion(_str_to_bytes32(round_id)).call(), quorum
+            ):
+                return True
+            # Reads succeeded; the cert genuinely does not bind this head — a
+            # DEFINITIVE negative, not an RPC blip. Refuse without retrying.
+            return False
+        except Exception as exc:  # noqa: BLE001 — transient RPC failure: retry with backoff
+            last_exc = exc
+            if attempt < attempts - 1:
+                wait = _CERT_READ_BACKOFF_S * (2 ** attempt)
+                logger.warning(
+                    "merge gate: cert read attempt %d/%d failed (%s) — retrying in %.1fs",
+                    attempt + 1, attempts, exc, wait,
+                )
+                time.sleep(wait)
+    logger.error(
+        "merge gate: on-chain cert read failed after %d attempt(s): %s — refusing merge",
+        attempts, last_exc,
+    )
+    return False
 
 
 def merge_miner_pr_when_certified(
@@ -1086,6 +1183,7 @@ def merge_miner_pr_when_certified(
     expected_head_sha: str,
     *,
     round_id: str | None = None,
+    attest_confirmed_sha: str | None = None,
 ) -> bool:
     """Squash-merge the miner's fork PR ONLY after the leader's OWN on-chain check.
 
@@ -1140,6 +1238,7 @@ def merge_miner_pr_when_certified(
         )
         return _publish_certified_tree_despite_pr(
             owner, repo, int(pr_number), certified, round_id,
+            attest_confirmed_sha=attest_confirmed_sha,
         )
 
     # 2) CI-disarm guard.
@@ -1148,7 +1247,7 @@ def merge_miner_pr_when_certified(
         return False
 
     # 3) The authority: on-chain quorum cert must bind this exact head SHA.
-    if not _onchain_cert_binds(live_head, round_id):
+    if not _onchain_cert_binds(live_head, round_id, attest_confirmed_sha=attest_confirmed_sha):
         logger.error(
             "merge gate: no on-chain quorum cert binds head %s (round %s) — refusing merge",
             live_head, round_id,
@@ -1174,6 +1273,8 @@ def _publish_certified_tree_despite_pr(
     pr_number: int,
     certified_sha: str,
     round_id: str | None,
+    *,
+    attest_confirmed_sha: str | None = None,
 ) -> bool:
     """Land a certified PUBLIC win whose PR drifted or closed post-certification.
 
@@ -1198,7 +1299,9 @@ def _publish_certified_tree_despite_pr(
     """
     if not certified_sha:
         return False
-    if not _onchain_cert_binds(certified_sha, round_id):
+    if not _onchain_cert_binds(
+        certified_sha, round_id, attest_confirmed_sha=attest_confirmed_sha,
+    ):
         logger.error(
             "merge gate: no on-chain quorum cert binds certified SHA %s (round %s) "
             "— refusing drift-fallback publish",
@@ -1295,6 +1398,7 @@ def publish_private_champion_when_certified(
     *,
     private_repo: str,
     repo_token: str,
+    attest_confirmed_sha: str | None = None,
 ) -> bool:
     """Finalize a PRIVATE-submission champion onto canonical ``main`` (leak-on-win).
 
@@ -1364,7 +1468,7 @@ def publish_private_champion_when_certified(
 
     # 2) THE authority: on-chain quorum cert must bind this exact SHA (the
     # cert's commit_hash is the private head SHA — same check as the public path).
-    if not _onchain_cert_binds(target, round_id):
+    if not _onchain_cert_binds(target, round_id, attest_confirmed_sha=attest_confirmed_sha):
         logger.error(
             "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
             target, round_id,
@@ -1690,6 +1794,11 @@ def on_champion_adopted_pr(
     # status check. Public: cross-fork squash-merge pinned to the resolved head.
     # Private: clone the miner's tree at the certified head and push it to
     # canonical main (GitHub can't cross-repo merge a private PR).
+    # A successful attest (tx_hash != None ⟺ certify() receipt status==1 for this
+    # commit_hash) is itself on-chain proof the cert binds this SHA with quorum —
+    # hand it to the merge gate so it skips the registry re-read that 429s. None
+    # when attest was skipped/failed ⇒ the gate does its authoritative read.
+    _attest_confirmed = commit_hash if tx_hash else None
     if _is_private:
         if not (_private_repo and _repo_token):
             logger.error(
@@ -1702,12 +1811,14 @@ def on_champion_adopted_pr(
             round_id,
             private_repo=_private_repo,
             repo_token=_repo_token,
+            attest_confirmed_sha=_attest_confirmed,
         )
     else:
         merged = merge_miner_pr_when_certified(
             _pr_number,
             commit_hash,
             round_id=round_id,
+            attest_confirmed_sha=_attest_confirmed,
         )
     if merged:
         # The winner is on main now → every OTHER open submission PR replaces the
