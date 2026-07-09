@@ -174,6 +174,18 @@ _ATTEST_RECEIPT_POLL_LATENCY_S = float(
     os.environ.get("ATTEST_RECEIPT_POLL_LATENCY_S", "3.0")
 )
 
+# Merge-gate cert-read resilience. By the time the merge gate re-reads the
+# ChampionRegistry to confirm a quorum cert binds the head SHA, the attest has
+# ALREADY landed on-chain — so a transient 429/timeout on that READ must not
+# throw away a certified, already-attested win (the merge_failed churn: attest
+# succeeds, cert-read 429s on the public BT-EVM endpoint, merge refused, champion
+# frozen; diagnosed live 2026-07-09). Retry the read with exponential backoff
+# before fail-closing. A read that SUCCEEDS but does not bind (or quorum < 1) is
+# a DEFINITIVE negative and is never retried — the gate stays fail-closed against
+# an uncertified head. Env-tunable, same discipline as the attest retry.
+_CERT_READ_ATTEMPTS = int(os.environ.get("MERGE_GATE_CERT_READ_ATTEMPTS", "4"))
+_CERT_READ_BACKOFF_S = float(os.environ.get("MERGE_GATE_CERT_READ_BACKOFF_S", "2.0"))
+
 
 def _attest_gas_fields(w3: Any) -> dict:
     """EIP-1559 (type-2) gas fields for the attest tx, with a legacy fallback.
@@ -1054,31 +1066,75 @@ def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
     common case — the leader attests immediately before merging), then falls back
     to getChampion(round_id) if latest has already moved past this round. The PR
     body/comments are NEVER an input — only the on-chain record.
+
+    Transient RPC failures on the read (registry unreadable, 429/timeout/5xx from
+    the public BT-EVM endpoint) are RETRIED with exponential backoff before the
+    gate fail-closes — the attest has already landed on-chain by now, so a
+    rate-limited read must not discard a certified win. A read that SUCCEEDS but
+    does not bind — or reports quorum < 1 — is a DEFINITIVE negative and returns
+    immediately, never retried: the gate stays fail-closed against an uncertified
+    head regardless of RPC weather.
     """
-    reg = _read_champion_registry()
-    if reg is None:
-        logger.error("merge gate: ChampionRegistry unreadable — refusing merge")
-        return False
     target = _str_to_bytes32(head_sha.strip().lower())  # == keccak(utf8(head_sha))
-    try:
-        quorum = int(reg.functions.getQuorumRequired().call())
-        if quorum < 1:
-            logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+
+    # A missing registry address / RPC URL is a PERSISTENT config error, never a
+    # transient RPC blip — refuse immediately rather than burning the whole
+    # backoff budget on every finalize (retrying a misconfig can never succeed).
+    # Mirrors the env gate in _read_champion_registry (CHAMPION_REGISTRY_964 +
+    # BITTENSOR_EVM_RPC_URL) so it stays a fast, definitive refusal.
+    if not os.environ.get("CHAMPION_REGISTRY_964", "").strip() or not os.environ.get(
+        "BITTENSOR_EVM_RPC_URL", ""
+    ).strip():
+        logger.error("merge gate: ChampionRegistry env unconfigured — refusing merge")
+        return False
+
+    def _binds(rec: Any, quorum: int) -> bool:
+        # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
+        # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7]).
+        # A successful read that yields an empty/malformed record (e.g. a
+        # never-certified round decodes to a zero-tuple, or None) DOES NOT BIND —
+        # a definitive negative, NOT a transient RPC error to retry on.
+        try:
+            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
+        except (TypeError, IndexError, ValueError):
             return False
 
-        def _binds(rec: Any) -> bool:
-            # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
-            # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7])
-            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
-
-        if _binds(reg.functions.getLatestChampion().call()):
-            return True
-        if round_id:
-            return _binds(reg.functions.getChampion(_str_to_bytes32(round_id)).call())
-        return False
-    except Exception as exc:
-        logger.error("merge gate: on-chain cert read failed: %s — refusing merge", exc)
-        return False
+    attempts = max(1, _CERT_READ_ATTEMPTS)
+    last_exc: Any = None
+    for attempt in range(attempts):
+        try:
+            reg = _read_champion_registry()
+            if reg is None:
+                # Provider/registry could not be built — transient (RPC down /
+                # rate-limited). Raise into the retry path rather than fail-close.
+                raise ConnectionError("ChampionRegistry unreadable")
+            quorum = int(reg.functions.getQuorumRequired().call())
+            if quorum < 1:
+                logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+                return False  # DEFINITIVE — read succeeded
+            if _binds(reg.functions.getLatestChampion().call(), quorum):
+                return True
+            if round_id and _binds(
+                reg.functions.getChampion(_str_to_bytes32(round_id)).call(), quorum
+            ):
+                return True
+            # Reads succeeded; the cert genuinely does not bind this head — a
+            # DEFINITIVE negative, not an RPC blip. Refuse without retrying.
+            return False
+        except Exception as exc:  # noqa: BLE001 — transient RPC failure: retry with backoff
+            last_exc = exc
+            if attempt < attempts - 1:
+                wait = _CERT_READ_BACKOFF_S * (2 ** attempt)
+                logger.warning(
+                    "merge gate: cert read attempt %d/%d failed (%s) — retrying in %.1fs",
+                    attempt + 1, attempts, exc, wait,
+                )
+                time.sleep(wait)
+    logger.error(
+        "merge gate: on-chain cert read failed after %d attempt(s): %s — refusing merge",
+        attempts, last_exc,
+    )
+    return False
 
 
 def merge_miner_pr_when_certified(
