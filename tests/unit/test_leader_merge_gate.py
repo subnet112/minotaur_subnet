@@ -50,6 +50,12 @@ def _registry(monkeypatch, quorum=4, *, head=SHA, approvals=4, exists=True, late
     monkeypatch.setattr(sr, "_read_champion_registry", lambda: fake)
 
 
+@pytest.fixture(autouse=True)
+def _instant_cert_retry(monkeypatch):
+    """Zero the merge-gate cert-read backoff so retry tests don't real-sleep."""
+    monkeypatch.setattr(sr, "_CERT_READ_BACKOFF_S", 0.0)
+
+
 # ── _onchain_cert_binds ──────────────────────────────────────────────────────
 
 def test_cert_binds_when_latest_matches(monkeypatch):
@@ -81,6 +87,96 @@ def test_cert_refuses_when_registry_unreadable(monkeypatch):
 def test_cert_refuses_when_quorum_zero(monkeypatch):
     _env(monkeypatch); _registry(monkeypatch, quorum=0)
     assert sr._onchain_cert_binds(SHA, "round-1") is False
+
+
+# ── cert-read retry/backoff resilience (429 churn fix) ────────────────────────
+
+def test_cert_read_retries_then_succeeds_on_transient(monkeypatch):
+    """Registry unreadable (RPC down/429) on the first attempts, then recovers →
+    the gate must retry and honor the certified win, not fail-close."""
+    _env(monkeypatch)
+    target = sr._str_to_bytes32(SHA)
+    good = type("R", (), {"functions": _FakeFns(4, _record(target, 4, True))})()
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        return None if calls["n"] < 3 else good  # transient twice, then good
+
+    monkeypatch.setattr(sr, "_read_champion_registry", flaky)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 4)
+    assert sr._onchain_cert_binds(SHA, "round-1") is True
+    assert calls["n"] == 3  # retried past the two transient failures
+
+
+def test_cert_read_retries_on_rpc_exception(monkeypatch):
+    """A 429-style exception from the .call() is transient → retried, not fatal."""
+    _env(monkeypatch)
+    target = sr._str_to_bytes32(SHA)
+
+    class _FlakyFns:
+        def __init__(self): self.n = 0
+        def getQuorumRequired(self):
+            self.n += 1
+            if self.n < 3:
+                raise Exception("429 Client Error: Too Many Requests")
+            return _Call(4)
+        def getLatestChampion(self): return _Call(_record(target, 4, True))
+        def getChampion(self, rid): return _Call(None)
+
+    fake = type("R", (), {"functions": _FlakyFns()})()
+    monkeypatch.setattr(sr, "_read_champion_registry", lambda: fake)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 4)
+    assert sr._onchain_cert_binds(SHA, "round-1") is True
+
+
+def test_cert_definitive_negative_does_not_retry(monkeypatch):
+    """A successful read whose cert simply doesn't bind is DEFINITIVE — refuse on
+    the first read, never burn retries (security: no waiting out a real reject)."""
+    _env(monkeypatch)
+    target = sr._str_to_bytes32(OTHER)  # commit mismatch
+    calls = {"n": 0}
+
+    def once():
+        calls["n"] += 1
+        return type("R", (), {"functions": _FakeFns(4, _record(target, 4, True))})()
+
+    monkeypatch.setattr(sr, "_read_champion_registry", once)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 4)
+    assert sr._onchain_cert_binds(SHA, "round-1") is False
+    assert calls["n"] == 1  # no retry on a definitive negative
+
+
+def test_cert_read_exhausts_retries_then_fail_closed(monkeypatch):
+    """Persistent transient failure across all attempts → fail-closed (refuse)."""
+    _env(monkeypatch)
+    calls = {"n": 0}
+
+    def always_down():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(sr, "_read_champion_registry", always_down)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 3)
+    assert sr._onchain_cert_binds(SHA, "round-1") is False
+    assert calls["n"] == 3  # exhausted all attempts before refusing
+
+
+def test_cert_refuses_fast_on_unconfigured_env(monkeypatch):
+    """A missing registry/RPC env is a persistent config error → refuse WITHOUT
+    burning the retry budget (never even reach _read_champion_registry)."""
+    _env(monkeypatch)
+    monkeypatch.delenv("CHAMPION_REGISTRY_964", raising=False)
+    calls = {"n": 0}
+
+    def _should_not_run():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(sr, "_read_champion_registry", _should_not_run)
+    monkeypatch.setattr(sr, "_CERT_READ_ATTEMPTS", 4)
+    assert sr._onchain_cert_binds(SHA, "round-1") is False
+    assert calls["n"] == 0  # config error refused before any read/retry
 
 
 # ── merge_miner_pr_when_certified ────────────────────────────────────────────
