@@ -18,7 +18,6 @@ sig with a guess than to silently refuse to participate in consensus.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Any
 
