@@ -37,9 +37,12 @@ from eth_hash.auto import keccak
 
 logger = logging.getLogger(__name__)
 
-# Canonical WTAO on Bittensor EVM (chain 964); WETH9-style, 18 decimals.
-DEFAULT_WTAO_964 = "0x9Dc08C6e2BF0F1eeD1E00670f80Df39145529F81"
+# Canonical WTAO on Bittensor EVM (chain 964); WETH9-style, 18 decimals. Sourced
+# from the single wrapped-native token table so the address isn't re-hardcoded.
+from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN as _WRAPPED_NATIVE_TOKEN
+
 DEFAULT_PAYMENT_CHAIN_ID = 964
+DEFAULT_WTAO_964 = _WRAPPED_NATIVE_TOKEN[DEFAULT_PAYMENT_CHAIN_ID]
 DEFAULT_MIN_CONFIRMATIONS = 6
 # ERC-20 Transfer(address,address,uint256) topic0.
 _TRANSFER_TOPIC = "0x" + keccak(b"Transfer(address,address,uint256)").hex()

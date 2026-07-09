@@ -17,15 +17,9 @@ import logging
 import os
 from dataclasses import dataclass
 
+from minotaur_subnet.chains import registry
+
 logger = logging.getLogger(__name__)
-
-
-# Per-chain RPC env var fallback chain. First non-empty wins.
-_CHAIN_RPC_ENV: dict[int, tuple[str, ...]] = {
-    1: ("ETH_RPC_URL", "ANVIL_RPC_URL"),
-    8453: ("BASE_RPC_URL",),
-    964: ("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_FORK_RPC_URL"),
-}
 
 
 @dataclass(frozen=True)
@@ -60,11 +54,7 @@ class ContractPresenceError(RuntimeError):
 
 
 def _resolve_rpc(chain_id: int) -> str | None:
-    for var in _CHAIN_RPC_ENV.get(chain_id, ()):
-        value = os.environ.get(var, "").strip()
-        if value:
-            return value
-    return None
+    return registry.check_rpc(chain_id) or None
 
 
 def verify_required_contracts(*, timeout_s: float = 10.0) -> list[str]:
@@ -92,7 +82,8 @@ def verify_required_contracts(*, timeout_s: float = 10.0) -> list[str]:
 
         rpc = _resolve_rpc(check.chain_id)
         if not rpc:
-            fallback_names = _CHAIN_RPC_ENV.get(check.chain_id, ())
+            _cspec = registry.spec(check.chain_id)
+            fallback_names = _cspec.check_rpc_envs if _cspec is not None else ()
             errors.append(
                 f"{check.label}: {check.env_var} is set but no RPC is configured for "
                 f"chain {check.chain_id} (set one of: {', '.join(fallback_names) or 'n/a'})"

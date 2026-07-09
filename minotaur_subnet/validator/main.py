@@ -321,32 +321,19 @@ class AppIntentsValidator:
         except Exception as exc:
             logger.warning("BridgeRegistry unavailable: %s", exc)
 
-        # Connect to Anvil for real simulation if available (multi-chain)
+        # Connect to Anvil for real simulation if available (multi-chain). The
+        # sim + upstream maps are derived from the chain registry (chains/wiring.py),
+        # the SAME builder the api uses — this unifies the two entry points (the
+        # validator previously omitted Bittensor-EVM and the ETH_SIM fork).
+        from minotaur_subnet.chains import wiring as chain_wiring
         simulator = None
-        anvil_url = os.environ.get("ANVIL_RPC_URL")
-        base_url = os.environ.get("BASE_RPC_URL")
-        base_sim_url = os.environ.get("BASE_SIM_RPC_URL") or base_url
-        sim_rpc_urls: dict[int, str] = {}
-        if anvil_url:
-            sim_rpc_urls[31337] = anvil_url
-            sim_rpc_urls[1] = anvil_url
-        if base_sim_url:
-            sim_rpc_urls[8453] = base_sim_url
+        sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
 
         # Upstream RPCs (same endpoints anvil containers fork from) so
         # AnvilSimulator can advance the fork to current upstream head
         # before each simulation. Without this, anvil_reset is a no-op
         # and sims run against stale fork-time state.
-        upstream_rpc_urls: dict[int, str] = {}
-        eth_upstream = (os.environ.get("ETH_UPSTREAM_RPC_URL") or "").strip()
-        if eth_upstream:
-            upstream_rpc_urls[1] = eth_upstream
-        base_upstream = (os.environ.get("BASE_UPSTREAM_RPC_URL") or "").strip()
-        if base_upstream:
-            upstream_rpc_urls[8453] = base_upstream
-        btevm_upstream = (os.environ.get("BITTENSOR_EVM_UPSTREAM_RPC_URL") or "").strip()
-        if btevm_upstream:
-            upstream_rpc_urls[964] = btevm_upstream
+        upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
 
         if sim_rpc_urls:
             try:
@@ -363,17 +350,11 @@ class AppIntentsValidator:
             except Exception as exc:
                 logger.warning("MultiChainSimulator init failed: %s", exc)
 
-        # Baseline solver for live validator quotes / plan generation.
+        # Baseline solver for live validator quotes / plan generation. Boot RPCs +
+        # chain set from the registry (same builder as the api).
         solver = None
-        rpc_urls: dict[int, str] = {}
-        chain_ids: list[int] = []
-        if anvil_url:
-            rpc_urls[31337] = anvil_url
-            rpc_urls[1] = anvil_url
-            chain_ids.extend([1, 31337])
-        if base_url:
-            rpc_urls[8453] = base_url
-            chain_ids.append(8453)
+        rpc_urls: dict[int, str] = chain_wiring.boot_rpc_urls()
+        chain_ids: list[int] = chain_wiring.runtime_chain_ids()
         # FORCE_SOLVER_IMAGE (operator break-glass) wins over GENESIS_SOLVER_IMAGE.
         solver = None
         from minotaur_subnet.harness.runtime_solver import resolve_boot_solver_image
