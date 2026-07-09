@@ -162,6 +162,17 @@ _ATTEST_GAS_LIMIT = 500_000
 # BT-EVM tip floor (mirrors the deploy path, #556) so a node reporting ~0 tip
 # doesn't underprice the attest.
 _ATTEST_TIP_FLOOR_WEI = 500_000_000  # 0.5 gwei
+# Receipt-poll cadence for the BT-EVM attest wait. web3.py defaults to 0.1s,
+# which fires ~10 eth_getTransactionReceipt/sec while a ~12s-block BT-EVM tx
+# mines — a self-inflicted burst (~120 calls/attempt × 3 retries) that trips
+# the public RPC's per-IP rate limit (429 → attest skipped → merge gate refuses
+# → champion freeze; diagnosed live 2026-07-09, with the official
+# lite.chain.opentensor.ai endpoint healthy for a normal caller). At 3s we poll
+# ~4×/block — plenty to catch the receipt promptly, ~30× less RPC load.
+# Env-tunable for other BT-EVM block times.
+_ATTEST_RECEIPT_POLL_LATENCY_S = float(
+    os.environ.get("ATTEST_RECEIPT_POLL_LATENCY_S", "3.0")
+)
 
 
 def _attest_gas_fields(w3: Any) -> dict:
@@ -337,7 +348,12 @@ def attest_champion_on_chain(
 
         signed = w3.eth.account.sign_transaction(tx, relayer_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        # poll_latency: don't hammer the RPC with getTransactionReceipt at the
+        # web3 default 0.1s (see _ATTEST_RECEIPT_POLL_LATENCY_S) — that burst is
+        # what 429s us on the public BT-EVM endpoint.
+        receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash, timeout=60, poll_latency=_ATTEST_RECEIPT_POLL_LATENCY_S,
+        )
 
         if receipt["status"] != 1:
             # Surface the on-chain revert reason rather than failing silently.
