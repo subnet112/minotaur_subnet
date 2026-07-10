@@ -804,3 +804,87 @@ class TestVetoOpenDecision:
     def test_phase_exists_wins_over_no_peers(self):
         # An already-open phase is never re-opened, regardless of peers.
         assert self._d(phase_exists=True, has_peers=False) == veto_wire.VETO_SKIP
+
+
+# ── Phase-1 enforcement mode reader ──
+
+class TestEnforceMode:
+    def _mode(self, monkeypatch, val):
+        if val is None:
+            monkeypatch.delenv("DISTRIBUTED_VETO_ENFORCE", raising=False)
+        else:
+            monkeypatch.setenv("DISTRIBUTED_VETO_ENFORCE", val)
+        return veto_wire.distributed_veto_enforce_mode()
+
+    def test_default_off(self, monkeypatch):
+        assert self._mode(monkeypatch, None) == veto_wire.VETO_ENFORCE_OFF
+
+    def test_explicit_off(self, monkeypatch):
+        assert self._mode(monkeypatch, "0") == veto_wire.VETO_ENFORCE_OFF
+        assert self._mode(monkeypatch, "off") == veto_wire.VETO_ENFORCE_OFF
+
+    def test_shadow(self, monkeypatch):
+        assert self._mode(monkeypatch, "shadow") == veto_wire.VETO_ENFORCE_SHADOW
+        assert self._mode(monkeypatch, "SHADOW") == veto_wire.VETO_ENFORCE_SHADOW
+
+    def test_hard(self, monkeypatch):
+        assert self._mode(monkeypatch, "hard") == veto_wire.VETO_ENFORCE_HARD
+        assert self._mode(monkeypatch, "enforce") == veto_wire.VETO_ENFORCE_HARD
+
+    def test_unknown_is_off(self, monkeypatch):
+        # A typo must never silently enable enforcement — fail safe to off.
+        assert self._mode(monkeypatch, "garbage") == veto_wire.VETO_ENFORCE_OFF
+
+
+# ── Phase-1 pre-certify gate decision (block | allow | wait) ──
+
+class TestVetoGateDecision:
+    def _g(self, **kw):
+        base = dict(resolved=True, n_veto=0, would_gate_confirmed=None,
+                    reverify_enabled=True, current_epoch=100, veto_deadline_epoch=110)
+        base.update(kw)
+        return veto_wire.veto_gate_decision(**base)
+
+    def test_block_on_confirmed_veto(self):
+        # The ONLY blocking path: leader reverify reproduced the violation.
+        assert self._g(n_veto=2, would_gate_confirmed=True) == veto_wire.GATE_BLOCK
+
+    def test_confirmed_blocks_even_past_deadline(self):
+        # A confirmed veto blocks regardless of the clock (block check is first).
+        assert self._g(n_veto=1, would_gate_confirmed=True,
+                       current_epoch=999) == veto_wire.GATE_BLOCK
+
+    def test_clean_round_allows(self):
+        assert self._g(resolved=True, n_veto=0) == veto_wire.GATE_ALLOW
+
+    def test_reverify_discarded_allows(self):
+        # Veto claimed, but the leader could NOT reproduce it → discarded → allow.
+        assert self._g(n_veto=3, would_gate_confirmed=False) == veto_wire.GATE_ALLOW
+
+    def test_wait_while_unresolved_in_window(self):
+        assert self._g(resolved=False, current_epoch=100,
+                       veto_deadline_epoch=110) == veto_wire.GATE_WAIT
+
+    def test_wait_for_reverify_when_veto_unconfirmed_in_window(self):
+        # Phase resolved with a claimed veto, but reverify hasn't landed yet
+        # (would_gate_confirmed is None) — wait for confirmation, not block.
+        assert self._g(resolved=True, n_veto=2,
+                       would_gate_confirmed=None) == veto_wire.GATE_WAIT
+
+    def test_reverify_off_allows_unconfirmed_veto_without_stalling(self):
+        # Reverify disabled → an unconfirmed claim can NEVER become a confirmed
+        # block (LD8), so allow now rather than stall the round to the deadline.
+        assert self._g(resolved=True, n_veto=2, would_gate_confirmed=None,
+                       reverify_enabled=False) == veto_wire.GATE_ALLOW
+
+    def test_fail_open_past_deadline_unresolved(self):
+        # Slow/unreachable fleet, phase never resolved by the interior deadline →
+        # FAIL-OPEN (allow), never stall adoption.
+        assert self._g(resolved=False, current_epoch=111,
+                       veto_deadline_epoch=110) == veto_wire.GATE_ALLOW
+
+    def test_fail_open_past_deadline_unconfirmed_veto(self):
+        # A veto was claimed but reverify never confirmed it by the deadline →
+        # fail-open (a raw/unconfirmed claim must never block — LD8).
+        assert self._g(resolved=True, n_veto=2, would_gate_confirmed=None,
+                       current_epoch=111, veto_deadline_epoch=110) == veto_wire.GATE_ALLOW

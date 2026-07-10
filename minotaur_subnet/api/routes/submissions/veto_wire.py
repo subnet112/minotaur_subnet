@@ -110,6 +110,14 @@ VETO_OPEN = "open"
 VETO_DEFER = "defer"
 VETO_SKIP = "skip"
 
+# Phase-1 enforcement modes + pre-certify gate actions.
+VETO_ENFORCE_OFF = "off"
+VETO_ENFORCE_SHADOW = "shadow"
+VETO_ENFORCE_HARD = "hard"
+GATE_WAIT = "wait"
+GATE_ALLOW = "allow"
+GATE_BLOCK = "block"
+
 
 def veto_open_decision(
     *,
@@ -179,6 +187,73 @@ def distributed_veto_enabled() -> bool:
     return (os.environ.get("DISTRIBUTED_VETO", "1").strip().lower()) in (
         "1", "true", "yes", "on",
     )
+
+
+def distributed_veto_enforce_mode() -> str:
+    """Phase-1 enforcement mode — DEFAULT ``off``. CONSENSUS-RELEVANT.
+
+    - ``off``    — observe-only (Phase 0): the veto never gates adoption.
+    - ``shadow`` — the pre-certify gate runs for real (holds the round in CERTIFYING
+      until the veto phase resolves or fails open, exactly like ``hard``) but on a
+      confirmed veto only LOGS "would block" and certifies anyway. Zero veto-abort
+      risk (it never blocks, and fails open before the reaper) — it validates the
+      pre-certify timing and the would-block rate under the enforcement ordering,
+      at the cost of the same per-round latency ``hard`` adds.
+    - ``hard``   — a LEADER-CONFIRMED veto ABORTS certification.
+
+    Blocking is ONLY ever on ``would_gate_confirmed`` (the leader's own reverify
+    reproduced the violation), NEVER on a raw follower claim (LD8). Enforcement
+    therefore requires ``DISTRIBUTED_VETO_REVERIFY=1`` to have teeth — with
+    reverify off, ``would_gate_confirmed`` is always None and the gate fail-opens
+    every round (safe but toothless)."""
+    raw = os.environ.get("DISTRIBUTED_VETO_ENFORCE", "off").strip().lower()
+    if raw in ("hard", "enforce", "block", "on"):
+        return VETO_ENFORCE_HARD
+    if raw in ("shadow", "dry", "dryrun", "observe-gate"):
+        return VETO_ENFORCE_SHADOW
+    return VETO_ENFORCE_OFF
+
+
+def veto_gate_decision(
+    *,
+    resolved: bool,
+    n_veto: int,
+    would_gate_confirmed: bool | None,
+    reverify_enabled: bool,
+    current_epoch: int,
+    veto_deadline_epoch: int,
+) -> str:
+    """Phase-1 pre-certify gate: ``block`` | ``allow`` | ``wait``. PURE — no I/O,
+    exhaustively unit-tested, mirroring ``veto_open_decision`` / ``resolve_phase``.
+
+    - BLOCK only on a leader-CONFIRMED veto (``would_gate_confirmed is True`` — the
+      leader's reverify reproduced the regression). A raw/unconfirmed follower
+      claim NEVER blocks (LD8).
+    - FAIL-OPEN: once ``current_epoch`` passes the (interior) veto deadline without
+      a confirmed block, ALLOW — a slow/unreachable fleet, or a reverify that
+      hasn't finished, must never stall champion adoption ("absence of evidence ⇒
+      proceed"). The caller passes a deadline strictly interior to the round's
+      certification deadline, so fail-open certifies rather than tripping the
+      reaper's ``certification_deadline_elapsed``.
+    - WAIT while the phase is still resolving, or a veto is claimed and its reverify
+      is enabled-but-not-yet-landed — but only until the deadline. If reverify is
+      DISABLED, an unconfirmed claim can never become a confirmed block (LD8), so
+      it ALLOWS immediately rather than stalling for a confirmation that isn't
+      coming.
+    """
+    if would_gate_confirmed is True:
+        return GATE_BLOCK
+    if current_epoch > veto_deadline_epoch:
+        return GATE_ALLOW  # fail-open: past the interior deadline, no confirmed block
+    if not resolved:
+        return GATE_WAIT
+    # Resolved. A claimed veto whose reverify is enabled but hasn't landed yet
+    # (would_gate_confirmed is None) waits for confirmation; everything else —
+    # no veto, reverify off (unconfirmable claim), or reverify ran and confirmed
+    # nothing — allows.
+    if n_veto > 0 and would_gate_confirmed is None and reverify_enabled:
+        return GATE_WAIT
+    return GATE_ALLOW
 
 
 # ─────────────────────────────────────────────────────────────────────────────
