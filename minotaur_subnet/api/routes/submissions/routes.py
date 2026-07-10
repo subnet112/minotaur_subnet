@@ -1707,6 +1707,11 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     # Current-metagraph UID for the submitting hotkey (null when the metagraph
     # hasn't synced or the hotkey has since deregistered) — display only.
     d["miner_uid"] = _hotkey_to_uid_map().get(sub.hotkey)
+    # Copycat attribution: status_dict already carries is_copycat + display_name;
+    # resolve the coiner's hotkey → its current UID here (coined_by_hotkey stays
+    # internal). Null when the original coiner has since churned off the metagraph.
+    _coiner = getattr(sub, "coined_by_hotkey", None)
+    d["coined_by_uid"] = _hotkey_to_uid_map().get(_coiner) if _coiner else None
     # Feedback report (P1): cheap read+shape of the already-persisted benchmark
     # detail + aggregate-vs-champion. Best-effort — never break /status on it.
     try:

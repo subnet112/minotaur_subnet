@@ -128,6 +128,14 @@ class StatusResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
+    # Copycat naming (first-to-coin). display_name carries the "-copycat" suffix
+    # when a DIFFERENT hotkey reused a name another hotkey coined first;
+    # coined_by_uid is the original coiner's current-metagraph UID (null if that
+    # hotkey has since churned). Cosmetic attribution — no scoring effect. See
+    # harness/submission_store solver-name coinage.
+    display_name: str | None = None
+    is_copycat: bool = False
+    coined_by_uid: int | None = None
     # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
     # any single named region (module / function / class body) in the submission's
     # in-tree Python — a golf-immune proxy for worst entanglement. Measured and
