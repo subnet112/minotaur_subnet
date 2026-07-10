@@ -118,6 +118,11 @@ GATE_WAIT = "wait"
 GATE_ALLOW = "allow"
 GATE_BLOCK = "block"
 
+# Cap on per-order violation rows surfaced in the observe summary (miner report
+# feedback) — keeps the persisted round record bounded (confirmed violations are
+# themselves ≤ VETO_VERIFY_BUDGET_ORDERS; this bounds the claimed set too).
+_MAX_REPORT_VIOLATIONS = 24
+
 
 def veto_open_decision(
     *,
@@ -1272,6 +1277,31 @@ def observe_summary(
 
     counts = phase_observe_counts(phase)
     ran = bool(reverify and reverify.get("ran"))
+    confirmed_map = (reverify or {}).get("orders") or {}
+    # Bounded per-order feedback: the specific orders followers flagged as hard
+    # regressions (deduped by order_id, capped), each tagged with whether the
+    # LEADER reproduced it (``confirmed``). This is what surfaces on the miner's
+    # submission report — "you regressed on THESE orders the followers checked,
+    # outside the leader's draw." Confirmed-first so the blocking orders lead.
+    seen: set[str] = set()
+    violations: list[dict[str, Any]] = []
+    for r in phase.responses.values():
+        for v in r.violations:
+            if v.order_id in seen:
+                continue
+            seen.add(v.order_id)
+            violations.append({
+                "order_id": v.order_id,
+                "kind": v.kind,
+                "champ_raw": v.champ_raw,
+                "chal_raw": v.chal_raw,
+                "confirmed": bool(confirmed_map.get(v.order_id, False)),
+            })
+            if len(violations) >= _MAX_REPORT_VIOLATIONS:
+                break
+        if len(violations) >= _MAX_REPORT_VIOLATIONS:
+            break
+    violations.sort(key=lambda x: (not x["confirmed"], x["order_id"]))
     return {
         "round_id": round_id,
         "candidate_submission_id": phase.candidate_submission_id,
@@ -1280,4 +1310,5 @@ def observe_summary(
         "reverify": reverify or {"ran": False},
         "would_gate_claims": counts["n_veto"] > 0,
         "would_gate_confirmed": (reverify.get("confirmed", 0) > 0) if ran else None,
+        "violations": violations,
     }

@@ -303,3 +303,71 @@ def test_app_status_marks_scoring_mode():
     data = client.get(f"/v1/apps/{app_id}/status").json()
     assert data["scoring_mode"] == "relative"
     assert "champion_score" in data  # legacy field still present
+
+
+# ── distributed-veto verdict attached to the finalist's report ───────────────
+
+_VETO_CONFIRMED = {
+    "round_id": "round-e1-n1",
+    "candidate_submission_id": "sub-1",
+    "resolution": "all_terminal",
+    "n_assignments": 3, "n_responses": 3, "n_ok": 1, "n_veto": 2,
+    "would_gate_claims": True, "would_gate_confirmed": True,
+    "reverify": {"ran": True, "confirmed": 1, "discarded": 3, "orders": {"ord_x": True}},
+    "violations": [
+        {"order_id": "ord_x", "kind": "catastrophic",
+         "champ_raw": "1000", "chal_raw": "900", "confirmed": True},
+        {"order_id": "ord_y", "kind": "dropped",
+         "champ_raw": "500", "chal_raw": "", "confirmed": False},
+    ],
+}
+
+
+def test_report_attaches_veto_when_finalist():
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-1", relative=_STORED_DETHRONE),
+        reason=None, veto_observe=_VETO_CONFIRMED,
+    )
+    dv = rpt["distributed_veto"]
+    assert dv["confirmed_regression"] is True
+    assert dv["followers_checked"] == 3
+    assert dv["veto"] == 2 and dv["ok"] == 1
+    assert len(dv["violations"]) == 2
+    assert dv["violations"][0]["confirmed"] is True  # confirmed-first ordering
+
+
+def test_report_no_veto_block_for_non_finalist():
+    # veto_observe is for a DIFFERENT candidate (this sub lost the round) → the
+    # follower slices never checked THIS submission → no veto block.
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-OTHER", relative=_STORED_DETHRONE),
+        reason=None, veto_observe=_VETO_CONFIRMED,
+    )
+    assert "distributed_veto" not in rpt
+
+
+def test_report_no_veto_block_while_opened():
+    opened = {**_VETO_CONFIRMED, "resolution": "opened"}
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-1", relative=_STORED_DETHRONE),
+        reason=None, veto_observe=opened,
+    )
+    assert "distributed_veto" not in rpt
+
+
+def test_report_no_veto_arg_is_backward_compatible():
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-1", relative=_STORED_DETHRONE), reason=None,
+    )
+    assert "distributed_veto" not in rpt
+
+
+def test_render_md_shows_confirmed_regression():
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-1", relative=_STORED_DETHRONE),
+        reason=None, won=True, veto_observe=_VETO_CONFIRMED,
+    )
+    md = render_report_md(rpt, submission_id="sub-1")
+    assert "leader-confirmed regression" in md
+    assert "ord_x" in md          # the confirmed violation order is shown
+    assert "1000" in md and "900" in md  # champ vs chal wei
