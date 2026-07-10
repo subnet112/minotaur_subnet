@@ -337,3 +337,33 @@ class TestObserveSummary:
         s = observe_summary("round-e9-n1", ph, "all_terminal", None)
         blob = json.dumps(s)  # must serialize
         assert "per_intent" not in blob and "raw_output" not in blob
+
+
+def test_observe_summary_includes_confirmed_first_violations():
+    # observe_summary surfaces the per-order regressions followers flagged, each
+    # tagged confirmed (leader reproduced), confirmed-first for the miner report.
+    a, _ = _assignment(order_ids=("ord_a", "ord_b"))
+    ph = _phase([a])
+    ph.responses["0xv1"] = _resp(a, verdict=VERDICT_VETO, violations=[
+        SliceViolation("ord_b", "catastrophic", "1000", "800"),
+        SliceViolation("ord_a", "dropped", "1", "0"),
+    ])
+    reverify = {"ran": True, "confirmed": 1, "discarded": 1,
+                "orders": {"ord_a": True, "ord_b": False}}
+    s = observe_summary("round-x", ph, "all_terminal", reverify)
+    v = s["violations"]
+    assert {x["order_id"] for x in v} == {"ord_a", "ord_b"}
+    assert v[0]["order_id"] == "ord_a" and v[0]["confirmed"] is True   # confirmed-first
+    assert v[1]["confirmed"] is False
+    assert v[0]["champ_raw"] == "1" and v[0]["chal_raw"] == "0"
+
+
+def test_observe_summary_no_reverify_marks_unconfirmed():
+    a, _ = _assignment(order_ids=("ord_a",))
+    ph = _phase([a])
+    ph.responses["0xv1"] = _resp(a, verdict=VERDICT_VETO, violations=[
+        SliceViolation("ord_a", "dropped", "1", "0"),
+    ])
+    s = observe_summary("round-x", ph, "all_terminal", None)  # reverify not run
+    assert s["would_gate_confirmed"] is None
+    assert s["violations"][0]["confirmed"] is False
