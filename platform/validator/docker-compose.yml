@@ -68,12 +68,18 @@ services:
     environment:
       UPSTREAMS: "eth=${ETH_UPSTREAM_RPC_URL:-},base=${BASE_UPSTREAM_RPC_URL:-},btevm=${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
       LISTEN_PORT: "8650"
+      # Warm the cache across restarts so a recreate (Watchtower/update.sh) skips
+      # the cold re-fetch storm to the archive provider. Immutable data, so a
+      # reload is always correct. Empty = off; default snapshots onto the volume.
+      FORK_CACHE_PERSIST_PATH: "${FORK_CACHE_PERSIST_PATH:-/var/cache/fork-cache/snapshot.json}"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8650/health')\" || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
+    volumes:
+      - fork-cache-data:/var/cache/fork-cache
     # minotaur ONLY — the sealed benchmark-sandbox never reaches this (the
     # solver's reads go through the block-pin proxy at 172.30.0.5).
     networks: [minotaur]
@@ -679,6 +685,9 @@ services:
 
 volumes:
   store-data:
+  # Fork-cache snapshot (immutable historical state) — survives restarts so the
+  # cache warm-loads instead of cold-refetching from the archive provider.
+  fork-cache-data:
 
 networks:
   # Main bridge — validator, api, anvils, docker-socket-proxy.

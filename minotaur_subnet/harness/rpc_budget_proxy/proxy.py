@@ -79,6 +79,7 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
+from ._persist import SnapshotScheduler, load_snapshot
 from .cost_table import batch_cost, request_cost
 from .rewrite_table import classify, rewrite_single
 
@@ -234,6 +235,33 @@ class PinCache:
             "entries": sum(len(g) for g in self._blocks.values()),
         }
 
+    def snapshot(self) -> list[list[Any]]:
+        """On-loop copy for persistence: ``[[chain, block_hex, {key: result}], ...]``
+        in LRU order (JSON has no tuple keys, so the ``(chain, block)`` key is
+        flattened into the row). Inner groups are copied so the JSON encode can
+        run in a worker thread without racing further writes."""
+        return [[chain, block, dict(group)]
+                for (chain, block), group in self._blocks.items()]
+
+    def restore(self, payload: Any) -> int:
+        """Rebuild ``_blocks`` from :meth:`snapshot` output, honouring the current
+        ``max_blocks`` / ``max_entries_per_block`` bounds; returns the entry count
+        loaded. Tolerant of a malformed payload (bad rows are skipped) — worst
+        case a partial warm cache, never a crash."""
+        self._blocks = {}
+        if not isinstance(payload, list):
+            return 0
+        for row in payload[-self.max_blocks:]:  # keep the most-recent block groups
+            if not (isinstance(row, list) and len(row) == 3):
+                continue
+            chain, block, group = row
+            if not isinstance(group, dict):
+                continue
+            if len(group) > self.max_entries_per_block:
+                group = dict(list(group.items())[:self.max_entries_per_block])
+            self._blocks[(str(chain), str(block))] = group
+        return sum(len(g) for g in self._blocks.values())
+
 
 class Session:
     """Per-benchmark-session meter.
@@ -354,6 +382,16 @@ class BudgetProxy:
         # False = RPC_PROXY_RESPONSE_CACHE=0 rollback: skip both caches, forward
         # everything (metering/pinning unaffected — they never depended on them).
         self.response_cache_enabled = bool(response_cache_enabled)
+        # Optional disk persistence for the pin cache: warm-load on startup and
+        # snapshot on a cadence so the api's rm+run proxy recreate (on every
+        # update) skips the cold re-fetch storm. Inert unless the env path is set.
+        self._pin_persist_path = os.environ.get(
+            "RPC_PROXY_PIN_CACHE_PERSIST_PATH", "").strip()
+        self._pin_snapshotter = SnapshotScheduler(
+            self._pin_persist_path,
+            _env_int("RPC_PROXY_PIN_CACHE_PERSIST_INTERVAL", 300),
+            self._pin_cache.snapshot,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -369,8 +407,18 @@ class BudgetProxy:
             self.default_mode,
             self.default_budget,
         )
+        if self._pin_snapshotter.enabled and self.response_cache_enabled:
+            payload = load_snapshot(self._pin_persist_path)
+            if payload is not None:
+                n = self._pin_cache.restore(payload)
+                logger.info(
+                    "pin-cache warm-loaded %d entries from %s",
+                    n, self._pin_persist_path,
+                )
+            await self._pin_snapshotter.start()
 
     async def _on_cleanup(self, _app: web.Application) -> None:
+        await self._pin_snapshotter.stop()  # final snapshot + cancel periodic task
         if self._client is not None:
             await self._client.close()
             self._client = None

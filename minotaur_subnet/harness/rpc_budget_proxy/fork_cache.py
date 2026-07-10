@@ -48,7 +48,10 @@ startup — an api-managed cache would deadlock a fresh host).
 
 Env: ``UPSTREAMS`` (``chain=url,...`` — same format as the budget proxy),
 ``LISTEN_PORT`` (default 8650), ``FORK_CACHE_DISABLE=1`` (forward everything),
-``FORK_CACHE_MAX_ENTRIES`` / ``FORK_CACHE_MAX_RESULT_BYTES`` bounds.
+``FORK_CACHE_MAX_ENTRIES`` / ``FORK_CACHE_MAX_RESULT_BYTES`` bounds,
+``FORK_CACHE_PERSIST_PATH`` (empty = off; a path = snapshot the cache there and
+warm-load it on startup, so a restart skips the cold re-fetch storm) /
+``FORK_CACHE_PERSIST_INTERVAL`` (snapshot cadence in seconds, default 300).
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
+from ._persist import SnapshotScheduler, load_snapshot
 from .proxy import _content_type_only, _parse_upstreams_env, _safe_parse
 from .rewrite_table import BLOCK_PARAM_INDEX
 
@@ -166,6 +170,15 @@ class ForkCache:
         self.misses = 0
         self.uncacheable = 0
         self._client: ClientSession | None = None
+        # Optional disk persistence: warm-load a snapshot on startup and re-write
+        # it on a cadence, so a restart skips the cold re-fetch storm. Inert
+        # unless FORK_CACHE_PERSIST_PATH is set (see ._persist).
+        self._persist_path = os.environ.get("FORK_CACHE_PERSIST_PATH", "").strip()
+        self._snapshotter = SnapshotScheduler(
+            self._persist_path,
+            _env_int("FORK_CACHE_PERSIST_INTERVAL", 300),
+            self._snapshot_payload,
+        )
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -179,8 +192,14 @@ class ForkCache:
             "fork_cache started: chains=%s max_entries=%d disabled=%s",
             list(self.upstreams), self.max_entries, self.disabled,
         )
+        if self._snapshotter.enabled:
+            payload = load_snapshot(self._persist_path)
+            if payload is not None:
+                self._restore(payload)
+            await self._snapshotter.start()
 
     async def _on_cleanup(self, _app: web.Application) -> None:
+        await self._snapshotter.stop()  # final snapshot + cancel the periodic task
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -207,6 +226,24 @@ class ForkCache:
         while len(self._cache) >= self.max_entries:
             self._cache.pop(next(iter(self._cache)))
         self._cache[key] = result
+
+    # -- persistence ---------------------------------------------------------
+
+    def _snapshot_payload(self) -> dict[str, Any]:
+        """On-loop shallow copy handed to the snapshotter. Cheap (one dict copy)
+        and safe to serialize in a thread: values are immutable JSON results."""
+        return dict(self._cache)
+
+    def _restore(self, payload: Any) -> None:
+        """Warm-load a snapshot, honouring the CURRENT ``max_entries`` bound
+        (keep the most-recently-inserted entries = LRU tail)."""
+        if not isinstance(payload, dict):
+            return
+        items = list(payload.items())
+        if len(items) > self.max_entries:
+            items = items[-self.max_entries:]
+        self._cache = dict(items)
+        logger.info("fork_cache warm-loaded %d entries from snapshot", len(self._cache))
 
     # -- request handling ----------------------------------------------------
 
@@ -348,6 +385,7 @@ class ForkCache:
             "uncacheable": self.uncacheable,
             "entries": len(self._cache),
             "disabled": self.disabled,
+            "persist": self._snapshotter.enabled,
         })
 
     def build_app(self) -> web.Application:
