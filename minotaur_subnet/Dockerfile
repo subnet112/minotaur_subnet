@@ -243,6 +243,14 @@ COPY --chown=minotaur:minotaur platform/ /home/minotaur/app/platform/
 # non-root process can write store.json without a runtime chown.
 RUN mkdir -p /data && chown -R minotaur:minotaur /data
 
+# Writable mount points for the RPC-cache disk snapshots (fork-cache +
+# block-pin proxy). A fresh named volume inherits its mount-point's ownership,
+# so — exactly like /data above — pre-chown to uid 1000 or the non-root process
+# can't write the snapshot and persistence silently no-ops. See
+# minotaur_subnet/harness/rpc_budget_proxy/_persist.py.
+RUN mkdir -p /var/cache/fork-cache /var/cache/pin-proxy \
+    && chown -R minotaur:minotaur /var/cache/fork-cache /var/cache/pin-proxy
+
 # Bake the git SHA the image was built from into an env var so the
 # api + validator daemon can echo it back in /health. Operators (and us
 # in incident response) can then see which version is running in each
