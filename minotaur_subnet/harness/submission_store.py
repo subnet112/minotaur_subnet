@@ -24,6 +24,7 @@ import logging
 import os
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -166,6 +167,56 @@ _DETAILS_STRIPPABLE_STATUSES = frozenset({
 })
 
 
+# ── Solver-name coinage (copycat labeling) ──────────────────────────────────
+# A solver's display name comes from the miner-authored ``metadata().name`` —
+# unvalidated free text — so multiple hotkeys can submit the same name (usually
+# a forked/replayed solver that kept the original's name). The store keeps a
+# first-to-coin registry keyed by NORMALIZED name (see SubmissionStore._names):
+# the first hotkey to submit a distinct, non-boilerplate name owns it; a later
+# DIFFERENT hotkey reusing it is flagged is_copycat. Purely cosmetic — the name
+# feeds no scoring/adoption path, this only drives attribution in status views.
+
+_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
+
+
+def _normalize_solver_name(name: str | None) -> str:
+    """Canonicalize a solver display name for coinage/copycat comparison.
+
+    Applies NFKC (folds width/compatibility variants), strips zero-width
+    characters, casefolds, and collapses whitespace, so ``"King"``, ``"king "``
+    and ``"k\u200bing"`` all map to the same key. Returns ``""`` for empty/None,
+    which is never coinable. NOTE: this does not merge cross-script confusables
+    (e.g. a Cyrillic homoglyph) — that would need a Unicode-TR39 skeleton map and
+    is a deliberate follow-up; copycat labeling is best-effort, not airtight.
+    """
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKC", str(name))
+    s = "".join(ch for ch in s if ch not in _ZERO_WIDTH)
+    return " ".join(s.casefold().split())
+
+
+# Names shipped in the SDK example + canonical solver template. Every unmodified
+# fork carries one, so they are NON-COINABLE: no miner can "own" boilerplate and
+# no honest fork is flagged a copycat for keeping the placeholder. Copycat
+# labeling only applies to distinctive, miner-coined names.
+_UNCOINABLE_NAMES = frozenset(
+    _normalize_solver_name(n)
+    for n in ("my-swap-solver", "baseline-swap-solver", "unknown")
+)
+
+
+def _exempt_names() -> frozenset[str]:
+    """Non-coinable names: the shipped boilerplate plus any operator additions
+    from ``SOLVER_NAME_UNCOINABLE`` (comma-separated, normalized)."""
+    extra = os.environ.get("SOLVER_NAME_UNCOINABLE", "").strip()
+    if not extra:
+        return _UNCOINABLE_NAMES
+    return _UNCOINABLE_NAMES | frozenset(
+        _normalize_solver_name(n) for n in extra.split(",") if n.strip()
+    )
+
+
 @dataclass
 class Submission:
     """A solver submission and its lifecycle state."""
@@ -207,6 +258,13 @@ class Submission:
     solver_path: str | None = None  # Local path to solver .py (source submissions)
     solver_name: str | None = None
     solver_version: str | None = None
+
+    # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
+    # free text, so the store coins each distinct non-boilerplate name to the
+    # first hotkey that submits it; a later DIFFERENT hotkey reusing it sets
+    # is_copycat=True and coined_by_hotkey=<original owner>. Cosmetic only.
+    is_copycat: bool = False
+    coined_by_hotkey: str | None = None
 
     # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
     # any single named region (module / function / class body) across the
@@ -255,6 +313,14 @@ class Submission:
     # Local path to cloned repo (transient, not persisted)
     _repo_path: str | None = field(default=None, repr=False)
 
+    @property
+    def display_name(self) -> str | None:
+        """Solver name for display, with a ``-copycat`` suffix when this
+        submission reused a name a different hotkey coined first."""
+        if self.solver_name and self.is_copycat:
+            return f"{self.solver_name}-copycat"
+        return self.solver_name
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to API-friendly dict."""
         return {
@@ -281,6 +347,8 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "is_copycat": self.is_copycat,
+            "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
@@ -308,6 +376,8 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "display_name": self.display_name,
+            "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
@@ -386,11 +456,32 @@ class SubmissionStore:
         self._lock_fd: int | None = None
         self._lock_depth = 0
         self._persist_mtime_ns: int | None = None
+        # Solver-name coinage registry (copycat labeling). Kept in a sibling
+        # sidecar next to the main JSON — like the tokens sidecar — so it
+        # survives restarts AND submission pruning (name ownership must outlive
+        # the coining submission). normalized_name -> {owner_hotkey, coined_at,
+        # coined_submission_id, display}.
+        self._names: dict[str, dict[str, Any]] = {}
+        self._names_path = (
+            persist_path.with_name(persist_path.name + ".names")
+            if persist_path is not None
+            else None
+        )
+        self._names_mtime_ns: int | None = None
 
         if persist_path and persist_path.exists():
             self._load()
         if self._tokens_path is not None and self._tokens_path.exists():
             self._load_tokens()
+        if self._names_path is not None:
+            if self._names_path.exists():
+                self._load_names()
+            else:
+                # First start after this ships: seed ownership from existing
+                # history so the earliest submitter of each name is credited,
+                # not whoever submits next. Deterministic, so concurrent
+                # first-run workers converge on the same registry.
+                self._backfill_names()
 
     @_write_locked
     def create(
@@ -577,6 +668,8 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            is_copycat=bool(record.get("is_copycat", False)),
+            coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
             content_fingerprint=record.get("content_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
@@ -947,19 +1040,48 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
+    @_write_locked
     def set_solver_info(
         self,
         submission_id: str,
         name: str | None = None,
         version: str | None = None,
     ) -> None:
-        """Set solver metadata extracted during screening."""
-        self._maybe_reload()
+        """Set solver metadata from screening and apply first-to-coin labeling.
+
+        The display name (``metadata().name``) is self-declared free text, so a
+        distinct, non-boilerplate name is coined to the FIRST hotkey that submits
+        it; a later DIFFERENT hotkey reusing it is flagged ``is_copycat`` with
+        ``coined_by_hotkey`` set to the original owner. Cosmetic only — the name
+        feeds no scoring/adoption path. Write-locked so two workers can't both
+        coin one name; the registry lives in the ``.names`` sidecar (survives
+        restarts and submission pruning). The ``_write_guard`` already reloaded
+        ``_submissions`` from disk, so the fetched record is fresh.
+        """
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_name = name
         sub.solver_version = version
+        # Recompute copycat state from scratch each call, so a re-screen with a
+        # changed name re-evaluates cleanly rather than sticking to a stale flag.
+        sub.is_copycat = False
+        sub.coined_by_hotkey = None
+        norm = _normalize_solver_name(name)
+        if norm and norm not in _exempt_names():
+            self._maybe_reload_names()
+            entry = self._names.get(norm)
+            if entry is None:
+                self._names[norm] = {
+                    "owner_hotkey": sub.hotkey,
+                    "coined_at": time.time(),
+                    "coined_submission_id": submission_id,
+                    "display": name,
+                }
+                self._persist_names()
+            elif entry.get("owner_hotkey") != sub.hotkey:
+                sub.is_copycat = True
+                sub.coined_by_hotkey = entry.get("owner_hotkey")
         sub.updated_at = time.time()
         self._persist()
 
@@ -1260,6 +1382,81 @@ class SubmissionStore:
         if self._tokens_mtime_ns is None or current_mtime_ns > self._tokens_mtime_ns:
             self._load_tokens()
 
+    # ── Solver-name coinage sidecar ──────────────────────────────────────────
+
+    def _persist_names(self) -> None:
+        """Atomically rewrite the coinage registry sidecar.
+
+        Kept OUTSIDE the main submissions JSON on purpose: that file is a flat
+        ``{id: submission}`` map (a stray top-level key breaks the loader) and is
+        pruned, whereas name ownership must be permanent. Same atomic temp-write
+        + ``os.replace`` as the other sidecars.
+        """
+        if self._names_path is None:
+            return
+        try:
+            self._names_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._names_path.with_name(
+                f".{self._names_path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.write_text(json.dumps(self._names, indent=2))
+            os.replace(tmp_path, self._names_path)
+            self._names_mtime_ns = self._names_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to persist solver-name registry: %s", exc)
+
+    def _load_names(self) -> None:
+        """Load the coinage registry sidecar."""
+        if self._names_path is None:
+            return
+        try:
+            data = json.loads(self._names_path.read_text())
+            self._names = {str(k): dict(v) for k, v in data.items()}
+            self._names_mtime_ns = self._names_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to load solver-name registry: %s", exc)
+
+    def _maybe_reload_names(self) -> None:
+        """Re-read the coinage sidecar when another process updated it."""
+        if self._names_path is None or not self._names_path.exists():
+            return
+        try:
+            current_mtime_ns = self._names_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if self._names_mtime_ns is None or current_mtime_ns > self._names_mtime_ns:
+            self._load_names()
+
+    def _backfill_names(self) -> None:
+        """Seed the registry from existing submissions (earliest coiner wins).
+
+        Runs once when the sidecar doesn't exist yet, so the true originator of a
+        name owns it rather than crediting whoever submits first after this
+        ships. Seeds ownership ONLY; it does not retroactively re-flag historical
+        submissions (that would rewrite the whole store) — labeling is
+        forward-looking from here.
+        """
+        if self._names_path is None:
+            return
+        exempt = _exempt_names()
+        registry: dict[str, dict[str, Any]] = {}
+        for s in sorted(
+            self._submissions.values(),
+            key=lambda x: (x.created_at or 0.0, x.submission_id),
+        ):
+            norm = _normalize_solver_name(s.solver_name)
+            if not norm or norm in exempt or norm in registry:
+                continue
+            registry[norm] = {
+                "owner_hotkey": s.hotkey,
+                "coined_at": s.created_at or 0.0,
+                "coined_submission_id": s.submission_id,
+                "display": s.solver_name,
+            }
+        self._names = registry
+        self._persist_names()
+        logger.info("Backfilled %d coined solver name(s) from history", len(registry))
+
     # ── Cross-process write lock ─────────────────────────────────────────────
 
     @contextmanager
@@ -1414,6 +1611,8 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    is_copycat=bool(d.get("is_copycat", False)),
+                    coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
                     content_fingerprint=d.get("content_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
