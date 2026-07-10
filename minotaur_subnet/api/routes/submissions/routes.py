@@ -1717,12 +1717,20 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         # scalars — and the champion-score / threshold / dethrone-margin lookups
         # that fed them — were removed. See ``report.py`` module docstring.
         reason = d.get("rejection_reason")
-        if not reason and sub.round_id:
+        # One round lookup for both the abort reason and the distributed-veto
+        # verdict (the follower-slice check). veto_observe attaches to the report
+        # only when this submission was the finalist the followers checked.
+        _veto_observe = None
+        if sub.round_id:
             rs = get_round_store().get_round(sub.round_id)
-            if rs is not None and getattr(rs, "abort_reason", None):
-                reason = rs.abort_reason
+            if rs is not None:
+                if not reason and getattr(rs, "abort_reason", None):
+                    reason = rs.abort_reason
+                _veto_observe = getattr(rs, "veto_observe", None)
 
-        d["report"] = build_submission_report(sub, reason=reason)
+        d["report"] = build_submission_report(
+            sub, reason=reason, veto_observe=_veto_observe,
+        )
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)
         d["report"] = None
