@@ -2813,6 +2813,83 @@ async def initialize(ctx: ServerContext) -> dict:
                 if not current.finalist_submission_id:
                     logger.warning("Cannot certify: no finalist")
                     return False
+
+                # ── Phase-1 distributed-veto ENFORCEMENT gate ────────────────
+                # off = observe-only (Phase 0), unchanged. shadow/hard gate certify
+                # on the LEADER-CONFIRMED veto (would_gate_confirmed). The veto phase
+                # is driven to resolution WHILE CERTIFYING before this point (the
+                # pre-certify drive in the tick); here we poll its persisted verdict
+                # and hold the round in CERTIFYING (return False) until it resolves
+                # or the interior deadline fails us open. NEVER blocks on a raw
+                # follower claim; fail-open on timeout/slow-fleet.
+                from minotaur_subnet.api.routes.submissions import veto_wire as _vw
+                _mode = _vw.distributed_veto_enforce_mode()
+                if _mode != _vw.VETO_ENFORCE_OFF:
+                    _now = _current_solver_round_epoch(ctx)
+                    # Fail-open deadline STRICTLY interior to the round's decision
+                    # deadline, so a timeout certifies (at ddl) BEFORE the
+                    # certification-deadline reaper aborts (at ddl+1) — a slow veto
+                    # must never become a certification_deadline_elapsed abort of a
+                    # legitimate champion. Clamp defensively (the phase's own
+                    # deadline floor can round up to ddl on a late-opening round).
+                    _ddl = current.decision_deadline_epoch
+                    _interior = (int(_ddl) - 1) if _ddl is not None else (_now + 20)
+                    _phase = _vw.REGISTRY.get(current.round_id)
+                    if _phase is None and not _veto_peer_urls():
+                        # No reachable followers → no veto coverage is possible →
+                        # allow now; a peerless/solo leader must not stall every
+                        # round waiting out the window.
+                        _gate = _vw.GATE_ALLOW
+                    else:
+                        if _phase is None:
+                            # Phase not (re)opened yet THIS session (fresh round, or
+                            # a restart dropped the in-memory registry). NEVER act on
+                            # a persisted summary without a live phase — a stale
+                            # would_gate_confirmed must not block on un-re-verified
+                            # state. Treat as pending; the pre-certify drive (re)opens
+                            # it, bounded by the interior deadline (fail-open).
+                            _veto_ddl, _resolved, _n_veto, _wgc = _interior, False, 0, None
+                        else:
+                            _veto_ddl = min(int(_phase.deadline_epoch), _interior)
+                            _fresh = round_store.get_round(current.round_id)
+                            _summary = _fresh.veto_observe if _fresh is not None else None
+                            _resolved = bool(
+                                _summary
+                                and _summary.get("resolution") not in (None, "opened")
+                            )
+                            _n_veto = int(_summary.get("n_veto", 0)) if _summary else 0
+                            _wgc = _summary.get("would_gate_confirmed") if _resolved else None
+                        _gate = _vw.veto_gate_decision(
+                            resolved=_resolved, n_veto=_n_veto, would_gate_confirmed=_wgc,
+                            reverify_enabled=_vw.distributed_veto_reverify_enabled(),
+                            current_epoch=_now, veto_deadline_epoch=_veto_ddl,
+                        )
+                    if _gate == _vw.GATE_WAIT:
+                        return False  # hold in CERTIFYING; re-checked next tick
+                    if _gate == _vw.GATE_BLOCK:
+                        if _mode == _vw.VETO_ENFORCE_HARD:
+                            logger.error(
+                                "[veto-enforce] BLOCK round=%s candidate=%s — "
+                                "leader-confirmed veto; aborting certification",
+                                current.round_id, current.finalist_submission_id,
+                            )
+                            aborted = submissions._abort_solver_round_state(
+                                submissions.AbortRoundRequest(
+                                    round_id=current.round_id, reason="veto_confirmed",
+                                )
+                            )
+                            await _broadcast_round_sync(
+                                "/v1/solver/round/internal/abort",
+                                _abort_sync_payload(aborted), label="abort",
+                            )
+                            return True
+                        logger.warning(
+                            "[veto-enforce] WOULD BLOCK round=%s candidate=%s — "
+                            "leader-confirmed veto (shadow: certifying anyway)",
+                            current.round_id, current.finalist_submission_id,
+                        )
+                    # GATE_ALLOW (or shadow would-block): fall through to certify.
+
                 logger.info(
                     "Attempting certification: round=%s finalist=%s",
                     current.round_id, current.finalist_submission_id,
@@ -3234,6 +3311,23 @@ async def initialize(ctx: ServerContext) -> dict:
                                 await asyncio.sleep(solver_round_poll_interval)
                             continue
 
+                        from minotaur_subnet.api.routes.submissions import (
+                            veto_wire as _vw,
+                        )
+                        _enforce = (
+                            _vw.distributed_veto_enforce_mode() != _vw.VETO_ENFORCE_OFF
+                        )
+                        # Phase-1 enforcement: drive the veto phase to resolution
+                        # WHILE the round is CERTIFYING — BEFORE certify — so the gate
+                        # in _maybe_certify_round can read a real verdict. In
+                        # observe-only mode the phase instead runs post-activate below.
+                        if (
+                            current is not None
+                            and _enforce
+                            and current.status == RoundStatus.CERTIFYING
+                        ):
+                            await _drive_veto_observe(current)
+
                         if current is not None and await _maybe_certify_round(current):
                             continue
 
@@ -3255,7 +3349,9 @@ async def initialize(ctx: ServerContext) -> dict:
                         # QUIET tick (nothing closed/evaluated/certified/activated/
                         # reopened above `continue`d), so it is structurally OFF
                         # the champion-adoption critical path and cannot delay it.
-                        if current is not None:
+                        # In ENFORCE mode the phase is driven pre-certify (above)
+                        # instead, so it is skipped here.
+                        if current is not None and not _enforce:
                             await _drive_veto_observe(current)
 
                         await asyncio.sleep(solver_round_poll_interval)
