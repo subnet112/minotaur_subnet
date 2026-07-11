@@ -371,3 +371,16 @@ def test_render_md_shows_confirmed_regression():
     assert "leader-confirmed regression" in md
     assert "ord_x" in md          # the confirmed violation order is shown
     assert "1000" in md and "900" in md  # champ vs chal wei
+
+
+def test_render_md_veto_block_on_reject_reason():
+    # Mirrors the enforce-gate's block-reject call: reason set (not won),
+    # veto_observe passed → the miner's PR comment carries the veto verdict.
+    rpt = build_submission_report(
+        _sub(_CHAL_INTENT, sid="sub-1", relative=_STORED_DETHRONE),
+        reason="adoption blocked by the distributed burden of proof",
+        veto_observe=_VETO_CONFIRMED,
+    )
+    md = render_report_md(rpt, submission_id="sub-1")
+    assert "leader-confirmed regression" in md
+    assert "ord_x" in md and "champion `1000`" in md
