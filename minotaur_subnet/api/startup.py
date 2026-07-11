@@ -2882,6 +2882,52 @@ async def initialize(ctx: ServerContext) -> dict:
                                 "/v1/solver/round/internal/abort",
                                 _abort_sync_payload(aborted), label="abort",
                             )
+                            # Tell the blocked miner WHY, on their PR — the same
+                            # per-order feedback channel benchmark rejections use.
+                            # A leader-draw win alone can't show it: the report
+                            # carries the round's veto verdict (the specific unseen
+                            # orders the followers checked + the ones the leader
+                            # reproduced). Leader-gated already (we're the certifier);
+                            # BEST-EFFORT — never let feedback break the abort.
+                            try:
+                                _bstore = submissions.get_store()
+                                _bsub = _bstore.get(current.finalist_submission_id)
+                                if (
+                                    _bsub is not None
+                                    and getattr(_bsub, "pr_number", None)
+                                    and _champion_reject_fn is not None
+                                ):
+                                    from minotaur_subnet.api.routes.submissions.report import (  # noqa: E501
+                                        build_submission_report as _brp,
+                                        render_report_md as _rmd,
+                                    )
+                                    _rr = round_store.get_round(current.round_id)
+                                    _bvo = _rr.veto_observe if _rr is not None else None
+                                    _msg = (
+                                        "adoption blocked by the distributed burden of "
+                                        "proof: you beat the leader's benchmark, but "
+                                        "other validators re-checked orders outside the "
+                                        "leader's draw and the leader reproduced a hard "
+                                        "regression (details below)."
+                                    )
+                                    _bmd = _rmd(
+                                        _brp(_bsub, reason=_msg, veto_observe=_bvo),
+                                        submission_id=current.finalist_submission_id,
+                                    )
+                                    try:
+                                        _btok = _bstore.get_repo_token(
+                                            current.finalist_submission_id,
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        _btok = None
+                                    _champion_reject_fn(
+                                        _bsub, _msg, report_md=_bmd, repo_token=_btok,
+                                    )
+                            except Exception as _exc:  # noqa: BLE001 — best-effort
+                                logger.warning(
+                                    "[veto-enforce] block-reject comment failed for "
+                                    "%s: %s", current.finalist_submission_id, _exc,
+                                )
                             return True
                         logger.warning(
                             "[veto-enforce] WOULD BLOCK round=%s candidate=%s — "
