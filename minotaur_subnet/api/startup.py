@@ -2824,16 +2824,36 @@ async def initialize(ctx: ServerContext) -> dict:
                 # follower claim; fail-open on timeout/slow-fleet.
                 from minotaur_subnet.api.routes.submissions import veto_wire as _vw
                 _mode = _vw.distributed_veto_enforce_mode()
-                if _mode != _vw.VETO_ENFORCE_OFF:
+                _gate = _vw.GATE_ALLOW
+                if _mode != _vw.VETO_ENFORCE_OFF and current.decision_deadline_epoch is None:
+                    # Anomalous: a CERTIFYING round with NO decision deadline (a
+                    # leadership handoff / restart-replay / synced close that omitted
+                    # it). Without a deadline the fail-open point can't be bounded to
+                    # a FIXED epoch — a moving fallback would recede every tick and the
+                    # gate would WAIT forever with no reaper rescue (permanent wedge).
+                    # Don't gate a deadline-less round: proceed to certify (fail-open —
+                    # the safe direction; never wedge, never wrong-block).
+                    logger.warning(
+                        "[veto-enforce] round=%s has no decision deadline; "
+                        "skipping veto gate (fail-open)", current.round_id,
+                    )
+                elif _mode != _vw.VETO_ENFORCE_OFF:
                     _now = _current_solver_round_epoch(ctx)
-                    # Fail-open deadline STRICTLY interior to the round's decision
-                    # deadline, so a timeout certifies (at ddl) BEFORE the
-                    # certification-deadline reaper aborts (at ddl+1) — a slow veto
-                    # must never become a certification_deadline_elapsed abort of a
-                    # legitimate champion. Clamp defensively (the phase's own
-                    # deadline floor can round up to ddl on a late-opening round).
+                    # Fail-open deadline, interior to the round's decision deadline,
+                    # so a timeout certifies BEFORE the certification-deadline reaper
+                    # aborts — a slow veto must never become a
+                    # certification_deadline_elapsed abort of a legitimate champion.
+                    # The reaper fires at ddl+1; fail-open at ddl-2 (not ddl-1) leaves
+                    # a TWO-epoch window {ddl-1, ddl} where the gate certifies and the
+                    # reaper is still quiet, so a single ~60s event-loop freeze (the
+                    # documented submission-store / screening-build stalls) that lands
+                    # on one epoch can't flip a fail-open into a reaper abort. Costs
+                    # one epoch of re-verify runway (negligible vs a tens-of-epoch
+                    # window); the streaming re-verify still starts the moment a veto
+                    # arrives (observed 2026-07-11: the old fail-open at the phase's
+                    # follower-response deadline starved the re-verify).
                     _ddl = current.decision_deadline_epoch
-                    _interior = (int(_ddl) - 1) if _ddl is not None else (_now + 20)
+                    _interior = int(_ddl) - 2
                     _phase = _vw.REGISTRY.get(current.round_id)
                     if _phase is None and not _veto_peer_urls():
                         # No reachable followers → no veto coverage is possible →
@@ -2850,7 +2870,12 @@ async def initialize(ctx: ServerContext) -> dict:
                             # it, bounded by the interior deadline (fail-open).
                             _veto_ddl, _resolved, _n_veto, _wgc = _interior, False, 0, None
                         else:
-                            _veto_ddl = min(int(_phase.deadline_epoch), _interior)
+                            # Interior window (ddl-2). Not the phase's own (earlier)
+                            # follower-response deadline: the re-verify runs AFTER
+                            # responses arrive and needs the remaining window to
+                            # confirm. Interior with a two-epoch reaper margin (see
+                            # above), regardless of when the phase opened.
+                            _veto_ddl = _interior
                             _fresh = round_store.get_round(current.round_id)
                             _summary = _fresh.veto_observe if _fresh is not None else None
                             _resolved = bool(
@@ -3054,6 +3079,15 @@ async def initialize(ctx: ServerContext) -> dict:
             # completion. Stored on ctx so the shutdown path can reach it.
             _VETO_REVERIFY_TASKS: set = set()
             ctx.veto_reverify_tasks = _VETO_REVERIFY_TASKS
+            # Per-round STREAMING re-verify state (keyed by round_id):
+            #   covered  — veto-responder EVMs already dispatched to a re-verify
+            #   inflight — a re-verify task is running (one at a time)
+            #   result   — accumulated {ran,planned,confirmed,discarded,orders}
+            #   done     — the terminal observe record has been written
+            # Lets the re-verify start EARLY (per veto as it arrives) yet cover the
+            # FULL claim set before allowing. Pruned to REGISTRY._phases each driver
+            # tick (bounded).
+            _VETO_REVERIFY_STATE: dict = {}
 
             def _veto_peer_urls() -> dict:
                 net = submissions.get_champion_peer_network()
@@ -3152,13 +3186,72 @@ async def initialize(ctx: ServerContext) -> dict:
                     len(assignments), deadline,
                 )
 
-            def _spawn_veto_reverify(round_id, phase, resolution) -> None:
+            def _veto_stream_step(round_id, phase, now) -> None:
+                """Symmetric finalize/dispatch step — run from BOTH the coordinator
+                tick AND each re-verify completion. Consults the round's streaming
+                coverage state and either dispatches a re-verify for the not-yet-
+                covered veto-responders, finalizes the observe record (block on a
+                confirmed violation, or a clean/allow verdict once fully covered),
+                or leaves the round pending (the gate WAITs, fail-open at the
+                interior deadline). Idempotent once ``done``. Never raises into the
+                loop (the outer observe pass swallows)."""
+                from minotaur_subnet.api.routes.submissions import veto_wire
+
+                st = _VETO_REVERIFY_STATE.get(round_id)
+                if st is None or st.get("done"):
+                    return
+                reverify_on = veto_wire.distributed_veto_reverify_enabled()
+                veto_responders = {
+                    evm for evm, r in phase.responses.items() if r.verdict == "veto"
+                }
+                result = st.get("result")
+                confirmed = bool(result and result.get("confirmed", 0) > 0)
+                action, resolution = veto_wire.resolve_phase(phase, now)
+                _resolved = action == "resolve"
+                _act = veto_wire.veto_stream_action(
+                    reverify_enabled=reverify_on, has_veto=bool(veto_responders),
+                    resolved=_resolved, inflight=bool(st.get("inflight")),
+                    uncovered=bool(veto_responders - st["covered"]),
+                    result_present=result is not None, confirmed=confirmed,
+                )
+                if _act == veto_wire.STREAM_SPAWN:
+                    # Dispatch the uncovered responders. Coverage is committed at
+                    # COMPLETION (only for responders actually benched), NOT here —
+                    # a no-op/gapped pass must leave them uncovered so they retry.
+                    # The inflight flag (not coverage) prevents a double spawn.
+                    new = veto_responders - st["covered"]
+                    st["inflight"] = True
+                    _spawn_veto_reverify(round_id, phase, new)
+                    return
+                if _act in (veto_wire.STREAM_WRITE_RESULT, veto_wire.STREAM_WRITE_NONE):
+                    # Terminal. A confirmed block can land mid-phase (resolution not
+                    # yet set) — write a non-"opened" string so the gate sees it
+                    # resolved and blocks now.
+                    res = resolution if _resolved else "reverified"
+                    phase.resolved = True
+                    phase.resolution = res
+                    veto_wire.forget_round_send_state(round_id)
+                    rv = st["result"] if _act == veto_wire.STREAM_WRITE_RESULT else None
+                    summary = veto_wire.observe_summary(round_id, phase, res, rv)
+                    round_store.set_round_veto_observe(round_id, summary)
+                    st["done"] = True
+                    logger.info(
+                        "[distributed-veto] round %s observe (streaming): %s",
+                        round_id, summary,
+                    )
+                # STREAM_PENDING / STREAM_NOOP: leave for the next tick / completion.
+
+            def _spawn_veto_reverify(round_id, phase, include_responders) -> None:
                 """Leader re-verification runs FIRE-AND-FORGET (never on the
                 coordinator's critical path): it benches on the shared sim lock
-                for minutes. On completion it writes the observe summary. The
-                summary is observe-only — it gates nothing — so a background write
-                is safe. Only spawned when the sub-flag is armed AND a real veto
-                exists."""
+                for minutes. STREAMING: dispatched per not-yet-covered veto-
+                responder AS they arrive, so every veto (even a late one) gets the
+                full remaining interior window to confirm before the gate fail-
+                opens. Benches only ``include_responders`` (each veto once). On
+                completion it accumulates the result and re-runs the finalize step,
+                which — under shadow/hard — writes the verdict that GATES
+                certification, so it must reflect the FULL claim set, never a
+                premature partial pass."""
                 from minotaur_subnet.api.routes.submissions import veto_wire
 
                 async def _run():
@@ -3169,17 +3262,57 @@ async def initialize(ctx: ServerContext) -> dict:
                             order_lookup=veto_wire._production_order_lookup,
                             worker_factory=veto_wire._production_worker_factory,
                             pull_image=_pull_image_for_veto,
+                            include_responders=include_responders,
                         )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("[distributed-veto] reverify task failed: %s", exc)
-                    summary = veto_wire.observe_summary(round_id, phase, resolution, reverify)
-                    round_store.set_round_veto_observe(round_id, summary)
-                    logger.info(
-                        "[distributed-veto] round %s observe (reverified): %s",
-                        round_id, summary,
-                    )
+                    _st = _VETO_REVERIFY_STATE.get(round_id)
+                    if _st is not None:
+                        _st["inflight"] = False
+                        _st["result"] = veto_wire.merge_reverify_results(
+                            _st.get("result"), reverify,
+                        )
+                        # Commit coverage PER RESPONDER, and only for a responder
+                        # whose EVERY planned order was actually benched (present in
+                        # reverify["benched"]). A responder whose slice missed
+                        # order-lookup — even co-batched with a peer that benched
+                        # fine (ran=True) — stays UNCOVERED, so the next tick
+                        # re-verifies it, until it benches or the interior deadline
+                        # fails open. Never a silent covered-but-unbenched allow.
+                        _benched = set((reverify or {}).get("benched") or ())
+                        for _evm in include_responders:
+                            _resp = phase.responses.get(_evm)
+                            if _resp is None:
+                                continue
+                            _pids = {
+                                v.order_id
+                                for v in veto_wire.plan_reverification(_resp)
+                            }
+                            if _pids and _pids <= _benched:
+                                _st["covered"].add(_evm)
+                        # Confirmed violation → finalize the BLOCK record NOW,
+                        # idempotently (behind ``done``). Fast (no ≤5s tick wait) and,
+                        # crucially, works even if the round already fail-open certified
+                        # and left CERTIFYING so the tick no longer drives it — the
+                        # observe/would-block record is never lost. NEVER spawns here
+                        # (no tight loop); the tick still handles allow-finalization.
+                        _res = _st.get("result") or {}
+                        if _res.get("confirmed", 0) > 0 and not _st.get("done"):
+                            _r = phase.resolution or "reverified"
+                            phase.resolved = True
+                            phase.resolution = _r
+                            veto_wire.forget_round_send_state(round_id)
+                            _summary = veto_wire.observe_summary(
+                                round_id, phase, _r, _st["result"],
+                            )
+                            round_store.set_round_veto_observe(round_id, _summary)
+                            _st["done"] = True
+                            logger.info(
+                                "[distributed-veto] round %s observe "
+                                "(reverified, confirmed): %s", round_id, _summary,
+                            )
                     _VETO_REVERIFY_TASKS.discard(asyncio.current_task())
 
                 _VETO_REVERIFY_TASKS.add(asyncio.create_task(_run()))
@@ -3222,52 +3355,50 @@ async def initialize(ctx: ServerContext) -> dict:
                         return _sign_internal_round_payload(network, p)
 
                     for round_id, phase in list(veto_wire.REGISTRY._phases.items()):
-                        if phase.resolved:
+                        _st = _VETO_REVERIFY_STATE.setdefault(round_id, {
+                            "covered": set(), "inflight": False,
+                            "result": None, "done": False,
+                        })
+                        # ``done`` = the terminal observe record is written (a
+                        # confirmed block, a fully-covered allow, or a no-veto
+                        # resolution). Until then keep driving the phase across ticks
+                        # — a slow follower's veto still needs re-verifying.
+                        if _st["done"]:
                             continue
-                        responded = set(phase.responses) | set(phase.unsupported)
-                        if network is not None and phase.assignments:
-                            # Parallel + bounded per-peer timeout (15s): a real
-                            # follower ACKs a signed assignment in ~3s idle but
-                            # slower under event-loop load, so 5s falsely timed
-                            # out live sends. A black-hole peer still can't
-                            # serialize-block the loop (parallel gather; runs on
-                            # a quiet tick after certify/activate).
-                            await veto_wire.fan_out_assignments(
-                                phase.assignments, peer_urls=peer_urls,
-                                sign_payload=_sign, exclude=responded,
-                                timeout_s=15.0,
-                            )
-                            for a in phase.assignments:
-                                if veto_wire.consecutive_reject_terminal(
-                                    round_id, a.validator_evm,
-                                ):
-                                    veto_wire.REGISTRY.mark_unsupported(
-                                        round_id, a.validator_evm,
-                                    )
-
-                        action, resolution = veto_wire.resolve_phase(phase, now)
+                        action, _res = veto_wire.resolve_phase(phase, now)
                         if action != "resolve":
-                            continue
+                            # Not yet resolved → keep collecting responses.
+                            responded = set(phase.responses) | set(phase.unsupported)
+                            if network is not None and phase.assignments:
+                                # Parallel + bounded per-peer timeout (15s): a real
+                                # follower ACKs a signed assignment in ~3s idle but
+                                # slower under event-loop load, so 5s falsely timed
+                                # out live sends. A black-hole peer still can't
+                                # serialize-block the loop (parallel gather).
+                                await veto_wire.fan_out_assignments(
+                                    phase.assignments, peer_urls=peer_urls,
+                                    sign_payload=_sign, exclude=responded,
+                                    timeout_s=15.0,
+                                )
+                                for a in phase.assignments:
+                                    if veto_wire.consecutive_reject_terminal(
+                                        round_id, a.validator_evm,
+                                    ):
+                                        veto_wire.REGISTRY.mark_unsupported(
+                                            round_id, a.validator_evm,
+                                        )
+                        # STREAMING re-verify: dispatch per not-yet-covered veto-
+                        # responder as they arrive (each veto gets the full remaining
+                        # interior window to confirm), finalize once the full claim
+                        # set is covered, or block immediately on a confirmation. The
+                        # gate polls the record it writes and fail-opens at ddl-1.
+                        _veto_stream_step(round_id, phase, now)
 
-                        phase.resolved = True
-                        phase.resolution = resolution
-                        veto_wire.forget_round_send_state(round_id)
-                        if (
-                            veto_wire.distributed_veto_reverify_enabled()
-                            and any(
-                                r.verdict == "veto" for r in phase.responses.values()
-                            )
-                        ):
-                            _spawn_veto_reverify(round_id, phase, resolution)
-                        else:
-                            summary = veto_wire.observe_summary(
-                                round_id, phase, resolution, None,
-                            )
-                            round_store.set_round_veto_observe(round_id, summary)
-                            logger.info(
-                                "[distributed-veto] round %s observe: %s",
-                                round_id, summary,
-                            )
+                    # Bound the streaming state to the registry's live phases (itself
+                    # capped): drop entries for rounds the registry has evicted.
+                    for _rid in list(_VETO_REVERIFY_STATE):
+                        if veto_wire.REGISTRY.get(_rid) is None:
+                            _VETO_REVERIFY_STATE.pop(_rid, None)
                 except Exception as exc:  # noqa: BLE001 — observe must never break the loop
                     logger.warning(
                         "[distributed-veto] observe pass failed (ignored): %s", exc,

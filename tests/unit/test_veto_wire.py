@@ -888,3 +888,94 @@ class TestVetoGateDecision:
         # fail-open (a raw/unconfirmed claim must never block — LD8).
         assert self._g(resolved=True, n_veto=2, would_gate_confirmed=None,
                        current_epoch=111, veto_deadline_epoch=110) == veto_wire.GATE_ALLOW
+
+
+class TestVetoStreamAction:
+    """The streaming re-verify orchestrator: decides, per phase, whether to
+    dispatch a re-verify for uncovered veto-responders, finalize the observe
+    record (block on confirmed / allow once fully covered), or stay pending."""
+
+    def _a(self, **kw):
+        base = dict(reverify_enabled=True, has_veto=True, resolved=False,
+                    inflight=False, uncovered=True, result_present=False,
+                    confirmed=False)
+        base.update(kw)
+        return veto_wire.veto_stream_action(**base)
+
+    # ── Confirmed short-circuits everything (block NOW, even mid-phase) ──────
+    def test_confirmed_writes_result_mid_phase(self):
+        # A leader-reproduced violation is authoritative: finalize (block) now,
+        # regardless of resolution/coverage/in-flight.
+        assert self._a(confirmed=True, resolved=False, inflight=True,
+                       uncovered=True) == veto_wire.STREAM_WRITE_RESULT
+
+    def test_confirmed_writes_result_when_resolved(self):
+        assert self._a(confirmed=True, resolved=True) \
+            == veto_wire.STREAM_WRITE_RESULT
+
+    # ── Early / streaming dispatch as vetos arrive ──────────────────────────
+    def test_first_veto_spawns_early(self):
+        # A veto exists, not yet covered, none in flight → dispatch NOW (don't
+        # wait for the phase to resolve). This is the streaming start.
+        assert self._a(resolved=False, uncovered=True, inflight=False) \
+            == veto_wire.STREAM_SPAWN
+
+    def test_late_veto_spawns_completing_pass(self):
+        # A later follower's veto (new uncovered responder) at resolution → spawn
+        # a completing re-verify so its claim is benched too.
+        assert self._a(resolved=True, uncovered=True, inflight=False) \
+            == veto_wire.STREAM_SPAWN
+
+    def test_no_second_spawn_while_inflight(self):
+        # One re-verify at a time: uncovered but a bench is running → wait.
+        assert self._a(resolved=False, uncovered=True, inflight=True) \
+            == veto_wire.STREAM_NOOP
+
+    def test_covered_unresolved_waits(self):
+        # All arrived vetos dispatched, phase not resolved → await more/resolution.
+        assert self._a(resolved=False, uncovered=False, inflight=False) \
+            == veto_wire.STREAM_NOOP
+
+    def test_no_veto_unresolved_noop(self):
+        assert self._a(resolved=False, has_veto=False, uncovered=False) \
+            == veto_wire.STREAM_NOOP
+
+    # ── Finalize / no-veto ──────────────────────────────────────────────────
+    def test_resolved_no_veto_writes_none(self):
+        assert self._a(resolved=True, has_veto=False, uncovered=False) \
+            == veto_wire.STREAM_WRITE_NONE
+
+    def test_resolved_reverify_disabled_writes_none(self):
+        # Claimed veto but reverify off → terminal no-reverify summary (as before).
+        assert self._a(resolved=True, reverify_enabled=False, uncovered=False) \
+            == veto_wire.STREAM_WRITE_NONE
+
+    def test_resolved_fully_covered_and_landed_writes_result(self):
+        # Full claim set covered, re-verify landed, nothing confirmed → allow.
+        assert self._a(resolved=True, uncovered=False, inflight=False,
+                       result_present=True) == veto_wire.STREAM_WRITE_RESULT
+
+    def test_resolved_inflight_pending(self):
+        # Resolved but a re-verify still running → hold (gate WAITs, fail-open at
+        # the interior deadline); never allow on a partial result.
+        assert self._a(resolved=True, uncovered=False, inflight=True) \
+            == veto_wire.STREAM_PENDING
+
+    def test_resolved_uncovered_inflight_pending(self):
+        # Covered set incomplete AND a bench in flight → pending (don't finalize).
+        assert self._a(resolved=True, uncovered=True, inflight=True) \
+            == veto_wire.STREAM_PENDING
+
+    def test_resolved_covered_no_result_pending(self):
+        # Covered, not in flight, but no landed result yet (e.g. all benches were
+        # no-ops) → pending rather than a premature allow.
+        assert self._a(resolved=True, uncovered=False, inflight=False,
+                       result_present=False) == veto_wire.STREAM_PENDING
+
+    def test_never_allows_a_late_veto_uncovered(self):
+        # REGRESSION GUARD: a resolved round with an uncovered veto-responder must
+        # NEVER finalize-allow — it must spawn/hold until that veto is benched.
+        for inflight in (True, False):
+            assert self._a(resolved=True, uncovered=True, inflight=inflight,
+                           result_present=True, confirmed=False) \
+                in (veto_wire.STREAM_SPAWN, veto_wire.STREAM_PENDING)
