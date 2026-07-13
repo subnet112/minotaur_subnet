@@ -213,6 +213,13 @@ class SolverChampionResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
+    # Copycat naming (first-to-coin). display_name carries the "-copycat" suffix
+    # when this champion's solver name was first coined by a DIFFERENT hotkey;
+    # coined_by_uid is that original coiner's current-metagraph UID. Resolved from
+    # the champion's submission at read time (null/false if it has been pruned).
+    display_name: str | None = None
+    is_copycat: bool = False
+    coined_by_uid: int | None = None
     hotkey: str | None = None
     activated_round_id: str | None = None
     activated_epoch: int = 0
