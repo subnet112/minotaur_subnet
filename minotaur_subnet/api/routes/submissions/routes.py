@@ -1690,10 +1690,23 @@ async def list_solver_rounds(
 @router.get("/solver/champion", response_model=SolverChampionResponse)
 async def get_solver_champion() -> SolverChampionResponse:
     """Return the last activated/adopted champion snapshot."""
+    store = get_store()
     round_store = get_round_store()
-    _sync_round_incumbent_from_submission_store(round_store, get_store())
+    _sync_round_incumbent_from_submission_store(round_store, store)
     champion = round_store.get_active_champion()
-    return SolverChampionResponse(**champion.to_dict())
+    d = champion.to_dict()
+    # Copycat attribution for the champion. The ChampionSnapshot is
+    # consensus-serialized, so we DON'T add fields to it — we resolve the
+    # already-computed flag from the champion's submission at read time
+    # (null/false if that submission has since been pruned). display_name carries
+    # the "-copycat" suffix; coined_by_uid is the original coiner's current UID.
+    sub = store.get(d.get("submission_id")) if d.get("submission_id") else None
+    if sub is not None:
+        _coiner = getattr(sub, "coined_by_hotkey", None)
+        d["display_name"] = getattr(sub, "display_name", None)
+        d["is_copycat"] = getattr(sub, "is_copycat", False)
+        d["coined_by_uid"] = _hotkey_to_uid_map().get(_coiner) if _coiner else None
+    return SolverChampionResponse(**d)
 
 
 @router.get("/submissions/{submission_id}/status", response_model=StatusResponse)
@@ -1780,6 +1793,13 @@ async def list_submissions(
         # Current-metagraph UID for the submitting hotkey (null when the
         # metagraph hasn't synced or the hotkey has since deregistered).
         d["miner_uid"] = uid_by_hotkey.get(s.hotkey)
+        # Copycat display: to_dict already carries is_copycat + coined_by_hotkey,
+        # but not the derived display_name (the "-copycat"-suffixed name) or the
+        # resolved coiner UID — add them so the dashboard can render the badge
+        # without re-deriving it.
+        d["display_name"] = getattr(s, "display_name", None)
+        _coiner = getattr(s, "coined_by_hotkey", None)
+        d["coined_by_uid"] = uid_by_hotkey.get(_coiner) if _coiner else None
         return d
 
     return {
