@@ -74,7 +74,8 @@ def _resp(status: int, payload: dict | None) -> MagicMock:
 
 
 def test_merge_ok_true_returns_true():
-    post = MagicMock(return_value=_resp(200, {"merge_ok": True, "round_id": ROUND_ID}))
+    # v2 reply shape: {ok, reason: null, ...}
+    post = MagicMock(return_value=_resp(200, {"ok": True, "reason": None, "round_id": ROUND_ID}))
     with patch.dict("os.environ", _env(), clear=False), patch(
         "requests.post", post,
     ):
@@ -84,9 +85,9 @@ def test_merge_ok_true_returns_true():
     assert result
     assert result.reason == ""  # success carries no reason
     post.assert_called_once()
-    # Sanity: the POST went to the finalize endpoint with the cert + submission.
+    # The client prefers the structured v2 endpoint.
     _, kwargs = post.call_args
-    assert post.call_args.args[0].endswith("/v1/finalize-champion")
+    assert post.call_args.args[0].endswith("/v2/finalize-champion")
     body = kwargs["json"]
     assert body["round_id"] == ROUND_ID
     assert body["submission"]["submission_id"] == SUBMISSION_ID
@@ -96,7 +97,11 @@ def test_merge_ok_true_returns_true():
 
 
 def test_merge_ok_false_returns_false():
-    post = MagicMock(return_value=_resp(200, {"merge_ok": False, "reason": "quorum not reached"}))
+    # v2 reply: structured reason {code, stage, detail} → propagated to the caller.
+    post = MagicMock(return_value=_resp(200, {
+        "ok": False,
+        "reason": {"code": "quorum_not_reached", "stage": "quorum", "detail": "quorum not reached: 1/2"},
+    }))
     with patch.dict("os.environ", _env(), clear=False), patch(
         "requests.post", post,
     ):
@@ -104,7 +109,25 @@ def test_merge_ok_false_returns_false():
             _submission(), ROUND_ID, certificate=_certificate(),
         )
     assert not result
-    assert result.reason == "quorum not reached"  # relayer's reason propagated to the caller
+    assert result.reason == "quorum_not_reached"  # code propagated (.reason aliases .code)
+    assert result.stage == "quorum"
+
+
+def test_v2_404_falls_back_to_v1():
+    # A relayer still on an older image (no /v2) → client retries /v1 and honors it.
+    def _post(url, **_kw):
+        if url.endswith("/v2/finalize-champion"):
+            return _resp(404, {"error": "not found"})
+        return _resp(200, {"merge_ok": True})  # v1 minimal shape
+    post = MagicMock(side_effect=_post)
+    with patch.dict("os.environ", _env(), clear=False), patch("requests.post", post):
+        result = on_champion_adopted_via_relayer(
+            _submission(), ROUND_ID, certificate=_certificate(),
+        )
+    assert result  # adopted via the v1 fallback
+    assert post.call_count == 2  # tried v2, then v1
+    assert post.call_args_list[0].args[0].endswith("/v2/finalize-champion")
+    assert post.call_args_list[1].args[0].endswith("/v1/finalize-champion")
 
 
 def test_post_raises_returns_false_fail_closed():

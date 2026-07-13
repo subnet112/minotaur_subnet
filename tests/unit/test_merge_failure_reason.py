@@ -13,10 +13,33 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from minotaur_subnet.relayer.solver_repo import (
+    FinalizeOutcome,
     MergeResult,
     on_champion_adopted_pr,
     on_champion_adopted_via_relayer,
 )
+
+
+def test_finalize_outcome_serialization_v1_minimal_v2_structured():
+    adopted = FinalizeOutcome.from_merge(MergeResult(True), round_id="r", submission_id="s")
+    assert adopted.to_v1() == {"merge_ok": True, "round_id": "r", "submission_id": "s"}
+    assert adopted.to_v2() == {
+        "ok": True, "outcome": "adopted", "round_id": "r", "submission_id": "s", "reason": None,
+    }
+
+    refused = FinalizeOutcome.from_merge(
+        MergeResult(False, "no_quorum_cert", "merge", "no on-chain cert"),
+        round_id="r", submission_id="s",
+    )
+    # v1 stays minimal — no reason accretion.
+    assert refused.to_v1() == {"merge_ok": False, "round_id": "r", "submission_id": "s"}
+    # v2 carries the structured reason.
+    v2 = refused.to_v2()
+    assert v2["ok"] is False and v2["outcome"] == "refused"
+    assert v2["reason"] == {"code": "no_quorum_cert", "stage": "merge", "detail": "no on-chain cert"}
+
+    # from_merge tolerates a bare bool (legacy/mock callers).
+    assert FinalizeOutcome.from_merge(False).to_v2()["reason"]["code"] == "merge_refused"
 
 
 def test_mergeresult_truthiness_is_ok():
