@@ -686,6 +686,7 @@ class EpochManager:
         # before any champion change takes effect. With no merge callback wired (e.g.
         # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
         merge_ok = True
+        merge_reason = ""  # specific abort code from the callback (empty on success)
         # Finalization (on-chain attest + squash-merge the miner's PR) is the
         # LEADER's job: it alone holds the solver-repo PAT and is the single
         # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
@@ -706,10 +707,14 @@ class EpochManager:
                 )
                 if inspect.isawaitable(cb_result):
                     cb_result = await cb_result
+                # cb_result is a MergeResult (truthy == success, carries .reason)
+                # or a bare bool (legacy/tests). getattr keeps both shapes working.
                 merge_ok = bool(cb_result)
+                merge_reason = str(getattr(cb_result, "reason", "") or "")
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
+                merge_reason = "callback_exception"
         elif _is_follower:
             logger.info(
                 "[merge-gate] round %s: follower adopts quorum-certified champion %s "
@@ -738,17 +743,22 @@ class EpochManager:
             self._notify_champion_rejected(
                 submission,
                 "adoption blocked — this submission won the round, but the champion "
-                "could not be finalized: its on-chain attestation and/or the "
-                "squash-merge of this PR did not both succeed. The most common cause "
-                "is the PR head being pushed PAST the certified commit, so the quorum "
-                "certificate no longer binds the head SHA (do not push to the branch "
-                "after submitting). The round was aborted and the champion is "
-                "unchanged; re-submit with the PR head pinned to the certified commit.",
+                "could not be finalized on-chain, so the round was aborted and the "
+                f"champion is unchanged. Reason: `{merge_reason or 'unknown'}`. "
+                "This is usually a validator-side issue (most commonly the quorum "
+                "of on-chain attestations not completing for this round), NOT "
+                "something you did — a drifted or closed PR is now recovered "
+                "automatically by publishing the certified commit directly. If the "
+                "reason names a certificate/quorum shortfall, no action is needed "
+                "on your part; the next round re-evaluates.",
+            )
+            _abort_reason = (
+                f"merge_failed:{merge_reason}" if merge_reason else "merge_failed"
             )
             next_round = self._complete_round(
-                round_state, epoch, activated=False, abort_reason="merge_failed",
+                round_state, epoch, activated=False, abort_reason=_abort_reason,
             )
-            result["abort_reason"] = "merge_failed"
+            result["abort_reason"] = _abort_reason
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result

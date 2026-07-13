@@ -774,10 +774,11 @@ class RelayerService:
                 quorum_required,
                 wrapper_signer[:10],
             )
-            merge_ok = bool(on_champion_adopted_pr(ns, round_id, certificate=cert))
+            _res = on_champion_adopted_pr(ns, round_id, certificate=cert)
             return web.json_response(
                 {
-                    "merge_ok": merge_ok,
+                    "merge_ok": bool(_res),
+                    "reason": getattr(_res, "reason", ""),
                     "round_id": round_id,
                     "submission_id": ns.submission_id,
                 },

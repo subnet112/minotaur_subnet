@@ -81,7 +81,8 @@ def test_merge_ok_true_returns_true():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is True
+    assert result
+    assert result.reason == ""  # success carries no reason
     post.assert_called_once()
     # Sanity: the POST went to the finalize endpoint with the cert + submission.
     _, kwargs = post.call_args
@@ -102,7 +103,8 @@ def test_merge_ok_false_returns_false():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
+    assert result.reason == "quorum not reached"  # relayer's reason propagated to the caller
 
 
 def test_post_raises_returns_false_fail_closed():
@@ -113,7 +115,7 @@ def test_post_raises_returns_false_fail_closed():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
 
 
 def test_non_200_returns_false_fail_closed():
@@ -124,7 +126,7 @@ def test_non_200_returns_false_fail_closed():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
 
 
 def test_bad_json_returns_false_fail_closed():
@@ -135,7 +137,7 @@ def test_bad_json_returns_false_fail_closed():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
 
 
 def test_non_git_submission_returns_false_without_posting():
@@ -146,7 +148,7 @@ def test_non_git_submission_returns_false_without_posting():
         result = on_champion_adopted_via_relayer(
             _submission(commit_hash=""), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
     post.assert_not_called()
 
 
@@ -160,5 +162,5 @@ def test_no_relayer_url_returns_false_without_posting():
         result = on_champion_adopted_via_relayer(
             _submission(), ROUND_ID, certificate=_certificate(),
         )
-    assert result is False
+    assert not result
     post.assert_not_called()
