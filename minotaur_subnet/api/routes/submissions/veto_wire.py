@@ -118,6 +118,13 @@ GATE_WAIT = "wait"
 GATE_ALLOW = "allow"
 GATE_BLOCK = "block"
 
+# Streaming re-verify orchestration actions (see veto_stream_action).
+STREAM_SPAWN = "spawn"
+STREAM_WRITE_RESULT = "write_result"
+STREAM_WRITE_NONE = "write_none"
+STREAM_PENDING = "pending"
+STREAM_NOOP = "noop"
+
 # Cap on per-order violation rows surfaced in the observe summary (miner report
 # feedback) — keeps the persisted round record bounded (confirmed violations are
 # themselves ≤ VETO_VERIFY_BUDGET_ORDERS; this bounds the claimed set too).
@@ -259,6 +266,83 @@ def veto_gate_decision(
     if n_veto > 0 and would_gate_confirmed is None and reverify_enabled:
         return GATE_WAIT
     return GATE_ALLOW
+
+
+def veto_stream_action(
+    *,
+    reverify_enabled: bool,
+    has_veto: bool,
+    resolved: bool,
+    inflight: bool,
+    uncovered: bool,
+    result_present: bool,
+    confirmed: bool,
+) -> str:
+    """STREAMING re-verify orchestration (PURE; no I/O). Decides, per phase, what
+    to do given the current coverage state. Called from BOTH the coordinator tick
+    and each re-verify completion (symmetric finalization). Mirrors
+    ``resolve_phase`` / ``veto_gate_decision`` — exhaustively unit-tested.
+
+    WHY STREAMING (the bug it fixes): the re-verify — minutes on the shared sim
+    lock — historically fired only at phase RESOLUTION (all followers terminal or
+    the window deadline elapsed). A single slow/missing follower pushed resolution
+    to the deadline, so the re-verify started too late to confirm before the gate
+    fail-opened, and a leader-confirmable regression slipped through (observed
+    2026-07-11). We now re-verify EACH veto-responder AS IT ARRIVES so every veto
+    — including a late one — gets the full remaining interior window of runway.
+
+    WHY COVERAGE (not just "spawn once early"): a single early spawn freezes its
+    bench plan on whichever follower vetoed FIRST; a confirmable veto from a
+    later-responding follower would never be benched (and an adversary could race
+    a junk early veto to burn the one spawn). So we track WHICH veto-responders a
+    re-verify has covered and dispatch a completing pass for any not-yet-covered
+    ones — holding the gate (pending → WAIT) until the full claimed-veto set is
+    covered, or a confirmation blocks, or the interior deadline fails us open.
+
+    Inputs:
+      - ``uncovered``: some veto-responder's claims are not yet dispatched to a
+        re-verify.
+      - ``inflight``: a re-verify task is currently running (only one at a time —
+        no sim/docker pile-up).
+      - ``result_present`` / ``confirmed``: a landed (accumulated) re-verify result
+        exists / it reproduced ≥1 violation.
+
+    Actions:
+      - ``STREAM_WRITE_RESULT`` — finalize the observe record from the accumulated
+        result. On ``confirmed`` this fires IMMEDIATELY (even mid-phase): a
+        leader-reproduced violation is authoritative and must block now. Otherwise
+        only once resolved AND fully covered AND landed (a clean/allow verdict).
+      - ``STREAM_WRITE_NONE``  — resolved with no veto (or re-verify disabled):
+        terminal no-reverify summary, exactly as the pre-streaming path.
+      - ``STREAM_SPAWN``       — dispatch a re-verify for the uncovered responders
+        (no re-verify already in flight).
+      - ``STREAM_PENDING``     — resolved but a re-verify is in flight / coverage
+        incomplete: leave the round ``"opened"``; the gate WAITs, fail-opening only
+        at the interior deadline. A later completion or tick finalizes.
+      - ``STREAM_NOOP``        — nothing to do yet (unresolved; covered-so-far or a
+        re-verify already running).
+    """
+    # A leader-CONFIRMED violation is authoritative: finalize (block) NOW, even
+    # mid-phase, regardless of coverage/resolution.
+    if confirmed:
+        return STREAM_WRITE_RESULT
+    # Nothing to re-verify (no veto, or re-verify disabled): terminal no-reverify
+    # record at resolution, else nothing.
+    if not (reverify_enabled and has_veto):
+        return STREAM_WRITE_NONE if resolved else STREAM_NOOP
+    # A veto-responder not yet covered → dispatch one re-verify (early on the first
+    # veto; a completing pass as later followers veto). One in flight at a time.
+    if uncovered and not inflight:
+        return STREAM_SPAWN
+    if not resolved:
+        return STREAM_NOOP
+    # Resolved: finalize only when the FULL claimed-veto set is covered AND landed;
+    # otherwise hold (the gate WAITs, fail-open at the interior deadline).
+    if inflight or uncovered:
+        return STREAM_PENDING
+    if result_present:
+        return STREAM_WRITE_RESULT
+    return STREAM_PENDING
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1173,16 +1257,30 @@ async def reverify_dissents(
     order_lookup: Callable[[str], dict[str, Any] | None],
     worker_factory: Callable[[], Any],
     pull_image: Callable[[str], Awaitable[bool]],
+    include_responders: set[str] | None = None,
     budget_orders: int = VETO_VERIFY_BUDGET_ORDERS,
 ) -> dict[str, Any]:
-    """Leader-side re-verification of the round's claimed vetoes.
+    """Leader-side re-verification of claimed vetoes.
 
     Unions the per-response re-verify plans (dropped-first, largest-cut,
     deduped, capped at ``budget_orders``), benches incumbent + candidate on
     exactly those orders at the round's pin, and recomputes the hard-violation
     set with the SAME rule the follower used (``extract_slice_evidence``). A
-    veto STANDS only on a leader-reproduced violation. Returns a summary dict;
-    the caller (Phase 0) only LOGS it — it never gates certification.
+    veto STANDS only on a leader-reproduced violation. Returns a summary dict.
+
+    ``include_responders`` (lower-cased validator EVMs) restricts the plan to
+    those responders' claims — the streaming caller passes the NOT-YET-covered
+    responders so each veto is benched exactly once (no re-bench: benchmark
+    nondeterminism can't flip an already-decided order, and coverage accumulates
+    monotonically across passes). ``None`` = every responder (whole-phase pass).
+
+    Budget: EACH response's plan is capped at ``budget_orders`` (dropped-first,
+    largest-cut). The UNION across responders is NOT globally truncated to
+    ``budget_orders`` — that would let a junk-first responder's 10 fabricated
+    claims fill the budget and STARVE a real responder's confirmable veto out of
+    the plan (which the streaming caller would then mark covered-but-unbenched, a
+    hard-gate bypass). Instead the union is bounded per-responder × the assigned
+    fleet, so every included responder keeps its own budget.
 
     Any resolution/bench gap is a swallowed no-op (returns ran=False) — an
     observe pass must never raise into the coordinator.
@@ -1198,12 +1296,17 @@ async def reverify_dissents(
 
     planned: list[SliceViolation] = []
     seen: set[str] = set()
-    for resp in phase.responses.values():
+    for evm, resp in phase.responses.items():
+        if include_responders is not None and evm not in include_responders:
+            continue
         for v in plan_reverification(resp, budget_orders):
             if v.order_id not in seen:
                 seen.add(v.order_id)
                 planned.append(v)
-    planned = planned[:budget_orders]
+    # Per-responder budget already bounds each response; keep only a defensive
+    # fleet-scaled ceiling (never truncates a legitimate per-responder batch:
+    # ≤ budget per responder × the assigned validators).
+    planned = planned[: budget_orders * max(1, len(phase.assignments))]
     if not planned:
         return empty
 
@@ -1254,6 +1357,42 @@ async def reverify_dissents(
         "confirmed": n_confirmed,
         "discarded": len(planned) - n_confirmed,
         "orders": per_order,
+        # Order_ids ACTUALLY looked-up-and-benched (a planned order whose lookup
+        # missed is NOT here). The streaming caller commits coverage per-responder
+        # against this set — a responder with an unbenched order stays uncovered
+        # and is re-verified, never a silent covered-but-unbenched fail-open. Not
+        # persisted: merge_reverify_results drops it before the observe record.
+        "benched": {o.get("order_id") for o in orders if o.get("order_id")},
+    }
+
+
+_EMPTY_REVERIFY = {
+    "ran": False, "planned": 0, "confirmed": 0, "discarded": 0, "orders": {},
+}
+
+
+def merge_reverify_results(
+    prev: dict[str, Any] | None, new: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Accumulate a completed streaming re-verify pass into the round's running
+    result (PURE). Passes cover DISJOINT responder sets (each veto benched once),
+    so the per-order ``orders`` maps union cleanly and ``confirmed`` is recomputed
+    from the union — monotone in coverage (a later pass only adds orders; a prior
+    confirmation is never dropped). ``ran`` is OR-ed so a no-op pass can't mask a
+    real one. ``None`` prev = first pass; ``None`` new = a crashed/no-op pass."""
+    new = new or _EMPTY_REVERIFY
+    # Union the per-order maps (prev={} on the first pass). Rebuild a CLEAN,
+    # JSON-safe 5-key dict — never carry through transient keys like ``benched``
+    # (a Python set the caller uses for coverage), which must not reach the
+    # persisted/serialized observe record.
+    orders = {**(prev or {}).get("orders", {}), **new.get("orders", {})}
+    n_conf = sum(1 for v in orders.values() if v)
+    return {
+        "ran": bool((prev or {}).get("ran")) or bool(new.get("ran")),
+        "planned": len(orders),
+        "confirmed": n_conf,
+        "discarded": len(orders) - n_conf,
+        "orders": orders,
     }
 
 
