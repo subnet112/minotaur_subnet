@@ -5,6 +5,7 @@ and RoundState.veto_observe persistence.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -275,6 +276,89 @@ class TestReverify:
         assert out["ran"] is False and out["planned"] == 0
 
     @pytest.mark.asyncio
+    async def test_include_responders_benches_only_selected(self):
+        # STREAMING: a completing pass benches ONLY the not-yet-covered responder,
+        # so an already-covered veto is never re-benched (bench-once).
+        a1, o1 = _assignment("0xv1", order_ids=("ord_a",))
+        a2, o2 = _assignment("0xv2", order_ids=("ord_b",))
+        ph = _phase([a1, a2])
+        ph.responses["0xv1"] = _resp(a1, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_a", "dropped", "1000000", ""),
+        ])
+        ph.responses["0xv2"] = _resp(a2, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_b", "dropped", "2000000", ""),
+        ])
+        orders = {**o1, **o2}
+        # Restrict to v2 only: plan must be ord_b, NOT ord_a.
+        champ = [_row("ord_b", "2000000")]
+        chal = [_row("ord_b", None)]
+        out = await reverify_dissents(
+            ph, include_responders={"0xv2"}, **_reverify_env(orders, champ, chal),
+        )
+        assert out["planned"] == 1 and "ord_b" in out["orders"]
+        assert "ord_a" not in out["orders"]
+
+    @pytest.mark.asyncio
+    async def test_include_responders_empty_set_plans_nothing(self):
+        a, orders = _assignment(order_ids=("ord_a",))
+        ph = _phase([a])
+        ph.responses["0xv1"] = _resp(a, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_a", "dropped", "1000000", ""),
+        ])
+        out = await reverify_dissents(
+            ph, include_responders=set(), **_reverify_env(orders, [], []),
+        )
+        assert out["ran"] is False and out["planned"] == 0
+
+
+class TestMergeReverifyResults:
+    """Accumulating disjoint streaming re-verify passes into one running result."""
+
+    def test_first_pass_is_copied(self):
+        new = {"ran": True, "planned": 1, "confirmed": 1, "discarded": 0,
+               "orders": {"ord_a": True}}
+        out = veto_wire.merge_reverify_results(None, new)
+        assert out == new and out is not new  # copy, not alias
+
+    def test_union_recomputes_confirmed(self):
+        prev = {"ran": True, "planned": 1, "confirmed": 0, "discarded": 1,
+                "orders": {"ord_a": False}}
+        new = {"ran": True, "planned": 1, "confirmed": 1, "discarded": 0,
+               "orders": {"ord_b": True}}
+        out = veto_wire.merge_reverify_results(prev, new)
+        assert out["orders"] == {"ord_a": False, "ord_b": True}
+        assert out["planned"] == 2 and out["confirmed"] == 1 and out["discarded"] == 1
+
+    def test_prior_confirmation_survives_a_later_noop_pass(self):
+        # REGRESSION GUARD: a confirmed block must never be dropped by a later
+        # crashed/no-op pass (would_gate_confirmed must stay derivable as True).
+        prev = {"ran": True, "planned": 1, "confirmed": 1, "discarded": 0,
+                "orders": {"ord_a": True}}
+        out = veto_wire.merge_reverify_results(prev, None)
+        assert out["confirmed"] == 1 and out["orders"]["ord_a"] is True
+        assert out["ran"] is True
+
+    def test_noop_first_then_confirm(self):
+        prev = veto_wire.merge_reverify_results(None, None)  # crashed first pass
+        assert prev["ran"] is False and prev["confirmed"] == 0
+        out = veto_wire.merge_reverify_results(prev, {
+            "ran": True, "planned": 1, "confirmed": 1, "discarded": 0,
+            "orders": {"ord_b": True}})
+        assert out["ran"] is True and out["confirmed"] == 1
+
+    def test_strips_transient_benched_set_and_stays_json_safe(self):
+        # REGRESSION GUARD: reverify_dissents returns a `benched` SET for coverage;
+        # it must never survive into the merged/persisted record (json.dumps would
+        # choke on a set). merge rebuilds a clean 5-key dict on BOTH branches.
+        raw = {"ran": True, "planned": 1, "confirmed": 1, "discarded": 0,
+               "orders": {"o1": True}, "benched": {"o1"}}
+        first = veto_wire.merge_reverify_results(None, raw)   # first-pass branch
+        second = veto_wire.merge_reverify_results(first, raw)  # union branch
+        for out in (first, second):
+            assert "benched" not in out
+            json.dumps(out)  # must not raise
+
+    @pytest.mark.asyncio
     async def test_bench_failure_is_swallowed(self):
         a, orders = _assignment(order_ids=("ord_a",))
         ph = _phase([a])
@@ -294,6 +378,205 @@ class TestReverify:
         env["worker_factory"] = wf
         out = await reverify_dissents(ph, **env)
         assert out["ran"] is False  # never raises
+
+
+# ── streaming coverage (end-to-end composition) ──────────────────────────────
+
+class TestStreamingCoverage:
+    """Drives the REAL pure building blocks (veto_stream_action + reverify_dissents
+    with include_responders + merge_reverify_results + observe_summary) in the
+    exact order _veto_stream_step composes them, to lock the coverage property the
+    adversarial review flagged: a confirmable veto from a LATE follower must still
+    be leader-reproduced (would_gate_confirmed=True), never fail-opened."""
+
+    async def _drive_once(self, ph, orders, st, now, *, benches):
+        # Mirror _veto_stream_step + the completion for one step: decide, and on
+        # SPAWN run the (mocked) re-verify for the uncovered responders, merge it,
+        # and — exactly as the real completion — commit coverage ONLY on ran=True.
+        veto_responders = {
+            evm for evm, r in ph.responses.items() if r.verdict == VERDICT_VETO
+        }
+        result = st.get("result")
+        confirmed = bool(result and result.get("confirmed", 0) > 0)
+        action, resolution = veto_wire.resolve_phase(ph, now)
+        resolved = action == "resolve"
+        act = veto_wire.veto_stream_action(
+            reverify_enabled=True, has_veto=bool(veto_responders),
+            resolved=resolved, inflight=False,
+            uncovered=bool(veto_responders - st["covered"]),
+            result_present=result is not None, confirmed=confirmed,
+        )
+        if act == veto_wire.STREAM_SPAWN:
+            new = veto_responders - st["covered"]
+            champ, chal = benches[frozenset(new)]
+            out = await reverify_dissents(
+                ph, include_responders=new, **_reverify_env(orders, champ, chal),
+            )
+            st["result"] = veto_wire.merge_reverify_results(st.get("result"), out)
+            # per-responder coverage on ACTUALLY-benched orders (mirror completion)
+            benched = set(out.get("benched") or ())
+            for evm in new:
+                resp = ph.responses.get(evm)
+                if resp is None:
+                    continue
+                pids = {v.order_id for v in veto_wire.plan_reverification(resp)}
+                if pids and pids <= benched:
+                    st["covered"].add(evm)
+            return "spawned"
+        if act in (veto_wire.STREAM_WRITE_RESULT, veto_wire.STREAM_WRITE_NONE):
+            rv = st["result"] if act == veto_wire.STREAM_WRITE_RESULT else None
+            return observe_summary(ph.assignments[0].round_id, ph,
+                                   resolution or "reverified", rv)
+        return act
+
+    @pytest.mark.asyncio
+    async def test_late_confirmable_veto_still_blocks(self):
+        # F1 (fast) vetoes order_a — NOT leader-reproducible (flaky).
+        # F2 (slow) vetoes order_b — leader-reproducible (real regression).
+        a1, o1 = _assignment("0xv1", order_ids=("ord_a",))
+        a2, o2 = _assignment("0xv2", order_ids=("ord_b",))
+        orders = {**o1, **o2}
+        ph = _phase([a1, a2])
+        st = {"covered": set(), "inflight": False, "result": None, "done": False}
+        benches = {
+            frozenset({"0xv1"}): ([_row("ord_a", "1000000")], [_row("ord_a", "1000000")]),  # matched → not confirmed
+            frozenset({"0xv2"}): ([_row("ord_b", "2000000")], [_row("ord_b", None)]),        # dropped → confirmed
+        }
+        # tick 1: only F1 has vetoed (phase not resolved — F2 outstanding)
+        ph.responses["0xv1"] = _resp(a1, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_a", "dropped", "1000000", ""),
+        ])
+        assert await self._drive_once(ph, orders, st, now=50, benches=benches) == "spawned"
+        assert st["result"]["confirmed"] == 0  # flaky claim discarded
+
+        # tick 2: F2's real veto now arrives and the phase resolves (all terminal)
+        ph.responses["0xv2"] = _resp(a2, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_b", "dropped", "2000000", ""),
+        ])
+        assert await self._drive_once(ph, orders, st, now=60, benches=benches) == "spawned"
+        assert st["result"]["confirmed"] == 1  # F2's regression reproduced
+
+        # finalize: confirmed → terminal observe with would_gate_confirmed True
+        summary = await self._drive_once(ph, orders, st, now=61, benches=benches)
+        assert summary["would_gate_confirmed"] is True
+        assert summary["reverify"]["orders"] == {"ord_a": False, "ord_b": True}
+
+    @pytest.mark.asyncio
+    async def test_junk_first_batch_does_not_starve_a_real_veto(self):
+        # REGRESSION GUARD (finding #1): a junk follower fills its own budget with
+        # 10 fabricated claims; a real follower co-batched in the SAME pass must
+        # still have its 1 confirmable order benched (no global union-truncation).
+        junk_ids = tuple(f"ord_j{i}" for i in range(10))
+        a1, oj = _assignment("0xvjunk", order_ids=junk_ids)
+        a2, orl = _assignment("0xvreal", order_ids=("ord_real",))
+        orders = {**oj, **orl}
+        ph = _phase([a1, a2])
+        ph.responses["0xvjunk"] = _resp(a1, verdict=VERDICT_VETO, violations=[
+            SliceViolation(o, "dropped", "1", "") for o in junk_ids
+        ])
+        ph.responses["0xvreal"] = _resp(a2, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_real", "dropped", "5000000", ""),
+        ])
+        # leader reproduces NONE of the junk (matched) but DOES reproduce ord_real
+        all_ids = list(junk_ids) + ["ord_real"]
+        champ = [_row(o, "1000000") for o in junk_ids] + [_row("ord_real", "5000000")]
+        chal = [_row(o, "1000000") for o in junk_ids] + [_row("ord_real", None)]
+
+        def wf():
+            w = SimpleNamespace()
+            w.benchmark_explicit_orders = AsyncMock(side_effect=[champ, chal])
+            return w
+
+        env = {"order_lookup": lambda oid: orders.get(oid),
+               "worker_factory": wf, "pull_image": _reverify_env({}, [], [])["pull_image"]}
+        out = await reverify_dissents(
+            ph, include_responders={"0xvjunk", "0xvreal"}, **env,
+        )
+        # ord_real survived the plan (not truncated) and was confirmed → BLOCK.
+        assert "ord_real" in out["orders"] and out["orders"]["ord_real"] is True
+        assert out["confirmed"] == 1 and out["planned"] == 11
+
+    @pytest.mark.asyncio
+    async def test_noop_pass_does_not_cover_responder(self):
+        # REGRESSION GUARD (finding #2): a ran=False (transient gap) pass must NOT
+        # mark its responder covered — it stays uncovered so the next tick retries,
+        # never a silent covered-but-unbenched fail-open allow.
+        a, orders = _assignment("0xv1", order_ids=("ord_a",))
+        ph = _phase([a])
+        ph.responses["0xv1"] = _resp(a, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_a", "dropped", "1000000", ""),
+        ])
+        st = {"covered": set(), "inflight": False, "result": None, "done": False}
+        # First pass: bench raises → reverify_dissents swallows → ran=False.
+        def wf_boom():
+            w = SimpleNamespace()
+            w.benchmark_explicit_orders = AsyncMock(side_effect=RuntimeError("boom"))
+            return w
+        benches_boom = {frozenset({"0xv1"}): (None, None)}  # unused; wf raises
+        # drive with a raising worker
+        veto_responders = {"0xv1"}
+        out = await reverify_dissents(
+            ph, include_responders={"0xv1"},
+            order_lookup=lambda oid: orders.get(oid),
+            worker_factory=wf_boom,
+            pull_image=_reverify_env({}, [], [])["pull_image"],
+        )
+        st["result"] = veto_wire.merge_reverify_results(None, out)
+        benched = set(out.get("benched") or ())
+        for evm in {"0xv1"}:
+            pids = {v.order_id for v in veto_wire.plan_reverification(
+                ph.responses[evm])}
+            if pids and pids <= benched:
+                st["covered"].add(evm)
+        assert out["ran"] is False
+        # v1 stays UNCOVERED → uncovered still true → the gate re-spawns / holds,
+        # never finalizes-allow on the gapped pass.
+        assert st["covered"] == set()
+        assert veto_wire.veto_stream_action(
+            reverify_enabled=True, has_veto=True, resolved=True, inflight=False,
+            uncovered=bool(veto_responders - st["covered"]),
+            result_present=st["result"] is not None, confirmed=False,
+        ) == veto_wire.STREAM_SPAWN
+
+    @pytest.mark.asyncio
+    async def test_partial_lookup_miss_leaves_that_responder_uncovered(self):
+        # REGRESSION GUARD (finding A): responder B's order misses order_lookup while
+        # co-batched responder A benches fine (ran=True). B must NOT be marked
+        # covered (its order was never benched) — it stays uncovered for retry.
+        a1, o1 = _assignment("0xva", order_ids=("ord_a",))
+        a2, o2 = _assignment("0xvb", order_ids=("ord_b",))
+        ph = _phase([a1, a2])
+        ph.responses["0xva"] = _resp(a1, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_a", "dropped", "1000000", ""),
+        ])
+        ph.responses["0xvb"] = _resp(a2, verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_b", "dropped", "2000000", ""),
+        ])
+        # order_lookup returns A's order but MISSES B's (transient store gap).
+        only_a = {"ord_a": o1["ord_a"]}
+        champ = [_row("ord_a", "1000000")]
+        chal = [_row("ord_a", "1000000")]  # A matched → not confirmed
+
+        def wf():
+            w = SimpleNamespace()
+            w.benchmark_explicit_orders = AsyncMock(side_effect=[champ, chal])
+            return w
+
+        out = await reverify_dissents(
+            ph, include_responders={"0xva", "0xvb"},
+            order_lookup=lambda oid: only_a.get(oid),
+            worker_factory=wf,
+            pull_image=_reverify_env({}, [], [])["pull_image"],
+        )
+        assert out["ran"] is True and out["benched"] == {"ord_a"}
+        # simulate the completion's per-responder coverage
+        covered = set()
+        for evm in {"0xva", "0xvb"}:
+            pids = {v.order_id for v in veto_wire.plan_reverification(
+                ph.responses[evm])}
+            if pids and pids <= set(out["benched"]):
+                covered.add(evm)
+        assert covered == {"0xva"}  # B (unbenched) stays UNCOVERED → will retry
 
 
 # ── observe summary ──────────────────────────────────────────────────────────
