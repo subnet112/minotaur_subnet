@@ -32,6 +32,8 @@ from typing import Awaitable, Callable, Sequence
 import aiohttp
 from web3 import Web3
 
+from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+
 from minotaur_subnet.chains import registry
 
 from .peer_discovery import MetagraphPeer, PeerInfo, discover_peers
@@ -532,7 +534,7 @@ def _read_override() -> int | None:
 
 
 def _read_quorum_bps(rpc_url: str, registry_address: str) -> int:
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -550,7 +552,7 @@ def _read_validator_count(rpc_url: str, registry_address: str) -> int:
     verifying a quorum bundle, so off-chain and on-chain agree byte-
     for-byte on how many signatures are required.
     """
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -559,7 +561,7 @@ def _read_validator_count(rpc_url: str, registry_address: str) -> int:
 
 
 def _read_validators(rpc_url: str, registry_address: str) -> list[str]:
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -586,9 +588,9 @@ def read_champion_last_nonce(
     wall-clock nonce) in a few seconds instead of stalling the whole event loop
     until the socket's default timeout.
     """
-    w3 = Web3(Web3.HTTPProvider(
+    w3 = build_retrying_web3(
         rpc_url, request_kwargs={"timeout": _NONCE_READ_TIMEOUT_SECONDS},
-    ))
+    )
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(champion_registry_address),
         abi=_CHAMPION_REGISTRY_ABI,
@@ -605,12 +607,12 @@ def _read_block_number(rpc_url: str) -> int:
     signature of an out-of-sync RPC node, which can serve stale contract
     reads (and thus a stale validator count/set) while still answering.
     """
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     return int(w3.eth.block_number)
 
 
 def _read_chain_id(rpc_url: str) -> int:
     """``eth_chainId`` for ``rpc_url`` — surfaced so operators can spot a
     node pointed at the wrong chain's registry."""
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     return int(w3.eth.chain_id)

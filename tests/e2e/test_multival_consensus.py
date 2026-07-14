@@ -91,9 +91,12 @@ VALIDATOR_REGISTRY_ABI = [
 def w3(anvil) -> Web3:
     """Web3 connected to Anvil."""
     w = Web3(Web3.HTTPProvider(RPC_URL))
-    _web3_cache[CHAIN_ID] = w
+    # Seed both cache variants (get_web3 keys on (chain_id, install_retry)).
+    _web3_cache[(CHAIN_ID, True)] = w
+    _web3_cache[(CHAIN_ID, False)] = w
     yield w
-    _web3_cache.pop(CHAIN_ID, None)
+    _web3_cache.pop((CHAIN_ID, True), None)
+    _web3_cache.pop((CHAIN_ID, False), None)
 
 
 @pytest.fixture(scope="module")
