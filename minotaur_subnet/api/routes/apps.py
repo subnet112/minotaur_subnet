@@ -720,16 +720,44 @@ async def get_admin_state(
     return result
 
 
-@router.put("/apps/{app_id}/scoring", dependencies=[Depends(_require_admin)])
+@router.put("/apps/{app_id}/scoring")
 def update_scoring(
     app_id: str,
     body: UpdateScoringRequest,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Update the JS scoring code for an App Intent.
 
-    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
-    ``_require_admin``).
+    Auth — mirrors PUT .../solidity (the other half of the code-update
+    story): admin key OR a wallet signature (action="update_scoring",
+    paramsHash = keccak256(utf8(new_js_code)) — the signature authorizes
+    THAT exact source and nothing else) from an allowed signer (the app's
+    ``deployer`` ∪ ``APP_ADMIN_SIGNERS``).
+
+    Back-compat: a signature may instead ride in the BODY
+    (``signature``/``nonce``/``deadline``) — the pre-header scheme, verified
+    deployer-only inside the service. Exactly one path runs per request, so
+    a nonce is never consumed twice. This route used to ALSO demand
+    X-Admin-Key on top of the body signature, which made it unreachable
+    from the wallet-only frontend (the manage page's JS editor 401'd for
+    everyone); the double gate is gone.
     """
+    from eth_hash.auto import keccak
+
+    from minotaur_subnet.api.services import developer_auth
+
+    if not (body.signature or "").strip():
+        signer = _authorize_or_403(
+            ctx, app_id, developer_auth.ACTION_UPDATE_SCORING,
+            keccak(body.new_js_code.encode()),
+        )
+        return _tools.update_scoring(
+            _store(), app_id, body.new_js_code,
+            caller=body.caller,
+            authorized_by=signer,
+        )
+    # Legacy in-body signature — verified (deployer-only, nonce-consuming)
+    # inside the service, exactly as before.
     return _tools.update_scoring(
         _store(), app_id, body.new_js_code,
         caller=body.caller,
@@ -1150,17 +1178,30 @@ async def get_historical_scenarios(
     }
 
 
-@router.post("/apps/{app_id}/activate", dependencies=[Depends(_require_admin)])
+@router.post("/apps/{app_id}/activate")
 def activate_app(
     app_id: str,
     chain_id: int = 0,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
 ) -> dict[str, Any]:
     """Admin: promote an app from solving → active (for testing).
 
-    Requires X-Admin-Key header unless in LOCAL_TESTNET dev mode (see
-    ``_require_admin``).
+    ACTIVE is legacy-equivalent to SOLVED for order-readiness, so this is a
+    testing lever (it skips the benchmark proof), never a go-live step.
+
+    Auth: admin key OR an ADMIN-ONLY wallet signature (action="activate_app",
+    paramsHash binds app_id + chain_id; signer must be in APP_ADMIN_SIGNERS —
+    like registration approval, the app's own deployer cannot self-authorize
+    a benchmark skip).
     """
+    from minotaur_subnet.api.services import app_auth, developer_auth
     from minotaur_subnet.shared.types import AppStatus
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_ACTIVATE_APP,
+        app_auth.params_hash_for(developer_auth.ACTION_ACTIVATE_APP, app_id, chain_id),
+        admin_only=True,
+    )
     s = _store()
     dep = s.get_deployment(app_id, chain_id=chain_id if chain_id else None)
     if dep is None:
