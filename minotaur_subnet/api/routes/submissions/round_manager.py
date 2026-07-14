@@ -548,7 +548,10 @@ def _close_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "quorum_required": state.quorum_required,
         "decision_deadline_epoch": state.decision_deadline_epoch,
         "effective_epoch": state.effective_epoch,
-        "benchmark_anchor_epoch": state.benchmark_anchor_epoch,
+        # getattr-defensive: real RoundState always carries it, but test doubles /
+        # legacy state objects (SimpleNamespace) may not — None then, so followers
+        # fall back to the opened_epoch anchor.
+        "benchmark_anchor_epoch": getattr(state, "benchmark_anchor_epoch", None),
     }
     # Bind the close-time submission snapshot to the close broadcast so followers
     # reproduce the SAME benchmark pack hash (mirrors the coordinator-loop close
