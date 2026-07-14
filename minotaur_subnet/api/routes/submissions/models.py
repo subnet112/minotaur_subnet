@@ -263,6 +263,11 @@ class CloseRoundRequest(BaseModel):
     quorum_required: int | None = Field(default=None, ge=0)
     decision_deadline_epoch: int | None = Field(default=None, ge=0)
     effective_epoch: int | None = Field(default=None, ge=0)
+    # Leader's real wall-clock epoch at round OPEN — the benchmark fork-pin anchor
+    # source (see RoundState.benchmark_anchor_epoch). Followers adopt it verbatim so
+    # every validator anchors the fork identically. None from a pre-B2 leader, in
+    # which case followers fall back to the legacy opened_epoch anchor.
+    benchmark_anchor_epoch: int | None = Field(default=None, ge=0)
     # Leader's close-time submission snapshot (full records). Followers upsert
     # these so their local pack-hash recompute matches the leader's. Always sent by
     # an up-to-date leader (the SUBMISSION_SNAPSHOT_SYNC gate was removed — it is now
