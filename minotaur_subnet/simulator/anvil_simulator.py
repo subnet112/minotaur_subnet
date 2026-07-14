@@ -37,6 +37,7 @@ from typing import Any
 import requests
 from web3 import Web3
 
+from minotaur_subnet.rpc_backoff import body_has_retryable_rpc_error, retry_sync
 from minotaur_subnet.shared.types import (
     ExecutionPlan,
     SimulationResult,
@@ -1222,15 +1223,28 @@ class AnvilSimulator:
         )
 
     def _fetch_upstream_head(self) -> int:
-        """Query the upstream RPC for the current head block number."""
+        """Query the upstream RPC for the current head block number.
+
+        Retries transient provider failures (429 / -32005 CU / 5xx / timeout /
+        reset) with backoff — a single hiccup here otherwise fails the fork reset
+        before a sim. Idempotent read (a head query), safe to retry."""
         if not self.upstream_rpc_url:
             raise RuntimeError("No upstream_rpc_url configured")
-        resp = requests.post(
-            self.upstream_rpc_url,
-            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
-            timeout=5,
+
+        def _once() -> "requests.Response":
+            resp = requests.post(
+                self.upstream_rpc_url,
+                json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return resp
+
+        resp = retry_sync(
+            _once,
+            retry_on_result=lambda r: body_has_retryable_rpc_error(r.content),
+            label="anvil-upstream-head",
         )
-        resp.raise_for_status()
         result = resp.json().get("result")
         if not result:
             raise RuntimeError(f"Upstream RPC returned no result: {resp.text[:200]}")

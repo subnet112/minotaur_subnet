@@ -249,7 +249,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     chains = _benchmark_pin_chains()
     confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
-    from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
 
     w3_cache: dict[int, object] = {}
 
@@ -266,8 +266,13 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
             # leader the same event loop also drives the order-execution
             # BlockLoop. An unbounded HTTP read on a stuck RPC would block the
             # loop (and stall order proposing); the timeout caps the worst case.
-            w3_cache[chain_id] = Web3(
-                Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s})
+            # TIGHT retry (attempts=2, deadline≈timeout): this is a blocking read
+            # on the leader's shared loop, so a persistent 429 must not multiply
+            # the worst-case block by the full retry budget — one fast retry, then
+            # defer (round-close self-heals to the live head).
+            w3_cache[chain_id] = build_retrying_web3(
+                rpc, request_kwargs={"timeout": timeout_s},
+                attempts=2, deadline_seconds=max(1.0, float(timeout_s)),
             )
         return w3_cache[chain_id]
 
@@ -295,10 +300,13 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
     """Leader-side: derive + store the round's canonical fork pins (gated).
 
     Called before the leader builds ``benchmark_pack_hash`` so the pins enter the
-    hash. Default-off and best-effort: with the gate off, or on any derivation
-    failure, ``fork_pins`` stays unset → the pack hash is unchanged and the
-    benchmark runs at live head (inert). Followers derive their own independently
-    (P3); divergence surfaces as PACK_HASH_MISMATCH, never a silent mis-score.
+    hash. Best-effort: on any derivation failure ``fork_pins`` stays unset → the
+    pack hash is unchanged and the benchmark runs at live head (inert). The gate
+    (``round_anchored_pin_enabled``) is DEFAULT ON, so this runs on the leader's
+    shared event loop every round close — the fork-pin reads use a TIGHT retry
+    (attempts=2, deadline≈timeout) to keep worst-case blocking near one request.
+    Followers derive their own independently (P3); divergence surfaces as
+    PACK_HASH_MISMATCH, never a silent mis-score.
     """
     from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not round_anchored_pin_enabled():
@@ -494,7 +502,7 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
     (a missing/failed hash is omitted, never raises — a probe must not break
     /health).
     """
-    from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
 
     timeout_s = _round_anchor_rpc_timeout()
@@ -504,7 +512,10 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
             rpc = _chain_rpc_env(int(chain_id))
             if not rpc:
                 continue
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s}))
+            w3 = build_retrying_web3(
+                rpc, request_kwargs={"timeout": timeout_s},
+                attempts=2, deadline_seconds=max(1.0, float(timeout_s)),
+            )
             block_hash = w3.eth.get_block(int(block)).get("hash")
             if block_hash is not None:
                 out[str(chain_id)] = (

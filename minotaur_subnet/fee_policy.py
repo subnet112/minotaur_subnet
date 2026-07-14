@@ -205,8 +205,8 @@ _GAS_W3_CACHE: dict = {}
 def _gas_w3(url: str):
     w3 = _GAS_W3_CACHE.get(url)
     if w3 is None:
-        from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(url))
+        from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+        w3 = build_retrying_web3(url)
         _GAS_W3_CACHE[url] = w3
     return w3
 

@@ -376,7 +376,7 @@ class ContractManager:
             )
 
         try:
-            w3 = get_web3(chain_id)
+            w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         except ValueError as exc:
             return DeploymentResult(
                 app_id="",
@@ -514,7 +514,7 @@ class ContractManager:
         Any
             The return value decoded according to the ABI.
         """
-        w3 = get_web3(chain_id)
+        w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         checksum = Web3.to_checksum_address(contract_address)
         contract = w3.eth.contract(address=checksum, abi=abi)
 
@@ -563,7 +563,7 @@ class ContractManager:
         if self._wallet_manager is None:
             raise RuntimeError("No wallet manager configured -- cannot execute plan.")
 
-        w3 = get_web3(chain_id)
+        w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         sender = Web3.to_checksum_address(wallet_address)
         contract_addr = Web3.to_checksum_address(contract_address)
 
@@ -643,7 +643,7 @@ class ContractManager:
         Raises ``TimeoutError`` (via web3) if the receipt is not available
         within *timeout* seconds.
         """
-        w3 = get_web3(chain_id)
+        w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         tx_bytes = bytes.fromhex(tx_hash[2:] if tx_hash.startswith("0x") else tx_hash)
         receipt = await _retry_rpc(
             lambda: w3.eth.wait_for_transaction_receipt(tx_bytes, timeout=timeout),
@@ -666,7 +666,7 @@ class ContractManager:
         Returns an ``IntentState`` populated with ``nonce``, ``owner``,
         and additional fields in ``raw_params``.
         """
-        w3 = get_web3(chain_id)
+        w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         checksum = Web3.to_checksum_address(contract_address)
         contract = w3.eth.contract(address=checksum, abi=APP_INTENT_BASE_ABI)
 
@@ -719,7 +719,7 @@ class ContractManager:
 
         Returns ``(True, "")`` or ``(False, reason_string)``.
         """
-        w3 = get_web3(chain_id)
+        w3 = get_web3(chain_id, install_retry=False)  # _retry_rpc owns retries
         checksum = Web3.to_checksum_address(contract_address)
         contract = w3.eth.contract(address=checksum, abi=APP_INTENT_BASE_ABI)
 
