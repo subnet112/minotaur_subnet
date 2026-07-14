@@ -223,6 +223,16 @@ class RoundState:
     shadow_case_log_hash: str | None = None
     certificate: ChampionCertificate | None = None
     effective_epoch: int | None = None
+    # Real wall-clock epoch (unix//EPOCH_SECONDS) at which the LEADER opened this
+    # round, stamped at open and broadcast for followers to adopt verbatim. This
+    # exists ONLY to anchor the benchmark fork-pin: opened_epoch is the champion
+    # ACTIVATION schedule (close_epoch + activation_delay, ~1 tempo in the FUTURE
+    # for commit-reveal alignment), so anchoring the pin to it lands ~40 min ahead
+    # and defers. benchmark_anchor_epoch is a recent-PAST time-epoch that
+    # confirm-brackets immediately. Purely the fork-pin anchor source — gated by
+    # BENCHMARK_ANCHOR_REAL_EPOCH (see api/startup._round_fork_anchor_epoch); until
+    # armed it is inert. None on legacy rounds / rounds opened before this shipped.
+    benchmark_anchor_epoch: int | None = None
     abort_reason: str | None = None
     # Set True ONLY when THIS node independently re-benchmarked the round's
     # candidate and its own verdict agreed (the reactive-benchmark APPROVE path),
@@ -288,6 +298,7 @@ class RoundState:
             "shadow_case_log_hash": self.shadow_case_log_hash,
             "certificate": self.certificate.to_dict() if self.certificate else None,
             "effective_epoch": self.effective_epoch,
+            "benchmark_anchor_epoch": self.benchmark_anchor_epoch,
             "abort_reason": self.abort_reason,
             "self_verified": self.self_verified,
             "self_verified_submission_id": self.self_verified_submission_id,
@@ -323,6 +334,7 @@ class RoundState:
             shadow_case_log_hash=raw.get("shadow_case_log_hash"),
             certificate=ChampionCertificate.from_dict(raw.get("certificate")),
             effective_epoch=raw.get("effective_epoch"),
+            benchmark_anchor_epoch=raw.get("benchmark_anchor_epoch"),
             abort_reason=raw.get("abort_reason"),
             self_verified=bool(raw.get("self_verified")),
             self_verified_submission_id=raw.get("self_verified_submission_id"),
@@ -463,10 +475,16 @@ class RoundStore:
 
         now = time.time()
         round_id = self._build_round_id(opened_epoch)
+        # Stamp the real wall-clock epoch at open as the fork-pin anchor source.
+        # opened_epoch is the (future) champion-activation schedule, so it is NOT a
+        # valid pin anchor; this is. Fleet-broadcast + adopted so every validator
+        # anchors identically. See RoundState.benchmark_anchor_epoch.
+        from minotaur_subnet.epoch.clock import EPOCH_SECONDS
         state = RoundState(
             round_id=round_id,
             status=RoundStatus.OPEN,
             opened_epoch=opened_epoch,
+            benchmark_anchor_epoch=int(now // EPOCH_SECONDS),
             created_at=now,
             updated_at=now,
         )

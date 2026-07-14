@@ -296,6 +296,47 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         return None
 
 
+def _benchmark_anchor_real_epoch_enabled() -> bool:
+    """Fleet-uniform gate for the B2 real-open-epoch fork-pin anchor. DEFAULT OFF.
+
+    When ON (and the round carries a stamped ``benchmark_anchor_epoch``), the fork
+    pin anchors to that recent-PAST wall-clock epoch instead of the FUTURE
+    ``opened_epoch`` (the champion-activation schedule = close_epoch +
+    activation_delay, ~1 tempo ahead for commit-reveal alignment) — so the pin
+    confirm-brackets immediately instead of deferring ~1 tempo every round.
+
+    CONSENSUS-RELEVANT: it changes the derived pin → ``benchmark_pack_hash``, so it
+    MUST be flipped fleet-uniformly (never a per-validator env) or mixed anchors
+    split the fleet (PACK_HASH_MISMATCH). Rollout: shadow-soak via
+    ``ROUND_ANCHOR_SHADOW`` (both anchors logged, role ``leader-realopen``) →
+    promote develop→main so every follower has the field + code → flip
+    ``BENCHMARK_ANCHOR_REAL_EPOCH=1`` fleet-wide on a round boundary.
+    """
+    return os.environ.get(
+        "BENCHMARK_ANCHOR_REAL_EPOCH", "",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _round_fork_anchor_epoch(round_state) -> int | None:
+    """Which epoch to anchor the round's benchmark fork-pin to.
+
+    ``opened_epoch`` is the champion ACTIVATION schedule, deliberately ~1 tempo in
+    the FUTURE — anchoring the pin to it lands ~40 min ahead and defers. When the
+    B2 anchor is armed AND the round carries a stamped ``benchmark_anchor_epoch``
+    (the leader's real wall-clock epoch at open, fleet-broadcast + adopted), anchor
+    to THAT — a recent-PAST time-epoch that brackets immediately. Otherwise fall
+    back to ``opened_epoch`` (legacy behaviour). Both are fleet-identical and known
+    at open. Only the epoch fed in changes; ``round_anchor_ts`` + the per-chain
+    lookback + ``find_pin_block`` are untouched.
+    """
+    if _benchmark_anchor_real_epoch_enabled():
+        bae = getattr(round_state, "benchmark_anchor_epoch", None)
+        if bae is not None:
+            return int(bae)
+    oe = getattr(round_state, "opened_epoch", None)
+    return int(oe) if oe is not None else None
+
+
 def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
     """Leader-side: derive + store the round's canonical fork pins (gated).
 
@@ -352,16 +393,16 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     cached = getattr(round_state, "fork_pins", None)
     if cached:
         return cached
-    # Anchor to opened_epoch (NOT close_epoch). opened_epoch is fleet-identical from the
-    # instant the round exists — it is encoded in the round_id (round-e{opened_epoch}-n{n})
-    # and followers parse it back verbatim — so every validator derives the SAME pin, and
-    # (unlike close_epoch, set only at close) it is KNOWN AT OPEN, so the pin resolves
-    # DURING the open window. round_anchor_ts(opened_epoch) sits ~1 epoch in the confirmed
-    # past at open so find_pin_block brackets immediately; by close it is deeply confirmed.
-    opened_epoch = getattr(round_state, "opened_epoch", None)
-    if opened_epoch is None:
+    # Select the fork-pin anchor epoch (see _round_fork_anchor_epoch): the stamped
+    # real-open wall-clock epoch (benchmark_anchor_epoch) when the B2 anchor is armed,
+    # else the legacy opened_epoch. Both are fleet-identical (opened_epoch is in the
+    # round_id; benchmark_anchor_epoch is leader-broadcast + adopted) and KNOWN AT OPEN,
+    # so the pin resolves DURING the open window and every validator derives the SAME
+    # pin. The gated switch is a fleet-uniform cutover — no mixed-anchor split.
+    anchor_epoch = _round_fork_anchor_epoch(round_state)
+    if anchor_epoch is None:
         return None
-    pins = _derive_round_fork_pins(int(opened_epoch))
+    pins = _derive_round_fork_pins(int(anchor_epoch))
     if pins:
         try:
             store.set_round_fork_pins(round_id, pins)  # cache for reuse
@@ -2734,21 +2775,32 @@ async def initialize(ctx: ServerContext) -> dict:
                     _current_solver_round_epoch(ctx),
                 )
                 # Round-anchored fork pins (gated, default-off). Populate BEFORE the pack
-                # hash below so the canonical pins are folded into it. Anchor to
-                # opened_epoch (NOT close_epoch): the pin is fixed at OPEN, so this
-                # close-time populate derives the SAME pin the worker already used during
-                # the open window — it can never overwrite the open-derived cache with a
-                # different (close_epoch) block, which would split scored-pin != hashed-pin.
+                # hash below so the canonical pins are folded into it. The anchor epoch is
+                # fixed at OPEN (opened_epoch always; benchmark_anchor_epoch stamped at
+                # open when the B2 anchor is armed), so this close-time populate derives
+                # the SAME pin the worker used during the open window — it can never
+                # overwrite the open-derived cache with a different block (which would
+                # split scored-pin != hashed-pin). See _round_fork_anchor_epoch.
+                _anchor_epoch = _round_fork_anchor_epoch(current) or int(current.opened_epoch)
                 _maybe_populate_round_fork_pins(
-                    current.round_id, int(current.opened_epoch)
+                    current.round_id, int(_anchor_epoch)
                 )
                 # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off, still
                 # derive + log the pins the leader WOULD pin, so fleet pin parity can be
                 # verified before enabling. No consensus effect.
                 _maybe_shadow_log_round_fork_pins(
                     ctx, current.round_id, role="leader",
-                    anchor_epoch=int(current.opened_epoch),
+                    anchor_epoch=int(_anchor_epoch),
                 )
+                # B2 parity: also log the pins the real-open-epoch anchor WOULD derive
+                # (independent of the BENCHMARK_ANCHOR_REAL_EPOCH gate) so the new anchor
+                # can be diffed fleet-wide BEFORE it is armed.
+                _b2_anchor = getattr(current, "benchmark_anchor_epoch", None)
+                if _b2_anchor is not None:
+                    _maybe_shadow_log_round_fork_pins(
+                        ctx, current.round_id, role="leader-realopen",
+                        anchor_epoch=int(_b2_anchor),
+                    )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
                 # Auto-scale the decision window with this round's slate: the serial
