@@ -77,8 +77,11 @@ class ChainSpec:
     # UPSTREAMS): plain RPC preferred, then the fork upstream. Falls back to
     # ``consensus_public_fallback`` (e.g. the BT-EVM lite endpoint) when set.
     proxy_upstream_envs: tuple[str, ...] = ()
-    # Live-RPC used to build the faucet + boot-solver rpc_urls (startup/validator).
-    boot_rpc_env: str | None = None
+    # Live-RPC ladder used to build the faucet + boot-solver rpc_urls
+    # (startup/validator). First configured env wins — the LIVE solver plans
+    # against this endpoint, so it must be the chain's REAL RPC, with the
+    # local anvil only as a dev fallback.
+    boot_rpc_envs: tuple[str, ...] = ()
 
     # ── consensus-static (CODE constants; fold into pack hash) ────────────────
     is_anchor: bool = False
@@ -123,7 +126,12 @@ _SPECS: tuple[ChainSpec, ...] = (
         benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
         check_rpc_envs=("ETH_RPC_URL", "ANVIL_RPC_URL"),
         proxy_upstream_envs=("ETH_RPC_URL", "ETH_UPSTREAM_RPC_URL"),
-        boot_rpc_env="ANVIL_RPC_URL",
+        # The live solver plans chain-1 routes against this endpoint. On
+        # production nodes ANVIL_RPC_URL is the BASE anvil (misnamed legacy),
+        # so it must only be the local-dev fallback — booting the solver with
+        # chain 1 → Base anvil makes every chain-1 generate_plan come back
+        # empty (no Ethereum pools on a Base fork) and live /quote returns 0.
+        boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
         is_anchor=False,
         lookback_epochs=3,   # ~12s blocks: 3 epochs clears 12-conf by round open
         fee_floor_wei=33_000_000_000_000,
@@ -148,7 +156,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         ),
         check_rpc_envs=("BASE_RPC_URL",),
         proxy_upstream_envs=("BASE_RPC_URL", "BASE_UPSTREAM_RPC_URL"),
-        boot_rpc_env="BASE_RPC_URL",
+        boot_rpc_envs=("BASE_RPC_URL",),
         is_anchor=True,          # the primary benchmark anchor (was ROUND_ANCHOR_CHAINS)
         lookback_epochs=1,
         fee_floor_wei=33_000_000_000_000,
@@ -180,7 +188,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         ),
         check_rpc_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_FORK_RPC_URL"),
         proxy_upstream_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_UPSTREAM_RPC_URL"),
-        boot_rpc_env="BITTENSOR_EVM_RPC_URL",
+        boot_rpc_envs=("BITTENSOR_EVM_RPC_URL",),
         is_anchor=False,
         lookback_epochs=1,
         fee_floor_wei=330_000_000_000_000,
@@ -200,7 +208,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         sim_rpc_envs=("ANVIL_RPC_URL",),
         upstream_rpc_env=None,   # local testnet forks from nothing
         benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        boot_rpc_env="ANVIL_RPC_URL",
+        boot_rpc_envs=("ANVIL_RPC_URL",),
         is_anchor=False,
         lookback_epochs=1,
         fee_floor_wei=0,
@@ -376,11 +384,19 @@ def proxy_upstream(chain_id: int) -> str:
 
 
 def boot_rpc(chain_id: int) -> str:
-    """Live RPC used to seed the faucet + boot-solver ``rpc_urls`` maps."""
+    """Live RPC used to seed the faucet + boot-solver ``rpc_urls`` maps.
+
+    Resolves the spec's ``boot_rpc_envs`` ladder — first env var that is set
+    wins, "" when none is.
+    """
     s = spec(chain_id)
-    if s is None or s.boot_rpc_env is None:
+    if s is None:
         return ""
-    return os.environ.get(s.boot_rpc_env, "").strip()
+    for env_name in s.boot_rpc_envs:
+        url = os.environ.get(env_name, "").strip()
+        if url:
+            return url
+    return ""
 
 
 # ── per-chain contract-address env resolution (templated ``PREFIX_<chain_id>``) ──
