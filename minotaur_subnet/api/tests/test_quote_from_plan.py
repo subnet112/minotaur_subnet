@@ -240,6 +240,11 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(len(runner.calls), 1)
         self.assertIsNotNone(runner.calls[0].intent_order)
         self.assertEqual(runner.calls[0].intent_order, _sentinel)
+        # The simulator's scoreIntent branch gates on `contract_address AND
+        # intent_order` — passing None here silently demotes the sim to the
+        # bare-interaction path (0 delivered), which is exactly the V2
+        # chain-1 zero-quote bug's final layer.
+        self.assertEqual(runner.calls[0].contract_address, _DEPLOYED)
         # Revert-avoidance: the order's submitted_by == the intent_order's source
         # == the receiver the encoder was handed (the pre-funded Anvil default).
         self.assertEqual(
