@@ -870,6 +870,12 @@ class AppConfigRequest(BaseModel):
     fee_bps: int | None = None
     volume_cap_bps: int | None = None
     fee_collector: str | None = None
+    fee_mode: int | None = Field(
+        None, ge=0, le=1, description="0=USER, 1=APP (fee paid from the app-held WETH float)",
+    )
+    app_owner: str | None = Field(
+        None, description="V2 float-recovery co-signer (setAppOwner; relayer-bootstrapped once)",
+    )
 
 
 @router.patch("/apps/{app_id}/deployments/{chain_id}/config")

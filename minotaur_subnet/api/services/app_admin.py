@@ -28,6 +28,8 @@ _APP_ADDRESS_VIEWS = (
     "platformFeeCollector",
     "appPaymaster",
     "wrappedNativeToken",
+    # V2-only (revert -> None on V1): float-recovery co-signer, 0x0 = unset.
+    "appOwner",
 )
 _APP_UINT_VIEWS = (
     "feeMode",            # enum FeeMode (0=USER, 1=APP)
