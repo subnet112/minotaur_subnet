@@ -1393,8 +1393,18 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     # captures the delivered output (metadata.raw_output / transfers);
                     # we add the framework wrapper overhead (executeIntent, proxy
                     # deploy, sig verify, fee settle) when pricing the fee below.
+                    #
+                    # contract_address must be the deployed app when we have an
+                    # intent_order: the simulator's scoreIntent branch gates on
+                    # `contract_address AND intent_order` (anvil_simulator), so
+                    # passing None here silently demoted every quote to the
+                    # bare-interaction path (0 delivered for most plans) even
+                    # with a perfectly built intent_order. Mirrors
+                    # order_processor.py's call shape.
                     _sim = await _sim_runner.simulate(
-                        _plan, _prov_order, None, _intent_order, False, _deployed,
+                        _plan, _prov_order,
+                        _deployed if _intent_order else None,
+                        _intent_order, False, _deployed,
                     )
                     _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
                     if _swap_gas > 0:
