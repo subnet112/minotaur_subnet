@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
-from minotaur_subnet.harness.submission_store import SubmissionStatus
+from minotaur_subnet.harness.submission_store import SubmissionStatus, offload_write
 from minotaur_subnet.harness.round_store import RoundStatus
 
 from .models import (
@@ -1052,7 +1052,8 @@ async def create_submission(
     # For the private path also stash is_private/private_repo_full (persisted) and
     # the per-submission token (in-memory only, purged on terminal state).
     try:
-        sub = store.create(
+        sub = await offload_write(
+            store.create,
             repo_url=pr["clone_url"],
             commit_hash=pr["head_sha"],
             epoch=body.epoch,

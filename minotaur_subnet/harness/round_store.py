@@ -21,6 +21,17 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+# Cap on retained rounds in the in-memory/persisted store. Rounds close ~1 per
+# tempo (~72 min), so this default keeps months of history while bounding the
+# whole-file rewrite + parse. Eviction NEVER drops the current round or the
+# standing/previous champion's activated round (their RoundState carries the
+# certificate that /champion/reattest + /champion/sync-bundle serve — an evicted
+# champion round 404s the follower re-adopt path → burn), nor the newest
+# opened_epoch (so a same-epoch reopen can't find a reset per-epoch count in
+# _build_round_id and mint a duplicate round_id). Every evicted round was already
+# mirrored to the durable record_sink. Set <= 0 to disable bounding.
+_ROUND_STORE_MAX_ROUNDS = int(os.environ.get("SOLVER_ROUND_STORE_MAX_ROUNDS", "2000"))
+
 
 class RoundStatus(str, Enum):
     """Lifecycle state for a solver submission round."""
@@ -816,10 +827,54 @@ class RoundStore:
                 getattr(state, "round_id", "?"), exc,
             )
 
+    def _evict_rounds(self) -> None:
+        """Bound ``_rounds`` to ``_ROUND_STORE_MAX_ROUNDS``, keeping the most
+        recent rounds plus a protected pin set. Rebinds ``_rounds`` (copy-on-
+        write) rather than mutating in place, so a lock-free reader's dict view
+        is never changed mid-iteration."""
+        cap = _ROUND_STORE_MAX_ROUNDS
+        if cap <= 0 or len(self._rounds) <= cap:
+            return
+        # Protected regardless of age: the current round, the standing and
+        # previous champion's activated rounds (their certificate lives here and
+        # the reattest / sync-bundle serve paths 404 without it), and every round
+        # in the newest opened_epoch (guarantees _build_round_id's per-epoch
+        # count is never reset by eviction → no duplicate round_id).
+        pinned = {
+            self._current_round_id,
+            self._active_champion.activated_round_id,
+            self._previous_champion.activated_round_id,
+        }
+        pinned.discard(None)
+        max_epoch = max((s.opened_epoch for s in self._rounds.values()), default=0)
+        protected = {
+            rid for rid, s in self._rounds.items()
+            if rid in pinned or s.opened_epoch >= max_epoch
+        }
+        survivors = set(protected)
+        room = cap - len(protected)
+        if room > 0:
+            ranked = sorted(
+                (rid for rid in self._rounds if rid not in protected),
+                key=lambda rid: (
+                    self._rounds[rid].opened_epoch,
+                    self._rounds[rid].created_at,
+                    rid,
+                ),
+                reverse=True,
+            )
+            survivors.update(ranked[:room])
+        if len(survivors) >= len(self._rounds):
+            return
+        self._rounds = {
+            rid: s for rid, s in self._rounds.items() if rid in survivors
+        }
+
     def _persist(self) -> None:
         if self._persist_path is None:
             return
         try:
+            self._evict_rounds()
             data = {
                 "current_round_id": self._current_round_id,
                 "active_champion": self._active_champion.to_dict(),
