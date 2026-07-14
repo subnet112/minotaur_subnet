@@ -175,6 +175,41 @@ def test_set_app_config_rejects_unknown_field(tmp_path):
         _store(tmp_path), "app_x", 8453, {"nope": 1})["error"]
 
 
+def test_set_app_config_flips_fee_mode_to_app(tmp_path):
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc):
+        out = set_app_config(s, "app_x", 8453, {"fee_mode": 1})
+
+    assert out["txs"] == {"fee_mode": "0xtx"}
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setFeeMode(uint8)"
+    assert call.args[4] == [1]
+
+
+def test_set_app_config_rejects_invalid_fee_mode(tmp_path):
+    assert "fee_mode" in set_app_config(
+        _store(tmp_path), "app_x", 8453, {"fee_mode": 2})["error"]
+
+
+def test_set_app_config_sets_app_owner(tmp_path):
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    owner = "0x" + "99" * 20
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc):
+        out = set_app_config(s, "app_x", 8453, {"app_owner": owner})
+
+    assert out["txs"] == {"app_owner": "0xtx"}
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setAppOwner(address)"
+    assert call.args[4] == [owner]
+
+
+def test_set_app_config_rejects_zero_app_owner(tmp_path):
+    assert "app_owner" in set_app_config(
+        _store(tmp_path), "app_x", 8453, {"app_owner": "0x" + "00" * 20})["error"]
+
+
 # ── registry calldata ────────────────────────────────────────────────────
 
 

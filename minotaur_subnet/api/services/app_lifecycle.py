@@ -182,6 +182,13 @@ _CONFIG_SETTERS = {
     "fee_bps": ("setFeeBps(uint256)", "uint256"),
     "volume_cap_bps": ("setVolumeCapBps(uint256)", "uint256"),
     "fee_collector": ("setFeeCollector(address)", "address"),
+    # Who pays the protocol fee: 0=USER (pulled from the user's WETH),
+    # 1=APP (paid from the app-held WETH float). setFeeMode is onlyRelayer,
+    # so a post-deploy USER->APP flip has to go through this endpoint.
+    "fee_mode": ("setFeeMode(uint8)", "uint8"),
+    # V2 float-recovery co-signer (withdrawFloat is relayer OR appOwner).
+    # setAppOwner is relayer-bootstrappable once, then appOwner-gated.
+    "app_owner": ("setAppOwner(address)", "address"),
 }
 
 
@@ -193,6 +200,10 @@ def set_app_config(
     unknown = set(updates) - set(_CONFIG_SETTERS)
     if unknown:
         return {"error": f"Unknown config fields: {sorted(unknown)}"}
+    if "fee_mode" in updates and int(updates["fee_mode"]) not in (0, 1):
+        return {"error": "fee_mode must be 0 (USER) or 1 (APP)"}
+    if "app_owner" in updates and not int(str(updates["app_owner"]), 16):
+        return {"error": "app_owner must be a non-zero address"}
     if not updates:
         return {"error": f"Nothing to set; supported: {sorted(_CONFIG_SETTERS)}"}
     relayer = _relayer()
