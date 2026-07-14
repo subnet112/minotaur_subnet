@@ -456,17 +456,25 @@ def _maybe_shadow_log_round_fork_pins(
     *,
     role: str,
     anchor_epoch: int | None = None,
+    force: bool = False,
 ) -> None:
     """Shadow phase (spec §6 step 2): derive + log the round-anchored fork pins
     and the ``benchmark_pack_hash`` they *would* produce, with **zero consensus
     effect**.
 
-    Enabled by ``ROUND_ANCHOR_SHADOW`` (default-off) and only active while the
-    real gate ``ROUND_ANCHORED_PIN`` is OFF — when the gate is on the live path
-    already derives, binds and logs the pins, so shadow would be redundant. This
-    closes the rollout gap where, with the gate off, ``_derive_round_fork_pins``
-    is never called, so operators have no way to confirm every validator computes
-    the identical pin *before* flipping the gate.
+    Enabled by ``ROUND_ANCHOR_SHADOW`` (default-off). Normally only active while
+    the real gate ``ROUND_ANCHORED_PIN`` is OFF — when the gate is on the live
+    path already derives, binds and logs the (opened_epoch-anchored) pins, so
+    shadow would be redundant. This closes the rollout gap where, with the gate
+    off, ``_derive_round_fork_pins`` is never called, so operators have no way to
+    confirm every validator computes the identical pin *before* flipping the gate.
+
+    ``force=True`` logs REGARDLESS of ``ROUND_ANCHORED_PIN`` (the ``ROUND_ANCHOR_
+    SHADOW`` gate still applies): used for the B2 real-open-epoch parity line
+    (``role=leader-realopen``, anchor = ``benchmark_anchor_epoch``), whose anchor
+    DIFFERS from the live opened_epoch pin — so it is NOT redundant when the gate
+    is on; it is exactly the parity signal needed before arming
+    ``BENCHMARK_ANCHOR_REAL_EPOCH``.
 
     Strictly observational and best-effort:
 
@@ -484,8 +492,10 @@ def _maybe_shadow_log_round_fork_pins(
     from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not _env_true("ROUND_ANCHOR_SHADOW", default=False):
         return
-    if round_anchored_pin_enabled():
+    if round_anchored_pin_enabled() and not force:
         return  # live path already derives/binds/logs — shadow is redundant
+        # (unless force: the B2 real-open anchor differs from the live pin, so it
+        # is NOT redundant and must log for parity even with the gate on)
     try:
         if anchor_epoch is None:
             from minotaur_subnet.api.routes import submissions
@@ -2799,7 +2809,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 if _b2_anchor is not None:
                     _maybe_shadow_log_round_fork_pins(
                         ctx, current.round_id, role="leader-realopen",
-                        anchor_epoch=int(_b2_anchor),
+                        anchor_epoch=int(_b2_anchor), force=True,
                     )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
