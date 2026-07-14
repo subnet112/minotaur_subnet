@@ -62,7 +62,7 @@ def get_tx_url(chain_id: int, tx_hash: str) -> str:
     return f"{base}/tx/{tx_hash}"
 
 
-def get_web3(chain_id: int) -> Web3:
+def get_web3(chain_id: int, *, install_retry: bool = True) -> Web3:
     """
     Return a ``Web3`` instance connected to the RPC for *chain_id*.
 
@@ -70,11 +70,19 @@ def get_web3(chain_id: int) -> Web3:
     ``CHAIN_CONFIG[chain_id]["rpc_env"]``.  Instances are cached so
     subsequent calls with the same *chain_id* return the same object.
 
+    ``install_retry`` (default True) installs the read-scoped transient-retry
+    middleware. Pass ``install_retry=False`` from a caller that ALREADY wraps its
+    calls in its own retry (e.g. ``ContractManager._retry_rpc``) so reads aren't
+    double-retried (attempts × the caller's attempts) and the provider isn't
+    hammered during a throttle. The cache is keyed on the flag, so a retry and a
+    no-retry client for the same chain coexist without clobbering each other.
+
     Raises ``ValueError`` if the chain is unsupported or the environment
     variable is not set.
     """
-    if chain_id in _web3_cache:
-        return _web3_cache[chain_id]
+    cache_key = (chain_id, install_retry)
+    if cache_key in _web3_cache:
+        return _web3_cache[cache_key]
 
     cfg = CHAIN_CONFIG.get(chain_id)
     if cfg is None:
@@ -98,7 +106,15 @@ def get_web3(chain_id: int) -> Web3:
     if cfg.get("is_poa"):
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
-    _web3_cache[chain_id] = w3
+    # Transient-read backoff: retry idempotent reads on 429/-32005/5xx/timeout
+    # (writes/mutations pass through untouched). Injected outermost so it wraps
+    # the PoA middleware + provider. LIGHT budget (see DEFAULT_WEB3_*) so it never
+    # nests badly with a caller's own retry.
+    if install_retry:
+        from minotaur_subnet.blockchain.web3_retry import install_rpc_retry
+        install_rpc_retry(w3)
+
+    _web3_cache[cache_key] = w3
     return w3
 
 

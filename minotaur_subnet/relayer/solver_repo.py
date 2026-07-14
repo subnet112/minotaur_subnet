@@ -1039,7 +1039,8 @@ def _read_champion_registry() -> Any | None:
         return None
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(rpc))
+        from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+        w3 = build_retrying_web3(rpc)
         if not w3.is_connected():
             logger.error("merge gate: cannot connect to BT EVM at %s", rpc)
             return None

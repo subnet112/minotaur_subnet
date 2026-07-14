@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 def _read_authorized_validators(rpc_url: str, registry_address: str) -> list[str]:
     """Read the current authorized-validator set from ValidatorRegistry on chain."""
     from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
     abi = [{
         "name": "getValidators",
         "type": "function",
@@ -58,7 +59,7 @@ def _read_authorized_validators(rpc_url: str, registry_address: str) -> list[str
         "inputs": [],
         "outputs": [{"name": "", "type": "address[]"}],
     }]
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=abi,

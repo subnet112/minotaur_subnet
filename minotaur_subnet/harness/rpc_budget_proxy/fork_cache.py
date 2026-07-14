@@ -64,7 +64,14 @@ from typing import Any
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 from ._persist import SnapshotScheduler, load_snapshot
-from .proxy import _content_type_only, _parse_upstreams_env, _safe_parse
+from minotaur_subnet.rpc_backoff import (
+    DEFAULT_FORWARD_DEADLINE_SECONDS,
+    body_has_retryable_rpc_error,
+    is_retryable_status,
+    retry_async,
+)
+
+from .proxy import _content_type_only, _host_of, _parse_upstreams_env, _safe_parse
 from .rewrite_table import BLOCK_PARAM_INDEX
 
 logger = logging.getLogger(__name__)
@@ -353,20 +360,34 @@ class ForkCache:
         fail-loud semantics anvil would see talking to the provider directly)."""
         assert self._client is not None, "client session not started"
         content_type = request.headers.get("Content-Type", "application/json")
-        try:
+
+        async def _once() -> tuple[int, bytes, str]:
             async with self._client.post(
                 upstream, data=raw_body, headers={"Content-Type": content_type},
             ) as resp:
                 body = await resp.read()
-                return web.Response(
-                    body=body,
-                    status=resp.status,
-                    content_type=_content_type_only(
-                        resp.headers.get("Content-Type", "application/json")
-                    ),
+                ct = _content_type_only(
+                    resp.headers.get("Content-Type", "application/json")
                 )
+                return resp.status, body, ct
+
+        # Retry TRANSIENT upstream failures (429 / -32005 / 5xx / timeout / reset)
+        # before surfacing them — fork fetches are the dominant Alchemy driver and
+        # a 429 here makes anvil (which --retries=10 blindly re-fires) hammer the
+        # provider and can zero a benchmark read. Fork reads are immutable-by-block
+        # → a retry re-fetches identical bytes. Fail-loud after retries exhaust.
+        try:
+            status, body, ct = await retry_async(
+                _once,
+                deadline_seconds=DEFAULT_FORWARD_DEADLINE_SECONDS,
+                retry_on_result=lambda r: is_retryable_status(r[0])
+                or body_has_retryable_rpc_error(r[1]),
+                label=f"fork-cache→{_host_of(upstream)}",
+            )
+            return web.Response(body=body, status=status, content_type=ct)
         except Exception as exc:  # noqa: BLE001 - surface any transport failure
-            logger.error("fork_cache upstream error (%s): %s", upstream, exc)
+            logger.error("fork_cache upstream error (%s, after retries): %s",
+                         _host_of(upstream), exc)
             return web.json_response(
                 {"jsonrpc": "2.0", "id": None,
                  "error": {"code": -32000, "message": "upstream unreachable"}},

@@ -347,7 +347,9 @@ def setup_full_stack(anvil, deployed_contracts, test_accounts, eip712_domain, tm
     os.environ.update(_prov_env)
 
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    _web3_cache[CHAIN_ID] = w3
+    # Seed both cache variants (get_web3 keys on (chain_id, install_retry)).
+    _web3_cache[(CHAIN_ID, True)] = w3
+    _web3_cache[(CHAIN_ID, False)] = w3
 
     dc = deployed_contracts
     accts = test_accounts
@@ -372,7 +374,8 @@ def setup_full_stack(anvil, deployed_contracts, test_accounts, eip712_domain, tm
 
     yield
 
-    _web3_cache.pop(CHAIN_ID, None)
+    _web3_cache.pop((CHAIN_ID, True), None)
+    _web3_cache.pop((CHAIN_ID, False), None)
     for k, v in _saved_env.items():
         if v is None:
             os.environ.pop(k, None)

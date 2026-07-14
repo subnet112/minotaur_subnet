@@ -244,6 +244,10 @@ def test_read_champion_last_nonce_uses_bounded_timeout(monkeypatch):
     MockWeb3.return_value = fake_w3
     MockWeb3.to_checksum_address.side_effect = lambda a: a
     monkeypatch.setattr(pc, "Web3", MockWeb3)
+    # The client is now built via build_retrying_web3, which constructs through
+    # the `web3.Web3` module attribute — patch that too so the mock is used.
+    import web3
+    monkeypatch.setattr(web3, "Web3", MockWeb3)
 
     result = pc.read_champion_last_nonce("http://bt-evm:9944", "0xCHAMP", "0xSigner")
 
