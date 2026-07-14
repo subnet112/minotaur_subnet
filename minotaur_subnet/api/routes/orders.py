@@ -1354,6 +1354,25 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                                 and hasattr(_js_engine, "get_manifest"))
                             else None
                         )
+                        if (_bench_manifest is None and _js_engine is not None
+                                and getattr(app_def, "js_code", None)):
+                            # The engine caches manifests only for intents
+                            # something has already SCORED (order scoring and
+                            # the blockloop lazy-load on first use). An app
+                            # that has never had a live order — e.g. a fresh
+                            # V2 deployment — is absent, which silently
+                            # degraded its quotes to the bare-interaction sim
+                            # (documented to measure 0 delivered for most
+                            # plans). Lazy-load it here exactly like
+                            # order_service does.
+                            try:
+                                await _js_engine.load_intent(app_id, app_def.js_code)
+                                _bench_manifest = _js_engine.get_manifest(app_id)
+                            except Exception as _mexc:
+                                logger.warning(
+                                    "Quote manifest lazy-load failed for %s: %s",
+                                    app_id, _mexc,
+                                )
                         _bench_state = IntentState(
                             contract_address=_deployed,
                             chain_id=req.chain_id,
