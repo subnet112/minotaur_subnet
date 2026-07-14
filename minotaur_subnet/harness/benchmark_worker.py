@@ -33,6 +33,7 @@ from minotaur_subnet.sdk.intent_solver import MarketSnapshot
 from minotaur_subnet.harness.submission_store import (
     SubmissionStatus,
     SubmissionStore,
+    offload_write,
 )
 from minotaur_subnet.harness.round_store import RoundStatus, RoundStore
 from minotaur_subnet.consensus.round_anchor import ForkPinUnavailable
@@ -879,7 +880,7 @@ class BenchmarkWorker:
         if not intents:
             logger.warning("No active intents for benchmarking")
             for sub in benchmarking:
-                self._sub_store.set_benchmark_result(
+                await offload_write(self._sub_store.set_benchmark_result,
                     sub.submission_id,
                     valid=False,
                     details={"error": "no_active_intents"},
@@ -940,7 +941,7 @@ class BenchmarkWorker:
                 continue
             if sub.solver_path is not None:
                 if not _allow_subprocess_benchmark():
-                    self._sub_store.reject(
+                    await offload_write(self._sub_store.reject,
                         sub.submission_id,
                         (
                             "Subprocess benchmarking is disabled by policy. "
@@ -967,7 +968,7 @@ class BenchmarkWorker:
                     details = self._results_to_details(results)
                     valid = has_delivered_value_rows(details["per_intent"])
 
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=valid,
                         details=details,
@@ -982,7 +983,7 @@ class BenchmarkWorker:
                         "Benchmarking failed for %s: %s",
                         sub.submission_id, exc,
                     )
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=False,
                         details={"error": str(exc)},
@@ -1002,7 +1003,7 @@ class BenchmarkWorker:
                     valid = has_delivered_value_rows(details["per_intent"])
                     print(f"[BENCHMARK] valid={valid} orders={len(results)}", flush=True)
 
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=valid,
                         details=details,
@@ -1020,7 +1021,7 @@ class BenchmarkWorker:
                         "Benchmarking failed for %s: %s",
                         sub.submission_id, exc,
                     )
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=False,
                         details={"error": str(exc)},
@@ -1028,7 +1029,7 @@ class BenchmarkWorker:
 
             else:
                 print(f"[BENCHMARK] No solver_path or image_tag for {sub.submission_id}", flush=True)
-                self._sub_store.reject(
+                await offload_write(self._sub_store.reject,
                     sub.submission_id,
                     "No solver_path or image_tag available for benchmarking",
                     outcome_code="benchmark_failed",
@@ -1694,24 +1695,28 @@ class BenchmarkWorker:
                 round_id = current_round.round_id
 
         # Create genesis submission (skip screening, go straight to BENCHMARKING)
-        sub = self._sub_store.create(
+        sub = await offload_write(
+            self._sub_store.create,
             repo_url=GENESIS_REPO_URL,
             commit_hash="builtin",
             epoch=GENESIS_EPOCH,
             hotkey=GENESIS_HOTKEY,
             round_id=round_id,
         )
-        self._sub_store.set_solver_info(
+        await offload_write(
+            self._sub_store.set_solver_info,
             sub.submission_id, name="baseline-swap-solver", version="2.0.0",
         )
-        self._sub_store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+        await offload_write(
+            self._sub_store.update_status, sub.submission_id, SubmissionStatus.BENCHMARKING,
+        )
         logger.info("Genesis submission created: %s", sub.submission_id)
 
         # Load intents, build scoring, enrich with manifests (same as run_once)
         intents = self._load_benchmark_intents()
         if not intents:
             logger.warning("Genesis: no active intents for benchmarking")
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=False, details={"error": "no_active_intents"},
             )
             return 1
@@ -1740,7 +1745,7 @@ class BenchmarkWorker:
             details = self._results_to_details(results)
             valid = has_delivered_value_rows(details["per_intent"])
 
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=valid, details=details,
             )
             logger.info(
@@ -1749,7 +1754,7 @@ class BenchmarkWorker:
             )
         except Exception as exc:
             logger.exception("Genesis benchmarking failed: %s", exc)
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=False, details={"error": str(exc)},
             )
 
