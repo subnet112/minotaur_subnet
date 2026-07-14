@@ -240,3 +240,116 @@ def test_create_owner_signature_no_admin_binds_owner(client):
     assert "app_id" in out, out
     # Ownership PROVEN by key + bound to the signer — no admin key used.
     assert out.get("deployer", "").lower() == OWNER.address.lower()
+
+
+# ── update_scoring: admin-key-only gate replaced by the standard matrix ──
+
+_JS = "function score(){return 1;}"
+
+
+def _scoring_hash():
+    from eth_hash.auto import keccak
+    return keccak(_JS.encode())
+
+
+def test_scoring_no_auth_is_403(client):
+    c, _ = client
+    r = c.put("/v1/apps/app_x/scoring", json={"new_js_code": _JS})
+    assert r.status_code == 403
+
+
+def test_scoring_wallet_header_sig_passes_auth(client):
+    c, _ = client
+    h = _headers("update_scoring", "app_x", _scoring_hash(), 1, _future(c))
+    r = c.put("/v1/apps/app_x/scoring", json={"new_js_code": _JS}, headers=h)
+    assert r.status_code == 200
+    # Auth passed — any residual error must be about the JS, never authz.
+    assert "Unauthorized" not in str(r.json().get("error", ""))
+
+
+def test_scoring_wrong_params_hash_is_403(client):
+    from eth_hash.auto import keccak
+    c, _ = client
+    h = _headers("update_scoring", "app_x", keccak(b"other code"), 1, _future(c))
+    r = c.put("/v1/apps/app_x/scoring", json={"new_js_code": _JS}, headers=h)
+    assert r.status_code == 403
+
+
+def test_scoring_admin_key_alone_passes_gate(client):
+    # The old double gate demanded key AND in-body deployer sig; the key alone
+    # (rollout bypass) must now clear authorization end-to-end.
+    c, _ = client
+    r = c.put(
+        "/v1/apps/app_x/scoring", json={"new_js_code": _JS},
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+    assert r.status_code == 200
+    assert "Unauthorized" not in str(r.json().get("error", ""))
+
+
+def test_scoring_legacy_body_signature_still_works(client):
+    # Pre-header scheme: signature in the body, no admin key, no headers.
+    c, _ = client
+    dl = _future(c)
+    sig = developer_auth.sign_developer_auth(
+        OWNER.key.hex(), action="update_scoring", app_id="app_x",
+        params_hash=_scoring_hash(), nonce=1, deadline=dl,
+    )
+    r = c.put("/v1/apps/app_x/scoring", json={
+        "new_js_code": _JS, "signature": sig, "nonce": 1, "deadline": dl,
+    })
+    assert r.status_code == 200
+    assert "Unauthorized" not in str(r.json().get("error", ""))
+
+
+# ── activate: admin key OR ADMIN-ONLY wallet signature ───────────────────
+
+ADMIN2 = Account.from_key("0x" + "22" * 32)
+
+
+def _seed_solving_deployment(store):
+    from minotaur_subnet.shared.types import AppStatus, DeploymentResult
+    store.save_deployment(DeploymentResult(
+        app_id="app_x", status=AppStatus.SOLVING, js_code_hash="x",
+        chain_id=8453, contract_address="0x" + "33" * 20,
+    ))
+
+
+def test_activate_no_auth_is_403(client):
+    c, store = client
+    _seed_solving_deployment(store)
+    r = c.post("/v1/apps/app_x/activate?chain_id=8453")
+    assert r.status_code == 403
+
+
+def test_activate_deployer_sig_is_403_admin_only(client):
+    # The app's own deployer must NOT be able to self-authorize a benchmark
+    # skip — activate is admin_only like registration approval.
+    c, store = client
+    _seed_solving_deployment(store)
+    ph = app_auth.params_hash_for("activate_app", "app_x", 8453)
+    h = _headers("activate_app", "app_x", ph, 1, _future(c), signer=OWNER)
+    r = c.post("/v1/apps/app_x/activate?chain_id=8453", headers=h)
+    assert r.status_code == 403
+
+
+def test_activate_admin_signer_sig_activates(client, monkeypatch):
+    c, store = client
+    _seed_solving_deployment(store)
+    monkeypatch.setenv("APP_ADMIN_SIGNERS", ADMIN2.address)
+    ph = app_auth.params_hash_for("activate_app", "app_x", 8453)
+    h = _headers("activate_app", "app_x", ph, 1, _future(c), signer=ADMIN2)
+    r = c.post("/v1/apps/app_x/activate?chain_id=8453", headers=h)
+    assert r.status_code == 200
+    assert r.json()["status"] == "active"
+
+
+def test_activate_admin_key_still_works(client):
+    c, store = client
+    _seed_solving_deployment(store)
+    r = c.post(
+        "/v1/apps/app_x/activate?chain_id=8453",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "active"
