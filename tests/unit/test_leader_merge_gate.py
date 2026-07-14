@@ -251,7 +251,7 @@ def test_merge_drift_publishes_certified_tree(monkeypatch):
                       lambda *a, **kw: published.append((a, kw)) or True), \
          patch.object(sr, "comment_on_pr", lambda n, body, **kw: commented.append(n) or True), \
          patch.object(sr, "close_pr", lambda n: closed.append(n) or True):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is True
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is True
     (args, kwargs), = published
     assert args[2] == SHA  # published the CERTIFIED sha, not the drifted head
     assert kwargs["source_token"] is None
@@ -266,7 +266,7 @@ def test_merge_drift_refuses_when_cert_not_bound(monkeypatch):
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(OTHER)), \
          patch.object(sr, "_publish_certified_tree_to_canonical",
                       lambda *a, **kw: published.append(a) or True):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is False
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is False
     assert published == []
 
 
@@ -274,14 +274,14 @@ def test_merge_refuses_when_pr_touches_ci(monkeypatch):
     _env(monkeypatch); _registry(monkeypatch)
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(SHA)), \
          patch.object(sr, "_pr_touches_ci", lambda o, r, n: True):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is False
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is False
 
 
 def test_merge_refuses_when_not_certified(monkeypatch):
     _env(monkeypatch); _registry(monkeypatch, latest_commit=OTHER)
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(SHA)), \
          patch.object(sr, "_pr_touches_ci", lambda o, r, n: False):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is False
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is False
 
 
 def test_merge_succeeds_and_pins_sha(monkeypatch):
@@ -295,7 +295,7 @@ def test_merge_succeeds_and_pins_sha(monkeypatch):
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", lambda n: _resolved(SHA)), \
          patch.object(sr, "_pr_touches_ci", lambda o, r, n: False), \
          patch.object(sr, "_github_api_request", fake_req):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is True
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is True
     method, url, payload = calls[-1]
     assert method == "PUT" and url.endswith("/pulls/7/merge")
     assert payload == {"merge_method": "squash", "sha": SHA}  # squash + pinned to head
@@ -316,7 +316,7 @@ def test_merge_unresolvable_pr_falls_back_to_certified_publish(monkeypatch):
                       lambda *a, **kw: published.append(a) or True), \
          patch.object(sr, "comment_on_pr", lambda n, body, **kw: True), \
          patch.object(sr, "close_pr", lambda n: True):
-        assert sr.merge_miner_pr_when_certified(7, SHA, round_id="r") is True
+        assert bool(sr.merge_miner_pr_when_certified(7, SHA, round_id="r")) is True
     assert published and published[0][2] == SHA
 
 
@@ -329,7 +329,7 @@ def test_merge_refuses_when_pr_unresolvable_and_no_certified_sha(monkeypatch):
         raise PRResolutionError("closed")
 
     with patch("minotaur_subnet.api.routes.submissions.github_pr.resolve_pr", boom):
-        assert sr.merge_miner_pr_when_certified(7, "", round_id="r") is False
+        assert bool(sr.merge_miner_pr_when_certified(7, "", round_id="r")) is False
 
 
 # ── assert_solver_repo_token_not_admin ───────────────────────────────────────

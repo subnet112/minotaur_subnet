@@ -196,6 +196,33 @@ async def test_merge_gate_aborts_when_merge_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_merge_gate_abort_reason_carries_callback_reason(monkeypatch):
+    # A MergeResult(False, reason) callback surfaces its SPECIFIC reason into the
+    # round's abort_reason as `merge_failed:<reason>` (self-diagnosing), while
+    # preserving the `merge_failed` prefix so existing filters still match. The
+    # miner notice reflects the reason and no longer blames PR-head drift.
+    from minotaur_subnet.relayer.solver_repo import MergeResult
+
+    m = _bare_manager()
+    _wire_commit_mocks(m)
+    m._on_champion_adopted = MagicMock(return_value=MergeResult(False, "no_quorum_cert"))
+    m._notify_champion_rejected = MagicMock()
+
+    monkeypatch.delenv("DISABLE_CHAMPION_ADOPTION", raising=False)
+    result = await m.activate_certified_round("r1", epoch=5)
+
+    assert result["champion_changed"] is False
+    assert result["abort_reason"] == "merge_failed:no_quorum_cert"
+    assert result["abort_reason"].startswith("merge_failed")  # backward-compatible prefix
+    m._hot_swap.assert_not_called()
+    m._emit_weights.assert_not_called()
+    # Miner notice names the real reason; the stale drift-blame default is gone.
+    notice = m._notify_champion_rejected.call_args.args[1]
+    assert "no_quorum_cert" in notice
+    assert "pushed PAST the certified commit" not in notice
+
+
+@pytest.mark.asyncio
 async def test_merge_gate_commits_when_merge_succeeds(monkeypatch):
     # The callback returns True (attest + merge both succeeded) → normal commit.
     m = _bare_manager()
