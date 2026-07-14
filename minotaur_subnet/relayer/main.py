@@ -522,8 +522,10 @@ class RelayerService:
             "error": submit_result.error,
         })
 
-    async def handle_finalize_champion(self, request: web.Request) -> web.Response:
-        """POST /v1/finalize-champion — attest + squash-merge a certified champion.
+    async def _finalize_core(self, request: web.Request) -> "FinalizeOutcome":
+        """Shared finalize logic → a structured FinalizeOutcome (serialized per
+        API version by the /v1 and /v2 handlers below). Attest + squash-merge a
+        certified champion.
 
         Champion FINALIZATION (the on-chain ``ChampionRegistry.certify()`` tx +
         the GitHub PR squash-merge) lives HERE, in the trusted relayer that holds
@@ -570,36 +572,29 @@ class RelayerService:
         )
         from minotaur_subnet.consensus.eip712 import build_domain_separator
         from minotaur_subnet.harness.round_store import ChampionCertificate
-        from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+        from minotaur_subnet.relayer.solver_repo import (
+            FinalizeOutcome,
+            on_champion_adopted_pr,
+        )
 
         try:
             data = await request.json()
         except Exception as exc:
-            return web.json_response(
-                {"merge_ok": False, "reason": f"bad JSON: {exc}"}, status=200,
-            )
+            return FinalizeOutcome(False, "bad_json", "validation", f"bad JSON: {exc}")
 
         try:
             round_id = str(data.get("round_id") or "").strip()
             cert = ChampionCertificate.from_dict(data.get("certificate"))
             if cert is None:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "missing certificate"}, status=200,
-                )
+                return FinalizeOutcome(False, "missing_certificate", "validation", "missing certificate", round_id=round_id)
             if not cert.approvals:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "certificate has no approvals"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "no_approvals", "validation", "certificate has no approvals", round_id=round_id)
 
             quorum_required = int(cert.quorum_required or 0)
             if quorum_required < 1:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": f"invalid quorum_required {quorum_required} (< 1)",
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "invalid_quorum", "validation",
+                    f"invalid quorum_required {quorum_required} (< 1)", round_id=round_id,
                 )
 
             # ── Champion DOMAIN_SEPARATOR ──────────────────────────────────
@@ -616,15 +611,10 @@ class RelayerService:
                 or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
             )
             if not champion_registry_address:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"no CHAMPION_REGISTRY_{champion_chain_id} configured — "
-                            "cannot recompute champion domain separator"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "registry_unconfigured", "validation",
+                    f"no CHAMPION_REGISTRY_{champion_chain_id} configured — "
+                    "cannot recompute champion domain separator", round_id=round_id,
                 )
             domain_separator = build_domain_separator(
                 champion_chain_id,
@@ -663,15 +653,10 @@ class RelayerService:
             # The cert is signed against the BT-EVM (champion-chain) ValidatorRegistry.
             chain_cfg = self.chains.get(champion_chain_id)
             if chain_cfg is None or not chain_cfg.validator_registry_address:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"no ValidatorRegistry configured on champion chain "
-                            f"{champion_chain_id}"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "vr_unconfigured", "validation",
+                    f"no ValidatorRegistry configured on champion chain {champion_chain_id}",
+                    round_id=round_id,
                 )
             try:
                 authorized = _read_authorized_validators(
@@ -679,9 +664,9 @@ class RelayerService:
                     chain_cfg.validator_registry_address,
                 )
             except Exception as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"ValidatorRegistry read failed: {exc}"},
-                    status=200,
+                return FinalizeOutcome(
+                    False, "vr_read_failed", "validation",
+                    f"ValidatorRegistry read failed: {exc}", round_id=round_id,
                 )
             authorized_lower = {addr.lower() for addr in authorized}
             authorized_verified = verified_signers & authorized_lower
@@ -693,10 +678,7 @@ class RelayerService:
             wrapper_data = data.get("wrapper")
             wrapper_sig = data.get("wrapper_signature")
             if not wrapper_data or not wrapper_sig:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "missing wrapper or wrapper_signature"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "missing_wrapper", "validation", "missing wrapper or wrapper_signature", round_id=round_id)
             try:
                 wrapper = WrapperPayload(
                     plan_hash=wrapper_data["plan_hash"],
@@ -705,41 +687,27 @@ class RelayerService:
                     chain_id=int(wrapper_data["chain_id"]),
                 )
             except (KeyError, ValueError, TypeError) as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"malformed wrapper: {exc}"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "malformed_wrapper", "validation", f"malformed wrapper: {exc}", round_id=round_id)
             expected_wrapper_hash = compute_champion_finalize_hash(
                 round_id, cert.candidate_submission_id or "",
             )
             if wrapper.plan_hash != expected_wrapper_hash:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": "wrapper plan_hash doesn't bind round+submission",
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "wrapper_hash_mismatch", "validation",
+                    "wrapper plan_hash doesn't bind round+submission", round_id=round_id,
                 )
             ok, err = is_wrapper_fresh(wrapper)
             if not ok:
-                return web.json_response({"merge_ok": False, "reason": err}, status=200)
+                return FinalizeOutcome(False, "wrapper_stale", "validation", err, round_id=round_id)
             try:
                 wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
             except Exception as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"wrapper sig invalid: {exc}"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "wrapper_sig_invalid", "validation", f"wrapper sig invalid: {exc}", round_id=round_id)
             if wrapper_signer.lower() not in authorized_lower:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
-                            f"on champion chain {champion_chain_id}"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "wrapper_signer_unauthorized", "validation",
+                    f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                    f"on champion chain {champion_chain_id}", round_id=round_id,
                 )
 
             # ── Quorum gate (THE authority) ────────────────────────────────
@@ -749,9 +717,9 @@ class RelayerService:
                     f"authorized verified signers (of {len(authorized)} validators)"
                 )
                 logger.warning("Relayer: finalize-champion REFUSED (%s) round=%s", reason, round_id)
-                return web.json_response(
-                    {"merge_ok": False, "reason": reason, "round_id": round_id},
-                    status=200,
+                return FinalizeOutcome(
+                    False, "quorum_not_reached", "quorum", reason,
+                    round_id=round_id, submission_id=cert.candidate_submission_id or "",
                 )
 
             # ── Quorum OK → attest on-chain + squash-merge ─────────────────
@@ -774,20 +742,29 @@ class RelayerService:
                 quorum_required,
                 wrapper_signer[:10],
             )
-            merge_ok = bool(on_champion_adopted_pr(ns, round_id, certificate=cert))
-            return web.json_response(
-                {
-                    "merge_ok": merge_ok,
-                    "round_id": round_id,
-                    "submission_id": ns.submission_id,
-                },
-                status=200,
+            _res = on_champion_adopted_pr(ns, round_id, certificate=cert)
+            return FinalizeOutcome.from_merge(
+                _res, round_id=round_id, submission_id=ns.submission_id,
             )
         except Exception as exc:
             logger.exception("Relayer: finalize-champion crashed")
-            return web.json_response(
-                {"merge_ok": False, "reason": f"finalize crashed: {exc}"}, status=200,
-            )
+            from minotaur_subnet.relayer.solver_repo import FinalizeOutcome
+            return FinalizeOutcome(False, "finalize_crashed", "internal", f"finalize crashed: {exc}")
+
+    async def handle_finalize_champion(self, request: web.Request) -> web.Response:
+        """POST /v1/finalize-champion — legacy minimal shape: {merge_ok, round_id,
+        submission_id}. Kept as a compat shim for a leader on an older image; the
+        client prefers /v2. Fail-closed (always HTTP 200)."""
+        outcome = await self._finalize_core(request)
+        return web.json_response(outcome.to_v1(), status=200)
+
+    async def handle_finalize_champion_v2(self, request: web.Request) -> web.Response:
+        """POST /v2/finalize-champion — structured contract:
+        {ok, outcome, round_id, submission_id, reason: null | {code, stage, detail}}.
+        Same authority + fail-closed semantics as v1; only the response shape is
+        richer, so callers get the specific refusal cause without log-diving."""
+        outcome = await self._finalize_core(request)
+        return web.json_response(outcome.to_v2(), status=200)
 
     async def handle_deploy(self, request: web.Request) -> web.Response:
         """POST /deploy — deploy an App contract.
@@ -987,6 +964,7 @@ def create_app() -> web.Application:
     # the canonical submission path now.
     app.router.add_post("/v1/submit-plan", service.handle_submit_plan)
     app.router.add_post("/v1/finalize-champion", service.handle_finalize_champion)
+    app.router.add_post("/v2/finalize-champion", service.handle_finalize_champion_v2)
     app.router.add_post("/deploy", service.handle_deploy)
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
     app.router.add_get("/gas-balances", service.handle_gas_balances)

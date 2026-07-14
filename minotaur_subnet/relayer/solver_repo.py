@@ -1184,7 +1184,7 @@ def merge_miner_pr_when_certified(
     *,
     round_id: str | None = None,
     attest_confirmed_sha: str | None = None,
-) -> bool:
+) -> "MergeResult":
     """Squash-merge the miner's fork PR ONLY after the leader's OWN on-chain check.
 
     Never polls a GitHub status check (fork-spoofable). Steps:
@@ -1210,7 +1210,7 @@ def merge_miner_pr_when_certified(
     owner_repo = _parse_github_owner_repo()
     if owner_repo is None or not pr_number:
         logger.error("merge gate: no owner/repo or pr_number — cannot merge")
-        return False
+        return MergeResult(False, "no_pr_number", "merge", "no owner/repo or pr_number")
     owner, repo = owner_repo
     certified = (expected_head_sha or "").strip().lower()
 
@@ -1227,7 +1227,7 @@ def merge_miner_pr_when_certified(
         )
     if not live_head and not certified:
         logger.error("merge gate: PR #%s has no resolvable head SHA", pr_number)
-        return False
+        return MergeResult(False, "pr_unresolvable", "merge", "PR has no resolvable head SHA")
     if certified and live_head != certified:
         logger.warning(
             "merge gate: PR #%s live head (%s) is not the certified/signed SHA (%s) — "
@@ -1244,7 +1244,7 @@ def merge_miner_pr_when_certified(
     # 2) CI-disarm guard.
     if _pr_touches_ci(owner, repo, int(pr_number)):
         logger.error("merge gate: PR #%s diff touches .github/** — refusing (CI-disarm guard)", pr_number)
-        return False
+        return MergeResult(False, "ci_disarm", "merge", "PR diff touches .github/**")
 
     # 3) The authority: on-chain quorum cert must bind this exact head SHA.
     if not _onchain_cert_binds(live_head, round_id, attest_confirmed_sha=attest_confirmed_sha):
@@ -1252,7 +1252,10 @@ def merge_miner_pr_when_certified(
             "merge gate: no on-chain quorum cert binds head %s (round %s) — refusing merge",
             live_head, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the certified head SHA",
+        )
 
     # 4) Squash-merge pinned to the resolved head (GitHub rejects on drift).
     st, body = _github_api_request(
@@ -1262,9 +1265,9 @@ def merge_miner_pr_when_certified(
     )
     if st == 200:
         logger.info("merge gate: PR #%s squash-merged (head %s on-chain-certified)", pr_number, live_head)
-        return True
+        return MergeResult(True)
     logger.error("merge gate: PR #%s merge failed: HTTP %s %s", pr_number, st, body)
-    return False
+    return MergeResult(False, "merge_http_error", "merge", f"GitHub squash-merge HTTP {st}")
 
 
 def _publish_certified_tree_despite_pr(
@@ -1275,7 +1278,7 @@ def _publish_certified_tree_despite_pr(
     round_id: str | None,
     *,
     attest_confirmed_sha: str | None = None,
-) -> bool:
+) -> "MergeResult":
     """Land a certified PUBLIC win whose PR drifted or closed post-certification.
 
     The quorum certified ``certified_sha`` (and the fleet verified the image
@@ -1298,7 +1301,7 @@ def _publish_certified_tree_despite_pr(
     before).
     """
     if not certified_sha:
-        return False
+        return MergeResult(False, "no_certified_sha", "merge", "empty certified SHA")
     if not _onchain_cert_binds(
         certified_sha, round_id, attest_confirmed_sha=attest_confirmed_sha,
     ):
@@ -1307,7 +1310,10 @@ def _publish_certified_tree_despite_pr(
             "— refusing drift-fallback publish",
             certified_sha, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the certified SHA (drift-fallback publish)",
+        )
     published = _publish_certified_tree_to_canonical(
         owner, repo, certified_sha, round_id,
         pr_number=pr_number,
@@ -1316,7 +1322,7 @@ def _publish_certified_tree_despite_pr(
         label="certified submission (PR drifted/closed post-certification)",
     )
     if not published:
-        return False
+        return MergeResult(False, "publish_failed", "merge", "certified-tree publish to canonical failed")
     comment_on_pr(
         pr_number,
         "### ⚠️ Certified tree published directly\n\n"
@@ -1328,7 +1334,7 @@ def _publish_certified_tree_despite_pr(
         "changes were NOT included. Submit them in a future round.",
     )
     close_pr(pr_number)
-    return True
+    return MergeResult(True)
 
 
 def _gh_json(method: str, url: str, payload: dict | None = None, *, token: str | None = None):
@@ -1399,7 +1405,7 @@ def publish_private_champion_when_certified(
     private_repo: str,
     repo_token: str,
     attest_confirmed_sha: str | None = None,
-) -> bool:
+) -> "MergeResult":
     """Finalize a PRIVATE-submission champion onto canonical ``main`` (leak-on-win).
 
     A private PR lives in the miner's own repo, so GitHub cannot cross-repo merge
@@ -1434,11 +1440,11 @@ def publish_private_champion_when_certified(
     owner_repo = _parse_github_owner_repo()
     if owner_repo is None or not pr_number:
         logger.error("publish: no canonical owner/repo or pr_number")
-        return False
+        return MergeResult(False, "no_pr_number", "merge", "no canonical owner/repo or pr_number")
     c_owner, c_repo = owner_repo
     if "/" not in (private_repo or ""):
         logger.error("publish: malformed private_repo %r", private_repo)
-        return False
+        return MergeResult(False, "malformed_repo", "merge", "malformed private_repo")
     p_owner, p_repo = private_repo.split("/", 1)
 
     # 1) TOCTOU visibility — re-resolve the live head with the miner token. The
@@ -1457,7 +1463,7 @@ def publish_private_champion_when_certified(
     target = certified or live_head
     if not target:
         logger.error("publish: PR #%s has no certified or resolvable head SHA", pr_number)
-        return False
+        return MergeResult(False, "pr_unresolvable", "merge", "no certified or resolvable head SHA")
     if certified and live_head != certified:
         logger.warning(
             "publish: PR #%s live head (%s) is not the certified SHA (%s) — "
@@ -1473,16 +1479,22 @@ def publish_private_champion_when_certified(
             "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
             target, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the private head SHA",
+        )
 
     # 3+4) Land the certified tree on canonical main (shared Git-Data publisher).
-    return _publish_certified_tree_to_canonical(
+    _published = _publish_certified_tree_to_canonical(
         p_owner, p_repo, target, round_id,
         pr_number=pr_number,
         source_token=repo_token,
         branch_prefix="private-champion",
         label="private submission",
     )
+    if not _published:
+        return MergeResult(False, "publish_failed", "merge", "private certified-tree publish failed")
+    return MergeResult(True)
 
 
 def _publish_certified_tree_to_canonical(
@@ -1702,12 +1714,89 @@ def assert_solver_repo_token_not_admin() -> None:
 # ── Orchestrator (replaces merge_champion_to_main) ───────────────────────────
 
 
+class MergeResult:
+    """Structured champion-adoption outcome: ok + a specific failure reason.
+
+    ``__bool__`` returns ``ok`` so every existing ``bool(result)`` / ``if
+    result:`` adoption gate stays correct — a failed result is FALSY even though
+    it carries a reason. ``code`` is a stable machine token (e.g.
+    ``no_quorum_cert``), ``stage`` is where it failed (``quorum``/``attest``/
+    ``merge``), ``detail`` is human text. ``.reason`` aliases ``.code`` for the
+    round store's ``abort_reason`` (``merge_failed:<code>``) and older callers.
+    """
+
+    __slots__ = ("ok", "code", "stage", "detail")
+
+    def __init__(self, ok: bool, code: str = "", stage: str = "", detail: str = "") -> None:
+        self.ok = bool(ok)
+        self.code = str(code or "")
+        self.stage = str(stage or "")
+        self.detail = str(detail or "")
+
+    @property
+    def reason(self) -> str:
+        return self.code
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self) -> str:
+        return f"MergeResult(ok={self.ok}, code={self.code!r}, stage={self.stage!r})"
+
+
+class FinalizeOutcome:
+    """Structured result of the finalize-champion endpoint, serialized per API
+    version. Carries the adoption verdict + a specific reason (code/stage/detail)
+    and round context, so ``/v2`` returns a clean typed body instead of ``/v1``'s
+    loose ``{merge_ok, reason}`` fields. Every validation refusal and the adoption
+    outcome funnel through this one type.
+    """
+
+    __slots__ = ("ok", "code", "stage", "detail", "round_id", "submission_id")
+
+    def __init__(
+        self, ok: bool, code: str = "", stage: str = "", detail: str = "",
+        *, round_id: str = "", submission_id: str = "",
+    ) -> None:
+        self.ok = bool(ok)
+        self.code = str(code or "")
+        self.stage = str(stage or "")
+        self.detail = str(detail or "")
+        self.round_id = str(round_id or "")
+        self.submission_id = str(submission_id or "")
+
+    @classmethod
+    def from_merge(cls, res: Any, *, round_id: str = "", submission_id: str = "") -> "FinalizeOutcome":
+        # Tolerate a MergeResult OR a bare bool (legacy/tests): getattr falls back.
+        ok = bool(res)
+        code = str(getattr(res, "code", "") or ("" if ok else "merge_refused"))
+        return cls(
+            ok, code, str(getattr(res, "stage", "")), str(getattr(res, "detail", "")),
+            round_id=round_id, submission_id=submission_id,
+        )
+
+    def to_v1(self) -> dict:
+        # Minimal legacy shape — no reason accretion (v1 stays a compat shim).
+        return {"merge_ok": self.ok, "round_id": self.round_id, "submission_id": self.submission_id}
+
+    def to_v2(self) -> dict:
+        return {
+            "ok": self.ok,
+            "outcome": "adopted" if self.ok else "refused",
+            "round_id": self.round_id,
+            "submission_id": self.submission_id,
+            "reason": None if self.ok else {
+                "code": self.code, "stage": self.stage, "detail": self.detail,
+            },
+        }
+
+
 def on_champion_adopted_pr(
     submission: Any,
     round_id: str | None = None,
     *,
     certificate: Any = None,
-) -> bool:
+) -> "MergeResult":
     """Handle champion adoption: attest on-chain + create GitHub PR.
 
     Replaces the old merge_champion_to_main() function. The leader no longer
@@ -1727,7 +1816,7 @@ def on_champion_adopted_pr(
 
     if not commit_hash or commit_hash in ("builtin", ""):
         logger.info("Skipping on-chain attestation for non-git submission: %s", submission_id)
-        return False
+        return MergeResult(False, "non_git_submission", "attest", "non-git submission (nothing to attest/merge)")
 
     # Step 1: On-chain attestation (retry up to 3 times)
     tx_hash = None
@@ -1753,6 +1842,14 @@ def on_champion_adopted_pr(
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
 
+    # Root cause of a failed/absent attestation, carried into abort_reason.
+    if certificate is None:
+        _attest_reason = "no_certificate"
+    elif not tx_hash:
+        _attest_reason = "attest_failed"
+    else:
+        _attest_reason = ""
+
     # Mirror the ADOPT decision onto the miner's OWN signed fork PR. This is the
     # SINGLE gated path onto main — the legacy create_champion_pr() (a second,
     # leader-pushed champion/<round> branch) is intentionally NOT called: a
@@ -1766,7 +1863,10 @@ def on_champion_adopted_pr(
             "Adopt for %s has no pr_number (not a fork-PR submission) — attest %s, nothing to merge",
             submission_id, tx_hash or "skipped",
         )
-        return False
+        return MergeResult(
+            False, _attest_reason or "no_pr_number",
+            "attest" if _attest_reason else "merge", "no PR to merge",
+        )
 
     # Private submissions carry their repo + per-submission token (passed through
     # the finalize request); public submissions have neither.
@@ -1804,7 +1904,7 @@ def on_champion_adopted_pr(
             logger.error(
                 "Adopt for %s is private but missing private_repo/token — refusing", submission_id,
             )
-            return False
+            return MergeResult(False, "private_missing_token", "merge", "private submission missing repo/token")
         merged = publish_private_champion_when_certified(
             _pr_number,
             commit_hash,
@@ -1829,11 +1929,23 @@ def on_champion_adopted_pr(
             close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("close-stale failed after champion merge: %s", exc)
+    _ok = bool(tx_hash) and bool(merged)
+    if _ok:
+        _result = MergeResult(True)
+    elif _attest_reason:                     # attest is the ROOT failure
+        _result = MergeResult(
+            False, _attest_reason, "attest",
+            "on-chain attestation was skipped or failed",
+        )
+    elif not bool(merged):                   # attest ok → merge gate's specific reason
+        _result = merged
+    else:
+        _result = MergeResult(False, "adopt_failed", "merge")
     logger.info(
-        "Champion adoption: attest=%s merge=%s pr=#%s round=%s",
-        tx_hash or "skipped", merged, _pr_number, round_id,
+        "Champion adoption: attest=%s merge=%s reason=%s pr=#%s round=%s",
+        tx_hash or "skipped", bool(merged), _result.code or "-", _pr_number, round_id,
     )
-    return bool(tx_hash) and merged
+    return _result
 
 
 # ── Relayer-delegated finalization (third-party leader) ──────────────────────
@@ -1850,7 +1962,7 @@ def on_champion_adopted_via_relayer(
     round_id: str | None = None,
     *,
     certificate: Any = None,
-) -> bool:
+) -> "MergeResult":
     """Ask the trusted relayer to finalize a certified champion; return its verdict.
 
     POSTs the certificate + submission identity to ``{RELAYER_URL}/v1/finalize-champion``.
@@ -1875,7 +1987,7 @@ def on_champion_adopted_via_relayer(
     relayer_url = os.environ.get("RELAYER_URL", "").strip()
     if not relayer_url:
         logger.error("on_champion_adopted_via_relayer: RELAYER_URL unset — cannot finalize")
-        return False
+        return MergeResult(False, "relayer_url_unset")
 
     commit_hash = getattr(submission, "commit_hash", "") or ""
     submission_id = getattr(submission, "submission_id", "") or ""
@@ -1883,20 +1995,20 @@ def on_champion_adopted_via_relayer(
         logger.info(
             "Skipping relayer finalization for non-git submission: %s", submission_id,
         )
-        return False
+        return MergeResult(False, "non_git_submission")
 
     if certificate is None:
         logger.error(
             "on_champion_adopted_via_relayer: no certificate for %s — refusing", submission_id,
         )
-        return False
+        return MergeResult(False, "no_certificate")
 
     validator_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
     if not validator_key:
         logger.error(
             "on_champion_adopted_via_relayer: VALIDATOR_PRIVATE_KEY unset — cannot sign wrapper",
         )
-        return False
+        return MergeResult(False, "no_validator_key")
 
     rid = str(round_id or "")
     candidate_submission_id = (
@@ -1939,7 +2051,7 @@ def on_champion_adopted_via_relayer(
             logger.error(
                 "relayer-finalize: private submission %s has no token — FAIL-CLOSED", submission_id,
             )
-            return False
+            return MergeResult(False, "private_missing_token")
         _submission["is_private"] = True
         _submission["private_repo"] = (
             getattr(submission, "private_repo_full", None)
@@ -1960,24 +2072,28 @@ def on_champion_adopted_via_relayer(
         "wrapper_signature": wrapper_sig,
     }
 
-    url = relayer_url.rstrip("/") + "/v1/finalize-champion"
+    base = relayer_url.rstrip("/")
+    # Prefer the structured v2 contract; fall back to v1 for a relayer still on an
+    # older image (the api + relayer recreate seconds apart during an update, so a
+    # brief version skew is possible). Generous timeout: the on-chain attest (up to
+    # 3 retries) + squash-merge can take a while.
     try:
-        # Generous timeout: the on-chain attest (with up to 3 retries) + the
-        # squash-merge can take a while.
-        resp = requests.post(url, json=body, timeout=180)
+        resp = requests.post(base + "/v2/finalize-champion", json=body, timeout=180)
+        if resp.status_code == 404:
+            resp = requests.post(base + "/v1/finalize-champion", json=body, timeout=180)
     except Exception as exc:
         logger.error(
             "on_champion_adopted_via_relayer: POST %s failed (%s) — FAIL-CLOSED (no adopt)",
-            url, exc,
+            base, exc,
         )
-        return False
+        return MergeResult(False, "relayer_unreachable", "client", str(exc))
 
     if resp.status_code != 200:
         logger.error(
             "on_champion_adopted_via_relayer: relayer HTTP %s for round=%s — FAIL-CLOSED",
             resp.status_code, rid,
         )
-        return False
+        return MergeResult(False, f"relayer_http_{resp.status_code}", "client", "non-200 from relayer")
 
     try:
         payload = resp.json()
@@ -1985,14 +2101,23 @@ def on_champion_adopted_via_relayer(
         logger.error(
             "on_champion_adopted_via_relayer: bad JSON reply (%s) — FAIL-CLOSED", exc,
         )
-        return False
+        return MergeResult(False, "relayer_bad_reply", "client", str(exc))
 
-    merge_ok = bool(payload.get("merge_ok"))
+    # v2 reply: {"ok", "reason": {"code","stage","detail"}}. v1 fallback: {"merge_ok"}.
+    if "ok" in payload:
+        ok = bool(payload.get("ok"))
+        r = payload.get("reason") or {}
+        code = str((r.get("code") if isinstance(r, dict) else r) or ("" if ok else "merge_refused"))
+        stage = str(r.get("stage", "")) if isinstance(r, dict) else ""
+        detail = str(r.get("detail", "")) if isinstance(r, dict) else ""
+    else:
+        ok = bool(payload.get("merge_ok"))
+        code, stage, detail = ("" if ok else "merge_refused"), "", ""
     logger.info(
-        "Champion finalization via relayer: round=%s submission=%s merge_ok=%s reason=%s",
-        rid, submission_id, merge_ok, payload.get("reason"),
+        "Champion finalization via relayer: round=%s submission=%s ok=%s reason=%s",
+        rid, submission_id, ok, code or "-",
     )
-    return merge_ok
+    return MergeResult(ok, code, stage, detail)
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────
@@ -2005,8 +2130,8 @@ def merge_champion_to_main(
     **kwargs: Any,
 ) -> bool:
     """Legacy alias — delegates to on_champion_adopted_pr."""
-    return on_champion_adopted_pr(
+    return bool(on_champion_adopted_pr(
         submission,
         round_id,
         certificate=kwargs.get("certificate"),
-    )
+    ))
