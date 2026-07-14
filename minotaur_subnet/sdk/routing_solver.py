@@ -92,8 +92,8 @@ class RoutingSolver(IntentSolver):
         for chain_str, url in self._rpc_urls.items():
             chain_id = int(chain_str)
             spec = registry.spec(chain_id)
-            if spec is not None and spec.boot_rpc_env:
-                os.environ.setdefault(spec.boot_rpc_env, url)
+            if spec is not None and spec.boot_rpc_envs:
+                os.environ.setdefault(spec.boot_rpc_envs[0], url)
         # Propagate the full config (rpc_urls included) to every
         # registered strategy so Strategy.rpc_for(chain_id) works inside
         # generate_plan. Validator passes URLs once, strategies read via
