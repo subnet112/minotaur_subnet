@@ -802,3 +802,75 @@ async def test_session_registry_capped(upstream):
         assert f"s{proxymod.MAX_SESSIONS + 4}" in proxy.sessions  # newest kept
     finally:
         await client.close()
+
+
+# ── transient-failure backoff (the fairness fix) ──────────────────────────────
+
+
+class _FlakyUpstream:
+    """Returns HTTP 429 for the first ``fail_times`` requests, then a canned
+    result — models Alchemy rate-limiting a solver's benchmark read."""
+
+    def __init__(self, fail_times: int = 1) -> None:
+        self.received = 0
+        self.fail_times = fail_times
+        self.canned_text = '{"jsonrpc":"2.0","id":1,"result":"0xdead"}'
+
+    async def handle(self, request: web.Request) -> web.Response:
+        await request.read()
+        self.received += 1
+        if self.received <= self.fail_times:
+            return web.Response(
+                status=429,
+                text='{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"CU limit"}}',
+                content_type="application/json",
+            )
+        return web.Response(text=self.canned_text, content_type="application/json")
+
+
+@pytest_asyncio.fixture
+async def flaky_upstream():
+    stub = _FlakyUpstream(fail_times=1)
+    app = web.Application()
+    app.router.add_post("/", stub.handle)
+    server = TestServer(app)
+    await server.start_server()
+    stub.url = str(server.make_url("/"))  # type: ignore[attr-defined]
+    yield stub
+    await server.close()
+
+
+@pytest.mark.asyncio
+async def test_forward_retries_transient_429_then_succeeds(flaky_upstream):
+    """FAIRNESS FIX: a transient 429 is retried away transparently, so the solver
+    gets the real value instead of a failed read (which would zero/drop its order).
+    """
+    proxy, client = await _make_proxy_client(flaky_upstream.url, mode="observe", budget=1000)
+    try:
+        await client.post(
+            "/control/open", json={"session_id": "f", "budget": 100, "mode": "observe"}
+        )
+        resp = await client.post("/rpc/f/eth", json=_rpc("eth_call"))
+        assert resp.status == 200  # the 429 was retried, not surfaced
+        text = await resp.text()
+        assert "0xdead" in text  # the true value came through
+        assert flaky_upstream.received == 2  # 1 retried 429 + 1 success
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_forward_persistent_429_fails_loud_after_retries(flaky_upstream):
+    """A genuinely-down upstream still fails LOUD after retries exhaust — never a
+    silent success."""
+    flaky_upstream.fail_times = 999  # always 429
+    proxy, client = await _make_proxy_client(flaky_upstream.url, mode="observe", budget=1000)
+    try:
+        await client.post(
+            "/control/open", json={"session_id": "d", "budget": 100, "mode": "observe"}
+        )
+        resp = await client.post("/rpc/d/eth", json=_rpc("eth_call"))
+        assert resp.status == 429  # exhausted → the last (retryable) status surfaces
+        assert flaky_upstream.received >= 2  # retried before giving up
+    finally:
+        await client.close()

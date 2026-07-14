@@ -152,8 +152,8 @@ def build_chain_corpus(app_store: Any, js_engine: Any, chain_id: int, *,
         logger.warning("chain corpus: no live RPC for chain %s (set BASE_UPSTREAM_RPC_URL etc.) "
                        "— empty corpus (fail-closed)", chain_id)
         return []
-    from web3 import Web3
-    w3 = Web3(Web3.HTTPProvider(rpc))
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+    w3 = build_retrying_web3(rpc)
     to_block = _corpus_to_block(w3, confirmations, to_block=to_block)
 
     records: list[dict] = []

@@ -396,7 +396,11 @@ class EvmRelayer(RelayerBase):
 
         try:
             from minotaur_subnet.blockchain.chains import get_web3
-            w3 = get_web3(chain_id)
+            # This submit path OWNS its retries (the _MAX_RETRIES loop below, with
+            # nonce reset + gas bump between tries), so skip the read-retry
+            # middleware — otherwise the loop's nonce/receipt reads double-retry
+            # (middleware × outer loop) and hammer a throttled provider.
+            w3 = get_web3(chain_id, install_retry=False)
 
             # Pre-submission balance check
             balance_err = self._check_balance(w3, config.relayer_wallet, chain_id)
