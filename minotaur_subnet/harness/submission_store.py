@@ -1212,6 +1212,24 @@ class SubmissionStore:
         self._persist()
 
     @_write_locked
+    def set_benchmark_ranks(self, ranks: dict[str, int]) -> None:
+        """Set DISPLAY ranks for a whole batch in ONE locked read-modify-write.
+
+        The ranking pass touches every scored submission; doing it per-record
+        would re-serialize the whole store N times on the caller's thread. This
+        collapses it to a single ``_persist`` (unknown ids are skipped). DISPLAY
+        only — never flips the SCORED/REJECTED verdict.
+        """
+        self._maybe_reload()
+        now = time.time()
+        for submission_id, rank in ranks.items():
+            sub = self._submissions.get(submission_id)
+            if sub is not None:
+                sub.benchmark_rank = rank
+                sub.updated_at = now
+        self._persist()
+
+    @_write_locked
     def merge_benchmark_details(
         self,
         submission_id: str,
