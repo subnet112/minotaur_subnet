@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -26,6 +27,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -410,6 +412,26 @@ def _write_locked(method):
     return wrapper
 
 
+async def offload_write(bound_method, /, *args, **kwargs):
+    """Run a bound store mutator off the event loop and await its completion.
+
+    On a real :class:`SubmissionStore` this dispatches to :meth:`aoffload`, so
+    the whole locked read-modify-write (the ~44MB ``json.loads``/``json.dumps``)
+    runs on the store's dedicated writer thread instead of blocking the loop.
+    On any object WITHOUT ``aoffload`` — a test double / stub store — it falls
+    back to running the sync mutator inline, so call sites stay decoupled from
+    the store's async surface and no test double needs to grow async methods.
+    Awaited, so durability + persist-before-caller-continues ordering hold.
+    Pass a BOUND method, e.g. ``await offload_write(store.set_benchmark_result,
+    sid, valid=True, details=d)``.
+    """
+    store = getattr(bound_method, "__self__", None)
+    aoff = getattr(store, "aoffload", None)
+    if aoff is not None:
+        return await aoff(bound_method, *args, **kwargs)
+    return bound_method(*args, **kwargs)
+
+
 class SubmissionStore:
     """In-memory store for submissions with optional JSON persistence.
 
@@ -456,6 +478,13 @@ class SubmissionStore:
         self._lock_fd: int | None = None
         self._lock_depth = 0
         self._persist_mtime_ns: int | None = None
+        # Dedicated single writer thread for the async offload path
+        # (:meth:`aoffload`). Lazily created so sync-only / test usage never
+        # spawns a thread. One thread ⇒ offloaded writes self-serialize, and
+        # the whole locked read-modify-write (the ~44MB json.loads reload +
+        # mutate + json.dumps persist) runs off the event loop rather than
+        # blocking it.
+        self._writer_executor: ThreadPoolExecutor | None = None
         # Solver-name coinage registry (copycat labeling). Kept in a sibling
         # sidecar next to the main JSON — like the tokens sidecar — so it
         # survives restarts AND submission pruning (name ownership must outlive
@@ -608,7 +637,13 @@ class SubmissionStore:
         if repo_token:
             self._tokens[sub.submission_id] = repo_token
 
-        self._submissions[sub.submission_id] = sub
+        # Copy-on-write: rebind rather than mutate the published dict in place.
+        # Once writes run on the writer thread (aoffload), lock-free loop-thread
+        # reads iterate self._submissions.values(); an in-place insert would
+        # raise "dictionary changed size during iteration". A fresh dict leaves
+        # any in-flight reader's view intact. The index dicts are only .get()-
+        # accessed (never iterated), so in-place update stays safe.
+        self._submissions = {**self._submissions, sub.submission_id: sub}
         self._by_hotkey_round[round_key] = sub.submission_id
         self._by_hotkey_epoch[epoch_key] = sub.submission_id
         self._persist()
@@ -683,12 +718,15 @@ class SubmissionStore:
         )
         # _submissions is the source of truth for list_by_round / the pack hash;
         # the indexes are best-effort lookups (last-wins is fine, they aren't
-        # consulted by the pack hash).
-        self._submissions[sid] = sub
+        # consulted by the pack hash). Copy-on-write (rebind, never mutate the
+        # published dict in place) keeps lock-free loop-thread readers safe
+        # against a concurrent writer-thread insert.
+        self._submissions = {**self._submissions, sid: sub}
         self._by_hotkey_round[f"{sub.hotkey}:{sub.round_id}"] = sid
         self._by_hotkey_epoch[f"{sub.hotkey}:{sub.epoch}"] = sid
         return sub
 
+    @_write_locked
     def upsert_submission(self, record: dict[str, Any]) -> Submission:
         """Insert or replace a single submission by caller-provided
         ``submission_id`` and persist. See ``_upsert_one`` for field handling.
@@ -703,6 +741,7 @@ class SubmissionStore:
         self._persist()
         return sub
 
+    @_write_locked
     def upsert_submissions(self, records: list[dict[str, Any]]) -> int:
         """Batch upsert the leader's snapshot, persisting ONCE (O(n), not the
         O(n²) of per-record persist). Bad records (missing submission_id) are
@@ -961,6 +1000,7 @@ class SubmissionStore:
                 rounds.add(sub.round_id)
         return len(rounds)
 
+    @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
         """Persist the Phase-0 factorization metric computed in screening stage 1.
 
@@ -1169,6 +1209,24 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.benchmark_rank = rank
         sub.updated_at = time.time()
+        self._persist()
+
+    @_write_locked
+    def set_benchmark_ranks(self, ranks: dict[str, int]) -> None:
+        """Set DISPLAY ranks for a whole batch in ONE locked read-modify-write.
+
+        The ranking pass touches every scored submission; doing it per-record
+        would re-serialize the whole store N times on the caller's thread. This
+        collapses it to a single ``_persist`` (unknown ids are skipped). DISPLAY
+        only — never flips the SCORED/REJECTED verdict.
+        """
+        self._maybe_reload()
+        now = time.time()
+        for submission_id, rank in ranks.items():
+            sub = self._submissions.get(submission_id)
+            if sub is not None:
+                sub.benchmark_rank = rank
+                sub.updated_at = now
         self._persist()
 
     @_write_locked
@@ -1513,6 +1571,36 @@ class SubmissionStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+    # ── Async offload ──────────────────────────────────────────────────────
+
+    def _get_writer_executor(self) -> ThreadPoolExecutor:
+        """Lazily create the single dedicated writer thread."""
+        if self._writer_executor is None:
+            self._writer_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="substore-writer"
+            )
+        return self._writer_executor
+
+    async def aoffload(self, fn, /, *args, **kwargs):
+        """Run a synchronous ``@_write_locked`` mutator on the dedicated writer
+        thread, off the event loop, and await its completion.
+
+        The whole locked critical section (advisory flock + in-process RLock →
+        ``_load`` reload → mutate → ``_persist`` write) executes on the single
+        writer thread, so the ~44MB ``json.loads``/``json.dumps`` no longer
+        block the asyncio loop. Because the one thread runs writes serially and
+        the RLock still serializes against any sync on-loop writer, ordering is
+        preserved. Awaited, so the atomic ``os.replace`` has landed before the
+        caller proceeds — keeping persist-before-broadcast ordering for the
+        consensus callers. Pass a BOUND mutator, e.g.
+        ``await store.aoffload(store.set_benchmark_result, sid, result)``.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_writer_executor(),
+            functools.partial(fn, *args, **kwargs),
+        )
 
     # ── Persistence ────────────────────────────────────────────────────────
 

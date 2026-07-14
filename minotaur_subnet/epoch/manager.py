@@ -33,6 +33,7 @@ from minotaur_subnet.harness.submission_store import (
     Submission,
     SubmissionStatus,
     SubmissionStore,
+    offload_write,
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
@@ -517,7 +518,7 @@ class EpochManager:
         # response then READ these stored counts instead of recomputing them
         # cross-fork against the champion's latest (different-pin) record. Fully
         # best-effort — it must never affect the authoritative verdict below.
-        self._persist_round_relative_counts(round_id)
+        await self._persist_round_relative_counts(round_id)
 
         # FALL-THROUGH: walk the ranked candidates and finalize on the FIRST one
         # the live verdict adopts. The rank (_eligible_candidates) is
@@ -1350,7 +1351,8 @@ class EpochManager:
             # against the SAME same-round/same-fork reference the adoption used —
             # instead of a stale bench from a different round/fork.
             if self._sub_store and details is not None:
-                self._sub_store.merge_benchmark_details(
+                await offload_write(
+                    self._sub_store.merge_benchmark_details,
                     incumbent_sub.submission_id, details,
                 )
 
@@ -1710,7 +1712,7 @@ class EpochManager:
             logger.warning("[per-order-adoption] failed (ignored): %s", exc)
             return None
 
-    def _persist_round_relative_counts(self, round_id: str) -> None:
+    async def _persist_round_relative_counts(self, round_id: str) -> None:
         """DISPLAY-ONLY: persist same-pin relative counts for each competitor.
 
         Call AFTER :meth:`_refresh_incumbent_score` (which re-benches the champion
@@ -1824,7 +1826,8 @@ class EpochManager:
                             "basis": GAS_BASIS,
                         }
                     counts["round_id"] = round_id
-                    self._sub_store.merge_benchmark_details(
+                    await offload_write(
+                        self._sub_store.merge_benchmark_details,
                         competitor.submission_id, {"relative": counts},
                     )
                 except Exception:
@@ -1958,7 +1961,7 @@ class EpochManager:
             adoption_outputs=blind_spot_bar_from_rows(self._per_intent(submission)),
         )
         if self._sub_store is not None:
-            self._sub_store.adopt(submission.submission_id)
+            await offload_write(self._sub_store.adopt, submission.submission_id)
         if self._round_store is not None:
             # Persist the blind-spot REPEAT bar next to the champion snapshot so
             # a restart restores it (see ChampionInfo.adoption_outputs). Written

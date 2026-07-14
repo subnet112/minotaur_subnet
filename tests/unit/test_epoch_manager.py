@@ -981,7 +981,8 @@ class TestEpochManager:
         assert result["abort_reason"] is None
         assert updated_round.abort_reason is None
 
-    def test_persist_round_relative_counts_is_same_pin(self):
+    @pytest.mark.asyncio
+    async def test_persist_round_relative_counts_is_same_pin(self):
         """DISPLAY: _persist_round_relative_counts writes each competitor's SAME-PIN
         relative counts (vs the re-benched champion) onto its own
         benchmark_details['relative'], tagged with the round_id. The champion record
@@ -1003,7 +1004,7 @@ class TestEpochManager:
         mgr = EpochManager(submission_store=store, round_store=RoundStore())
         mgr._champion = ChampionInfo(submission_id="champ")
 
-        mgr._persist_round_relative_counts("round-e1-n1")
+        await mgr._persist_round_relative_counts("round-e1-n1")
 
         rel = store.get("chal").benchmark_details["relative"]
         assert rel["better"] == 2 and rel["worse"] == 0
