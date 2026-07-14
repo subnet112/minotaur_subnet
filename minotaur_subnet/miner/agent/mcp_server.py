@@ -481,8 +481,8 @@ def _initialize_with_rpc(strategy, chain_id: int) -> None:
     # picks it up. Also call initialize directly when the strategy
     # supports it.
     spec = registry.spec(int(chain_id))
-    if spec is not None and spec.boot_rpc_env:
-        os.environ.setdefault(spec.boot_rpc_env, rpc_url)
+    if spec is not None and spec.boot_rpc_envs:
+        os.environ.setdefault(spec.boot_rpc_envs[0], rpc_url)
     init = getattr(strategy, "initialize", None)
     if callable(init):
         try:
