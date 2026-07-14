@@ -164,6 +164,32 @@ def test_aoffload_runs_on_writer_thread(tmp_path):
     asyncio.run(_run())
 
 
+def test_set_benchmark_ranks_batch_persists_once(tmp_path):
+    """The ranking pass must set N ranks in ONE persist, not N whole-store writes."""
+    path = tmp_path / "submissions.json"
+    store = SubmissionStore(persist_path=path)
+    subs = [_mk(store, status=SubmissionStatus.SCORED) for _ in range(5)]
+    ids = [s.submission_id for s in subs]
+
+    persists = {"n": 0}
+    real_persist = store._persist
+
+    def counting_persist():
+        persists["n"] += 1
+        real_persist()
+
+    store._persist = counting_persist
+    store.set_benchmark_ranks({sid: i + 1 for i, sid in enumerate(ids)})
+
+    assert persists["n"] == 1  # ONE write for the whole batch
+    for i, sid in enumerate(ids):
+        assert store.get(sid).benchmark_rank == i + 1
+    # Unknown ids are skipped, not raised.
+    store._persist = real_persist
+    store.set_benchmark_ranks({"sub_does_not_exist": 9})
+    assert store.get(ids[0]).benchmark_rank == 1
+
+
 def test_offload_write_falls_back_inline_for_store_without_aoffload():
     """A test double / stub store (no aoffload) runs its sync mutator inline —
     call sites stay decoupled from the store's async surface."""

@@ -1039,7 +1039,7 @@ class BenchmarkWorker:
         self._transition_solving_apps(benchmarking)
 
         # Assign ranks within the replay batch; champion activation happens later.
-        self._rank_scored_submissions(benchmarking)
+        await self._rank_scored_submissions(benchmarking)
 
         return len(benchmarking)
 
@@ -1760,7 +1760,7 @@ class BenchmarkWorker:
 
         # Transition SOLVING apps and rank the replay result (same pipeline as run_once)
         self._transition_solving_apps([sub])
-        self._rank_scored_submissions([sub])
+        await self._rank_scored_submissions([sub])
 
         return 1
 
@@ -2516,7 +2516,7 @@ class BenchmarkWorker:
                     bare_app_id, dep.chain_id, best_sc,
                 )
 
-    def _rank_scored_submissions(
+    async def _rank_scored_submissions(
         self,
         submissions: list,
     ) -> list[Any]:
@@ -2558,8 +2558,11 @@ class BenchmarkWorker:
             str(s.submission_id or ""),
         ))
 
+        # Set every rank in ONE offloaded, locked read-modify-write instead of
+        # N whole-store persists on the event loop.
+        ranks: dict[str, int] = {}
         for i, sub in enumerate(scored):
-            self._sub_store.set_benchmark_rank(sub.submission_id, i + 1)
+            ranks[sub.submission_id] = i + 1
             # [gas-shadow] soak observability — incumbent (stored rows) vs
             # this challenger's fresh rows; display/log only, never feeds
             # the rank above or any verdict.
@@ -2568,4 +2571,5 @@ class BenchmarkWorker:
                 (sub.benchmark_details or {}).get("per_intent") or [],
                 ctx=f"rank{i + 1}:{sub.submission_id}",
             )
+        await offload_write(self._sub_store.set_benchmark_ranks, ranks)
         return scored
