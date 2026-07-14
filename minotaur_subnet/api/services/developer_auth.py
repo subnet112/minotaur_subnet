@@ -75,6 +75,10 @@ ACTION_ADMIN_STATE: Final[str] = "admin_state"
 ACTION_REQUEST_REGISTRATION: Final[str] = "request_registration"
 ACTION_APPROVE_REGISTRATION: Final[str] = "approve_registration"
 ACTION_REJECT_REGISTRATION: Final[str] = "reject_registration"
+# Testing lever (solving → active skips the benchmark proof): ADMIN-ONLY like
+# the registration moderation actions. ACTIVE is legacy-equivalent to SOLVED
+# for order-readiness, so this never gates a normal go-live.
+ACTION_ACTIVATE_APP: Final[str] = "activate_app"
 
 # Reject deadlines further out than this — caps how long a signed-but-unused
 # authorization can sit before replay, even though the nonce already makes it

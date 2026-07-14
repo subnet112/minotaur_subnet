@@ -745,6 +745,7 @@ def update_scoring(
     signature: str = "",
     nonce: int = 0,
     deadline: int = 0,
+    authorized_by: str = "",
 ) -> dict[str, Any]:
     """Update the JS scoring code for an existing App Intent.
 
@@ -762,6 +763,12 @@ def update_scoring(
         nonce:       The deployer's next developer-auth nonce (read from
                      ``GET /apps/{id}/auth-nonce``). Must equal last_consumed + 1.
         deadline:    Unix-seconds expiry the signature was signed with.
+        authorized_by: Resolved signer from the route-level X-App-Auth header
+                     authorization (deployer ∪ APP_ADMIN_SIGNERS, nonce already
+                     consumed there — or "admin" for the key bypass). When set,
+                     the in-body deployer-signature check is skipped; passing
+                     BOTH a signature and authorized_by is a caller bug and the
+                     signature path wins.
 
     Returns:
         Dict with the new js_code_hash and update status.
@@ -814,7 +821,11 @@ def update_scoring(
     # proven by an EIP-712 developer-auth signature with a single-use nonce.
     # The nonce + deadline make a captured signature unusable twice — closing
     # the version-rollback replay the old nonce-less scheme allowed.
-    if definition.deployer:
+    # ``authorized_by`` set = the route already verified an X-App-Auth header
+    # signature (or the admin key) and consumed its nonce — don't demand a
+    # second, in-body signature on top. A provided signature still wins
+    # (never silently ignore one).
+    if definition.deployer and not (authorized_by and not (signature or "").strip()):
         from minotaur_subnet.api.services import developer_auth
 
         deployer_addr = definition.deployer.strip().lower()
