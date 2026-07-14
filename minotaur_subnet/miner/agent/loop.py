@@ -1563,8 +1563,8 @@ class BundledRoutingSolver(IntentSolver):
                 except (ValueError, TypeError):
                     continue
                 _spec = registry.spec(cid)
-                if _spec is not None and _spec.boot_rpc_env:
-                    _os.environ.setdefault(_spec.boot_rpc_env, url)
+                if _spec is not None and _spec.boot_rpc_envs:
+                    _os.environ.setdefault(_spec.boot_rpc_envs[0], url)
         # Propagate the full config to every registered strategy so
         # Strategy.rpc_for(chain_id) works inside generate_plan. This is
         # the canonical contract — strategies should NEVER hardcode RPC

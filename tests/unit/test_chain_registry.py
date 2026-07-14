@@ -166,3 +166,43 @@ def test_fee_floor_and_gas_defaults():
     assert registry.fee_floor_wei(999, default=7) == 7
     assert registry.fallback_gas_price_wei(8453) == 20_000_000
     assert registry.fallback_gas_price_wei(999) == 1_000_000_000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  boot_rpc — the live-solver / faucet boot map. Chain 1 must prefer the REAL
+#  Ethereum RPC: booting the live solver with chain 1 → ANVIL_RPC_URL (the Base
+#  anvil on production nodes, misnamed legacy) made every chain-1 generate_plan
+#  return an empty plan, so live /quote answered estimated_output=0 on chain 1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_boot_rpc_chain1_prefers_real_ethereum_rpc(monkeypatch):
+    monkeypatch.setenv("ETHEREUM_RPC_URL", "https://eth.example/v2/key")
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    assert registry.boot_rpc(1) == "https://eth.example/v2/key"
+
+
+def test_boot_rpc_chain1_falls_back_to_anvil_for_local_dev(monkeypatch):
+    monkeypatch.delenv("ETHEREUM_RPC_URL", raising=False)
+    monkeypatch.delenv("ETH_RPC_URL", raising=False)
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
+    assert registry.boot_rpc(1) == "http://localhost:8545"
+
+
+def test_boot_rpc_other_chains_unchanged(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "https://base.example")
+    monkeypatch.setenv("BITTENSOR_EVM_RPC_URL", "https://btevm.example")
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
+    assert registry.boot_rpc(8453) == "https://base.example"
+    assert registry.boot_rpc(964) == "https://btevm.example"
+    assert registry.boot_rpc(31337) == "http://localhost:8545"
+
+
+def test_boot_rpc_urls_map_uses_real_eth_when_configured(monkeypatch):
+    from minotaur_subnet.chains import wiring
+    monkeypatch.setenv("ETHEREUM_RPC_URL", "https://eth.example/v2/key")
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    monkeypatch.setenv("BASE_RPC_URL", "https://base.example")
+    urls = wiring.boot_rpc_urls()
+    assert urls[1] == "https://eth.example/v2/key"
+    assert urls[31337] == "http://anvil-base:8546"
+    assert urls[8453] == "https://base.example"
