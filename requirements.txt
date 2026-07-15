@@ -19,6 +19,11 @@ requests==2.32.5
 aiohttp==3.13.3
 httpx==0.28.1
 numpy==2.4.2
+# Fast JSON for the large store files (~44MB submissions.json re-serialized per
+# write). ~5-10x the stdlib, shrinking the GIL-held encode/decode window so the
+# writer-thread persist offload actually frees the event loop. Optional at
+# runtime (harness/fastjson.py falls back to the stdlib), pinned for prod.
+orjson==3.11.9
 
 # Testing
 pytest==9.0.2
