@@ -452,3 +452,22 @@ def test_bootstrap_app_owner_never_raises(tmp_path):
     with patch("minotaur_subnet.api.services._state._deploy_service", None):
         out = bootstrap_app_owner(_store(tmp_path), "app_x", 8453, APP_ADDR, DEV)
     assert out["owner_set"] is False
+
+
+def test_set_developer_allowed_already_set_skips_owner_check(tmp_path):
+    # Already in the desired state → changed:False, and the owner mismatch is
+    # IRRELEVANT (no tx needed). The pre-#782 ordering returned "registry
+    # owner is …" here, which aborted auto-register on production even though
+    # the relayer was already allowlisted and registerApp needed no owner.
+    operator = bytes(12) + b"\xab" * 20  # owner != relayer wallet
+    views = {
+        _k("owner()"): operator,
+        _k("allowedDevelopers(address)"): (1).to_bytes(32, "big"),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out == {"developer": "0x" + "63" * 20, "allowed": True, "changed": False}
+    relayer.call_contract_function.assert_not_awaited()
