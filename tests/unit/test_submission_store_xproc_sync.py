@@ -444,3 +444,219 @@ def test_concurrent_same_record_rmw_does_not_lose_a_field(tmp_path: Path):
     assert fresh is not None
     assert fresh.max_region_nodes == 4242, "the api's field was clobbered by the worker"
     assert fresh.benchmark_rank == 7, "the worker's field was clobbered by the api"
+
+
+# ── second-review regressions (the fixes to the fixes) ──────────────────────
+
+
+def test_stale_offlock_snapshot_does_not_revert_a_newer_write(tmp_path: Path):
+    """THE consensus bug: _maybe_reload SELECTs off-lock, then applies in-lock.
+
+    A writer can supersede one of those rows in between (its own _write_guard
+    reload advances the watermark past the peer row, then writes a NEWER blob).
+    Applying the stale snapshot reverts the newer state in memory — PERMANENTLY,
+    because the healing row carries our OWN writer id and load_since filters it
+    out forever. The next mutation then UPSERTs the reverted blob back over the
+    good DB row, so the DB is not a safety net. That is precisely the
+    wrong-champion adoption this whole feature exists to prevent.
+    Fixed by re-reading the watermark inside the lock and skipping seq <= it.
+    """
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    sub = _create(api, hotkey="5Grace")
+    sid = sub.submission_id
+    worker.get(sid)
+
+    # The peer's (older) result — this is what the stale snapshot will carry.
+    api.set_benchmark_result(sid, valid=True, rank=1, details={"total_intents": 1})
+
+    real_load_since = worker._db.load_since
+    raced = []
+
+    def racing_load_since(seq):
+        rows = real_load_since(seq)  # the stale snapshot: rank=1
+        if not raced:
+            raced.append(True)
+            # The race: our own guarded write lands AFTER the SELECT, stamping a
+            # NEWER seq and advancing the watermark past the peer's row.
+            worker.set_benchmark_result(
+                sid, valid=True, rank=7, details={"total_intents": 9}
+            )
+        return rows
+
+    worker._db.load_since = racing_load_since  # type: ignore[method-assign]
+    worker._maybe_reload()
+    del worker._db.load_since
+
+    assert worker._submissions[sid].benchmark_rank == 7, (
+        "a stale off-lock snapshot reverted a newer write in memory — and it can "
+        "NEVER heal (own-writer rows are filtered out of the pull for good)"
+    )
+    # And the durable row still agrees, so a later mutation can't re-persist stale.
+    assert _mk(tmp_path).get(sid).benchmark_rank == 7
+
+
+def test_peer_holding_the_flock_cannot_freeze_a_reader(tmp_path: Path):
+    """Lock ORDER. fcntl.flock(LOCK_EX) blocks indefinitely; taking it while
+    holding _rmw_lock let a peer process freeze the api's EVENT LOOP for as long
+    as it held the lock file (every read path calls _maybe_reload -> _rmw_lock).
+    That is the Phase-1 stall class, re-introduced and made cross-process."""
+    import fcntl as _fcntl
+    import os as _os
+    import threading
+    import time
+
+    HOLD = 1.0
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+    sub = _create(api, hotkey="5Gflock")
+    sid = sub.submission_id
+    lock_path = tmp_path / "submissions.json.lock"
+
+    # A PENDING PEER ROW is the precondition: without one, _maybe_reload returns at
+    # the max_seq gate before ever taking _rmw_lock, and the read never contends.
+    worker.get(sid)
+    worker.set_max_region_nodes(sid, 1234)
+    assert api._db.max_seq() > api._last_seen_seq, "precondition: a peer row is pending"
+
+    holding = threading.Event()
+
+    def peer() -> None:
+        fd = _os.open(str(lock_path), _os.O_RDWR | _os.O_CREAT, 0o644)
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        holding.set()
+        time.sleep(HOLD)
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        _os.close(fd)
+
+    pt = threading.Thread(target=peer, daemon=True)
+    pt.start()
+    assert holding.wait(3), "peer never took the lock"
+
+    writer_started = threading.Event()
+
+    def writer() -> None:
+        writer_started.set()
+        api.set_max_region_nodes(sid, 99)  # blocks on the peer's flock
+
+    wt = threading.Thread(target=writer, daemon=True)
+    wt.start()
+    assert writer_started.wait(3)
+    time.sleep(0.25)  # let the writer reach the blocking flock wait
+
+    t0 = time.perf_counter()
+    api.get(sid)  # a plain read on the "event loop" — must NOT block
+    elapsed = time.perf_counter() - t0
+
+    pt.join(timeout=5)
+    wt.join(timeout=5)
+    assert elapsed < 0.3, (
+        f"a read blocked {elapsed:.2f}s because a writer held _rmw_lock while "
+        "waiting on the flock — that is a frozen event loop"
+    )
+
+
+def test_failed_flock_acquire_does_not_silently_disarm_the_lock(tmp_path: Path):
+    """A single OSError (EMFILE — this leader has an fd-leak history) used to
+    leave _lock_depth incremented forever, so every later guard computed
+    outermost=False and ran with NO cross-process lock at all. Silently."""
+    store = _mk(tmp_path)
+    real_acquire = store._acquire_file_lock
+
+    def boom() -> int:
+        raise OSError(24, "Too many open files")
+
+    store._acquire_file_lock = boom  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        _create(store, hotkey="5Gboom")
+
+    acquired: list[int] = []
+
+    def counting():
+        acquired.append(1)
+        return real_acquire()
+
+    store._acquire_file_lock = counting  # type: ignore[method-assign]
+    _create(store, hotkey="5Gafter")
+    assert acquired, (
+        "the flock was silently disarmed for the process lifetime after one "
+        "failed acquire — writes now race across processes with no lock"
+    )
+
+
+def test_write_records_stamps_unique_seqs_without_the_store_flock(tmp_path: Path):
+    """Drives SubmissionDB DIRECTLY, bypassing the store's _write_guard.
+
+    The flock now serializes the store's writers, which MASKS a BEGIN IMMEDIATE
+    regression: test_two_concurrent_writers_never_duplicate_a_seq would stay green
+    even if _immediate() were reverted to the legacy `with self._conn:`. This is
+    the only test that can actually see that regression, so it is the guard on the
+    atomicity of MAX(updated_seq)+1 itself.
+    """
+    import threading
+
+    from minotaur_subnet.harness.submission_db import SubmissionDB
+
+    db_path = tmp_path / "direct.db"
+    dbs = [SubmissionDB(db_path), SubmissionDB(db_path)]
+
+    def hammer(db: SubmissionDB, tag: str) -> None:
+        for i in range(25):
+            sid = f"sub_{tag}{i:03d}"
+            db.write_records([(sid, {"submission_id": sid, "hotkey": f"5G{tag}"})])
+
+    threads = [
+        threading.Thread(target=hammer, args=(dbs[0], "a")),
+        threading.Thread(target=hammer, args=(dbs[1], "b")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for db in dbs:
+        db.close()
+
+    conn = sqlite3.connect(str(db_path))
+    rows, distinct = conn.execute(
+        "SELECT COUNT(updated_seq), COUNT(DISTINCT updated_seq) FROM submissions"
+    ).fetchone()
+    conn.close()
+    assert rows == 50, f"expected 50 rows, got {rows}"
+    assert rows == distinct, (
+        f"DUPLICATE updated_seq ({rows} rows, {distinct} distinct) — the MAX+1 "
+        "read-then-write is not atomic; a peer's watermark will skip a row"
+    )
+
+
+def test_load_takes_the_watermark_before_hydrating(tmp_path: Path):
+    """A peer row committed DURING load_all() must still be pulled afterwards.
+
+    Seeding the watermark AFTER the hydrate counts that row as 'seen' even though
+    the SELECT never returned it → neither hydrated nor pulled → silently lost
+    until it happens to be written again. The api restarts hourly while the worker
+    keeps committing, so this window is real.
+    """
+    api = _mk(tmp_path)
+    _create(api, hotkey="5Gaaa")
+    worker = _mk(tmp_path)
+
+    real_load_all = worker._db.load_all
+    injected: dict[str, str] = {}
+
+    def racing_load_all():
+        rows = list(real_load_all())
+        # A peer commits mid-hydrate — after the SELECT, before we seed the mark.
+        s = _create(api, hotkey="5Gmid")
+        injected["sid"] = s.submission_id
+        return iter(rows)
+
+    worker._db.load_all = racing_load_all  # type: ignore[method-assign]
+    worker._load()
+    del worker._db.load_all
+
+    assert injected["sid"] not in worker._submissions, "precondition: not hydrated"
+    assert worker.get(injected["sid"]) is not None, (
+        "a row committed during the hydrate was never hydrated AND never pulled "
+        "— the watermark was seeded after load_all()"
+    )

@@ -152,7 +152,12 @@ class SubmissionDB:
         legacy mode two processes could both read the same MAX and stamp the SAME
         updated_seq. A peer's watermark then skips past one of them → that row is
         NEVER pulled → permanently stale in-memory state (a benchmark result the
-        coordinator never sees). Proven with a two-writer test.
+        coordinator never sees).
+
+        Guarded by test_write_records_stamps_unique_seqs_without_the_store_flock,
+        which drives SubmissionDB DIRECTLY: the store's flock serializes its own
+        writers and would MASK a regression here, so the store-level two-writer
+        test cannot see it.
 
         IMMEDIATE (not deferred) because a deferred txn that reads first and writes
         later must UPGRADE its lock, which raises SQLITE_BUSY_SNAPSHOT if a peer
@@ -163,7 +168,15 @@ class SubmissionDB:
         try:
             yield
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                # SQLite already auto-rolled-back (SQLITE_FULL / SQLITE_IOERR /
+                # interrupt), so ROLLBACK raises "no transaction is active" — which
+                # would REPLACE the real error (disk full) with a confusing one.
+                # The legacy `with conn:` form checked sqlite3_get_autocommit() and
+                # skipped the rollback; hand-rolling it means handling this here.
+                pass
             raise
         else:
             self._conn.execute("COMMIT")
