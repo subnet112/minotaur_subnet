@@ -134,8 +134,8 @@ def test_upsert_submissions_batch_skips_bad_and_persists_once(tmp_path):
     p = tmp_path / "f.json"
     store = SubmissionStore(persist_path=p)
     persists = {"n": 0}
-    orig = store._persist
-    store._persist = lambda: (persists.__setitem__("n", persists["n"] + 1), orig())[1]
+    orig = store._persist_records
+    store._persist_records = lambda subs: (persists.__setitem__("n", persists["n"] + 1), orig(subs))[1]
     n = store.upsert_submissions([
         {"submission_id": "sub_a", "repo_url": "r", "commit_hash": "h", "epoch": 1,
          "hotkey": "5A", "round_id": "rr", "status": "scored"},

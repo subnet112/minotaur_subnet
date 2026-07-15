@@ -51,8 +51,8 @@ def _anvil_healthy(rpc_url: str) -> bool:
     if not rpc_url:
         return False
     try:
-        from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
+        from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+        w3 = build_retrying_web3(rpc_url, request_kwargs={"timeout": 5})
         block = w3.eth.block_number
         return int(block) > 0
     except Exception as exc:

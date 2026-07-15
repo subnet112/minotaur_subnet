@@ -182,6 +182,13 @@ _CONFIG_SETTERS = {
     "fee_bps": ("setFeeBps(uint256)", "uint256"),
     "volume_cap_bps": ("setVolumeCapBps(uint256)", "uint256"),
     "fee_collector": ("setFeeCollector(address)", "address"),
+    # Who pays the protocol fee: 0=USER (pulled from the user's WETH),
+    # 1=APP (paid from the app-held WETH float). setFeeMode is onlyRelayer,
+    # so a post-deploy USER->APP flip has to go through this endpoint.
+    "fee_mode": ("setFeeMode(uint8)", "uint8"),
+    # V2 float-recovery co-signer (withdrawFloat is relayer OR appOwner).
+    # setAppOwner is relayer-bootstrappable once, then appOwner-gated.
+    "app_owner": ("setAppOwner(address)", "address"),
 }
 
 
@@ -193,6 +200,10 @@ def set_app_config(
     unknown = set(updates) - set(_CONFIG_SETTERS)
     if unknown:
         return {"error": f"Unknown config fields: {sorted(unknown)}"}
+    if "fee_mode" in updates and int(updates["fee_mode"]) not in (0, 1):
+        return {"error": "fee_mode must be 0 (USER) or 1 (APP)"}
+    if "app_owner" in updates and not int(str(updates["app_owner"]), 16):
+        return {"error": "app_owner must be a non-zero address"}
     if not updates:
         return {"error": f"Nothing to set; supported: {sorted(_CONFIG_SETTERS)}"}
     relayer = _relayer()
@@ -286,11 +297,13 @@ def set_developer_allowed(
 ) -> dict[str, Any]:
     """Owner-only AppRegistry.setDeveloperAllowed via the relayer key.
 
-    Works today because the relayer key IS the registry owner; if ownership
-    ever rotates to a cold key/multisig this returns the revert and the
-    frontend falls back to registry-calldata. Allowlisting the app's REAL
-    developer is what lets them registerApp/updateManifest themselves —
-    the registry-side counterpart of the appOwner float rights.
+    Only works when the relayer key IS the registry owner — on production
+    registries the owner is the operator wallet, so this pre-checks
+    ``owner()`` and returns a clean service-level error instead of sending a
+    doomed tx (mainapp #20 moves the flow to a direct owner-wallet tx).
+    Allowlisting the app's REAL developer is what lets them
+    registerApp/updateManifest themselves — the registry-side counterpart
+    of the appOwner float rights.
     """
     ctx = _registry_ctx(store, app_id, chain_id)
     if isinstance(ctx, dict):
@@ -299,18 +312,80 @@ def set_developer_allowed(
     if not developer or not int(developer, 16):
         return {"error": "developer address is required"}
 
-    from minotaur_subnet.api.services.app_admin import _call, _selector
+    from minotaur_subnet.api.services.app_admin import _call, _selector, _view_address
 
+    # Probe FIRST: when the developer is already in the desired state there is
+    # no tx to send, so registry ownership is irrelevant. Checking owner before
+    # the probe made auto-register abort on production ("allowlist failed:
+    # registry owner is …") even though the relayer was ALREADY allowlisted and
+    # registerApp needed nothing from the owner.
     probe = _call(w3, registry, _selector("allowedDevelopers(address)")
                   + bytes.fromhex(developer[2:].lower().zfill(64)))
     already = bool(probe) and bool(int.from_bytes(probe[:32], "big"))
     if already == allowed:
         return {"developer": developer, "allowed": allowed, "changed": False}
-    tx = _run_async(relayer.call_contract_function(
-        registry, chain_id, "setDeveloperAllowed(address,bool)",
-        ["address", "bool"], [developer, allowed], gas=100_000,
-    ))
+
+    owner = _view_address(w3, registry, "owner")
+    wallet = relayer._resolve_wallet(chain_id)
+    if owner and wallet and owner.lower() != wallet.lower():
+        return {
+            "error": (
+                f"registry owner is {owner}, not the relayer ({wallet}) — "
+                "send setDeveloperAllowed from the owner wallet instead"
+            ),
+            "owner": owner,
+        }
+    try:
+        tx = _run_async(relayer.call_contract_function(
+            registry, chain_id, "setDeveloperAllowed(address,bool)",
+            ["address", "bool"], [developer, allowed], gas=100_000,
+        ))
+    except Exception as exc:  # revert / RPC rejection → service-level error, not a 500
+        return {"error": f"setDeveloperAllowed failed: {exc}"[:300]}
     return {"developer": developer, "allowed": allowed, "changed": True, "tx": tx}
+
+
+def bootstrap_app_owner(
+    store: Any, app_id: str, chain_id: int, contract_address: str, owner: str,
+) -> dict[str, Any]:
+    """Best-effort post-deploy ``setAppOwner`` bootstrap (never raises).
+
+    V2 keeps ``appOwner`` out of the constructor, so a fresh deployment has
+    owner 0x0 and the developer is custodially dependent on the relayer for
+    float recovery (``withdrawFloat`` is relayer OR appOwner). Called from
+    the deploy pipeline right after a successful deploy so every app is born
+    with its developer-of-record as a self-sovereign owner. Skips when the
+    contract has no ``appOwner()`` view (V1) or the owner is already set —
+    ``setAppOwner`` is relayer-bootstrappable exactly once, then owner-gated.
+    """
+    try:
+        if not owner or not int(owner, 16):
+            return {"owner_set": False, "skipped": "no deployer recorded"}
+        relayer = _relayer()
+        if relayer is None:
+            return {"owner_set": False, "error": "No EVM relayer configured"}
+
+        from minotaur_subnet.api.services.app_admin import _view_address
+        from minotaur_subnet.blockchain.chains import get_web3
+
+        w3 = get_web3(chain_id)
+        current = _view_address(w3, contract_address, "appOwner")
+        if current is None:
+            # V1 base — no appOwner() view; nothing to bootstrap.
+            return {"owner_set": False, "skipped": "contract has no appOwner()"}
+        if int(current, 16) != 0:
+            return {"owner_set": True, "already": True, "owner": current}
+
+        tx = _run_async(relayer.call_contract_function(
+            contract_address, chain_id, "setAppOwner(address)",
+            ["address"], [owner], gas=100_000,
+        ))
+        return {"owner_set": True, "owner": owner, "tx": tx}
+    except Exception as exc:  # never fail the deploy over the owner bootstrap
+        logger.warning(
+            "appOwner bootstrap failed for %s chain %d: %s", app_id, chain_id, exc,
+        )
+        return {"owner_set": False, "error": str(exc)[:300]}
 
 
 def auto_register_deployment(

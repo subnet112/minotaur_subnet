@@ -172,6 +172,65 @@ def compute_champion_finalize_hash(round_id: str, candidate_submission_id: str) 
     return "0x" + keccak(encoded).hex()
 
 
+def compute_contract_call_hash(
+    chain_id: int,
+    target: str,
+    fn_signature: str,
+    abi_types: Any,
+    values: Any,
+    tx_value: int,
+    gas: int,
+) -> str:
+    """Hash a generic relayer contract-call for the wrapper's ``plan_hash``.
+
+    Protects ``POST /v1/contract-call`` with the same wrapper protocol as
+    ``/deploy`` / ``/v1/finalize-champion``: the hash binds EVERY parameter
+    of the call (chain, target, function, args, value, gas), so a captured
+    wrapper signature can't be re-pointed at a different target, different
+    arguments, or a larger value. Both ``HttpRelayer.call_contract_function``
+    and the relayer's handler compute this independently — they MUST agree
+    byte-for-byte, hence canonical JSON (sorted keys, minimal whitespace,
+    values stringified) exactly like ``compute_deploy_hash``'s args.
+
+    Returns a 0x-prefixed 32-byte hex digest.
+    """
+    canonical = json.dumps(
+        {
+            "chain_id": int(chain_id),
+            "target": (target or "").lower(),
+            "fn_signature": str(fn_signature or ""),
+            "abi_types": list(abi_types or []),
+            "values": contract_call_wire_values(values),
+            "tx_value": int(tx_value),
+            "gas": int(gas),
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return "0x" + keccak(canonical).hex()
+
+
+def contract_call_wire_values(values: Any) -> list[str]:
+    """Canonical wire/hash form of contract-call values.
+
+    ``bytes``/``bytearray`` → 0x-hex (str() of bytes is Python repr — it
+    round-trips to nothing and broke ``registerApp(bytes32,…)`` live),
+    bools → "true"/"false", everything else → str. Shared by
+    ``HttpRelayer.call_contract_function`` (serialize + hash) and
+    ``compute_contract_call_hash`` (the relayer hashes the received wire
+    strings, for which this is the identity), so transport and plan_hash can
+    never disagree.
+    """
+    out: list[str] = []
+    for v in (values or []):
+        if isinstance(v, (bytes, bytearray)):
+            out.append("0x" + bytes(v).hex())
+        elif isinstance(v, bool):
+            out.append("true" if v else "false")
+        else:
+            out.append(str(v))
+    return out
+
+
 def is_wrapper_fresh(
     payload: WrapperPayload,
     *,

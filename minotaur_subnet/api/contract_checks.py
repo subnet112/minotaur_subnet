@@ -66,6 +66,8 @@ def verify_required_contracts(*, timeout_s: float = 10.0) -> list[str]:
     """
     from web3 import Web3
 
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+
     errors: list[str] = []
     verified: list[str] = []
 
@@ -91,7 +93,7 @@ def verify_required_contracts(*, timeout_s: float = 10.0) -> list[str]:
             continue
 
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s}))
+            w3 = build_retrying_web3(rpc, request_kwargs={"timeout": timeout_s})
             code = w3.eth.get_code(Web3.to_checksum_address(address))
         except Exception as exc:
             errors.append(

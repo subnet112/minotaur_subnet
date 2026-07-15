@@ -28,6 +28,8 @@ _APP_ADDRESS_VIEWS = (
     "platformFeeCollector",
     "appPaymaster",
     "wrappedNativeToken",
+    # V2-only (revert -> None on V1): float-recovery co-signer, 0x0 = unset.
+    "appOwner",
 )
 _APP_UINT_VIEWS = (
     "feeMode",            # enum FeeMode (0=USER, 1=APP)
@@ -119,6 +121,11 @@ def _registry_state(
 
     mode = _view_uint(w3, registry, "mode")
     state["mode"] = _REGISTRY_MODE_NAMES.get(mode, mode)
+
+    # Ownable.owner() — setDeveloperAllowed/revokeApp are owner-only, and the
+    # owner is NOT necessarily the relayer. The frontend gates the direct
+    # wallet flows on this (mainapp #20).
+    state["owner"] = _view_address(w3, registry, "owner")
 
     # appByContract(address) -> bytes32 appId (zero = not registered)
     data = _selector("appByContract(address)") + bytes.fromhex(

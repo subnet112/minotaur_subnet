@@ -404,6 +404,20 @@ async def _ensure_impl() -> tuple[bool, bool]:
         "-e", f"LISTEN_PORT={PROXY_PORT}",
         "-e", "LOG_LEVEL=INFO",
     ]
+    # Pin-cache disk persistence (opt-in): when the operator sets the persist
+    # path (auto-forwarded as an RPC_PROXY_* env by the loop below), mount a
+    # named volume for its directory so the snapshot survives this rm+run
+    # recreate — the whole point is to skip the cold re-fetch storm after an
+    # api update. Inert (no volume) when the path is unset. The path should live
+    # under /var/cache/pin-proxy — the image pre-chowns that dir to the non-root
+    # runtime user (uid 1000), so the fresh named volume inherits a writable
+    # mount point (a root-owned volume would make the snapshot write silently
+    # no-op). See the Dockerfile + rpc_budget_proxy/_persist.py.
+    pin_persist = os.environ.get("RPC_PROXY_PIN_CACHE_PERSIST_PATH", "").strip()
+    if pin_persist:
+        pin_vol = os.environ.get("RPC_PROXY_PIN_CACHE_VOLUME", "minotaur-pin-cache").strip()
+        pin_dir = os.path.dirname(pin_persist) or "/var/cache/pin-proxy"
+        create += ["-v", f"{pin_vol}:{pin_dir}"]
     for k, v in sorted(_rpc_proxy_env().items()):  # operator-tunable proxy knobs
         create += ["-e", f"{k}={v}"]
     create += [image, "-m", _PROXY_MODULE]

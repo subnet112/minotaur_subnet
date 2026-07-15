@@ -63,8 +63,16 @@ def _build_service():
             validator_registry_address="0xChampionVR",
         ),
     }
+    # Bind the real methods: the v1/v2 handlers are thin serializers over the
+    # shared _finalize_core, so all three must run the real code.
+    service._finalize_core = (
+        relayer_main.RelayerService._finalize_core.__get__(service)
+    )
     service.handle_finalize_champion = (
         relayer_main.RelayerService.handle_finalize_champion.__get__(service)
+    )
+    service.handle_finalize_champion_v2 = (
+        relayer_main.RelayerService.handle_finalize_champion_v2.__get__(service)
     )
     return service
 
@@ -128,6 +136,12 @@ async def _post(service, body: dict) -> web.Response:
     request = MagicMock()
     request.json = AsyncMock(return_value=body)
     return await service.handle_finalize_champion(request)
+
+
+async def _post_v2(service, body: dict) -> web.Response:
+    request = MagicMock()
+    request.json = AsyncMock(return_value=body)
+    return await service.handle_finalize_champion_v2(request)
 
 
 def _read_json(resp: web.Response) -> dict:
@@ -209,12 +223,14 @@ async def test_finalize_sub_quorum_refuses_without_merging():
         "minotaur_subnet.relayer.solver_repo.on_champion_adopted_pr",
         adopt_mock,
     ):
-        resp = await _post(service, body)
+        resp = await _post_v2(service, body)
 
     assert resp.status == 200, _read_json(resp)
     out = _read_json(resp)
-    assert out["merge_ok"] is False, out
-    assert "quorum not reached" in out["reason"]
+    assert out["ok"] is False, out
+    assert out["outcome"] == "refused"
+    assert out["reason"]["code"] == "quorum_not_reached"
+    assert "quorum not reached" in out["reason"]["detail"]
     adopt_mock.assert_not_called()
 
 
@@ -246,12 +262,14 @@ async def test_finalize_unverified_signatures_refuses():
         "minotaur_subnet.relayer.solver_repo.on_champion_adopted_pr",
         adopt_mock,
     ):
-        resp = await _post(service, body)
+        resp = await _post_v2(service, body)
 
     assert resp.status == 200, _read_json(resp)
     out = _read_json(resp)
-    assert out["merge_ok"] is False, out
-    assert "quorum not reached" in out["reason"]
+    assert out["ok"] is False, out
+    assert out["outcome"] == "refused"
+    assert out["reason"]["code"] == "quorum_not_reached"
+    assert "quorum not reached" in out["reason"]["detail"]
     adopt_mock.assert_not_called()
 
 
@@ -281,10 +299,11 @@ async def test_finalize_bad_wrapper_signer_refuses():
         "minotaur_subnet.relayer.solver_repo.on_champion_adopted_pr",
         adopt_mock,
     ):
-        resp = await _post(service, body)
+        resp = await _post_v2(service, body)
 
     assert resp.status == 200, _read_json(resp)
     out = _read_json(resp)
-    assert out["merge_ok"] is False, out
-    assert "not in ValidatorRegistry" in out["reason"]
+    assert out["ok"] is False, out
+    assert out["reason"]["code"] == "wrapper_signer_unauthorized"
+    assert "not in ValidatorRegistry" in out["reason"]["detail"]
     adopt_mock.assert_not_called()

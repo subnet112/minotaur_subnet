@@ -211,3 +211,41 @@ def test_empty_upstreams_filtered():
     import pytest as _pytest
     with _pytest.raises(ValueError):
         ForkCache({"eth": ""})
+
+
+# ── transient-failure backoff ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fork_cache_retries_transient_429():
+    """A 429 on a fork-fetch is retried away, so anvil gets the block instead of
+    an error it would re-hammer the provider over."""
+    hits = {"n": 0}
+
+    async def flaky(request):
+        await request.read()
+        hits["n"] += 1
+        if hits["n"] == 1:
+            return web.Response(status=429, text='{"error":{"code":-32005}}',
+                                content_type="application/json")
+        return web.json_response({"jsonrpc": "2.0", "id": 1, "result": "0xfeed"})
+
+    up = web.Application()
+    up.router.add_post("/", flaky)
+    server = TestServer(up)
+    await server.start_server()
+    try:
+        fc = ForkCache({"base": str(server.make_url("/"))})
+        client = TestClient(TestServer(fc.build_app()))
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/base",
+                json=_rpc("eth_getBlockByNumber", ["0x2ddd7c6", False]),
+            )
+            assert resp.status == 200
+            assert "0xfeed" in await resp.text()
+            assert hits["n"] == 2  # 1 retried 429 + 1 success
+        finally:
+            await client.close()
+    finally:
+        await server.close()

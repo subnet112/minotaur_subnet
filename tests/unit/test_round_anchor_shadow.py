@@ -82,6 +82,38 @@ def test_shadow_derives_and_logs_when_enabled(monkeypatch, caplog):
     assert "964:5012345|8453:46904887" in line  # sorted, deterministic segment
 
 
+def test_shadow_force_logs_even_with_real_gate_on(monkeypatch, caplog):
+    # B2 parity (role=leader-realopen): the real-open-epoch anchor DIFFERS from the
+    # live opened_epoch pin, so it is NOT redundant and must log even when
+    # ROUND_ANCHORED_PIN is ON (the leader's normal config). force=True bypasses
+    # the redundancy guard — the whole reason the leader-realopen line exists.
+    monkeypatch.setenv("ROUND_ANCHOR_SHADOW", "1")
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")  # gate ON, as on the live leader
+    p_store, p_syn, p_hist = _patch_pack_builder()
+    with patch(
+        "minotaur_subnet.api.startup._derive_round_fork_pins", return_value=dict(_PINS)
+    ) as derive, p_store, p_syn, p_hist, caplog.at_level("INFO"):
+        _maybe_shadow_log_round_fork_pins(
+            _ctx(), "round-x", role="leader-realopen", anchor_epoch=42, force=True,
+        )
+    derive.assert_called_once_with(42)
+    line = "\n".join(caplog.messages)
+    assert "[round-anchor-shadow]" in line
+    assert "role=leader-realopen" in line
+
+
+def test_shadow_force_still_respects_master_shadow_flag(monkeypatch):
+    # force bypasses only the ROUND_ANCHORED_PIN redundancy guard, NOT the master
+    # ROUND_ANCHOR_SHADOW switch — shadow off stays silent even with force=True.
+    monkeypatch.delenv("ROUND_ANCHOR_SHADOW", raising=False)
+    monkeypatch.setenv("ROUND_ANCHORED_PIN", "1")
+    with patch("minotaur_subnet.api.startup._derive_round_fork_pins") as derive:
+        _maybe_shadow_log_round_fork_pins(
+            _ctx(), "round-x", role="leader-realopen", anchor_epoch=42, force=True,
+        )
+    derive.assert_not_called()
+
+
 def test_shadow_never_stores_pins(monkeypatch):
     # The whole point: shadow must NOT touch RoundState.fork_pins (which would
     # feed the real pack hash). It must never call set_round_fork_pins.

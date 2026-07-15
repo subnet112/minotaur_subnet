@@ -726,13 +726,24 @@ class TestParticipationDefault:
             monkeypatch.setenv("DISTRIBUTED_VETO", val)
             assert veto_wire.distributed_veto_enabled() is True, val
 
-    def test_reverify_stays_default_off(self, monkeypatch):
-        # The expensive leader re-bench must NOT be flipped on by the
-        # default-ON participation switch — it stays independently opt-in.
+    def test_reverify_default_on(self, monkeypatch):
+        # Default ON (image-baked): enforcement blocks only on the leader's own
+        # reverified confirmation, so without reverify the default-hard gate
+        # fail-opens every round. Soaked =1 on the leader since 2026-07-11.
         monkeypatch.delenv("DISTRIBUTED_VETO", raising=False)
         monkeypatch.delenv("DISTRIBUTED_VETO_REVERIFY", raising=False)
         assert veto_wire.distributed_veto_enabled() is True
-        assert veto_wire.distributed_veto_reverify_enabled() is False
+        assert veto_wire.distributed_veto_reverify_enabled() is True
+
+    def test_reverify_explicit_off(self, monkeypatch):
+        for val in ("0", "false", "no", "off"):
+            monkeypatch.setenv("DISTRIBUTED_VETO_REVERIFY", val)
+            assert veto_wire.distributed_veto_reverify_enabled() is False, val
+
+    def test_reverify_typo_stays_on(self, monkeypatch):
+        # A typo must never silently disarm the reverify on one validator.
+        monkeypatch.setenv("DISTRIBUTED_VETO_REVERIFY", "flase")
+        assert veto_wire.distributed_veto_reverify_enabled() is True
 
 
 # ── digest resolution (the get_submission→get bug that skipped every round) ──
@@ -804,3 +815,184 @@ class TestVetoOpenDecision:
     def test_phase_exists_wins_over_no_peers(self):
         # An already-open phase is never re-opened, regardless of peers.
         assert self._d(phase_exists=True, has_peers=False) == veto_wire.VETO_SKIP
+
+
+# ── Phase-1 enforcement mode reader ──
+
+class TestEnforceMode:
+    def _mode(self, monkeypatch, val):
+        if val is None:
+            monkeypatch.delenv("DISTRIBUTED_VETO_ENFORCE", raising=False)
+        else:
+            monkeypatch.setenv("DISTRIBUTED_VETO_ENFORCE", val)
+        return veto_wire.distributed_veto_enforce_mode()
+
+    def test_default_hard(self, monkeypatch):
+        # Image-baked default: third-party validators never set env flags, so
+        # the enforcement the leader soaked (hard since 2026-07-11) reaches the
+        # fleet only as a code default. Fail-open on deadline expiry unchanged.
+        assert self._mode(monkeypatch, None) == veto_wire.VETO_ENFORCE_HARD
+
+    def test_explicit_off(self, monkeypatch):
+        assert self._mode(monkeypatch, "0") == veto_wire.VETO_ENFORCE_OFF
+        assert self._mode(monkeypatch, "off") == veto_wire.VETO_ENFORCE_OFF
+
+    def test_shadow(self, monkeypatch):
+        assert self._mode(monkeypatch, "shadow") == veto_wire.VETO_ENFORCE_SHADOW
+        assert self._mode(monkeypatch, "SHADOW") == veto_wire.VETO_ENFORCE_SHADOW
+
+    def test_hard(self, monkeypatch):
+        assert self._mode(monkeypatch, "hard") == veto_wire.VETO_ENFORCE_HARD
+        assert self._mode(monkeypatch, "enforce") == veto_wire.VETO_ENFORCE_HARD
+
+    def test_unknown_is_hard(self, monkeypatch):
+        # Now that hard IS the fleet default, the fail-safe inverts: a typo'd
+        # override must never silently DISARM one validator (the odd node out
+        # is the split risk). Only the explicit off/shadow spellings divert.
+        assert self._mode(monkeypatch, "garbage") == veto_wire.VETO_ENFORCE_HARD
+        assert self._mode(monkeypatch, "observe") == veto_wire.VETO_ENFORCE_OFF
+
+
+# ── Phase-1 pre-certify gate decision (block | allow | wait) ──
+
+class TestVetoGateDecision:
+    def _g(self, **kw):
+        base = dict(resolved=True, n_veto=0, would_gate_confirmed=None,
+                    reverify_enabled=True, current_epoch=100, veto_deadline_epoch=110)
+        base.update(kw)
+        return veto_wire.veto_gate_decision(**base)
+
+    def test_block_on_confirmed_veto(self):
+        # The ONLY blocking path: leader reverify reproduced the violation.
+        assert self._g(n_veto=2, would_gate_confirmed=True) == veto_wire.GATE_BLOCK
+
+    def test_confirmed_blocks_even_past_deadline(self):
+        # A confirmed veto blocks regardless of the clock (block check is first).
+        assert self._g(n_veto=1, would_gate_confirmed=True,
+                       current_epoch=999) == veto_wire.GATE_BLOCK
+
+    def test_clean_round_allows(self):
+        assert self._g(resolved=True, n_veto=0) == veto_wire.GATE_ALLOW
+
+    def test_reverify_discarded_allows(self):
+        # Veto claimed, but the leader could NOT reproduce it → discarded → allow.
+        assert self._g(n_veto=3, would_gate_confirmed=False) == veto_wire.GATE_ALLOW
+
+    def test_wait_while_unresolved_in_window(self):
+        assert self._g(resolved=False, current_epoch=100,
+                       veto_deadline_epoch=110) == veto_wire.GATE_WAIT
+
+    def test_wait_for_reverify_when_veto_unconfirmed_in_window(self):
+        # Phase resolved with a claimed veto, but reverify hasn't landed yet
+        # (would_gate_confirmed is None) — wait for confirmation, not block.
+        assert self._g(resolved=True, n_veto=2,
+                       would_gate_confirmed=None) == veto_wire.GATE_WAIT
+
+    def test_reverify_off_allows_unconfirmed_veto_without_stalling(self):
+        # Reverify disabled → an unconfirmed claim can NEVER become a confirmed
+        # block (LD8), so allow now rather than stall the round to the deadline.
+        assert self._g(resolved=True, n_veto=2, would_gate_confirmed=None,
+                       reverify_enabled=False) == veto_wire.GATE_ALLOW
+
+    def test_fail_open_past_deadline_unresolved(self):
+        # Slow/unreachable fleet, phase never resolved by the interior deadline →
+        # FAIL-OPEN (allow), never stall adoption.
+        assert self._g(resolved=False, current_epoch=111,
+                       veto_deadline_epoch=110) == veto_wire.GATE_ALLOW
+
+    def test_fail_open_past_deadline_unconfirmed_veto(self):
+        # A veto was claimed but reverify never confirmed it by the deadline →
+        # fail-open (a raw/unconfirmed claim must never block — LD8).
+        assert self._g(resolved=True, n_veto=2, would_gate_confirmed=None,
+                       current_epoch=111, veto_deadline_epoch=110) == veto_wire.GATE_ALLOW
+
+
+class TestVetoStreamAction:
+    """The streaming re-verify orchestrator: decides, per phase, whether to
+    dispatch a re-verify for uncovered veto-responders, finalize the observe
+    record (block on confirmed / allow once fully covered), or stay pending."""
+
+    def _a(self, **kw):
+        base = dict(reverify_enabled=True, has_veto=True, resolved=False,
+                    inflight=False, uncovered=True, result_present=False,
+                    confirmed=False)
+        base.update(kw)
+        return veto_wire.veto_stream_action(**base)
+
+    # ── Confirmed short-circuits everything (block NOW, even mid-phase) ──────
+    def test_confirmed_writes_result_mid_phase(self):
+        # A leader-reproduced violation is authoritative: finalize (block) now,
+        # regardless of resolution/coverage/in-flight.
+        assert self._a(confirmed=True, resolved=False, inflight=True,
+                       uncovered=True) == veto_wire.STREAM_WRITE_RESULT
+
+    def test_confirmed_writes_result_when_resolved(self):
+        assert self._a(confirmed=True, resolved=True) \
+            == veto_wire.STREAM_WRITE_RESULT
+
+    # ── Early / streaming dispatch as vetos arrive ──────────────────────────
+    def test_first_veto_spawns_early(self):
+        # A veto exists, not yet covered, none in flight → dispatch NOW (don't
+        # wait for the phase to resolve). This is the streaming start.
+        assert self._a(resolved=False, uncovered=True, inflight=False) \
+            == veto_wire.STREAM_SPAWN
+
+    def test_late_veto_spawns_completing_pass(self):
+        # A later follower's veto (new uncovered responder) at resolution → spawn
+        # a completing re-verify so its claim is benched too.
+        assert self._a(resolved=True, uncovered=True, inflight=False) \
+            == veto_wire.STREAM_SPAWN
+
+    def test_no_second_spawn_while_inflight(self):
+        # One re-verify at a time: uncovered but a bench is running → wait.
+        assert self._a(resolved=False, uncovered=True, inflight=True) \
+            == veto_wire.STREAM_NOOP
+
+    def test_covered_unresolved_waits(self):
+        # All arrived vetos dispatched, phase not resolved → await more/resolution.
+        assert self._a(resolved=False, uncovered=False, inflight=False) \
+            == veto_wire.STREAM_NOOP
+
+    def test_no_veto_unresolved_noop(self):
+        assert self._a(resolved=False, has_veto=False, uncovered=False) \
+            == veto_wire.STREAM_NOOP
+
+    # ── Finalize / no-veto ──────────────────────────────────────────────────
+    def test_resolved_no_veto_writes_none(self):
+        assert self._a(resolved=True, has_veto=False, uncovered=False) \
+            == veto_wire.STREAM_WRITE_NONE
+
+    def test_resolved_reverify_disabled_writes_none(self):
+        # Claimed veto but reverify off → terminal no-reverify summary (as before).
+        assert self._a(resolved=True, reverify_enabled=False, uncovered=False) \
+            == veto_wire.STREAM_WRITE_NONE
+
+    def test_resolved_fully_covered_and_landed_writes_result(self):
+        # Full claim set covered, re-verify landed, nothing confirmed → allow.
+        assert self._a(resolved=True, uncovered=False, inflight=False,
+                       result_present=True) == veto_wire.STREAM_WRITE_RESULT
+
+    def test_resolved_inflight_pending(self):
+        # Resolved but a re-verify still running → hold (gate WAITs, fail-open at
+        # the interior deadline); never allow on a partial result.
+        assert self._a(resolved=True, uncovered=False, inflight=True) \
+            == veto_wire.STREAM_PENDING
+
+    def test_resolved_uncovered_inflight_pending(self):
+        # Covered set incomplete AND a bench in flight → pending (don't finalize).
+        assert self._a(resolved=True, uncovered=True, inflight=True) \
+            == veto_wire.STREAM_PENDING
+
+    def test_resolved_covered_no_result_pending(self):
+        # Covered, not in flight, but no landed result yet (e.g. all benches were
+        # no-ops) → pending rather than a premature allow.
+        assert self._a(resolved=True, uncovered=False, inflight=False,
+                       result_present=False) == veto_wire.STREAM_PENDING
+
+    def test_never_allows_a_late_veto_uncovered(self):
+        # REGRESSION GUARD: a resolved round with an uncovered veto-responder must
+        # NEVER finalize-allow — it must spawn/hold until that veto is benched.
+        for inflight in (True, False):
+            assert self._a(resolved=True, uncovered=True, inflight=inflight,
+                           result_present=True, confirmed=False) \
+                in (veto_wire.STREAM_SPAWN, veto_wire.STREAM_PENDING)

@@ -20,11 +20,12 @@ RUN pip install --no-cache-dir aiohttp==3.13.3
 
 WORKDIR /app
 
-# Only the package this sidecar needs. The proxy imports nothing else from the
-# repo, so we keep the image tiny by copying just this subpackage and a stub
-# package marker so the module path `minotaur_subnet.harness.rpc_budget_proxy`
-# resolves.
+# Only what this sidecar needs. The proxy imports just this subpackage plus the
+# stdlib-only shared backoff primitive (minotaur_subnet.rpc_backoff — no web3 /
+# no other repo deps), so the image stays tiny. A stub package marker makes the
+# module path `minotaur_subnet.harness.rpc_budget_proxy` resolve.
 COPY minotaur_subnet/harness/rpc_budget_proxy/ /app/minotaur_subnet/harness/rpc_budget_proxy/
+COPY minotaur_subnet/rpc_backoff.py /app/minotaur_subnet/rpc_backoff.py
 RUN mkdir -p /app/minotaur_subnet/harness \
     && touch /app/minotaur_subnet/__init__.py /app/minotaur_subnet/harness/__init__.py
 

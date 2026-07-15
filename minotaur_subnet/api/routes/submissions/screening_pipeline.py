@@ -30,7 +30,7 @@ DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
 # bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
 MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 
-from minotaur_subnet.harness.submission_store import SubmissionStatus
+from minotaur_subnet.harness.submission_store import SubmissionStatus, offload_write
 from minotaur_subnet.harness.provenance import create_signed_provenance
 
 from .state import get_store
@@ -123,17 +123,21 @@ def _build_git_process_env(repo_url: str) -> tuple[dict[str, str], str | None]:
 def _max_rounds_per_fingerprint() -> int:
     """Cross-hotkey benched-round cap per NORMALIZED content fingerprint.
 
-    ``SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT`` (default 0 = disabled so the
-    merge is inert; the leader arms it via env). Complements the per-(hotkey,
+    ``SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT`` (default 2 — the value the
+    leader has run via env; it shipped 0/disabled so the merge was inert, and
+    the default now lives in CODE so a leader failover keeps the guard without
+    anyone re-arming an env var. 0 disables). Complements the per-(hotkey,
     commit) cap: that one stops naive same-SHA resubmit automation, this one
     stops the two evasions it explicitly cannot — cosmetic hash rotation
-    (nonce comments) and sybil spread (one tree, many hotkeys).
+    (nonce comments) and sybil spread (one tree, many hotkeys). Leader-local
+    intake policy, NOT consensus-relevant: followers mirror the leader's
+    post-intake snapshot either way.
     """
-    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT", "0").strip()
+    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT", "2").strip()
     try:
         return int(raw)
     except ValueError:
-        return 0
+        return 2
 
 
 def _cleanup_temp_file(path: str | None) -> None:
@@ -706,7 +710,7 @@ async def resume_stranded_screenings() -> int:
             )
             continue
         if sub.is_private and store.get_repo_token(sub.submission_id) is None:
-            store.reject(
+            await offload_write(store.reject,
                 sub.submission_id,
                 "screening was interrupted by a validator restart and the "
                 "private-repo token is not retained across restarts — please "
@@ -773,14 +777,14 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             sub.repo_url, sub.commit_hash, repo_dir, token=repo_token,
         )
         if not clone_ok:
-            store.reject(
+            await offload_write(store.reject,
                 submission_id, "Failed to clone repository",
                 outcome_code="clone_failed",
             )
             return
 
         # Stage 1: Static checks
-        store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_1)
+        await offload_write(store.update_status,submission_id, SubmissionStatus.SCREENING_STAGE_1)
 
         from minotaur_subnet.harness.screening import run_stage_1
         # Off the event loop: the AST walk (factorization/deadwood metrics)
@@ -793,8 +797,8 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # value it was rejected at — miners see the number they must get under.
         # Runs for BOTH the public and private clone paths (single confluence).
         if s1.max_region_nodes is not None:
-            store.set_max_region_nodes(submission_id, s1.max_region_nodes)
-        store.set_screening_result(
+            await offload_write(store.set_max_region_nodes,submission_id, s1.max_region_nodes)
+        await offload_write(store.set_screening_result,
             submission_id, stage=1,
             passed=s1.passed,
             duration_ms=s1.duration_ms,
@@ -806,7 +810,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # recorded even when the submission is rejected. unproductive_nodes may
         # be None (unparseable non-exempt file) — persisted as None on purpose.
         if s1.unproductive_metric_version is not None:
-            store.set_deadwood_metric(
+            await offload_write(store.set_deadwood_metric,
                 submission_id,
                 s1.unproductive_nodes,
                 s1.unproductive_metric_version,
@@ -816,7 +820,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # (persist-on-reject, like the metrics above) so rejected submissions
         # still record the identity they were rejected under.
         if s1.content_fingerprint:
-            store.set_content_fingerprint(submission_id, s1.content_fingerprint)
+            await offload_write(store.set_content_fingerprint,submission_id, s1.content_fingerprint)
 
         if not s1.passed:
             return  # set_screening_result already rejected
@@ -836,7 +840,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 s1.content_fingerprint, exclude_submission_id=submission_id,
             )
             if benched >= fp_cap:
-                store.reject(
+                await offload_write(store.reject,
                     submission_id,
                     (
                         f"identical code (normalized fingerprint "
@@ -851,12 +855,12 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 return
 
         # Stage 2: Build check
-        store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_2)
+        await offload_write(store.update_status,submission_id, SubmissionStatus.SCREENING_STAGE_2)
 
         image_tag = f"solver-{sub.commit_hash[:12]}:screening"
         from minotaur_subnet.harness.screening import run_stage_2
         s2 = await run_stage_2(repo_dir, image_tag)
-        store.set_screening_result(
+        await offload_write(store.set_screening_result,
             submission_id, stage=2,
             passed=s2.passed,
             duration_ms=s2.duration_ms,
@@ -866,10 +870,10 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s2.passed:
             return
 
-        store.set_image_tag(submission_id, image_tag)
+        await offload_write(store.set_image_tag,submission_id, image_tag)
         image_id = await _resolve_image_id(image_tag)
         if not image_id:
-            store.reject(
+            await offload_write(store.reject,
                 submission_id,
                 (
                     "Stage 2 policy: failed to resolve immutable image ID "
@@ -877,7 +881,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 ),
             )
             return
-        store.set_image_id(submission_id, image_id)
+        await offload_write(store.set_image_id,submission_id, image_id)
 
         # Content-addressed transport (leader-only, inert until CANDIDATE_IMAGE_REPO
         # is set): push the built image to the candidate repo and persist its GHCR
@@ -889,7 +893,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 image_tag, sub.pr_number, submission_id,
             )
             if digest_ref:
-                store.set_image_digest(submission_id, digest_ref)
+                await offload_write(store.set_image_digest,submission_id, digest_ref)
                 logger.info("Candidate image pushed for %s: %s", submission_id, digest_ref)
             else:
                 logger.warning(
@@ -905,7 +909,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         ).strip()
         signing_address = os.environ.get("SUBMISSION_PROVENANCE_SIGNING_ADDRESS", "").strip()
         if require_asymmetric_provenance and not signing_private_key:
-            store.reject(
+            await offload_write(store.reject,
                 submission_id,
                 (
                     "Stage 2 policy: REQUIRE_ASYMMETRIC_PROVENANCE=1 but "
@@ -914,7 +918,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             )
             return
         if require_signed_provenance and not signing_private_key and not signing_key:
-            store.reject(
+            await offload_write(store.reject,
                 submission_id,
                 (
                     "Stage 2 policy: REQUIRE_SIGNED_PROVENANCE=1 but no provenance "
@@ -935,19 +939,19 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                     signer_address=signing_address,
                 )
             except Exception as exc:
-                store.reject(
+                await offload_write(store.reject,
                     submission_id,
                     f"Stage 2 policy: failed to sign provenance ({exc})",
                 )
                 return
-            store.set_provenance(submission_id, provenance)
+            await offload_write(store.set_provenance,submission_id, provenance)
 
         # Extract solver info from stage 2 details
         if ":" in s2.details:
             try:
                 info_part = s2.details.split(": ", 1)[1]
                 name_ver = info_part.split(" v")
-                store.set_solver_info(
+                await offload_write(store.set_solver_info,
                     submission_id,
                     name=name_ver[0],
                     version=name_ver[1] if len(name_ver) > 1 else None,
@@ -956,11 +960,11 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 pass
 
         # Stage 3: Smoke test
-        store.update_status(submission_id, SubmissionStatus.SCREENING_STAGE_3)
+        await offload_write(store.update_status,submission_id, SubmissionStatus.SCREENING_STAGE_3)
 
         from minotaur_subnet.harness.screening import run_stage_3
         s3 = await run_stage_3(image_tag)
-        store.set_screening_result(
+        await offload_write(store.set_screening_result,
             submission_id, stage=3,
             passed=s3.passed,
             duration_ms=s3.duration_ms,
@@ -986,7 +990,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             )
             return
         # All screening passed -- move to benchmarking queue
-        store.update_status(submission_id, SubmissionStatus.BENCHMARKING)
+        await offload_write(store.update_status,submission_id, SubmissionStatus.BENCHMARKING)
         logger.info(
             "Submission %s passed screening, queued for benchmarking",
             submission_id,
@@ -994,7 +998,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
 
     except Exception as exc:
         logger.exception("Screening pipeline error for %s", submission_id)
-        store.reject(submission_id, f"Screening error: {exc}", outcome_code="screening_error")
+        await offload_write(store.reject,submission_id, f"Screening error: {exc}", outcome_code="screening_error")
 
     finally:
         if repo_dir and os.path.exists(repo_dir):

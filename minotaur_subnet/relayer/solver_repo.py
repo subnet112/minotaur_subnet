@@ -174,6 +174,28 @@ _ATTEST_RECEIPT_POLL_LATENCY_S = float(
     os.environ.get("ATTEST_RECEIPT_POLL_LATENCY_S", "3.0")
 )
 
+# Merge-gate cert-read resilience. By the time the merge gate re-reads the
+# ChampionRegistry to confirm a quorum cert binds the head SHA, the attest has
+# ALREADY landed on-chain — so a transient 429/timeout on that READ must not
+# throw away a certified, already-attested win (the merge_failed churn: attest
+# succeeds, cert-read 429s on the public BT-EVM endpoint, merge refused, champion
+# frozen; diagnosed live 2026-07-09). Retry the read with exponential backoff
+# before fail-closing. A read that SUCCEEDS but does not bind (or quorum < 1) is
+# a DEFINITIVE negative and is never retried — the gate stays fail-closed against
+# an uncertified head. Env-tunable, same discipline as the attest retry.
+_CERT_READ_ATTEMPTS = int(os.environ.get("MERGE_GATE_CERT_READ_ATTEMPTS", "4"))
+_CERT_READ_BACKOFF_S = float(os.environ.get("MERGE_GATE_CERT_READ_BACKOFF_S", "2.0"))
+
+# Trust this round's own status=1 certify() receipt as proof the cert binds the
+# head, skipping the registry re-read entirely (there's no read to 429). DEFAULT
+# ON. Trade-off: unlike a fresh read, it can't observe a chain reorg that orphans
+# the certify() tx between the receipt and the merge — a rare, non-attacker
+# robustness gap that self-heals (the leader re-attests next round). Set to 0 to
+# force the authoritative (retrying) read on every merge.
+_TRUST_ATTEST_RECEIPT = os.environ.get(
+    "MERGE_GATE_TRUST_ATTEST_RECEIPT", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 def _attest_gas_fields(w3: Any) -> dict:
     """EIP-1559 (type-2) gas fields for the attest tx, with a legacy fallback.
@@ -1017,7 +1039,8 @@ def _read_champion_registry() -> Any | None:
         return None
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(rpc))
+        from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+        w3 = build_retrying_web3(rpc)
         if not w3.is_connected():
             logger.error("merge gate: cannot connect to BT EVM at %s", rpc)
             return None
@@ -1046,7 +1069,9 @@ def _pr_touches_ci(owner: str, repo: str, pr_number: int) -> bool:
     return any((f.get("filename") or "").startswith(".github/") for f in files)
 
 
-def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
+def _onchain_cert_binds(
+    head_sha: str, round_id: str | None, *, attest_confirmed_sha: str | None = None,
+) -> bool:
     """Leader's OWN authority check: does a quorum cert on-chain bind this head SHA?
 
     Asserts exists AND commitHash == keccak(utf8(lowercase head_sha)) AND
@@ -1054,31 +1079,104 @@ def _onchain_cert_binds(head_sha: str, round_id: str | None) -> bool:
     common case — the leader attests immediately before merging), then falls back
     to getChampion(round_id) if latest has already moved past this round. The PR
     body/comments are NEVER an input — only the on-chain record.
+
+    Transient RPC failures on the read (registry unreadable, 429/timeout/5xx from
+    the public BT-EVM endpoint) are RETRIED with exponential backoff before the
+    gate fail-closes — the attest has already landed on-chain by now, so a
+    rate-limited read must not discard a certified win. A read that SUCCEEDS but
+    does not bind — or reports quorum < 1 — is a DEFINITIVE negative and returns
+    immediately, never retried: the gate stays fail-closed against an uncertified
+    head regardless of RPC weather.
+
+    ``attest_confirmed_sha`` is the head this round's certify() tx just wrote with
+    a status=1 receipt (verified in attest_champion_on_chain). certify() is
+    contract-enforced quorum, so a successful receipt IS proof the cert exists and
+    binds ``_str_to_bytes32(commit_hash)`` with approvalCount >= quorum. When its
+    on-chain commitHash byte-encoding equals ``target``, we trust that receipt and
+    SKIP the registry re-read entirely — the exact read that 429s on the public
+    BT-EVM endpoint. It is set ONLY on a confirmed attest (tx_hash != None) for
+    this same SHA; any mismatch, or no attest, falls through to the authoritative
+    (retrying) read below. Gated by MERGE_GATE_TRUST_ATTEST_RECEIPT (default on).
     """
-    reg = _read_champion_registry()
-    if reg is None:
-        logger.error("merge gate: ChampionRegistry unreadable — refusing merge")
-        return False
     target = _str_to_bytes32(head_sha.strip().lower())  # == keccak(utf8(head_sha))
-    try:
-        quorum = int(reg.functions.getQuorumRequired().call())
-        if quorum < 1:
-            logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+
+    # Fast path: skip the RPC entirely when this round's own attest already
+    # confirmed this head on-chain (see attest_confirmed_sha above) — the merge is
+    # resilient to a rate-limited read-back because there is no read to rate-limit.
+    # Compare with the SAME byte derivation the on-chain bind + the read use
+    # (_str_to_bytes32), NOT a lowercased string == : _str_to_bytes32 does not
+    # lowercase a non-64-char value, so a case/format-skewed attest_confirmed_sha
+    # that would NOT actually bind on-chain must NOT short-circuit — it falls
+    # through to the authoritative read. Equivalent to the read's commitHash check.
+    if (
+        _TRUST_ATTEST_RECEIPT
+        and attest_confirmed_sha
+        and _str_to_bytes32(attest_confirmed_sha) == target
+    ):
+        logger.info(
+            "merge gate: head %s confirmed by this round's on-chain attest receipt "
+            "(status=1 certify) — skipping registry re-read", head_sha,
+        )
+        return True
+
+    # A missing registry address / RPC URL is a PERSISTENT config error, never a
+    # transient RPC blip — refuse immediately rather than burning the whole
+    # backoff budget on every finalize (retrying a misconfig can never succeed).
+    # Mirrors the env gate in _read_champion_registry (CHAMPION_REGISTRY_964 +
+    # BITTENSOR_EVM_RPC_URL) so it stays a fast, definitive refusal.
+    if not os.environ.get("CHAMPION_REGISTRY_964", "").strip() or not os.environ.get(
+        "BITTENSOR_EVM_RPC_URL", ""
+    ).strip():
+        logger.error("merge gate: ChampionRegistry env unconfigured — refusing merge")
+        return False
+
+    def _binds(rec: Any, quorum: int) -> bool:
+        # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
+        # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7]).
+        # A successful read that yields an empty/malformed record (e.g. a
+        # never-certified round decodes to a zero-tuple, or None) DOES NOT BIND —
+        # a definitive negative, NOT a transient RPC error to retry on.
+        try:
+            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
+        except (TypeError, IndexError, ValueError):
             return False
 
-        def _binds(rec: Any) -> bool:
-            # ChampionRecord = (roundId, candidateSubmissionId, candidateImageId,
-            # commitHash[3], effectiveEpoch, certifiedAt, approvalCount[6], exists[7])
-            return bool(rec[7]) and rec[3] == target and int(rec[6]) >= quorum
-
-        if _binds(reg.functions.getLatestChampion().call()):
-            return True
-        if round_id:
-            return _binds(reg.functions.getChampion(_str_to_bytes32(round_id)).call())
-        return False
-    except Exception as exc:
-        logger.error("merge gate: on-chain cert read failed: %s — refusing merge", exc)
-        return False
+    attempts = max(1, _CERT_READ_ATTEMPTS)
+    last_exc: Any = None
+    for attempt in range(attempts):
+        try:
+            reg = _read_champion_registry()
+            if reg is None:
+                # Provider/registry could not be built — transient (RPC down /
+                # rate-limited). Raise into the retry path rather than fail-close.
+                raise ConnectionError("ChampionRegistry unreadable")
+            quorum = int(reg.functions.getQuorumRequired().call())
+            if quorum < 1:
+                logger.error("merge gate: on-chain quorum %s < 1 — refusing (fail-closed)", quorum)
+                return False  # DEFINITIVE — read succeeded
+            if _binds(reg.functions.getLatestChampion().call(), quorum):
+                return True
+            if round_id and _binds(
+                reg.functions.getChampion(_str_to_bytes32(round_id)).call(), quorum
+            ):
+                return True
+            # Reads succeeded; the cert genuinely does not bind this head — a
+            # DEFINITIVE negative, not an RPC blip. Refuse without retrying.
+            return False
+        except Exception as exc:  # noqa: BLE001 — transient RPC failure: retry with backoff
+            last_exc = exc
+            if attempt < attempts - 1:
+                wait = _CERT_READ_BACKOFF_S * (2 ** attempt)
+                logger.warning(
+                    "merge gate: cert read attempt %d/%d failed (%s) — retrying in %.1fs",
+                    attempt + 1, attempts, exc, wait,
+                )
+                time.sleep(wait)
+    logger.error(
+        "merge gate: on-chain cert read failed after %d attempt(s): %s — refusing merge",
+        attempts, last_exc,
+    )
+    return False
 
 
 def merge_miner_pr_when_certified(
@@ -1086,7 +1184,8 @@ def merge_miner_pr_when_certified(
     expected_head_sha: str,
     *,
     round_id: str | None = None,
-) -> bool:
+    attest_confirmed_sha: str | None = None,
+) -> "MergeResult":
     """Squash-merge the miner's fork PR ONLY after the leader's OWN on-chain check.
 
     Never polls a GitHub status check (fork-spoofable). Steps:
@@ -1112,7 +1211,7 @@ def merge_miner_pr_when_certified(
     owner_repo = _parse_github_owner_repo()
     if owner_repo is None or not pr_number:
         logger.error("merge gate: no owner/repo or pr_number — cannot merge")
-        return False
+        return MergeResult(False, "no_pr_number", "merge", "no owner/repo or pr_number")
     owner, repo = owner_repo
     certified = (expected_head_sha or "").strip().lower()
 
@@ -1129,7 +1228,7 @@ def merge_miner_pr_when_certified(
         )
     if not live_head and not certified:
         logger.error("merge gate: PR #%s has no resolvable head SHA", pr_number)
-        return False
+        return MergeResult(False, "pr_unresolvable", "merge", "PR has no resolvable head SHA")
     if certified and live_head != certified:
         logger.warning(
             "merge gate: PR #%s live head (%s) is not the certified/signed SHA (%s) — "
@@ -1140,20 +1239,24 @@ def merge_miner_pr_when_certified(
         )
         return _publish_certified_tree_despite_pr(
             owner, repo, int(pr_number), certified, round_id,
+            attest_confirmed_sha=attest_confirmed_sha,
         )
 
     # 2) CI-disarm guard.
     if _pr_touches_ci(owner, repo, int(pr_number)):
         logger.error("merge gate: PR #%s diff touches .github/** — refusing (CI-disarm guard)", pr_number)
-        return False
+        return MergeResult(False, "ci_disarm", "merge", "PR diff touches .github/**")
 
     # 3) The authority: on-chain quorum cert must bind this exact head SHA.
-    if not _onchain_cert_binds(live_head, round_id):
+    if not _onchain_cert_binds(live_head, round_id, attest_confirmed_sha=attest_confirmed_sha):
         logger.error(
             "merge gate: no on-chain quorum cert binds head %s (round %s) — refusing merge",
             live_head, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the certified head SHA",
+        )
 
     # 4) Squash-merge pinned to the resolved head (GitHub rejects on drift).
     st, body = _github_api_request(
@@ -1163,9 +1266,9 @@ def merge_miner_pr_when_certified(
     )
     if st == 200:
         logger.info("merge gate: PR #%s squash-merged (head %s on-chain-certified)", pr_number, live_head)
-        return True
+        return MergeResult(True)
     logger.error("merge gate: PR #%s merge failed: HTTP %s %s", pr_number, st, body)
-    return False
+    return MergeResult(False, "merge_http_error", "merge", f"GitHub squash-merge HTTP {st}")
 
 
 def _publish_certified_tree_despite_pr(
@@ -1174,7 +1277,9 @@ def _publish_certified_tree_despite_pr(
     pr_number: int,
     certified_sha: str,
     round_id: str | None,
-) -> bool:
+    *,
+    attest_confirmed_sha: str | None = None,
+) -> "MergeResult":
     """Land a certified PUBLIC win whose PR drifted or closed post-certification.
 
     The quorum certified ``certified_sha`` (and the fleet verified the image
@@ -1197,14 +1302,19 @@ def _publish_certified_tree_despite_pr(
     before).
     """
     if not certified_sha:
-        return False
-    if not _onchain_cert_binds(certified_sha, round_id):
+        return MergeResult(False, "no_certified_sha", "merge", "empty certified SHA")
+    if not _onchain_cert_binds(
+        certified_sha, round_id, attest_confirmed_sha=attest_confirmed_sha,
+    ):
         logger.error(
             "merge gate: no on-chain quorum cert binds certified SHA %s (round %s) "
             "— refusing drift-fallback publish",
             certified_sha, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the certified SHA (drift-fallback publish)",
+        )
     published = _publish_certified_tree_to_canonical(
         owner, repo, certified_sha, round_id,
         pr_number=pr_number,
@@ -1213,7 +1323,7 @@ def _publish_certified_tree_despite_pr(
         label="certified submission (PR drifted/closed post-certification)",
     )
     if not published:
-        return False
+        return MergeResult(False, "publish_failed", "merge", "certified-tree publish to canonical failed")
     comment_on_pr(
         pr_number,
         "### ⚠️ Certified tree published directly\n\n"
@@ -1225,7 +1335,7 @@ def _publish_certified_tree_despite_pr(
         "changes were NOT included. Submit them in a future round.",
     )
     close_pr(pr_number)
-    return True
+    return MergeResult(True)
 
 
 def _gh_json(method: str, url: str, payload: dict | None = None, *, token: str | None = None):
@@ -1295,7 +1405,8 @@ def publish_private_champion_when_certified(
     *,
     private_repo: str,
     repo_token: str,
-) -> bool:
+    attest_confirmed_sha: str | None = None,
+) -> "MergeResult":
     """Finalize a PRIVATE-submission champion onto canonical ``main`` (leak-on-win).
 
     A private PR lives in the miner's own repo, so GitHub cannot cross-repo merge
@@ -1330,11 +1441,11 @@ def publish_private_champion_when_certified(
     owner_repo = _parse_github_owner_repo()
     if owner_repo is None or not pr_number:
         logger.error("publish: no canonical owner/repo or pr_number")
-        return False
+        return MergeResult(False, "no_pr_number", "merge", "no canonical owner/repo or pr_number")
     c_owner, c_repo = owner_repo
     if "/" not in (private_repo or ""):
         logger.error("publish: malformed private_repo %r", private_repo)
-        return False
+        return MergeResult(False, "malformed_repo", "merge", "malformed private_repo")
     p_owner, p_repo = private_repo.split("/", 1)
 
     # 1) TOCTOU visibility — re-resolve the live head with the miner token. The
@@ -1353,7 +1464,7 @@ def publish_private_champion_when_certified(
     target = certified or live_head
     if not target:
         logger.error("publish: PR #%s has no certified or resolvable head SHA", pr_number)
-        return False
+        return MergeResult(False, "pr_unresolvable", "merge", "no certified or resolvable head SHA")
     if certified and live_head != certified:
         logger.warning(
             "publish: PR #%s live head (%s) is not the certified SHA (%s) — "
@@ -1364,21 +1475,27 @@ def publish_private_champion_when_certified(
 
     # 2) THE authority: on-chain quorum cert must bind this exact SHA (the
     # cert's commit_hash is the private head SHA — same check as the public path).
-    if not _onchain_cert_binds(target, round_id):
+    if not _onchain_cert_binds(target, round_id, attest_confirmed_sha=attest_confirmed_sha):
         logger.error(
             "publish: no on-chain quorum cert binds head %s (round %s) — refusing",
             target, round_id,
         )
-        return False
+        return MergeResult(
+            False, "no_quorum_cert", "merge",
+            "no on-chain quorum cert binds the private head SHA",
+        )
 
     # 3+4) Land the certified tree on canonical main (shared Git-Data publisher).
-    return _publish_certified_tree_to_canonical(
+    _published = _publish_certified_tree_to_canonical(
         p_owner, p_repo, target, round_id,
         pr_number=pr_number,
         source_token=repo_token,
         branch_prefix="private-champion",
         label="private submission",
     )
+    if not _published:
+        return MergeResult(False, "publish_failed", "merge", "private certified-tree publish failed")
+    return MergeResult(True)
 
 
 def _publish_certified_tree_to_canonical(
@@ -1598,12 +1715,89 @@ def assert_solver_repo_token_not_admin() -> None:
 # ── Orchestrator (replaces merge_champion_to_main) ───────────────────────────
 
 
+class MergeResult:
+    """Structured champion-adoption outcome: ok + a specific failure reason.
+
+    ``__bool__`` returns ``ok`` so every existing ``bool(result)`` / ``if
+    result:`` adoption gate stays correct — a failed result is FALSY even though
+    it carries a reason. ``code`` is a stable machine token (e.g.
+    ``no_quorum_cert``), ``stage`` is where it failed (``quorum``/``attest``/
+    ``merge``), ``detail`` is human text. ``.reason`` aliases ``.code`` for the
+    round store's ``abort_reason`` (``merge_failed:<code>``) and older callers.
+    """
+
+    __slots__ = ("ok", "code", "stage", "detail")
+
+    def __init__(self, ok: bool, code: str = "", stage: str = "", detail: str = "") -> None:
+        self.ok = bool(ok)
+        self.code = str(code or "")
+        self.stage = str(stage or "")
+        self.detail = str(detail or "")
+
+    @property
+    def reason(self) -> str:
+        return self.code
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self) -> str:
+        return f"MergeResult(ok={self.ok}, code={self.code!r}, stage={self.stage!r})"
+
+
+class FinalizeOutcome:
+    """Structured result of the finalize-champion endpoint, serialized per API
+    version. Carries the adoption verdict + a specific reason (code/stage/detail)
+    and round context, so ``/v2`` returns a clean typed body instead of ``/v1``'s
+    loose ``{merge_ok, reason}`` fields. Every validation refusal and the adoption
+    outcome funnel through this one type.
+    """
+
+    __slots__ = ("ok", "code", "stage", "detail", "round_id", "submission_id")
+
+    def __init__(
+        self, ok: bool, code: str = "", stage: str = "", detail: str = "",
+        *, round_id: str = "", submission_id: str = "",
+    ) -> None:
+        self.ok = bool(ok)
+        self.code = str(code or "")
+        self.stage = str(stage or "")
+        self.detail = str(detail or "")
+        self.round_id = str(round_id or "")
+        self.submission_id = str(submission_id or "")
+
+    @classmethod
+    def from_merge(cls, res: Any, *, round_id: str = "", submission_id: str = "") -> "FinalizeOutcome":
+        # Tolerate a MergeResult OR a bare bool (legacy/tests): getattr falls back.
+        ok = bool(res)
+        code = str(getattr(res, "code", "") or ("" if ok else "merge_refused"))
+        return cls(
+            ok, code, str(getattr(res, "stage", "")), str(getattr(res, "detail", "")),
+            round_id=round_id, submission_id=submission_id,
+        )
+
+    def to_v1(self) -> dict:
+        # Minimal legacy shape — no reason accretion (v1 stays a compat shim).
+        return {"merge_ok": self.ok, "round_id": self.round_id, "submission_id": self.submission_id}
+
+    def to_v2(self) -> dict:
+        return {
+            "ok": self.ok,
+            "outcome": "adopted" if self.ok else "refused",
+            "round_id": self.round_id,
+            "submission_id": self.submission_id,
+            "reason": None if self.ok else {
+                "code": self.code, "stage": self.stage, "detail": self.detail,
+            },
+        }
+
+
 def on_champion_adopted_pr(
     submission: Any,
     round_id: str | None = None,
     *,
     certificate: Any = None,
-) -> bool:
+) -> "MergeResult":
     """Handle champion adoption: attest on-chain + create GitHub PR.
 
     Replaces the old merge_champion_to_main() function. The leader no longer
@@ -1623,7 +1817,7 @@ def on_champion_adopted_pr(
 
     if not commit_hash or commit_hash in ("builtin", ""):
         logger.info("Skipping on-chain attestation for non-git submission: %s", submission_id)
-        return False
+        return MergeResult(False, "non_git_submission", "attest", "non-git submission (nothing to attest/merge)")
 
     # Step 1: On-chain attestation (retry up to 3 times)
     tx_hash = None
@@ -1649,6 +1843,14 @@ def on_champion_adopted_pr(
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
 
+    # Root cause of a failed/absent attestation, carried into abort_reason.
+    if certificate is None:
+        _attest_reason = "no_certificate"
+    elif not tx_hash:
+        _attest_reason = "attest_failed"
+    else:
+        _attest_reason = ""
+
     # Mirror the ADOPT decision onto the miner's OWN signed fork PR. This is the
     # SINGLE gated path onto main — the legacy create_champion_pr() (a second,
     # leader-pushed champion/<round> branch) is intentionally NOT called: a
@@ -1662,7 +1864,10 @@ def on_champion_adopted_pr(
             "Adopt for %s has no pr_number (not a fork-PR submission) — attest %s, nothing to merge",
             submission_id, tx_hash or "skipped",
         )
-        return False
+        return MergeResult(
+            False, _attest_reason or "no_pr_number",
+            "attest" if _attest_reason else "merge", "no PR to merge",
+        )
 
     # Private submissions carry their repo + per-submission token (passed through
     # the finalize request); public submissions have neither.
@@ -1690,24 +1895,31 @@ def on_champion_adopted_pr(
     # status check. Public: cross-fork squash-merge pinned to the resolved head.
     # Private: clone the miner's tree at the certified head and push it to
     # canonical main (GitHub can't cross-repo merge a private PR).
+    # A successful attest (tx_hash != None ⟺ certify() receipt status==1 for this
+    # commit_hash) is itself on-chain proof the cert binds this SHA with quorum —
+    # hand it to the merge gate so it skips the registry re-read that 429s. None
+    # when attest was skipped/failed ⇒ the gate does its authoritative read.
+    _attest_confirmed = commit_hash if tx_hash else None
     if _is_private:
         if not (_private_repo and _repo_token):
             logger.error(
                 "Adopt for %s is private but missing private_repo/token — refusing", submission_id,
             )
-            return False
+            return MergeResult(False, "private_missing_token", "merge", "private submission missing repo/token")
         merged = publish_private_champion_when_certified(
             _pr_number,
             commit_hash,
             round_id,
             private_repo=_private_repo,
             repo_token=_repo_token,
+            attest_confirmed_sha=_attest_confirmed,
         )
     else:
         merged = merge_miner_pr_when_certified(
             _pr_number,
             commit_hash,
             round_id=round_id,
+            attest_confirmed_sha=_attest_confirmed,
         )
     if merged:
         # The winner is on main now → every OTHER open submission PR replaces the
@@ -1718,11 +1930,23 @@ def on_champion_adopted_pr(
             close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("close-stale failed after champion merge: %s", exc)
+    _ok = bool(tx_hash) and bool(merged)
+    if _ok:
+        _result = MergeResult(True)
+    elif _attest_reason:                     # attest is the ROOT failure
+        _result = MergeResult(
+            False, _attest_reason, "attest",
+            "on-chain attestation was skipped or failed",
+        )
+    elif not bool(merged):                   # attest ok → merge gate's specific reason
+        _result = merged
+    else:
+        _result = MergeResult(False, "adopt_failed", "merge")
     logger.info(
-        "Champion adoption: attest=%s merge=%s pr=#%s round=%s",
-        tx_hash or "skipped", merged, _pr_number, round_id,
+        "Champion adoption: attest=%s merge=%s reason=%s pr=#%s round=%s",
+        tx_hash or "skipped", bool(merged), _result.code or "-", _pr_number, round_id,
     )
-    return bool(tx_hash) and merged
+    return _result
 
 
 # ── Relayer-delegated finalization (third-party leader) ──────────────────────
@@ -1739,7 +1963,7 @@ def on_champion_adopted_via_relayer(
     round_id: str | None = None,
     *,
     certificate: Any = None,
-) -> bool:
+) -> "MergeResult":
     """Ask the trusted relayer to finalize a certified champion; return its verdict.
 
     POSTs the certificate + submission identity to ``{RELAYER_URL}/v1/finalize-champion``.
@@ -1764,7 +1988,7 @@ def on_champion_adopted_via_relayer(
     relayer_url = os.environ.get("RELAYER_URL", "").strip()
     if not relayer_url:
         logger.error("on_champion_adopted_via_relayer: RELAYER_URL unset — cannot finalize")
-        return False
+        return MergeResult(False, "relayer_url_unset")
 
     commit_hash = getattr(submission, "commit_hash", "") or ""
     submission_id = getattr(submission, "submission_id", "") or ""
@@ -1772,20 +1996,20 @@ def on_champion_adopted_via_relayer(
         logger.info(
             "Skipping relayer finalization for non-git submission: %s", submission_id,
         )
-        return False
+        return MergeResult(False, "non_git_submission")
 
     if certificate is None:
         logger.error(
             "on_champion_adopted_via_relayer: no certificate for %s — refusing", submission_id,
         )
-        return False
+        return MergeResult(False, "no_certificate")
 
     validator_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
     if not validator_key:
         logger.error(
             "on_champion_adopted_via_relayer: VALIDATOR_PRIVATE_KEY unset — cannot sign wrapper",
         )
-        return False
+        return MergeResult(False, "no_validator_key")
 
     rid = str(round_id or "")
     candidate_submission_id = (
@@ -1828,7 +2052,7 @@ def on_champion_adopted_via_relayer(
             logger.error(
                 "relayer-finalize: private submission %s has no token — FAIL-CLOSED", submission_id,
             )
-            return False
+            return MergeResult(False, "private_missing_token")
         _submission["is_private"] = True
         _submission["private_repo"] = (
             getattr(submission, "private_repo_full", None)
@@ -1849,24 +2073,28 @@ def on_champion_adopted_via_relayer(
         "wrapper_signature": wrapper_sig,
     }
 
-    url = relayer_url.rstrip("/") + "/v1/finalize-champion"
+    base = relayer_url.rstrip("/")
+    # Prefer the structured v2 contract; fall back to v1 for a relayer still on an
+    # older image (the api + relayer recreate seconds apart during an update, so a
+    # brief version skew is possible). Generous timeout: the on-chain attest (up to
+    # 3 retries) + squash-merge can take a while.
     try:
-        # Generous timeout: the on-chain attest (with up to 3 retries) + the
-        # squash-merge can take a while.
-        resp = requests.post(url, json=body, timeout=180)
+        resp = requests.post(base + "/v2/finalize-champion", json=body, timeout=180)
+        if resp.status_code == 404:
+            resp = requests.post(base + "/v1/finalize-champion", json=body, timeout=180)
     except Exception as exc:
         logger.error(
             "on_champion_adopted_via_relayer: POST %s failed (%s) — FAIL-CLOSED (no adopt)",
-            url, exc,
+            base, exc,
         )
-        return False
+        return MergeResult(False, "relayer_unreachable", "client", str(exc))
 
     if resp.status_code != 200:
         logger.error(
             "on_champion_adopted_via_relayer: relayer HTTP %s for round=%s — FAIL-CLOSED",
             resp.status_code, rid,
         )
-        return False
+        return MergeResult(False, f"relayer_http_{resp.status_code}", "client", "non-200 from relayer")
 
     try:
         payload = resp.json()
@@ -1874,14 +2102,23 @@ def on_champion_adopted_via_relayer(
         logger.error(
             "on_champion_adopted_via_relayer: bad JSON reply (%s) — FAIL-CLOSED", exc,
         )
-        return False
+        return MergeResult(False, "relayer_bad_reply", "client", str(exc))
 
-    merge_ok = bool(payload.get("merge_ok"))
+    # v2 reply: {"ok", "reason": {"code","stage","detail"}}. v1 fallback: {"merge_ok"}.
+    if "ok" in payload:
+        ok = bool(payload.get("ok"))
+        r = payload.get("reason") or {}
+        code = str((r.get("code") if isinstance(r, dict) else r) or ("" if ok else "merge_refused"))
+        stage = str(r.get("stage", "")) if isinstance(r, dict) else ""
+        detail = str(r.get("detail", "")) if isinstance(r, dict) else ""
+    else:
+        ok = bool(payload.get("merge_ok"))
+        code, stage, detail = ("" if ok else "merge_refused"), "", ""
     logger.info(
-        "Champion finalization via relayer: round=%s submission=%s merge_ok=%s reason=%s",
-        rid, submission_id, merge_ok, payload.get("reason"),
+        "Champion finalization via relayer: round=%s submission=%s ok=%s reason=%s",
+        rid, submission_id, ok, code or "-",
     )
-    return merge_ok
+    return MergeResult(ok, code, stage, detail)
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────
@@ -1894,8 +2131,8 @@ def merge_champion_to_main(
     **kwargs: Any,
 ) -> bool:
     """Legacy alias — delegates to on_champion_adopted_pr."""
-    return on_champion_adopted_pr(
+    return bool(on_champion_adopted_pr(
         submission,
         round_id,
         certificate=kwargs.get("certificate"),
-    )
+    ))

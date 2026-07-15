@@ -34,10 +34,23 @@ CHAMPION_APPROVAL_TYPEHASH = keccak(
 )
 
 
-# Signed approvals are valid for this long by default; longer than the
-# champion-consensus timeout so a slow round doesn't reject sigs that were
-# minted near the start.
+# FLOOR for how long a signed approval stays valid — not the whole story.
+#
+# The signature is spent by the on-chain certify() at ADOPTION, which fires at
+# the round's activation (effective_epoch), NOT at certification. The autoscaled
+# decision window (#421) sets activation = close + window + 2, so activation can
+# land arbitrarily far past the mint and a fixed now+TTL deadline silently dies
+# before the attest it exists to authorize — certify() then reverts "Expired"
+# and the round aborts merge_failed:attest_failed. Callers minting a fresh
+# approval must anchor the deadline to activation; see
+# ``_champion_approval_deadline``. This constant only floors that result.
 CHAMPION_APPROVAL_DEADLINE_SECONDS = 3600
+
+# Slack added on top of a round's activation timestamp when anchoring an
+# approval deadline. The attest fires up to one round-eval tick (~60s) after
+# activation and then retries with backoff, so the signature has to outlive
+# activation by more than that retry budget.
+CHAMPION_APPROVAL_ACTIVATION_MARGIN_SECONDS = 900
 
 
 @dataclass(frozen=True)
