@@ -202,6 +202,105 @@ class HttpRelayer(RelayerBase):
                     )
                 return addr, tx_hash
 
+    async def call_contract_function(
+        self,
+        contract_address: str,
+        chain_id: int,
+        signature: str,
+        abi_types: list[str],
+        values: list,
+        tx_value: int = 0,
+        gas: int = 200_000,
+    ) -> str:
+        """Proxy ``EvmRelayer.call_contract_function`` via ``POST /v1/contract-call``.
+
+        Same contract as the in-process version (returns tx hash, raises on
+        failure) so the app-lifecycle services work identically on the
+        split api/relayer topology — before this, every float/config/registry
+        admin action raised ``AttributeError`` on production. Signs the same
+        EIP-191 validator wrapper as ``deploy_contract``, with
+        ``plan_hash = compute_contract_call_hash(...)`` binding every call
+        parameter. The relayer additionally enforces a function allowlist.
+        """
+        if not self.signing_key:
+            raise RuntimeError(
+                "call_contract_function: HttpRelayer requires signing_key — set "
+                "VALIDATOR_PRIVATE_KEY on the api so it can sign the call wrapper"
+            )
+
+        from minotaur_subnet.consensus.leader_wrapper import compute_contract_call_hash
+
+        abi_types = list(abi_types or [])
+        # Stringify values for the canonical hash; the relayer coerces back
+        # per ABI type before encoding.
+        values_wire = [str(v) for v in (values or [])]
+        call_hash = compute_contract_call_hash(
+            int(chain_id), contract_address, signature, abi_types, values_wire,
+            int(tx_value), int(gas),
+        )
+        nonce = next(self._nonce_counter)
+        wrapper, wrapper_sig = sign_wrapper(
+            self.signing_key,
+            plan_hash=call_hash,
+            submission_nonce=nonce,
+            chain_id=int(chain_id),
+        )
+        payload = {
+            "target": contract_address,
+            "chain_id": int(chain_id),
+            "fn_signature": signature,
+            "abi_types": abi_types,
+            "values": values_wire,
+            "tx_value": int(tx_value),
+            "gas": int(gas),
+            "wrapper": {
+                "plan_hash": wrapper.plan_hash,
+                "submission_nonce": wrapper.submission_nonce,
+                "timestamp": wrapper.timestamp,
+                "chain_id": wrapper.chain_id,
+            },
+            "wrapper_signature": wrapper_sig,
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(f"{self.url}/v1/contract-call", json=payload) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    err = body.get("error") or f"HTTP {resp.status}"
+                    raise RuntimeError(
+                        f"call_contract_function: relayer {self.url} rejected {signature} "
+                        f"on chain {chain_id}: {err}",
+                    )
+                tx_hash = body.get("tx_hash")
+                if not tx_hash:
+                    raise RuntimeError(
+                        f"call_contract_function: malformed response from {self.url}: {body!r}",
+                    )
+                return tx_hash
+
+    def _resolve_wallet(self, chain_id: int) -> str:
+        """The relayer service's sending address for *chain_id*.
+
+        Fetched once from ``GET /wallets`` and cached — the address only
+        changes with a relayer key rotation, which restarts both services.
+        Mirrors ``EvmRelayer._resolve_wallet`` so callers (auto-register's
+        self-allowlist, the owner pre-checks) work on the split topology.
+        """
+        cache = getattr(self, "_wallet_cache", None)
+        if cache is None:
+            import requests
+
+            resp = requests.get(f"{self.url}/wallets", timeout=10)
+            resp.raise_for_status()
+            cache = dict((resp.json() or {}).get("wallets") or {})
+            self._wallet_cache = cache
+        wallet = cache.get(str(int(chain_id)))
+        if not wallet:
+            raise RuntimeError(
+                f"_resolve_wallet: relayer {self.url} has no wallet for chain {chain_id}",
+            )
+        return wallet
+
     async def submit_plan(
         self,
         order: Any,
