@@ -366,11 +366,18 @@ class RoundStore:
         self,
         persist_path: Path | None = None,
         record_sink: Callable[[RoundState], None] | None = None,
+        sweep_orphan_temps: bool = True,
     ) -> None:
         self._persist_path = persist_path
         # Best-effort mirror of each round mutation to durable history (e.g. the
         # order-book DB). NEVER affects round state — failures are swallowed.
         self._record_sink = record_sink
+        # A read-only sharer of the round store (the split benchmark worker) sets
+        # this False: _load's orphan-temp sweep globs + unlinks `.<name>.*.tmp` in
+        # the shared /data dir, which can delete the api coordinator's IN-FLIGHT
+        # persist temp between its mkstemp and os.replace → a silently-lost round /
+        # champion write. Only the sole WRITER (the api) should sweep.
+        self._sweep_orphan_temps_enabled = sweep_orphan_temps
         self._persist_mtime_ns: int | None = None
         self._rounds: dict[str, RoundState] = {}
         self._current_round_id: str | None = None
@@ -963,8 +970,11 @@ class RoundStore:
     def _load(self) -> None:
         try:
             # Clean up any orphan temp files from a prior crashed persist before
-            # loading (the unique-temp-name scheme would otherwise let them pile up).
-            self._sweep_orphan_temps()
+            # loading — but ONLY in the sole-writer process. A read-only sharer
+            # (the split worker) would otherwise unlink the api coordinator's
+            # in-flight persist temp, silently losing a round/champion write.
+            if self._sweep_orphan_temps_enabled:
+                self._sweep_orphan_temps()
             data = fastjson.loads(self._persist_path.read_bytes())
             current_round_id = data.get("current_round_id")
             active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))

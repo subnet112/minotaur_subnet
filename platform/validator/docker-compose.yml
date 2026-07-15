@@ -201,6 +201,108 @@ services:
     # minotaur ONLY — see anvil-eth. Solver reaches BT EVM state via the pin proxy.
     networks: [minotaur]
 
+  # ── Dedicated benchmark-worker forks (Phase 2 split — LEADER ONLY) ────
+  # These three anvils exist ONLY for the split `benchmark-worker` service below.
+  # They are gated behind the `benchmark-worker` compose profile, so they are
+  # INERT on every node (followers on :stable get this file but never start them);
+  # the LEADER activates them with COMPOSE_PROFILES=benchmark-worker.
+  #
+  # Why dedicated forks: the worker and the api both evm_snapshot / evm_revert +
+  # re-fork their anvils around every scoreIntent. Sharing a fork would let the two
+  # processes corrupt each other's simulation state → non-deterministic scoring
+  # (a consensus hazard). The api's boot guard (_assert_worker_forks_isolated)
+  # HARD-FAILS the worker if its *_SIM_RPC_URL still points at anvil-eth/base/btevm.
+  #
+  # They fork through the SAME `fork-cache` (immutable pinned state, read-through)
+  # as the api's anvils, so a cache HIT means no extra archive-provider cost and —
+  # critically — the worker forks the IDENTICAL pinned block the api/followers do.
+  anvil-eth-bench:
+    profiles: [benchmark-worker]
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8545"
+      - "--fork-url=http://fork-cache:8650/eth"   # SAME cache/slug as anvil-eth
+      - "--chain-id=1"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:18545:8545"   # distinct host port from anvil-eth (8545)
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-base-bench:
+    profiles: [benchmark-worker]
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8546"
+      - "--fork-url=http://fork-cache:8650/base"   # SAME cache/slug as anvil-base
+      - "--chain-id=8453"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:18546:8546"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-btevm-bench:
+    profiles: [benchmark-worker]
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8547"
+      - "--fork-url=http://fork-cache:8650/btevm"   # SAME cache/slug as anvil-btevm
+      - "--chain-id=964"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    ports:
+      - "127.0.0.1:18547:8547"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8547 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    networks: [minotaur]
+
   # ── Block-pin RPC proxy (deterministic solver reads) ─────────────────
   # NOT a compose service ON PURPOSE. The proxy routes the solver's READS to the
   # validator's own upstream archive RPC, FORCED to the round's canonical fork
@@ -568,6 +670,132 @@ services:
       timeout: 10s
       retries: 20
       start_period: 180s
+
+  # ── Benchmark worker (Phase 2 process split — LEADER ONLY) ────────────
+  # Runs the benchmark SLATE (scoring challenger submissions) in a SEPARATE
+  # process so the sim no longer stalls the api's asyncio event loop (the api is
+  # one GIL-bound process; a scoreIntent pass pegged a core and froze /health).
+  #
+  # Gated behind the `benchmark-worker` compose profile → INERT everywhere by
+  # default. Followers on :stable receive this file but never start it. The LEADER
+  # activates the whole split (this service + the three anvil-*-bench forks above)
+  # with COMPOSE_PROFILES=benchmark-worker in its .env, AND flips the api to
+  # ENABLE_BENCHMARK_WORKER=0 so the api hands the slate to this worker (the api
+  # still re-benches the single incumbent on its own loop — see startup.py).
+  #
+  # SAME IMAGE as the api — MUST run the identical digest (scoring is a consensus
+  # quantity). update.sh keeps them in lockstep when the leader sets
+  # MINOTAUR_UPDATE_SERVICES to include `benchmark-worker` (see that script).
+  #
+  # SAFETY MODEL (all enforced by code gates in startup.py / round_store.py, keyed
+  # on BENCHMARK_WORKER_ONLY):
+  #   • round-store READ-ONLY: no round bootstrap, non-persisting fork-pin
+  #     resolver, no orphan-temp sweep (would delete the api's in-flight persist
+  #     temp on the shared /data volume), GET /solver/champion skips its lazy write.
+  #   • no screening resume + no stale-deploy reconcile (the api owns those; a
+  #     second runner would double Docker builds / corrupt a live deploy).
+  #   • UNREACHABLE from untrusted code: no published host port + `minotaur` net
+  #     ONLY (never benchmark-sandbox), so the sealed solver containers it spawns
+  #     cannot dial its routes. This is the router gate — the worker mounts the
+  #     full app but nothing outside the trusted net can reach it.
+  benchmark-worker:
+    profiles: [benchmark-worker]
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    # Binds 8080 for its OWN healthcheck only — NOT published to the host.
+    command:
+      - "exec python -m minotaur_subnet.api.server --port 8080"
+    # NO `ports:` — intentionally unreachable from the host and from the sandbox.
+    depends_on:
+      anvil-eth-bench:
+        condition: service_healthy
+      anvil-base-bench:
+        condition: service_healthy
+      anvil-btevm-bench:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    environment:
+      # ── identity (same hotkey/EVM key as the api) ────────────────────
+      WALLET_NAME: "${WALLET_NAME}"
+      HOTKEY_NAME: "${HOTKEY_NAME}"
+      SUBTENSOR_URL: "${SUBTENSOR_URL:-finney}"
+      NETUID: "${NETUID:-112}"
+      VALIDATOR_PRIVATE_KEY: "${VALIDATOR_PRIVATE_KEY:?empty signing key}"
+
+      # ── ROLE: dedicated benchmark worker ─────────────────────────────
+      BENCHMARK_WORKER_ONLY: "1"          # activates every worker-mode code gate
+      ENABLE_BENCHMARK_WORKER: "1"        # THIS process runs the slate run_loop
+      DISABLE_BLOCK_LOOP: "1"             # no block loop / EpochManager here
+      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # the api owns the round lifecycle
+      SUBMISSIONS_ACCEPTING: "0"          # users submit to the leader api, not here
+      DISABLE_READ_PROXY: "1"             # the api LAUNCHES + owns the pin proxy;
+                                          # the worker must not launch a second one
+
+      # ── DEDICATED sim forks (isolated snapshot/revert — see the boot guard) ──
+      ANVIL_RPC_URL: http://anvil-base-bench:8546
+      ETH_SIM_RPC_URL: http://anvil-eth-bench:8545
+      BASE_SIM_RPC_URL: http://anvil-base-bench:8546
+      BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm-bench:8547
+
+      # ── live read RPCs + upstreams (SAME as the api — must fork-pin identically) ──
+      BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      ETH_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
+      BASE_UPSTREAM_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
+      BITTENSOR_EVM_UPSTREAM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+      CHAIN_ID: "8453"
+      CONSENSUS_MODE: "real"
+
+      # ── shared block-pin read proxy (the api's, at sandbox .5) ───────
+      # DISABLE_READ_PROXY=1 above means this process does NOT launch a proxy, so
+      # it must be TOLD where the api's proxy is. The solver containers it spawns
+      # dial the DATA plane at 172.30.0.5:8645 (sealed sandbox); this process dials
+      # the CONTROL plane by the proxy's container name to set the per-run pin. The
+      # control token is the same secret the api uses (SOLVER_ROUND_INTERNAL_API_KEY),
+      # here provided ONLY as the proxy token — the worker has no inbound consensus
+      # routes reachable (no port, minotaur-only), so it is not an auth gate here.
+      SOLVER_READ_PROXY: "http://172.30.0.5:8645"
+      SOLVER_READ_PROXY_CONTROL: "http://minotaur-rpc-pin-proxy:8645"
+      SOLVER_READ_PROXY_TOKEN: "${SOLVER_ROUND_INTERNAL_API_KEY:?proxy control token}"
+
+      # ── solver-spawn sandbox (identical to the api) ──────────────────
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+      DOCKER_API_VERSION: "1.45"
+      BENCHMARK_DOCKER_NETWORK: "benchmark-sandbox"
+      # Keep these at the now-DEAD sandbox anvil IPs (see the api service note): a
+      # dead IP is a safe dead end; UNSETTING them would leak the archive key into
+      # the untrusted solver's env.
+      BENCHMARK_ALLOWED_HOSTS: "172.30.0.5"
+      BENCHMARK_ANVIL_RPC_ETH: "http://172.30.0.2:8545"
+      BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
+      BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
+
+      # ── forward-progress heartbeat (drives the healthcheck below) ────
+      BENCHMARK_WORKER_HEARTBEAT_FILE: "/data/.benchmark_worker_heartbeat"
+    volumes:
+      - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
+      - store-data:/data              # SHARED with the api (read-only sharer of round state)
+    networks: [minotaur]              # NOT benchmark-sandbox — see the router-gate note
+    healthcheck:
+      # FORWARD-PROGRESS, not just liveness: run_loop bumps the heartbeat file
+      # AFTER each completed pass AND each per-image bench step. So both a HUNG sim
+      # call (loop wedged) AND a CRASH-LOOP (run_once raises every tick → the
+      # post-pass bump is never reached) go stale → container unhealthy → the
+      # operator's restarter (or update.sh's force-recreate of unhealthy services)
+      # recycles it. A clean idle pass (no work) still bumps = healthy. Threshold
+      # generous for a full slate pass; tune with BENCHMARK_WORKER_HEARTBEAT_MAX_AGE.
+      test:
+        - "CMD-SHELL"
+        - "test $(( $(date +%s) - $(stat -c %Y ${BENCHMARK_WORKER_HEARTBEAT_FILE:-/data/.benchmark_worker_heartbeat} 2>/dev/null || echo 0) )) -lt ${BENCHMARK_WORKER_HEARTBEAT_MAX_AGE:-900}"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s              # cold start: build live champion, first fork, first pass
 
   # ── Watchtower — auto-update validator + api on :stable promotion ─────
   # Polls GHCR every hour for a new image SHA on the configured tag (default

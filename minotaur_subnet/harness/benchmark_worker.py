@@ -620,6 +620,12 @@ class BenchmarkWorker:
         while self._running:
             try:
                 processed = await self.run_once()
+                # Bump AFTER a completed pass (processed 0 or N) — NOT before — so a
+                # worker that raises every tick (dead proxy / sim gone) never reaches
+                # here, its heartbeat goes stale, and the container is marked
+                # unhealthy. A clean idle pass (0 work) still bumps = healthy. The
+                # per-image touch inside run_once bounds long slates.
+                self._touch_worker_heartbeat()
                 if processed == 0:
                     await asyncio.sleep(interval)
             except Exception as exc:
@@ -629,6 +635,28 @@ class BenchmarkWorker:
     def stop(self) -> None:
         """Signal the worker to stop after the current batch."""
         self._running = False
+
+    def _touch_worker_heartbeat(self) -> None:
+        """Forward-progress heartbeat for the SPLIT worker container's healthcheck.
+
+        Bumps the mtime of ``BENCHMARK_WORKER_HEARTBEAT_FILE`` (default
+        ``/data/.benchmark_worker_heartbeat``) each run_loop iteration AND each
+        per-submission bench step. The container healthcheck asserts the file is
+        recent → a wedged/hung run_once (e.g. a blocked sim call) goes stale and
+        the container is marked unhealthy so an external restarter recycles it.
+
+        No-op outside the dedicated worker (BENCHMARK_WORKER_ONLY unset) so the
+        monolith api is unaffected. Best-effort — never raises into the loop."""
+        if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+            return
+        path = os.environ.get(
+            "BENCHMARK_WORKER_HEARTBEAT_FILE", "/data/.benchmark_worker_heartbeat",
+        )
+        try:
+            with open(path, "w") as fh:
+                fh.write(str(time.time()))
+        except OSError:
+            pass
 
     def _current_replay_round(self) -> Any | None:
         """Return the active replay-ready round when explicit round gating is enabled."""
@@ -914,6 +942,9 @@ class BenchmarkWorker:
 
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
+            # Per-submission heartbeat: a full slate pass can run minutes; bump
+            # between images so the healthcheck sees progress, not just at loop top.
+            self._touch_worker_heartbeat()
             # FRESH-STATUS GUARD: ``benchmarking`` is a snapshot; rotation at
             # round close terminally rejects the slate overflow "regardless of
             # benchmark progress" (and purges its private token), and a restart
