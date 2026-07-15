@@ -123,17 +123,21 @@ def _build_git_process_env(repo_url: str) -> tuple[dict[str, str], str | None]:
 def _max_rounds_per_fingerprint() -> int:
     """Cross-hotkey benched-round cap per NORMALIZED content fingerprint.
 
-    ``SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT`` (default 0 = disabled so the
-    merge is inert; the leader arms it via env). Complements the per-(hotkey,
+    ``SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT`` (default 2 — the value the
+    leader has run via env; it shipped 0/disabled so the merge was inert, and
+    the default now lives in CODE so a leader failover keeps the guard without
+    anyone re-arming an env var. 0 disables). Complements the per-(hotkey,
     commit) cap: that one stops naive same-SHA resubmit automation, this one
     stops the two evasions it explicitly cannot — cosmetic hash rotation
-    (nonce comments) and sybil spread (one tree, many hotkeys).
+    (nonce comments) and sybil spread (one tree, many hotkeys). Leader-local
+    intake policy, NOT consensus-relevant: followers mirror the leader's
+    post-intake snapshot either way.
     """
-    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT", "0").strip()
+    raw = os.environ.get("SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT", "2").strip()
     try:
         return int(raw)
     except ValueError:
-        return 0
+        return 2
 
 
 def _cleanup_temp_file(path: str | None) -> None:
