@@ -548,7 +548,7 @@ def _execute_deploy_and_persist(
     # admin approves it (api/services/app_registration.py). This is the
     # permissionless-deploy / gated-activation boundary.
     if result.contract_address and not result.error:
-        from .app_lifecycle import auto_register_deployment
+        from .app_lifecycle import auto_register_deployment, bootstrap_app_owner
         from .app_registration import registration_allows_autoregister
 
         if registration_allows_autoregister(definition.registration_status):
@@ -562,6 +562,14 @@ def _execute_deploy_and_persist(
                 "registration_status": definition.registration_status,
                 "note": "app not approved — request registration for admin review",
             }
+        # Born with the right owner: bootstrap appOwner to the developer-of-
+        # record so float custody (withdrawFloat is relayer OR appOwner) never
+        # depends on the relayer. Best-effort; V1 contracts (no appOwner())
+        # and already-owned contracts are skipped inside.
+        out["app_owner"] = bootstrap_app_owner(
+            store, app_id, chain_id, result.contract_address,
+            (definition.deployer or "").strip(),
+        )
     return out
 
 
