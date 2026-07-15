@@ -22,10 +22,7 @@ import pytest
 
 from minotaur_subnet.epoch.manager import ChampionInfo, EpochManager
 from minotaur_subnet.harness.submission_store import SubmissionStatus
-from minotaur_subnet.weight_policy import (
-    CHAMPION_MINER_WEIGHT_FRACTION,
-    GENESIS_HOTKEY,
-)
+from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
 OWNER = "5OwnerHotkeyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
@@ -121,8 +118,8 @@ def test_winner_takes_all_only_champion_earns_weight():
     weights = mgr._build_weights_mapping(epoch=1, round_id="r1")
 
     assert set(weights) == {"5RealMiner", OWNER}
-    assert weights["5RealMiner"] == pytest.approx(CHAMPION_MINER_WEIGHT_FRACTION)
-    assert weights[OWNER] == pytest.approx(1 - CHAMPION_MINER_WEIGHT_FRACTION)
+    assert weights["5RealMiner"] == pytest.approx(0.10)
+    assert weights[OWNER] == pytest.approx(0.90)
     assert "5OtherMiner" not in weights  # no decay tail; non-champion earns nothing
 
 

@@ -37,10 +37,7 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStatus,
     SubmissionStore,
 )
-from minotaur_subnet.weight_policy import (
-    CHAMPION_MINER_WEIGHT_FRACTION,
-    GENESIS_HOTKEY,
-)
+from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 
 
 # Anvil's well-known account #0 — public test fixture used to satisfy
@@ -1395,12 +1392,9 @@ class TestWeightEmission:
         assert "5Gminer_best" in mapping
         assert "5Gminer_mid" not in mapping
         assert "5Gminer_low" not in mapping
-        # The champion takes CHAMPION_MINER_WEIGHT_FRACTION, the owner the rest.
-        # Symbolic on purpose: the split is a tunable constant, and this test is
-        # about the champion-takes-all SHAPE, not the current number. The literal
-        # is pinned once, in test_weight_policy.py.
-        assert mapping["5Gminer_best"] == pytest.approx(CHAMPION_MINER_WEIGHT_FRACTION)
-        assert mapping[owner] == pytest.approx(1 - CHAMPION_MINER_WEIGHT_FRACTION)
+        # 0.10 to the champion, 0.90 burns to owner.
+        assert mapping["5Gminer_best"] == pytest.approx(0.10)
+        assert mapping[owner] == pytest.approx(0.90)
 
     @pytest.mark.asyncio
     async def test_no_champion_burns_to_owner(self, monkeypatch):
