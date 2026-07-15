@@ -15,12 +15,20 @@ read source, so all reads / the benchmark pack context stay byte-identical):
   A stripped record simply has no details row; ``load_all`` LEFT JOINs, so a
   missing details row reloads as ``benchmark_details=None`` — byte-identical to
   the current stripped state (and it keeps the in-memory details bound).
-- WAL + synchronous=FULL + busy_timeout: per-row writes are tiny, so FULL's fsync
-  is cheap and worth the durability of the last scoring verdict; busy_timeout lets
-  a second process (Phase 2 benchmark worker) wait for the write lock instead of
-  erroring. Per-row UPSERT means two writers touching different rows never clobber
-  each other (unlike the old whole-file replace) — the two-writer lost-update
-  class is structurally impossible.
+- WAL + synchronous=NORMAL + busy_timeout: NORMAL is fully crash-safe against a
+  PROCESS crash (api kill / OOM / update-restart — the common case; committed txns
+  live in the WAL and are recovered on reopen). Only an OS crash / power loss can
+  lose the WAL tail (the last few tiny writes), which is rare and re-benchmark
+  recoverable; FULL would fsync every commit for needless latency on per-record
+  writes. busy_timeout lets a second process (Phase 2 benchmark worker) wait for
+  the write lock instead of erroring. Per-row UPSERT means two writers touching
+  different rows never clobber each other (unlike the old whole-file replace) —
+  the two-writer lost-update class is structurally impossible.
+
+Rollback: the crash-safe DB (not the frozen submissions.json) is the authoritative
+recovery source. To downgrade to a pre-SQLite build, export the DB to JSON FIRST
+via ``python -m minotaur_subnet.harness.submission_db export <db> <json>`` (works
+even after an OOM/SIGKILL, since the DB survives), then start the old build.
 - One connection per store instance; the store serializes all access with its
   in-process RLock, so ``check_same_thread=False`` is safe.
 
@@ -32,6 +40,7 @@ store is single-writer (only the api constructs it), so it isn't needed.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -123,12 +132,26 @@ class SubmissionDB:
             self._conn.commit()
             return 0
         try:
-            data = fastjson.loads(json_path.read_bytes())
-        except Exception as exc:  # noqa: BLE001 — a corrupt JSON must not wedge boot
-            logger.error("[submission-db] migration read failed (%s); starting empty", exc)
-            self._mark_migrated()
-            self._conn.commit()
-            return 0
+            raw = json_path.read_bytes()
+        except OSError as exc:
+            # Transient IO blip at the one migration boot. Do NOT mark migrated —
+            # leave the flag unset so the NEXT boot retries and the blip self-heals
+            # (a permanent empty store on a leader is the #430 burn class).
+            logger.error(
+                "[submission-db] migration read failed (%s); NOT marking migrated "
+                "— will retry next boot", exc,
+            )
+            raise
+        try:
+            data = fastjson.loads(raw)
+        except Exception as exc:  # noqa: BLE001 — genuinely corrupt JSON
+            # Fail LOUD (like require_durable_state): starting a consensus-critical
+            # validator with an EMPTY submission store must not be silent. Leave the
+            # flag unset + raise so an operator repairs the retained submissions.json
+            # (or deliberately clears the DB) rather than the validator burning.
+            logger.error("[submission-db] submissions.json is corrupt (%s) — refusing "
+                         "to start empty; leaving it for repair", exc)
+            raise
         n = 0
         try:
             with self._conn:  # BEGIN…COMMIT (or ROLLBACK on exception)
@@ -164,28 +187,20 @@ class SubmissionDB:
         det_blob = fastjson.dumps(details) if details else None
         return fastjson.dumps(body), det_blob
 
-    def write_record(self, submission_id: str, record: dict) -> None:
-        data, det = self._split(record)
-        self._conn.execute(
-            "INSERT INTO submissions(submission_id, data) VALUES(?, ?) "
-            "ON CONFLICT(submission_id) DO UPDATE SET data=excluded.data",
-            (submission_id, data),
-        )
-        if det is not None:
-            self._conn.execute(
-                "INSERT INTO submission_details(submission_id, details) VALUES(?, ?) "
-                "ON CONFLICT(submission_id) DO UPDATE SET details=excluded.details",
-                (submission_id, det),
-            )
-        else:
-            self._conn.execute(
-                "DELETE FROM submission_details WHERE submission_id=?", (submission_id,)
-            )
-        self._conn.commit()
+    def write_records(
+        self,
+        records: Iterable[tuple[str, dict]],
+        strip_ids: Iterable[str] = (),
+    ) -> None:
+        """Write the given record(s) AND drop the retention-strip's details rows
+        in ONE transaction, so the stripped state is durable together with the
+        write (matching the old whole-file os.replace all-or-nothing semantics).
 
-    def write_records(self, records: Iterable[tuple[str, dict]]) -> None:
-        """Batch-write many records in ONE transaction (upsert_submissions /
-        set_benchmark_ranks / adopt's two rows)."""
+        Each record is a data UPSERT + a details UPSERT-or-DELETE; strip_ids are
+        the submission_ids whose benchmark_details the in-memory retention pass
+        just nulled (their DB details rows are DELETEd here). All-or-nothing:
+        a crash between statements rolls the whole batch back rather than leaking
+        a details row that would re-inflate on reload."""
         try:
             with self._conn:
                 for submission_id, record in records:
@@ -206,22 +221,12 @@ class SubmissionDB:
                             "DELETE FROM submission_details WHERE submission_id=?",
                             (submission_id,),
                         )
+                for sid in strip_ids:
+                    self._conn.execute(
+                        "DELETE FROM submission_details WHERE submission_id=?", (sid,)
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[submission-db] batch write failed: %s", exc)
-
-    def delete_details(self, submission_ids: Iterable[str]) -> None:
-        """Drop the details rows the retention strip just nulled (O(#stripped),
-        typically 0-1 per write)."""
-        ids = [(s,) for s in submission_ids]
-        if not ids:
-            return
-        try:
-            with self._conn:
-                self._conn.executemany(
-                    "DELETE FROM submission_details WHERE submission_id=?", ids
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[submission-db] detail-strip delete failed: %s", exc)
 
     # ── read (startup / reload only; hot reads use the in-memory dict) ────
 
@@ -238,8 +243,44 @@ class SubmissionDB:
             record["benchmark_details"] = fastjson.loads(det) if det is not None else None
             yield sid, record
 
+    def export_to_json(self, json_path: Path) -> int:
+        """Reconstruct a whole-store submissions.json from the DB — the crash-safe
+        recovery source. Run this BEFORE deliberately downgrading to a pre-SQLite
+        build (it works even after an OOM/SIGKILL, unlike the graceful-shutdown
+        snapshot). Returns the record count. The exported JSON reflects the
+        current retention-bounded state (stripped records have benchmark_details
+        null), which is exactly what the store holds."""
+        data = {sid: record for sid, record in self.load_all()}
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = json_path.with_name(f".{json_path.name}.export.tmp")
+        tmp.write_bytes(fastjson.dumps(data))
+        os.replace(tmp, json_path)
+        return len(data)
+
     def close(self) -> None:
         try:
             self._conn.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _main() -> None:
+    import sys
+
+    if len(sys.argv) != 4 or sys.argv[1] != "export":
+        print(
+            "usage: python -m minotaur_subnet.harness.submission_db export "
+            "<db_path> <json_path>",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    db = SubmissionDB(Path(sys.argv[2]))
+    try:
+        n = db.export_to_json(Path(sys.argv[3]))
+    finally:
+        db.close()
+    print(f"exported {n} records to {sys.argv[3]}")
+
+
+if __name__ == "__main__":
+    _main()

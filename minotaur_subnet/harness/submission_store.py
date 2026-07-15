@@ -447,6 +447,10 @@ class SubmissionStore:
 
     def __init__(self, persist_path: Path | None = None) -> None:
         self._submissions: dict[str, Submission] = {}
+        # Set True only when _load() completes cleanly. snapshot_json refuses to
+        # overwrite submissions.json when False, so a failed DB hydrate (which
+        # leaves the store empty) can never clobber the rollback artifact.
+        self._loaded = False
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
         # Per-submission private-repo PATs. Kept OUTSIDE _submissions so the
@@ -473,18 +477,7 @@ class SubmissionStore:
         # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
         # in-memory-only stores (persist_path=None, tests).
         self._db: SubmissionDB | None = None
-        # Cross-process advisory lock lives in a sibling file that is never
-        # rewritten — locking the data file itself would break, since each
-        # persist replaces it (a new inode the held fd no longer refers to).
-        self._lock_path = (
-            persist_path.with_name(persist_path.name + ".lock")
-            if persist_path is not None
-            else None
-        )
         self._rmw_lock = threading.RLock()  # in-process serialization
-        self._lock_fd: int | None = None
-        self._lock_depth = 0
-        self._persist_mtime_ns: int | None = None
         # Dedicated single writer thread for the async offload path
         # (:meth:`aoffload`). Lazily created so sync-only / test usage never
         # spawns a thread. One thread ⇒ offloaded writes self-serialize, and
@@ -1091,7 +1084,6 @@ class SubmissionStore:
         self._persist_records([sub])
 
     @_write_locked
-    @_write_locked
     def set_solver_info(
         self,
         submission_id: str,
@@ -1106,8 +1098,9 @@ class SubmissionStore:
         ``coined_by_hotkey`` set to the original owner. Cosmetic only — the name
         feeds no scoring/adoption path. Write-locked so two workers can't both
         coin one name; the registry lives in the ``.names`` sidecar (survives
-        restarts and submission pruning). The ``_write_guard`` already reloaded
-        ``_submissions`` from disk, so the fetched record is fresh.
+        restarts and submission pruning). The store is single-writer and
+        ``_write_guard`` serializes each read-modify-write on the in-process
+        RLock, so the in-memory record fetched below is authoritative + fresh.
         """
         sub = self._submissions.get(submission_id)
         if sub is None:
@@ -1531,7 +1524,7 @@ class SubmissionStore:
         self._persist_names()
         logger.info("Backfilled %d coined solver name(s) from history", len(registry))
 
-    # ── Cross-process write lock ─────────────────────────────────────────────
+    # ── In-process write lock ────────────────────────────────────────────────
 
     @contextmanager
     def _write_guard(self):
@@ -1546,28 +1539,6 @@ class SubmissionStore:
         """
         with self._rmw_lock:
             yield
-
-    def _acquire_file_lock(self) -> int | None:
-        """Open the sibling lock file and take an exclusive advisory lock."""
-        if self._lock_path is None or fcntl is None:
-            return None
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
-            os.close(fd)
-            raise
-        return fd
-
-    @staticmethod
-    def _release_file_lock(fd: int | None) -> None:
-        if fd is None:
-            return
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
     # ── Async offload ──────────────────────────────────────────────────────
 
@@ -1617,25 +1588,48 @@ class SubmissionStore:
         if self._db is None:
             return
         try:
-            self._db.write_records([(s.submission_id, s.to_dict()) for s in subs])
+            # Run the in-memory retention strip FIRST, then write the record(s)
+            # AND drop the just-stripped details rows in ONE transaction, so the
+            # stripped state is durable together with the write (a crash can't
+            # leak a details row that re-inflates on reload).
             stripped = self._enforce_benchmark_details_retention()
-            if stripped:
-                self._db.delete_details(stripped)
+            self._db.write_records(
+                [(s.submission_id, s.to_dict()) for s in subs], strip_ids=stripped
+            )
         except Exception as exc:  # noqa: BLE001 — persistence must never crash a mutation
             logger.warning("Failed to persist submission record(s): %s", exc)
 
     def snapshot_json(self) -> None:
         """Write the WHOLE store to submissions.json (the legacy format).
 
-        NOT on the write hot path — called on graceful shutdown so a code
-        rollback to a pre-SQLite build reads a fresh file instead of the stale
-        migration-time snapshot. The in-memory state is already retention-stripped
-        (the strip runs on every _persist_records), so this dumps the bounded set."""
+        NOT on the write hot path — called on graceful shutdown as a best-effort
+        rollback convenience. NOTE: this only fires on a CLEAN stop; after an
+        OOM/SIGKILL the JSON is stale, so the authoritative rollback path is the
+        DB→JSON exporter (``python -m minotaur_subnet.harness.submission_db
+        export``) run against the crash-safe DB. The in-memory state is already
+        retention-stripped, so this dumps the bounded set.
+
+        Refuses to write if the store did NOT load cleanly, or would replace a
+        non-empty file with an empty store — so a degraded/failed DB hydrate can
+        never destroy the last-good rollback artifact."""
         if self._persist_path is None:
+            return
+        if not self._loaded:
+            logger.warning(
+                "snapshot_json: store did not load cleanly — refusing to overwrite "
+                "%s (preserving the rollback artifact)", self._persist_path,
+            )
             return
         with self._write_guard():
             try:
                 data = {sid: sub.to_dict() for sid, sub in self._submissions.items()}
+                if not data and self._persist_path.exists() \
+                        and self._persist_path.stat().st_size > 2:
+                    logger.warning(
+                        "snapshot_json: in-memory store is empty but %s is non-empty "
+                        "— refusing to clobber", self._persist_path,
+                    )
+                    return
                 self._persist_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path = self._persist_path.with_name(
                     f".{self._persist_path.name}.{os.getpid()}.tmp"
@@ -1736,6 +1730,7 @@ class SubmissionStore:
             self._submissions = submissions
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
+            self._loaded = True  # clean hydrate — safe to snapshot to JSON
             if not quiet:
                 logger.info("Loaded %d submissions from the submission DB", len(data))
         except Exception as exc:

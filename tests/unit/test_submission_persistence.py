@@ -105,3 +105,55 @@ def test_in_memory_store_has_no_db(tmp_path):
     sub = _create(store, 1)
     assert store.get(sub.submission_id) is sub
     store.close()  # must be a no-op, not crash
+
+
+def test_migration_corrupt_json_fails_loud_not_empty(tmp_path):
+    """A corrupt submissions.json must NOT silently start an empty store (a
+    leader burning) — it fails loud, leaves the JSON + the migrated flag unset so
+    an operator can repair and retry."""
+    import pytest
+    p = tmp_path / "submissions.json"
+    p.write_bytes(b"{not valid json")
+    with pytest.raises(Exception):
+        SubmissionStore(persist_path=p)
+    # the legacy file is untouched (available for repair)
+    assert p.read_bytes() == b"{not valid json"
+    # not marked migrated → a fixed JSON is imported on the next attempt
+    from minotaur_subnet.harness.submission_db import SubmissionDB
+    db = SubmissionDB(p.with_suffix(".db"))
+    assert not db.is_migrated()
+    db.close()
+
+
+def test_snapshot_refuses_to_clobber_when_not_loaded(tmp_path):
+    """A store that did not load cleanly must never overwrite the good rollback
+    JSON with its empty state."""
+    p = tmp_path / "submissions.json"
+    good = {"sub_x": {"submission_id": "sub_x", "repo_url": "r", "commit_hash": "h",
+                      "epoch": 1, "hotkey": "hk", "round_id": "r1", "status": "scored",
+                      "benchmark_details": None}}
+    p.write_bytes(fastjson.dumps(good))
+    store = SubmissionStore(persist_path=p)  # migrates + loads → _loaded True
+    # simulate a degraded reload: mark not-loaded + empty in memory
+    store._loaded = False
+    store._submissions = {}
+    store.snapshot_json()  # must REFUSE
+    assert fastjson.loads(p.read_bytes()) == good, "good JSON was clobbered"
+
+
+def test_export_reconstructs_current_json(tmp_path):
+    """The DB→JSON exporter reconstructs a current submissions.json from the
+    crash-safe DB (the authoritative rollback path)."""
+    p = tmp_path / "submissions.json"
+    store = SubmissionStore(persist_path=p)
+    a = _create(store, 1)
+    store.update_status(a.submission_id, SubmissionStatus.BENCHMARKING)
+    store.close()  # closes the DB
+    out = tmp_path / "export.json"
+    from minotaur_subnet.harness.submission_db import SubmissionDB
+    db = SubmissionDB(p.with_suffix(".db"))
+    n = db.export_to_json(out)
+    db.close()
+    exported = fastjson.loads(out.read_bytes())
+    assert n == 1
+    assert exported[a.submission_id]["status"] == "benchmarking"
