@@ -341,3 +341,48 @@ def test_set_developer_allowed_sends_owner_tx(tmp_path):
     call = relayer.call_contract_function.await_args
     assert call.args[2] == "setDeveloperAllowed(address,bool)"
     assert call.args[4] == ["0x" + "63" * 20, True]
+
+
+def test_set_developer_allowed_owner_mismatch_is_clean_error(tmp_path):
+    # owner() = operator wallet, relayer wallet = 0xd4… → no doomed tx sent.
+    operator = bytes(12) + b"\xab" * 20
+    views = {
+        _k("owner()"): operator,
+        _k("allowedDevelopers(address)"): bytes(32),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert "registry owner is" in out["error"]
+    assert out["owner"].lower() == "0x" + "ab" * 20
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_set_developer_allowed_owner_match_sends_tx(tmp_path):
+    # owner() == relayer wallet (0xd4…) → the pre-check lets the tx through.
+    views = {
+        _k("owner()"): bytes(12) + b"\xd4" * 20,
+        _k("allowedDevelopers(address)"): bytes(32),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out["changed"] is True and out["tx"] == "0xtx"
+
+
+def test_set_developer_allowed_revert_is_clean_error(tmp_path):
+    # Tx raising (revert / RPC rejection) → {"error": …}, never a 500.
+    views = {_k("allowedDevelopers(address)"): bytes(32)}
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    relayer.call_contract_function = AsyncMock(
+        side_effect=RuntimeError("setDeveloperAllowed(address,bool) reverted: tx=0xdead"))
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out["error"].startswith("setDeveloperAllowed failed:")
+    assert "reverted" in out["error"]
