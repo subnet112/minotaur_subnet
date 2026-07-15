@@ -340,6 +340,49 @@ def set_developer_allowed(
     return {"developer": developer, "allowed": allowed, "changed": True, "tx": tx}
 
 
+def bootstrap_app_owner(
+    store: Any, app_id: str, chain_id: int, contract_address: str, owner: str,
+) -> dict[str, Any]:
+    """Best-effort post-deploy ``setAppOwner`` bootstrap (never raises).
+
+    V2 keeps ``appOwner`` out of the constructor, so a fresh deployment has
+    owner 0x0 and the developer is custodially dependent on the relayer for
+    float recovery (``withdrawFloat`` is relayer OR appOwner). Called from
+    the deploy pipeline right after a successful deploy so every app is born
+    with its developer-of-record as a self-sovereign owner. Skips when the
+    contract has no ``appOwner()`` view (V1) or the owner is already set —
+    ``setAppOwner`` is relayer-bootstrappable exactly once, then owner-gated.
+    """
+    try:
+        if not owner or not int(owner, 16):
+            return {"owner_set": False, "skipped": "no deployer recorded"}
+        relayer = _relayer()
+        if relayer is None:
+            return {"owner_set": False, "error": "No EVM relayer configured"}
+
+        from minotaur_subnet.api.services.app_admin import _view_address
+        from minotaur_subnet.blockchain.chains import get_web3
+
+        w3 = get_web3(chain_id)
+        current = _view_address(w3, contract_address, "appOwner")
+        if current is None:
+            # V1 base — no appOwner() view; nothing to bootstrap.
+            return {"owner_set": False, "skipped": "contract has no appOwner()"}
+        if int(current, 16) != 0:
+            return {"owner_set": True, "already": True, "owner": current}
+
+        tx = _run_async(relayer.call_contract_function(
+            contract_address, chain_id, "setAppOwner(address)",
+            ["address"], [owner], gas=100_000,
+        ))
+        return {"owner_set": True, "owner": owner, "tx": tx}
+    except Exception as exc:  # never fail the deploy over the owner bootstrap
+        logger.warning(
+            "appOwner bootstrap failed for %s chain %d: %s", app_id, chain_id, exc,
+        )
+        return {"owner_set": False, "error": str(exc)[:300]}
+
+
 def auto_register_deployment(
     store: Any, app_id: str, chain_id: int, contract_address: str,
 ) -> dict[str, Any]:
