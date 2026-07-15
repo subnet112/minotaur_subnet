@@ -317,6 +317,46 @@ def _benchmark_anchor_real_epoch_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _benched_slate_size(round_id: str, rotation: dict[str, object] | None) -> int:
+    """How many submissions this round will actually BENCHMARK.
+
+    This sizes the decision window (#421), whose entire job is to cover the
+    SERIAL benchmark (#387) — so it has to count what gets benched, not what got
+    submitted. When rotation (#499) applied, that is exactly its selected slate.
+
+    Deriving it from store statuses instead is what broke this: the autoscale
+    kept its own copy of the "won't be benched" rule as ``status != "rejected"``,
+    and #620 parked rotation's overflow in ``waitlisted`` rather than
+    ``rejected``. The two silently diverged, so ~17 never-benched submissions
+    inflated the window to 86 epochs (10 + 4*19 vs the true 10 + 4*3); activation
+    = close + window + 2 then landed ~78 min after certification, outliving the
+    champion approval, and certify() reverted "Expired" ->
+    ``merge_failed:attest_failed`` on every contested round.
+
+    So prefer the POSITIVE definition (the slate we selected), and fall back to
+    rotation's own non-terminal candidate rule only when rotation did not apply
+    — ``slots <= 0`` (disabled/unlimited) or it raised — which is precisely when
+    every candidate does get benched. Never keep a second copy of that rule here.
+    """
+    if rotation is not None and rotation.get("applied"):
+        selected = rotation.get("selected")
+        if selected is not None:
+            return len(selected)
+    try:
+        from minotaur_subnet.api.routes import submissions
+        from minotaur_subnet.harness.rotation import benchable_candidate_count
+
+        return benchable_candidate_count(
+            submissions.get_store().list_by_round(round_id)
+        )
+    except Exception:
+        logger.warning(
+            "benched-slate size for %s failed (window falls back to the floor)",
+            round_id, exc_info=True,
+        )
+        return 0
+
+
 def _round_fork_anchor_epoch(round_state) -> int | None:
     """Which epoch to anchor the round's benchmark fork-pin to.
 
@@ -2902,10 +2942,11 @@ async def initialize(ctx: ServerContext) -> dict:
 
                 # Rotation slate (leader-local fairness): pick which of the round's
                 # submissions get benched — miners benched longest ago first, NOT
-                # first-come — and reject the overflow with a resubmit reason.
+                # first-come — and waitlist the overflow for next-round seniority.
                 # Runs BEFORE the close snapshot + decision-window autoscale so
                 # followers mirror the post-rotation set and the window scales with
                 # the real slate. Best-effort: must never block the close.
+                _rot: dict[str, object] | None = None
                 try:
                     _rot = submissions.apply_round_rotation(current.round_id)
                     if _rot.get("applied") and _rot.get("skipped"):
@@ -2917,6 +2958,7 @@ async def initialize(ctx: ServerContext) -> dict:
                             _rot.get("skipped"),
                         )
                 except Exception:
+                    _rot = None
                     logger.warning(
                         "rotation slate failed for %s (ignored — closing with all "
                         "submissions)", current.round_id, exc_info=True,
@@ -2960,21 +3002,12 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
-                # Auto-scale the decision window with this round's slate: the serial
-                # benchmark (#387) runs close→adopt in ~linear time with the submission
-                # count, so a fixed window aborts contested rounds the instant the leader
-                # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
-                # it (keep ACTIVATION_DELAY >= the effective decision window).
-                try:
-                    # Count only the surviving slate: rotation (and screening)
-                    # rejects don't get benched, so they must not inflate the
-                    # decision window.
-                    _n_subs = len([
-                        s for s in submissions.get_store().list_by_round(current.round_id)
-                        if str(getattr(getattr(s, "status", None), "value", "") or getattr(s, "status", "")) != "rejected"
-                    ])
-                except Exception:
-                    _n_subs = 0
+                # Auto-scale the decision window with what this round will actually
+                # BENCH: the serial benchmark (#387) runs close→adopt in ~linear time
+                # with the benched count, so a fixed window aborts contested rounds the
+                # instant the leader votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS;
+                # activation tracks it (keep ACTIVATION_DELAY >= the effective window).
+                _n_subs = _benched_slate_size(current.round_id, _rot)
                 _decision_window = submissions.autoscaled_decision_window(
                     _n_subs,
                     base_epochs=solver_round_decision_base_epochs,
