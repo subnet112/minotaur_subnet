@@ -1093,14 +1093,22 @@ class RelayerService:
             wrapper.submission_nonce, tx_value, gas,
         )
 
-        # Values arrive JSON-stringified (canonical-hash requirement); coerce
-        # back per ABI type for the encoder.
+        # Values arrive in canonical wire form (contract_call_wire_values:
+        # strings, bytes as 0x-hex, bools as true/false); coerce back per ABI
+        # type for the encoder — bytes* MUST become real bytes (eth_abi's
+        # BytesEncoder rejects strings; broke registerApp(bytes32,…) live).
+        def _coerce(t, v):
+            if t in ("address", "string"):
+                return v
+            if t.startswith("bytes"):
+                s = str(v)
+                return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+            if t == "bool":
+                return str(v).lower() in ("true", "1")
+            return int(v)
+
         try:
-            coerced = [
-                v if t in ("address", "string") or t.startswith("bytes")
-                else (str(v).lower() in ("true", "1") if t == "bool" else int(v))
-                for t, v in zip(abi_types, values)
-            ]
+            coerced = [_coerce(t, v) for t, v in zip(abi_types, values)]
         except (TypeError, ValueError) as exc:
             return web.json_response({"error": f"bad values for abi_types: {exc}"}, status=400)
 

@@ -200,13 +200,35 @@ def compute_contract_call_hash(
             "target": (target or "").lower(),
             "fn_signature": str(fn_signature or ""),
             "abi_types": list(abi_types or []),
-            "values": [str(v) for v in (values or [])],
+            "values": contract_call_wire_values(values),
             "tx_value": int(tx_value),
             "gas": int(gas),
         },
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return "0x" + keccak(canonical).hex()
+
+
+def contract_call_wire_values(values: Any) -> list[str]:
+    """Canonical wire/hash form of contract-call values.
+
+    ``bytes``/``bytearray`` → 0x-hex (str() of bytes is Python repr — it
+    round-trips to nothing and broke ``registerApp(bytes32,…)`` live),
+    bools → "true"/"false", everything else → str. Shared by
+    ``HttpRelayer.call_contract_function`` (serialize + hash) and
+    ``compute_contract_call_hash`` (the relayer hashes the received wire
+    strings, for which this is the identity), so transport and plan_hash can
+    never disagree.
+    """
+    out: list[str] = []
+    for v in (values or []):
+        if isinstance(v, (bytes, bytearray)):
+            out.append("0x" + bytes(v).hex())
+        elif isinstance(v, bool):
+            out.append("true" if v else "false")
+        else:
+            out.append(str(v))
+    return out
 
 
 def is_wrapper_fresh(
