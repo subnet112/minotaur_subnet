@@ -726,13 +726,24 @@ class TestParticipationDefault:
             monkeypatch.setenv("DISTRIBUTED_VETO", val)
             assert veto_wire.distributed_veto_enabled() is True, val
 
-    def test_reverify_stays_default_off(self, monkeypatch):
-        # The expensive leader re-bench must NOT be flipped on by the
-        # default-ON participation switch — it stays independently opt-in.
+    def test_reverify_default_on(self, monkeypatch):
+        # Default ON (image-baked): enforcement blocks only on the leader's own
+        # reverified confirmation, so without reverify the default-hard gate
+        # fail-opens every round. Soaked =1 on the leader since 2026-07-11.
         monkeypatch.delenv("DISTRIBUTED_VETO", raising=False)
         monkeypatch.delenv("DISTRIBUTED_VETO_REVERIFY", raising=False)
         assert veto_wire.distributed_veto_enabled() is True
-        assert veto_wire.distributed_veto_reverify_enabled() is False
+        assert veto_wire.distributed_veto_reverify_enabled() is True
+
+    def test_reverify_explicit_off(self, monkeypatch):
+        for val in ("0", "false", "no", "off"):
+            monkeypatch.setenv("DISTRIBUTED_VETO_REVERIFY", val)
+            assert veto_wire.distributed_veto_reverify_enabled() is False, val
+
+    def test_reverify_typo_stays_on(self, monkeypatch):
+        # A typo must never silently disarm the reverify on one validator.
+        monkeypatch.setenv("DISTRIBUTED_VETO_REVERIFY", "flase")
+        assert veto_wire.distributed_veto_reverify_enabled() is True
 
 
 # ── digest resolution (the get_submission→get bug that skipped every round) ──
@@ -816,8 +827,11 @@ class TestEnforceMode:
             monkeypatch.setenv("DISTRIBUTED_VETO_ENFORCE", val)
         return veto_wire.distributed_veto_enforce_mode()
 
-    def test_default_off(self, monkeypatch):
-        assert self._mode(monkeypatch, None) == veto_wire.VETO_ENFORCE_OFF
+    def test_default_hard(self, monkeypatch):
+        # Image-baked default: third-party validators never set env flags, so
+        # the enforcement the leader soaked (hard since 2026-07-11) reaches the
+        # fleet only as a code default. Fail-open on deadline expiry unchanged.
+        assert self._mode(monkeypatch, None) == veto_wire.VETO_ENFORCE_HARD
 
     def test_explicit_off(self, monkeypatch):
         assert self._mode(monkeypatch, "0") == veto_wire.VETO_ENFORCE_OFF
@@ -831,9 +845,12 @@ class TestEnforceMode:
         assert self._mode(monkeypatch, "hard") == veto_wire.VETO_ENFORCE_HARD
         assert self._mode(monkeypatch, "enforce") == veto_wire.VETO_ENFORCE_HARD
 
-    def test_unknown_is_off(self, monkeypatch):
-        # A typo must never silently enable enforcement — fail safe to off.
-        assert self._mode(monkeypatch, "garbage") == veto_wire.VETO_ENFORCE_OFF
+    def test_unknown_is_hard(self, monkeypatch):
+        # Now that hard IS the fleet default, the fail-safe inverts: a typo'd
+        # override must never silently DISARM one validator (the odd node out
+        # is the split risk). Only the explicit off/shadow spellings divert.
+        assert self._mode(monkeypatch, "garbage") == veto_wire.VETO_ENFORCE_HARD
+        assert self._mode(monkeypatch, "observe") == veto_wire.VETO_ENFORCE_OFF
 
 
 # ── Phase-1 pre-certify gate decision (block | allow | wait) ──
