@@ -49,6 +49,19 @@ ANVIL_WAIT="${MINOTAUR_ANVIL_WAIT:-300}"        # secs for the forks to go healt
 SERVICE_WAIT="${MINOTAUR_UPDATE_WAIT:-240}"     # secs for api/validator to go healthy
 SERVICES="${MINOTAUR_UPDATE_SERVICES:-fork-cache validator api}"  # tag-tracked (pulled) services
 ANVILS="${MINOTAUR_ANVILS:-anvil-eth anvil-base anvil-btevm}"
+# Phase 2 split (LEADER ONLY): when the leader activates the benchmark-worker
+# profile it MUST keep the worker in lockstep with the api. In its .env, set:
+#   COMPOSE_PROFILES=benchmark-worker
+#   MINOTAUR_UPDATE_SERVICES="fork-cache validator api benchmark-worker"
+#   MINOTAUR_ANVILS="anvil-eth anvil-base anvil-btevm anvil-eth-bench anvil-base-bench anvil-btevm-bench"
+#   MINOTAUR_DIGEST_PARITY_SVCS="benchmark-worker"   # asserts worker digest == api's
+#   MINOTAUR_UPDATE_WAIT=600   # IMPORTANT: the worker cold-starts slowly (champion
+#       # build + first -bench fork; its healthcheck start_period is 300s). The
+#       # final `up --wait` waits on the WHOLE stack, so a default 240s wait can
+#       # time out on the still-cold worker and needlessly ROLL BACK a healthy api.
+#       # Raise it above the worker's realistic cold start (>=600s).
+# Empty by default → a no-op on every follower (no worker in the stack).
+DIGEST_PARITY_SVCS="${MINOTAUR_DIGEST_PARITY_SVCS:-}"
 PROBE_SVC="${MINOTAUR_UPDATE_PROBE_SVC:-api}"   # snapshot the rollback image from this service
 DIR="${MINOTAUR_COMPOSE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 ENV_FILE="${MINOTAUR_ENV_FILE:-$DIR/.env}"
@@ -155,6 +168,34 @@ svc_health() {
   echo "$health"
 }
 
+# ── image digest parity (Phase 2 split: api and benchmark-worker MUST match) ──
+# Scoring is a consensus quantity, so the split worker MUST run the SAME image
+# digest as the api — a stale worker would score on old code and split the node's
+# own consensus. After a successful up, assert each service in
+# MINOTAUR_DIGEST_PARITY_SVCS shares PROBE_SVC's (api's) running image digest.
+# Loud WARN, not a hard fail: a parity gap must be visible in update.log, but must
+# not take the leader down mid-soak (the operator recreates the lagging service).
+check_digest_parity() {
+  [ -z "$DIGEST_PARITY_SVCS" ] && return 0
+  local ref_cid ref_dig svc cid dig
+  ref_cid="$(DC ps -q "$PROBE_SVC" 2>/dev/null || true)"
+  if [ -z "$ref_cid" ]; then warn "digest-parity: $PROBE_SVC not running — cannot compare"; return 0; fi
+  ref_dig="$(docker inspect --format '{{.Image}}' "$ref_cid" 2>/dev/null || true)"
+  for svc in $DIGEST_PARITY_SVCS; do
+    cid="$(DC ps -q "$svc" 2>/dev/null || true)"
+    if [ -z "$cid" ]; then
+      warn "digest-parity: $svc not running — split misconfigured? (is COMPOSE_PROFILES=benchmark-worker set?)"
+      continue
+    fi
+    dig="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
+    if [ "$dig" != "$ref_dig" ]; then
+      err "DIGEST DRIFT: $svc ($dig) != $PROBE_SVC ($ref_dig) — the worker is on a DIFFERENT image than the api; scoring may diverge. Fix: DC up -d --force-recreate $svc"
+    else
+      log "digest-parity ✅ $svc matches $PROBE_SVC ($ref_dig)"
+    fi
+  done
+}
+
 diagnose_anvils() {
   err "one or more forks did not go healthy within ${ANVIL_WAIT}s. Diagnosis:"
   local a st up_env
@@ -231,6 +272,7 @@ log "✅ all forks healthy"
 # ── 4. bring up api/validator (health-gate now satisfied) ─────────────────
 log "recreating api/validator with --wait (timeout ${SERVICE_WAIT}s)…"
 if DC up -d --wait --wait-timeout "$SERVICE_WAIT"; then
+  check_digest_parity   # Phase 2 split: warn if benchmark-worker digest != api's
   log "✅ update/repair complete — stack healthy"
   exit 0
 fi

@@ -1624,6 +1624,17 @@ async def abort_solver_round(
 @router.get("/solver/round", response_model=SolverRoundResponse)
 async def get_solver_round() -> SolverRoundResponse:
     """Return the current solver submission round."""
+    # _get_current_solver_round WRITES the round store (incumbent sync +
+    # lazy ensure_open_round). The split benchmark worker keeps solver_rounds.json
+    # READ-ONLY (the api coordinator is the sole writer; RoundStore has no
+    # cross-process lock), so serve a pure read there — same gate as
+    # get_solver_champion. The coordinator maintains the open round, so a live
+    # worker sees a non-None current; 404 only in the transient no-round window.
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() in ("1", "true", "yes"):
+        current = get_round_store().get_current_round()
+        if current is None:
+            raise HTTPException(status_code=404, detail="No open solver round")
+        return _round_state_to_response(current)
     current = _get_current_solver_round(epoch_hint=0)
     return _round_state_to_response(current)
 
@@ -1693,7 +1704,13 @@ async def get_solver_champion() -> SolverChampionResponse:
     """Return the last activated/adopted champion snapshot."""
     store = get_store()
     round_store = get_round_store()
-    _sync_round_incumbent_from_submission_store(round_store, store)
+    # This lazy incumbent sync is a round-store WRITE (only on drift). The split
+    # benchmark worker keeps solver_rounds.json READ-ONLY (the api coordinator is
+    # the sole writer, and round_store has no cross-process lock), and the
+    # coordinator syncs the incumbent on its own path — so skip the write here on
+    # the worker. Its champion reads still reflect the shared file.
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+        _sync_round_incumbent_from_submission_store(round_store, store)
     champion = round_store.get_active_champion()
     d = champion.to_dict()
     # Copycat attribution for the champion. The ChampionSnapshot is

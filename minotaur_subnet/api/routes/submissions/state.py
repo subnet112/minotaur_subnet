@@ -121,10 +121,16 @@ def get_round_store() -> RoundStore:
     if _round_store is None:
         from pathlib import Path
 
+        import os
         persist_path = _resolve_persist_path("solver_rounds.json", "SOLVER_ROUND_STORE_PATH")
+        # The split benchmark worker (BENCHMARK_WORKER_ONLY) is a READ-ONLY sharer
+        # of solver_rounds.json — it must NOT sweep orphan temps (that would delete
+        # the api coordinator's in-flight persist temp on the shared /data volume).
+        _worker_only = os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() in ("1", "true", "yes")
         _round_store = RoundStore(
             persist_path=Path(persist_path) if persist_path else None,
             record_sink=_round_history_sink,
+            sweep_orphan_temps=not _worker_only,
         )
         # One-time backfill: mirror rounds already in the JSON store into the
         # order-book DB so history is complete from first use (best-effort).
