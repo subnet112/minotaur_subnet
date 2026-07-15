@@ -1693,7 +1693,13 @@ async def get_solver_champion() -> SolverChampionResponse:
     """Return the last activated/adopted champion snapshot."""
     store = get_store()
     round_store = get_round_store()
-    _sync_round_incumbent_from_submission_store(round_store, store)
+    # This lazy incumbent sync is a round-store WRITE (only on drift). The split
+    # benchmark worker keeps solver_rounds.json READ-ONLY (the api coordinator is
+    # the sole writer, and round_store has no cross-process lock), and the
+    # coordinator syncs the incumbent on its own path — so skip the write here on
+    # the worker. Its champion reads still reflect the shared file.
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+        _sync_round_incumbent_from_submission_store(round_store, store)
     champion = round_store.get_active_champion()
     d = champion.to_dict()
     # Copycat attribution for the champion. The ChampionSnapshot is

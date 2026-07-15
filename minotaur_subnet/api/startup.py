@@ -365,7 +365,7 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
         logger.warning("fork-pins: store failed for round %s: %s", round_id, exc)
 
 
-def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
+def _resolve_round_fork_pins(round_id: str, *, persist: bool = True) -> dict[int, int] | None:
     """Resolve the round's canonical fork pins, deriving + caching if absent.
 
     Gated by ``ROUND_ANCHORED_PIN``. Returns ``RoundState.fork_pins`` when already
@@ -403,7 +403,11 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     if anchor_epoch is None:
         return None
     pins = _derive_round_fork_pins(int(anchor_epoch))
-    if pins:
+    if pins and persist:
+        # Cache for reuse. Skipped (persist=False) for the split benchmark-worker
+        # process, which must stay ROUND-STORE-READ-ONLY (pins are deterministic
+        # from opened_epoch, so it derives the identical value without writing —
+        # the api coordinator remains the sole fork_pins writer).
         try:
             store.set_round_fork_pins(round_id, pins)  # cache for reuse
         except Exception as exc:
@@ -432,6 +436,47 @@ def _leader_fork_pin_resolver(round_id: str) -> int | dict[int, int] | None:
     if benchmark_all_deployment_chains_enabled():
         return dict(pins)
     return pins.get(_round_anchor_chains()[0])
+
+
+def _leader_fork_pin_resolver_readonly(round_id: str) -> int | dict[int, int] | None:
+    """Round-store-READ-ONLY variant of :func:`_leader_fork_pin_resolver` for the
+    split benchmark-worker process. Identical deterministic pins, but never caches
+    them back to the round store (persist=False) — so the worker performs NO
+    round-store write and the api coordinator stays the sole fork_pins writer."""
+    pins = _resolve_round_fork_pins(round_id, persist=False)
+    if not pins:
+        return None
+    from minotaur_subnet.consensus.round_anchor import (
+        benchmark_all_deployment_chains_enabled,
+    )
+    if benchmark_all_deployment_chains_enabled():
+        return dict(pins)
+    return pins.get(_round_anchor_chains()[0])
+
+
+def _build_simulator():
+    """Build the MultiChainSimulator from the registry sim/upstream RPC ladders,
+    or None if no sim RPCs are configured. Used by BOTH the block-loop path (api /
+    monolith) and the dedicated benchmark-worker process (which has no block loop),
+    so the worker can score. The worker's ``*_SIM_RPC_URL`` env resolves to its
+    dedicated ``anvil-*-bench`` forks, isolating its snapshot/revert from the api's."""
+    from minotaur_subnet.chains import wiring as chain_wiring
+    sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
+    if not sim_rpc_urls:
+        return None
+    upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
+    try:
+        from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
+        sim = MultiChainSimulator(sim_rpc_urls, upstream_rpc_urls=upstream_rpc_urls)
+        logger.info(
+            "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
+            list(sim_rpc_urls.keys()),
+            [c for c in sim_rpc_urls if c in upstream_rpc_urls],
+        )
+        return sim
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MultiChainSimulator unavailable: %s", exc)
+        return None
 
 
 def _round_anchored_pin_segment(round_id: str) -> str:
@@ -1154,13 +1199,19 @@ async def initialize(ctx: ServerContext) -> dict:
     # the submission in QUEUED/SCREENING_* forever — the round then busy-spins
     # in `replaying` with benchmarked=0 while miners see "scoring…". Re-kick
     # any recent strandings (no-op on nodes with none, e.g. followers).
-    try:
-        from minotaur_subnet.api.routes.submissions.screening_pipeline import (
-            resume_stranded_screenings,
-        )
-        await resume_stranded_screenings()
-    except Exception as exc:
-        logger.error("[screening] boot resume failed (continuing startup): %s", exc)
+    # Screening runs in exactly ONE process (the intake/coordinator api). The split
+    # benchmark worker (BENCHMARK_WORKER_ONLY) must NOT resume screenings — it shares
+    # /data + the docker socket, so it would DOUBLE the concurrent Docker screening
+    # builds (the #583 per-process CPU semaphore can't span two processes → the
+    # CPU-starvation freeze the split exists to reduce).
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+        try:
+            from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+                resume_stranded_screenings,
+            )
+            await resume_stranded_screenings()
+        except Exception as exc:
+            logger.error("[screening] boot resume failed (continuing startup): %s", exc)
 
     # ── benchmark worker ─────────────────────────────────────────────────
     # ALWAYS wire the submission store: the EpochManager needs it to ACTIVATE a certified
@@ -1170,28 +1221,51 @@ async def initialize(ctx: ServerContext) -> dict:
     # None and activate_certified_round raises "submission_store is required for certified
     # activation", silently stranding the follower on burn.
     sub_store = submissions.get_store()
-    benchmark_worker_enabled = os.environ.get(
+    # ── worker-mode gates (Phase 2 benchmark-worker split) ───────────────
+    # BENCHMARK_WORKER_ONLY=1 marks the dedicated worker process (same image,
+    # DISABLE_BLOCK_LOOP=1 + ENABLE_SOLVER_ROUND_COORDINATOR=0 + SUBMISSIONS_ACCEPTING=0).
+    _benchmark_worker_only = os.environ.get(
+        "BENCHMARK_WORKER_ONLY", "",
+    ).lower() in ("1", "true", "yes")
+    # Run the benchmark run_loop TASK in this process (the worker, or the monolith
+    # leader pre-split). ENABLE_BENCHMARK_WORKER=0 on the split api → the worker
+    # container owns the slate; the api only re-benches the single incumbent.
+    _run_benchmark_loop = os.environ.get(
         "ENABLE_BENCHMARK_WORKER", "",
     ).lower() in ("1", "true", "yes")
     if os.environ.get("DISABLE_BENCHMARK_WORKER", "").lower() in ("1", "true", "yes"):
-        benchmark_worker_enabled = False
+        _run_benchmark_loop = False
+    # Whether THIS process runs the solver-round coordinator (opens/advances
+    # rounds + drives the single-image incumbent re-bench).
+    _coordinator_will_run = (
+        os.environ.get("DISABLE_BLOCK_LOOP", "").lower() not in ("1", "true", "yes")
+        and os.environ.get("ENABLE_SOLVER_ROUND_COORDINATOR", "1").lower()
+        not in ("0", "false", "no")
+    )
+    # Construct the worker OBJECT if we run its loop OR we're the coordinator — the
+    # coordinator needs it for _refresh_incumbent_score (the single-image incumbent
+    # re-bench) even when it does NOT run the slate loop (the split api).
+    _construct_worker = _run_benchmark_loop or _coordinator_will_run
 
-    if benchmark_worker_enabled:
+    if _construct_worker:
         from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 
-        submissions._sync_round_incumbent_from_submission_store(round_store, sub_store)
-        current_round = round_store.get_current_round()
-        if current_round is None:
-            active_champion = round_store.get_active_champion()
-            initial_epoch = (
-                active_champion.activated_epoch + 1
-                if active_champion.submission_id
-                else 0
-            )
-            round_store.ensure_open_round(
-                opened_epoch=initial_epoch,
-                incumbent=active_champion if active_champion.submission_id else None,
-            )
+        # Round bootstrap is the COORDINATOR's job. The worker process must NOT
+        # write the round store here (C2 — it stays round-store-read-only).
+        if _coordinator_will_run:
+            submissions._sync_round_incumbent_from_submission_store(round_store, sub_store)
+            current_round = round_store.get_current_round()
+            if current_round is None:
+                active_champion = round_store.get_active_champion()
+                initial_epoch = (
+                    active_champion.activated_epoch + 1
+                    if active_champion.submission_id
+                    else 0
+                )
+                round_store.ensure_open_round(
+                    opened_epoch=initial_epoch,
+                    incumbent=active_champion if active_champion.submission_id else None,
+                )
 
         poll_interval = float(os.environ.get("BENCHMARK_POLL_INTERVAL", "30"))
         _genesis_solver_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip() or None
@@ -1203,19 +1277,47 @@ async def initialize(ctx: ServerContext) -> dict:
             round_store=round_store,
             genesis_solver_image=_genesis_solver_image,
             require_real_sim=_require_real_sim,
-            pin_resolver=_leader_fork_pin_resolver,
+            # The worker process stays round-store-read-only (C3): non-persisting
+            # pin resolver. The coordinator/api keeps the caching one.
+            pin_resolver=(
+                _leader_fork_pin_resolver_readonly
+                if _benchmark_worker_only
+                else _leader_fork_pin_resolver
+            ),
             validator_identity=_resolve_solver_round_hotkey(),
         )
-        ctx.benchmark_task = asyncio.create_task(
-            ctx.benchmark_worker.run_loop(interval=poll_interval),
-        )
+        # The worker has no block loop, so the simulator (built inside the
+        # block-loop block below) is never wired for it — build + attach it here so
+        # the worker can actually score (C1). Its *_SIM_RPC_URL env points at the
+        # dedicated anvil-*-bench forks, isolating it from the api's forks.
+        if _benchmark_worker_only:
+            _worker_sim = _build_simulator()
+            if _worker_sim is not None:
+                ctx.benchmark_worker._simulator = _worker_sim
+                apps.set_simulator(_worker_sim)
+                logger.info("[worker] BenchmarkWorker using dedicated-fork Anvil simulation")
+            elif _require_real_sim:
+                logger.error(
+                    "[worker] BENCHMARK_REQUIRE_REAL_SIM set but no simulator "
+                    "available — the worker will fail-closed each tick",
+                )
+        # Run the slate loop only in a process that owns it.
+        if _run_benchmark_loop:
+            ctx.benchmark_task = asyncio.create_task(
+                ctx.benchmark_worker.run_loop(interval=poll_interval),
+            )
+            logger.info("Benchmark worker loop started (poll every %ds)", poll_interval)
+        else:
+            logger.info(
+                "Benchmark worker CONSTRUCTED for incumbent re-bench only "
+                "(the slate loop runs in the dedicated worker process)",
+            )
         # Expose the worker to routes (diagnostic image-scoring endpoint).
         try:
             from minotaur_subnet.api.routes.submissions.state import set_benchmark_worker
             set_benchmark_worker(ctx.benchmark_worker)
         except Exception:
             pass
-        logger.info("Benchmark worker started (poll every %ds)", poll_interval)
 
     # ── relayer ──────────────────────────────────────────────────────────
     # Two modes, picked by env:
@@ -1545,33 +1647,10 @@ async def initialize(ctx: ServerContext) -> dict:
         # scoreIntent runs on the ETHEREUM fork, not the Base anvil (ANVIL_RPC_URL is
         # the Base anvil on the leader, misnamed legacy) — required before arming
         # BENCHMARK_ALL_DEPLOYMENT_CHAINS with a chain-1 deployment.
-        simulator = None
-        sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
-
-        # Upstream RPC URLs — the same endpoints the anvil containers
-        # are forking from. Used by AnvilSimulator._reset_fork to advance
-        # each fork to the current upstream head before every simulation
-        # (otherwise anvil_reset is a no-op and sims run against stale
-        # fork-time state — pool prices that no longer match real chain).
-        # Optional: when unset for a given chain, that chain's fork stays
-        # static (acceptable for local-testnet chain 31337 which isn't
-        # forked from anything).
-        upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
-
-        if sim_rpc_urls:
-            try:
-                from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
-                simulator = MultiChainSimulator(
-                    sim_rpc_urls,
-                    upstream_rpc_urls=upstream_rpc_urls,
-                )
-                logger.info(
-                    "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
-                    list(sim_rpc_urls.keys()),
-                    [c for c in sim_rpc_urls if c in upstream_rpc_urls],
-                )
-            except Exception as exc:
-                logger.warning("MultiChainSimulator unavailable: %s", exc)
+        # Built via the shared helper (also used by the split worker process, which
+        # has no block loop). Per-chain sim fork targets come from registry.sim_rpc
+        # + the upstream head endpoints for _reset_fork.
+        simulator = _build_simulator()
 
         if simulator is not None:
             apps.set_simulator(simulator)
@@ -2269,6 +2348,12 @@ async def initialize(ctx: ServerContext) -> dict:
                 on_champion_rejected=_champion_reject_fn,
                 on_champion_finalist=_champion_finalist_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
+                # After the split the api runs the coordinator but NOT the slate
+                # loop (ENABLE_BENCHMARK_WORKER=0 → _run_benchmark_loop False), so
+                # evaluate_round must NOT bench the whole slate on the api loop — it
+                # defers to the worker container's scored rows and re-benches only
+                # the single incumbent. True in the monolith (unchanged behavior).
+                coordinator_runs_slate=_run_benchmark_loop,
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
 
