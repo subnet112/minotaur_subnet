@@ -42,6 +42,7 @@ except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
     fcntl = None  # type: ignore[assignment]
 
 from minotaur_subnet.harness import fastjson
+from minotaur_subnet.harness.submission_db import SubmissionDB
 
 logger = logging.getLogger(__name__)
 
@@ -468,6 +469,10 @@ class SubmissionStore:
         )
         self._tokens_mtime_ns: int | None = None
         self._persist_path = persist_path
+        # Per-record SQLite persistence (submissions.db beside submissions.json):
+        # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
+        # in-memory-only stores (persist_path=None, tests).
+        self._db: SubmissionDB | None = None
         # Cross-process advisory lock lives in a sibling file that is never
         # rewritten — locking the data file itself would break, since each
         # persist replaces it (a new inode the held fd no longer refers to).
@@ -500,7 +505,12 @@ class SubmissionStore:
         )
         self._names_mtime_ns: int | None = None
 
-        if persist_path and persist_path.exists():
+        if persist_path is not None:
+            self._db = SubmissionDB(persist_path.with_suffix(".db"))
+            # One-time import of a legacy whole-file submissions.json (left in
+            # place for rollback + audit), then hydrate the in-memory dict from
+            # the DB. Idempotent on restart (the migrated flag lives in the DB).
+            self._db.migrate_from_json(persist_path)
             self._load()
         if self._tokens_path is not None and self._tokens_path.exists():
             self._load_tokens()
@@ -648,7 +658,7 @@ class SubmissionStore:
         self._submissions = {**self._submissions, sub.submission_id: sub}
         self._by_hotkey_round[round_key] = sub.submission_id
         self._by_hotkey_epoch[epoch_key] = sub.submission_id
-        self._persist()
+        self._persist_records([sub])
         # With an encryption key available the secret also goes to the sidecar
         # file (after the record is indexed — _persist_tokens prunes to known
         # submissions) so finalize still works after a restart / from a
@@ -740,7 +750,7 @@ class SubmissionStore:
         """
         self._maybe_reload()
         sub = self._upsert_one(record)
-        self._persist()
+        self._persist_records([sub])
         return sub
 
     @_write_locked
@@ -751,19 +761,18 @@ class SubmissionStore:
         returns the number successfully upserted.
         """
         self._maybe_reload()
-        n = 0
+        upserted: list[Submission] = []
         for record in records or []:
             try:
-                self._upsert_one(record)
-                n += 1
+                upserted.append(self._upsert_one(record))
             except Exception as exc:  # noqa: BLE001 — skip the bad record, keep the rest
                 logger.warning(
                     "upsert_submissions: skipped record %r: %s",
                     (record or {}).get("submission_id"), exc,
                 )
-        if n:
-            self._persist()
-        return n
+        if upserted:
+            self._persist_records(upserted)
+        return len(upserted)
 
     def get(self, submission_id: str) -> Submission | None:
         """Get a submission by ID."""
@@ -894,7 +903,7 @@ class SubmissionStore:
 
         sub.status = status
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_screening_result(
@@ -937,7 +946,7 @@ class SubmissionStore:
                 sub.outcome_code = OUTCOME_INVALID_PLANS
             self.purge_token(submission_id)  # terminal — drop the secret
 
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_tag(self, submission_id: str, image_tag: str) -> None:
@@ -948,7 +957,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_tag = image_tag
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_id(self, submission_id: str, image_id: str) -> None:
@@ -959,7 +968,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_id = image_id
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_content_fingerprint(self, submission_id: str, value: str) -> None:
@@ -974,7 +983,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.content_fingerprint = value
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     def count_benched_rounds_for_fingerprint(
         self,
@@ -1016,7 +1025,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.max_region_nodes = value
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_deadwood_metric(
@@ -1042,7 +1051,7 @@ class SubmissionStore:
         sub.unproductive_metric_version = version
         sub.unproductive_top_offenders = top_offenders
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_digest(self, submission_id: str, image_digest: str) -> None:
@@ -1053,7 +1062,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_digest = image_digest
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_provenance(
@@ -1068,7 +1077,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.provenance = provenance
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_solver_path(self, submission_id: str, solver_path: str) -> None:
@@ -1079,7 +1088,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_path = solver_path
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     @_write_locked
@@ -1125,7 +1134,7 @@ class SubmissionStore:
                 sub.is_copycat = True
                 sub.coined_by_hotkey = entry.get("owner_hotkey")
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_benchmark_result(
@@ -1177,7 +1186,7 @@ class SubmissionStore:
                 submission_id, (sub.rejection_reason or "?")[:80],
             )
             sub.updated_at = time.time()
-            self._persist()
+            self._persist_records([sub])
             return
 
         # The validity gate: no order delivered value -> the solver produced no
@@ -1196,7 +1205,7 @@ class SubmissionStore:
             # outcome (a terminally rejected sub never reaches this branch).
             sub.rejection_reason = None
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_benchmark_rank(self, submission_id: str, rank: int) -> None:
@@ -1211,7 +1220,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.benchmark_rank = rank
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_benchmark_ranks(self, ranks: dict[str, int]) -> None:
@@ -1224,12 +1233,14 @@ class SubmissionStore:
         """
         self._maybe_reload()
         now = time.time()
+        ranked: list[Submission] = []
         for submission_id, rank in ranks.items():
             sub = self._submissions.get(submission_id)
             if sub is not None:
                 sub.benchmark_rank = rank
                 sub.updated_at = now
-        self._persist()
+                ranked.append(sub)
+        self._persist_records(ranked)
 
     @_write_locked
     def merge_benchmark_details(
@@ -1254,7 +1265,7 @@ class SubmissionStore:
         details.update(extra)
         sub.benchmark_details = details
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def reject(
@@ -1276,7 +1287,7 @@ class SubmissionStore:
         sub.outcome_code = outcome_code
         sub.updated_at = time.time()
         self.purge_token(submission_id)  # terminal — drop the secret
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def waitlist(
@@ -1314,7 +1325,7 @@ class SubmissionStore:
         }
         sub.updated_at = time.time()
         self.purge_token(submission_id)
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def adopt(self, submission_id: str) -> None:
@@ -1323,21 +1334,24 @@ class SubmissionStore:
         Un-adopts any previous champion first (at most one champion at a time).
         """
         self._maybe_reload()
+        touched: list[Submission] = []
         # Un-adopt previous champion
         for s in self._submissions.values():
             if s.status == SubmissionStatus.ADOPTED and s.submission_id != submission_id:
                 s.status = SubmissionStatus.SCORED
                 s.updated_at = time.time()
+                touched.append(s)
 
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.status = SubmissionStatus.ADOPTED
         sub.updated_at = time.time()
+        touched.append(sub)
         # Terminal for the credential too: adoption only happens AFTER the
         # relayer's attest + merge consumed the token (merge-gate ordering).
         self.purge_token(submission_id)
-        self._persist()
+        self._persist_records(touched)
 
     def get_champion(self) -> Any:
         """Return the currently adopted champion submission, or None."""
@@ -1521,36 +1535,17 @@ class SubmissionStore:
 
     @contextmanager
     def _write_guard(self):
-        """Hold the write lock around a single read-modify-write.
+        """Serialize a read-modify-write within this process (re-entrant RLock).
 
-        Acquires the in-process lock (threads) then the exclusive advisory file
-        lock (processes), adopts the freshest persisted state, and yields for
-        the caller to mutate + persist. Re-entrant on one thread: nested guards
-        share the outermost lock and skip the reload so an in-progress mutation
-        is never discarded. When there is no ``persist_path`` (pure in-memory)
-        or ``fcntl`` is unavailable, the file lock is a no-op and only the
-        in-process lock applies.
+        The old cross-process fcntl flock + reload-from-file are gone: persistence
+        is now per-record SQLite, where UPSERTs to different rows never clobber
+        each other (the old whole-file replace did), and the store is single-writer
+        so the in-memory dict is authoritative — no reload needed. Any future
+        second-process writer (Phase 2) is serialized by SQLite's own write lock
+        (busy_timeout); cross-process read visibility is a separate Phase-2 change.
         """
         with self._rmw_lock:
-            outermost = self._lock_depth == 0
-            self._lock_depth += 1
-            if outermost:
-                self._lock_fd = self._acquire_file_lock()
-            try:
-                if (
-                    outermost
-                    and self._persist_path is not None
-                    and self._persist_path.exists()
-                ):
-                    # Under the exclusive lock, take the latest committed state
-                    # so the check-and-write below cannot race another writer.
-                    self._load(quiet=True)
-                yield
-            finally:
-                self._lock_depth -= 1
-                if self._lock_depth == 0:
-                    self._release_file_lock(self._lock_fd)
-                    self._lock_fd = None
+            yield
 
     def _acquire_file_lock(self) -> int | None:
         """Open the sibling lock file and take an exclusive advisory lock."""
@@ -1607,75 +1602,92 @@ class SubmissionStore:
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _maybe_reload(self) -> None:
-        """Refresh persisted state when another process updated the backing file."""
-        if self._persist_path is None or not self._persist_path.exists():
+        """No-op: the store is single-writer today (only the api constructs it),
+        so the in-memory dict is authoritative for this process. Per-record
+        SQLite UPSERTs make the old whole-file two-writer lost-update impossible
+        without a reload. Cross-process READ visibility (a 2nd writer's rows
+        reflected here) is deferred to Phase 2 (updated_seq incremental pull)."""
+        return
+
+    def _persist_records(self, subs: list["Submission"]) -> None:
+        """Persist the just-mutated record(s) as O(1) row UPSERT(s), then run the
+        in-memory benchmark_details retention strip and DELETE the details rows it
+        nulled (O(#stripped), typically 0-1). Replaces the old whole-store
+        _persist on every write hot path."""
+        if self._db is None:
             return
         try:
-            current_mtime_ns = self._persist_path.stat().st_mtime_ns
-        except OSError:
-            return
-        if self._persist_mtime_ns is None or current_mtime_ns > self._persist_mtime_ns:
-            self._load()
+            self._db.write_records([(s.submission_id, s.to_dict()) for s in subs])
+            stripped = self._enforce_benchmark_details_retention()
+            if stripped:
+                self._db.delete_details(stripped)
+        except Exception as exc:  # noqa: BLE001 — persistence must never crash a mutation
+            logger.warning("Failed to persist submission record(s): %s", exc)
 
-    def _persist(self) -> None:
-        """Write state to disk atomically if persist_path is set.
+    def snapshot_json(self) -> None:
+        """Write the WHOLE store to submissions.json (the legacy format).
 
-        Writes a temp file then ``os.replace``s it into place so a concurrent
-        lock-free reader always sees a complete file, never a half-written one.
-        """
+        NOT on the write hot path — called on graceful shutdown so a code
+        rollback to a pre-SQLite build reads a fresh file instead of the stale
+        migration-time snapshot. The in-memory state is already retention-stripped
+        (the strip runs on every _persist_records), so this dumps the bounded set."""
         if self._persist_path is None:
             return
-        try:
-            self._enforce_benchmark_details_retention()
-            data = {
-                sid: sub.to_dict()
-                for sid, sub in self._submissions.items()
-            }
-            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._persist_path.with_name(
-                f".{self._persist_path.name}.{os.getpid()}.tmp"
-            )
-            # Compact (no indent): the store is re-serialized on EVERY write, so
-            # pretty-printing ~doubles both the bytes written and the encode time
-            # on the (previously loop-blocking) hot path for zero machine benefit.
-            # fastjson (orjson) keeps the GIL-held encode window small so the
-            # writer-thread offload actually frees the loop.
-            tmp_path.write_bytes(fastjson.dumps(data))
-            os.replace(tmp_path, self._persist_path)
-            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
-        except Exception as exc:
-            logger.warning("Failed to persist submissions: %s", exc)
+        with self._write_guard():
+            try:
+                data = {sid: sub.to_dict() for sid, sub in self._submissions.items()}
+                self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = self._persist_path.with_name(
+                    f".{self._persist_path.name}.{os.getpid()}.tmp"
+                )
+                tmp_path.write_bytes(fastjson.dumps(data))
+                os.replace(tmp_path, self._persist_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to snapshot submissions.json: %s", exc)
 
-    def _enforce_benchmark_details_retention(self) -> None:
+    def close(self) -> None:
+        """Snapshot to JSON (rollback safety) + close the DB. Call on shutdown."""
+        self.snapshot_json()
+        if self._db is not None:
+            self._db.close()
+
+    def _enforce_benchmark_details_retention(self) -> list[str]:
         """Drop benchmark_details from terminal submissions beyond the retention
-        cap so the persisted store stays bounded.
+        cap so the store stays bounded; return the submission_ids just nulled so
+        the caller can DELETE their DB details rows (O(#stripped), not O(store)).
 
         benchmark_details is ~40-70KB per submission; unbounded it grew the store
-        to 142MB, and _persist re-serializes the WHOLE store on every write on the
-        event loop → ~25s api-wide freezes. We keep details for all non-terminal
-        (in-flight) submissions plus the ``_BENCHMARK_DETAILS_RETENTION`` most
-        recent by epoch, and strip the rest in place. In-memory mutation is fine:
-        the field is Optional and every reader uses ``.get()``/``or {}``.
+        to 142MB. We keep details for all non-terminal (in-flight) submissions plus
+        the ``_BENCHMARK_DETAILS_RETENTION`` most recent by epoch, and strip the
+        rest in place. In-memory mutation is fine: the field is Optional and every
+        reader uses ``.get()``/``or {}``; on the DB side the missing details row
+        reloads as None, so the stripped state round-trips byte-identically.
         """
         cap = _BENCHMARK_DETAILS_RETENTION
         if cap <= 0:
-            return
+            return []
         # Candidates: terminal submissions that still carry details.
         withdetails = [
             s for s in self._submissions.values()
             if s.status in _DETAILS_STRIPPABLE_STATUSES and s.benchmark_details
         ]
         if len(withdetails) <= cap:
-            return
+            return []
         # Keep the `cap` most recent by epoch; strip the older tail.
         withdetails.sort(key=lambda s: s.epoch, reverse=True)
+        stripped: list[str] = []
         for sub in withdetails[cap:]:
             sub.benchmark_details = None
+            stripped.append(sub.submission_id)
+        return stripped
 
     def _load(self, *, quiet: bool = False) -> None:
-        """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
+        """Hydrate the in-memory dict from the SQLite DB. ``quiet`` skips the info
+        log. The per-record row-building below is byte-identical to the legacy
+        JSON path (a missing details row → benchmark_details=None, matching the
+        retention-stripped state)."""
         try:
-            data = fastjson.loads(self._persist_path.read_bytes())
+            data = dict(self._db.load_all()) if self._db is not None else {}
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
             by_hotkey_epoch: dict[str, str] = {}
@@ -1724,9 +1736,8 @@ class SubmissionStore:
             self._submissions = submissions
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
-            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
             if not quiet:
-                logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
+                logger.info("Loaded %d submissions from the submission DB", len(data))
         except Exception as exc:
             logger.warning("Failed to load submissions: %s", exc)
 
