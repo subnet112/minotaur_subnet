@@ -77,16 +77,12 @@ solver code. First external participants onboard and sync.
 
 Connected to Bittensor. Validators and miners register on Subnet 112,
 weight setting begins. Bootstrap test miners retire — independent miners
-compete for champion. **The champion miner earns a flat 75% of the miner
-emission pool**, with the remaining 25% routed to the subnet owner — a fixed
-split, not a ramp. Champions are chosen by relative reference-bar scoring
+compete for champion. **Miner emissions ramp with network usage** — a 5%
+floor at low volume, scaling linearly to 100% at 1,000 orders in the
+trailing 24h — and champions are chosen by relative reference-bar scoring
 (a challenger must out-deliver the champion per order, with no regressions).
 
-The order-volume ramp previously described here (a 5% floor scaling linearly
-to 100% at 1,000 orders in the trailing 24h) was **never shipped and has been
-withdrawn** — the emission split is a flat constant with no throughput term.
-
-`Weight Setting` `Flat 75% Champion Split` `Independent Miners` `Independent Validators`
+`Weight Setting` `5% Emission Ramp` `Independent Miners` `Independent Validators`
 
 ---
 
