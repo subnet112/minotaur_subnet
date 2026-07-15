@@ -473,6 +473,17 @@ class SubmissionStore:
         )
         self._tokens_mtime_ns: int | None = None
         self._persist_path = persist_path
+        # Cross-process advisory lock (restored for the Phase-2 split — see
+        # _write_guard for why SQLite's own write lock is not a substitute). Lives
+        # in a sibling file that is never rewritten: locking a file that each
+        # persist replaces would break, as the held fd points at the old inode.
+        self._lock_path = (
+            persist_path.with_name(persist_path.name + ".lock")
+            if persist_path is not None
+            else None
+        )
+        self._lock_fd: int | None = None
+        self._lock_depth = 0
         # Per-record SQLite persistence (submissions.db beside submissions.json):
         # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
         # in-memory-only stores (persist_path=None, tests).
@@ -1534,21 +1545,71 @@ class SubmissionStore:
         self._persist_names()
         logger.info("Backfilled %d coined solver name(s) from history", len(registry))
 
-    # ── In-process write lock ────────────────────────────────────────────────
+    # ── Cross-process write lock ─────────────────────────────────────────────
 
     @contextmanager
     def _write_guard(self):
-        """Serialize a read-modify-write within this process (re-entrant RLock).
+        """Hold the write lock around a single read-modify-write.
 
-        The old cross-process fcntl flock + reload-from-file are gone: persistence
-        is now per-record SQLite, where UPSERTs to different rows never clobber
-        each other (the old whole-file replace did), and the store is single-writer
-        so the in-memory dict is authoritative — no reload needed. Any future
-        second-process writer (Phase 2) is serialized by SQLite's own write lock
-        (busy_timeout); cross-process read visibility is a separate Phase-2 change.
+        Acquires the in-process RLock (threads) then the exclusive advisory file
+        lock (processes), pulls any peer rows written since our watermark, and
+        yields for the caller to mutate + persist. Re-entrant on one thread: nested
+        guards share the outermost lock and skip the reload so an in-progress
+        mutation is never discarded. With no ``persist_path`` (pure in-memory) or
+        no ``fcntl``, the file lock is a no-op and only the RLock applies.
+
+        The flock is REQUIRED again for Phase 2, and #794's note that "any future
+        second-process writer is serialized by SQLite's own write lock" is not
+        enough: SQLite serializes the write TRANSACTION, not the whole
+        pull → mutate → persist. ``_persist_records`` UPSERTs the WHOLE record blob,
+        so two processes that read the same row and each mutate a DIFFERENT field
+        still lose one side's field entirely (e.g. rotation setting REJECTED while
+        the worker writes SCORED). Only a lock held across the full read-modify-write
+        prevents that, which is exactly what this guard is.
+
+        The reload inside the guard is the INCREMENTAL ``_maybe_reload`` (one indexed
+        max_seq query in the single-writer steady state), not the old
+        ``_load(quiet=True)`` whole-store re-read — so restoring the lock does not
+        restore the Phase-1 stall it was part of.
         """
         with self._rmw_lock:
-            yield
+            outermost = self._lock_depth == 0
+            self._lock_depth += 1
+            if outermost:
+                self._lock_fd = self._acquire_file_lock()
+            try:
+                if outermost:
+                    # Under the exclusive lock, take the peer's latest committed
+                    # rows so the check-and-write below cannot race another writer.
+                    self._maybe_reload()
+                yield
+            finally:
+                self._lock_depth -= 1
+                if self._lock_depth == 0:
+                    self._release_file_lock(self._lock_fd)
+                    self._lock_fd = None
+
+    def _acquire_file_lock(self) -> int | None:
+        """Open the sibling lock file and take an exclusive advisory lock."""
+        if self._lock_path is None or fcntl is None:
+            return None
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
+    @staticmethod
+    def _release_file_lock(fd: int | None) -> None:
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     # ── Async offload ──────────────────────────────────────────────────────
 
@@ -1606,6 +1667,11 @@ class SubmissionStore:
         if latest <= self._last_seen_seq:
             return  # nothing new from a peer (the single-writer steady state)
         rows = self._db.load_since(self._last_seen_seq)
+        if rows is None:
+            # The pull FAILED (None, not []). Leave the watermark where it is so the
+            # next tick retries this range; advancing here would skip the rows for
+            # good. Cheap to retry — the seq gate re-fires on the very next read.
+            return
         if not rows:
             # Only our OWN writes moved the seq (filtered in SQL) — just advance.
             self._last_seen_seq = latest
@@ -1616,12 +1682,26 @@ class SubmissionStore:
         # lose one of the two updates. We never hold the lock across I/O, so this
         # cannot re-introduce the event-loop stall Phase 1 removed.
         with self._rmw_lock:
-            for _sid, record, _seq in rows:
+            # Advance only over a CONTIGUOUS applied prefix. A row that won't apply
+            # must not be skipped past: the watermark is the only record of what we
+            # have seen, so jumping over a bad row drops it permanently AND hides
+            # the corruption. Stall at it instead, loudly, and retry every tick.
+            applied_through = self._last_seen_seq
+            complete = True
+            for sid, record, seq in rows:
                 try:
                     self._upsert_one(record)
-                except Exception as exc:  # noqa: BLE001 — one bad row must not stall sync
-                    logger.warning("[xproc-sync] skipping unloadable row: %s", exc)
-            self._last_seen_seq = latest
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "[xproc-sync] STALLED at unloadable peer row %s (seq %s): %s "
+                        "— this process is now behind its peer; the row is retried "
+                        "on every read until it applies or an operator repairs it",
+                        sid, seq, exc,
+                    )
+                    complete = False
+                    break
+                applied_through = seq
+            self._last_seen_seq = latest if complete else applied_through
         logger.debug("[xproc-sync] pulled %d peer row(s) up to seq %d", len(rows), latest)
 
     def _persist_records(self, subs: list["Submission"]) -> None:
@@ -1725,6 +1805,13 @@ class SubmissionStore:
         JSON path (a missing details row → benchmark_details=None, matching the
         retention-stripped state)."""
         try:
+            # Read the watermark BEFORE hydrating, not after. A peer commit that
+            # lands DURING load_all() would otherwise be neither hydrated (it wasn't
+            # there when the SELECT started) nor pulled (an after-the-fact max_seq
+            # already counts it) → silently lost until that row is written again.
+            # Seeding from the pre-hydrate max can only re-pull a row we already
+            # have, which _upsert_one absorbs idempotently.
+            seq_before_hydrate = self._db.max_seq() if self._db is not None else 0
             data = dict(self._db.load_all()) if self._db is not None else {}
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
@@ -1776,10 +1863,10 @@ class SubmissionStore:
             self._by_hotkey_epoch = by_hotkey_epoch
             self._loaded = True  # clean hydrate — safe to snapshot to JSON
             # We just took EVERY row into memory, so the cross-process watermark
-            # starts at the current max: only rows a peer writes AFTER this hydrate
-            # are pulled. (Pre-Phase-2 rows carry seq 0 and are never re-pulled.)
-            if self._db is not None:
-                self._last_seen_seq = self._db.max_seq()
+            # starts at the max as of BEFORE the hydrate: only rows a peer writes
+            # after that point are pulled, and none can slip through the gap.
+            # (Pre-Phase-2 rows carry seq 0 and are never re-pulled.)
+            self._last_seen_seq = seq_before_hydrate
             if not quiet:
                 logger.info("Loaded %d submissions from the submission DB", len(data))
         except Exception as exc:
