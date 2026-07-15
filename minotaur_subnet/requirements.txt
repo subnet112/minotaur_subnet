@@ -50,6 +50,7 @@ base58==2.1.1
 # ── Misc runtime ─────────────────────────────────────────────────────
 python-dotenv==1.2.2
 numpy==2.4.2
+orjson==3.11.9  # fast JSON for the large store files (submissions.json ~44MB re-serialized per write); runtime-optional — harness/fastjson.py falls back to stdlib json
 
 # ── MCP (miner agent — exposes tools to the Claude CLI) ──────────────
 mcp==1.26.0
