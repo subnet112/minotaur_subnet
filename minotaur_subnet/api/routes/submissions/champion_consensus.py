@@ -645,6 +645,30 @@ async def _maybe_prepare_round_for_certification(
     # the shared SOLVER_ROUND_INTERNAL_API_KEY. Without this the get_round() below
     # 404s on the leader's unknown round_id. Adopt as CLOSED so the existing prep
     # flow (close->evaluate->CERTIFYING) advances it normally.
+    #
+    # KNOWN GAP — benchmark_anchor_epoch is NOT carried here, and this is deliberate.
+    # A follower that adopts a round via THIS path (i.e. it missed the close
+    # broadcast, which does carry the field) gets benchmark_anchor_epoch=None and so
+    # anchors its fork pin to opened_epoch, while the leader anchored to the real-open
+    # epoch → different pin → PACK_HASH_MISMATCH for that follower on that round.
+    #
+    # It is not fixed here because the fix is not local: the field rides in
+    # **field_updates (so its absence is silent — no signature error, no test), and
+    # the field exists on CloseRoundRequest only, NOT on CertifyRoundRequest or
+    # ChampionConsensusProposalRequest. The proposal route authenticates by
+    # canonicalizing body.model_dump() (routes.py _verify_champion_proposal_signature),
+    # so ADDING a field to that model breaks signature verification in BOTH directions
+    # during any staggered rollout — the exact shape of the #378 outage where a stray
+    # `timestamp` key made followers reject every champion proposal and quorum could
+    # never be reached (see peer_network.py).
+    #
+    # HARD INVARIANT: this gap is free at quorum <= 1 (FOLLOWER_TRUST_LEADER_QUORUM1 —
+    # the follower adopts the leader's signed champion without self-verifying, so its
+    # own pin never gates anything). QUORUM MUST NOT BE RAISED ABOVE 1 until
+    # benchmark_anchor_epoch is plumbed through the proposal/certify path — and that
+    # plumbing requires a PREREQUISITE PR converting proposal-sig verification to
+    # raw-dict canonicalization (mirroring _verify_internal_round_signature) so adding
+    # a field is not itself a fleet-wide quorum outage.
     if round_store.get_round(round_id) is None:
         _adopt_leader_round_if_behind(
             round_id,
