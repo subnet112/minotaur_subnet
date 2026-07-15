@@ -19,6 +19,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from minotaur_subnet.harness import fastjson
+
 logger = logging.getLogger(__name__)
 
 # Cap on retained rounds in the in-memory/persisted store. Rounds close ~1 per
@@ -900,8 +902,8 @@ class RoundStore:
                 dir=str(parent), prefix=f".{self._persist_path.name}.", suffix=".tmp",
             )
             try:
-                with os.fdopen(fd, "w") as fh:
-                    fh.write(json.dumps(data, indent=2))
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(fastjson.dumps(data, indent=True))
                     fh.flush()
                     os.fsync(fh.fileno())
                 # mkstemp creates the temp 0600; match the target's mode so a replace
@@ -963,7 +965,7 @@ class RoundStore:
             # Clean up any orphan temp files from a prior crashed persist before
             # loading (the unique-temp-name scheme would otherwise let them pile up).
             self._sweep_orphan_temps()
-            data = json.loads(self._persist_path.read_text())
+            data = fastjson.loads(self._persist_path.read_bytes())
             current_round_id = data.get("current_round_id")
             active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))
             previous_champion = ChampionSnapshot.from_dict(data.get("previous_champion"))
