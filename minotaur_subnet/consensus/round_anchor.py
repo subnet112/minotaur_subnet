@@ -114,14 +114,20 @@ def round_anchor_lookback_epochs(chain_id: int) -> int:
 
 def benchmark_all_deployment_chains_enabled() -> bool:
     """Gate for benchmarking EVERY operational deployment chain of an app
-    (not just the app's primary deployment). **DEFAULT OFF.**
+    (not just the app's primary deployment). **DEFAULT ON** (image-baked).
 
-    CONSENSUS-RELEVANT: turning this on adds each deployment chain's scenarios
-    to the flat benchmark set (they join the relative adoption rule) and folds
-    that chain's round-anchored pin into ``benchmark_pack_hash``. Like
-    BENCHMARK_STATIC_QUOTE / ROUND_ANCHORED_PIN it must be flipped
-    FLEET-UNIFORMLY: a split value surfaces as PACK_HASH_MISMATCH (fail-loud),
-    never a silent mis-score. Ships OFF so it can soak on the lead first.
+    CONSENSUS-RELEVANT: this adds each deployment chain's scenarios to the flat
+    benchmark set (they join the relative adoption rule) and folds that chain's
+    round-anchored pin into ``benchmark_pack_hash``. Like ROUND_ANCHORED_PIN /
+    BENCHMARK_ANCHOR_REAL_EPOCH it must be FLEET-UNIFORM: a split value surfaces
+    as PACK_HASH_MISMATCH (fail-loud), never a silent mis-score. It shipped
+    default-OFF to soak on the lead (armed there via env since 2026-07-08); the
+    default now lives in CODE because third-party validators run the canonical
+    compose and never set env flags — an env-gated default-OFF feature is
+    permanently OFF on every node we don't operate. Same discipline as
+    ``benchmark_anchor_real_epoch_enabled``: only an explicit off-value
+    (``{0,false,no,off}``) disables, so a typo can never silently split one
+    validator off the fleet. Flip fleet-uniformly (promote) on a round boundary.
 
     Operational prerequisites on every node that arms it: the extra chains must
     be routed through the block-pin proxy (``SOLVER_READ_PROXY_CHAINS``), have a
@@ -130,9 +136,10 @@ def benchmark_all_deployment_chains_enabled() -> bool:
     the benchmark fails loud (RealSimulationUnavailable / ForkPinUnavailable)
     rather than scoring degraded.
     """
-    return os.environ.get(
-        "BENCHMARK_ALL_DEPLOYMENT_CHAINS", "",
-    ).strip().lower() in ("1", "true", "yes", "on")
+    raw = os.environ.get("BENCHMARK_ALL_DEPLOYMENT_CHAINS")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _GATE_OFF_VALUES
 
 
 def epoch_anchor_ts(epoch: int, epoch_seconds: int) -> int:

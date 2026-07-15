@@ -202,7 +202,7 @@ def distributed_veto_enabled() -> bool:
 
 
 def distributed_veto_enforce_mode() -> str:
-    """Phase-1 enforcement mode — DEFAULT ``off``. CONSENSUS-RELEVANT.
+    """Phase-1 enforcement mode — DEFAULT ``hard`` (image-baked). CONSENSUS-RELEVANT.
 
     - ``off``    — observe-only (Phase 0): the veto never gates adoption.
     - ``shadow`` — the pre-certify gate runs for real (holds the round in CERTIFYING
@@ -215,15 +215,27 @@ def distributed_veto_enforce_mode() -> str:
 
     Blocking is ONLY ever on ``would_gate_confirmed`` (the leader's own reverify
     reproduced the violation), NEVER on a raw follower claim (LD8). Enforcement
-    therefore requires ``DISTRIBUTED_VETO_REVERIFY=1`` to have teeth — with
+    therefore requires reverify (also default-ON now) to have teeth — with
     reverify off, ``would_gate_confirmed`` is always None and the gate fail-opens
-    every round (safe but toothless)."""
-    raw = os.environ.get("DISTRIBUTED_VETO_ENFORCE", "off").strip().lower()
-    if raw in ("hard", "enforce", "block", "on"):
+    every round (safe but toothless).
+
+    Default ``hard`` in CODE: it soaked leader-side via env (hard since
+    2026-07-11, one overfit challenger blocked), and third-party validators run
+    the canonical compose without custom env — a default-``off`` env gate is
+    permanently off on every node we don't operate. Explicit ``off``/``shadow``
+    remain available as emergency overrides; an unrecognized value (typo) maps
+    to ``hard``, never silently back to ``off``, so a mistyped override can't
+    quietly disarm one validator. The gate stays fail-open on deadline expiry
+    by design (LD8), so worst case equals the old observe-only behaviour."""
+    raw = os.environ.get("DISTRIBUTED_VETO_ENFORCE")
+    if raw is None:
         return VETO_ENFORCE_HARD
+    raw = raw.strip().lower()
+    if raw in ("off", "0", "false", "no", "disable", "disabled", "observe"):
+        return VETO_ENFORCE_OFF
     if raw in ("shadow", "dry", "dryrun", "observe-gate"):
         return VETO_ENFORCE_SHADOW
-    return VETO_ENFORCE_OFF
+    return VETO_ENFORCE_HARD
 
 
 def veto_gate_decision(
@@ -1240,15 +1252,18 @@ async def _production_runner(assignment: SliceAssignment) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def distributed_veto_reverify_enabled() -> bool:
-    """Leader re-verification sub-switch — DEFAULT OFF, independent of (and NOT
-    flipped by) the default-ON participation switch. When OFF the leader records
-    what followers CLAIM without re-benching — so the initial observe soak
-    measures fan-out + follower verdicts with ZERO added docker load on the
-    leader (which also runs the canonical benchmark). Turn on deliberately,
-    later in the soak, to measure trust-but-verify reproduction."""
-    return (os.environ.get("DISTRIBUTED_VETO_REVERIFY", "0").strip().lower()) in (
-        "1", "true", "yes", "on",
-    )
+    """Leader re-verification sub-switch — DEFAULT ON (image-baked).
+
+    Enforcement blocks ONLY on ``would_gate_confirmed`` (the leader's own
+    reverify reproduced the violation), so with reverify off the default-``hard``
+    gate is toothless — it fail-opens every round. It shipped default-OFF for the
+    observe soak (zero added docker load); the leader has run it ``=1`` since
+    2026-07-11 and the default now lives in CODE for the same reason as the
+    enforce mode above. Only an explicit off-value disables (typo-safe)."""
+    raw = os.environ.get("DISTRIBUTED_VETO_REVERIFY")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 async def reverify_dissents(
