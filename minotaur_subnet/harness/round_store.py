@@ -242,9 +242,14 @@ class RoundState:
     # ACTIVATION schedule (close_epoch + activation_delay, ~1 tempo in the FUTURE
     # for commit-reveal alignment), so anchoring the pin to it lands ~40 min ahead
     # and defers. benchmark_anchor_epoch is a recent-PAST time-epoch that
-    # confirm-brackets immediately. Purely the fork-pin anchor source — gated by
-    # BENCHMARK_ANCHOR_REAL_EPOCH (see api/startup._round_fork_anchor_epoch); until
-    # armed it is inert. None on legacy rounds / rounds opened before this shipped.
+    # confirm-brackets immediately. Purely the fork-pin anchor source, and the LIVE
+    # one: the anchor selection is default-ON in code (see
+    # consensus.round_anchor.benchmark_anchor_real_epoch_enabled), with
+    # BENCHMARK_ANCHOR_REAL_EPOCH={0,false,no,off} as an emergency override only.
+    # None on legacy rounds / rounds opened before this shipped → those anchor to
+    # opened_epoch. That fallback is fleet-uniform, not node-local: the stamp is set
+    # once by the leader at open and travels with the round, so every node sees the
+    # same presence-or-absence. See api/startup._round_fork_anchor_epoch.
     benchmark_anchor_epoch: int | None = None
     abort_reason: str | None = None
     # Set True ONLY when THIS node independently re-benchmarked the round's

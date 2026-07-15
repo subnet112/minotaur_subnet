@@ -603,10 +603,27 @@ services:
       # Unset or any other value = enabled (default). A typo can never silently
       # disable a single node and split it off — only the explicit off-set does.
       #
+      # WHICH EPOCH THE PIN ANCHORS TO (also default-ON in code, same discipline):
+      # the pin anchors to the round's real-open wall-clock epoch
+      # (benchmark_anchor_epoch, stamped by the leader at open and adopted with the
+      # round). It used to anchor to opened_epoch — but opened_epoch is the champion
+      # ACTIVATION schedule (close_epoch + activation_delay), deliberately ~1 tempo
+      # in the FUTURE for commit-reveal alignment, so the anchor landed ~40 min ahead
+      # of wall-clock and the pin DEFERRED every round. Rounds opened before the field
+      # existed have no stamp and still anchor to opened_epoch; that fallback is
+      # fleet-uniform because the stamp travels with the round.
+      #   BENCHMARK_ANCHOR_REAL_EPOCH: "0"   (also accepts false/no/off)
+      # EMERGENCY OVERRIDE ONLY, and note it must be set on BOTH the api and the
+      # benchmark-worker services (each has its own environment: block and both
+      # resolve pins through the same gate) — a hold on one and not the other splits
+      # a single HOST against itself. Same typo-safety as above: unset / any other
+      # value = enabled.
+      #
       # Pre-flight parity check (default-ON, observe-only): a background probe
       # derives this node's fork pin for the current epoch anchor and publishes
       # it on GET /health under "round_anchor" (pins, pin_hashes, anchor_epoch,
-      # status, gate_enabled). The subnet team polls every validator's /health and
+      # status, gate_enabled, anchor_real_epoch_enabled). The subnet team polls
+      # every validator's /health and
       # diffs the pin (and block hash) per epoch to confirm the WHOLE fleet derives
       # an identical block — the parity evidence backing the default-ON rollout. It
       # never changes consensus and runs with a bounded RPC timeout. The probe runs
