@@ -29,6 +29,7 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,20 @@ _TERMINAL_STATUSES = ("rejected", "adopted", "waitlisted")
 def _status_value(sub: Any) -> str:
     st = getattr(sub, "status", None)
     return str(getattr(st, "value", None) or st or "")
+
+
+def benchable_candidate_count(subs: Iterable[Any]) -> int:
+    """How many of ``subs`` a rotation pass would consider — i.e. how many get
+    BENCHED when rotation is disabled (``slots <= 0``) or fails.
+
+    Shares ``_TERMINAL_STATUSES`` with :func:`apply_rotation_slate` on purpose:
+    the decision-window autoscale used to keep its OWN copy of this rule as
+    "status != rejected", and when #620 parked rotation's overflow in
+    ``waitlisted`` instead of ``rejected`` the two silently diverged — never-benched
+    submissions inflated the window until activation outlived the champion
+    approval and certify() reverted "Expired". One definition, one place.
+    """
+    return len([s for s in subs if _status_value(s) not in _TERMINAL_STATUSES])
 
 
 def rotation_ledger_path() -> str:
