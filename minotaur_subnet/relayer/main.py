@@ -932,6 +932,204 @@ class RelayerService:
             "tx_hash": tx_hash,
         })
 
+    # The ONLY function signatures /v1/contract-call may invoke — the app-
+    # management admin surface, nothing else. A generic "send any tx as the
+    # relayer" endpoint would let one compromised validator key drain the
+    # relayer wallet arbitrarily (see the 2026-05-25 /deploy audit note), so
+    # the callable set is enumerated and every call is still wrapper-bound to
+    # its exact params. Extend deliberately, per function.
+    CONTRACT_CALL_ALLOWED_SIGS = frozenset({
+        # V2 float ops (WETH wrap + transfer to the app, relayer-side recover)
+        "deposit()",
+        "transfer(address,uint256)",
+        "withdrawFloat(address,uint256)",
+        # V2 relayer-gated app config
+        "setFeeBps(uint256)",
+        "setVolumeCapBps(uint256)",
+        "setFeeCollector(address)",
+        "setFeeMode(uint8)",
+        "setAppOwner(address)",
+        # AppRegistry automation
+        "setDeveloperAllowed(address,bool)",
+        "registerApp(bytes32,bytes32,address)",
+        "revokeApp(bytes32)",
+    })
+    CONTRACT_CALL_MAX_GAS = 300_000
+    CONTRACT_CALL_MAX_VALUE_WEI = 10**18  # 1 native token per call, hard cap
+
+    async def handle_contract_call(self, request: web.Request) -> web.Response:
+        """POST /v1/contract-call — allowlisted admin call from the relayer wallet.
+
+        The generic backend for the api's app-lifecycle endpoints (float
+        deposit/withdraw, config setters, AppRegistry automation) when the api
+        and relayer run as separate services: ``EvmRelayer.call_contract_function``
+        lives HERE, so ``HttpRelayer`` proxies to this endpoint.
+
+        Auth mirrors ``/deploy``: an EIP-191 wrapper whose recovered signer is
+        in the on-chain ``ValidatorRegistry`` for the target chain, with
+        ``plan_hash = compute_contract_call_hash(...)`` binding EVERY call
+        parameter. Additionally the function signature must be on
+        ``CONTRACT_CALL_ALLOWED_SIGS`` and gas/value are capped — this is an
+        admin surface, not an arbitrary-tx relay.
+        """
+        from minotaur_subnet.consensus.leader_wrapper import compute_contract_call_hash
+
+        try:
+            data = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": f"malformed JSON: {exc}"}, status=400)
+
+        target = data.get("target") or ""
+        fn_signature = data.get("fn_signature") or ""
+        abi_types = data.get("abi_types") or []
+        values = data.get("values") or []
+        try:
+            chain_id = int(data.get("chain_id"))
+            tx_value = int(data.get("tx_value") or 0)
+            gas = int(data.get("gas") or 200_000)
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": f"invalid numeric field: {exc}"}, status=400)
+
+        if fn_signature not in self.CONTRACT_CALL_ALLOWED_SIGS:
+            return web.json_response(
+                {"error": f"function not allowlisted for contract-call: {fn_signature!r}"},
+                status=403,
+            )
+        if not target or len(abi_types) != len(values):
+            return web.json_response(
+                {"error": "target required; abi_types/values length mismatch"}, status=400,
+            )
+        if gas <= 0 or gas > self.CONTRACT_CALL_MAX_GAS:
+            return web.json_response(
+                {"error": f"gas outside (0, {self.CONTRACT_CALL_MAX_GAS}]"}, status=400,
+            )
+        if tx_value < 0 or tx_value > self.CONTRACT_CALL_MAX_VALUE_WEI:
+            return web.json_response(
+                {"error": f"tx_value outside [0, {self.CONTRACT_CALL_MAX_VALUE_WEI}]"},
+                status=400,
+            )
+
+        chain_cfg = self.chains.get(chain_id)
+        if chain_cfg is None:
+            return web.json_response({"error": f"unsupported chain_id {chain_id}"}, status=400)
+
+        # ── Safeguards: same ladder as /deploy ──────────────────────────
+        ok, err = self.safeguards.check_daily_gas_room()
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        wrapper_data = data.get("wrapper")
+        wrapper_sig = data.get("wrapper_signature")
+        if not wrapper_data or not wrapper_sig:
+            return web.json_response(
+                {"error": (
+                    "missing wrapper or wrapper_signature — sign a freshness "
+                    "wrapper with plan_hash=compute_contract_call_hash(...)"
+                )},
+                status=400,
+            )
+        try:
+            wrapper = WrapperPayload(
+                plan_hash=wrapper_data["plan_hash"],
+                submission_nonce=int(wrapper_data["submission_nonce"]),
+                timestamp=int(wrapper_data["timestamp"]),
+                chain_id=int(wrapper_data["chain_id"]),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return web.json_response({"error": f"malformed wrapper: {exc}"}, status=400)
+
+        expected_hash = compute_contract_call_hash(
+            chain_id, target, fn_signature, abi_types, values, tx_value, gas,
+        )
+        if wrapper.plan_hash != expected_hash:
+            return web.json_response(
+                {"error": "wrapper plan_hash doesn't match call params"}, status=400,
+            )
+        if wrapper.chain_id != chain_id:
+            return web.json_response(
+                {"error": "wrapper chain_id doesn't match request"}, status=400,
+            )
+        ok, err = is_wrapper_fresh(wrapper)
+        if not ok:
+            return web.json_response({"error": err}, status=400)
+        try:
+            wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
+        except Exception as exc:
+            return web.json_response({"error": f"wrapper sig invalid: {exc}"}, status=400)
+
+        if not chain_cfg.validator_registry_address:
+            return web.json_response(
+                {"error": f"no ValidatorRegistry configured on chain {chain_id}"},
+                status=500,
+            )
+        try:
+            authorized = _read_authorized_validators(
+                chain_cfg.rpc_url,
+                chain_cfg.validator_registry_address,
+            )
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"ValidatorRegistry read failed: {exc}"}, status=502,
+            )
+        if wrapper_signer.lower() not in {a.lower() for a in authorized}:
+            return web.json_response(
+                {"error": (
+                    f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                    f"on chain {chain_id} — only registered validators may call"
+                )},
+                status=403,
+            )
+        ok, err = self.safeguards.check_signer_nonce(wrapper_signer, wrapper.submission_nonce)
+        if not ok:
+            return web.json_response({"error": err}, status=409)
+        ok, err = self.safeguards.check_caller_rate(wrapper_signer)
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        logger.info(
+            "Relayer: contract-call accepted (chain=%d fn=%s target=%s "
+            "wrapper-signer=%s nonce=%d value=%d gas=%d)",
+            chain_id, fn_signature, target[:10], wrapper_signer[:10],
+            wrapper.submission_nonce, tx_value, gas,
+        )
+
+        # Values arrive JSON-stringified (canonical-hash requirement); coerce
+        # back per ABI type for the encoder.
+        try:
+            coerced = [
+                v if t in ("address", "string") or t.startswith("bytes")
+                else (str(v).lower() in ("true", "1") if t == "bool" else int(v))
+                for t, v in zip(abi_types, values)
+            ]
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": f"bad values for abi_types: {exc}"}, status=400)
+
+        try:
+            tx_hash = await self.relayer.call_contract_function(
+                target, chain_id, fn_signature, list(abi_types), coerced,
+                tx_value=tx_value, gas=gas,
+            )
+        except Exception as exc:
+            logger.exception("Relayer: contract-call crashed on chain %d", chain_id)
+            return web.json_response({"error": f"contract-call failed: {exc}"}, status=500)
+
+        return web.json_response({"status": "sent", "tx_hash": tx_hash})
+
+    async def handle_wallets(self, request: web.Request) -> web.Response:
+        """GET /wallets — the relayer's sending address per configured chain.
+
+        Lets ``HttpRelayer._resolve_wallet`` answer without holding the key —
+        addresses are public information (they're on every tx the relayer
+        sends), so no auth needed.
+        """
+        wallets: dict[str, str] = {}
+        for cid in self.chains:
+            try:
+                wallets[str(cid)] = self.relayer._resolve_wallet(cid)
+            except Exception as exc:
+                logger.warning("wallet resolve failed for chain %s: %s", cid, exc)
+        return web.json_response({"wallets": wallets})
+
     async def handle_tx_status(self, request: web.Request) -> web.Response:
         """GET /status/{tx_hash} — check transaction status."""
         tx_hash = request.match_info["tx_hash"]
@@ -967,6 +1165,8 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/finalize-champion", service.handle_finalize_champion)
     app.router.add_post("/v2/finalize-champion", service.handle_finalize_champion_v2)
     app.router.add_post("/deploy", service.handle_deploy)
+    app.router.add_post("/v1/contract-call", service.handle_contract_call)
+    app.router.add_get("/wallets", service.handle_wallets)
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
     app.router.add_get("/gas-balances", service.handle_gas_balances)
     app.router.add_get("/health", service.handle_health)
