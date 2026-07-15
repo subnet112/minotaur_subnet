@@ -928,6 +928,8 @@ class EvmRelayer(RelayerBase):
             "nonce": nonce,
             "gas": 200_000,
             "gasPrice": self._get_gas_price(w3),
+            # EIP-155 replay protection — mainnet RPCs reject unprotected txs.
+            "chainId": chain_id,
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
@@ -980,6 +982,8 @@ class EvmRelayer(RelayerBase):
             "nonce": nonce,
             "gas": gas,
             "gasPrice": self._get_gas_price(w3),
+            # EIP-155 replay protection — mainnet RPCs reject unprotected txs.
+            "chainId": chain_id,
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
@@ -1035,6 +1039,8 @@ class EvmRelayer(RelayerBase):
             "nonce": nonce,
             "gas": 300_000,
             "gasPrice": self._get_gas_price(w3),
+            # EIP-155 replay protection — mainnet RPCs reject unprotected txs.
+            "chainId": chain_id,
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
