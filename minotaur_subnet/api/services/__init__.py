@@ -77,6 +77,7 @@ from .app_lifecycle import (  # noqa: F401
     registry_calldata,
     set_developer_allowed,
     auto_register_deployment,
+    bootstrap_app_owner,
 )
 from .app_registration import (  # noqa: F401
     request_registration,
