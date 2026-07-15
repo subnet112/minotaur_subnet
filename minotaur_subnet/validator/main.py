@@ -1300,7 +1300,7 @@ class AppIntentsValidator:
                 logger.error("Rescan error: %s", exc)
 
     async def _local_champion_hotkey(self) -> str | None:
-        """Hotkey of the current champion for the 0.05/0.95 burn ramp; None ⇒ 100% burn.
+        """Hotkey of the current champion for the CHAMPION_MINER_WEIGHT_FRACTION split; None ⇒ 100% burn.
 
         Read from THIS node's co-located API (GET /v1/solver/champion) — the single source
         of truth that ran the benchmark/consensus and adopted — with a bounded
@@ -1413,7 +1413,8 @@ class AppIntentsValidator:
             if epoch_weights:
                 # Label the emit by what it actually does so /health last_emit.source agrees
                 # with emission_mode: "champion" when weighting a resolved champion (the
-                # 0.05/0.95 ramp), "burn" when champion is None (definitive owner burn). The
+                # CHAMPION_MINER_WEIGHT_FRACTION split), "burn" when champion is None (a
+                # definitive owner burn). The
                 # old hardcoded "burn_fallback" mislabeled champion emits as burns.
                 emitted = await self._do_emit(
                     epoch_weights,
