@@ -314,6 +314,17 @@ def set_developer_allowed(
 
     from minotaur_subnet.api.services.app_admin import _call, _selector, _view_address
 
+    # Probe FIRST: when the developer is already in the desired state there is
+    # no tx to send, so registry ownership is irrelevant. Checking owner before
+    # the probe made auto-register abort on production ("allowlist failed:
+    # registry owner is …") even though the relayer was ALREADY allowlisted and
+    # registerApp needed nothing from the owner.
+    probe = _call(w3, registry, _selector("allowedDevelopers(address)")
+                  + bytes.fromhex(developer[2:].lower().zfill(64)))
+    already = bool(probe) and bool(int.from_bytes(probe[:32], "big"))
+    if already == allowed:
+        return {"developer": developer, "allowed": allowed, "changed": False}
+
     owner = _view_address(w3, registry, "owner")
     wallet = relayer._resolve_wallet(chain_id)
     if owner and wallet and owner.lower() != wallet.lower():
@@ -324,12 +335,6 @@ def set_developer_allowed(
             ),
             "owner": owner,
         }
-
-    probe = _call(w3, registry, _selector("allowedDevelopers(address)")
-                  + bytes.fromhex(developer[2:].lower().zfill(64)))
-    already = bool(probe) and bool(int.from_bytes(probe[:32], "big"))
-    if already == allowed:
-        return {"developer": developer, "allowed": allowed, "changed": False}
     try:
         tx = _run_async(relayer.call_contract_function(
             registry, chain_id, "setDeveloperAllowed(address,bool)",
