@@ -483,7 +483,9 @@ class SubmissionStore:
             else None
         )
         self._lock_fd: int | None = None
-        self._lock_depth = 0
+        # Re-entrancy depth is per-THREAD (see _write_guard): _rmw_lock no longer
+        # guards it, since the flock must be taken before the RLock, not under it.
+        self._tls = threading.local()
         # Per-record SQLite persistence (submissions.db beside submissions.json):
         # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
         # in-memory-only stores (persist_path=None, tests).
@@ -1551,8 +1553,8 @@ class SubmissionStore:
     def _write_guard(self):
         """Hold the write lock around a single read-modify-write.
 
-        Acquires the in-process RLock (threads) then the exclusive advisory file
-        lock (processes), pulls any peer rows written since our watermark, and
+        Acquires the exclusive advisory file lock (processes) then the in-process
+        RLock (threads), pulls any peer rows written since our watermark, and
         yields for the caller to mutate + persist. Re-entrant on one thread: nested
         guards share the outermost lock and skip the reload so an in-progress
         mutation is never discarded. With no ``persist_path`` (pure in-memory) or
@@ -1571,23 +1573,43 @@ class SubmissionStore:
         max_seq query in the single-writer steady state), not the old
         ``_load(quiet=True)`` whole-store re-read — so restoring the lock does not
         restore the Phase-1 stall it was part of.
+
+        LOCK ORDER IS LOAD-BEARING: the flock is taken BEFORE ``_rmw_lock``, never
+        while holding it. ``fcntl.flock(LOCK_EX)`` blocks indefinitely, and every
+        read path calls ``_maybe_reload`` → ``_rmw_lock`` on the EVENT LOOP; holding
+        the RLock across that blocking wait let a peer process freeze the api's loop
+        for as long as it held the lock file (measured: 4.5s). That is the Phase-1
+        stall class, re-introduced and made cross-process. No inversion results:
+        ``_maybe_reload`` takes only ``_rmw_lock`` and never the flock, so nothing
+        ever waits for the flock while holding the RLock.
+
+        Re-entrancy depth is THREAD-LOCAL because ``_rmw_lock`` no longer guards it
+        (and re-entrancy is per-thread by definition — the offload writer thread and
+        a sync on-loop caller are different RMWs and must not share a depth).
         """
-        with self._rmw_lock:
-            outermost = self._lock_depth == 0
-            self._lock_depth += 1
+        depth = getattr(self._tls, "lock_depth", 0)
+        outermost = depth == 0
+        fd = None
+        try:
             if outermost:
-                self._lock_fd = self._acquire_file_lock()
-            try:
+                # Blocks WITHOUT the RLock held (see above).
+                fd = self._acquire_file_lock()
+                self._lock_fd = fd
+            # Only after a SUCCESSFUL acquire: an OSError here (EMFILE/ENOSPC) used
+            # to leave the depth incremented forever, so every later guard computed
+            # outermost=False and silently ran with NO cross-process lock at all.
+            self._tls.lock_depth = depth + 1
+            with self._rmw_lock:
                 if outermost:
                     # Under the exclusive lock, take the peer's latest committed
                     # rows so the check-and-write below cannot race another writer.
                     self._maybe_reload()
                 yield
-            finally:
-                self._lock_depth -= 1
-                if self._lock_depth == 0:
-                    self._release_file_lock(self._lock_fd)
-                    self._lock_fd = None
+        finally:
+            self._tls.lock_depth = depth
+            if outermost:
+                self._release_file_lock(fd)
+                self._lock_fd = None
 
     def _acquire_file_lock(self) -> int | None:
         """Open the sibling lock file and take an exclusive advisory lock."""
@@ -1674,7 +1696,9 @@ class SubmissionStore:
             return
         if not rows:
             # Only our OWN writes moved the seq (filtered in SQL) — just advance.
-            self._last_seen_seq = latest
+            # max(): a concurrent reload may have advanced it past `latest` while we
+            # were querying off-lock; the watermark must never go BACKWARDS.
+            self._last_seen_seq = max(self._last_seen_seq, latest)
             return
         # The SELECT above ran OFF any lock. Take the write lock only for the
         # in-memory merge (microseconds): _upsert_one rebinds self._submissions
@@ -1682,13 +1706,25 @@ class SubmissionStore:
         # lose one of the two updates. We never hold the lock across I/O, so this
         # cannot re-introduce the event-loop stall Phase 1 removed.
         with self._rmw_lock:
-            # Advance only over a CONTIGUOUS applied prefix. A row that won't apply
-            # must not be skipped past: the watermark is the only record of what we
-            # have seen, so jumping over a bad row drops it permanently AND hides
-            # the corruption. Stall at it instead, loudly, and retry every tick.
+            # RE-READ the watermark inside the lock. The rows above were SELECTed
+            # off-lock, so a writer may have superseded one of them in between: our
+            # own _write_guard reload advances the watermark past a peer row, then
+            # writes a NEWER blob for that record. Applying the stale snapshot now
+            # would revert the newer state in memory — PERMANENTLY, because the
+            # healing row carries our own writer id and load_since filters it out
+            # forever. The next mutation then UPSERTs the reverted blob back over
+            # the good DB row, so the DB is not a safety net either. That is exactly
+            # the wrong-champion adoption this sync exists to prevent.
             applied_through = self._last_seen_seq
             complete = True
             for sid, record, seq in rows:
+                if seq <= applied_through:
+                    continue  # superseded while we queried off-lock
+                # Advance only over a CONTIGUOUS applied prefix. A row that won't
+                # apply must not be skipped past: the watermark is the only record
+                # of what we have seen, so jumping over a bad row drops it
+                # permanently AND hides the corruption. Stall at it instead,
+                # loudly, and retry every tick.
                 try:
                     self._upsert_one(record)
                 except Exception as exc:  # noqa: BLE001
@@ -1701,7 +1737,9 @@ class SubmissionStore:
                     complete = False
                     break
                 applied_through = seq
-            self._last_seen_seq = latest if complete else applied_through
+            self._last_seen_seq = max(
+                self._last_seen_seq, latest if complete else applied_through
+            )
         logger.debug("[xproc-sync] pulled %d peer row(s) up to seq %d", len(rows), latest)
 
     def _persist_records(self, subs: list["Submission"]) -> None:
