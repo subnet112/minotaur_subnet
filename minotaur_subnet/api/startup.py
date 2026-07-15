@@ -3747,3 +3747,15 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
     ctx.solver_round_metagraph_sync = None
     ctx.solver_round_role = "standalone"
     ctx.solver_round_epoch_clock = None
+
+    # Submission store: after all writers (coordinator + benchmark worker) have
+    # stopped, snapshot the store to submissions.json (rollback safety to a
+    # pre-SQLite build) and close its SQLite DB. Guarded on the singleton
+    # existing so we never create a store just to close it.
+    try:
+        from minotaur_subnet.api.routes.submissions import state as _sub_state
+        if getattr(_sub_state, "_store", None) is not None:
+            _sub_state._store.close()
+            logger.info("Submission store snapshotted to JSON + DB closed")
+    except Exception:  # noqa: BLE001 — shutdown must never raise
+        logger.warning("Submission store close failed during shutdown", exc_info=True)

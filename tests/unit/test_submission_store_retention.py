@@ -1,6 +1,5 @@
 """benchmark_details retention keeps the persisted submission store bounded so
 _persist can't re-serialize a 142MB blob on the event loop (~25s api freezes)."""
-import json
 
 from minotaur_subnet.harness import submission_store as ss
 from minotaur_subnet.harness.submission_store import SubmissionStore, SubmissionStatus
@@ -59,21 +58,32 @@ def test_retention_disabled_when_zero(monkeypatch):
     assert all(s.benchmark_details is not None for s in subs)
 
 
-def test_persist_is_compact_and_bounded(tmp_path, monkeypatch):
+def test_persist_is_bounded_on_disk_via_reload(tmp_path, monkeypatch):
+    """Per-record persist + retention on disk: ALL records are kept but only the
+    details of the cap-most-recent terminal records survive — verified by
+    reloading a fresh store from the SQLite DB."""
     monkeypatch.setattr(ss, "_BENCHMARK_DETAILS_RETENTION", 2)
     p = tmp_path / "submissions.json"
     store = SubmissionStore(persist_path=p)
     for e in range(1, 8):
-        _mk(store, e, SubmissionStatus.SCORED)
-    # create() reloads from disk on each write, dropping post-create in-memory
-    # edits — set status/details on the live stored objects before persisting.
-    for sub in store._submissions.values():
-        sub.status = SubmissionStatus.SCORED
-        sub.benchmark_details = {"per_order": ["x"] * 50}
-    store._persist()
-    text = p.read_text()
-    assert "\n" not in text, "must be compact json (no indent)"
-    data = json.loads(text)
-    assert len(data) == 7, f"all records retained, only details pruned: {len(data)}"
-    with_details = [v for v in data.values() if v.get("benchmark_details")]
-    assert len(with_details) == 2, f"retention cap not applied on persist: {len(with_details)}"
+        sub = store.create(
+            repo_url=f"https://example.com/r{e}.git",
+            commit_hash=f"{e:040d}",
+            epoch=e,
+            hotkey=f"hk{e}",
+            round_id=f"round-{e}",
+            max_per_round=0,
+            max_rounds_per_commit=0,
+        )
+        store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+        # SCORED + details, persisted per-record through the real write path.
+        store.set_benchmark_result(
+            sub.submission_id, valid=True,
+            details={"per_intent": [{"raw_output": "1"}], "epoch": e},
+        )
+
+    # Reload a fresh store from the same DB — retention must hold on disk.
+    store2 = SubmissionStore(persist_path=p)
+    assert len(store2._submissions) == 7, "all records retained"
+    with_details = [s for s in store2._submissions.values() if s.benchmark_details]
+    assert len(with_details) == 2, f"retention cap not applied on disk: {len(with_details)}"
