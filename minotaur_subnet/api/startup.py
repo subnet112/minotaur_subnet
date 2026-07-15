@@ -1284,6 +1284,21 @@ async def initialize(ctx: ServerContext) -> dict:
         and os.environ.get("ENABLE_SOLVER_ROUND_COORDINATOR", "1").lower()
         not in ("0", "false", "no")
     )
+    # Misconfig alarm: a process that runs the slate loop (ENABLE_BENCHMARK_WORKER=1)
+    # with NO block loop (DISABLE_BLOCK_LOOP=1) is worker-SHAPED — but every
+    # read-only protection (no temp sweep, non-persisting pin resolver, no stale-
+    # deploy reconcile, no screening resume) keys on BENCHMARK_WORKER_ONLY. If that
+    # flag is missing, a second process sharing /data silently loses ALL of them and
+    # can clobber the api's round writes. Warn LOUDLY (don't fail — a dev may run
+    # this shape against a private /data).
+    _disable_block_loop = os.environ.get("DISABLE_BLOCK_LOOP", "").lower() in ("1", "true", "yes")
+    if _run_benchmark_loop and _disable_block_loop and not _benchmark_worker_only:
+        logger.warning(
+            "[worker] worker-SHAPED process (ENABLE_BENCHMARK_WORKER=1 + "
+            "DISABLE_BLOCK_LOOP=1) is MISSING BENCHMARK_WORKER_ONLY=1 — the round-"
+            "store read-only protections are OFF. If this process shares /data with "
+            "the api it can corrupt round/champion writes. Set BENCHMARK_WORKER_ONLY=1.",
+        )
     # Construct the worker OBJECT if we run its loop OR we're the coordinator — the
     # coordinator needs it for _refresh_incumbent_score (the single-image incumbent
     # re-bench) even when it does NOT run the slate loop (the split api).

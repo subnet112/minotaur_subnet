@@ -210,3 +210,58 @@ def test_worker_heartbeat_written_in_worker_mode(tmp_path: Path, monkeypatch):
     w._touch_worker_heartbeat()
     assert hb.exists()
     assert float(hb.read_text()) > 0
+
+
+# ── GET /solver/round is READ-ONLY on the worker ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_solver_round_readonly_on_worker(tmp_path: Path, monkeypatch):
+    """On the worker, GET /solver/round must NOT hit the writing helper
+    (_get_current_solver_round does set_active_champion + ensure_open_round) — it
+    serves a pure read of the shared round store."""
+    from minotaur_subnet.api.routes.submissions import routes, state
+    from minotaur_subnet.harness.round_store import RoundStore
+
+    rs = RoundStore(persist_path=tmp_path / "sr.json")
+    rs.ensure_open_round(opened_epoch=3)
+    state.set_round_store(rs)
+    monkeypatch.setenv("BENCHMARK_WORKER_ONLY", "1")
+    calls = {"n": 0}
+
+    def _boom(**_kw):
+        calls["n"] += 1
+        raise AssertionError("worker must not call the round-store write helper")
+
+    monkeypatch.setattr(routes, "_get_current_solver_round", _boom)
+    try:
+        resp = await routes.get_solver_round()
+        assert calls["n"] == 0
+        assert resp.round_id == "round-e3-n1"
+    finally:
+        state.set_round_store(None)
+
+
+@pytest.mark.asyncio
+async def test_get_solver_round_uses_write_helper_off_worker(tmp_path: Path, monkeypatch):
+    """Control: without the worker flag the endpoint keeps its lazy create/sync
+    (calls the write helper) — the monolith/coordinator behavior is unchanged."""
+    from minotaur_subnet.api.routes.submissions import routes, state
+    from minotaur_subnet.harness.round_store import RoundStore
+
+    rs = RoundStore(persist_path=tmp_path / "sr.json")
+    opened = rs.ensure_open_round(opened_epoch=4)
+    state.set_round_store(rs)
+    monkeypatch.delenv("BENCHMARK_WORKER_ONLY", raising=False)
+    calls = {"n": 0}
+
+    def _spy(**_kw):
+        calls["n"] += 1
+        return opened
+
+    monkeypatch.setattr(routes, "_get_current_solver_round", _spy)
+    try:
+        await routes.get_solver_round()
+        assert calls["n"] == 1
+    finally:
+        state.set_round_store(None)

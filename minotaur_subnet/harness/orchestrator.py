@@ -1157,7 +1157,12 @@ async def _provision_extra_runtime(
     rpc_map = dict(base_rpc_map)
     init_config = dict(init_config_base)
     if read_proxy is not None and pin_blocks:
-        proxy_session_id = f"bench-{id(sess):x}-{fork_block}"
+        # Salt with the PID: post-split the api (incumbent re-bench) and the
+        # benchmark worker share ONE block-pin proxy, and id() is only unique
+        # within a process — two heaps can allocate a session at the same address
+        # for the same fork_block, colliding the session id (open_session would
+        # replace the peer's session + reset its budget). PID makes it per-process.
+        proxy_session_id = f"bench-{os.getpid()}-{id(sess):x}-{fork_block}"
         rec = await open_session(read_proxy, proxy_session_id, pin_blocks)
         for cid in list(rpc_map):
             if cid in read_proxy.chain_ids and cid in CHAIN_NAMES:
@@ -1324,7 +1329,9 @@ async def run_benchmark(
                 f"SOLVER_READ_PROXY_CHAINS (fleet-wide) before benchmarking them."
             )
         if pin_blocks:
-            _proxy_session_id = f"bench-{id(session):x}-{fork_block}"
+            # PID-salted: the split shares one proxy across api + worker; id() is
+            # process-local, so PID prevents a cross-process session-id collision.
+            _proxy_session_id = f"bench-{os.getpid()}-{id(session):x}-{fork_block}"
             try:
                 rec = await open_session(_read_proxy, _proxy_session_id, pin_blocks)
             except Exception as exc:  # noqa: BLE001

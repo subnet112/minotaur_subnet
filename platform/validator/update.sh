@@ -55,6 +55,11 @@ ANVILS="${MINOTAUR_ANVILS:-anvil-eth anvil-base anvil-btevm}"
 #   MINOTAUR_UPDATE_SERVICES="fork-cache validator api benchmark-worker"
 #   MINOTAUR_ANVILS="anvil-eth anvil-base anvil-btevm anvil-eth-bench anvil-base-bench anvil-btevm-bench"
 #   MINOTAUR_DIGEST_PARITY_SVCS="benchmark-worker"   # asserts worker digest == api's
+#   MINOTAUR_UPDATE_WAIT=600   # IMPORTANT: the worker cold-starts slowly (champion
+#       # build + first -bench fork; its healthcheck start_period is 300s). The
+#       # final `up --wait` waits on the WHOLE stack, so a default 240s wait can
+#       # time out on the still-cold worker and needlessly ROLL BACK a healthy api.
+#       # Raise it above the worker's realistic cold start (>=600s).
 # Empty by default → a no-op on every follower (no worker in the stack).
 DIGEST_PARITY_SVCS="${MINOTAUR_DIGEST_PARITY_SVCS:-}"
 PROBE_SVC="${MINOTAUR_UPDATE_PROBE_SVC:-api}"   # snapshot the rollback image from this service

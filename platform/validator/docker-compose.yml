@@ -782,11 +782,13 @@ services:
       - store-data:/data              # SHARED with the api (read-only sharer of round state)
     networks: [minotaur]              # NOT benchmark-sandbox — see the router-gate note
     healthcheck:
-      # FORWARD-PROGRESS, not just liveness: the run_loop bumps the heartbeat file
-      # each iteration AND each per-image bench step, so a wedged/hung sim call
-      # goes stale → container unhealthy → the operator's restarter (or update.sh's
-      # force-recreate of unhealthy services) recycles it. Threshold generous
-      # enough for a full slate pass; tune with BENCHMARK_WORKER_HEARTBEAT_MAX_AGE.
+      # FORWARD-PROGRESS, not just liveness: run_loop bumps the heartbeat file
+      # AFTER each completed pass AND each per-image bench step. So both a HUNG sim
+      # call (loop wedged) AND a CRASH-LOOP (run_once raises every tick → the
+      # post-pass bump is never reached) go stale → container unhealthy → the
+      # operator's restarter (or update.sh's force-recreate of unhealthy services)
+      # recycles it. A clean idle pass (no work) still bumps = healthy. Threshold
+      # generous for a full slate pass; tune with BENCHMARK_WORKER_HEARTBEAT_MAX_AGE.
       test:
         - "CMD-SHELL"
         - "test $(( $(date +%s) - $(stat -c %Y ${BENCHMARK_WORKER_HEARTBEAT_FILE:-/data/.benchmark_worker_heartbeat} 2>/dev/null || echo 0) )) -lt ${BENCHMARK_WORKER_HEARTBEAT_MAX_AGE:-900}"

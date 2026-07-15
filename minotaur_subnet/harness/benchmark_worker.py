@@ -619,8 +619,13 @@ class BenchmarkWorker:
 
         while self._running:
             try:
-                self._touch_worker_heartbeat()  # forward-progress liveness (split worker)
                 processed = await self.run_once()
+                # Bump AFTER a completed pass (processed 0 or N) — NOT before — so a
+                # worker that raises every tick (dead proxy / sim gone) never reaches
+                # here, its heartbeat goes stale, and the container is marked
+                # unhealthy. A clean idle pass (0 work) still bumps = healthy. The
+                # per-image touch inside run_once bounds long slates.
+                self._touch_worker_heartbeat()
                 if processed == 0:
                     await asyncio.sleep(interval)
             except Exception as exc:
