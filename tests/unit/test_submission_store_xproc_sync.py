@@ -262,3 +262,185 @@ def test_alters_a_pre_phase2_db_in_place(tmp_path: Path):
     new = _create(store, hotkey="5Gnew")
     assert store._db.max_seq() > 0
     assert store.get(new.submission_id) is not None
+
+
+# ── review-fix regressions ──────────────────────────────────────────────────
+#
+# Each of these FAILS against the first cut of this feature. They are the reason
+# the adversarial review round happened, so they are kept as the guard rail.
+
+
+def test_two_concurrent_writers_never_duplicate_a_seq(tmp_path: Path):
+    """updated_seq must be unique — it is the ONLY record of what a peer has seen.
+
+    The first cut stamped MAX(updated_seq)+1 inside `with self._conn:`. Python's
+    legacy isolation mode emits an implicit BEGIN only before the first DML, so
+    that SELECT ran in AUTOCOMMIT holding no write lock: two processes read the
+    same MAX and stamped the SAME seq. A peer's watermark then advances past both
+    having applied only one → the other row is never pulled again (a benchmark
+    result the coordinator never sees). The fix is BEGIN IMMEDIATE.
+    """
+    import threading
+
+    a = _mk(tmp_path)
+    b = _mk(tmp_path)
+    errors: list[BaseException] = []
+
+    def hammer(store: SubmissionStore, tag: str) -> None:
+        try:
+            for i in range(25):
+                _create(store, hotkey=f"5G{tag}{i:03d}")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=hammer, args=(a, "a")),
+        threading.Thread(target=hammer, args=(b, "b")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"writer raised: {errors!r}"
+
+    conn = sqlite3.connect(str(tmp_path / "submissions.db"))
+    rows, distinct = conn.execute(
+        "SELECT COUNT(updated_seq), COUNT(DISTINCT updated_seq) FROM submissions"
+    ).fetchone()
+    conn.close()
+    assert rows == 50, f"expected 50 rows, got {rows}"
+    assert rows == distinct, (
+        f"DUPLICATE updated_seq under two writers ({rows} rows, {distinct} distinct) "
+        "— a peer's watermark will skip a row permanently"
+    )
+
+
+def test_failed_pull_does_not_advance_the_watermark(tmp_path: Path):
+    """A FAILED pull and 'no peer rows' are opposite instructions.
+
+    The first cut returned [] on exception, which is indistinguishable from "no
+    peer rows" → the caller advanced the watermark past rows it never applied →
+    permanent silent loss. load_since now returns None on failure.
+    """
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    sub = _create(api, hotkey="5Gpull")
+    before = worker._last_seen_seq
+
+    # Simulate a transient read blip on the pull.
+    def boom(_seq):
+        return None
+
+    worker._db.load_since = boom  # type: ignore[method-assign]
+    worker._maybe_reload()
+    assert worker._last_seen_seq == before, (
+        "the watermark advanced past a FAILED pull — those rows are lost for good"
+    )
+
+    # Recovery: once the read works again the same range is retried, not skipped.
+    del worker._db.load_since
+    assert worker.get(sub.submission_id) is not None, (
+        "the row was not recovered after the blip cleared"
+    )
+
+
+def test_bad_peer_row_stalls_loudly_without_skipping(tmp_path: Path, caplog):
+    """A row that won't apply must stall the watermark AT it, not be skipped.
+
+    The first cut logged a warning and advanced past the bad row, dropping it
+    permanently and hiding the corruption. We now advance only over a contiguous
+    applied prefix.
+    """
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    good = _create(api, hotkey="5Ggood")
+    worker.get(good.submission_id)  # apply the good row, advance the watermark
+    at_good = worker._last_seen_seq
+
+    bad = _create(api, hotkey="5Gbad0")
+    later = _create(api, hotkey="5Glate")
+
+    real_upsert = worker._upsert_one
+
+    def selective(record):
+        if record.get("submission_id") == bad.submission_id:
+            raise ValueError("synthetic undecodable row")
+        return real_upsert(record)
+
+    worker._upsert_one = selective  # type: ignore[method-assign]
+    with caplog.at_level("ERROR"):
+        worker._maybe_reload()
+
+    assert worker._last_seen_seq == at_good, (
+        "the watermark advanced past a row that never applied — it is now "
+        f"unreachable (stalled at {worker._last_seen_seq}, expected {at_good})"
+    )
+    assert any("STALLED" in r.message for r in caplog.records), (
+        "an unapplyable peer row must be LOUD (error), not a silent skip"
+    )
+    # The row AFTER the bad one is not applied either — the prefix is contiguous,
+    # so nothing beyond the stall point leaks in out of order.
+    assert worker._submissions.get(later.submission_id) is None
+
+    # Recovery: once the row applies, the stall clears and everything catches up.
+    worker._upsert_one = real_upsert  # type: ignore[method-assign]
+    worker._maybe_reload()
+    assert worker._last_seen_seq > at_good
+    assert worker.get(bad.submission_id) is not None
+    assert worker.get(later.submission_id) is not None
+
+
+def test_concurrent_same_record_rmw_does_not_lose_a_field(tmp_path: Path):
+    """Two processes mutating DIFFERENT fields of the SAME record must not lose
+    either field.
+
+    #794 removed the cross-process flock, reasoning that "any future
+    second-process writer is serialized by SQLite's own write lock". That is not
+    enough: SQLite serializes the write TRANSACTION, not the whole
+    pull → mutate → persist, and _persist_records UPSERTs the WHOLE record blob.
+    Interleaved, one side's field is lost entirely (the live shape: rotation sets
+    REJECTED while the worker writes SCORED). The flock in _write_guard is what
+    makes the read-modify-write atomic across processes.
+    """
+    import threading
+
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    sub = _create(api, hotkey="5Grmw")
+    sid = sub.submission_id
+    worker.get(sid)
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def api_side() -> None:
+        try:
+            barrier.wait()
+            api.set_max_region_nodes(sid, 4242)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def worker_side() -> None:
+        try:
+            barrier.wait()
+            worker.set_benchmark_result(
+                sid, valid=True, rank=7, details={"total_intents": 1}
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=api_side), threading.Thread(target=worker_side)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"a writer raised: {errors!r}"
+
+    # A THIRD reader sees the durable truth: both fields survived.
+    fresh = _mk(tmp_path).get(sid)
+    assert fresh is not None
+    assert fresh.max_region_nodes == 4242, "the api's field was clobbered by the worker"
+    assert fresh.benchmark_rank == 7, "the worker's field was clobbered by the api"

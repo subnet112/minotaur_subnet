@@ -35,8 +35,9 @@ even after an OOM/SIGKILL, since the DB survives), then start the old build.
 Cross-process READ visibility (Phase 2 — a 2nd process's writes reflected in this
 process's in-memory dict) IS handled here now, via a monotonic ``updated_seq``
 column + a ``writer`` tag + a dedicated read connection:
-- every write stamps ``updated_seq = MAX(updated_seq)+1`` (SQLite serializes
-  writers, so the max+1 is race-free) and the writing store's ``writer`` id;
+- every write stamps ``updated_seq = MAX(updated_seq)+1`` and the writing store's
+  ``writer`` id, inside an explicit ``BEGIN IMMEDIATE`` (see ``_immediate``) so the
+  MAX read and the UPSERT that depends on it are one atomic write transaction;
 - a reader pulls only ``updated_seq > watermark AND writer <> me`` — its OWN rows
   are filtered IN SQL, so a single-process node never re-parses its own writes;
 - ``max_seq()`` is the cheap O(log n) gate: unchanged ⇒ the reader returns without
@@ -52,6 +53,7 @@ import os
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -91,7 +93,12 @@ class SubmissionDB:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # timeout backs busy handling for any statement that can't be served the
         # write lock immediately (a concurrent writer process).
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
+        # isolation_level=None disables the legacy implicit-BEGIN machinery: every
+        # write transaction is opened EXPLICITLY via _immediate() (BEGIN IMMEDIATE).
+        # Required for correctness, not style — see _immediate.
+        self._conn = sqlite3.connect(
+            str(db_path), check_same_thread=False, timeout=10.0, isolation_level=None
+        )
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         # WAL + NORMAL: fully crash-safe against a PROCESS crash (api kill / OOM /
@@ -133,6 +140,34 @@ class SubmissionDB:
         """Opaque id tagging rows written by THIS store instance."""
         return self._writer_id
 
+    @contextmanager
+    def _immediate(self) -> Iterator[None]:
+        """Run the body in an explicit ``BEGIN IMMEDIATE`` write transaction.
+
+        This is load-bearing for cross-process correctness, NOT a style choice.
+        Python's legacy isolation mode only emits an implicit BEGIN before the
+        first INSERT/UPDATE/DELETE — a ``SELECT`` inside ``with conn:`` therefore
+        runs in AUTOCOMMIT, holding no write lock. ``write_records`` reads
+        ``MAX(updated_seq)`` and then writes rows derived from it, so under the
+        legacy mode two processes could both read the same MAX and stamp the SAME
+        updated_seq. A peer's watermark then skips past one of them → that row is
+        NEVER pulled → permanently stale in-memory state (a benchmark result the
+        coordinator never sees). Proven with a two-writer test.
+
+        IMMEDIATE (not deferred) because a deferred txn that reads first and writes
+        later must UPGRADE its lock, which raises SQLITE_BUSY_SNAPSHOT if a peer
+        wrote in between — an error busy_timeout does NOT retry. IMMEDIATE takes
+        the write lock up front, so contention is handled by busy_timeout instead.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
     def _migrate_schema(self) -> None:
         """Additively bring a pre-Phase-2 DB up to the current schema.
 
@@ -149,8 +184,21 @@ class SubmissionDB:
             ("writer", "TEXT"),
         ):
             if name not in cols:
-                self._conn.execute(f"ALTER TABLE submissions ADD COLUMN {name} {decl}")
-                logger.info("[submission-db] schema: added submissions.%s", name)
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE submissions ADD COLUMN {name} {decl}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    # check-then-act race: the api and the worker boot together and
+                    # both see the column missing, so the loser's ALTER fails. The
+                    # column exists either way — that is the state we wanted.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                    logger.info(
+                        "[submission-db] schema: submissions.%s added by a peer", name
+                    )
+                else:
+                    logger.info("[submission-db] schema: added submissions.%s", name)
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_submissions_updated_seq "
             "ON submissions(updated_seq)"
@@ -213,7 +261,11 @@ class SubmissionDB:
             raise
         n = 0
         try:
-            with self._conn:  # BEGIN…COMMIT (or ROLLBACK on exception)
+            # Explicit BEGIN IMMEDIATE: the connection is in autocommit
+            # (isolation_level=None), where `with self._conn:` would open NO
+            # transaction at all and silently drop this import's all-or-nothing
+            # guarantee (a crash mid-import would leave a half-populated store).
+            with self._immediate():
                 for sid, record in (data or {}).items():
                     if not isinstance(record, dict):
                         continue
@@ -263,11 +315,11 @@ class SubmissionDB:
 
         Each row is stamped with a monotonic ``updated_seq`` (MAX+1) and this
         instance's ``writer`` id, so a second process can incrementally pull just
-        the rows it hasn't seen (see load_since). SQLite serializes writers, so the
-        MAX+1 read-then-write is race-free: it happens inside this transaction while
-        we hold the write lock."""
+        the rows it hasn't seen (see load_since). The MAX+1 read-then-write is
+        race-free ONLY because _immediate() holds the write lock across both — see
+        _immediate for why the legacy ``with self._conn:`` form is not enough."""
         try:
-            with self._conn:
+            with self._immediate():
                 seq = self._conn.execute(
                     "SELECT COALESCE(MAX(updated_seq), 0) FROM submissions"
                 ).fetchone()[0]
@@ -316,35 +368,48 @@ class SubmissionDB:
                 logger.warning("[submission-db] max_seq failed: %s", exc)
                 return 0
 
-    def load_since(self, seq: int) -> list[tuple[str, dict, int]]:
+    def load_since(self, seq: int) -> list[tuple[str, dict, int]] | None:
         """Rows written by ANOTHER store instance after ``seq``, oldest first.
 
         Our OWN rows are excluded IN SQL (``writer <> me``) — they are already in
         this process's memory, so re-parsing them would be pure waste on every read
         of a single-writer node. Returns (submission_id, full record, updated_seq).
         Materialized (not a generator) so the connection isn't held across the
-        caller's in-memory merge."""
+        caller's in-memory merge.
+
+        Returns ``None`` — NOT ``[]`` — if the pull fails. The two are opposite
+        instructions to the caller: ``[]`` means "no peer rows, safe to advance the
+        watermark", while a failure means "unknown, do NOT advance". Conflating them
+        made a transient read blip advance the watermark past rows that were never
+        applied → permanent silent loss."""
         with self._read_lock:
             try:
-                cur = self._read_conn.execute(
+                rows = self._read_conn.execute(
                     "SELECT s.submission_id, s.data, d.details, s.updated_seq "
                     "FROM submissions s LEFT JOIN submission_details d "
                     "USING(submission_id) "
                     "WHERE s.updated_seq > ? AND (s.writer IS NULL OR s.writer <> ?) "
                     "ORDER BY s.updated_seq",
                     (seq, self._writer_id),
-                )
-                out: list[tuple[str, dict, int]] = []
-                for sid, data, det, row_seq in cur:
-                    record = fastjson.loads(data)
-                    record["benchmark_details"] = (
-                        fastjson.loads(det) if det is not None else None
-                    )
-                    out.append((sid, record, int(row_seq)))
-                return out
+                ).fetchall()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[submission-db] load_since failed: %s", exc)
-                return []
+                return None
+        # Decode OUTSIDE the read lock (and outside the DB): a row that fails to
+        # decode is corruption, not a transient blip, and must not be reported as
+        # "no rows" either — the caller stalls loudly rather than skipping it.
+        try:
+            out: list[tuple[str, dict, int]] = []
+            for sid, data, det, row_seq in rows:
+                record = fastjson.loads(data)
+                record["benchmark_details"] = (
+                    fastjson.loads(det) if det is not None else None
+                )
+                out.append((sid, record, int(row_seq)))
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[submission-db] load_since decode failed: %s", exc)
+            return None
 
     # ── read (startup / reload only; hot reads use the in-memory dict) ────
 
