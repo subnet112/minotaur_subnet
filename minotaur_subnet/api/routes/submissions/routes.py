@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
-from minotaur_subnet.harness.submission_store import SubmissionStatus
+from minotaur_subnet.harness.submission_store import SubmissionStatus, offload_write
 from minotaur_subnet.harness.round_store import RoundStatus
 
 from .models import (
@@ -1052,7 +1052,8 @@ async def create_submission(
     # For the private path also stash is_private/private_repo_full (persisted) and
     # the per-submission token (in-memory only, purged on terminal state).
     try:
-        sub = store.create(
+        sub = await offload_write(
+            store.create,
             repo_url=pr["clone_url"],
             commit_hash=pr["head_sha"],
             epoch=body.epoch,
@@ -1623,6 +1624,17 @@ async def abort_solver_round(
 @router.get("/solver/round", response_model=SolverRoundResponse)
 async def get_solver_round() -> SolverRoundResponse:
     """Return the current solver submission round."""
+    # _get_current_solver_round WRITES the round store (incumbent sync +
+    # lazy ensure_open_round). The split benchmark worker keeps solver_rounds.json
+    # READ-ONLY (the api coordinator is the sole writer; RoundStore has no
+    # cross-process lock), so serve a pure read there — same gate as
+    # get_solver_champion. The coordinator maintains the open round, so a live
+    # worker sees a non-None current; 404 only in the transient no-round window.
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() in ("1", "true", "yes"):
+        current = get_round_store().get_current_round()
+        if current is None:
+            raise HTTPException(status_code=404, detail="No open solver round")
+        return _round_state_to_response(current)
     current = _get_current_solver_round(epoch_hint=0)
     return _round_state_to_response(current)
 
@@ -1690,10 +1702,29 @@ async def list_solver_rounds(
 @router.get("/solver/champion", response_model=SolverChampionResponse)
 async def get_solver_champion() -> SolverChampionResponse:
     """Return the last activated/adopted champion snapshot."""
+    store = get_store()
     round_store = get_round_store()
-    _sync_round_incumbent_from_submission_store(round_store, get_store())
+    # This lazy incumbent sync is a round-store WRITE (only on drift). The split
+    # benchmark worker keeps solver_rounds.json READ-ONLY (the api coordinator is
+    # the sole writer, and round_store has no cross-process lock), and the
+    # coordinator syncs the incumbent on its own path — so skip the write here on
+    # the worker. Its champion reads still reflect the shared file.
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+        _sync_round_incumbent_from_submission_store(round_store, store)
     champion = round_store.get_active_champion()
-    return SolverChampionResponse(**champion.to_dict())
+    d = champion.to_dict()
+    # Copycat attribution for the champion. The ChampionSnapshot is
+    # consensus-serialized, so we DON'T add fields to it — we resolve the
+    # already-computed flag from the champion's submission at read time
+    # (null/false if that submission has since been pruned). display_name carries
+    # the "-copycat" suffix; coined_by_uid is the original coiner's current UID.
+    sub = store.get(d.get("submission_id")) if d.get("submission_id") else None
+    if sub is not None:
+        _coiner = getattr(sub, "coined_by_hotkey", None)
+        d["display_name"] = getattr(sub, "display_name", None)
+        d["is_copycat"] = getattr(sub, "is_copycat", False)
+        d["coined_by_uid"] = _hotkey_to_uid_map().get(_coiner) if _coiner else None
+    return SolverChampionResponse(**d)
 
 
 @router.get("/submissions/{submission_id}/status", response_model=StatusResponse)
@@ -1707,6 +1738,11 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
     # Current-metagraph UID for the submitting hotkey (null when the metagraph
     # hasn't synced or the hotkey has since deregistered) — display only.
     d["miner_uid"] = _hotkey_to_uid_map().get(sub.hotkey)
+    # Copycat attribution: status_dict already carries is_copycat + display_name;
+    # resolve the coiner's hotkey → its current UID here (coined_by_hotkey stays
+    # internal). Null when the original coiner has since churned off the metagraph.
+    _coiner = getattr(sub, "coined_by_hotkey", None)
+    d["coined_by_uid"] = _hotkey_to_uid_map().get(_coiner) if _coiner else None
     # Feedback report (P1): cheap read+shape of the already-persisted benchmark
     # detail + aggregate-vs-champion. Best-effort — never break /status on it.
     try:
@@ -1717,12 +1753,20 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         # scalars — and the champion-score / threshold / dethrone-margin lookups
         # that fed them — were removed. See ``report.py`` module docstring.
         reason = d.get("rejection_reason")
-        if not reason and sub.round_id:
+        # One round lookup for both the abort reason and the distributed-veto
+        # verdict (the follower-slice check). veto_observe attaches to the report
+        # only when this submission was the finalist the followers checked.
+        _veto_observe = None
+        if sub.round_id:
             rs = get_round_store().get_round(sub.round_id)
-            if rs is not None and getattr(rs, "abort_reason", None):
-                reason = rs.abort_reason
+            if rs is not None:
+                if not reason and getattr(rs, "abort_reason", None):
+                    reason = rs.abort_reason
+                _veto_observe = getattr(rs, "veto_observe", None)
 
-        d["report"] = build_submission_report(sub, reason=reason)
+        d["report"] = build_submission_report(
+            sub, reason=reason, veto_observe=_veto_observe,
+        )
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)
         d["report"] = None
@@ -1767,6 +1811,13 @@ async def list_submissions(
         # Current-metagraph UID for the submitting hotkey (null when the
         # metagraph hasn't synced or the hotkey has since deregistered).
         d["miner_uid"] = uid_by_hotkey.get(s.hotkey)
+        # Copycat display: to_dict already carries is_copycat + coined_by_hotkey,
+        # but not the derived display_name (the "-copycat"-suffixed name) or the
+        # resolved coiner UID — add them so the dashboard can render the badge
+        # without re-deriving it.
+        d["display_name"] = getattr(s, "display_name", None)
+        _coiner = getattr(s, "coined_by_hotkey", None)
+        d["coined_by_uid"] = uid_by_hotkey.get(_coiner) if _coiner else None
         return d
 
     return {

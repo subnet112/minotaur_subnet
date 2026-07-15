@@ -37,7 +37,10 @@ from minotaur_subnet.harness.submission_store import (
     SubmissionStatus,
     SubmissionStore,
 )
-from minotaur_subnet.weight_policy import GENESIS_HOTKEY
+from minotaur_subnet.weight_policy import (
+    CHAMPION_MINER_WEIGHT_FRACTION,
+    GENESIS_HOTKEY,
+)
 
 
 # Anvil's well-known account #0 — public test fixture used to satisfy
@@ -981,7 +984,8 @@ class TestEpochManager:
         assert result["abort_reason"] is None
         assert updated_round.abort_reason is None
 
-    def test_persist_round_relative_counts_is_same_pin(self):
+    @pytest.mark.asyncio
+    async def test_persist_round_relative_counts_is_same_pin(self):
         """DISPLAY: _persist_round_relative_counts writes each competitor's SAME-PIN
         relative counts (vs the re-benched champion) onto its own
         benchmark_details['relative'], tagged with the round_id. The champion record
@@ -1003,7 +1007,7 @@ class TestEpochManager:
         mgr = EpochManager(submission_store=store, round_store=RoundStore())
         mgr._champion = ChampionInfo(submission_id="champ")
 
-        mgr._persist_round_relative_counts("round-e1-n1")
+        await mgr._persist_round_relative_counts("round-e1-n1")
 
         rel = store.get("chal").benchmark_details["relative"]
         assert rel["better"] == 2 and rel["worse"] == 0
@@ -1391,9 +1395,12 @@ class TestWeightEmission:
         assert "5Gminer_best" in mapping
         assert "5Gminer_mid" not in mapping
         assert "5Gminer_low" not in mapping
-        # 0.10 to the champion, 0.90 burns to owner.
-        assert mapping["5Gminer_best"] == pytest.approx(0.10)
-        assert mapping[owner] == pytest.approx(0.90)
+        # The champion takes CHAMPION_MINER_WEIGHT_FRACTION, the owner the rest.
+        # Symbolic on purpose: the split is a tunable constant, and this test is
+        # about the champion-takes-all SHAPE, not the current number. The literal
+        # is pinned once, in test_weight_policy.py.
+        assert mapping["5Gminer_best"] == pytest.approx(CHAMPION_MINER_WEIGHT_FRACTION)
+        assert mapping[owner] == pytest.approx(1 - CHAMPION_MINER_WEIGHT_FRACTION)
 
     @pytest.mark.asyncio
     async def test_no_champion_burns_to_owner(self, monkeypatch):

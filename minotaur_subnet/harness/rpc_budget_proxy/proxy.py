@@ -79,10 +79,27 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
+from minotaur_subnet.rpc_backoff import (
+    DEFAULT_FORWARD_DEADLINE_SECONDS,
+    body_has_retryable_rpc_error,
+    is_retryable_status,
+    retry_async,
+)
+
+from ._persist import SnapshotScheduler, load_snapshot
 from .cost_table import batch_cost, request_cost
 from .rewrite_table import classify, rewrite_single
 
 logger = logging.getLogger(__name__)
+
+
+def _host_of(url: str) -> str:
+    """Host of an upstream URL for logging — never the full URL (it carries the
+    provider API key in the path)."""
+    try:
+        return url.split("://", 1)[1].split("/", 1)[0]
+    except (IndexError, AttributeError):
+        return "upstream"
 
 # Deterministic budget-exceeded error (consensus-visible to the solver).
 BUDGET_EXCEEDED_CODE = -32099
@@ -234,6 +251,33 @@ class PinCache:
             "entries": sum(len(g) for g in self._blocks.values()),
         }
 
+    def snapshot(self) -> list[list[Any]]:
+        """On-loop copy for persistence: ``[[chain, block_hex, {key: result}], ...]``
+        in LRU order (JSON has no tuple keys, so the ``(chain, block)`` key is
+        flattened into the row). Inner groups are copied so the JSON encode can
+        run in a worker thread without racing further writes."""
+        return [[chain, block, dict(group)]
+                for (chain, block), group in self._blocks.items()]
+
+    def restore(self, payload: Any) -> int:
+        """Rebuild ``_blocks`` from :meth:`snapshot` output, honouring the current
+        ``max_blocks`` / ``max_entries_per_block`` bounds; returns the entry count
+        loaded. Tolerant of a malformed payload (bad rows are skipped) — worst
+        case a partial warm cache, never a crash."""
+        self._blocks = {}
+        if not isinstance(payload, list):
+            return 0
+        for row in payload[-self.max_blocks:]:  # keep the most-recent block groups
+            if not (isinstance(row, list) and len(row) == 3):
+                continue
+            chain, block, group = row
+            if not isinstance(group, dict):
+                continue
+            if len(group) > self.max_entries_per_block:
+                group = dict(list(group.items())[:self.max_entries_per_block])
+            self._blocks[(str(chain), str(block))] = group
+        return sum(len(g) for g in self._blocks.values())
+
 
 class Session:
     """Per-benchmark-session meter.
@@ -354,6 +398,16 @@ class BudgetProxy:
         # False = RPC_PROXY_RESPONSE_CACHE=0 rollback: skip both caches, forward
         # everything (metering/pinning unaffected — they never depended on them).
         self.response_cache_enabled = bool(response_cache_enabled)
+        # Optional disk persistence for the pin cache: warm-load on startup and
+        # snapshot on a cadence so the api's rm+run proxy recreate (on every
+        # update) skips the cold re-fetch storm. Inert unless the env path is set.
+        self._pin_persist_path = os.environ.get(
+            "RPC_PROXY_PIN_CACHE_PERSIST_PATH", "").strip()
+        self._pin_snapshotter = SnapshotScheduler(
+            self._pin_persist_path,
+            _env_int("RPC_PROXY_PIN_CACHE_PERSIST_INTERVAL", 300),
+            self._pin_cache.snapshot,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -369,8 +423,18 @@ class BudgetProxy:
             self.default_mode,
             self.default_budget,
         )
+        if self._pin_snapshotter.enabled and self.response_cache_enabled:
+            payload = load_snapshot(self._pin_persist_path)
+            if payload is not None:
+                n = self._pin_cache.restore(payload)
+                logger.info(
+                    "pin-cache warm-loaded %d entries from %s",
+                    n, self._pin_persist_path,
+                )
+            await self._pin_snapshotter.start()
 
     async def _on_cleanup(self, _app: web.Application) -> None:
+        await self._pin_snapshotter.stop()  # final snapshot + cancel periodic task
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -587,7 +651,8 @@ class BudgetProxy:
         """
         assert self._client is not None, "client session not started"
         content_type = request.headers.get("Content-Type", "application/json")
-        try:
+
+        async def _once() -> tuple[int, bytes, str]:
             async with self._client.post(
                 upstream,
                 data=raw_body,
@@ -595,18 +660,36 @@ class BudgetProxy:
             ) as resp:
                 body = await resp.read()
                 resp_ct = resp.headers.get("Content-Type", "application/json")
-                return web.Response(
-                    body=body,
-                    status=resp.status,
-                    content_type=_content_type_only(resp_ct),
-                )
+                return resp.status, body, _content_type_only(resp_ct)
+
+        # Retry TRANSIENT upstream failures (429 / -32005 compute-unit / 5xx /
+        # timeout / connection reset) with exponential backoff before surfacing
+        # anything to the solver. This is the fairness fix: a single Alchemy
+        # rate-limit hiccup otherwise fails the solver's read → the order scores
+        # 0/dropped → the whole challenger is vetoed for a provider blip.
+        # DETERMINISM-SAFE: the budget was already charged before _forward, and
+        # the read is block-pinned, so a retry re-fetches the SAME value without
+        # changing `spent` or the pack hash. Fail-loud after retries exhaust.
+        # deadline_seconds bounds cumulative wall-clock so a stalled upstream (the
+        # 30s per-request timeout) is not re-tried into ~4×30s — which would
+        # asymmetrically blow the solver's plan window on the throttled validator
+        # and split adopt-vs-veto at quorum>1.
+        try:
+            status, body, ct = await retry_async(
+                _once,
+                deadline_seconds=DEFAULT_FORWARD_DEADLINE_SECONDS,
+                retry_on_result=lambda r: is_retryable_status(r[0])
+                or body_has_retryable_rpc_error(r[1]),
+                label=f"pin-proxy→{_host_of(upstream)}",
+            )
+            return web.Response(body=body, status=status, content_type=ct)
         except asyncio.TimeoutError:
-            logger.error("upstream timeout forwarding to %s", upstream)
+            logger.error("upstream timeout forwarding to %s (after retries)", upstream)
             return self._json_error_response(
                 None, code=-32000, message="upstream timeout", http_status=504
             )
         except Exception as exc:  # noqa: BLE001 - surface any transport failure
-            logger.error("upstream error forwarding to %s: %s", upstream, exc)
+            logger.error("upstream error forwarding to %s (after retries): %s", upstream, exc)
             return self._json_error_response(
                 None, code=-32000, message="upstream unreachable", http_status=502
             )

@@ -33,6 +33,7 @@ from minotaur_subnet.sdk.intent_solver import MarketSnapshot
 from minotaur_subnet.harness.submission_store import (
     SubmissionStatus,
     SubmissionStore,
+    offload_write,
 )
 from minotaur_subnet.harness.round_store import RoundStatus, RoundStore
 from minotaur_subnet.consensus.round_anchor import ForkPinUnavailable
@@ -619,6 +620,12 @@ class BenchmarkWorker:
         while self._running:
             try:
                 processed = await self.run_once()
+                # Bump AFTER a completed pass (processed 0 or N) — NOT before — so a
+                # worker that raises every tick (dead proxy / sim gone) never reaches
+                # here, its heartbeat goes stale, and the container is marked
+                # unhealthy. A clean idle pass (0 work) still bumps = healthy. The
+                # per-image touch inside run_once bounds long slates.
+                self._touch_worker_heartbeat()
                 if processed == 0:
                     await asyncio.sleep(interval)
             except Exception as exc:
@@ -628,6 +635,28 @@ class BenchmarkWorker:
     def stop(self) -> None:
         """Signal the worker to stop after the current batch."""
         self._running = False
+
+    def _touch_worker_heartbeat(self) -> None:
+        """Forward-progress heartbeat for the SPLIT worker container's healthcheck.
+
+        Bumps the mtime of ``BENCHMARK_WORKER_HEARTBEAT_FILE`` (default
+        ``/data/.benchmark_worker_heartbeat``) each run_loop iteration AND each
+        per-submission bench step. The container healthcheck asserts the file is
+        recent → a wedged/hung run_once (e.g. a blocked sim call) goes stale and
+        the container is marked unhealthy so an external restarter recycles it.
+
+        No-op outside the dedicated worker (BENCHMARK_WORKER_ONLY unset) so the
+        monolith api is unaffected. Best-effort — never raises into the loop."""
+        if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+            return
+        path = os.environ.get(
+            "BENCHMARK_WORKER_HEARTBEAT_FILE", "/data/.benchmark_worker_heartbeat",
+        )
+        try:
+            with open(path, "w") as fh:
+                fh.write(str(time.time()))
+        except OSError:
+            pass
 
     def _current_replay_round(self) -> Any | None:
         """Return the active replay-ready round when explicit round gating is enabled."""
@@ -879,7 +908,7 @@ class BenchmarkWorker:
         if not intents:
             logger.warning("No active intents for benchmarking")
             for sub in benchmarking:
-                self._sub_store.set_benchmark_result(
+                await offload_write(self._sub_store.set_benchmark_result,
                     sub.submission_id,
                     valid=False,
                     details={"error": "no_active_intents"},
@@ -913,6 +942,9 @@ class BenchmarkWorker:
 
         # Benchmark each submission (route by solver_path or image_tag)
         for sub in benchmarking:
+            # Per-submission heartbeat: a full slate pass can run minutes; bump
+            # between images so the healthcheck sees progress, not just at loop top.
+            self._touch_worker_heartbeat()
             # FRESH-STATUS GUARD: ``benchmarking`` is a snapshot; rotation at
             # round close terminally rejects the slate overflow "regardless of
             # benchmark progress" (and purges its private token), and a restart
@@ -940,7 +972,7 @@ class BenchmarkWorker:
                 continue
             if sub.solver_path is not None:
                 if not _allow_subprocess_benchmark():
-                    self._sub_store.reject(
+                    await offload_write(self._sub_store.reject,
                         sub.submission_id,
                         (
                             "Subprocess benchmarking is disabled by policy. "
@@ -967,7 +999,7 @@ class BenchmarkWorker:
                     details = self._results_to_details(results)
                     valid = has_delivered_value_rows(details["per_intent"])
 
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=valid,
                         details=details,
@@ -982,7 +1014,7 @@ class BenchmarkWorker:
                         "Benchmarking failed for %s: %s",
                         sub.submission_id, exc,
                     )
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=False,
                         details={"error": str(exc)},
@@ -1002,7 +1034,7 @@ class BenchmarkWorker:
                     valid = has_delivered_value_rows(details["per_intent"])
                     print(f"[BENCHMARK] valid={valid} orders={len(results)}", flush=True)
 
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=valid,
                         details=details,
@@ -1020,7 +1052,7 @@ class BenchmarkWorker:
                         "Benchmarking failed for %s: %s",
                         sub.submission_id, exc,
                     )
-                    self._sub_store.set_benchmark_result(
+                    await offload_write(self._sub_store.set_benchmark_result,
                         sub.submission_id,
                         valid=False,
                         details={"error": str(exc)},
@@ -1028,7 +1060,7 @@ class BenchmarkWorker:
 
             else:
                 print(f"[BENCHMARK] No solver_path or image_tag for {sub.submission_id}", flush=True)
-                self._sub_store.reject(
+                await offload_write(self._sub_store.reject,
                     sub.submission_id,
                     "No solver_path or image_tag available for benchmarking",
                     outcome_code="benchmark_failed",
@@ -1038,7 +1070,7 @@ class BenchmarkWorker:
         self._transition_solving_apps(benchmarking)
 
         # Assign ranks within the replay batch; champion activation happens later.
-        self._rank_scored_submissions(benchmarking)
+        await self._rank_scored_submissions(benchmarking)
 
         return len(benchmarking)
 
@@ -1694,24 +1726,28 @@ class BenchmarkWorker:
                 round_id = current_round.round_id
 
         # Create genesis submission (skip screening, go straight to BENCHMARKING)
-        sub = self._sub_store.create(
+        sub = await offload_write(
+            self._sub_store.create,
             repo_url=GENESIS_REPO_URL,
             commit_hash="builtin",
             epoch=GENESIS_EPOCH,
             hotkey=GENESIS_HOTKEY,
             round_id=round_id,
         )
-        self._sub_store.set_solver_info(
+        await offload_write(
+            self._sub_store.set_solver_info,
             sub.submission_id, name="baseline-swap-solver", version="2.0.0",
         )
-        self._sub_store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+        await offload_write(
+            self._sub_store.update_status, sub.submission_id, SubmissionStatus.BENCHMARKING,
+        )
         logger.info("Genesis submission created: %s", sub.submission_id)
 
         # Load intents, build scoring, enrich with manifests (same as run_once)
         intents = self._load_benchmark_intents()
         if not intents:
             logger.warning("Genesis: no active intents for benchmarking")
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=False, details={"error": "no_active_intents"},
             )
             return 1
@@ -1740,7 +1776,7 @@ class BenchmarkWorker:
             details = self._results_to_details(results)
             valid = has_delivered_value_rows(details["per_intent"])
 
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=valid, details=details,
             )
             logger.info(
@@ -1749,13 +1785,13 @@ class BenchmarkWorker:
             )
         except Exception as exc:
             logger.exception("Genesis benchmarking failed: %s", exc)
-            self._sub_store.set_benchmark_result(
+            await offload_write(self._sub_store.set_benchmark_result,
                 sub.submission_id, valid=False, details={"error": str(exc)},
             )
 
         # Transition SOLVING apps and rank the replay result (same pipeline as run_once)
         self._transition_solving_apps([sub])
-        self._rank_scored_submissions([sub])
+        await self._rank_scored_submissions([sub])
 
         return 1
 
@@ -2511,7 +2547,7 @@ class BenchmarkWorker:
                     bare_app_id, dep.chain_id, best_sc,
                 )
 
-    def _rank_scored_submissions(
+    async def _rank_scored_submissions(
         self,
         submissions: list,
     ) -> list[Any]:
@@ -2553,8 +2589,11 @@ class BenchmarkWorker:
             str(s.submission_id or ""),
         ))
 
+        # Set every rank in ONE offloaded, locked read-modify-write instead of
+        # N whole-store persists on the event loop.
+        ranks: dict[str, int] = {}
         for i, sub in enumerate(scored):
-            self._sub_store.set_benchmark_rank(sub.submission_id, i + 1)
+            ranks[sub.submission_id] = i + 1
             # [gas-shadow] soak observability — incumbent (stored rows) vs
             # this challenger's fresh rows; display/log only, never feeds
             # the rank above or any verdict.
@@ -2563,4 +2602,5 @@ class BenchmarkWorker:
                 (sub.benchmark_details or {}).get("per_intent") or [],
                 ctx=f"rank{i + 1}:{sub.submission_id}",
             )
+        await offload_write(self._sub_store.set_benchmark_ranks, ranks)
         return scored

@@ -116,7 +116,10 @@ class _FakeStore:
         self.attempts: list[tuple] = []
 
     def get_app(self, app_id):
-        return SimpleNamespace(app_id=app_id, name="DexAggregator")
+        return SimpleNamespace(
+            app_id=app_id, name="DexAggregator",
+            js_code="function score(){return 1;}",
+        )
 
     def get_deployment(self, app_id, chain_id=None):
         return SimpleNamespace(
@@ -237,6 +240,11 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(len(runner.calls), 1)
         self.assertIsNotNone(runner.calls[0].intent_order)
         self.assertEqual(runner.calls[0].intent_order, _sentinel)
+        # The simulator's scoreIntent branch gates on `contract_address AND
+        # intent_order` — passing None here silently demotes the sim to the
+        # bare-interaction path (0 delivered), which is exactly the V2
+        # chain-1 zero-quote bug's final layer.
+        self.assertEqual(runner.calls[0].contract_address, _DEPLOYED)
         # Revert-avoidance: the order's submitted_by == the intent_order's source
         # == the receiver the encoder was handed (the pre-funded Anvil default).
         self.assertEqual(
@@ -246,6 +254,56 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(
             _captured["receiver"], "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
         )
+
+    def test_manifest_lazy_loads_into_shared_engine_when_missing(self):
+        """An app the shared engine has never scored (e.g. a fresh V2
+        deployment with no live orders yet) has no cached manifest. The quote
+        path must lazy-load the app's js_code into the engine — not silently
+        degrade to the bare-interaction sim, which measures 0 delivered (the
+        DEX Aggregator V2 chain-1 zero-quote bug)."""
+        _MANIFEST = {"intent_functions": [{"name": "swap"}]}
+
+        class _FakeEngine:
+            def __init__(self):
+                self.loaded: list = []
+                self._manifests: dict = {}
+
+            def get_manifest(self, app_id):
+                return self._manifests.get(app_id)
+
+            async def load_intent(self, app_id, js_code):
+                self.loaded.append((app_id, js_code))
+                self._manifests[app_id] = _MANIFEST
+
+        _captured: dict = {}
+
+        def _fake_builder(state, plan, manifest=None):
+            _captured["manifest"] = manifest
+            # Like the real builder: no manifest → no intent_order (bare path).
+            return {"submitted_by": "0xf39F"} if manifest else None
+
+        orchestrator_module._build_benchmark_intent_order = _fake_builder
+
+        engine = _FakeEngine()
+        orders_module.set_js_engine(engine)
+        runner = _FakeSimRunner()
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        resp = self._post_quote()
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # The engine was lazily fed the app's js_code exactly once…
+        self.assertEqual(
+            engine.loaded, [("testapp", "function score(){return 1;}")],
+        )
+        # …the builder received the freshly extracted manifest…
+        self.assertEqual(_captured["manifest"], _MANIFEST)
+        # …and the sim therefore ran the scoreIntent path, not the bare one.
+        self.assertEqual(len(runner.calls), 1)
+        self.assertIsNotNone(runner.calls[0].intent_order)
 
     def test_estimated_output_from_scoreintent_raw_output_metadata(self):
         """estimated_output must read the scoreIntent gained value the live scorer

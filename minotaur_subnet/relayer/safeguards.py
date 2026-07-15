@@ -10,11 +10,27 @@ Layers:
 1. **Deadline check** — reject plans whose ``deadline`` has passed.
    Catches replay of expired plans cheaply.
 
-2. **Plan-hash dedup** — in-memory ``set[plan_hash]`` with TTL bounded
-   by the plan's deadline + grace. Each unique plan submittable exactly
-   once. Survives RPC failure & retry-noise of the calling code.
-   Restart-vulnerable; the on-chain nonce burn is the authoritative
-   replay defense underneath this.
+2. **Submission dedup** — in-memory reservation keyed by
+   ``(order_id, execution_count, plan_hash)`` with a TTL clamped to a
+   broadcast-window scale regardless of the plan's claimed deadline.
+   Each logical submission (one fill round of one order) submittable
+   exactly once while in flight — this is what stops two duplicate
+   submissions racing past the pre-broadcast dry-run and double-executing
+   a perpetual order. Restart-vulnerable; the on-chain nonce burn /
+   cooldown is the authoritative replay defense underneath this.
+   Cross-order replay needs no dedup at all: validator approvals sign
+   ``PlanApproval(orderId, planHash, score)``, so a plan approved for
+   one order can never be submitted under another.
+
+   The key/TTL shape matters — three production incidents from the
+   original ``plan_hash``-only version (2026-07-15): a submission that
+   failed on the gas-balance floor permanently burned its hash; the
+   champion's sentinel plan deadline (~year 2286) made every entry
+   permanent; and a second order with byte-identical champion calldata
+   (deterministic solver, recurring DCA orders) collided with the
+   first. Reservations are therefore released on pre-broadcast failure
+   (nothing happened on-chain), the TTL is clamped, and the key is
+   scoped per fill-round.
 
 3. **Per-caller rate limit** — sliding-window counter keyed by the
    wrapper's signer address. Bounds how many submissions any single
@@ -48,7 +64,13 @@ logger = logging.getLogger(__name__)
 
 
 # Tunables — all overrideable via env so we can adjust without restart-the-world.
-DEFAULT_DEDUP_GRACE_SECONDS = 600  # how long after deadline to keep a plan_hash
+DEFAULT_DEDUP_GRACE_SECONDS = 600  # how long after deadline to keep a reservation
+# Hard ceiling on how far into the future a dedup reservation may live,
+# no matter what deadline the plan claims. Miner-authored plans carry
+# sentinel deadlines (~10^10); trusting them made reservations permanent.
+# The dedup only needs to cover the in-flight broadcast/confirmation
+# window — after that, on-chain nonce burn / cooldown takes over.
+DEFAULT_DEDUP_MAX_TTL_SECONDS = 900  # 15 min
 DEFAULT_PER_CALLER_LIMIT = 60       # submissions
 DEFAULT_PER_CALLER_WINDOW_SECONDS = 3600  # 60/hour
 DEFAULT_DAILY_GAS_CAP_ETH = 0.5     # halt submissions after 0.5 ETH of gas in 24h
@@ -70,10 +92,11 @@ class Safeguards:
     per_caller_window_seconds: int = DEFAULT_PER_CALLER_WINDOW_SECONDS
     daily_gas_cap_wei: int = field(default_factory=lambda: int(DEFAULT_DAILY_GAS_CAP_ETH * 10**18))
     dedup_grace_seconds: int = DEFAULT_DEDUP_GRACE_SECONDS
+    dedup_max_ttl_seconds: int = DEFAULT_DEDUP_MAX_TTL_SECONDS
 
     # state
     _lock: threading.Lock = field(default_factory=threading.Lock)
-    # plan_hash -> evict_at (unix seconds)
+    # dedup_key ("order_id:execution_count:plan_hash") -> evict_at (unix seconds)
     _seen_plan_hashes: dict[str, int] = field(default_factory=dict)
     # caller_addr_lower -> list[unix_seconds] of recent successful submissions
     _caller_history: dict[str, list[int]] = field(default_factory=dict)
@@ -103,6 +126,7 @@ class Safeguards:
             per_caller_window_seconds=_int_env("RELAYER_PER_CALLER_WINDOW_SECONDS", DEFAULT_PER_CALLER_WINDOW_SECONDS),
             daily_gas_cap_wei=int(cap_eth * 10**18),
             dedup_grace_seconds=_int_env("RELAYER_DEDUP_GRACE_SECONDS", DEFAULT_DEDUP_GRACE_SECONDS),
+            dedup_max_ttl_seconds=_int_env("RELAYER_DEDUP_MAX_TTL_SECONDS", DEFAULT_DEDUP_MAX_TTL_SECONDS),
         )
 
     # ── Public checks. Each returns (ok: bool, error: str) ─────────────
@@ -115,19 +139,47 @@ class Safeguards:
             return False, f"plan deadline expired ({plan_deadline} <= now {now})"
         return True, ""
 
-    def check_plan_hash_unseen(self, plan_hash: str, plan_deadline: int) -> tuple[bool, str]:
-        """Check + reserve the plan_hash. Idempotent at the hash level:
-        same hash twice returns False the second time, and the cache
-        evicts when (deadline + grace) elapses.
+    def check_plan_hash_unseen(self, dedup_key: str, plan_deadline: int) -> tuple[bool, str]:
+        """Check + reserve a submission slot. Idempotent at the key level:
+        same key twice returns False the second time, and the cache evicts
+        when min(deadline, now + max_ttl) + grace elapses.
+
+        ``dedup_key`` is the caller's identity for one logical submission —
+        ``handle_submit_plan`` uses ``order_id:execution_count:plan_hash``
+        so distinct orders (and successive perpetual fill rounds) never
+        collide even when the champion emits byte-identical plans. The
+        deadline is CLAMPED to ``dedup_max_ttl_seconds`` because plans
+        carry miner-authored sentinel deadlines; the reservation only
+        needs to outlive the broadcast/confirmation window.
+
+        A reservation made here must be released via ``release_plan_hash``
+        if the submission later fails before broadcast — otherwise a
+        transient failure (gas floor, dry-run revert) blocks the retry.
         """
         now = int(time.time())
+        evict_at = min(int(plan_deadline), now + self.dedup_max_ttl_seconds) + self.dedup_grace_seconds
         with self._lock:
             self._evict_expired(now)
-            existing = self._seen_plan_hashes.get(plan_hash)
+            existing = self._seen_plan_hashes.get(dedup_key)
             if existing is not None and existing > now:
                 return False, f"plan_hash already submitted (re-submittable after {existing - now}s)"
-            self._seen_plan_hashes[plan_hash] = int(plan_deadline) + self.dedup_grace_seconds
+            self._seen_plan_hashes[dedup_key] = evict_at
             return True, ""
+
+    def release_plan_hash(self, dedup_key: str) -> None:
+        """Release a reservation made by ``check_plan_hash_unseen``.
+
+        Called when the submission failed WITHOUT broadcasting a tx
+        (gas-balance floor, pre-broadcast dry-run revert, estimate_gas
+        error) — nothing happened on-chain, so there is nothing for the
+        dedup to protect and the caller must be free to retry. Do NOT
+        call this when a tx was broadcast (success or mined-revert), and
+        do NOT call it on ambiguous crashes — the clamped TTL bounds the
+        damage of a stale reservation to minutes either way. No-op for
+        unknown keys.
+        """
+        with self._lock:
+            self._seen_plan_hashes.pop(dedup_key, None)
 
     def check_caller_rate(self, caller_addr: str) -> tuple[bool, str]:
         """Check the caller hasn't exceeded the per-window limit.

@@ -175,6 +175,41 @@ def test_set_app_config_rejects_unknown_field(tmp_path):
         _store(tmp_path), "app_x", 8453, {"nope": 1})["error"]
 
 
+def test_set_app_config_flips_fee_mode_to_app(tmp_path):
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc):
+        out = set_app_config(s, "app_x", 8453, {"fee_mode": 1})
+
+    assert out["txs"] == {"fee_mode": "0xtx"}
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setFeeMode(uint8)"
+    assert call.args[4] == [1]
+
+
+def test_set_app_config_rejects_invalid_fee_mode(tmp_path):
+    assert "fee_mode" in set_app_config(
+        _store(tmp_path), "app_x", 8453, {"fee_mode": 2})["error"]
+
+
+def test_set_app_config_sets_app_owner(tmp_path):
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    owner = "0x" + "99" * 20
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc):
+        out = set_app_config(s, "app_x", 8453, {"app_owner": owner})
+
+    assert out["txs"] == {"app_owner": "0xtx"}
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setAppOwner(address)"
+    assert call.args[4] == [owner]
+
+
+def test_set_app_config_rejects_zero_app_owner(tmp_path):
+    assert "app_owner" in set_app_config(
+        _store(tmp_path), "app_x", 8453, {"app_owner": "0x" + "00" * 20})["error"]
+
+
 # ── registry calldata ────────────────────────────────────────────────────
 
 
@@ -306,3 +341,133 @@ def test_set_developer_allowed_sends_owner_tx(tmp_path):
     call = relayer.call_contract_function.await_args
     assert call.args[2] == "setDeveloperAllowed(address,bool)"
     assert call.args[4] == ["0x" + "63" * 20, True]
+
+
+def test_set_developer_allowed_owner_mismatch_is_clean_error(tmp_path):
+    # owner() = operator wallet, relayer wallet = 0xd4… → no doomed tx sent.
+    operator = bytes(12) + b"\xab" * 20
+    views = {
+        _k("owner()"): operator,
+        _k("allowedDevelopers(address)"): bytes(32),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert "registry owner is" in out["error"]
+    assert out["owner"].lower() == "0x" + "ab" * 20
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_set_developer_allowed_owner_match_sends_tx(tmp_path):
+    # owner() == relayer wallet (0xd4…) → the pre-check lets the tx through.
+    views = {
+        _k("owner()"): bytes(12) + b"\xd4" * 20,
+        _k("allowedDevelopers(address)"): bytes(32),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out["changed"] is True and out["tx"] == "0xtx"
+
+
+def test_set_developer_allowed_revert_is_clean_error(tmp_path):
+    # Tx raising (revert / RPC rejection) → {"error": …}, never a 500.
+    views = {_k("allowedDevelopers(address)"): bytes(32)}
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    relayer.call_contract_function = AsyncMock(
+        side_effect=RuntimeError("setDeveloperAllowed(address,bool) reverted: tx=0xdead"))
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out["error"].startswith("setDeveloperAllowed failed:")
+    assert "reverted" in out["error"]
+
+
+# ── appOwner bootstrap at deploy ─────────────────────────────────────────
+
+DEV = "0x" + "44" * 20
+
+
+def _owner_env(tmp_path, views):
+    s = _store(tmp_path)
+    svc, relayer = _deploy_service_with_relayer()
+    w3 = MagicMock()
+    def call(tx):
+        key = bytes.fromhex(tx["data"][2:])[:4]
+        if key in views:
+            return views[key]
+        raise Exception("execution reverted")
+    w3.eth.call.side_effect = call
+    return s, svc, relayer, w3
+
+
+def test_bootstrap_app_owner_sets_owner_on_fresh_v2(tmp_path):
+    views = {_k("appOwner()"): bytes(32)}  # deployed, owner unset (0x0)
+    from minotaur_subnet.api.services.app_lifecycle import bootstrap_app_owner
+    s, svc, relayer, w3 = _owner_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = bootstrap_app_owner(s, "app_x", 8453, APP_ADDR, DEV)
+    assert out["owner_set"] is True and out["tx"] == "0xtx"
+    call = relayer.call_contract_function.await_args
+    assert call.args[2] == "setAppOwner(address)"
+    assert call.args[4] == [DEV]
+
+
+def test_bootstrap_app_owner_skips_when_already_owned(tmp_path):
+    views = {_k("appOwner()"): bytes(12) + b"\x99" * 20}
+    from minotaur_subnet.api.services.app_lifecycle import bootstrap_app_owner
+    s, svc, relayer, w3 = _owner_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = bootstrap_app_owner(s, "app_x", 8453, APP_ADDR, DEV)
+    assert out.get("already") is True and out["owner_set"] is True
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_bootstrap_app_owner_skips_v1_contract_without_view(tmp_path):
+    # V1 base has no appOwner() — the probe reverts → skip, no tx.
+    from minotaur_subnet.api.services.app_lifecycle import bootstrap_app_owner
+    s, svc, relayer, w3 = _owner_env(tmp_path, views={})
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = bootstrap_app_owner(s, "app_x", 8453, APP_ADDR, DEV)
+    assert out["owner_set"] is False and "appOwner" in out["skipped"]
+    relayer.call_contract_function.assert_not_awaited()
+
+
+def test_bootstrap_app_owner_skips_without_deployer(tmp_path):
+    from minotaur_subnet.api.services.app_lifecycle import bootstrap_app_owner
+    out = bootstrap_app_owner(_store(tmp_path), "app_x", 8453, APP_ADDR, "")
+    assert out["owner_set"] is False and "deployer" in out["skipped"]
+
+
+def test_bootstrap_app_owner_never_raises(tmp_path):
+    from minotaur_subnet.api.services.app_lifecycle import bootstrap_app_owner
+    with patch("minotaur_subnet.api.services._state._deploy_service", None):
+        out = bootstrap_app_owner(_store(tmp_path), "app_x", 8453, APP_ADDR, DEV)
+    assert out["owner_set"] is False
+
+
+def test_set_developer_allowed_already_set_skips_owner_check(tmp_path):
+    # Already in the desired state → changed:False, and the owner mismatch is
+    # IRRELEVANT (no tx needed). The pre-#782 ordering returned "registry
+    # owner is …" here, which aborted auto-register on production even though
+    # the relayer was already allowlisted and registerApp needed no owner.
+    operator = bytes(12) + b"\xab" * 20  # owner != relayer wallet
+    views = {
+        _k("owner()"): operator,
+        _k("allowedDevelopers(address)"): (1).to_bytes(32, "big"),
+    }
+    from minotaur_subnet.api.services.app_lifecycle import set_developer_allowed
+    s, svc, relayer, w3 = _registry_env(tmp_path, views)
+    with patch("minotaur_subnet.api.services._state._deploy_service", svc), \
+         patch("minotaur_subnet.blockchain.chains.get_web3", return_value=w3):
+        out = set_developer_allowed(s, "app_x", 8453, "0x" + "63" * 20, True)
+    assert out == {"developer": "0x" + "63" * 20, "allowed": True, "changed": False}
+    relayer.call_contract_function.assert_not_awaited()

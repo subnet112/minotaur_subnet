@@ -49,6 +49,7 @@ def build_submission_report(
     *,
     reason: str | None,
     won: bool = False,
+    veto_observe: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Assemble the per-order feedback report, or None if nothing to report yet.
 
@@ -249,6 +250,30 @@ def build_submission_report(
                 report["reason_relative"] = rel_reason
         except Exception:  # additive surface — must never break the report
             pass
+
+    # ── Distributed burden of proof (follower slices) ──────────────────────
+    # The followers bench a DISJOINT slice of historical orders (outside the
+    # leader's draw) against this candidate; the leader re-benches any claimed
+    # veto to confirm it. Attach the round's verdict ONLY when this submission is
+    # the finalist the followers actually checked (candidate match) and the phase
+    # produced a real verdict. ``confirmed_regression`` (would_gate_confirmed) is
+    # the enforce-mode block signal: the leader reproduced a hard regression on an
+    # order the leader's own benchmark never saw.
+    if (
+        isinstance(veto_observe, dict)
+        and veto_observe.get("candidate_submission_id")
+        == getattr(sub, "submission_id", None)
+        and veto_observe.get("resolution") not in (None, "opened")
+    ):
+        report["distributed_veto"] = {
+            "resolution": veto_observe.get("resolution"),
+            "followers_checked": veto_observe.get("n_assignments"),
+            "responses": veto_observe.get("n_responses"),
+            "ok": veto_observe.get("n_ok"),
+            "veto": veto_observe.get("n_veto"),
+            "confirmed_regression": bool(veto_observe.get("would_gate_confirmed")),
+            "violations": veto_observe.get("violations") or [],
+        }
 
     if rejected_in_screening:
         report["screening"] = screening
@@ -495,6 +520,50 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             "(same-pin) on the status endpoint — pending until the round is evaluated._",
             "",
         ]
+
+    # Distributed burden of proof: the orders OTHER validators checked (their
+    # disjoint slices, outside the leader's draw) and whether the leader
+    # reproduced any regression — the "why you were blocked" a leader-draw win
+    # alone can't show.
+    dv = report.get("distributed_veto")
+    if isinstance(dv, dict) and (dv.get("veto") or dv.get("confirmed_regression")):
+        checked = dv.get("followers_checked")
+        if dv.get("confirmed_regression"):
+            lines += [
+                (
+                    f"**⚠️ Distributed burden of proof — leader-confirmed regression.** "
+                    f"{checked} validator(s) benched a DIFFERENT slice of historical "
+                    f"orders (outside the leader's draw); the leader reproduced a hard "
+                    f"regression on the order(s) below. You beat the leader's draw but "
+                    f"not these unseen orders — under enforcement this blocks adoption."
+                ),
+                "",
+            ]
+        else:
+            lines += [
+                (
+                    f"**Distributed burden of proof.** {checked} validator(s) benched a "
+                    f"different slice; {dv.get('veto')} flagged a regression the leader "
+                    f"could NOT reproduce (not counted against you)."
+                ),
+                "",
+            ]
+        _vios = dv.get("violations") or []
+        _shown = [v for v in _vios if v.get("confirmed")] or _vios
+        for v in _shown[:8]:
+            _tag = "confirmed" if v.get("confirmed") else "claimed"
+            if v.get("kind") == "dropped":
+                lines.append(
+                    f"- `{v.get('order_id')}` — **dropped** (champion delivered, you "
+                    f"delivered nothing) [{_tag}]"
+                )
+            else:
+                lines.append(
+                    f"- `{v.get('order_id')}` — **>1% output cut**: champion "
+                    f"`{v.get('champ_raw')}` vs you `{v.get('chal_raw')}` [{_tag}]"
+                )
+        if _shown:
+            lines.append("")
 
     if outcome == "rejected_screening":
         scr = report.get("screening") or {}

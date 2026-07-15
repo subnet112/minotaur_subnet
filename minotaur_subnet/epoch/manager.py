@@ -33,6 +33,7 @@ from minotaur_subnet.harness.submission_store import (
     Submission,
     SubmissionStatus,
     SubmissionStore,
+    offload_write,
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
@@ -202,9 +203,18 @@ class EpochManager:
         on_champion_rejected: Any = None,
         on_champion_finalist: Any = None,
         vote_recorder: Any = None,
+        coordinator_runs_slate: bool = True,
     ) -> None:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
+        # When the benchmark worker runs in a SEPARATE process (Phase 2 split),
+        # the coordinator/api must NOT drive the full-slate run_once on its own
+        # loop — it only re-benches the single incumbent (via _refresh_incumbent_
+        # score, which needs a constructed worker) and reads the worker container's
+        # scored rows. Set False in the api after the split; True for the monolith
+        # / the worker process / tests. Only gates the slate run_once, never the
+        # incumbent re-bench.
+        self._coordinator_runs_slate = coordinator_runs_slate
         self._sub_store = submission_store
         # App/order store injected for app/order lookups (optional; may be None).
         self._app_store = app_store
@@ -310,8 +320,9 @@ class EpochManager:
         }
         scope_round_id = current_round.round_id if current_round is not None else None
 
-        # Step 1: Run benchmarks
-        if self._benchmark_worker:
+        # Step 1: Run benchmarks (skipped when a separate worker process owns the
+        # slate — the coordinator then reads its already-scored rows).
+        if self._benchmark_worker and self._coordinator_runs_slate:
             try:
                 await self._benchmark_worker.run_once()
                 result["benchmarked"] = self._count_scored(epoch, round_id=scope_round_id)
@@ -456,7 +467,10 @@ class EpochManager:
                 RoundStatus.REPLAYING,
             )
 
-        if self._benchmark_worker:
+        # Slate benchmarking (skipped when a separate worker process owns it —
+        # evaluate_round then defers via _round_has_inflight_submissions until the
+        # worker's SCORED rows land, and only re-benches the single incumbent).
+        if self._benchmark_worker and self._coordinator_runs_slate:
             try:
                 await self._benchmark_worker.run_once()
                 result["benchmarked"] = self._count_scored(epoch, round_id=round_id)
@@ -517,7 +531,7 @@ class EpochManager:
         # response then READ these stored counts instead of recomputing them
         # cross-fork against the champion's latest (different-pin) record. Fully
         # best-effort — it must never affect the authoritative verdict below.
-        self._persist_round_relative_counts(round_id)
+        await self._persist_round_relative_counts(round_id)
 
         # FALL-THROUGH: walk the ranked candidates and finalize on the FIRST one
         # the live verdict adopts. The rank (_eligible_candidates) is
@@ -686,6 +700,7 @@ class EpochManager:
         # before any champion change takes effect. With no merge callback wired (e.g.
         # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
         merge_ok = True
+        merge_reason = ""  # specific abort code from the callback (empty on success)
         # Finalization (on-chain attest + squash-merge the miner's PR) is the
         # LEADER's job: it alone holds the solver-repo PAT and is the single
         # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
@@ -706,10 +721,14 @@ class EpochManager:
                 )
                 if inspect.isawaitable(cb_result):
                     cb_result = await cb_result
+                # cb_result is a MergeResult (truthy == success, carries .reason)
+                # or a bare bool (legacy/tests). getattr keeps both shapes working.
                 merge_ok = bool(cb_result)
+                merge_reason = str(getattr(cb_result, "reason", "") or "")
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
+                merge_reason = "callback_exception"
         elif _is_follower:
             logger.info(
                 "[merge-gate] round %s: follower adopts quorum-certified champion %s "
@@ -738,17 +757,22 @@ class EpochManager:
             self._notify_champion_rejected(
                 submission,
                 "adoption blocked — this submission won the round, but the champion "
-                "could not be finalized: its on-chain attestation and/or the "
-                "squash-merge of this PR did not both succeed. The most common cause "
-                "is the PR head being pushed PAST the certified commit, so the quorum "
-                "certificate no longer binds the head SHA (do not push to the branch "
-                "after submitting). The round was aborted and the champion is "
-                "unchanged; re-submit with the PR head pinned to the certified commit.",
+                "could not be finalized on-chain, so the round was aborted and the "
+                f"champion is unchanged. Reason: `{merge_reason or 'unknown'}`. "
+                "This is usually a validator-side issue (most commonly the quorum "
+                "of on-chain attestations not completing for this round), NOT "
+                "something you did — a drifted or closed PR is now recovered "
+                "automatically by publishing the certified commit directly. If the "
+                "reason names a certificate/quorum shortfall, no action is needed "
+                "on your part; the next round re-evaluates.",
+            )
+            _abort_reason = (
+                f"merge_failed:{merge_reason}" if merge_reason else "merge_failed"
             )
             next_round = self._complete_round(
-                round_state, epoch, activated=False, abort_reason="merge_failed",
+                round_state, epoch, activated=False, abort_reason=_abort_reason,
             )
-            result["abort_reason"] = "merge_failed"
+            result["abort_reason"] = _abort_reason
             if next_round is not None:
                 result["next_round_id"] = next_round.round_id
             return result
@@ -1340,7 +1364,8 @@ class EpochManager:
             # against the SAME same-round/same-fork reference the adoption used —
             # instead of a stale bench from a different round/fork.
             if self._sub_store and details is not None:
-                self._sub_store.merge_benchmark_details(
+                await offload_write(
+                    self._sub_store.merge_benchmark_details,
                     incumbent_sub.submission_id, details,
                 )
 
@@ -1700,7 +1725,7 @@ class EpochManager:
             logger.warning("[per-order-adoption] failed (ignored): %s", exc)
             return None
 
-    def _persist_round_relative_counts(self, round_id: str) -> None:
+    async def _persist_round_relative_counts(self, round_id: str) -> None:
         """DISPLAY-ONLY: persist same-pin relative counts for each competitor.
 
         Call AFTER :meth:`_refresh_incumbent_score` (which re-benches the champion
@@ -1814,7 +1839,8 @@ class EpochManager:
                             "basis": GAS_BASIS,
                         }
                     counts["round_id"] = round_id
-                    self._sub_store.merge_benchmark_details(
+                    await offload_write(
+                        self._sub_store.merge_benchmark_details,
                         competitor.submission_id, {"relative": counts},
                     )
                 except Exception:
@@ -1948,7 +1974,7 @@ class EpochManager:
             adoption_outputs=blind_spot_bar_from_rows(self._per_intent(submission)),
         )
         if self._sub_store is not None:
-            self._sub_store.adopt(submission.submission_id)
+            await offload_write(self._sub_store.adopt, submission.submission_id)
         if self._round_store is not None:
             # Persist the blind-spot REPEAT bar next to the champion snapshot so
             # a restart restores it (see ChampionInfo.adoption_outputs). Written
@@ -2143,7 +2169,7 @@ class EpochManager:
 
         WINNER-TAKES-ALL, champion-only: 100% burn to the subnet owner before a
         real miner-backed champion exists; once one does, the champion gets a flat
-        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.10) and 0.90 burns to the owner. This
+        ``CHAMPION_MINER_WEIGHT_FRACTION`` and the owner keeps the remainder. This
         is a FIXED split — there is no order-volume scaling.
 
         Only ``self._champion`` — the submission that won AND was finalized

@@ -18,13 +18,16 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
 import os
 import threading
 import time
+import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,6 +40,9 @@ except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
     # Without fcntl we cannot take a cross-process advisory lock; the store
     # degrades to in-process locking only (its historical behaviour).
     fcntl = None  # type: ignore[assignment]
+
+from minotaur_subnet.harness import fastjson
+from minotaur_subnet.harness.submission_db import SubmissionDB
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +172,56 @@ _DETAILS_STRIPPABLE_STATUSES = frozenset({
 })
 
 
+# ── Solver-name coinage (copycat labeling) ──────────────────────────────────
+# A solver's display name comes from the miner-authored ``metadata().name`` —
+# unvalidated free text — so multiple hotkeys can submit the same name (usually
+# a forked/replayed solver that kept the original's name). The store keeps a
+# first-to-coin registry keyed by NORMALIZED name (see SubmissionStore._names):
+# the first hotkey to submit a distinct, non-boilerplate name owns it; a later
+# DIFFERENT hotkey reusing it is flagged is_copycat. Purely cosmetic — the name
+# feeds no scoring/adoption path, this only drives attribution in status views.
+
+_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
+
+
+def _normalize_solver_name(name: str | None) -> str:
+    """Canonicalize a solver display name for coinage/copycat comparison.
+
+    Applies NFKC (folds width/compatibility variants), strips zero-width
+    characters, casefolds, and collapses whitespace, so ``"King"``, ``"king "``
+    and ``"k\u200bing"`` all map to the same key. Returns ``""`` for empty/None,
+    which is never coinable. NOTE: this does not merge cross-script confusables
+    (e.g. a Cyrillic homoglyph) — that would need a Unicode-TR39 skeleton map and
+    is a deliberate follow-up; copycat labeling is best-effort, not airtight.
+    """
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKC", str(name))
+    s = "".join(ch for ch in s if ch not in _ZERO_WIDTH)
+    return " ".join(s.casefold().split())
+
+
+# Names shipped in the SDK example + canonical solver template. Every unmodified
+# fork carries one, so they are NON-COINABLE: no miner can "own" boilerplate and
+# no honest fork is flagged a copycat for keeping the placeholder. Copycat
+# labeling only applies to distinctive, miner-coined names.
+_UNCOINABLE_NAMES = frozenset(
+    _normalize_solver_name(n)
+    for n in ("my-swap-solver", "baseline-swap-solver", "unknown")
+)
+
+
+def _exempt_names() -> frozenset[str]:
+    """Non-coinable names: the shipped boilerplate plus any operator additions
+    from ``SOLVER_NAME_UNCOINABLE`` (comma-separated, normalized)."""
+    extra = os.environ.get("SOLVER_NAME_UNCOINABLE", "").strip()
+    if not extra:
+        return _UNCOINABLE_NAMES
+    return _UNCOINABLE_NAMES | frozenset(
+        _normalize_solver_name(n) for n in extra.split(",") if n.strip()
+    )
+
+
 @dataclass
 class Submission:
     """A solver submission and its lifecycle state."""
@@ -207,6 +263,13 @@ class Submission:
     solver_path: str | None = None  # Local path to solver .py (source submissions)
     solver_name: str | None = None
     solver_version: str | None = None
+
+    # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
+    # free text, so the store coins each distinct non-boilerplate name to the
+    # first hotkey that submits it; a later DIFFERENT hotkey reusing it sets
+    # is_copycat=True and coined_by_hotkey=<original owner>. Cosmetic only.
+    is_copycat: bool = False
+    coined_by_hotkey: str | None = None
 
     # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
     # any single named region (module / function / class body) across the
@@ -255,6 +318,14 @@ class Submission:
     # Local path to cloned repo (transient, not persisted)
     _repo_path: str | None = field(default=None, repr=False)
 
+    @property
+    def display_name(self) -> str | None:
+        """Solver name for display, with a ``-copycat`` suffix when this
+        submission reused a name a different hotkey coined first."""
+        if self.solver_name and self.is_copycat:
+            return f"{self.solver_name}-copycat"
+        return self.solver_name
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to API-friendly dict."""
         return {
@@ -281,6 +352,8 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "is_copycat": self.is_copycat,
+            "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
@@ -308,6 +381,8 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "display_name": self.display_name,
+            "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
@@ -340,6 +415,26 @@ def _write_locked(method):
     return wrapper
 
 
+async def offload_write(bound_method, /, *args, **kwargs):
+    """Run a bound store mutator off the event loop and await its completion.
+
+    On a real :class:`SubmissionStore` this dispatches to :meth:`aoffload`, so
+    the whole locked read-modify-write (the ~44MB ``json.loads``/``json.dumps``)
+    runs on the store's dedicated writer thread instead of blocking the loop.
+    On any object WITHOUT ``aoffload`` — a test double / stub store — it falls
+    back to running the sync mutator inline, so call sites stay decoupled from
+    the store's async surface and no test double needs to grow async methods.
+    Awaited, so durability + persist-before-caller-continues ordering hold.
+    Pass a BOUND method, e.g. ``await offload_write(store.set_benchmark_result,
+    sid, valid=True, details=d)``.
+    """
+    store = getattr(bound_method, "__self__", None)
+    aoff = getattr(store, "aoffload", None)
+    if aoff is not None:
+        return await aoff(bound_method, *args, **kwargs)
+    return bound_method(*args, **kwargs)
+
+
 class SubmissionStore:
     """In-memory store for submissions with optional JSON persistence.
 
@@ -352,6 +447,10 @@ class SubmissionStore:
 
     def __init__(self, persist_path: Path | None = None) -> None:
         self._submissions: dict[str, Submission] = {}
+        # Set True only when _load() completes cleanly. snapshot_json refuses to
+        # overwrite submissions.json when False, so a failed DB hydrate (which
+        # leaves the store empty) can never clobber the rollback artifact.
+        self._loaded = False
         self._by_hotkey_round: dict[str, str] = {}  # "hotkey:round_id" → submission_id
         self._by_hotkey_epoch: dict[str, str] = {}  # "hotkey:epoch" → submission_id
         # Per-submission private-repo PATs. Kept OUTSIDE _submissions so the
@@ -374,23 +473,72 @@ class SubmissionStore:
         )
         self._tokens_mtime_ns: int | None = None
         self._persist_path = persist_path
-        # Cross-process advisory lock lives in a sibling file that is never
-        # rewritten — locking the data file itself would break, since each
-        # persist replaces it (a new inode the held fd no longer refers to).
+        # Cross-process advisory lock (restored for the Phase-2 split — see
+        # _write_guard for why SQLite's own write lock is not a substitute). Lives
+        # in a sibling file that is never rewritten: locking a file that each
+        # persist replaces would break, as the held fd points at the old inode.
         self._lock_path = (
             persist_path.with_name(persist_path.name + ".lock")
             if persist_path is not None
             else None
         )
-        self._rmw_lock = threading.RLock()  # in-process serialization
         self._lock_fd: int | None = None
-        self._lock_depth = 0
-        self._persist_mtime_ns: int | None = None
+        # Re-entrancy depth is per-THREAD (see _write_guard): _rmw_lock no longer
+        # guards it, since the flock must be taken before the RLock, not under it.
+        self._tls = threading.local()
+        # Per-record SQLite persistence (submissions.db beside submissions.json):
+        # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
+        # in-memory-only stores (persist_path=None, tests).
+        self._db: SubmissionDB | None = None
+        # Cross-process read-sync (Phase 2 split): watermark of the highest
+        # updated_seq this process has taken into memory. Rows beyond it that a
+        # PEER wrote are pulled by _maybe_reload. Seeded from the DB at _load.
+        self._last_seen_seq = 0
+        # Self-configuring: harmless + free for a single-writer node (the seq gate
+        # short-circuits), so it needs no per-role env. Kill switch for soak.
+        self._xproc_sync = (
+            os.environ.get("SUBMISSION_STORE_XPROC_SYNC", "1").strip().lower()
+            not in ("0", "false", "no")
+        )
+        self._rmw_lock = threading.RLock()  # in-process serialization
+        # Dedicated single writer thread for the async offload path
+        # (:meth:`aoffload`). Lazily created so sync-only / test usage never
+        # spawns a thread. One thread ⇒ offloaded writes self-serialize, and
+        # the whole locked read-modify-write (the ~44MB json.loads reload +
+        # mutate + json.dumps persist) runs off the event loop rather than
+        # blocking it.
+        self._writer_executor: ThreadPoolExecutor | None = None
+        # Solver-name coinage registry (copycat labeling). Kept in a sibling
+        # sidecar next to the main JSON — like the tokens sidecar — so it
+        # survives restarts AND submission pruning (name ownership must outlive
+        # the coining submission). normalized_name -> {owner_hotkey, coined_at,
+        # coined_submission_id, display}.
+        self._names: dict[str, dict[str, Any]] = {}
+        self._names_path = (
+            persist_path.with_name(persist_path.name + ".names")
+            if persist_path is not None
+            else None
+        )
+        self._names_mtime_ns: int | None = None
 
-        if persist_path and persist_path.exists():
+        if persist_path is not None:
+            self._db = SubmissionDB(persist_path.with_suffix(".db"))
+            # One-time import of a legacy whole-file submissions.json (left in
+            # place for rollback + audit), then hydrate the in-memory dict from
+            # the DB. Idempotent on restart (the migrated flag lives in the DB).
+            self._db.migrate_from_json(persist_path)
             self._load()
         if self._tokens_path is not None and self._tokens_path.exists():
             self._load_tokens()
+        if self._names_path is not None:
+            if self._names_path.exists():
+                self._load_names()
+            else:
+                # First start after this ships: seed ownership from existing
+                # history so the earliest submitter of each name is credited,
+                # not whoever submits next. Deterministic, so concurrent
+                # first-run workers converge on the same registry.
+                self._backfill_names()
 
     @_write_locked
     def create(
@@ -517,10 +665,16 @@ class SubmissionStore:
         if repo_token:
             self._tokens[sub.submission_id] = repo_token
 
-        self._submissions[sub.submission_id] = sub
+        # Copy-on-write: rebind rather than mutate the published dict in place.
+        # Once writes run on the writer thread (aoffload), lock-free loop-thread
+        # reads iterate self._submissions.values(); an in-place insert would
+        # raise "dictionary changed size during iteration". A fresh dict leaves
+        # any in-flight reader's view intact. The index dicts are only .get()-
+        # accessed (never iterated), so in-place update stays safe.
+        self._submissions = {**self._submissions, sub.submission_id: sub}
         self._by_hotkey_round[round_key] = sub.submission_id
         self._by_hotkey_epoch[epoch_key] = sub.submission_id
-        self._persist()
+        self._persist_records([sub])
         # With an encryption key available the secret also goes to the sidecar
         # file (after the record is indexed — _persist_tokens prunes to known
         # submissions) so finalize still works after a restart / from a
@@ -577,6 +731,8 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            is_copycat=bool(record.get("is_copycat", False)),
+            coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
             content_fingerprint=record.get("content_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
@@ -590,12 +746,15 @@ class SubmissionStore:
         )
         # _submissions is the source of truth for list_by_round / the pack hash;
         # the indexes are best-effort lookups (last-wins is fine, they aren't
-        # consulted by the pack hash).
-        self._submissions[sid] = sub
+        # consulted by the pack hash). Copy-on-write (rebind, never mutate the
+        # published dict in place) keeps lock-free loop-thread readers safe
+        # against a concurrent writer-thread insert.
+        self._submissions = {**self._submissions, sid: sub}
         self._by_hotkey_round[f"{sub.hotkey}:{sub.round_id}"] = sid
         self._by_hotkey_epoch[f"{sub.hotkey}:{sub.epoch}"] = sid
         return sub
 
+    @_write_locked
     def upsert_submission(self, record: dict[str, Any]) -> Submission:
         """Insert or replace a single submission by caller-provided
         ``submission_id`` and persist. See ``_upsert_one`` for field handling.
@@ -607,9 +766,10 @@ class SubmissionStore:
         """
         self._maybe_reload()
         sub = self._upsert_one(record)
-        self._persist()
+        self._persist_records([sub])
         return sub
 
+    @_write_locked
     def upsert_submissions(self, records: list[dict[str, Any]]) -> int:
         """Batch upsert the leader's snapshot, persisting ONCE (O(n), not the
         O(n²) of per-record persist). Bad records (missing submission_id) are
@@ -617,19 +777,18 @@ class SubmissionStore:
         returns the number successfully upserted.
         """
         self._maybe_reload()
-        n = 0
+        upserted: list[Submission] = []
         for record in records or []:
             try:
-                self._upsert_one(record)
-                n += 1
+                upserted.append(self._upsert_one(record))
             except Exception as exc:  # noqa: BLE001 — skip the bad record, keep the rest
                 logger.warning(
                     "upsert_submissions: skipped record %r: %s",
                     (record or {}).get("submission_id"), exc,
                 )
-        if n:
-            self._persist()
-        return n
+        if upserted:
+            self._persist_records(upserted)
+        return len(upserted)
 
     def get(self, submission_id: str) -> Submission | None:
         """Get a submission by ID."""
@@ -760,7 +919,7 @@ class SubmissionStore:
 
         sub.status = status
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_screening_result(
@@ -803,7 +962,7 @@ class SubmissionStore:
                 sub.outcome_code = OUTCOME_INVALID_PLANS
             self.purge_token(submission_id)  # terminal — drop the secret
 
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_tag(self, submission_id: str, image_tag: str) -> None:
@@ -814,7 +973,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_tag = image_tag
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_id(self, submission_id: str, image_id: str) -> None:
@@ -825,7 +984,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_id = image_id
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_content_fingerprint(self, submission_id: str, value: str) -> None:
@@ -840,7 +999,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.content_fingerprint = value
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     def count_benched_rounds_for_fingerprint(
         self,
@@ -868,6 +1027,7 @@ class SubmissionStore:
                 rounds.add(sub.round_id)
         return len(rounds)
 
+    @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
         """Persist the Phase-0 factorization metric computed in screening stage 1.
 
@@ -881,7 +1041,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.max_region_nodes = value
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_deadwood_metric(
@@ -907,7 +1067,7 @@ class SubmissionStore:
         sub.unproductive_metric_version = version
         sub.unproductive_top_offenders = top_offenders
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_image_digest(self, submission_id: str, image_digest: str) -> None:
@@ -918,7 +1078,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.image_digest = image_digest
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_provenance(
@@ -933,7 +1093,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.provenance = provenance
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_solver_path(self, submission_id: str, solver_path: str) -> None:
@@ -944,7 +1104,7 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_path = solver_path
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_solver_info(
@@ -953,15 +1113,44 @@ class SubmissionStore:
         name: str | None = None,
         version: str | None = None,
     ) -> None:
-        """Set solver metadata extracted during screening."""
-        self._maybe_reload()
+        """Set solver metadata from screening and apply first-to-coin labeling.
+
+        The display name (``metadata().name``) is self-declared free text, so a
+        distinct, non-boilerplate name is coined to the FIRST hotkey that submits
+        it; a later DIFFERENT hotkey reusing it is flagged ``is_copycat`` with
+        ``coined_by_hotkey`` set to the original owner. Cosmetic only — the name
+        feeds no scoring/adoption path. Write-locked so two workers can't both
+        coin one name; the registry lives in the ``.names`` sidecar (survives
+        restarts and submission pruning). The store is single-writer and
+        ``_write_guard`` serializes each read-modify-write on the in-process
+        RLock, so the in-memory record fetched below is authoritative + fresh.
+        """
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_name = name
         sub.solver_version = version
+        # Recompute copycat state from scratch each call, so a re-screen with a
+        # changed name re-evaluates cleanly rather than sticking to a stale flag.
+        sub.is_copycat = False
+        sub.coined_by_hotkey = None
+        norm = _normalize_solver_name(name)
+        if norm and norm not in _exempt_names():
+            self._maybe_reload_names()
+            entry = self._names.get(norm)
+            if entry is None:
+                self._names[norm] = {
+                    "owner_hotkey": sub.hotkey,
+                    "coined_at": time.time(),
+                    "coined_submission_id": submission_id,
+                    "display": name,
+                }
+                self._persist_names()
+            elif entry.get("owner_hotkey") != sub.hotkey:
+                sub.is_copycat = True
+                sub.coined_by_hotkey = entry.get("owner_hotkey")
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_benchmark_result(
@@ -1013,7 +1202,7 @@ class SubmissionStore:
                 submission_id, (sub.rejection_reason or "?")[:80],
             )
             sub.updated_at = time.time()
-            self._persist()
+            self._persist_records([sub])
             return
 
         # The validity gate: no order delivered value -> the solver produced no
@@ -1032,7 +1221,7 @@ class SubmissionStore:
             # outcome (a terminally rejected sub never reaches this branch).
             sub.rejection_reason = None
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def set_benchmark_rank(self, submission_id: str, rank: int) -> None:
@@ -1047,7 +1236,27 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.benchmark_rank = rank
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
+
+    @_write_locked
+    def set_benchmark_ranks(self, ranks: dict[str, int]) -> None:
+        """Set DISPLAY ranks for a whole batch in ONE locked read-modify-write.
+
+        The ranking pass touches every scored submission; doing it per-record
+        would re-serialize the whole store N times on the caller's thread. This
+        collapses it to a single ``_persist`` (unknown ids are skipped). DISPLAY
+        only — never flips the SCORED/REJECTED verdict.
+        """
+        self._maybe_reload()
+        now = time.time()
+        ranked: list[Submission] = []
+        for submission_id, rank in ranks.items():
+            sub = self._submissions.get(submission_id)
+            if sub is not None:
+                sub.benchmark_rank = rank
+                sub.updated_at = now
+                ranked.append(sub)
+        self._persist_records(ranked)
 
     @_write_locked
     def merge_benchmark_details(
@@ -1072,7 +1281,7 @@ class SubmissionStore:
         details.update(extra)
         sub.benchmark_details = details
         sub.updated_at = time.time()
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def reject(
@@ -1094,7 +1303,7 @@ class SubmissionStore:
         sub.outcome_code = outcome_code
         sub.updated_at = time.time()
         self.purge_token(submission_id)  # terminal — drop the secret
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def waitlist(
@@ -1132,7 +1341,7 @@ class SubmissionStore:
         }
         sub.updated_at = time.time()
         self.purge_token(submission_id)
-        self._persist()
+        self._persist_records([sub])
 
     @_write_locked
     def adopt(self, submission_id: str) -> None:
@@ -1141,21 +1350,24 @@ class SubmissionStore:
         Un-adopts any previous champion first (at most one champion at a time).
         """
         self._maybe_reload()
+        touched: list[Submission] = []
         # Un-adopt previous champion
         for s in self._submissions.values():
             if s.status == SubmissionStatus.ADOPTED and s.submission_id != submission_id:
                 s.status = SubmissionStatus.SCORED
                 s.updated_at = time.time()
+                touched.append(s)
 
         sub = self._submissions.get(submission_id)
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.status = SubmissionStatus.ADOPTED
         sub.updated_at = time.time()
+        touched.append(sub)
         # Terminal for the credential too: adoption only happens AFTER the
         # relayer's attest + merge consumed the token (merge-gate ordering).
         self.purge_token(submission_id)
-        self._persist()
+        self._persist_records(touched)
 
     def get_champion(self) -> Any:
         """Return the currently adopted champion submission, or None."""
@@ -1260,40 +1472,144 @@ class SubmissionStore:
         if self._tokens_mtime_ns is None or current_mtime_ns > self._tokens_mtime_ns:
             self._load_tokens()
 
+    # ── Solver-name coinage sidecar ──────────────────────────────────────────
+
+    def _persist_names(self) -> None:
+        """Atomically rewrite the coinage registry sidecar.
+
+        Kept OUTSIDE the main submissions JSON on purpose: that file is a flat
+        ``{id: submission}`` map (a stray top-level key breaks the loader) and is
+        pruned, whereas name ownership must be permanent. Same atomic temp-write
+        + ``os.replace`` as the other sidecars.
+        """
+        if self._names_path is None:
+            return
+        try:
+            self._names_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._names_path.with_name(
+                f".{self._names_path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.write_text(json.dumps(self._names, indent=2))
+            os.replace(tmp_path, self._names_path)
+            self._names_mtime_ns = self._names_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to persist solver-name registry: %s", exc)
+
+    def _load_names(self) -> None:
+        """Load the coinage registry sidecar."""
+        if self._names_path is None:
+            return
+        try:
+            data = json.loads(self._names_path.read_text())
+            self._names = {str(k): dict(v) for k, v in data.items()}
+            self._names_mtime_ns = self._names_path.stat().st_mtime_ns
+        except Exception as exc:
+            logger.warning("Failed to load solver-name registry: %s", exc)
+
+    def _maybe_reload_names(self) -> None:
+        """Re-read the coinage sidecar when another process updated it."""
+        if self._names_path is None or not self._names_path.exists():
+            return
+        try:
+            current_mtime_ns = self._names_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if self._names_mtime_ns is None or current_mtime_ns > self._names_mtime_ns:
+            self._load_names()
+
+    def _backfill_names(self) -> None:
+        """Seed the registry from existing submissions (earliest coiner wins).
+
+        Runs once when the sidecar doesn't exist yet, so the true originator of a
+        name owns it rather than crediting whoever submits first after this
+        ships. Seeds ownership ONLY; it does not retroactively re-flag historical
+        submissions (that would rewrite the whole store) — labeling is
+        forward-looking from here.
+        """
+        if self._names_path is None:
+            return
+        exempt = _exempt_names()
+        registry: dict[str, dict[str, Any]] = {}
+        for s in sorted(
+            self._submissions.values(),
+            key=lambda x: (x.created_at or 0.0, x.submission_id),
+        ):
+            norm = _normalize_solver_name(s.solver_name)
+            if not norm or norm in exempt or norm in registry:
+                continue
+            registry[norm] = {
+                "owner_hotkey": s.hotkey,
+                "coined_at": s.created_at or 0.0,
+                "coined_submission_id": s.submission_id,
+                "display": s.solver_name,
+            }
+        self._names = registry
+        self._persist_names()
+        logger.info("Backfilled %d coined solver name(s) from history", len(registry))
+
     # ── Cross-process write lock ─────────────────────────────────────────────
 
     @contextmanager
     def _write_guard(self):
         """Hold the write lock around a single read-modify-write.
 
-        Acquires the in-process lock (threads) then the exclusive advisory file
-        lock (processes), adopts the freshest persisted state, and yields for
-        the caller to mutate + persist. Re-entrant on one thread: nested guards
-        share the outermost lock and skip the reload so an in-progress mutation
-        is never discarded. When there is no ``persist_path`` (pure in-memory)
-        or ``fcntl`` is unavailable, the file lock is a no-op and only the
-        in-process lock applies.
+        Acquires the exclusive advisory file lock (processes) then the in-process
+        RLock (threads), pulls any peer rows written since our watermark, and
+        yields for the caller to mutate + persist. Re-entrant on one thread: nested
+        guards share the outermost lock and skip the reload so an in-progress
+        mutation is never discarded. With no ``persist_path`` (pure in-memory) or
+        no ``fcntl``, the file lock is a no-op and only the RLock applies.
+
+        The flock is REQUIRED again for Phase 2, and #794's note that "any future
+        second-process writer is serialized by SQLite's own write lock" is not
+        enough: SQLite serializes the write TRANSACTION, not the whole
+        pull → mutate → persist. ``_persist_records`` UPSERTs the WHOLE record blob,
+        so two processes that read the same row and each mutate a DIFFERENT field
+        still lose one side's field entirely (e.g. rotation setting REJECTED while
+        the worker writes SCORED). Only a lock held across the full read-modify-write
+        prevents that, which is exactly what this guard is.
+
+        The reload inside the guard is the INCREMENTAL ``_maybe_reload`` (one indexed
+        max_seq query in the single-writer steady state), not the old
+        ``_load(quiet=True)`` whole-store re-read — so restoring the lock does not
+        restore the Phase-1 stall it was part of.
+
+        LOCK ORDER IS LOAD-BEARING: the flock is taken BEFORE ``_rmw_lock``, never
+        while holding it. ``fcntl.flock(LOCK_EX)`` blocks indefinitely, and every
+        read path calls ``_maybe_reload`` → ``_rmw_lock`` on the EVENT LOOP; holding
+        the RLock across that blocking wait let a peer process freeze the api's loop
+        for as long as it held the lock file (measured: 4.5s). That is the Phase-1
+        stall class, re-introduced and made cross-process. No inversion results:
+        ``_maybe_reload`` takes only ``_rmw_lock`` and never the flock, so nothing
+        ever waits for the flock while holding the RLock.
+
+        Re-entrancy depth is THREAD-LOCAL because ``_rmw_lock`` no longer guards it
+        (and re-entrancy is per-thread by definition — the offload writer thread and
+        a sync on-loop caller are different RMWs and must not share a depth).
         """
-        with self._rmw_lock:
-            outermost = self._lock_depth == 0
-            self._lock_depth += 1
+        depth = getattr(self._tls, "lock_depth", 0)
+        outermost = depth == 0
+        fd = None
+        try:
             if outermost:
-                self._lock_fd = self._acquire_file_lock()
-            try:
-                if (
-                    outermost
-                    and self._persist_path is not None
-                    and self._persist_path.exists()
-                ):
-                    # Under the exclusive lock, take the latest committed state
-                    # so the check-and-write below cannot race another writer.
-                    self._load(quiet=True)
+                # Blocks WITHOUT the RLock held (see above).
+                fd = self._acquire_file_lock()
+                self._lock_fd = fd
+            # Only after a SUCCESSFUL acquire: an OSError here (EMFILE/ENOSPC) used
+            # to leave the depth incremented forever, so every later guard computed
+            # outermost=False and silently ran with NO cross-process lock at all.
+            self._tls.lock_depth = depth + 1
+            with self._rmw_lock:
+                if outermost:
+                    # Under the exclusive lock, take the peer's latest committed
+                    # rows so the check-and-write below cannot race another writer.
+                    self._maybe_reload()
                 yield
-            finally:
-                self._lock_depth -= 1
-                if self._lock_depth == 0:
-                    self._release_file_lock(self._lock_fd)
-                    self._lock_fd = None
+        finally:
+            self._tls.lock_depth = depth
+            if outermost:
+                self._release_file_lock(fd)
+                self._lock_fd = None
 
     def _acquire_file_lock(self) -> int | None:
         """Open the sibling lock file and take an exclusive advisory lock."""
@@ -1317,76 +1633,224 @@ class SubmissionStore:
         finally:
             os.close(fd)
 
+    # ── Async offload ──────────────────────────────────────────────────────
+
+    def _get_writer_executor(self) -> ThreadPoolExecutor:
+        """Lazily create the single dedicated writer thread."""
+        if self._writer_executor is None:
+            self._writer_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="substore-writer"
+            )
+        return self._writer_executor
+
+    async def aoffload(self, fn, /, *args, **kwargs):
+        """Run a synchronous ``@_write_locked`` mutator on the dedicated writer
+        thread, off the event loop, and await its completion.
+
+        The whole locked critical section (advisory flock + in-process RLock →
+        ``_load`` reload → mutate → ``_persist`` write) executes on the single
+        writer thread, so the ~44MB ``json.loads``/``json.dumps`` no longer
+        block the asyncio loop. Because the one thread runs writes serially and
+        the RLock still serializes against any sync on-loop writer, ordering is
+        preserved. Awaited, so the atomic ``os.replace`` has landed before the
+        caller proceeds — keeping persist-before-broadcast ordering for the
+        consensus callers. Pass a BOUND mutator, e.g.
+        ``await store.aoffload(store.set_benchmark_result, sid, result)``.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_writer_executor(),
+            functools.partial(fn, *args, **kwargs),
+        )
+
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _maybe_reload(self) -> None:
-        """Refresh persisted state when another process updated the backing file."""
-        if self._persist_path is None or not self._persist_path.exists():
+        """Pull any rows a SECOND process wrote since our watermark into memory.
+
+        This is what makes the Phase-2 split correct in BOTH directions: the
+        benchmark worker sees submissions the api just intook (QUEUED→BENCHMARKING),
+        and the api sees the benchmark results the worker just scored (without
+        which the coordinator would rank a stale slate and adopt the wrong
+        champion). Called on every read and at the top of every mutator, so a
+        read-modify-write always starts from peer-fresh state.
+
+        SELF-CONFIGURING and inert for a single-writer node: ``max_seq()`` is one
+        indexed O(log n) query, and a lone writer never sees a seq beyond its own
+        watermark, so it returns right there — no rows parsed, no lock taken, no
+        behavior change for the monolith leader or any follower. Our own rows are
+        additionally filtered in SQL, so they are never re-parsed.
+
+        Kill switch: SUBMISSION_STORE_XPROC_SYNC=0 restores the strict no-op.
+        """
+        if self._db is None or not self._xproc_sync:
+            return
+        latest = self._db.max_seq()
+        if latest <= self._last_seen_seq:
+            return  # nothing new from a peer (the single-writer steady state)
+        rows = self._db.load_since(self._last_seen_seq)
+        if rows is None:
+            # The pull FAILED (None, not []). Leave the watermark where it is so the
+            # next tick retries this range; advancing here would skip the rows for
+            # good. Cheap to retry — the seq gate re-fires on the very next read.
+            return
+        if not rows:
+            # Only our OWN writes moved the seq (filtered in SQL) — just advance.
+            # max(): a concurrent reload may have advanced it past `latest` while we
+            # were querying off-lock; the watermark must never go BACKWARDS.
+            self._last_seen_seq = max(self._last_seen_seq, latest)
+            return
+        # The SELECT above ran OFF any lock. Take the write lock only for the
+        # in-memory merge (microseconds): _upsert_one rebinds self._submissions
+        # copy-on-write, and a concurrent writer-thread rebind would otherwise
+        # lose one of the two updates. We never hold the lock across I/O, so this
+        # cannot re-introduce the event-loop stall Phase 1 removed.
+        with self._rmw_lock:
+            # RE-READ the watermark inside the lock. The rows above were SELECTed
+            # off-lock, so a writer may have superseded one of them in between: our
+            # own _write_guard reload advances the watermark past a peer row, then
+            # writes a NEWER blob for that record. Applying the stale snapshot now
+            # would revert the newer state in memory — PERMANENTLY, because the
+            # healing row carries our own writer id and load_since filters it out
+            # forever. The next mutation then UPSERTs the reverted blob back over
+            # the good DB row, so the DB is not a safety net either. That is exactly
+            # the wrong-champion adoption this sync exists to prevent.
+            applied_through = self._last_seen_seq
+            complete = True
+            for sid, record, seq in rows:
+                if seq <= applied_through:
+                    continue  # superseded while we queried off-lock
+                # Advance only over a CONTIGUOUS applied prefix. A row that won't
+                # apply must not be skipped past: the watermark is the only record
+                # of what we have seen, so jumping over a bad row drops it
+                # permanently AND hides the corruption. Stall at it instead,
+                # loudly, and retry every tick.
+                try:
+                    self._upsert_one(record)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "[xproc-sync] STALLED at unloadable peer row %s (seq %s): %s "
+                        "— this process is now behind its peer; the row is retried "
+                        "on every read until it applies or an operator repairs it",
+                        sid, seq, exc,
+                    )
+                    complete = False
+                    break
+                applied_through = seq
+            self._last_seen_seq = max(
+                self._last_seen_seq, latest if complete else applied_through
+            )
+        logger.debug("[xproc-sync] pulled %d peer row(s) up to seq %d", len(rows), latest)
+
+    def _persist_records(self, subs: list["Submission"]) -> None:
+        """Persist the just-mutated record(s) as O(1) row UPSERT(s), then run the
+        in-memory benchmark_details retention strip and DELETE the details rows it
+        nulled (O(#stripped), typically 0-1). Replaces the old whole-store
+        _persist on every write hot path."""
+        if self._db is None:
             return
         try:
-            current_mtime_ns = self._persist_path.stat().st_mtime_ns
-        except OSError:
-            return
-        if self._persist_mtime_ns is None or current_mtime_ns > self._persist_mtime_ns:
-            self._load()
+            # Run the in-memory retention strip FIRST, then write the record(s)
+            # AND drop the just-stripped details rows in ONE transaction, so the
+            # stripped state is durable together with the write (a crash can't
+            # leak a details row that re-inflates on reload).
+            stripped = self._enforce_benchmark_details_retention()
+            self._db.write_records(
+                [(s.submission_id, s.to_dict()) for s in subs], strip_ids=stripped
+            )
+        except Exception as exc:  # noqa: BLE001 — persistence must never crash a mutation
+            logger.warning("Failed to persist submission record(s): %s", exc)
 
-    def _persist(self) -> None:
-        """Write state to disk atomically if persist_path is set.
+    def snapshot_json(self) -> None:
+        """Write the WHOLE store to submissions.json (the legacy format).
 
-        Writes a temp file then ``os.replace``s it into place so a concurrent
-        lock-free reader always sees a complete file, never a half-written one.
-        """
+        NOT on the write hot path — called on graceful shutdown as a best-effort
+        rollback convenience. NOTE: this only fires on a CLEAN stop; after an
+        OOM/SIGKILL the JSON is stale, so the authoritative rollback path is the
+        DB→JSON exporter (``python -m minotaur_subnet.harness.submission_db
+        export``) run against the crash-safe DB. The in-memory state is already
+        retention-stripped, so this dumps the bounded set.
+
+        Refuses to write if the store did NOT load cleanly, or would replace a
+        non-empty file with an empty store — so a degraded/failed DB hydrate can
+        never destroy the last-good rollback artifact."""
         if self._persist_path is None:
             return
-        try:
-            self._enforce_benchmark_details_retention()
-            data = {
-                sid: sub.to_dict()
-                for sid, sub in self._submissions.items()
-            }
-            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._persist_path.with_name(
-                f".{self._persist_path.name}.{os.getpid()}.tmp"
+        if not self._loaded:
+            logger.warning(
+                "snapshot_json: store did not load cleanly — refusing to overwrite "
+                "%s (preserving the rollback artifact)", self._persist_path,
             )
-            # Compact (no indent): the store is re-serialized on EVERY write, so
-            # pretty-printing ~doubles both the bytes written and the encode time
-            # on the (previously loop-blocking) hot path for zero machine benefit.
-            tmp_path.write_text(json.dumps(data))
-            os.replace(tmp_path, self._persist_path)
-            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
-        except Exception as exc:
-            logger.warning("Failed to persist submissions: %s", exc)
+            return
+        with self._write_guard():
+            try:
+                data = {sid: sub.to_dict() for sid, sub in self._submissions.items()}
+                if not data and self._persist_path.exists() \
+                        and self._persist_path.stat().st_size > 2:
+                    logger.warning(
+                        "snapshot_json: in-memory store is empty but %s is non-empty "
+                        "— refusing to clobber", self._persist_path,
+                    )
+                    return
+                self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = self._persist_path.with_name(
+                    f".{self._persist_path.name}.{os.getpid()}.tmp"
+                )
+                tmp_path.write_bytes(fastjson.dumps(data))
+                os.replace(tmp_path, self._persist_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to snapshot submissions.json: %s", exc)
 
-    def _enforce_benchmark_details_retention(self) -> None:
+    def close(self) -> None:
+        """Snapshot to JSON (rollback safety) + close the DB. Call on shutdown."""
+        self.snapshot_json()
+        if self._db is not None:
+            self._db.close()
+
+    def _enforce_benchmark_details_retention(self) -> list[str]:
         """Drop benchmark_details from terminal submissions beyond the retention
-        cap so the persisted store stays bounded.
+        cap so the store stays bounded; return the submission_ids just nulled so
+        the caller can DELETE their DB details rows (O(#stripped), not O(store)).
 
         benchmark_details is ~40-70KB per submission; unbounded it grew the store
-        to 142MB, and _persist re-serializes the WHOLE store on every write on the
-        event loop → ~25s api-wide freezes. We keep details for all non-terminal
-        (in-flight) submissions plus the ``_BENCHMARK_DETAILS_RETENTION`` most
-        recent by epoch, and strip the rest in place. In-memory mutation is fine:
-        the field is Optional and every reader uses ``.get()``/``or {}``.
+        to 142MB. We keep details for all non-terminal (in-flight) submissions plus
+        the ``_BENCHMARK_DETAILS_RETENTION`` most recent by epoch, and strip the
+        rest in place. In-memory mutation is fine: the field is Optional and every
+        reader uses ``.get()``/``or {}``; on the DB side the missing details row
+        reloads as None, so the stripped state round-trips byte-identically.
         """
         cap = _BENCHMARK_DETAILS_RETENTION
         if cap <= 0:
-            return
+            return []
         # Candidates: terminal submissions that still carry details.
         withdetails = [
             s for s in self._submissions.values()
             if s.status in _DETAILS_STRIPPABLE_STATUSES and s.benchmark_details
         ]
         if len(withdetails) <= cap:
-            return
+            return []
         # Keep the `cap` most recent by epoch; strip the older tail.
         withdetails.sort(key=lambda s: s.epoch, reverse=True)
+        stripped: list[str] = []
         for sub in withdetails[cap:]:
             sub.benchmark_details = None
+            stripped.append(sub.submission_id)
+        return stripped
 
     def _load(self, *, quiet: bool = False) -> None:
-        """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
+        """Hydrate the in-memory dict from the SQLite DB. ``quiet`` skips the info
+        log. The per-record row-building below is byte-identical to the legacy
+        JSON path (a missing details row → benchmark_details=None, matching the
+        retention-stripped state)."""
         try:
-            data = json.loads(self._persist_path.read_text())
+            # Read the watermark BEFORE hydrating, not after. A peer commit that
+            # lands DURING load_all() would otherwise be neither hydrated (it wasn't
+            # there when the SELECT started) nor pulled (an after-the-fact max_seq
+            # already counts it) → silently lost until that row is written again.
+            # Seeding from the pre-hydrate max can only re-pull a row we already
+            # have, which _upsert_one absorbs idempotently.
+            seq_before_hydrate = self._db.max_seq() if self._db is not None else 0
+            data = dict(self._db.load_all()) if self._db is not None else {}
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
             by_hotkey_epoch: dict[str, str] = {}
@@ -1414,6 +1878,8 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    is_copycat=bool(d.get("is_copycat", False)),
+                    coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
                     content_fingerprint=d.get("content_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
@@ -1433,9 +1899,14 @@ class SubmissionStore:
             self._submissions = submissions
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
-            self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
+            self._loaded = True  # clean hydrate — safe to snapshot to JSON
+            # We just took EVERY row into memory, so the cross-process watermark
+            # starts at the max as of BEFORE the hydrate: only rows a peer writes
+            # after that point are pulled, and none can slip through the gap.
+            # (Pre-Phase-2 rows carry seq 0 and are never re-pulled.)
+            self._last_seen_seq = seq_before_hydrate
             if not quiet:
-                logger.info("Loaded %d submissions from %s", len(data), self._persist_path)
+                logger.info("Loaded %d submissions from the submission DB", len(data))
         except Exception as exc:
             logger.warning("Failed to load submissions: %s", exc)
 

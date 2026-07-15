@@ -128,6 +128,14 @@ class StatusResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
+    # Copycat naming (first-to-coin). display_name carries the "-copycat" suffix
+    # when a DIFFERENT hotkey reused a name another hotkey coined first;
+    # coined_by_uid is the original coiner's current-metagraph UID (null if that
+    # hotkey has since churned). Cosmetic attribution — no scoring effect. See
+    # harness/submission_store solver-name coinage.
+    display_name: str | None = None
+    is_copycat: bool = False
+    coined_by_uid: int | None = None
     # Factorization metric (Phase 0, OBSERVE-ONLY): the largest AST-node count of
     # any single named region (module / function / class body) in the submission's
     # in-tree Python — a golf-immune proxy for worst entanglement. Measured and
@@ -205,6 +213,13 @@ class SolverChampionResponse(BaseModel):
     image_id: str | None = None
     solver_name: str | None = None
     solver_version: str | None = None
+    # Copycat naming (first-to-coin). display_name carries the "-copycat" suffix
+    # when this champion's solver name was first coined by a DIFFERENT hotkey;
+    # coined_by_uid is that original coiner's current-metagraph UID. Resolved from
+    # the champion's submission at read time (null/false if it has been pruned).
+    display_name: str | None = None
+    is_copycat: bool = False
+    coined_by_uid: int | None = None
     hotkey: str | None = None
     activated_round_id: str | None = None
     activated_epoch: int = 0
@@ -248,6 +263,11 @@ class CloseRoundRequest(BaseModel):
     quorum_required: int | None = Field(default=None, ge=0)
     decision_deadline_epoch: int | None = Field(default=None, ge=0)
     effective_epoch: int | None = Field(default=None, ge=0)
+    # Leader's real wall-clock epoch at round OPEN — the benchmark fork-pin anchor
+    # source (see RoundState.benchmark_anchor_epoch). Followers adopt it verbatim so
+    # every validator anchors the fork identically. None from a pre-B2 leader, in
+    # which case followers fall back to the legacy opened_epoch anchor.
+    benchmark_anchor_epoch: int | None = Field(default=None, ge=0)
     # Leader's close-time submission snapshot (full records). Followers upsert
     # these so their local pack-hash recompute matches the leader's. Always sent by
     # an up-to-date leader (the SUBMISSION_SNAPSHOT_SYNC gate was removed — it is now

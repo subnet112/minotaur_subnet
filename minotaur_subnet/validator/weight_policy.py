@@ -20,7 +20,9 @@ class ChampionWeights:
 
     Before a real miner-backed champion exists, 100% of emissions are routed to
     the subnet owner hotkey (burn behavior). Once a real miner champion exists,
-    100% goes to that champion.
+    the champion gets ``CHAMPION_MINER_WEIGHT_FRACTION`` of the miner emission
+    pool and the owner keeps the remainder — NOT 100% to the champion, which this
+    docstring claimed for as long as the split has existed.
     """
 
     def __init__(

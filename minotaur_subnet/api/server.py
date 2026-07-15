@@ -62,12 +62,18 @@ ctx.store = store
 # Deploys run synchronously inside this process, so any DEPLOYING record on
 # disk at boot is an orphan from a previous process. Roll them back to draft
 # so the deploy guard doesn't refuse redeploys forever (2026-07-07 incident).
-_stale_deploys = store.reconcile_stale_deploying()
-if _stale_deploys:
-    logger.warning(
-        "Rolled %d stale mid-deploy record(s) back to draft at boot: %s",
-        len(_stale_deploys), _stale_deploys,
-    )
+# The split benchmark worker (BENCHMARK_WORKER_ONLY) shares this SQLite app-store
+# with the api and MUST NOT run this — its boot would flip the api's IN-FLIGHT
+# DEPLOYING record to DRAFT (the function's own docstring forbids calling it from
+# a second process racing a live deploy). NOT gated on ENABLE_BENCHMARK_WORKER —
+# every pre-split api / follower sets that and must still reconcile.
+if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+    _stale_deploys = store.reconcile_stale_deploying()
+    if _stale_deploys:
+        logger.warning(
+            "Rolled %d stale mid-deploy record(s) back to draft at boot: %s",
+            len(_stale_deploys), _stale_deploys,
+        )
 
 # ── backward-compatible module-level accessors ───────────────────────────────
 #

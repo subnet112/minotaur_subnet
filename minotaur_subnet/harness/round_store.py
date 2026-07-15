@@ -19,7 +19,20 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from minotaur_subnet.harness import fastjson
+
 logger = logging.getLogger(__name__)
+
+# Cap on retained rounds in the in-memory/persisted store. Rounds close ~1 per
+# tempo (~72 min), so this default keeps months of history while bounding the
+# whole-file rewrite + parse. Eviction NEVER drops the current round or the
+# standing/previous champion's activated round (their RoundState carries the
+# certificate that /champion/reattest + /champion/sync-bundle serve — an evicted
+# champion round 404s the follower re-adopt path → burn), nor the newest
+# opened_epoch (so a same-epoch reopen can't find a reset per-epoch count in
+# _build_round_id and mint a duplicate round_id). Every evicted round was already
+# mirrored to the durable record_sink. Set <= 0 to disable bounding.
+_ROUND_STORE_MAX_ROUNDS = int(os.environ.get("SOLVER_ROUND_STORE_MAX_ROUNDS", "2000"))
 
 
 class RoundStatus(str, Enum):
@@ -223,6 +236,21 @@ class RoundState:
     shadow_case_log_hash: str | None = None
     certificate: ChampionCertificate | None = None
     effective_epoch: int | None = None
+    # Real wall-clock epoch (unix//EPOCH_SECONDS) at which the LEADER opened this
+    # round, stamped at open and broadcast for followers to adopt verbatim. This
+    # exists ONLY to anchor the benchmark fork-pin: opened_epoch is the champion
+    # ACTIVATION schedule (close_epoch + activation_delay, ~1 tempo in the FUTURE
+    # for commit-reveal alignment), so anchoring the pin to it lands ~40 min ahead
+    # and defers. benchmark_anchor_epoch is a recent-PAST time-epoch that
+    # confirm-brackets immediately. Purely the fork-pin anchor source, and the LIVE
+    # one: the anchor selection is default-ON in code (see
+    # consensus.round_anchor.benchmark_anchor_real_epoch_enabled), with
+    # BENCHMARK_ANCHOR_REAL_EPOCH={0,false,no,off} as an emergency override only.
+    # None on legacy rounds / rounds opened before this shipped → those anchor to
+    # opened_epoch. That fallback is fleet-uniform, not node-local: the stamp is set
+    # once by the leader at open and travels with the round, so every node sees the
+    # same presence-or-absence. See api/startup._round_fork_anchor_epoch.
+    benchmark_anchor_epoch: int | None = None
     abort_reason: str | None = None
     # Set True ONLY when THIS node independently re-benchmarked the round's
     # candidate and its own verdict agreed (the reactive-benchmark APPROVE path),
@@ -288,6 +316,7 @@ class RoundState:
             "shadow_case_log_hash": self.shadow_case_log_hash,
             "certificate": self.certificate.to_dict() if self.certificate else None,
             "effective_epoch": self.effective_epoch,
+            "benchmark_anchor_epoch": self.benchmark_anchor_epoch,
             "abort_reason": self.abort_reason,
             "self_verified": self.self_verified,
             "self_verified_submission_id": self.self_verified_submission_id,
@@ -323,6 +352,7 @@ class RoundState:
             shadow_case_log_hash=raw.get("shadow_case_log_hash"),
             certificate=ChampionCertificate.from_dict(raw.get("certificate")),
             effective_epoch=raw.get("effective_epoch"),
+            benchmark_anchor_epoch=raw.get("benchmark_anchor_epoch"),
             abort_reason=raw.get("abort_reason"),
             self_verified=bool(raw.get("self_verified")),
             self_verified_submission_id=raw.get("self_verified_submission_id"),
@@ -341,11 +371,18 @@ class RoundStore:
         self,
         persist_path: Path | None = None,
         record_sink: Callable[[RoundState], None] | None = None,
+        sweep_orphan_temps: bool = True,
     ) -> None:
         self._persist_path = persist_path
         # Best-effort mirror of each round mutation to durable history (e.g. the
         # order-book DB). NEVER affects round state — failures are swallowed.
         self._record_sink = record_sink
+        # A read-only sharer of the round store (the split benchmark worker) sets
+        # this False: _load's orphan-temp sweep globs + unlinks `.<name>.*.tmp` in
+        # the shared /data dir, which can delete the api coordinator's IN-FLIGHT
+        # persist temp between its mkstemp and os.replace → a silently-lost round /
+        # champion write. Only the sole WRITER (the api) should sweep.
+        self._sweep_orphan_temps_enabled = sweep_orphan_temps
         self._persist_mtime_ns: int | None = None
         self._rounds: dict[str, RoundState] = {}
         self._current_round_id: str | None = None
@@ -463,10 +500,16 @@ class RoundStore:
 
         now = time.time()
         round_id = self._build_round_id(opened_epoch)
+        # Stamp the real wall-clock epoch at open as the fork-pin anchor source.
+        # opened_epoch is the (future) champion-activation schedule, so it is NOT a
+        # valid pin anchor; this is. Fleet-broadcast + adopted so every validator
+        # anchors identically. See RoundState.benchmark_anchor_epoch.
+        from minotaur_subnet.epoch.clock import EPOCH_SECONDS
         state = RoundState(
             round_id=round_id,
             status=RoundStatus.OPEN,
             opened_epoch=opened_epoch,
+            benchmark_anchor_epoch=int(now // EPOCH_SECONDS),
             created_at=now,
             updated_at=now,
         )
@@ -798,10 +841,54 @@ class RoundStore:
                 getattr(state, "round_id", "?"), exc,
             )
 
+    def _evict_rounds(self) -> None:
+        """Bound ``_rounds`` to ``_ROUND_STORE_MAX_ROUNDS``, keeping the most
+        recent rounds plus a protected pin set. Rebinds ``_rounds`` (copy-on-
+        write) rather than mutating in place, so a lock-free reader's dict view
+        is never changed mid-iteration."""
+        cap = _ROUND_STORE_MAX_ROUNDS
+        if cap <= 0 or len(self._rounds) <= cap:
+            return
+        # Protected regardless of age: the current round, the standing and
+        # previous champion's activated rounds (their certificate lives here and
+        # the reattest / sync-bundle serve paths 404 without it), and every round
+        # in the newest opened_epoch (guarantees _build_round_id's per-epoch
+        # count is never reset by eviction → no duplicate round_id).
+        pinned = {
+            self._current_round_id,
+            self._active_champion.activated_round_id,
+            self._previous_champion.activated_round_id,
+        }
+        pinned.discard(None)
+        max_epoch = max((s.opened_epoch for s in self._rounds.values()), default=0)
+        protected = {
+            rid for rid, s in self._rounds.items()
+            if rid in pinned or s.opened_epoch >= max_epoch
+        }
+        survivors = set(protected)
+        room = cap - len(protected)
+        if room > 0:
+            ranked = sorted(
+                (rid for rid in self._rounds if rid not in protected),
+                key=lambda rid: (
+                    self._rounds[rid].opened_epoch,
+                    self._rounds[rid].created_at,
+                    rid,
+                ),
+                reverse=True,
+            )
+            survivors.update(ranked[:room])
+        if len(survivors) >= len(self._rounds):
+            return
+        self._rounds = {
+            rid: s for rid, s in self._rounds.items() if rid in survivors
+        }
+
     def _persist(self) -> None:
         if self._persist_path is None:
             return
         try:
+            self._evict_rounds()
             data = {
                 "current_round_id": self._current_round_id,
                 "active_champion": self._active_champion.to_dict(),
@@ -827,8 +914,8 @@ class RoundStore:
                 dir=str(parent), prefix=f".{self._persist_path.name}.", suffix=".tmp",
             )
             try:
-                with os.fdopen(fd, "w") as fh:
-                    fh.write(json.dumps(data, indent=2))
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(fastjson.dumps(data, indent=True))
                     fh.flush()
                     os.fsync(fh.fileno())
                 # mkstemp creates the temp 0600; match the target's mode so a replace
@@ -888,9 +975,12 @@ class RoundStore:
     def _load(self) -> None:
         try:
             # Clean up any orphan temp files from a prior crashed persist before
-            # loading (the unique-temp-name scheme would otherwise let them pile up).
-            self._sweep_orphan_temps()
-            data = json.loads(self._persist_path.read_text())
+            # loading — but ONLY in the sole-writer process. A read-only sharer
+            # (the split worker) would otherwise unlink the api coordinator's
+            # in-flight persist temp, silently losing a round/champion write.
+            if self._sweep_orphan_temps_enabled:
+                self._sweep_orphan_temps()
+            data = fastjson.loads(self._persist_path.read_bytes())
             current_round_id = data.get("current_round_id")
             active_champion = ChampionSnapshot.from_dict(data.get("active_champion"))
             previous_champion = ChampionSnapshot.from_dict(data.get("previous_champion"))

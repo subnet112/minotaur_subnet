@@ -1354,6 +1354,25 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                                 and hasattr(_js_engine, "get_manifest"))
                             else None
                         )
+                        if (_bench_manifest is None and _js_engine is not None
+                                and getattr(app_def, "js_code", None)):
+                            # The engine caches manifests only for intents
+                            # something has already SCORED (order scoring and
+                            # the blockloop lazy-load on first use). An app
+                            # that has never had a live order — e.g. a fresh
+                            # V2 deployment — is absent, which silently
+                            # degraded its quotes to the bare-interaction sim
+                            # (documented to measure 0 delivered for most
+                            # plans). Lazy-load it here exactly like
+                            # order_service does.
+                            try:
+                                await _js_engine.load_intent(app_id, app_def.js_code)
+                                _bench_manifest = _js_engine.get_manifest(app_id)
+                            except Exception as _mexc:
+                                logger.warning(
+                                    "Quote manifest lazy-load failed for %s: %s",
+                                    app_id, _mexc,
+                                )
                         _bench_state = IntentState(
                             contract_address=_deployed,
                             chain_id=req.chain_id,
@@ -1374,8 +1393,18 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     # captures the delivered output (metadata.raw_output / transfers);
                     # we add the framework wrapper overhead (executeIntent, proxy
                     # deploy, sig verify, fee settle) when pricing the fee below.
+                    #
+                    # contract_address must be the deployed app when we have an
+                    # intent_order: the simulator's scoreIntent branch gates on
+                    # `contract_address AND intent_order` (anvil_simulator), so
+                    # passing None here silently demoted every quote to the
+                    # bare-interaction path (0 delivered for most plans) even
+                    # with a perfectly built intent_order. Mirrors
+                    # order_processor.py's call shape.
                     _sim = await _sim_runner.simulate(
-                        _plan, _prov_order, None, _intent_order, False, _deployed,
+                        _plan, _prov_order,
+                        _deployed if _intent_order else None,
+                        _intent_order, False, _deployed,
                     )
                     _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
                     if _swap_gas > 0:

@@ -42,6 +42,7 @@ from .round_manager import (
     _close_round_sync_payload,
     _current_solver_round_epoch,
     _round_certification_deadline_elapsed,
+    epoch_start_ts,
 )
 
 logger = logging.getLogger(__name__)
@@ -644,6 +645,30 @@ async def _maybe_prepare_round_for_certification(
     # the shared SOLVER_ROUND_INTERNAL_API_KEY. Without this the get_round() below
     # 404s on the leader's unknown round_id. Adopt as CLOSED so the existing prep
     # flow (close->evaluate->CERTIFYING) advances it normally.
+    #
+    # KNOWN GAP — benchmark_anchor_epoch is NOT carried here, and this is deliberate.
+    # A follower that adopts a round via THIS path (i.e. it missed the close
+    # broadcast, which does carry the field) gets benchmark_anchor_epoch=None and so
+    # anchors its fork pin to opened_epoch, while the leader anchored to the real-open
+    # epoch → different pin → PACK_HASH_MISMATCH for that follower on that round.
+    #
+    # It is not fixed here because the fix is not local: the field rides in
+    # **field_updates (so its absence is silent — no signature error, no test), and
+    # the field exists on CloseRoundRequest only, NOT on CertifyRoundRequest or
+    # ChampionConsensusProposalRequest. The proposal route authenticates by
+    # canonicalizing body.model_dump() (routes.py _verify_champion_proposal_signature),
+    # so ADDING a field to that model breaks signature verification in BOTH directions
+    # during any staggered rollout — the exact shape of the #378 outage where a stray
+    # `timestamp` key made followers reject every champion proposal and quorum could
+    # never be reached (see peer_network.py).
+    #
+    # HARD INVARIANT: this gap is free at quorum <= 1 (FOLLOWER_TRUST_LEADER_QUORUM1 —
+    # the follower adopts the leader's signed champion without self-verifying, so its
+    # own pin never gates anything). QUORUM MUST NOT BE RAISED ABOVE 1 until
+    # benchmark_anchor_epoch is plumbed through the proposal/certify path — and that
+    # plumbing requires a PREREQUISITE PR converting proposal-sig verification to
+    # raw-dict canonicalization (mirroring _verify_internal_round_signature) so adding
+    # a field is not itself a fleet-wide quorum outage.
     if round_store.get_round(round_id) is None:
         _adopt_leader_round_if_behind(
             round_id,
@@ -719,6 +744,48 @@ async def _maybe_prepare_round_for_certification(
                     )
 
     return round_state
+
+
+def _champion_approval_deadline(
+    effective_epoch: int | None,
+    *,
+    now: float | None = None,
+) -> int:
+    """Unix-seconds expiry to sign into a fresh champion approval — PURE.
+
+    The approval signature is spent by the on-chain ``certify()`` at ADOPTION,
+    which fires at the round's ACTIVATION (``effective_epoch``) — roughly one
+    round-eval tick after it — not at certification time. Certification can land
+    long before that: only the rotation slate (#499) is benchmarked, while the
+    autoscaled decision window (#421) still sizes activation off the FULL slate
+    (``activation = close + 10 + 4*n_submissions + 2``). A fixed ``now + TTL``
+    deadline therefore expires mid-wait on a busy round, and ``certify()``
+    reverts "Expired" — its deadline check precedes signature/nonce/quorum in
+    ChampionRegistry.sol, so it is the first thing to fail — surfacing as
+    ``merge_failed:attest_failed``.
+
+    Anchor the deadline to the activation the signature must survive to. Floored
+    at the legacy ``now + CHAMPION_APPROVAL_DEADLINE_SECONDS`` so this can only
+    ever WIDEN a deadline, never shorten one: a reattest of a standing champion
+    whose activation is already in the past keeps the legacy TTL.
+
+    Only for leaders minting fresh. Followers reuse the leader's deadline
+    verbatim via ``deadline_override`` (it is part of the EIP-712 digest), so
+    old-image followers inherit the anchored value without a coordinated
+    rollout.
+    """
+    import time as _time
+
+    from minotaur_subnet.consensus.champion_manager import (
+        CHAMPION_APPROVAL_ACTIVATION_MARGIN_SECONDS,
+        CHAMPION_APPROVAL_DEADLINE_SECONDS,
+    )
+
+    floor = int(now if now is not None else _time.time()) + CHAMPION_APPROVAL_DEADLINE_SECONDS
+    activation_ts = epoch_start_ts(effective_epoch)
+    if activation_ts is None:
+        return floor
+    return max(floor, int(activation_ts) + CHAMPION_APPROVAL_ACTIVATION_MARGIN_SECONDS)
 
 
 def _floor_champion_nonce(
@@ -935,12 +1002,10 @@ def _build_champion_proposal_for_round(
     # v2 digest fields: commit_hash binds the git SHA, nonce/deadline are
     # replay protection. Nonce uses millisecond wall-clock — monotonic in
     # practice across champion proposals from a given leader, and enforced
-    # strictly-greater on-chain per-signer. Deadline is 1 hour from now.
+    # strictly-greater on-chain per-signer. Deadline is anchored to the round's
+    # activation (see _champion_approval_deadline).
     # Peers pass *_override from the leader's payload so digests match.
     import time as _time
-    from minotaur_subnet.consensus.champion_manager import (
-        CHAMPION_APPROVAL_DEADLINE_SECONDS,
-    )
     if nonce_override is not None:
         # Follower (or re-broadcast): reuse the leader's signed nonce verbatim so
         # the EIP-712 digest matches. Must NOT re-floor — that would diverge the
@@ -952,9 +1017,11 @@ def _build_champion_proposal_for_round(
         # nonce that silently bricks certification. Fail-open (see helper).
         nonce = _floor_champion_nonce(int(_time.time() * 1000), consensus_manager)
     if deadline_override is not None:
+        # Follower (or re-broadcast): reuse the leader's signed deadline verbatim
+        # — same reason as the nonce above, it is part of the EIP-712 digest.
         deadline = int(deadline_override)
     else:
-        deadline = int(_time.time()) + CHAMPION_APPROVAL_DEADLINE_SECONDS
+        deadline = _champion_approval_deadline(resolved_effective_epoch)
     if commit_hash_override is not None:
         resolved_commit_hash: str | None = commit_hash_override or None
     else:

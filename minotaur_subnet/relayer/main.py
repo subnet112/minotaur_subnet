@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 def _read_authorized_validators(rpc_url: str, registry_address: str) -> list[str]:
     """Read the current authorized-validator set from ValidatorRegistry on chain."""
     from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
     abi = [{
         "name": "getValidators",
         "type": "function",
@@ -58,7 +59,7 @@ def _read_authorized_validators(rpc_url: str, registry_address: str) -> list[str
         "inputs": [],
         "outputs": [{"name": "", "type": "address[]"}],
     }]
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = build_retrying_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=abi,
@@ -436,10 +437,22 @@ class RelayerService:
                 status=400,
             )
 
-        # ── Safeguard 7: plan-hash dedup (committed last, after all
+        # ── Safeguard 7: submission dedup (committed last, after all
         # cheaper checks — so we don't waste a slot on a request that
-        # would have failed verification anyway). ────────────────────
-        ok, err = self.safeguards.check_plan_hash_unseen(expected_plan_hash, plan.deadline)
+        # would have failed verification anyway). Keyed per fill-round,
+        # not per plan-bytes: the champion solver is deterministic, so
+        # two different orders (or two fills of one perpetual order)
+        # legitimately carry byte-identical plans — and each arrives
+        # with its own PlanApproval quorum (which signs orderId+planHash,
+        # so cross-order replay is already impossible cryptographically).
+        # The dedup only has to stop the same fill-round double-racing
+        # past the pre-broadcast dry-run. ─────────────────────────────
+        try:
+            _exec_count = int(order_data.get("execution_count") or 0)
+        except (TypeError, ValueError):
+            _exec_count = 0
+        dedup_key = f"{order_data.get('order_id', '')}:{_exec_count}:{expected_plan_hash}"
+        ok, err = self.safeguards.check_plan_hash_unseen(dedup_key, plan.deadline)
         if not ok:
             return web.json_response({"success": False, "error": err}, status=409)
 
@@ -488,11 +501,30 @@ class RelayerService:
                 contract_address=contract_address_override,
             )
         except Exception as exc:
+            # Deliberately NOT releasing the dedup reservation here: a crash
+            # mid-submit is ambiguous (the tx MAY have been broadcast, e.g. a
+            # timeout waiting for the receipt). The clamped TTL bounds the
+            # block to minutes.
             logger.exception("Relayer: submit_plan crashed for order=%s", order_data.get("order_id", "")[:12])
             return web.json_response(
                 {"success": False, "error": f"submit_plan crashed: {exc}"},
                 status=500,
             )
+
+        # Pre-broadcast failure (gas-balance floor, dry-run revert,
+        # estimate_gas error): no tx exists, nothing on-chain to protect —
+        # release the dedup slot so a retry of this fill-round isn't
+        # blocked. Live incident 2026-07-15: a balance-floor failure burned
+        # the hash and every identical retry 409'd until a relayer restart.
+        # ``broadcast_attempted`` (not tx_hash absence) is the discriminator:
+        # a broadcast can land while the receipt wait times out, and that
+        # in-flight tx is exactly what the reservation must keep protecting.
+        if (
+            not submit_result.success
+            and not submit_result.tx_hash
+            and not getattr(submit_result, "broadcast_attempted", True)
+        ):
+            self.safeguards.release_plan_hash(dedup_key)
 
         # Charge against the daily gas budget whenever gas was actually burned
         # ON-CHAIN — i.e. a successful submit OR a mined-then-reverted tx. The
@@ -522,8 +554,10 @@ class RelayerService:
             "error": submit_result.error,
         })
 
-    async def handle_finalize_champion(self, request: web.Request) -> web.Response:
-        """POST /v1/finalize-champion — attest + squash-merge a certified champion.
+    async def _finalize_core(self, request: web.Request) -> "FinalizeOutcome":
+        """Shared finalize logic → a structured FinalizeOutcome (serialized per
+        API version by the /v1 and /v2 handlers below). Attest + squash-merge a
+        certified champion.
 
         Champion FINALIZATION (the on-chain ``ChampionRegistry.certify()`` tx +
         the GitHub PR squash-merge) lives HERE, in the trusted relayer that holds
@@ -570,36 +604,29 @@ class RelayerService:
         )
         from minotaur_subnet.consensus.eip712 import build_domain_separator
         from minotaur_subnet.harness.round_store import ChampionCertificate
-        from minotaur_subnet.relayer.solver_repo import on_champion_adopted_pr
+        from minotaur_subnet.relayer.solver_repo import (
+            FinalizeOutcome,
+            on_champion_adopted_pr,
+        )
 
         try:
             data = await request.json()
         except Exception as exc:
-            return web.json_response(
-                {"merge_ok": False, "reason": f"bad JSON: {exc}"}, status=200,
-            )
+            return FinalizeOutcome(False, "bad_json", "validation", f"bad JSON: {exc}")
 
         try:
             round_id = str(data.get("round_id") or "").strip()
             cert = ChampionCertificate.from_dict(data.get("certificate"))
             if cert is None:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "missing certificate"}, status=200,
-                )
+                return FinalizeOutcome(False, "missing_certificate", "validation", "missing certificate", round_id=round_id)
             if not cert.approvals:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "certificate has no approvals"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "no_approvals", "validation", "certificate has no approvals", round_id=round_id)
 
             quorum_required = int(cert.quorum_required or 0)
             if quorum_required < 1:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": f"invalid quorum_required {quorum_required} (< 1)",
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "invalid_quorum", "validation",
+                    f"invalid quorum_required {quorum_required} (< 1)", round_id=round_id,
                 )
 
             # ── Champion DOMAIN_SEPARATOR ──────────────────────────────────
@@ -616,15 +643,10 @@ class RelayerService:
                 or os.environ.get("CHAMPION_CONSENSUS_CONTRACT_ADDRESS", "").strip()
             )
             if not champion_registry_address:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"no CHAMPION_REGISTRY_{champion_chain_id} configured — "
-                            "cannot recompute champion domain separator"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "registry_unconfigured", "validation",
+                    f"no CHAMPION_REGISTRY_{champion_chain_id} configured — "
+                    "cannot recompute champion domain separator", round_id=round_id,
                 )
             domain_separator = build_domain_separator(
                 champion_chain_id,
@@ -663,15 +685,10 @@ class RelayerService:
             # The cert is signed against the BT-EVM (champion-chain) ValidatorRegistry.
             chain_cfg = self.chains.get(champion_chain_id)
             if chain_cfg is None or not chain_cfg.validator_registry_address:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"no ValidatorRegistry configured on champion chain "
-                            f"{champion_chain_id}"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "vr_unconfigured", "validation",
+                    f"no ValidatorRegistry configured on champion chain {champion_chain_id}",
+                    round_id=round_id,
                 )
             try:
                 authorized = _read_authorized_validators(
@@ -679,9 +696,9 @@ class RelayerService:
                     chain_cfg.validator_registry_address,
                 )
             except Exception as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"ValidatorRegistry read failed: {exc}"},
-                    status=200,
+                return FinalizeOutcome(
+                    False, "vr_read_failed", "validation",
+                    f"ValidatorRegistry read failed: {exc}", round_id=round_id,
                 )
             authorized_lower = {addr.lower() for addr in authorized}
             authorized_verified = verified_signers & authorized_lower
@@ -693,10 +710,7 @@ class RelayerService:
             wrapper_data = data.get("wrapper")
             wrapper_sig = data.get("wrapper_signature")
             if not wrapper_data or not wrapper_sig:
-                return web.json_response(
-                    {"merge_ok": False, "reason": "missing wrapper or wrapper_signature"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "missing_wrapper", "validation", "missing wrapper or wrapper_signature", round_id=round_id)
             try:
                 wrapper = WrapperPayload(
                     plan_hash=wrapper_data["plan_hash"],
@@ -705,41 +719,27 @@ class RelayerService:
                     chain_id=int(wrapper_data["chain_id"]),
                 )
             except (KeyError, ValueError, TypeError) as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"malformed wrapper: {exc}"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "malformed_wrapper", "validation", f"malformed wrapper: {exc}", round_id=round_id)
             expected_wrapper_hash = compute_champion_finalize_hash(
                 round_id, cert.candidate_submission_id or "",
             )
             if wrapper.plan_hash != expected_wrapper_hash:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": "wrapper plan_hash doesn't bind round+submission",
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "wrapper_hash_mismatch", "validation",
+                    "wrapper plan_hash doesn't bind round+submission", round_id=round_id,
                 )
             ok, err = is_wrapper_fresh(wrapper)
             if not ok:
-                return web.json_response({"merge_ok": False, "reason": err}, status=200)
+                return FinalizeOutcome(False, "wrapper_stale", "validation", err, round_id=round_id)
             try:
                 wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
             except Exception as exc:
-                return web.json_response(
-                    {"merge_ok": False, "reason": f"wrapper sig invalid: {exc}"},
-                    status=200,
-                )
+                return FinalizeOutcome(False, "wrapper_sig_invalid", "validation", f"wrapper sig invalid: {exc}", round_id=round_id)
             if wrapper_signer.lower() not in authorized_lower:
-                return web.json_response(
-                    {
-                        "merge_ok": False,
-                        "reason": (
-                            f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
-                            f"on champion chain {champion_chain_id}"
-                        ),
-                    },
-                    status=200,
+                return FinalizeOutcome(
+                    False, "wrapper_signer_unauthorized", "validation",
+                    f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                    f"on champion chain {champion_chain_id}", round_id=round_id,
                 )
 
             # ── Quorum gate (THE authority) ────────────────────────────────
@@ -749,9 +749,9 @@ class RelayerService:
                     f"authorized verified signers (of {len(authorized)} validators)"
                 )
                 logger.warning("Relayer: finalize-champion REFUSED (%s) round=%s", reason, round_id)
-                return web.json_response(
-                    {"merge_ok": False, "reason": reason, "round_id": round_id},
-                    status=200,
+                return FinalizeOutcome(
+                    False, "quorum_not_reached", "quorum", reason,
+                    round_id=round_id, submission_id=cert.candidate_submission_id or "",
                 )
 
             # ── Quorum OK → attest on-chain + squash-merge ─────────────────
@@ -774,20 +774,29 @@ class RelayerService:
                 quorum_required,
                 wrapper_signer[:10],
             )
-            merge_ok = bool(on_champion_adopted_pr(ns, round_id, certificate=cert))
-            return web.json_response(
-                {
-                    "merge_ok": merge_ok,
-                    "round_id": round_id,
-                    "submission_id": ns.submission_id,
-                },
-                status=200,
+            _res = on_champion_adopted_pr(ns, round_id, certificate=cert)
+            return FinalizeOutcome.from_merge(
+                _res, round_id=round_id, submission_id=ns.submission_id,
             )
         except Exception as exc:
             logger.exception("Relayer: finalize-champion crashed")
-            return web.json_response(
-                {"merge_ok": False, "reason": f"finalize crashed: {exc}"}, status=200,
-            )
+            from minotaur_subnet.relayer.solver_repo import FinalizeOutcome
+            return FinalizeOutcome(False, "finalize_crashed", "internal", f"finalize crashed: {exc}")
+
+    async def handle_finalize_champion(self, request: web.Request) -> web.Response:
+        """POST /v1/finalize-champion — legacy minimal shape: {merge_ok, round_id,
+        submission_id}. Kept as a compat shim for a leader on an older image; the
+        client prefers /v2. Fail-closed (always HTTP 200)."""
+        outcome = await self._finalize_core(request)
+        return web.json_response(outcome.to_v1(), status=200)
+
+    async def handle_finalize_champion_v2(self, request: web.Request) -> web.Response:
+        """POST /v2/finalize-champion — structured contract:
+        {ok, outcome, round_id, submission_id, reason: null | {code, stage, detail}}.
+        Same authority + fail-closed semantics as v1; only the response shape is
+        richer, so callers get the specific refusal cause without log-diving."""
+        outcome = await self._finalize_core(request)
+        return web.json_response(outcome.to_v2(), status=200)
 
     async def handle_deploy(self, request: web.Request) -> web.Response:
         """POST /deploy — deploy an App contract.
@@ -954,6 +963,212 @@ class RelayerService:
             "tx_hash": tx_hash,
         })
 
+    # The ONLY function signatures /v1/contract-call may invoke — the app-
+    # management admin surface, nothing else. A generic "send any tx as the
+    # relayer" endpoint would let one compromised validator key drain the
+    # relayer wallet arbitrarily (see the 2026-05-25 /deploy audit note), so
+    # the callable set is enumerated and every call is still wrapper-bound to
+    # its exact params. Extend deliberately, per function.
+    CONTRACT_CALL_ALLOWED_SIGS = frozenset({
+        # V2 float ops (WETH wrap + transfer to the app, relayer-side recover)
+        "deposit()",
+        "transfer(address,uint256)",
+        "withdrawFloat(address,uint256)",
+        # V2 relayer-gated app config
+        "setFeeBps(uint256)",
+        "setVolumeCapBps(uint256)",
+        "setFeeCollector(address)",
+        "setFeeMode(uint8)",
+        "setAppOwner(address)",
+        # AppRegistry automation
+        "setDeveloperAllowed(address,bool)",
+        "registerApp(bytes32,bytes32,address)",
+        "revokeApp(bytes32)",
+    })
+    CONTRACT_CALL_MAX_GAS = 300_000
+    CONTRACT_CALL_MAX_VALUE_WEI = 10**18  # 1 native token per call, hard cap
+
+    async def handle_contract_call(self, request: web.Request) -> web.Response:
+        """POST /v1/contract-call — allowlisted admin call from the relayer wallet.
+
+        The generic backend for the api's app-lifecycle endpoints (float
+        deposit/withdraw, config setters, AppRegistry automation) when the api
+        and relayer run as separate services: ``EvmRelayer.call_contract_function``
+        lives HERE, so ``HttpRelayer`` proxies to this endpoint.
+
+        Auth mirrors ``/deploy``: an EIP-191 wrapper whose recovered signer is
+        in the on-chain ``ValidatorRegistry`` for the target chain, with
+        ``plan_hash = compute_contract_call_hash(...)`` binding EVERY call
+        parameter. Additionally the function signature must be on
+        ``CONTRACT_CALL_ALLOWED_SIGS`` and gas/value are capped — this is an
+        admin surface, not an arbitrary-tx relay.
+        """
+        from minotaur_subnet.consensus.leader_wrapper import compute_contract_call_hash
+
+        try:
+            data = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": f"malformed JSON: {exc}"}, status=400)
+
+        target = data.get("target") or ""
+        fn_signature = data.get("fn_signature") or ""
+        abi_types = data.get("abi_types") or []
+        values = data.get("values") or []
+        try:
+            chain_id = int(data.get("chain_id"))
+            tx_value = int(data.get("tx_value") or 0)
+            gas = int(data.get("gas") or 200_000)
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": f"invalid numeric field: {exc}"}, status=400)
+
+        if fn_signature not in self.CONTRACT_CALL_ALLOWED_SIGS:
+            return web.json_response(
+                {"error": f"function not allowlisted for contract-call: {fn_signature!r}"},
+                status=403,
+            )
+        if not target or len(abi_types) != len(values):
+            return web.json_response(
+                {"error": "target required; abi_types/values length mismatch"}, status=400,
+            )
+        if gas <= 0 or gas > self.CONTRACT_CALL_MAX_GAS:
+            return web.json_response(
+                {"error": f"gas outside (0, {self.CONTRACT_CALL_MAX_GAS}]"}, status=400,
+            )
+        if tx_value < 0 or tx_value > self.CONTRACT_CALL_MAX_VALUE_WEI:
+            return web.json_response(
+                {"error": f"tx_value outside [0, {self.CONTRACT_CALL_MAX_VALUE_WEI}]"},
+                status=400,
+            )
+
+        chain_cfg = self.chains.get(chain_id)
+        if chain_cfg is None:
+            return web.json_response({"error": f"unsupported chain_id {chain_id}"}, status=400)
+
+        # ── Safeguards: same ladder as /deploy ──────────────────────────
+        ok, err = self.safeguards.check_daily_gas_room()
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        wrapper_data = data.get("wrapper")
+        wrapper_sig = data.get("wrapper_signature")
+        if not wrapper_data or not wrapper_sig:
+            return web.json_response(
+                {"error": (
+                    "missing wrapper or wrapper_signature — sign a freshness "
+                    "wrapper with plan_hash=compute_contract_call_hash(...)"
+                )},
+                status=400,
+            )
+        try:
+            wrapper = WrapperPayload(
+                plan_hash=wrapper_data["plan_hash"],
+                submission_nonce=int(wrapper_data["submission_nonce"]),
+                timestamp=int(wrapper_data["timestamp"]),
+                chain_id=int(wrapper_data["chain_id"]),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return web.json_response({"error": f"malformed wrapper: {exc}"}, status=400)
+
+        expected_hash = compute_contract_call_hash(
+            chain_id, target, fn_signature, abi_types, values, tx_value, gas,
+        )
+        if wrapper.plan_hash != expected_hash:
+            return web.json_response(
+                {"error": "wrapper plan_hash doesn't match call params"}, status=400,
+            )
+        if wrapper.chain_id != chain_id:
+            return web.json_response(
+                {"error": "wrapper chain_id doesn't match request"}, status=400,
+            )
+        ok, err = is_wrapper_fresh(wrapper)
+        if not ok:
+            return web.json_response({"error": err}, status=400)
+        try:
+            wrapper_signer = recover_wrapper_signer(wrapper, wrapper_sig)
+        except Exception as exc:
+            return web.json_response({"error": f"wrapper sig invalid: {exc}"}, status=400)
+
+        if not chain_cfg.validator_registry_address:
+            return web.json_response(
+                {"error": f"no ValidatorRegistry configured on chain {chain_id}"},
+                status=500,
+            )
+        try:
+            authorized = _read_authorized_validators(
+                chain_cfg.rpc_url,
+                chain_cfg.validator_registry_address,
+            )
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"ValidatorRegistry read failed: {exc}"}, status=502,
+            )
+        if wrapper_signer.lower() not in {a.lower() for a in authorized}:
+            return web.json_response(
+                {"error": (
+                    f"wrapper signer {wrapper_signer} not in ValidatorRegistry "
+                    f"on chain {chain_id} — only registered validators may call"
+                )},
+                status=403,
+            )
+        ok, err = self.safeguards.check_signer_nonce(wrapper_signer, wrapper.submission_nonce)
+        if not ok:
+            return web.json_response({"error": err}, status=409)
+        ok, err = self.safeguards.check_caller_rate(wrapper_signer)
+        if not ok:
+            return web.json_response({"error": err}, status=429)
+
+        logger.info(
+            "Relayer: contract-call accepted (chain=%d fn=%s target=%s "
+            "wrapper-signer=%s nonce=%d value=%d gas=%d)",
+            chain_id, fn_signature, target[:10], wrapper_signer[:10],
+            wrapper.submission_nonce, tx_value, gas,
+        )
+
+        # Values arrive in canonical wire form (contract_call_wire_values:
+        # strings, bytes as 0x-hex, bools as true/false); coerce back per ABI
+        # type for the encoder — bytes* MUST become real bytes (eth_abi's
+        # BytesEncoder rejects strings; broke registerApp(bytes32,…) live).
+        def _coerce(t, v):
+            if t in ("address", "string"):
+                return v
+            if t.startswith("bytes"):
+                s = str(v)
+                return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+            if t == "bool":
+                return str(v).lower() in ("true", "1")
+            return int(v)
+
+        try:
+            coerced = [_coerce(t, v) for t, v in zip(abi_types, values)]
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": f"bad values for abi_types: {exc}"}, status=400)
+
+        try:
+            tx_hash = await self.relayer.call_contract_function(
+                target, chain_id, fn_signature, list(abi_types), coerced,
+                tx_value=tx_value, gas=gas,
+            )
+        except Exception as exc:
+            logger.exception("Relayer: contract-call crashed on chain %d", chain_id)
+            return web.json_response({"error": f"contract-call failed: {exc}"}, status=500)
+
+        return web.json_response({"status": "sent", "tx_hash": tx_hash})
+
+    async def handle_wallets(self, request: web.Request) -> web.Response:
+        """GET /wallets — the relayer's sending address per configured chain.
+
+        Lets ``HttpRelayer._resolve_wallet`` answer without holding the key —
+        addresses are public information (they're on every tx the relayer
+        sends), so no auth needed.
+        """
+        wallets: dict[str, str] = {}
+        for cid in self.chains:
+            try:
+                wallets[str(cid)] = self.relayer._resolve_wallet(cid)
+            except Exception as exc:
+                logger.warning("wallet resolve failed for chain %s: %s", cid, exc)
+        return web.json_response({"wallets": wallets})
+
     async def handle_tx_status(self, request: web.Request) -> web.Response:
         """GET /status/{tx_hash} — check transaction status."""
         tx_hash = request.match_info["tx_hash"]
@@ -987,7 +1202,10 @@ def create_app() -> web.Application:
     # the canonical submission path now.
     app.router.add_post("/v1/submit-plan", service.handle_submit_plan)
     app.router.add_post("/v1/finalize-champion", service.handle_finalize_champion)
+    app.router.add_post("/v2/finalize-champion", service.handle_finalize_champion_v2)
     app.router.add_post("/deploy", service.handle_deploy)
+    app.router.add_post("/v1/contract-call", service.handle_contract_call)
+    app.router.add_get("/wallets", service.handle_wallets)
     app.router.add_get("/status/{tx_hash}", service.handle_tx_status)
     app.router.add_get("/gas-balances", service.handle_gas_balances)
     app.router.add_get("/health", service.handle_health)

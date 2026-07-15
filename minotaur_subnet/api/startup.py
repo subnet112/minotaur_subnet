@@ -249,7 +249,7 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     chains = _benchmark_pin_chains()
     confirmations = ROUND_ANCHOR_CONFIRMATIONS  # fleet-uniform code constant (was env)
 
-    from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
 
     w3_cache: dict[int, object] = {}
 
@@ -266,8 +266,13 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
             # leader the same event loop also drives the order-execution
             # BlockLoop. An unbounded HTTP read on a stuck RPC would block the
             # loop (and stall order proposing); the timeout caps the worst case.
-            w3_cache[chain_id] = Web3(
-                Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s})
+            # TIGHT retry (attempts=2, deadline≈timeout): this is a blocking read
+            # on the leader's shared loop, so a persistent 429 must not multiply
+            # the worst-case block by the full retry budget — one fast retry, then
+            # defer (round-close self-heals to the live head).
+            w3_cache[chain_id] = build_retrying_web3(
+                rpc, request_kwargs={"timeout": timeout_s},
+                attempts=2, deadline_seconds=max(1.0, float(timeout_s)),
             )
         return w3_cache[chain_id]
 
@@ -291,14 +296,100 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         return None
 
 
+def _benchmark_anchor_real_epoch_enabled() -> bool:
+    """Fleet-uniform gate for the B2 real-open-epoch fork-pin anchor. **DEFAULT ON.**
+
+    Thin delegate to :func:`consensus.round_anchor.benchmark_anchor_real_epoch_enabled`
+    — the single place the default lives, alongside the other fleet-uniform pin
+    gates, so every read site stays in lock-step. See that docstring for the
+    rationale (image-baked default; ``{0,false,no,off}`` emergency override only).
+    """
+    from minotaur_subnet.consensus.round_anchor import (
+        benchmark_anchor_real_epoch_enabled,
+    )
+
+    return benchmark_anchor_real_epoch_enabled()
+
+
+def _benched_slate_size(round_id: str, rotation: dict[str, object] | None) -> int:
+    """How many submissions this round will actually BENCHMARK.
+
+    This sizes the decision window (#421), whose entire job is to cover the
+    SERIAL benchmark (#387) — so it has to count what gets benched, not what got
+    submitted. When rotation (#499) applied, that is exactly its selected slate.
+
+    Deriving it from store statuses instead is what broke this: the autoscale
+    kept its own copy of the "won't be benched" rule as ``status != "rejected"``,
+    and #620 parked rotation's overflow in ``waitlisted`` rather than
+    ``rejected``. The two silently diverged, so ~17 never-benched submissions
+    inflated the window to 86 epochs (10 + 4*19 vs the true 10 + 4*3); activation
+    = close + window + 2 then landed ~78 min after certification, outliving the
+    champion approval, and certify() reverted "Expired" ->
+    ``merge_failed:attest_failed`` on every contested round.
+
+    So prefer the POSITIVE definition (the slate we selected), and fall back to
+    rotation's own non-terminal candidate rule only when rotation did not apply
+    — ``slots <= 0`` (disabled/unlimited) or it raised — which is precisely when
+    every candidate does get benched. Never keep a second copy of that rule here.
+    """
+    if rotation is not None and rotation.get("applied"):
+        selected = rotation.get("selected")
+        if selected is not None:
+            return len(selected)
+    try:
+        from minotaur_subnet.api.routes import submissions
+        from minotaur_subnet.harness.rotation import benchable_candidate_count
+
+        return benchable_candidate_count(
+            submissions.get_store().list_by_round(round_id)
+        )
+    except Exception:
+        logger.warning(
+            "benched-slate size for %s failed (window falls back to the floor)",
+            round_id, exc_info=True,
+        )
+        return 0
+
+
+def _round_fork_anchor_epoch(round_state) -> int | None:
+    """Which epoch to anchor the round's benchmark fork-pin to.
+
+    ``opened_epoch`` is the champion ACTIVATION schedule, deliberately ~1 tempo in
+    the FUTURE — anchoring the pin to it lands ~40 min ahead and defers. When the
+    B2 anchor is enabled (**default ON**) AND the round carries a stamped
+    ``benchmark_anchor_epoch`` (the leader's real wall-clock epoch at open,
+    fleet-broadcast + adopted), anchor to THAT — a recent-PAST time-epoch that
+    brackets immediately. Otherwise fall back to ``opened_epoch`` (legacy
+    behaviour). Both are fleet-identical and known at open. Only the epoch fed in
+    changes; ``round_anchor_ts`` + the per-chain lookback + ``find_pin_block`` are
+    untouched.
+
+    The ``benchmark_anchor_epoch is None`` fallback is fleet-uniform, NOT a local
+    default: the stamp is set once by the leader at open and travels with the round
+    (close-sync payload → ``CloseRoundRequest`` → adopted ``RoundState``), so every
+    node evaluating the same round sees the same stamp — present or absent — and
+    therefore derives the same anchor. A round opened before the field existed is
+    None everywhere, and anchors to ``opened_epoch`` everywhere.
+    """
+    if _benchmark_anchor_real_epoch_enabled():
+        bae = getattr(round_state, "benchmark_anchor_epoch", None)
+        if bae is not None:
+            return int(bae)
+    oe = getattr(round_state, "opened_epoch", None)
+    return int(oe) if oe is not None else None
+
+
 def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
     """Leader-side: derive + store the round's canonical fork pins (gated).
 
     Called before the leader builds ``benchmark_pack_hash`` so the pins enter the
-    hash. Default-off and best-effort: with the gate off, or on any derivation
-    failure, ``fork_pins`` stays unset → the pack hash is unchanged and the
-    benchmark runs at live head (inert). Followers derive their own independently
-    (P3); divergence surfaces as PACK_HASH_MISMATCH, never a silent mis-score.
+    hash. Best-effort: on any derivation failure ``fork_pins`` stays unset → the
+    pack hash is unchanged and the benchmark runs at live head (inert). The gate
+    (``round_anchored_pin_enabled``) is DEFAULT ON, so this runs on the leader's
+    shared event loop every round close — the fork-pin reads use a TIGHT retry
+    (attempts=2, deadline≈timeout) to keep worst-case blocking near one request.
+    Followers derive their own independently (P3); divergence surfaces as
+    PACK_HASH_MISMATCH, never a silent mis-score.
     """
     from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not round_anchored_pin_enabled():
@@ -316,7 +407,7 @@ def _maybe_populate_round_fork_pins(round_id: str, anchor_epoch: int) -> None:
         logger.warning("fork-pins: store failed for round %s: %s", round_id, exc)
 
 
-def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
+def _resolve_round_fork_pins(round_id: str, *, persist: bool = True) -> dict[int, int] | None:
     """Resolve the round's canonical fork pins, deriving + caching if absent.
 
     Gated by ``ROUND_ANCHORED_PIN``. Returns ``RoundState.fork_pins`` when already
@@ -344,17 +435,27 @@ def _resolve_round_fork_pins(round_id: str) -> dict[int, int] | None:
     cached = getattr(round_state, "fork_pins", None)
     if cached:
         return cached
-    # Anchor to opened_epoch (NOT close_epoch). opened_epoch is fleet-identical from the
-    # instant the round exists — it is encoded in the round_id (round-e{opened_epoch}-n{n})
-    # and followers parse it back verbatim — so every validator derives the SAME pin, and
-    # (unlike close_epoch, set only at close) it is KNOWN AT OPEN, so the pin resolves
-    # DURING the open window. round_anchor_ts(opened_epoch) sits ~1 epoch in the confirmed
-    # past at open so find_pin_block brackets immediately; by close it is deeply confirmed.
-    opened_epoch = getattr(round_state, "opened_epoch", None)
-    if opened_epoch is None:
+    # Select the fork-pin anchor epoch (see _round_fork_anchor_epoch): the stamped
+    # real-open wall-clock epoch (benchmark_anchor_epoch), else the legacy opened_epoch
+    # on rounds opened before that field existed. Both are fleet-identical (opened_epoch
+    # is in the round_id; benchmark_anchor_epoch is leader-broadcast + adopted) and KNOWN
+    # AT OPEN, so the pin resolves DURING the open window and every validator derives the
+    # SAME pin.
+    #
+    # NOTE the cached-pin fast path above returns BEFORE this: a node that already cached
+    # a pin for the round keeps it. So changing the anchor default only takes effect for
+    # rounds opened after the change — flip it on a round boundary or the arm is a silent
+    # partial no-op for in-flight rounds (set_round_fork_pins refuses a differing
+    # overwrite and only warns).
+    anchor_epoch = _round_fork_anchor_epoch(round_state)
+    if anchor_epoch is None:
         return None
-    pins = _derive_round_fork_pins(int(opened_epoch))
-    if pins:
+    pins = _derive_round_fork_pins(int(anchor_epoch))
+    if pins and persist:
+        # Cache for reuse. Skipped (persist=False) for the split benchmark-worker
+        # process, which must stay ROUND-STORE-READ-ONLY (pins are deterministic
+        # from opened_epoch, so it derives the identical value without writing —
+        # the api coordinator remains the sole fork_pins writer).
         try:
             store.set_round_fork_pins(round_id, pins)  # cache for reuse
         except Exception as exc:
@@ -385,6 +486,89 @@ def _leader_fork_pin_resolver(round_id: str) -> int | dict[int, int] | None:
     return pins.get(_round_anchor_chains()[0])
 
 
+def _leader_fork_pin_resolver_readonly(round_id: str) -> int | dict[int, int] | None:
+    """Round-store-READ-ONLY variant of :func:`_leader_fork_pin_resolver` for the
+    split benchmark-worker process. Identical deterministic pins, but never caches
+    them back to the round store (persist=False) — so the worker performs NO
+    round-store write and the api coordinator stays the sole fork_pins writer."""
+    pins = _resolve_round_fork_pins(round_id, persist=False)
+    if not pins:
+        return None
+    from minotaur_subnet.consensus.round_anchor import (
+        benchmark_all_deployment_chains_enabled,
+    )
+    if benchmark_all_deployment_chains_enabled():
+        return dict(pins)
+    return pins.get(_round_anchor_chains()[0])
+
+
+def _build_simulator():
+    """Build the MultiChainSimulator from the registry sim/upstream RPC ladders,
+    or None if no sim RPCs are configured. Used by BOTH the block-loop path (api /
+    monolith) and the dedicated benchmark-worker process (which has no block loop),
+    so the worker can score. The worker's ``*_SIM_RPC_URL`` env resolves to its
+    dedicated ``anvil-*-bench`` forks, isolating its snapshot/revert from the api's."""
+    from minotaur_subnet.chains import wiring as chain_wiring
+    sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
+    if not sim_rpc_urls:
+        return None
+    upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
+    try:
+        from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
+        sim = MultiChainSimulator(sim_rpc_urls, upstream_rpc_urls=upstream_rpc_urls)
+        logger.info(
+            "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
+            list(sim_rpc_urls.keys()),
+            [c for c in sim_rpc_urls if c in upstream_rpc_urls],
+        )
+        return sim
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MultiChainSimulator unavailable: %s", exc)
+        return None
+
+
+# Compose service names of the api's SHARED simulator forks. The split benchmark
+# worker (BENCHMARK_WORKER_ONLY) MUST fork on its OWN dedicated anvils (…-bench):
+# sharing a fork means both processes evm_snapshot / evm_revert + re-fork the same
+# anvil, silently corrupting each other's scoreIntent on BOTH sides.
+_SHARED_API_FORK_HOSTS = frozenset({"anvil-eth", "anvil-base", "anvil-btevm"})
+
+
+def _assert_worker_forks_isolated() -> None:
+    """Fail-closed at boot if the split benchmark worker is pointed at the api's
+    SHARED simulator forks instead of its own dedicated ``anvil-*-bench`` forks.
+
+    Self-contained (the worker can't read the api's env), so it asserts the
+    worker's sim hosts are not the well-known shared-fork compose service names.
+    Escape hatch for a single-fork dev/test box: BENCHMARK_WORKER_ALLOW_SHARED_FORKS=1.
+    """
+    if os.environ.get(
+        "BENCHMARK_WORKER_ALLOW_SHARED_FORKS", "",
+    ).lower() in ("1", "true", "yes"):
+        return
+    from urllib.parse import urlsplit
+    from minotaur_subnet.chains import wiring as chain_wiring
+
+    shared = []
+    for cid, url in chain_wiring.sim_rpc_urls().items():
+        try:
+            host = urlsplit(url).hostname or ""
+        except (ValueError, TypeError):
+            continue
+        if host in _SHARED_API_FORK_HOSTS:
+            shared.append(f"chain {cid} → {url}")
+    if shared:
+        raise RuntimeError(
+            "BENCHMARK_WORKER_ONLY: the worker is pointed at the api's SHARED "
+            "simulator fork(s): " + ", ".join(shared) + ". The worker must fork on "
+            "its OWN dedicated anvil-*-bench forks (set ETH_SIM_RPC_URL / "
+            "BASE_SIM_RPC_URL / BITTENSOR_EVM_SIM_RPC_URL to the -bench hosts) — "
+            "sharing a fork races snapshot/revert on both processes and corrupts "
+            "scoring. Override for single-fork dev only: "
+            "BENCHMARK_WORKER_ALLOW_SHARED_FORKS=1."
+        )
+
+
 def _round_anchored_pin_segment(round_id: str) -> str:
     """Canonical per-chain fork pins for the round, serialized for the pack hash.
 
@@ -407,17 +591,25 @@ def _maybe_shadow_log_round_fork_pins(
     *,
     role: str,
     anchor_epoch: int | None = None,
+    force: bool = False,
 ) -> None:
     """Shadow phase (spec §6 step 2): derive + log the round-anchored fork pins
     and the ``benchmark_pack_hash`` they *would* produce, with **zero consensus
     effect**.
 
-    Enabled by ``ROUND_ANCHOR_SHADOW`` (default-off) and only active while the
-    real gate ``ROUND_ANCHORED_PIN`` is OFF — when the gate is on the live path
-    already derives, binds and logs the pins, so shadow would be redundant. This
-    closes the rollout gap where, with the gate off, ``_derive_round_fork_pins``
-    is never called, so operators have no way to confirm every validator computes
-    the identical pin *before* flipping the gate.
+    Enabled by ``ROUND_ANCHOR_SHADOW`` (default-off). Normally only active while
+    the real gate ``ROUND_ANCHORED_PIN`` is OFF — when the gate is on the live
+    path already derives, binds and logs the (opened_epoch-anchored) pins, so
+    shadow would be redundant. This closes the rollout gap where, with the gate
+    off, ``_derive_round_fork_pins`` is never called, so operators have no way to
+    confirm every validator computes the identical pin *before* flipping the gate.
+
+    ``force=True`` logs REGARDLESS of ``ROUND_ANCHORED_PIN`` (the ``ROUND_ANCHOR_
+    SHADOW`` gate still applies): used for the B2 real-open-epoch parity line
+    (``role=leader-realopen``, anchor = ``benchmark_anchor_epoch``), whose anchor
+    DIFFERS from the live opened_epoch pin — so it is NOT redundant when the gate
+    is on; it is exactly the parity signal needed before arming
+    ``BENCHMARK_ANCHOR_REAL_EPOCH``.
 
     Strictly observational and best-effort:
 
@@ -435,8 +627,10 @@ def _maybe_shadow_log_round_fork_pins(
     from minotaur_subnet.consensus.round_anchor import round_anchored_pin_enabled
     if not _env_true("ROUND_ANCHOR_SHADOW", default=False):
         return
-    if round_anchored_pin_enabled():
+    if round_anchored_pin_enabled() and not force:
         return  # live path already derives/binds/logs — shadow is redundant
+        # (unless force: the B2 real-open anchor differs from the live pin, so it
+        # is NOT redundant and must log for parity even with the gate on)
     try:
         if anchor_epoch is None:
             from minotaur_subnet.api.routes import submissions
@@ -494,7 +688,7 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
     (a missing/failed hash is omitted, never raises — a probe must not break
     /health).
     """
-    from web3 import Web3
+    from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
 
     timeout_s = _round_anchor_rpc_timeout()
@@ -504,7 +698,10 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
             rpc = _chain_rpc_env(int(chain_id))
             if not rpc:
                 continue
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": timeout_s}))
+            w3 = build_retrying_web3(
+                rpc, request_kwargs={"timeout": timeout_s},
+                attempts=2, deadline_seconds=max(1.0, float(timeout_s)),
+            )
             block_hash = w3.eth.get_block(int(block)).get("hash")
             if block_hash is not None:
                 out[str(chain_id)] = (
@@ -552,6 +749,12 @@ def _compute_round_anchor_parity_snapshot(anchor_epoch: int) -> dict:
         "pin_hashes": pin_hashes,
         "pin_segment": pin_segment,
         "gate_enabled": round_anchored_pin_enabled(),
+        # The B2 anchor selection resolved on THIS node. Surfaced for the same
+        # reason as gate_enabled: both fold into benchmark_pack_hash, so a node
+        # disagreeing here is a fleet split — and a split is otherwise only
+        # visible as an unexplained quorum drop. Poll /health across the fleet
+        # and diff this before and after any anchor change.
+        "anchor_real_epoch_enabled": _benchmark_anchor_real_epoch_enabled(),
         "derived_at": int(time.time()),
     }
 
@@ -1092,13 +1295,19 @@ async def initialize(ctx: ServerContext) -> dict:
     # the submission in QUEUED/SCREENING_* forever — the round then busy-spins
     # in `replaying` with benchmarked=0 while miners see "scoring…". Re-kick
     # any recent strandings (no-op on nodes with none, e.g. followers).
-    try:
-        from minotaur_subnet.api.routes.submissions.screening_pipeline import (
-            resume_stranded_screenings,
-        )
-        await resume_stranded_screenings()
-    except Exception as exc:
-        logger.error("[screening] boot resume failed (continuing startup): %s", exc)
+    # Screening runs in exactly ONE process (the intake/coordinator api). The split
+    # benchmark worker (BENCHMARK_WORKER_ONLY) must NOT resume screenings — it shares
+    # /data + the docker socket, so it would DOUBLE the concurrent Docker screening
+    # builds (the #583 per-process CPU semaphore can't span two processes → the
+    # CPU-starvation freeze the split exists to reduce).
+    if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
+        try:
+            from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+                resume_stranded_screenings,
+            )
+            await resume_stranded_screenings()
+        except Exception as exc:
+            logger.error("[screening] boot resume failed (continuing startup): %s", exc)
 
     # ── benchmark worker ─────────────────────────────────────────────────
     # ALWAYS wire the submission store: the EpochManager needs it to ACTIVATE a certified
@@ -1108,28 +1317,66 @@ async def initialize(ctx: ServerContext) -> dict:
     # None and activate_certified_round raises "submission_store is required for certified
     # activation", silently stranding the follower on burn.
     sub_store = submissions.get_store()
-    benchmark_worker_enabled = os.environ.get(
+    # ── worker-mode gates (Phase 2 benchmark-worker split) ───────────────
+    # BENCHMARK_WORKER_ONLY=1 marks the dedicated worker process (same image,
+    # DISABLE_BLOCK_LOOP=1 + ENABLE_SOLVER_ROUND_COORDINATOR=0 + SUBMISSIONS_ACCEPTING=0).
+    _benchmark_worker_only = os.environ.get(
+        "BENCHMARK_WORKER_ONLY", "",
+    ).lower() in ("1", "true", "yes")
+    # Run the benchmark run_loop TASK in this process (the worker, or the monolith
+    # leader pre-split). ENABLE_BENCHMARK_WORKER=0 on the split api → the worker
+    # container owns the slate; the api only re-benches the single incumbent.
+    _run_benchmark_loop = os.environ.get(
         "ENABLE_BENCHMARK_WORKER", "",
     ).lower() in ("1", "true", "yes")
     if os.environ.get("DISABLE_BENCHMARK_WORKER", "").lower() in ("1", "true", "yes"):
-        benchmark_worker_enabled = False
+        _run_benchmark_loop = False
+    # Whether THIS process runs the solver-round coordinator (opens/advances
+    # rounds + drives the single-image incumbent re-bench).
+    _coordinator_will_run = (
+        os.environ.get("DISABLE_BLOCK_LOOP", "").lower() not in ("1", "true", "yes")
+        and os.environ.get("ENABLE_SOLVER_ROUND_COORDINATOR", "1").lower()
+        not in ("0", "false", "no")
+    )
+    # Misconfig alarm: a process that runs the slate loop (ENABLE_BENCHMARK_WORKER=1)
+    # with NO block loop (DISABLE_BLOCK_LOOP=1) is worker-SHAPED — but every
+    # read-only protection (no temp sweep, non-persisting pin resolver, no stale-
+    # deploy reconcile, no screening resume) keys on BENCHMARK_WORKER_ONLY. If that
+    # flag is missing, a second process sharing /data silently loses ALL of them and
+    # can clobber the api's round writes. Warn LOUDLY (don't fail — a dev may run
+    # this shape against a private /data).
+    _disable_block_loop = os.environ.get("DISABLE_BLOCK_LOOP", "").lower() in ("1", "true", "yes")
+    if _run_benchmark_loop and _disable_block_loop and not _benchmark_worker_only:
+        logger.warning(
+            "[worker] worker-SHAPED process (ENABLE_BENCHMARK_WORKER=1 + "
+            "DISABLE_BLOCK_LOOP=1) is MISSING BENCHMARK_WORKER_ONLY=1 — the round-"
+            "store read-only protections are OFF. If this process shares /data with "
+            "the api it can corrupt round/champion writes. Set BENCHMARK_WORKER_ONLY=1.",
+        )
+    # Construct the worker OBJECT if we run its loop OR we're the coordinator — the
+    # coordinator needs it for _refresh_incumbent_score (the single-image incumbent
+    # re-bench) even when it does NOT run the slate loop (the split api).
+    _construct_worker = _run_benchmark_loop or _coordinator_will_run
 
-    if benchmark_worker_enabled:
+    if _construct_worker:
         from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
 
-        submissions._sync_round_incumbent_from_submission_store(round_store, sub_store)
-        current_round = round_store.get_current_round()
-        if current_round is None:
-            active_champion = round_store.get_active_champion()
-            initial_epoch = (
-                active_champion.activated_epoch + 1
-                if active_champion.submission_id
-                else 0
-            )
-            round_store.ensure_open_round(
-                opened_epoch=initial_epoch,
-                incumbent=active_champion if active_champion.submission_id else None,
-            )
+        # Round bootstrap is the COORDINATOR's job. The worker process must NOT
+        # write the round store here (C2 — it stays round-store-read-only).
+        if _coordinator_will_run:
+            submissions._sync_round_incumbent_from_submission_store(round_store, sub_store)
+            current_round = round_store.get_current_round()
+            if current_round is None:
+                active_champion = round_store.get_active_champion()
+                initial_epoch = (
+                    active_champion.activated_epoch + 1
+                    if active_champion.submission_id
+                    else 0
+                )
+                round_store.ensure_open_round(
+                    opened_epoch=initial_epoch,
+                    incumbent=active_champion if active_champion.submission_id else None,
+                )
 
         poll_interval = float(os.environ.get("BENCHMARK_POLL_INTERVAL", "30"))
         _genesis_solver_image = os.environ.get("GENESIS_SOLVER_IMAGE", "").strip() or None
@@ -1141,19 +1388,52 @@ async def initialize(ctx: ServerContext) -> dict:
             round_store=round_store,
             genesis_solver_image=_genesis_solver_image,
             require_real_sim=_require_real_sim,
-            pin_resolver=_leader_fork_pin_resolver,
+            # The worker process stays round-store-read-only (C3): non-persisting
+            # pin resolver. The coordinator/api keeps the caching one.
+            pin_resolver=(
+                _leader_fork_pin_resolver_readonly
+                if _benchmark_worker_only
+                else _leader_fork_pin_resolver
+            ),
             validator_identity=_resolve_solver_round_hotkey(),
         )
-        ctx.benchmark_task = asyncio.create_task(
-            ctx.benchmark_worker.run_loop(interval=poll_interval),
-        )
+        # The worker has no block loop, so the simulator (built inside the
+        # block-loop block below) is never wired for it — build + attach it here so
+        # the worker can actually score (C1). Its *_SIM_RPC_URL env points at the
+        # dedicated anvil-*-bench forks, isolating it from the api's forks.
+        if _benchmark_worker_only:
+            # Fail-closed if the worker was misconfigured onto the api's SHARED
+            # forks — both processes would snapshot/revert + re-fork the same
+            # anvil, silently corrupting each other's scoreIntent (a consensus
+            # hazard). The worker MUST fork on its own anvil-*-bench.
+            _assert_worker_forks_isolated()
+            _worker_sim = _build_simulator()
+            if _worker_sim is not None:
+                ctx.benchmark_worker._simulator = _worker_sim
+                apps.set_simulator(_worker_sim)
+                logger.info("[worker] BenchmarkWorker using dedicated-fork Anvil simulation")
+            elif _require_real_sim:
+                logger.error(
+                    "[worker] BENCHMARK_REQUIRE_REAL_SIM set but no simulator "
+                    "available — the worker will fail-closed each tick",
+                )
+        # Run the slate loop only in a process that owns it.
+        if _run_benchmark_loop:
+            ctx.benchmark_task = asyncio.create_task(
+                ctx.benchmark_worker.run_loop(interval=poll_interval),
+            )
+            logger.info("Benchmark worker loop started (poll every %ds)", poll_interval)
+        else:
+            logger.info(
+                "Benchmark worker CONSTRUCTED for incumbent re-bench only "
+                "(the slate loop runs in the dedicated worker process)",
+            )
         # Expose the worker to routes (diagnostic image-scoring endpoint).
         try:
             from minotaur_subnet.api.routes.submissions.state import set_benchmark_worker
             set_benchmark_worker(ctx.benchmark_worker)
         except Exception:
             pass
-        logger.info("Benchmark worker started (poll every %ds)", poll_interval)
 
     # ── relayer ──────────────────────────────────────────────────────────
     # Two modes, picked by env:
@@ -1483,33 +1763,10 @@ async def initialize(ctx: ServerContext) -> dict:
         # scoreIntent runs on the ETHEREUM fork, not the Base anvil (ANVIL_RPC_URL is
         # the Base anvil on the leader, misnamed legacy) — required before arming
         # BENCHMARK_ALL_DEPLOYMENT_CHAINS with a chain-1 deployment.
-        simulator = None
-        sim_rpc_urls: dict[int, str] = chain_wiring.sim_rpc_urls()
-
-        # Upstream RPC URLs — the same endpoints the anvil containers
-        # are forking from. Used by AnvilSimulator._reset_fork to advance
-        # each fork to the current upstream head before every simulation
-        # (otherwise anvil_reset is a no-op and sims run against stale
-        # fork-time state — pool prices that no longer match real chain).
-        # Optional: when unset for a given chain, that chain's fork stays
-        # static (acceptable for local-testnet chain 31337 which isn't
-        # forked from anything).
-        upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
-
-        if sim_rpc_urls:
-            try:
-                from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
-                simulator = MultiChainSimulator(
-                    sim_rpc_urls,
-                    upstream_rpc_urls=upstream_rpc_urls,
-                )
-                logger.info(
-                    "MultiChainSimulator initialized (chains=%s, upstreams=%s)",
-                    list(sim_rpc_urls.keys()),
-                    [c for c in sim_rpc_urls if c in upstream_rpc_urls],
-                )
-            except Exception as exc:
-                logger.warning("MultiChainSimulator unavailable: %s", exc)
+        # Built via the shared helper (also used by the split worker process, which
+        # has no block loop). Per-chain sim fork targets come from registry.sim_rpc
+        # + the upstream head endpoints for _reset_fork.
+        simulator = _build_simulator()
 
         if simulator is not None:
             apps.set_simulator(simulator)
@@ -2207,6 +2464,12 @@ async def initialize(ctx: ServerContext) -> dict:
                 on_champion_rejected=_champion_reject_fn,
                 on_champion_finalist=_champion_finalist_fn,
                 vote_recorder=lambda v: setattr(ctx, "last_independent_vote", v),
+                # After the split the api runs the coordinator but NOT the slate
+                # loop (ENABLE_BENCHMARK_WORKER=0 → _run_benchmark_loop False), so
+                # evaluate_round must NOT bench the whole slate on the api loop — it
+                # defers to the worker container's scored rows and re-benches only
+                # the single incumbent. True in the monolith (unchanged behavior).
+                coordinator_runs_slate=_run_benchmark_loop,
             )
             submissions.set_epoch_manager(ctx.epoch_manager)
 
@@ -2693,10 +2956,11 @@ async def initialize(ctx: ServerContext) -> dict:
 
                 # Rotation slate (leader-local fairness): pick which of the round's
                 # submissions get benched — miners benched longest ago first, NOT
-                # first-come — and reject the overflow with a resubmit reason.
+                # first-come — and waitlist the overflow for next-round seniority.
                 # Runs BEFORE the close snapshot + decision-window autoscale so
                 # followers mirror the post-rotation set and the window scales with
                 # the real slate. Best-effort: must never block the close.
+                _rot: dict[str, object] | None = None
                 try:
                     _rot = submissions.apply_round_rotation(current.round_id)
                     if _rot.get("applied") and _rot.get("skipped"):
@@ -2708,6 +2972,7 @@ async def initialize(ctx: ServerContext) -> dict:
                             _rot.get("skipped"),
                         )
                 except Exception:
+                    _rot = None
                     logger.warning(
                         "rotation slate failed for %s (ignored — closing with all "
                         "submissions)", current.round_id, exc_info=True,
@@ -2722,39 +2987,49 @@ async def initialize(ctx: ServerContext) -> dict:
                     int(current.opened_epoch),
                     _current_solver_round_epoch(ctx),
                 )
-                # Round-anchored fork pins (gated, default-off). Populate BEFORE the pack
-                # hash below so the canonical pins are folded into it. Anchor to
-                # opened_epoch (NOT close_epoch): the pin is fixed at OPEN, so this
-                # close-time populate derives the SAME pin the worker already used during
-                # the open window — it can never overwrite the open-derived cache with a
-                # different (close_epoch) block, which would split scored-pin != hashed-pin.
+                # Round-anchored fork pins (default-ON; ROUND_ANCHORED_PIN is the
+                # emergency off-switch). Populate BEFORE the pack hash below so the
+                # canonical pins are folded into it. The anchor epoch is fixed at OPEN
+                # (benchmark_anchor_epoch stamped at open, else opened_epoch), so this
+                # close-time populate derives the SAME pin the worker used during the
+                # open window — it can never overwrite the open-derived cache with a
+                # different block (which would split scored-pin != hashed-pin).
+                # CAVEAT this cannot express: that invariant holds across nodes running
+                # the SAME code. A node whose anchor selection changes MID-ROUND (an
+                # image update between open and close) would derive a different block —
+                # which is why the anchor default must only ever flip on a round
+                # boundary, with the whole fleet already on the image. See
+                # _round_fork_anchor_epoch.
+                _anchor_epoch = _round_fork_anchor_epoch(current)
+                if _anchor_epoch is None:
+                    _anchor_epoch = int(current.opened_epoch)
                 _maybe_populate_round_fork_pins(
-                    current.round_id, int(current.opened_epoch)
+                    current.round_id, int(_anchor_epoch)
                 )
                 # Shadow phase (ROUND_ANCHOR_SHADOW): when the real gate is off, still
                 # derive + log the pins the leader WOULD pin, so fleet pin parity can be
                 # verified before enabling. No consensus effect.
                 _maybe_shadow_log_round_fork_pins(
                     ctx, current.round_id, role="leader",
-                    anchor_epoch=int(current.opened_epoch),
+                    anchor_epoch=int(_anchor_epoch),
                 )
+                # B2 parity: also log the pins the real-open-epoch anchor WOULD derive
+                # (independent of the BENCHMARK_ANCHOR_REAL_EPOCH gate) so the new anchor
+                # can be diffed fleet-wide BEFORE it is armed.
+                _b2_anchor = getattr(current, "benchmark_anchor_epoch", None)
+                if _b2_anchor is not None:
+                    _maybe_shadow_log_round_fork_pins(
+                        ctx, current.round_id, role="leader-realopen",
+                        anchor_epoch=int(_b2_anchor), force=True,
+                    )
                 committee_hash = manager.committee_hash if manager is not None else None
                 quorum_required = manager.quorum_required if manager is not None else None
-                # Auto-scale the decision window with this round's slate: the serial
-                # benchmark (#387) runs close→adopt in ~linear time with the submission
-                # count, so a fixed window aborts contested rounds the instant the leader
-                # votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS; activation tracks
-                # it (keep ACTIVATION_DELAY >= the effective decision window).
-                try:
-                    # Count only the surviving slate: rotation (and screening)
-                    # rejects don't get benched, so they must not inflate the
-                    # decision window.
-                    _n_subs = len([
-                        s for s in submissions.get_store().list_by_round(current.round_id)
-                        if str(getattr(getattr(s, "status", None), "value", "") or getattr(s, "status", "")) != "rejected"
-                    ])
-                except Exception:
-                    _n_subs = 0
+                # Auto-scale the decision window with what this round will actually
+                # BENCH: the serial benchmark (#387) runs close→adopt in ~linear time
+                # with the benched count, so a fixed window aborts contested rounds the
+                # instant the leader votes adopt. Floored at SOLVER_ROUND_DECISION_EPOCHS;
+                # activation tracks it (keep ACTIVATION_DELAY >= the effective window).
+                _n_subs = _benched_slate_size(current.round_id, _rot)
                 _decision_window = submissions.autoscaled_decision_window(
                     _n_subs,
                     base_epochs=solver_round_decision_base_epochs,
@@ -2813,6 +3088,154 @@ async def initialize(ctx: ServerContext) -> dict:
                 if not current.finalist_submission_id:
                     logger.warning("Cannot certify: no finalist")
                     return False
+
+                # ── Phase-1 distributed-veto ENFORCEMENT gate ────────────────
+                # off = observe-only (Phase 0), unchanged. shadow/hard gate certify
+                # on the LEADER-CONFIRMED veto (would_gate_confirmed). The veto phase
+                # is driven to resolution WHILE CERTIFYING before this point (the
+                # pre-certify drive in the tick); here we poll its persisted verdict
+                # and hold the round in CERTIFYING (return False) until it resolves
+                # or the interior deadline fails us open. NEVER blocks on a raw
+                # follower claim; fail-open on timeout/slow-fleet.
+                from minotaur_subnet.api.routes.submissions import veto_wire as _vw
+                _mode = _vw.distributed_veto_enforce_mode()
+                _gate = _vw.GATE_ALLOW
+                if _mode != _vw.VETO_ENFORCE_OFF and current.decision_deadline_epoch is None:
+                    # Anomalous: a CERTIFYING round with NO decision deadline (a
+                    # leadership handoff / restart-replay / synced close that omitted
+                    # it). Without a deadline the fail-open point can't be bounded to
+                    # a FIXED epoch — a moving fallback would recede every tick and the
+                    # gate would WAIT forever with no reaper rescue (permanent wedge).
+                    # Don't gate a deadline-less round: proceed to certify (fail-open —
+                    # the safe direction; never wedge, never wrong-block).
+                    logger.warning(
+                        "[veto-enforce] round=%s has no decision deadline; "
+                        "skipping veto gate (fail-open)", current.round_id,
+                    )
+                elif _mode != _vw.VETO_ENFORCE_OFF:
+                    _now = _current_solver_round_epoch(ctx)
+                    # Fail-open deadline, interior to the round's decision deadline,
+                    # so a timeout certifies BEFORE the certification-deadline reaper
+                    # aborts — a slow veto must never become a
+                    # certification_deadline_elapsed abort of a legitimate champion.
+                    # The reaper fires at ddl+1; fail-open at ddl-2 (not ddl-1) leaves
+                    # a TWO-epoch window {ddl-1, ddl} where the gate certifies and the
+                    # reaper is still quiet, so a single ~60s event-loop freeze (the
+                    # documented submission-store / screening-build stalls) that lands
+                    # on one epoch can't flip a fail-open into a reaper abort. Costs
+                    # one epoch of re-verify runway (negligible vs a tens-of-epoch
+                    # window); the streaming re-verify still starts the moment a veto
+                    # arrives (observed 2026-07-11: the old fail-open at the phase's
+                    # follower-response deadline starved the re-verify).
+                    _ddl = current.decision_deadline_epoch
+                    _interior = int(_ddl) - 2
+                    _phase = _vw.REGISTRY.get(current.round_id)
+                    if _phase is None and not _veto_peer_urls():
+                        # No reachable followers → no veto coverage is possible →
+                        # allow now; a peerless/solo leader must not stall every
+                        # round waiting out the window.
+                        _gate = _vw.GATE_ALLOW
+                    else:
+                        if _phase is None:
+                            # Phase not (re)opened yet THIS session (fresh round, or
+                            # a restart dropped the in-memory registry). NEVER act on
+                            # a persisted summary without a live phase — a stale
+                            # would_gate_confirmed must not block on un-re-verified
+                            # state. Treat as pending; the pre-certify drive (re)opens
+                            # it, bounded by the interior deadline (fail-open).
+                            _veto_ddl, _resolved, _n_veto, _wgc = _interior, False, 0, None
+                        else:
+                            # Interior window (ddl-2). Not the phase's own (earlier)
+                            # follower-response deadline: the re-verify runs AFTER
+                            # responses arrive and needs the remaining window to
+                            # confirm. Interior with a two-epoch reaper margin (see
+                            # above), regardless of when the phase opened.
+                            _veto_ddl = _interior
+                            _fresh = round_store.get_round(current.round_id)
+                            _summary = _fresh.veto_observe if _fresh is not None else None
+                            _resolved = bool(
+                                _summary
+                                and _summary.get("resolution") not in (None, "opened")
+                            )
+                            _n_veto = int(_summary.get("n_veto", 0)) if _summary else 0
+                            _wgc = _summary.get("would_gate_confirmed") if _resolved else None
+                        _gate = _vw.veto_gate_decision(
+                            resolved=_resolved, n_veto=_n_veto, would_gate_confirmed=_wgc,
+                            reverify_enabled=_vw.distributed_veto_reverify_enabled(),
+                            current_epoch=_now, veto_deadline_epoch=_veto_ddl,
+                        )
+                    if _gate == _vw.GATE_WAIT:
+                        return False  # hold in CERTIFYING; re-checked next tick
+                    if _gate == _vw.GATE_BLOCK:
+                        if _mode == _vw.VETO_ENFORCE_HARD:
+                            logger.error(
+                                "[veto-enforce] BLOCK round=%s candidate=%s — "
+                                "leader-confirmed veto; aborting certification",
+                                current.round_id, current.finalist_submission_id,
+                            )
+                            aborted = submissions._abort_solver_round_state(
+                                submissions.AbortRoundRequest(
+                                    round_id=current.round_id, reason="veto_confirmed",
+                                )
+                            )
+                            await _broadcast_round_sync(
+                                "/v1/solver/round/internal/abort",
+                                _abort_sync_payload(aborted), label="abort",
+                            )
+                            # Tell the blocked miner WHY, on their PR — the same
+                            # per-order feedback channel benchmark rejections use.
+                            # A leader-draw win alone can't show it: the report
+                            # carries the round's veto verdict (the specific unseen
+                            # orders the followers checked + the ones the leader
+                            # reproduced). Leader-gated already (we're the certifier);
+                            # BEST-EFFORT — never let feedback break the abort.
+                            try:
+                                _bstore = submissions.get_store()
+                                _bsub = _bstore.get(current.finalist_submission_id)
+                                if (
+                                    _bsub is not None
+                                    and getattr(_bsub, "pr_number", None)
+                                    and _champion_reject_fn is not None
+                                ):
+                                    from minotaur_subnet.api.routes.submissions.report import (  # noqa: E501
+                                        build_submission_report as _brp,
+                                        render_report_md as _rmd,
+                                    )
+                                    _rr = round_store.get_round(current.round_id)
+                                    _bvo = _rr.veto_observe if _rr is not None else None
+                                    _msg = (
+                                        "adoption blocked by the distributed burden of "
+                                        "proof: you beat the leader's benchmark, but "
+                                        "other validators re-checked orders outside the "
+                                        "leader's draw and the leader reproduced a hard "
+                                        "regression (details below)."
+                                    )
+                                    _bmd = _rmd(
+                                        _brp(_bsub, reason=_msg, veto_observe=_bvo),
+                                        submission_id=current.finalist_submission_id,
+                                    )
+                                    try:
+                                        _btok = _bstore.get_repo_token(
+                                            current.finalist_submission_id,
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        _btok = None
+                                    _champion_reject_fn(
+                                        _bsub, _msg, report_md=_bmd, repo_token=_btok,
+                                    )
+                            except Exception as _exc:  # noqa: BLE001 — best-effort
+                                logger.warning(
+                                    "[veto-enforce] block-reject comment failed for "
+                                    "%s: %s", current.finalist_submission_id, _exc,
+                                )
+                            return True
+                        logger.warning(
+                            "[veto-enforce] WOULD BLOCK round=%s candidate=%s — "
+                            "leader-confirmed veto (shadow: certifying anyway)",
+                            current.round_id, current.finalist_submission_id,
+                        )
+                    # GATE_ALLOW (or shadow would-block): fall through to certify.
+
                 logger.info(
                     "Attempting certification: round=%s finalist=%s",
                     current.round_id, current.finalist_submission_id,
@@ -2931,6 +3354,15 @@ async def initialize(ctx: ServerContext) -> dict:
             # completion. Stored on ctx so the shutdown path can reach it.
             _VETO_REVERIFY_TASKS: set = set()
             ctx.veto_reverify_tasks = _VETO_REVERIFY_TASKS
+            # Per-round STREAMING re-verify state (keyed by round_id):
+            #   covered  — veto-responder EVMs already dispatched to a re-verify
+            #   inflight — a re-verify task is running (one at a time)
+            #   result   — accumulated {ran,planned,confirmed,discarded,orders}
+            #   done     — the terminal observe record has been written
+            # Lets the re-verify start EARLY (per veto as it arrives) yet cover the
+            # FULL claim set before allowing. Pruned to REGISTRY._phases each driver
+            # tick (bounded).
+            _VETO_REVERIFY_STATE: dict = {}
 
             def _veto_peer_urls() -> dict:
                 net = submissions.get_champion_peer_network()
@@ -3029,13 +3461,72 @@ async def initialize(ctx: ServerContext) -> dict:
                     len(assignments), deadline,
                 )
 
-            def _spawn_veto_reverify(round_id, phase, resolution) -> None:
+            def _veto_stream_step(round_id, phase, now) -> None:
+                """Symmetric finalize/dispatch step — run from BOTH the coordinator
+                tick AND each re-verify completion. Consults the round's streaming
+                coverage state and either dispatches a re-verify for the not-yet-
+                covered veto-responders, finalizes the observe record (block on a
+                confirmed violation, or a clean/allow verdict once fully covered),
+                or leaves the round pending (the gate WAITs, fail-open at the
+                interior deadline). Idempotent once ``done``. Never raises into the
+                loop (the outer observe pass swallows)."""
+                from minotaur_subnet.api.routes.submissions import veto_wire
+
+                st = _VETO_REVERIFY_STATE.get(round_id)
+                if st is None or st.get("done"):
+                    return
+                reverify_on = veto_wire.distributed_veto_reverify_enabled()
+                veto_responders = {
+                    evm for evm, r in phase.responses.items() if r.verdict == "veto"
+                }
+                result = st.get("result")
+                confirmed = bool(result and result.get("confirmed", 0) > 0)
+                action, resolution = veto_wire.resolve_phase(phase, now)
+                _resolved = action == "resolve"
+                _act = veto_wire.veto_stream_action(
+                    reverify_enabled=reverify_on, has_veto=bool(veto_responders),
+                    resolved=_resolved, inflight=bool(st.get("inflight")),
+                    uncovered=bool(veto_responders - st["covered"]),
+                    result_present=result is not None, confirmed=confirmed,
+                )
+                if _act == veto_wire.STREAM_SPAWN:
+                    # Dispatch the uncovered responders. Coverage is committed at
+                    # COMPLETION (only for responders actually benched), NOT here —
+                    # a no-op/gapped pass must leave them uncovered so they retry.
+                    # The inflight flag (not coverage) prevents a double spawn.
+                    new = veto_responders - st["covered"]
+                    st["inflight"] = True
+                    _spawn_veto_reverify(round_id, phase, new)
+                    return
+                if _act in (veto_wire.STREAM_WRITE_RESULT, veto_wire.STREAM_WRITE_NONE):
+                    # Terminal. A confirmed block can land mid-phase (resolution not
+                    # yet set) — write a non-"opened" string so the gate sees it
+                    # resolved and blocks now.
+                    res = resolution if _resolved else "reverified"
+                    phase.resolved = True
+                    phase.resolution = res
+                    veto_wire.forget_round_send_state(round_id)
+                    rv = st["result"] if _act == veto_wire.STREAM_WRITE_RESULT else None
+                    summary = veto_wire.observe_summary(round_id, phase, res, rv)
+                    round_store.set_round_veto_observe(round_id, summary)
+                    st["done"] = True
+                    logger.info(
+                        "[distributed-veto] round %s observe (streaming): %s",
+                        round_id, summary,
+                    )
+                # STREAM_PENDING / STREAM_NOOP: leave for the next tick / completion.
+
+            def _spawn_veto_reverify(round_id, phase, include_responders) -> None:
                 """Leader re-verification runs FIRE-AND-FORGET (never on the
                 coordinator's critical path): it benches on the shared sim lock
-                for minutes. On completion it writes the observe summary. The
-                summary is observe-only — it gates nothing — so a background write
-                is safe. Only spawned when the sub-flag is armed AND a real veto
-                exists."""
+                for minutes. STREAMING: dispatched per not-yet-covered veto-
+                responder AS they arrive, so every veto (even a late one) gets the
+                full remaining interior window to confirm before the gate fail-
+                opens. Benches only ``include_responders`` (each veto once). On
+                completion it accumulates the result and re-runs the finalize step,
+                which — under shadow/hard — writes the verdict that GATES
+                certification, so it must reflect the FULL claim set, never a
+                premature partial pass."""
                 from minotaur_subnet.api.routes.submissions import veto_wire
 
                 async def _run():
@@ -3046,17 +3537,57 @@ async def initialize(ctx: ServerContext) -> dict:
                             order_lookup=veto_wire._production_order_lookup,
                             worker_factory=veto_wire._production_worker_factory,
                             pull_image=_pull_image_for_veto,
+                            include_responders=include_responders,
                         )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("[distributed-veto] reverify task failed: %s", exc)
-                    summary = veto_wire.observe_summary(round_id, phase, resolution, reverify)
-                    round_store.set_round_veto_observe(round_id, summary)
-                    logger.info(
-                        "[distributed-veto] round %s observe (reverified): %s",
-                        round_id, summary,
-                    )
+                    _st = _VETO_REVERIFY_STATE.get(round_id)
+                    if _st is not None:
+                        _st["inflight"] = False
+                        _st["result"] = veto_wire.merge_reverify_results(
+                            _st.get("result"), reverify,
+                        )
+                        # Commit coverage PER RESPONDER, and only for a responder
+                        # whose EVERY planned order was actually benched (present in
+                        # reverify["benched"]). A responder whose slice missed
+                        # order-lookup — even co-batched with a peer that benched
+                        # fine (ran=True) — stays UNCOVERED, so the next tick
+                        # re-verifies it, until it benches or the interior deadline
+                        # fails open. Never a silent covered-but-unbenched allow.
+                        _benched = set((reverify or {}).get("benched") or ())
+                        for _evm in include_responders:
+                            _resp = phase.responses.get(_evm)
+                            if _resp is None:
+                                continue
+                            _pids = {
+                                v.order_id
+                                for v in veto_wire.plan_reverification(_resp)
+                            }
+                            if _pids and _pids <= _benched:
+                                _st["covered"].add(_evm)
+                        # Confirmed violation → finalize the BLOCK record NOW,
+                        # idempotently (behind ``done``). Fast (no ≤5s tick wait) and,
+                        # crucially, works even if the round already fail-open certified
+                        # and left CERTIFYING so the tick no longer drives it — the
+                        # observe/would-block record is never lost. NEVER spawns here
+                        # (no tight loop); the tick still handles allow-finalization.
+                        _res = _st.get("result") or {}
+                        if _res.get("confirmed", 0) > 0 and not _st.get("done"):
+                            _r = phase.resolution or "reverified"
+                            phase.resolved = True
+                            phase.resolution = _r
+                            veto_wire.forget_round_send_state(round_id)
+                            _summary = veto_wire.observe_summary(
+                                round_id, phase, _r, _st["result"],
+                            )
+                            round_store.set_round_veto_observe(round_id, _summary)
+                            _st["done"] = True
+                            logger.info(
+                                "[distributed-veto] round %s observe "
+                                "(reverified, confirmed): %s", round_id, _summary,
+                            )
                     _VETO_REVERIFY_TASKS.discard(asyncio.current_task())
 
                 _VETO_REVERIFY_TASKS.add(asyncio.create_task(_run()))
@@ -3099,52 +3630,50 @@ async def initialize(ctx: ServerContext) -> dict:
                         return _sign_internal_round_payload(network, p)
 
                     for round_id, phase in list(veto_wire.REGISTRY._phases.items()):
-                        if phase.resolved:
+                        _st = _VETO_REVERIFY_STATE.setdefault(round_id, {
+                            "covered": set(), "inflight": False,
+                            "result": None, "done": False,
+                        })
+                        # ``done`` = the terminal observe record is written (a
+                        # confirmed block, a fully-covered allow, or a no-veto
+                        # resolution). Until then keep driving the phase across ticks
+                        # — a slow follower's veto still needs re-verifying.
+                        if _st["done"]:
                             continue
-                        responded = set(phase.responses) | set(phase.unsupported)
-                        if network is not None and phase.assignments:
-                            # Parallel + bounded per-peer timeout (15s): a real
-                            # follower ACKs a signed assignment in ~3s idle but
-                            # slower under event-loop load, so 5s falsely timed
-                            # out live sends. A black-hole peer still can't
-                            # serialize-block the loop (parallel gather; runs on
-                            # a quiet tick after certify/activate).
-                            await veto_wire.fan_out_assignments(
-                                phase.assignments, peer_urls=peer_urls,
-                                sign_payload=_sign, exclude=responded,
-                                timeout_s=15.0,
-                            )
-                            for a in phase.assignments:
-                                if veto_wire.consecutive_reject_terminal(
-                                    round_id, a.validator_evm,
-                                ):
-                                    veto_wire.REGISTRY.mark_unsupported(
-                                        round_id, a.validator_evm,
-                                    )
-
-                        action, resolution = veto_wire.resolve_phase(phase, now)
+                        action, _res = veto_wire.resolve_phase(phase, now)
                         if action != "resolve":
-                            continue
+                            # Not yet resolved → keep collecting responses.
+                            responded = set(phase.responses) | set(phase.unsupported)
+                            if network is not None and phase.assignments:
+                                # Parallel + bounded per-peer timeout (15s): a real
+                                # follower ACKs a signed assignment in ~3s idle but
+                                # slower under event-loop load, so 5s falsely timed
+                                # out live sends. A black-hole peer still can't
+                                # serialize-block the loop (parallel gather).
+                                await veto_wire.fan_out_assignments(
+                                    phase.assignments, peer_urls=peer_urls,
+                                    sign_payload=_sign, exclude=responded,
+                                    timeout_s=15.0,
+                                )
+                                for a in phase.assignments:
+                                    if veto_wire.consecutive_reject_terminal(
+                                        round_id, a.validator_evm,
+                                    ):
+                                        veto_wire.REGISTRY.mark_unsupported(
+                                            round_id, a.validator_evm,
+                                        )
+                        # STREAMING re-verify: dispatch per not-yet-covered veto-
+                        # responder as they arrive (each veto gets the full remaining
+                        # interior window to confirm), finalize once the full claim
+                        # set is covered, or block immediately on a confirmation. The
+                        # gate polls the record it writes and fail-opens at ddl-1.
+                        _veto_stream_step(round_id, phase, now)
 
-                        phase.resolved = True
-                        phase.resolution = resolution
-                        veto_wire.forget_round_send_state(round_id)
-                        if (
-                            veto_wire.distributed_veto_reverify_enabled()
-                            and any(
-                                r.verdict == "veto" for r in phase.responses.values()
-                            )
-                        ):
-                            _spawn_veto_reverify(round_id, phase, resolution)
-                        else:
-                            summary = veto_wire.observe_summary(
-                                round_id, phase, resolution, None,
-                            )
-                            round_store.set_round_veto_observe(round_id, summary)
-                            logger.info(
-                                "[distributed-veto] round %s observe: %s",
-                                round_id, summary,
-                            )
+                    # Bound the streaming state to the registry's live phases (itself
+                    # capped): drop entries for rounds the registry has evicted.
+                    for _rid in list(_VETO_REVERIFY_STATE):
+                        if veto_wire.REGISTRY.get(_rid) is None:
+                            _VETO_REVERIFY_STATE.pop(_rid, None)
                 except Exception as exc:  # noqa: BLE001 — observe must never break the loop
                     logger.warning(
                         "[distributed-veto] observe pass failed (ignored): %s", exc,
@@ -3234,6 +3763,23 @@ async def initialize(ctx: ServerContext) -> dict:
                                 await asyncio.sleep(solver_round_poll_interval)
                             continue
 
+                        from minotaur_subnet.api.routes.submissions import (
+                            veto_wire as _vw,
+                        )
+                        _enforce = (
+                            _vw.distributed_veto_enforce_mode() != _vw.VETO_ENFORCE_OFF
+                        )
+                        # Phase-1 enforcement: drive the veto phase to resolution
+                        # WHILE the round is CERTIFYING — BEFORE certify — so the gate
+                        # in _maybe_certify_round can read a real verdict. In
+                        # observe-only mode the phase instead runs post-activate below.
+                        if (
+                            current is not None
+                            and _enforce
+                            and current.status == RoundStatus.CERTIFYING
+                        ):
+                            await _drive_veto_observe(current)
+
                         if current is not None and await _maybe_certify_round(current):
                             continue
 
@@ -3255,7 +3801,9 @@ async def initialize(ctx: ServerContext) -> dict:
                         # QUIET tick (nothing closed/evaluated/certified/activated/
                         # reopened above `continue`d), so it is structurally OFF
                         # the champion-adoption critical path and cannot delay it.
-                        if current is not None:
+                        # In ENFORCE mode the phase is driven pre-certify (above)
+                        # instead, so it is skipped here.
+                        if current is not None and not _enforce:
                             await _drive_veto_observe(current)
 
                         await asyncio.sleep(solver_round_poll_interval)
@@ -3401,3 +3949,15 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
     ctx.solver_round_metagraph_sync = None
     ctx.solver_round_role = "standalone"
     ctx.solver_round_epoch_clock = None
+
+    # Submission store: after all writers (coordinator + benchmark worker) have
+    # stopped, snapshot the store to submissions.json (rollback safety to a
+    # pre-SQLite build) and close its SQLite DB. Guarded on the singleton
+    # existing so we never create a store just to close it.
+    try:
+        from minotaur_subnet.api.routes.submissions import state as _sub_state
+        if getattr(_sub_state, "_store", None) is not None:
+            _sub_state._store.close()
+            logger.info("Submission store snapshotted to JSON + DB closed")
+    except Exception:  # noqa: BLE001 — shutdown must never raise
+        logger.warning("Submission store close failed during shutdown", exc_info=True)
