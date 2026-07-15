@@ -25,6 +25,12 @@ class SubmitResult:
     chain_id: int = 0
     block_number: int | None = None
     gas_used: int = 0
+    # True if any submission attempt MAY have reached the mempool (set just
+    # before send_raw_transaction, sticky across retries). ``tx_hash=None``
+    # alone does NOT mean nothing was broadcast — a broadcast can succeed and
+    # the receipt wait time out. The submit-plan dedup releases its
+    # reservation only when this is False (definitely pre-broadcast failure).
+    broadcast_attempted: bool = False
 
 
 class RelayerBase(ABC):
