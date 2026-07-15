@@ -41,6 +41,8 @@ except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows)
     # degrades to in-process locking only (its historical behaviour).
     fcntl = None  # type: ignore[assignment]
 
+from minotaur_subnet.harness import fastjson
+
 logger = logging.getLogger(__name__)
 
 
@@ -1636,7 +1638,9 @@ class SubmissionStore:
             # Compact (no indent): the store is re-serialized on EVERY write, so
             # pretty-printing ~doubles both the bytes written and the encode time
             # on the (previously loop-blocking) hot path for zero machine benefit.
-            tmp_path.write_text(json.dumps(data))
+            # fastjson (orjson) keeps the GIL-held encode window small so the
+            # writer-thread offload actually frees the loop.
+            tmp_path.write_bytes(fastjson.dumps(data))
             os.replace(tmp_path, self._persist_path)
             self._persist_mtime_ns = self._persist_path.stat().st_mtime_ns
         except Exception as exc:
@@ -1671,7 +1675,7 @@ class SubmissionStore:
     def _load(self, *, quiet: bool = False) -> None:
         """Load state from disk. Set ``quiet`` to skip the info log on hot paths."""
         try:
-            data = json.loads(self._persist_path.read_text())
+            data = fastjson.loads(self._persist_path.read_bytes())
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
             by_hotkey_epoch: dict[str, str] = {}
