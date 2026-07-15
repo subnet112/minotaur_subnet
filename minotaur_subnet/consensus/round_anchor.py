@@ -53,6 +53,44 @@ def round_anchored_pin_enabled() -> bool:
     return raw.strip().lower() not in _GATE_OFF_VALUES
 
 
+def benchmark_anchor_real_epoch_enabled() -> bool:
+    """Fleet-uniform gate for the B2 real-open-epoch fork-pin anchor. **DEFAULT ON.**
+
+    Anchors the round's fork pin to the stamped ``benchmark_anchor_epoch`` (the
+    leader's REAL wall-clock epoch at open, broadcast + adopted with the round)
+    instead of ``opened_epoch``. ``opened_epoch`` is the champion ACTIVATION
+    schedule (``close_epoch + activation_delay``), deliberately ~1 tempo in the
+    FUTURE so distributed certification finishes and commit-reveal weights reveal
+    before the champion changes — so anchoring the pin to it put the anchor ~40 min
+    AHEAD of wall-clock and the pin deferred every single round. Anchoring to the
+    real open epoch confirm-brackets immediately.
+
+    DEFAULT ON, in CODE, for the same reason as ``round_anchored_pin_enabled``
+    above and ``CHAMPION_MINER_WEIGHT_FRACTION`` / ``EPOCH_SECONDS``: it folds into
+    ``benchmark_pack_hash``, so it must be uniform across the fleet, and a
+    per-validator env is not a mechanism we have — third-party operators run our
+    canonical compose and never set flags we ask for. An env-gated default-OFF flag
+    is therefore permanently OFF in practice on every node we do not personally
+    operate. Baking the default into the image is the only way it propagates
+    uniformly (via ``:stable``/redeploy).
+
+    Emergency override only: set ``BENCHMARK_ANCHOR_REAL_EPOCH`` to one of
+    ``{0, false, no, off}`` (case-insensitive) to fall back to ``opened_epoch``
+    fleet-wide via compose without a code revert. Unset / any other value =
+    enabled — a typo must never silently drop ONE validator back to the old anchor
+    and split it off the fleet (PACK_HASH_MISMATCH).
+
+    Note this gate only SELECTS the anchor; a round with no stamped
+    ``benchmark_anchor_epoch`` (opened before the field existed) still falls back to
+    ``opened_epoch``, and that fallback is itself fleet-uniform because the stamp
+    travels with the round. See ``api.startup._round_fork_anchor_epoch``.
+    """
+    raw = os.environ.get("BENCHMARK_ANCHOR_REAL_EPOCH")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _GATE_OFF_VALUES
+
+
 # Fleet-uniform benchmark-pin config. These fold into the round-anchored pin and
 # thus ``benchmark_pack_hash``, so — like the gate above and CHAMPION_MINER_WEIGHT_
 # FRACTION / EPOCH_SECONDS — they MUST be uniform CODE, never per-validator envs a
