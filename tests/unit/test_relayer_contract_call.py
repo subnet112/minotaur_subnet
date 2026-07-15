@@ -297,3 +297,48 @@ def test_http_relayer_resolve_wallet_caches(fresh_signer):
         assert g.call_count == 1
     with pytest.raises(RuntimeError, match="no wallet"):
         r._resolve_wallet(964)
+
+
+# ── bytes-on-the-wire (registerApp bytes32 round-trip) ─────────────────────
+
+
+def test_wire_values_hex_encode_bytes_and_canonicalize_bools():
+    from minotaur_subnet.consensus.leader_wrapper import contract_call_wire_values
+    b32 = b"\x7e" * 32
+    assert contract_call_wire_values([b32, True, 5, "0xAbC"]) == [
+        "0x" + "7e" * 32, "true", "5", "0xAbC",
+    ]
+
+
+def test_call_hash_bytes_equal_their_hex_form():
+    # HttpRelayer hashes python-bytes inputs; the relayer hashes the received
+    # wire strings — both MUST produce the same digest or every bytes-carrying
+    # call is rejected with "plan_hash doesn't match".
+    b32 = b"\x7e" * 32
+    a = compute_contract_call_hash(
+        1, TARGET, "revokeApp(bytes32)", ["bytes32"], [b32], 0, 120_000)
+    b = compute_contract_call_hash(
+        1, TARGET, "revokeApp(bytes32)", ["bytes32"], ["0x" + "7e" * 32], 0, 120_000)
+    assert a == b
+
+
+@pytest.mark.asyncio
+async def test_register_app_bytes32_round_trip(fresh_signer):
+    # The live failure: registerApp(bytes32,bytes32,address) with str(bytes)
+    # values → "cannot be encoded by BytesEncoder". Wire form must arrive as
+    # 0x-hex and be coerced to REAL bytes before hitting eth_abi.
+    priv, addr = fresh_signer
+    service = _service()
+    app_id_hex = "0x" + "7e" * 32
+    manifest_hex = "0x" + "11" * 32
+    body = _signed_body(
+        priv, fn_signature="registerApp(bytes32,bytes32,address)",
+        abi_types=("bytes32", "bytes32", "address"),
+        values=(app_id_hex, manifest_hex, TARGET), gas=200_000,
+    )
+    with patch("minotaur_subnet.relayer.main._read_authorized_validators",
+               return_value=[addr]):
+        resp = await _post(service, body)
+    assert resp.status == 200, resp.body
+    call = service.relayer.call_contract_function.await_args
+    assert call.args[4] == [b"\x7e" * 32, b"\x11" * 32, TARGET]

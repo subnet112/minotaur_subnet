@@ -228,12 +228,15 @@ class HttpRelayer(RelayerBase):
                 "VALIDATOR_PRIVATE_KEY on the api so it can sign the call wrapper"
             )
 
-        from minotaur_subnet.consensus.leader_wrapper import compute_contract_call_hash
+        from minotaur_subnet.consensus.leader_wrapper import (
+            compute_contract_call_hash,
+            contract_call_wire_values,
+        )
 
         abi_types = list(abi_types or [])
-        # Stringify values for the canonical hash; the relayer coerces back
-        # per ABI type before encoding.
-        values_wire = [str(v) for v in (values or [])]
+        # Canonical wire form (bytes → 0x-hex, bool → true/false) for both
+        # the hash and the payload; the relayer coerces back per ABI type.
+        values_wire = contract_call_wire_values(values)
         call_hash = compute_contract_call_hash(
             int(chain_id), contract_address, signature, abi_types, values_wire,
             int(tx_value), int(gas),
