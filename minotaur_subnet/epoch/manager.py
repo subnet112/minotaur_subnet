@@ -203,9 +203,18 @@ class EpochManager:
         on_champion_rejected: Any = None,
         on_champion_finalist: Any = None,
         vote_recorder: Any = None,
+        coordinator_runs_slate: bool = True,
     ) -> None:
         self._block_loop = block_loop
         self._benchmark_worker = benchmark_worker
+        # When the benchmark worker runs in a SEPARATE process (Phase 2 split),
+        # the coordinator/api must NOT drive the full-slate run_once on its own
+        # loop — it only re-benches the single incumbent (via _refresh_incumbent_
+        # score, which needs a constructed worker) and reads the worker container's
+        # scored rows. Set False in the api after the split; True for the monolith
+        # / the worker process / tests. Only gates the slate run_once, never the
+        # incumbent re-bench.
+        self._coordinator_runs_slate = coordinator_runs_slate
         self._sub_store = submission_store
         # App/order store injected for app/order lookups (optional; may be None).
         self._app_store = app_store
@@ -311,8 +320,9 @@ class EpochManager:
         }
         scope_round_id = current_round.round_id if current_round is not None else None
 
-        # Step 1: Run benchmarks
-        if self._benchmark_worker:
+        # Step 1: Run benchmarks (skipped when a separate worker process owns the
+        # slate — the coordinator then reads its already-scored rows).
+        if self._benchmark_worker and self._coordinator_runs_slate:
             try:
                 await self._benchmark_worker.run_once()
                 result["benchmarked"] = self._count_scored(epoch, round_id=scope_round_id)
@@ -457,7 +467,10 @@ class EpochManager:
                 RoundStatus.REPLAYING,
             )
 
-        if self._benchmark_worker:
+        # Slate benchmarking (skipped when a separate worker process owns it —
+        # evaluate_round then defers via _round_has_inflight_submissions until the
+        # worker's SCORED rows land, and only re-benches the single incumbent).
+        if self._benchmark_worker and self._coordinator_runs_slate:
             try:
                 await self._benchmark_worker.run_once()
                 result["benchmarked"] = self._count_scored(epoch, round_id=round_id)
