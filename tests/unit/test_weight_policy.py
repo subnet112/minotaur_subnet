@@ -28,9 +28,24 @@ def test_build_weights_burns_to_owner_for_genesis():
     ) == {"5Gowner": 1.0}
 
 
+def test_champion_miner_weight_fraction_is_pinned():
+    # THE one literal assertion of the split in the whole suite, and it has to
+    # exist: every other weight test is written symbolically against the constant,
+    # so the suite passes under ANY value and an accidental edit to the emission
+    # split would otherwise reach production with CI fully green.
+    #
+    # Changing this number is a deliberate fleet-wide tokenomics event, not a
+    # refactor. If this test fails, that is the point — read
+    # weight_policy.CHAMPION_MINER_WEIGHT_FRACTION's comment block before touching
+    # it, and never let the change sit on develop unpromoted (the leader holds the
+    # supermajority of validator stake, so it alone moves consensus and every
+    # third-party validator still on the old value gets its vtrust clipped).
+    assert CHAMPION_MINER_WEIGHT_FRACTION == 0.75
+
+
 def test_build_weights_ramps_champion_with_owner_burn():
-    # Once a real miner champion exists: the champion gets the fixed fraction
-    # (0.10), the owner burns the rest (0.90).
+    # Once a real miner champion exists: the champion gets the fixed fraction and
+    # the owner keeps the rest.
     assert build_bootstrap_or_champion_weights(
         "5Gminer",
         owner_hotkey="5Gowner",
