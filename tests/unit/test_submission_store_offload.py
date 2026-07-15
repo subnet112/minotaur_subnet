@@ -103,7 +103,10 @@ def test_cow_read_safe_under_concurrent_offloaded_create(tmp_path):
                     store.list_by_round("round-e0-n1")
                 except RuntimeError as exc:  # "dictionary changed size ..."
                     errors.append(exc)
-                await asyncio.sleep(0)
+                # Real (tiny) yield: releases the GIL so the writer's executor
+                # thread isn't starved by a busy sleep(0) loop, while still
+                # interleaving reads with the concurrent offloaded writes.
+                await asyncio.sleep(0.0005)
 
         async def writer():
             nonlocal stop
@@ -146,9 +149,10 @@ def test_aoffload_write_is_durable_after_await(tmp_path):
             max_rounds_per_commit=0,
         )
         await offload_write(store.set_max_region_nodes, sub.submission_id, 4242)
-        # The write has landed on disk by the time the await returns.
-        on_disk = json.loads(path.read_text())
-        assert on_disk[sub.submission_id]["max_region_nodes"] == 4242
+        # The per-record write has landed in the DB by the time the await returns:
+        # a fresh store loading from the same DB sees it.
+        store2 = SubmissionStore(persist_path=path)
+        assert store2.get(sub.submission_id).max_region_nodes == 4242
 
     asyncio.run(_run())
 
@@ -172,20 +176,20 @@ def test_set_benchmark_ranks_batch_persists_once(tmp_path):
     ids = [s.submission_id for s in subs]
 
     persists = {"n": 0}
-    real_persist = store._persist
+    real = store._persist_records
 
-    def counting_persist():
+    def counting(subs):
         persists["n"] += 1
-        real_persist()
+        real(subs)
 
-    store._persist = counting_persist
+    store._persist_records = counting
     store.set_benchmark_ranks({sid: i + 1 for i, sid in enumerate(ids)})
 
-    assert persists["n"] == 1  # ONE write for the whole batch
+    assert persists["n"] == 1  # ONE per-record batch write for the whole ranking
     for i, sid in enumerate(ids):
         assert store.get(sid).benchmark_rank == i + 1
     # Unknown ids are skipped, not raised.
-    store._persist = real_persist
+    store._persist_records = real
     store.set_benchmark_ranks({"sub_does_not_exist": 9})
     assert store.get(ids[0]).benchmark_rank == 1
 
