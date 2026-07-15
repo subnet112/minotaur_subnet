@@ -437,10 +437,22 @@ class RelayerService:
                 status=400,
             )
 
-        # ── Safeguard 7: plan-hash dedup (committed last, after all
+        # ── Safeguard 7: submission dedup (committed last, after all
         # cheaper checks — so we don't waste a slot on a request that
-        # would have failed verification anyway). ────────────────────
-        ok, err = self.safeguards.check_plan_hash_unseen(expected_plan_hash, plan.deadline)
+        # would have failed verification anyway). Keyed per fill-round,
+        # not per plan-bytes: the champion solver is deterministic, so
+        # two different orders (or two fills of one perpetual order)
+        # legitimately carry byte-identical plans — and each arrives
+        # with its own PlanApproval quorum (which signs orderId+planHash,
+        # so cross-order replay is already impossible cryptographically).
+        # The dedup only has to stop the same fill-round double-racing
+        # past the pre-broadcast dry-run. ─────────────────────────────
+        try:
+            _exec_count = int(order_data.get("execution_count") or 0)
+        except (TypeError, ValueError):
+            _exec_count = 0
+        dedup_key = f"{order_data.get('order_id', '')}:{_exec_count}:{expected_plan_hash}"
+        ok, err = self.safeguards.check_plan_hash_unseen(dedup_key, plan.deadline)
         if not ok:
             return web.json_response({"success": False, "error": err}, status=409)
 
@@ -489,11 +501,30 @@ class RelayerService:
                 contract_address=contract_address_override,
             )
         except Exception as exc:
+            # Deliberately NOT releasing the dedup reservation here: a crash
+            # mid-submit is ambiguous (the tx MAY have been broadcast, e.g. a
+            # timeout waiting for the receipt). The clamped TTL bounds the
+            # block to minutes.
             logger.exception("Relayer: submit_plan crashed for order=%s", order_data.get("order_id", "")[:12])
             return web.json_response(
                 {"success": False, "error": f"submit_plan crashed: {exc}"},
                 status=500,
             )
+
+        # Pre-broadcast failure (gas-balance floor, dry-run revert,
+        # estimate_gas error): no tx exists, nothing on-chain to protect —
+        # release the dedup slot so a retry of this fill-round isn't
+        # blocked. Live incident 2026-07-15: a balance-floor failure burned
+        # the hash and every identical retry 409'd until a relayer restart.
+        # ``broadcast_attempted`` (not tx_hash absence) is the discriminator:
+        # a broadcast can land while the receipt wait times out, and that
+        # in-flight tx is exactly what the reservation must keep protecting.
+        if (
+            not submit_result.success
+            and not submit_result.tx_hash
+            and not getattr(submit_result, "broadcast_attempted", True)
+        ):
+            self.safeguards.release_plan_hash(dedup_key)
 
         # Charge against the daily gas budget whenever gas was actually burned
         # ON-CHAIN — i.e. a successful submit OR a mined-then-reverted tx. The
