@@ -1643,7 +1643,7 @@ def _fmt_weight_source(src: str | None, last_emit: dict | None = None) -> str:
       - ``self·queued`` — last emit was a per-miner ranking from the
         api EpochManager's queue POST (``source="queued_from_api"``).
       - ``self·champ`` — last emit weighted a resolved champion (the
-        0.05/0.95 ramp; ``source="champion"``).
+        CHAMPION_MINER_WEIGHT_FRACTION split; ``source="champion"``).
       - ``self·burn`` — last emit was a definitive owner burn (no
         champion adopted; ``source="burn"``, or the legacy
         ``"burn_fallback"`` label from pre-rename daemons).

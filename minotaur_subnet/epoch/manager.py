@@ -2169,7 +2169,7 @@ class EpochManager:
 
         WINNER-TAKES-ALL, champion-only: 100% burn to the subnet owner before a
         real miner-backed champion exists; once one does, the champion gets a flat
-        ``CHAMPION_MINER_WEIGHT_FRACTION`` (0.10) and 0.90 burns to the owner. This
+        ``CHAMPION_MINER_WEIGHT_FRACTION`` and the owner keeps the remainder. This
         is a FIXED split — there is no order-volume scaling.
 
         Only ``self._champion`` — the submission that won AND was finalized
