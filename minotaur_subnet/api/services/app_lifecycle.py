@@ -297,11 +297,13 @@ def set_developer_allowed(
 ) -> dict[str, Any]:
     """Owner-only AppRegistry.setDeveloperAllowed via the relayer key.
 
-    Works today because the relayer key IS the registry owner; if ownership
-    ever rotates to a cold key/multisig this returns the revert and the
-    frontend falls back to registry-calldata. Allowlisting the app's REAL
-    developer is what lets them registerApp/updateManifest themselves —
-    the registry-side counterpart of the appOwner float rights.
+    Only works when the relayer key IS the registry owner — on production
+    registries the owner is the operator wallet, so this pre-checks
+    ``owner()`` and returns a clean service-level error instead of sending a
+    doomed tx (mainapp #20 moves the flow to a direct owner-wallet tx).
+    Allowlisting the app's REAL developer is what lets them
+    registerApp/updateManifest themselves — the registry-side counterpart
+    of the appOwner float rights.
     """
     ctx = _registry_ctx(store, app_id, chain_id)
     if isinstance(ctx, dict):
@@ -310,17 +312,31 @@ def set_developer_allowed(
     if not developer or not int(developer, 16):
         return {"error": "developer address is required"}
 
-    from minotaur_subnet.api.services.app_admin import _call, _selector
+    from minotaur_subnet.api.services.app_admin import _call, _selector, _view_address
+
+    owner = _view_address(w3, registry, "owner")
+    wallet = relayer._resolve_wallet(chain_id)
+    if owner and wallet and owner.lower() != wallet.lower():
+        return {
+            "error": (
+                f"registry owner is {owner}, not the relayer ({wallet}) — "
+                "send setDeveloperAllowed from the owner wallet instead"
+            ),
+            "owner": owner,
+        }
 
     probe = _call(w3, registry, _selector("allowedDevelopers(address)")
                   + bytes.fromhex(developer[2:].lower().zfill(64)))
     already = bool(probe) and bool(int.from_bytes(probe[:32], "big"))
     if already == allowed:
         return {"developer": developer, "allowed": allowed, "changed": False}
-    tx = _run_async(relayer.call_contract_function(
-        registry, chain_id, "setDeveloperAllowed(address,bool)",
-        ["address", "bool"], [developer, allowed], gas=100_000,
-    ))
+    try:
+        tx = _run_async(relayer.call_contract_function(
+            registry, chain_id, "setDeveloperAllowed(address,bool)",
+            ["address", "bool"], [developer, allowed], gas=100_000,
+        ))
+    except Exception as exc:  # revert / RPC rejection → service-level error, not a 500
+        return {"error": f"setDeveloperAllowed failed: {exc}"[:300]}
     return {"developer": developer, "allowed": allowed, "changed": True, "tx": tx}
 
 
