@@ -477,6 +477,16 @@ class SubmissionStore:
         # each mutation is an O(1) row UPSERT, not a whole-store rewrite. None for
         # in-memory-only stores (persist_path=None, tests).
         self._db: SubmissionDB | None = None
+        # Cross-process read-sync (Phase 2 split): watermark of the highest
+        # updated_seq this process has taken into memory. Rows beyond it that a
+        # PEER wrote are pulled by _maybe_reload. Seeded from the DB at _load.
+        self._last_seen_seq = 0
+        # Self-configuring: harmless + free for a single-writer node (the seq gate
+        # short-circuits), so it needs no per-role env. Kill switch for soak.
+        self._xproc_sync = (
+            os.environ.get("SUBMISSION_STORE_XPROC_SYNC", "1").strip().lower()
+            not in ("0", "false", "no")
+        )
         self._rmw_lock = threading.RLock()  # in-process serialization
         # Dedicated single writer thread for the async offload path
         # (:meth:`aoffload`). Lazily created so sync-only / test usage never
@@ -1573,12 +1583,46 @@ class SubmissionStore:
     # ── Persistence ────────────────────────────────────────────────────────
 
     def _maybe_reload(self) -> None:
-        """No-op: the store is single-writer today (only the api constructs it),
-        so the in-memory dict is authoritative for this process. Per-record
-        SQLite UPSERTs make the old whole-file two-writer lost-update impossible
-        without a reload. Cross-process READ visibility (a 2nd writer's rows
-        reflected here) is deferred to Phase 2 (updated_seq incremental pull)."""
-        return
+        """Pull any rows a SECOND process wrote since our watermark into memory.
+
+        This is what makes the Phase-2 split correct in BOTH directions: the
+        benchmark worker sees submissions the api just intook (QUEUED→BENCHMARKING),
+        and the api sees the benchmark results the worker just scored (without
+        which the coordinator would rank a stale slate and adopt the wrong
+        champion). Called on every read and at the top of every mutator, so a
+        read-modify-write always starts from peer-fresh state.
+
+        SELF-CONFIGURING and inert for a single-writer node: ``max_seq()`` is one
+        indexed O(log n) query, and a lone writer never sees a seq beyond its own
+        watermark, so it returns right there — no rows parsed, no lock taken, no
+        behavior change for the monolith leader or any follower. Our own rows are
+        additionally filtered in SQL, so they are never re-parsed.
+
+        Kill switch: SUBMISSION_STORE_XPROC_SYNC=0 restores the strict no-op.
+        """
+        if self._db is None or not self._xproc_sync:
+            return
+        latest = self._db.max_seq()
+        if latest <= self._last_seen_seq:
+            return  # nothing new from a peer (the single-writer steady state)
+        rows = self._db.load_since(self._last_seen_seq)
+        if not rows:
+            # Only our OWN writes moved the seq (filtered in SQL) — just advance.
+            self._last_seen_seq = latest
+            return
+        # The SELECT above ran OFF any lock. Take the write lock only for the
+        # in-memory merge (microseconds): _upsert_one rebinds self._submissions
+        # copy-on-write, and a concurrent writer-thread rebind would otherwise
+        # lose one of the two updates. We never hold the lock across I/O, so this
+        # cannot re-introduce the event-loop stall Phase 1 removed.
+        with self._rmw_lock:
+            for _sid, record, _seq in rows:
+                try:
+                    self._upsert_one(record)
+                except Exception as exc:  # noqa: BLE001 — one bad row must not stall sync
+                    logger.warning("[xproc-sync] skipping unloadable row: %s", exc)
+            self._last_seen_seq = latest
+        logger.debug("[xproc-sync] pulled %d peer row(s) up to seq %d", len(rows), latest)
 
     def _persist_records(self, subs: list["Submission"]) -> None:
         """Persist the just-mutated record(s) as O(1) row UPSERT(s), then run the
@@ -1731,6 +1775,11 @@ class SubmissionStore:
             self._by_hotkey_round = by_hotkey_round
             self._by_hotkey_epoch = by_hotkey_epoch
             self._loaded = True  # clean hydrate — safe to snapshot to JSON
+            # We just took EVERY row into memory, so the cross-process watermark
+            # starts at the current max: only rows a peer writes AFTER this hydrate
+            # are pulled. (Pre-Phase-2 rows carry seq 0 and are never re-pulled.)
+            if self._db is not None:
+                self._last_seen_seq = self._db.max_seq()
             if not quiet:
                 logger.info("Loaded %d submissions from the submission DB", len(data))
         except Exception as exc:
