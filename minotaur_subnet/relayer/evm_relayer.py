@@ -332,6 +332,12 @@ class EvmRelayer(RelayerBase):
         """Synchronous implementation of submit_plan (runs in thread executor)."""
         chain_id = getattr(order, "chain_id", 1)
         config = self.chains.get(chain_id)
+        # Sticky flag: flipped just before send_raw_transaction. Failure
+        # results constructed after the retry loop carry it so the caller
+        # can distinguish "definitely nothing broadcast" (safe to retry
+        # immediately) from "a tx may be in the mempool" (keep the dedup
+        # reservation). See SubmitResult.broadcast_attempted.
+        broadcast_attempted = False
 
         if config is None:
             return SubmitResult(
@@ -507,10 +513,17 @@ class EvmRelayer(RelayerBase):
                             "NOT broadcasting (0 gas spent): %s",
                             getattr(order, "order_id", "?"), _dr.reason[:200],
                         )
+                        # Propagate the sticky flag: this branch is inside the
+                        # retry loop, so a PRIOR attempt may already have
+                        # broadcast (receipt-wait timeout → retry → dry-run now
+                        # reverts, often because that very tx just mined).
+                        # Dropping the flag here would let the caller release
+                        # the dedup slot while a tx is live.
                         return SubmitResult(
                             success=False,
                             chain_id=chain_id,
                             error=f"pre-broadcast dry-run reverted: {_dr.reason}",
+                            broadcast_attempted=broadcast_attempted,
                         )
 
                     # Protocol-fee gas-price cap. Bound the bid so the relayer
@@ -551,11 +564,13 @@ class EvmRelayer(RelayerBase):
                         signed_raw = _aio.run(self.wallet_manager.sign_transaction(
                             config.relayer_wallet, tx, chain_id,
                         ))
+                        broadcast_attempted = True
                         tx_hash = w3.eth.send_raw_transaction(
                             bytes.fromhex(signed_raw.replace("0x", ""))
                         )
                     else:
                         signed = w3.eth.account.sign_transaction(tx, self.private_key)
+                        broadcast_attempted = True
                         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
                     # Wait for receipt — short timeout to avoid blocking the event loop.
@@ -585,6 +600,7 @@ class EvmRelayer(RelayerBase):
                             block_number=receipt["blockNumber"],
                             gas_used=receipt["gasUsed"],
                             error=revert_reason,
+                            broadcast_attempted=True,
                         )
 
                     # Success
@@ -594,6 +610,7 @@ class EvmRelayer(RelayerBase):
                         chain_id=chain_id,
                         block_number=receipt["blockNumber"],
                         gas_used=receipt["gasUsed"],
+                        broadcast_attempted=True,
                     )
                     self._submissions.append({
                         "order_id": getattr(order, "order_id", ""),
@@ -665,6 +682,7 @@ class EvmRelayer(RelayerBase):
                 success=False,
                 error=f"Failed after {_MAX_RETRIES} attempts: {last_error}",
                 chain_id=chain_id,
+                broadcast_attempted=broadcast_attempted,
             )
 
         except Exception as exc:
@@ -678,6 +696,7 @@ class EvmRelayer(RelayerBase):
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
                 chain_id=chain_id,
+                broadcast_attempted=broadcast_attempted,
             )
 
     def on_leader_changed(self, new_leader_id: str) -> int:
