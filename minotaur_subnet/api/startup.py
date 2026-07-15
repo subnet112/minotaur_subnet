@@ -479,6 +479,48 @@ def _build_simulator():
         return None
 
 
+# Compose service names of the api's SHARED simulator forks. The split benchmark
+# worker (BENCHMARK_WORKER_ONLY) MUST fork on its OWN dedicated anvils (…-bench):
+# sharing a fork means both processes evm_snapshot / evm_revert + re-fork the same
+# anvil, silently corrupting each other's scoreIntent on BOTH sides.
+_SHARED_API_FORK_HOSTS = frozenset({"anvil-eth", "anvil-base", "anvil-btevm"})
+
+
+def _assert_worker_forks_isolated() -> None:
+    """Fail-closed at boot if the split benchmark worker is pointed at the api's
+    SHARED simulator forks instead of its own dedicated ``anvil-*-bench`` forks.
+
+    Self-contained (the worker can't read the api's env), so it asserts the
+    worker's sim hosts are not the well-known shared-fork compose service names.
+    Escape hatch for a single-fork dev/test box: BENCHMARK_WORKER_ALLOW_SHARED_FORKS=1.
+    """
+    if os.environ.get(
+        "BENCHMARK_WORKER_ALLOW_SHARED_FORKS", "",
+    ).lower() in ("1", "true", "yes"):
+        return
+    from urllib.parse import urlsplit
+    from minotaur_subnet.chains import wiring as chain_wiring
+
+    shared = []
+    for cid, url in chain_wiring.sim_rpc_urls().items():
+        try:
+            host = urlsplit(url).hostname or ""
+        except (ValueError, TypeError):
+            continue
+        if host in _SHARED_API_FORK_HOSTS:
+            shared.append(f"chain {cid} → {url}")
+    if shared:
+        raise RuntimeError(
+            "BENCHMARK_WORKER_ONLY: the worker is pointed at the api's SHARED "
+            "simulator fork(s): " + ", ".join(shared) + ". The worker must fork on "
+            "its OWN dedicated anvil-*-bench forks (set ETH_SIM_RPC_URL / "
+            "BASE_SIM_RPC_URL / BITTENSOR_EVM_SIM_RPC_URL to the -bench hosts) — "
+            "sharing a fork races snapshot/revert on both processes and corrupts "
+            "scoring. Override for single-fork dev only: "
+            "BENCHMARK_WORKER_ALLOW_SHARED_FORKS=1."
+        )
+
+
 def _round_anchored_pin_segment(round_id: str) -> str:
     """Canonical per-chain fork pins for the round, serialized for the pack hash.
 
@@ -1291,6 +1333,11 @@ async def initialize(ctx: ServerContext) -> dict:
         # the worker can actually score (C1). Its *_SIM_RPC_URL env points at the
         # dedicated anvil-*-bench forks, isolating it from the api's forks.
         if _benchmark_worker_only:
+            # Fail-closed if the worker was misconfigured onto the api's SHARED
+            # forks — both processes would snapshot/revert + re-fork the same
+            # anvil, silently corrupting each other's scoreIntent (a consensus
+            # hazard). The worker MUST fork on its own anvil-*-bench.
+            _assert_worker_forks_isolated()
             _worker_sim = _build_simulator()
             if _worker_sim is not None:
                 ctx.benchmark_worker._simulator = _worker_sim

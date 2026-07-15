@@ -134,3 +134,79 @@ def test_sweep_flag_defaults_true(tmp_path: Path):
     """Default construction keeps the sole-writer crash-cleanup sweep enabled."""
     store = RoundStore(persist_path=tmp_path / "solver_rounds.json")
     assert store._sweep_orphan_temps_enabled is True
+
+
+# ── worker fork-isolation boot guard ────────────────────────────────────────
+
+
+def test_worker_fork_guard_rejects_shared_api_forks(monkeypatch):
+    """The worker forking on the api's SHARED anvils (…-eth/-base/-btevm) is a
+    consensus hazard — snapshot/revert races corrupt both processes' scoring —
+    so the boot guard must fail-closed."""
+    from minotaur_subnet.api import startup
+
+    monkeypatch.delenv("BENCHMARK_WORKER_ALLOW_SHARED_FORKS", raising=False)
+    monkeypatch.setattr(
+        "minotaur_subnet.chains.wiring.sim_rpc_urls",
+        lambda: {1: "http://anvil-eth:8545", 8453: "http://anvil-base:8546"},
+    )
+    with pytest.raises(RuntimeError, match="SHARED simulator fork"):
+        startup._assert_worker_forks_isolated()
+
+
+def test_worker_fork_guard_accepts_dedicated_bench_forks(monkeypatch):
+    """Dedicated anvil-*-bench forks (isolated from the api) pass the guard."""
+    from minotaur_subnet.api import startup
+
+    monkeypatch.delenv("BENCHMARK_WORKER_ALLOW_SHARED_FORKS", raising=False)
+    monkeypatch.setattr(
+        "minotaur_subnet.chains.wiring.sim_rpc_urls",
+        lambda: {
+            1: "http://anvil-eth-bench:8545",
+            8453: "http://anvil-base-bench:8546",
+            964: "http://anvil-btevm-bench:8547",
+        },
+    )
+    startup._assert_worker_forks_isolated()  # must not raise
+
+
+def test_worker_fork_guard_escape_hatch(monkeypatch):
+    """The single-fork dev/test escape hatch disables the guard."""
+    from minotaur_subnet.api import startup
+
+    monkeypatch.setenv("BENCHMARK_WORKER_ALLOW_SHARED_FORKS", "1")
+    monkeypatch.setattr(
+        "minotaur_subnet.chains.wiring.sim_rpc_urls",
+        lambda: {1: "http://anvil-eth:8545"},
+    )
+    startup._assert_worker_forks_isolated()  # escape hatch → no raise
+
+
+# ── worker forward-progress heartbeat ───────────────────────────────────────
+
+
+def test_worker_heartbeat_noop_in_monolith(tmp_path: Path, monkeypatch):
+    """No heartbeat file in the monolith api (BENCHMARK_WORKER_ONLY unset) — the
+    split-container healthcheck must not leak into normal api operation."""
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+    hb = tmp_path / "hb"
+    monkeypatch.setenv("BENCHMARK_WORKER_HEARTBEAT_FILE", str(hb))
+    monkeypatch.delenv("BENCHMARK_WORKER_ONLY", raising=False)
+    w = object.__new__(BenchmarkWorker)  # bypass heavy __init__; helper is self-contained
+    w._touch_worker_heartbeat()
+    assert not hb.exists()
+
+
+def test_worker_heartbeat_written_in_worker_mode(tmp_path: Path, monkeypatch):
+    """The split worker bumps its heartbeat file so a wedged loop goes stale and
+    the container healthcheck can catch it."""
+    from minotaur_subnet.harness.benchmark_worker import BenchmarkWorker
+
+    hb = tmp_path / "hb"
+    monkeypatch.setenv("BENCHMARK_WORKER_HEARTBEAT_FILE", str(hb))
+    monkeypatch.setenv("BENCHMARK_WORKER_ONLY", "1")
+    w = object.__new__(BenchmarkWorker)
+    w._touch_worker_heartbeat()
+    assert hb.exists()
+    assert float(hb.read_text()) > 0
