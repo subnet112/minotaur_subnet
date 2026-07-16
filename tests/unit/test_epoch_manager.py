@@ -928,6 +928,11 @@ class TestEpochManager:
             {"intent_id": "o1", "raw_output": "1000000"},  # matched vs stored bar
             {"intent_id": "o2", "raw_output": "1000000"},
         ]}
+        # Stale OUTPERFORMS badges from an earlier pass — the walk must overwrite
+        # them from each candidate's authoritative (reject) verdict so a
+        # no-change round never leaves a "dethrone" badge standing.
+        top.benchmark_details["relative"] = {"verdict": "dethrone", "better": 1}
+        runner.benchmark_details["relative"] = {"verdict": "dethrone", "better": 1}
         # Fresh bar: o1=2000000 -> top is cut ~50% (hard floor), runner too.
         mgr, current_round, rejected = self._fallthrough_fixture(
             [{"intent_id": "o1", "raw_output": "2000000"},
@@ -940,6 +945,11 @@ class TestEpochManager:
         assert result["status_after"] == RoundStatus.ABORTED.value
         assert "hard floor" in result["abort_reason"]  # top candidate's reason
         assert {r[0] for r in rejected} == {"sub_top", "sub_runner"}
+        # Both evaluated candidates' badges reflect the reject verdict, not the
+        # stale dethrone (no OUTPERFORMS survives the no-change round).
+        for sid in ("sub_top", "sub_runner"):
+            rel = mgr._sub_store.get(sid).benchmark_details.get("relative")
+            assert rel is not None and rel["verdict"] != "dethrone"
 
     @pytest.mark.asyncio
     async def test_evaluate_round_is_noop_on_follower(self):
@@ -1030,6 +1040,60 @@ class TestEpochManager:
         # Champion + no-shadow competitor untouched.
         assert "relative" not in store.get("champ").benchmark_details
         assert "relative" not in store.get("noshadow").benchmark_details
+
+    @pytest.mark.asyncio
+    async def test_author_candidate_badge_overwrites_stale_dethrone(self):
+        """The decision authors the badge: after the adoption walk evaluates a
+        candidate, its stored `relative` block is overwritten from the SAME
+        verdict the decision used. A STALE `dethrone` block (e.g. persisted in an
+        earlier pass against slightly-drifted champion rows) must NOT survive a
+        `matched` authoritative verdict — that stale OUTPERFORMS badge on a
+        no-change round is exactly what a miner misread as a merge."""
+        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+
+        champ = _make_submission(submission_id="champ")
+        champ.benchmark_details = {"per_intent": [{"intent_id": "o1", "raw_output": "1000"}]}
+        cand = _make_submission(submission_id="cand", round_id="round-e1-n1")
+        cand.benchmark_details = {
+            "per_intent": [{"intent_id": "o1", "raw_output": "1000"}],  # matched
+            # Stale winning badge left over from a prior pass.
+            "relative": {"verdict": "dethrone", "better": 1, "worse": 0, "matched": 0},
+        }
+        store = _make_store_with_subs(champ, cand)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+
+        # Authoritative verdict for THIS candidate vs the champion: all-matched.
+        mgr._last_adopt_verdict = evaluate_relative_adoption(
+            mgr._per_intent(champ), mgr._per_intent(cand),
+        )
+        assert mgr._last_adopt_verdict["adopt"] is False  # matched, not adopted
+
+        await mgr._author_candidate_badge(cand, champ, "round-e1-n1")
+
+        rel = store.get("cand").benchmark_details["relative"]
+        assert rel["verdict"] == "matched"          # overwrote the stale dethrone
+        assert rel["better"] == 0 and rel["worse"] == 0
+        assert rel["round_id"] == "round-e1-n1"
+        assert "factorization" in rel and "deadwood" in rel  # shared context attached
+
+    @pytest.mark.asyncio
+    async def test_author_candidate_badge_noop_when_abstained(self):
+        """When the verdict is unavailable (abstain: no data / stale bar), the
+        badge author leaves any existing block untouched — it never writes a
+        previous candidate's verdict onto this one."""
+        cand = _make_submission(submission_id="cand", round_id="round-e1-n1")
+        stale = {"verdict": "dethrone", "better": 1, "worse": 0, "matched": 0}
+        cand.benchmark_details = {"per_intent": [{"intent_id": "o1", "raw_output": "1"}],
+                                  "relative": dict(stale)}
+        store = _make_store_with_subs(cand)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+        mgr._last_adopt_verdict = None  # abstained
+
+        await mgr._author_candidate_badge(cand, None, "round-e1-n1")
+
+        assert store.get("cand").benchmark_details["relative"] == stale
 
     @pytest.mark.asyncio
     async def test_activate_certified_round_adopts_finalist(self):

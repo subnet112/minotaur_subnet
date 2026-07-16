@@ -18,6 +18,7 @@ from minotaur_subnet.epoch.relative_scoring import (
     MIN_VALID_OUTPUT,
     RELATIVE_TOL,
     RELATIVE_TOL_BPS,
+    counts_from_verdict,
     evaluate_relative_adoption,
     has_raw_output_rows,
     relative_counts,
@@ -518,6 +519,20 @@ def test_reason_behind_uses_matched_and_regressed():
 
 def test_reason_none_when_no_counts():
     assert relative_reason(None) is None
+
+
+def test_counts_from_verdict_matches_relative_counts():
+    # relative_counts == evaluate_relative_adoption + counts_from_verdict, so a
+    # caller that already holds the decision's verdict (the manager's adoption
+    # walk) can persist the SAME badge without a second, drift-prone comparison.
+    for champ, chal in (
+        ([_r("o1", "100")], [_r("o1", "200")]),          # win -> dethrone
+        ([_r("o1", "100")], [_r("o1", "100")]),          # matched
+        ([_r("o1", "100"), _r("o2", "100")],
+         [_r("o1", "100"), _r("o2", "50")]),             # regressed -> behind
+    ):
+        res = evaluate_relative_adoption(champ, chal)
+        assert counts_from_verdict(res) == relative_counts(champ, chal)
 
 
 # ── blind-spot REPEAT guard (BLIND_SPOT_BAR_TTL_S; Phase 0 disarmed) ──────────
