@@ -384,7 +384,16 @@ services:
       APP_REGISTRY_964: "${APP_REGISTRY_964}"
 
       # Sim-fork RPCs (internal anvil) — used ONLY for executeIntent simulation.
+      # ETH_SIM_RPC_URL was MISSING here until 2026-07-16: chain-1 sim
+      # resolution is (ETH_SIM_RPC_URL, ANVIL_RPC_URL), so follower
+      # re-simulation of chain-1 proposals silently ran against the BASE
+      # fork (ANVIL_RPC_URL is the misnamed legacy Base anvil) and
+      # dissented every chain-1 order with "on-chain score unavailable"
+      # — no ETH order could ever reach quorum. The anvil-eth fork was
+      # already a hard boot dependency of this service; it just was
+      # never wired into the simulator.
       ANVIL_RPC_URL: http://anvil-base:8546
+      ETH_SIM_RPC_URL: http://anvil-eth:8545
       BASE_SIM_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
@@ -506,7 +515,16 @@ services:
       CHAMPION_CONSENSUS_CHAIN_ID: "964"
 
       # Sim-fork RPCs (internal anvil) — used ONLY for executeIntent simulation.
+      # ETH_SIM_RPC_URL was MISSING here until 2026-07-16: chain-1 sim
+      # resolution is (ETH_SIM_RPC_URL, ANVIL_RPC_URL), so follower
+      # re-simulation of chain-1 proposals silently ran against the BASE
+      # fork (ANVIL_RPC_URL is the misnamed legacy Base anvil) and
+      # dissented every chain-1 order with "on-chain score unavailable"
+      # — no ETH order could ever reach quorum. The anvil-eth fork was
+      # already a hard boot dependency of this service; it just was
+      # never wired into the simulator.
       ANVIL_RPC_URL: http://anvil-base:8546
+      ETH_SIM_RPC_URL: http://anvil-eth:8545
       BASE_SIM_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
