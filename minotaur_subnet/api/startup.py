@@ -2573,6 +2573,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 and os.environ.get("SUBTENSOR_URL", "").strip()
                 and not solver_round_force_leader
             ):
+                # This node is CONFIGURED as a validator that must have metagraph
+                # sync. Record it BEFORE the attempt so /health can report unhealthy
+                # (503) when the wiring fails — letting update.sh's health-gate roll
+                # the deploy back, instead of leaving a stuck standalone api (which
+                # is what happened when a finney runtime change broke metagraph
+                # encoding 2026-07-16 and the lenient healthcheck stayed green).
+                ctx.solver_round_metagraph_expected = True
                 try:
                     from minotaur_subnet.validator.metagraph_sync import MetagraphSync
 
