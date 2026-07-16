@@ -170,6 +170,43 @@ for _cid, _toks in TOKENS.items():
 # Public helpers
 # ---------------------------------------------------------------------------
 
+def resolve_spend_token_amount(
+    params: dict[str, Any],
+) -> tuple[str | None, int | None]:
+    """Best-effort identify the ERC-20 token + per-execution amount the app will
+    pull from the user for this intent, using the platform-wide param-name
+    convention — NO app names, NO swap assumptions.
+
+    This is the single source of truth for "what does the user spend", shared by
+    order submission approval, the perpetual pre-flight funds gate, and the quote.
+    Any app that names its spend token/amount by these conventional keys is
+    covered; anything else returns ``(None, None)`` and callers MUST treat that as
+    "unknown → skip", never as zero (a funds pre-check that can't identify the
+    pull falls through to the settlement backstop rather than falsely failing).
+    """
+    token = (
+        params.get("input_token")
+        or params.get("tokenIn")
+        or params.get("token_in")
+        or params.get("asset")
+    )
+    raw_amount = (
+        params.get("input_amount")
+        or params.get("amountPerBuy")
+        or params.get("amount_per_buy")
+        or params.get("amount")
+    )
+    if not token or raw_amount is None:
+        return None, None
+    try:
+        amount = int(raw_amount)
+    except (ValueError, TypeError):
+        return None, None
+    if amount <= 0:
+        return None, None
+    return token, amount
+
+
 def resolve_token(
     token: str,
     fallback_chain_id: int = 1,

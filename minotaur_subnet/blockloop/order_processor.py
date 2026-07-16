@@ -832,21 +832,16 @@ class OrderProcessor:
 
         loop = _asyncio.get_running_loop()
         legs: list[tuple[str, int]] = []
-        # Input-token leg (skip when the input is native — paid as msg.value).
+        # Spend-token leg — the token the app pulls from the user for THIS intent,
+        # identified app-agnostically (shared resolve_spend_token_amount, same
+        # convention as order submission). Skipped when the input is native (paid
+        # as msg.value) or unidentifiable (unknown → settlement backstop, never a
+        # false terminate). Works for any app, not just swaps.
         if not order.params.get("_input_token_is_native"):
-            input_token = (
-                order.params.get("input_token")
-                or order.params.get("tokenIn")
-                or order.params.get("token_in")
-            )
-            input_amount = order.params.get("input_amount") or order.params.get("amount")
-            if input_token and input_amount:
-                try:
-                    amt = int(input_amount)
-                    if amt > 0:
-                        legs.append((input_token, amt))
-                except (ValueError, TypeError):
-                    pass
+            from minotaur_subnet.blockchain.tokens import resolve_spend_token_amount
+            spend_token, spend_amount = resolve_spend_token_amount(order.params)
+            if spend_token and spend_amount:
+                legs.append((spend_token, spend_amount))
         # Fee-token leg — ONLY when the app collects the fee directly from the
         # user (FeeMode.USER: the base _collectPlatformFee pulls WETH via
         # safeTransferFrom on every fill). APP-mode apps (e.g. DexAggregatorApp)
