@@ -1112,6 +1112,28 @@ def _require_real_consensus_signing_key(consensus_mode: str) -> None:
 # ── initialization ───────────────────────────────────────────────────────────
 
 
+
+def _restore_logging_after_bittensor() -> None:
+    """Undo the bittensor-import logging hijack.
+
+    ``import bittensor`` (triggered by MetagraphSync, wallet loading, …) clears
+    all root handlers, sets the root logger to WARNING, and pins every EXISTING
+    logger to CRITICAL — muting the whole app from that point on. The block-loop
+    init has carried this restore for the monolith; the SPLIT WORKER
+    (DISABLE_BLOCK_LOOP=1) never reached it, so in the 2026-07-16 incident the
+    worker printed but never logged again after construction — every WARNING/
+    ERROR (including the no-intents mass-reject) was invisible. Call this after
+    any component that may import bittensor."""
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        force=True,
+    )
+    for name in list(logging.Logger.manager.loggerDict):
+        if name.startswith("minotaur_subnet"):
+            logging.getLogger(name).setLevel(logging.NOTSET)
+
 async def initialize(ctx: ServerContext) -> dict:
     """Run all startup initialization.  Populates ``ctx`` fields.
 
@@ -1417,6 +1439,13 @@ async def initialize(ctx: ServerContext) -> dict:
                     "[worker] BENCHMARK_REQUIRE_REAL_SIM set but no simulator "
                     "available — the worker will fail-closed each tick",
                 )
+            # Worker construction loads the hotkey wallet → imports bittensor →
+            # every existing logger is pinned to CRITICAL. The monolith's restore
+            # lives in the block-loop init, which the worker (DISABLE_BLOCK_LOOP=1)
+            # never runs — restore here or the worker logs NOTHING after boot
+            # (2026-07-16 incident: hid the no-intents mass-reject for hours).
+            _restore_logging_after_bittensor()
+            logger.info("[worker] logging restored after bittensor import")
         # Run the slate loop only in a process that owns it.
         if _run_benchmark_loop:
             ctx.benchmark_task = asyncio.create_task(
@@ -2521,22 +2550,8 @@ async def initialize(ctx: ServerContext) -> dict:
                         )
 
                     # Restore logging — instantiating MetagraphSync above
-                    # imports bittensor, which clears all root logging
-                    # handlers, sets the root logger to WARNING, and sets
-                    # every existing logger to CRITICAL. Without this the
-                    # api goes silent after this point: no order/champion
-                    # ProtocolConfig refresh-loop logs, no peer-discovery
-                    # logs, no submission logs, nothing. Mirrors the same
-                    # workaround in ``validator/main.py``.
-                    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-                    logging.basicConfig(
-                        level=getattr(logging, _log_level, logging.INFO),
-                        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-                        force=True,
-                    )
-                    for name in list(logging.Logger.manager.loggerDict):
-                        if name.startswith("minotaur_subnet"):
-                            logging.getLogger(name).setLevel(logging.NOTSET)
+                    # imports bittensor (see _restore_logging_after_bittensor).
+                    _restore_logging_after_bittensor()
 
                     # Wire /identity now that metagraph_sync exists. The
                     # signing key was already set when ChampionConsensusManager

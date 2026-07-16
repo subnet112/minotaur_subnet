@@ -46,6 +46,22 @@ def _status_value(sub: Any) -> str:
     return str(getattr(st, "value", None) or st or "")
 
 
+def is_terminal_status(sub: Any) -> bool:
+    """Is this submission OUT of the running for its round (rejected /
+    adopted / waitlisted)?
+
+    The single shared definition of round-terminality — the same
+    ``_TERMINAL_STATUSES`` that slate selection and the decision-window
+    autoscale use (see :func:`benchable_candidate_count` for the #620 incident
+    that taught the one-definition discipline). The screening pipeline's
+    re-queue guard MUST use this too: it used to check only REJECTED while
+    rotation had switched to parking overflow as WAITLISTED, so a
+    late-finishing screening silently overwrote a terminal waitlist back to
+    BENCHMARKING and busted the slate cap.
+    """
+    return _status_value(sub) in _TERMINAL_STATUSES
+
+
 def benchable_candidate_count(subs: Iterable[Any]) -> int:
     """How many of ``subs`` a rotation pass would consider — i.e. how many get
     BENCHED when rotation is disabled (``slots <= 0``) or fails.
