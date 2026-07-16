@@ -1846,6 +1846,50 @@ def prepare_permit(app_id: str, req: PreparePermitRequest) -> dict:
     }
 
 
+@router.get("/orders/{order_id}/signing-payload")
+def get_order_signing_payload(order_id: str) -> dict:
+    """Return the EIP-712 payload the user signs to authorize this order.
+
+    ``order_id`` is minted server-side at submit and the signed digest depends on
+    it, so signing happens AFTER creation:
+    submit → GET signing-payload → sign → PATCH /signature.
+
+    Returns the full typed data (``domain``/``types``/``message`` for
+    ``eth_signTypedData_v4``) AND the final ``digest`` (for raw-hash signing),
+    built from the SAME fields the server verifies — so the resulting signature
+    always passes PATCH /signature. Works for one-shot and perpetual orders alike;
+    for a perpetual, ``message`` carries the perpetual/maxExecutions/cooldown terms
+    and the uint256-max sentinel ``nonce`` a perpetual must sign with (so a client
+    can't accidentally sign a concrete nonce and fail at settlement).
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    if not order.params.get("app_address"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Order has no app_address yet — its signing payload isn't ready. "
+                "Submit through the leader so intent params/app address are resolved."
+            ),
+        )
+    from minotaur_subnet.api.routes._signature_verify import build_order_signing_payload
+    payload = build_order_signing_payload(order)
+    return {
+        "order_id": order_id,
+        "submitted_by": order.submitted_by,
+        "perpetual": bool(order.perpetual),
+        **payload,
+        "note": (
+            "Sign with eth_signTypedData_v4(domain, types, message) OR sign the raw "
+            "32-byte `digest`, then PATCH /orders/{id}/signature with "
+            "{user_signature}. Do NOT change message.nonce — perpetuals use the "
+            "uint256-max sentinel shown."
+        ),
+    }
+
+
 @router.get("/orders/{order_id}/bridge")
 def get_bridge_status(order_id: str) -> dict:
     """Get bridge transfer status for a cross-chain order.
