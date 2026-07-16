@@ -59,6 +59,17 @@ async def _run_one_iteration(self_stub) -> None:
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,
     )
+    # Bind the real null-champion debounce (a MagicMock here returns truthy and
+    # silently skips every burn) with no champion history — keeps the stubs'
+    # definitive-no-champion burn semantics.
+    self_stub._last_successful_emit_state = None
+    self_stub._null_champion_since = None
+    self_stub._should_defer_null_champion_burn = (
+        AppIntentsValidator._should_defer_null_champion_burn.__get__(
+            self_stub, AppIntentsValidator,
+        )
+    )
+
     # _local_champion_hotkey is async now (HTTP-resolves the champion from the co-located
     # API); the burn path awaits it. None + source 'api' = DEFINITIVE no-champion => the
     # owner-burn path these tests mock via maybe_emit (an UNRESOLVED None would SKIP).
