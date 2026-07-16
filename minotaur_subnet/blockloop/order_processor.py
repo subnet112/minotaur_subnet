@@ -516,6 +516,10 @@ class OrderProcessor:
         # onchain_score_fail_closed() so they gate identically (break-glass:
         # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
+            if self._try_requeue_perpetual(
+                order, "on-chain score unavailable this cycle (fail-closed)",
+            ):
+                return False
             self.orderbook.update_order(
                 order.order_id,
                 status=OrderStatus.REJECTED,
@@ -525,6 +529,11 @@ class OrderProcessor:
             self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
         if oc_score is not None and oc_score < on_chain_threshold:
+            if self._try_requeue_perpetual(
+                order,
+                f"on-chain score {oc_score} BPS < threshold {on_chain_threshold}",
+            ):
+                return False
             self.orderbook.update_order(
                 order.order_id,
                 status=OrderStatus.REJECTED,
@@ -666,8 +675,14 @@ class OrderProcessor:
                 # Re-open perpetual orders if under max_executions
                 # Note: execution_count was already incremented by update_order above
                 if order.execution_count < order.max_executions:
-                    # Sync on-chain nonce so next execution doesn't revert
-                    await self._refresh_perpetual_nonce(order)
+                    # Perpetuals are signed ONCE with the sentinel nonce
+                    # (type(uint256).max): the contract neither verifies nor
+                    # increments it (AppIntentBase replay protection for a
+                    # perpetual is executionCounts + cooldown + maxExecutions),
+                    # so there is no per-fill nonce to refresh and the single
+                    # user signature stays valid across every fill. Refreshing
+                    # it to a concrete value would mutate a signed EIP-712 field
+                    # and break signature verification on fill #2.
                     self.orderbook.update_order(
                         order.order_id,
                         status=OrderStatus.OPEN,
@@ -778,88 +793,70 @@ class OrderProcessor:
         )
         return sig
 
+    def _try_requeue_perpetual(self, order: Any, reason: str) -> bool:
+        """Requeue a live perpetual OPEN for a later cycle; return True if done.
+
+        A perpetual's trigger condition is simply *"can this execute now?"* —
+        answered every cycle by the on-chain score gate. A non-fatal miss this
+        cycle (solver produced no plan, on-chain score below threshold, contract
+        didn't bless the plan) is the perpetual's normal resting state: a
+        limit-order perpetual only clears the gate when the price is favorable,
+        and may rest below threshold for most of its life. So a live perpetual —
+        still under ``max_executions`` and not past its ``deadline`` — is requeued
+        OPEN **without consuming an execution slot and without debiting the miner**
+        (the user's price simply not being hit is not a solver failure).
+        ``last_filled_at=now`` reuses the cooldown gate to back off one cycle. The
+        requeue is unbounded (unlike the consensus retry budget) because resting
+        below threshold indefinitely is expected, not a transient fault.
+
+        Returns False and leaves the order untouched for one-shot orders and for
+        perpetuals that are exhausted or past deadline, so the caller applies its
+        normal terminal handling (REJECTED, with its existing miner-debit policy).
+        ``deadline<=0`` means "no deadline" (see ``Order.deadline``).
+        """
+        now = time.time()
+        deadline = float(getattr(order, "deadline", 0) or 0)
+        live_perpetual = (
+            order.perpetual
+            and order.execution_count < order.max_executions
+            and (deadline <= 0 or now < deadline)
+        )
+        if not live_perpetual:
+            return False
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.OPEN,
+            last_filled_at=now,
+        )
+        self.order_persistence.sync(order.order_id)
+        logger.info(
+            "Perpetual order %s: %s — requeued OPEN "
+            "(execution slot not consumed, miner not debited)",
+            order.order_id, reason,
+        )
+        return True
+
     def _handle_no_plan(self, order: Any) -> None:
         """Resolve an order whose solver produced no plan (#225/#226).
 
-        Perpetual orders (still under max_executions) are requeued to OPEN to be
-        retried on a later cycle — the champion solver hot-swaps over the order's
-        lifetime, so a future champion may solve it; ``last_filled_at=now`` reuses
-        the existing cooldown gate for per-cycle backoff and the execution slot is
-        NOT consumed. One-shot orders (and exhausted perpetuals) are terminal:
-        ``REJECTED`` with a clear reason + ``record_execution(success=False)`` for
-        miner accountability — matching the bad-plan path, instead of a silent
-        ASSIGNED→EXPIRED with no signal.
+        Live perpetuals are requeued via ``_try_requeue_perpetual`` — the champion
+        solver hot-swaps over the order's lifetime, so a future champion may solve
+        it, and the execution slot is not consumed. One-shot orders (and exhausted
+        or expired perpetuals) are terminal: ``REJECTED`` with a clear reason +
+        ``record_execution(success=False)`` for miner accountability — matching the
+        bad-plan path, instead of a silent ASSIGNED→EXPIRED with no signal.
         """
-        if order.perpetual and order.execution_count < order.max_executions:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.OPEN,
-                last_filled_at=time.time(),
-            )
-            self.order_persistence.sync(order.order_id)
-            logger.info(
-                "Perpetual order %s: no plan this cycle — requeued OPEN for retry",
-                order.order_id,
-            )
-        else:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.REJECTED,
-                error="solver produced no plan",
-            )
-            self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, 0.0, success=False)
-            logger.info(
-                "Order %s: solver produced no plan — REJECTED + miner debited",
-                order.order_id,
-            )
+        if self._try_requeue_perpetual(order, "no plan this cycle"):
+            return
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error="solver produced no plan",
+        )
+        self.order_persistence.sync(order.order_id)
+        self.app_store.record_execution(order.app_id, 0.0, success=False)
+        logger.info(
+            "Order %s: solver produced no plan — REJECTED + miner debited",
+            order.order_id,
+        )
 
-    async def _refresh_perpetual_nonce(self, order: "Order") -> None:
-        """Fetch the user's current on-chain nonce and update the order params.
-
-        After a perpetual order fills, the on-chain nonce advances but the
-        off-chain order params still hold the old value.  Without this sync,
-        subsequent fills revert with "Invalid nonce".
-
-        Uses the simulator's web3 connection to call ``nonces(address)`` on
-        the app contract.  If the fetch fails, a warning is logged but the
-        re-open is not blocked.
-        """
-        try:
-            w3 = None
-            if self.simulator is not None:
-                w3 = getattr(self.simulator, "w3", None)
-            if w3 is None:
-                return
-
-            contract_address = order.params.get("contract_address")
-            if not contract_address:
-                # Try to look up from app store deployment
-                dep = self.app_store.get_deployment(order.app_id) if self.app_store else None
-                if dep:
-                    contract_address = getattr(dep, "contract_address", None)
-            if not contract_address:
-                return
-
-            # Call nonces(address) -- returns uint256
-            nonce_selector = "0x7ecebe00"  # keccak256("nonces(address)")[:4]
-            padded_addr = order.submitted_by.lower().replace("0x", "").zfill(64)
-            call_data = nonce_selector + padded_addr
-
-            result = w3.eth.call({
-                "to": w3.to_checksum_address(contract_address),
-                "data": call_data,
-            })
-            new_nonce = int(result.hex(), 16)
-            order.params["user_nonce"] = new_nonce
-            # Also update the order in the orderbook
-            self.orderbook.update_order(order.order_id, params=order.params)
-            logger.info(
-                "Refreshed on-chain nonce for perpetual order %s (user=%s, nonce=%d)",
-                order.order_id, order.submitted_by, new_nonce,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to refresh on-chain nonce for perpetual order %s: %s",
-                order.order_id, exc,
-            )
