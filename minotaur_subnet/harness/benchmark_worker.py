@@ -40,6 +40,7 @@ from minotaur_subnet.consensus.round_anchor import ForkPinUnavailable
 from minotaur_subnet.harness.orchestrator import (
     BenchmarkConfig,
     BenchmarkResult,
+    RealSimulationUnavailable,
     SolverOrchestrator,
     SolverSession,
     SolverTimeoutError,
@@ -906,14 +907,30 @@ class BenchmarkWorker:
         # Load intents to benchmark against
         intents = self._load_benchmark_intents()
         if not intents:
-            logger.warning("No active intents for benchmarking")
-            for sub in benchmarking:
-                await offload_write(self._sub_store.set_benchmark_result,
-                    sub.submission_id,
-                    valid=False,
-                    details={"error": "no_active_intents"},
-                )
-            return len(benchmarking)
+            # A CONFIG failure, not a verdict. This branch used to terminally
+            # REJECT every queued submission with {"error": "no_active_intents"}
+            # — in the 2026-07-16 split-worker incident a worker whose
+            # APP_INTENTS_STORE_PATH was never wired saw an EMPTY app store and
+            # mass-rejected every slate ~30s after rotation selected it, killing
+            # every round no_champion_candidate for hours, silently (the WARNING
+            # below was muted by the bittensor logging hijack). An empty intent
+            # set says nothing about the submissions; raise instead:
+            # - the print survives any logging blackout;
+            # - run_loop's catch-all skips the heartbeat bump, so the split
+            #   worker goes UNHEALTHY instead of masking the failure;
+            # - in the monolith, evaluate_round records benchmark_failed with
+            #   this message instead of silently rejecting paying miners.
+            print(
+                "[BENCHMARK] FATAL: no active benchmark intents — app store "
+                "empty or APP_INTENTS_STORE_PATH mis-wired; refusing to touch "
+                f"{len(benchmarking)} queued submission(s)", flush=True,
+            )
+            logger.error("No active intents for benchmarking (config failure)")
+            raise RuntimeError(
+                "no active benchmark intents (empty app store / "
+                "APP_INTENTS_STORE_PATH mis-wired?) — refusing to judge "
+                "submissions on a config failure"
+            )
 
         # Build scoring function from JS engine (also loads JS into engine)
         score_fn = await self._build_score_fn(intents)
@@ -1044,6 +1061,23 @@ class BenchmarkWorker:
                         sub.submission_id, len(results),
                         "SCORED" if valid else "REJECTED (no order delivered value)",
                     )
+                except RealSimulationUnavailable as exc:
+                    # CONFIG failure (proxy chain routing / sim fork wiring),
+                    # not a verdict on the submission — 2026-07-16 soak: a
+                    # worker missing SOLVER_READ_PROXY_CHAINS terminally
+                    # rejected every chain-1 bench on this handler. Leave the
+                    # sub BENCHMARKING for the next pass (the round decision
+                    # deadline bounds a persistent gap); never judge miners on
+                    # operator config.
+                    print(
+                        f"[BENCHMARK] CONFIG failure for {sub.submission_id} — "
+                        f"NOT judging the submission: {exc}", flush=True,
+                    )
+                    logger.error(
+                        "Benchmark config failure for %s (submission left "
+                        "queued for retry): %s", sub.submission_id, exc,
+                    )
+                    continue
                 except Exception as exc:
                     import traceback
                     print(f"[BENCHMARK] Docker benchmark FAILED for {sub.submission_id}: {exc}", flush=True)

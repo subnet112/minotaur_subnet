@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -37,6 +38,16 @@ from minotaur_subnet.v3.contexts import build_typed_context
 from minotaur_subnet.v3.flags import load_v3_flags
 
 logger = logging.getLogger(__name__)
+
+
+def _int_env(name: str, default: int) -> int:
+    """Env int with fallback — malformed values must not crash import
+    (same posture as ``relayer.safeguards.Safeguards.from_env``)."""
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, os.environ.get(name), default)
+        return default
 
 
 # Revert signatures of a USER-side signature fault at settlement (#229). When
@@ -163,6 +174,100 @@ class OrderProcessor:
         self.default_fee_wei = default_fee_wei
         self.v3_flags = v3_flags or load_v3_flags()
         self.simulator = simulator
+        # Consensus retry bookkeeping: order_id -> (attempts, last_attempt_ts).
+        # A consensus round can fail transiently (peer set flapped empty,
+        # follower slow) — while the order deadline has time left we requeue
+        # the order OPEN for the next tick instead of terminally rejecting
+        # (live incident 2026-07-16: a fresh, valid ETH order died
+        # "Consensus not reached" because the proposal went out one second
+        # after a spurious probe-timeout round zeroed the peer set).
+        self._consensus_retries: dict[str, tuple[int, float]] = {}
+
+    # How many consensus attempts an order gets before the failure is
+    # terminal, how much order-deadline headroom a retry requires, and the
+    # minimum spacing between counted attempts. Spacing matters: the block
+    # loop re-picks a requeued order every ~12s tick, but the peer set can
+    # only recover on a discovery refresh (60s cadence — and the refresh
+    # loop sleeps a full interval before its FIRST pass after boot).
+    # Without spacing, all attempts burn in ~36s and the retry mechanism
+    # mathematically cannot outlast the very condition it waits out.
+    # Requeues inside the spacing window don't consume an attempt.
+    _CONSENSUS_RETRY_MAX = _int_env("ORDER_CONSENSUS_RETRY_MAX", 3)
+    _CONSENSUS_RETRY_SPACING_S = float(_int_env("ORDER_CONSENSUS_RETRY_SPACING_S", 45))
+    _CONSENSUS_RETRY_MIN_DEADLINE_S = 60.0
+
+    def _defer_or_reject_consensus(
+        self, order: Order, reason: str, consensus_result: Any = None,
+    ) -> None:
+        """Requeue the order OPEN for another consensus attempt, or
+        terminally reject once attempts/deadline run out.
+
+        The requeued order re-runs the whole pipeline next tick (fresh
+        plan, fresh simulation) — same pattern as the perpetual no-plan
+        requeue below. ``deadline<=0`` means "no deadline" (see
+        ``Order.deadline``) and counts as unlimited headroom.
+        """
+        # Opportunistic prune so abandoned entries (order expired outside
+        # this path) don't accumulate.
+        now = time.time()
+        if len(self._consensus_retries) > 256:
+            self._consensus_retries = {
+                k: v for k, v in self._consensus_retries.items()
+                if now - v[1] < 7200
+            }
+        attempts, last_ts = self._consensus_retries.get(order.order_id, (0, 0.0))
+        deadline = float(order.deadline or 0)
+        deadline_left = (deadline - now) if deadline > 0 else float("inf")
+
+        # Inside the spacing window: requeue without consuming an attempt,
+        # so counted attempts stay >= spacing apart and the retry budget
+        # spans at least one full discovery-refresh interval.
+        if (
+            attempts > 0
+            and (now - last_ts) < self._CONSENSUS_RETRY_SPACING_S
+            and deadline_left > self._CONSENSUS_RETRY_MIN_DEADLINE_S
+        ):
+            logger.info(
+                "Order %s: %s — inside retry spacing window "
+                "(%.0fs/%.0fs since attempt %d), requeued OPEN",
+                order.order_id, reason, now - last_ts,
+                self._CONSENSUS_RETRY_SPACING_S, attempts,
+            )
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.OPEN,
+                error=f"{reason} (retry {attempts}/{self._CONSENSUS_RETRY_MAX} pending)",
+            )
+            self.order_persistence.sync(order.order_id)
+            return
+
+        if attempts < self._CONSENSUS_RETRY_MAX and deadline_left > self._CONSENSUS_RETRY_MIN_DEADLINE_S:
+            self._consensus_retries[order.order_id] = (attempts + 1, now)
+            logger.warning(
+                "Order %s: %s (attempt %d/%d, %s of deadline left) — "
+                "requeued OPEN for retry",
+                order.order_id, reason, attempts + 1,
+                self._CONSENSUS_RETRY_MAX,
+                "unlimited" if deadline_left == float("inf") else f"{deadline_left:.0f}s",
+            )
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.OPEN,
+                error=f"{reason} (retry {attempts + 1}/{self._CONSENSUS_RETRY_MAX} pending)",
+            )
+            self.order_persistence.sync(order.order_id)
+            return
+        self._consensus_retries.pop(order.order_id, None)
+        update_kwargs: dict[str, Any] = {}
+        if consensus_result is not None:
+            update_kwargs["consensus_result"] = _json_safe(consensus_result)
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error=f"{reason} — terminal after {attempts + 1} attempt(s)",
+            **update_kwargs,
+        )
+        self.order_persistence.sync(order.order_id)
 
     async def process(self, order: Order) -> bool:
         """Process a single order through the full pipeline.
@@ -482,6 +587,21 @@ class OrderProcessor:
             from minotaur_subnet.consensus.signatures import hash_plan
             plan_hash = hash_plan(plan)
 
+            # Fast-path defer: with quorum > 1 and ZERO reachable peers the
+            # round is mathematically unwinnable — don't broadcast to nobody
+            # and then burn the full consensus timeout (that's what killed
+            # ord_710c9140 on 2026-07-16). Requeue and let the next tick try
+            # with a (hopefully recovered) peer set.
+            if (
+                self.peer_network is not None
+                and int(getattr(self.consensus, "quorum_required", 1) or 1) > 1
+                and not self.peer_network.peers
+            ):
+                self._defer_or_reject_consensus(
+                    order, "No reachable validator peers for consensus",
+                )
+                return False
+
             # Start peer broadcast concurrently (leader broadcasts to followers)
             broadcast_task = None
             if self.peer_network is not None:
@@ -520,18 +640,19 @@ class OrderProcessor:
                     pass
 
             if not consensus_result.reached:
-                self.orderbook.update_order(
-                    order.order_id,
-                    status=OrderStatus.REJECTED,
-                    error="Consensus not reached",
-                    consensus_result=_json_safe(consensus_result),
+                self._defer_or_reject_consensus(
+                    order, "Consensus not reached",
+                    consensus_result=consensus_result,
                 )
-                self.order_persistence.sync(order.order_id)
                 return False
 
+        self._consensus_retries.pop(order.order_id, None)
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.APPROVED,
+            # Clear any "retry N/M pending" note a prior consensus failure
+            # left — a filled order must not carry a stale error forever.
+            error=None,
             consensus_result=_json_safe(consensus_result) if consensus_result is not None else None,
         )
         self.order_persistence.sync(order.order_id)

@@ -46,6 +46,9 @@ def _store_with_benchmarking(n: int, round_id: str = ROUND_ID):
             max_rounds_per_commit=0,
         )
         store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+        # Docker-shaped submission so the per-sub loop takes the (stubbed)
+        # docker bench path — see _worker_for's fake bench layer.
+        store._submissions[sub.submission_id].image_tag = f"solver-{i:02d}:screening"
         subs.append(sub)
     return store, subs
 
@@ -61,10 +64,25 @@ def _worker_for(store, monkeypatch, tmp_path, slots: int = 3):
     worker = BenchmarkWorker(store, use_docker=False)
     closed = SimpleNamespace(round_id=ROUND_ID, status=RoundStatus.CLOSED)
     monkeypatch.setattr(worker, "_current_replay_round", lambda: closed)
-    # Force the fast no-intents path: every capped-in submission gets a
-    # set_benchmark_result (validity-reject) — a recognisable "bench attempt"
-    # touch — with zero sim machinery.
-    monkeypatch.setattr(worker, "_load_benchmark_intents", lambda *a, **k: [])
+    # Fast fake bench layer: non-empty intents + a stubbed docker bench that
+    # returns zero results — every capped-in submission gets a
+    # set_benchmark_result validity-reject (the recognisable "bench attempt"
+    # touch) with zero sim machinery. Replaces the pre-2026-07-16 trick of
+    # forcing the no-intents branch: that branch is now a LOUD config-failure
+    # raise and never touches submissions (see
+    # test_no_intents_config_failure.py).
+    monkeypatch.setattr(worker, "_load_benchmark_intents", lambda *a, **k: [object()])
+
+    async def _score_fn(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(worker, "_build_score_fn", lambda intents: _score_fn())
+    monkeypatch.setattr(worker, "_enrich_intents_with_manifests", lambda intents: intents)
+
+    async def _no_results(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(worker, "_benchmark_submission", _no_results)
     return worker
 
 
