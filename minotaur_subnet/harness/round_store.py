@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 import time
@@ -33,6 +34,25 @@ logger = logging.getLogger(__name__)
 # _build_round_id and mint a duplicate round_id). Every evicted round was already
 # mirrored to the durable record_sink. Set <= 0 to disable bounding.
 _ROUND_STORE_MAX_ROUNDS = int(os.environ.get("SOLVER_ROUND_STORE_MAX_ROUNDS", "2000"))
+
+# round_id carries its opened_epoch (see _build_round_id: "round-e{epoch}-n{n}").
+_ROUND_ID_EPOCH_RE = re.compile(r"^round-e(\d+)-n\d+$")
+
+
+def opened_epoch_from_round_id(round_id: str | None) -> int | None:
+    """Parse a round's ``opened_epoch`` straight out of its ``round_id``.
+
+    ``round_id`` is minted as ``round-e{opened_epoch}-n{n}`` (``_build_round_id``),
+    so the fleet-uniform round epoch is a PURE function of the id — no round-store
+    lookup needed. Consensus surfaces (the Stage-2 draw, the pack hash, the veto
+    slice) use this to apply the round-anchored retirement cutover deterministically
+    from the same id that already seeds the draw. Returns None for an id that
+    doesn't match the canonical shape (legacy/test ids) — callers then treat a
+    RETIRING deployment as not-yet-effective (it stays benchmarked)."""
+    if not round_id:
+        return None
+    m = _ROUND_ID_EPOCH_RE.match(round_id)
+    return int(m.group(1)) if m else None
 
 
 class RoundStatus(str, Enum):

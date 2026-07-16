@@ -28,8 +28,6 @@ import json
 import logging
 from typing import Any, Iterable
 
-from minotaur_subnet.shared.types import AppStatus
-
 logger = logging.getLogger(__name__)
 
 
@@ -157,19 +155,22 @@ def _canonical_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
     return {k: scenario[k] for k in keys if k in scenario}
 
 
-def deregistered_app_ids(app_store: Any) -> set[str]:
-    """App IDs that are fully deregistered — ≥1 deployment and ALL are RETIRED.
+def deregistered_app_ids(app_store: Any, at_epoch: int | None = None) -> set[str]:
+    """App IDs fully deregistered for a round at ``at_epoch`` — ≥1 deployment and
+    ALL effectively retired (RETIRED, or RETIRING past their cutover epoch).
 
     App-level rollup of ``order_sampler.retired_app_chain_keys`` (which is
     per-chain): a deregistered app leaves the synthetic half of the pack hash
     (apps payload + synthetic scenarios), just as its orders leave the historical
-    half. Keyed on RETIRED specifically — NOT on "not operational" — so this is
+    half. Keyed on effective retirement — NOT on "not operational" — so this is
     INERT on deploy (drafts/paused apps are unchanged, exactly as before) and only
     a deliberate retire/deregister flips the hash. That decouples the code rollout
     from the corpus change: promote is byte-identical, and retiring V1 is the
     single, observable hash-changing action. A retirement a validator hasn't synced
     yet diverges LOUDLY (PACK_HASH_MISMATCH → no adoption) rather than silently
-    scoring a different corpus. Fail-open to empty on a store error.
+    scoring a different corpus. ``at_epoch`` (the round's opened_epoch) applies the
+    round-anchored RETIRING cutover fleet-uniformly. Fail-open to empty on a store
+    error.
 
     An app live on one chain and retired on another is NOT fully deregistered, so
     it stays here (its live chain still runs synthetic scenarios) while its retired
@@ -188,20 +189,23 @@ def deregistered_app_ids(app_store: Any) -> set[str]:
             deps = app_store.get_deployments(app.app_id)
         except Exception:
             continue
-        if deps and all(d.status == AppStatus.RETIRED for d in deps.values()):
+        if deps and all(d.is_effectively_retired(at_epoch) for d in deps.values()):
             out.add(app.app_id)
     return out
 
 
-def collect_synthetic_scenarios(app_store: Any) -> list[dict[str, Any]]:
-    """Gather all synthetic scenarios from each app's manifest, EXCEPT fully
-    deregistered (all-deployments-RETIRED) apps.
+def collect_synthetic_scenarios(
+    app_store: Any, at_epoch: int | None = None,
+) -> list[dict[str, Any]]:
+    """Gather all synthetic scenarios from each app's manifest, EXCEPT apps fully
+    deregistered for a round at ``at_epoch``.
 
     Walks the app store, extracts benchmark_scenarios from each app's JS manifest,
     annotates each with the app_id. Deregistered apps are skipped so a retired app
     leaves the pack hash's synthetic set together with its historical orders. Other
     non-operational states (draft/paused) are left untouched — this stays inert on
-    deploy and only reacts to a deliberate retirement.
+    deploy and only reacts to a deliberate retirement (round-anchored via
+    ``at_epoch``).
     """
     scenarios: list[dict[str, Any]] = []
     if app_store is None:
@@ -213,7 +217,7 @@ def collect_synthetic_scenarios(app_store: Any) -> list[dict[str, Any]]:
         logger.warning("Failed to list apps for pack hash: %s", exc)
         return scenarios
 
-    excluded = deregistered_app_ids(app_store)
+    excluded = deregistered_app_ids(app_store, at_epoch)
     for app in apps:
         if app.app_id in excluded:
             continue

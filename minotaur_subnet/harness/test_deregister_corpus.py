@@ -171,6 +171,53 @@ def test_app_live_on_one_chain_not_deregistered():
         tmp.cleanup()
 
 
+def test_retiring_cutover_is_round_anchored():
+    # A RETIRING deployment stays in the draw until its effective epoch, then drops —
+    # driven purely by the opened_epoch parsed from round_id.
+    store, tmp = _store()
+    try:
+        _add_app(store, "v2", status=AppStatus.ACTIVE)
+        _add_app(store, "v1", status=AppStatus.ACTIVE)
+        _add_orders(store, "v2", 4)
+        v1_ids = set(_add_orders(store, "v1", 4))
+        store.update_deployment_status("v1", CHAIN, AppStatus.RETIRING,
+                                       retire_effective_epoch=100)
+
+        # Round BEFORE the cutover (epoch 50): v1 still benchmarked.
+        before = {o["order_id"] for o in sample_historical_orders(store, "round-e50-n1")}
+        assert v1_ids & before, "RETIRING app stays in the draw before its cutover"
+
+        # Round AT the cutover (epoch 100): v1 drops.
+        at = {o["order_id"] for o in sample_historical_orders(store, "round-e100-n1")}
+        assert not (v1_ids & at), "RETIRING app leaves the draw at its cutover epoch"
+
+        # Rows are still present regardless.
+        assert {o["order_id"] for o in store.list_orders(app_id="v1")} == v1_ids
+    finally:
+        tmp.cleanup()
+
+
+def test_retiring_synthetic_cutover_is_round_anchored():
+    store, tmp = _store()
+    try:
+        _add_app(store, "live", status=AppStatus.ACTIVE,
+                 scenarios=[{"name": "s1", "intent_function": "swap", "params": {}}])
+        _add_app(store, "closing", status=AppStatus.ACTIVE,
+                 scenarios=[{"name": "s2", "intent_function": "swap", "params": {}}])
+        store.update_deployment_status("closing", CHAIN, AppStatus.RETIRING,
+                                       retire_effective_epoch=100)
+
+        # Before cutover: still in the synthetic set + not yet deregistered.
+        assert deregistered_app_ids(store, 50) == set()
+        assert {s["app_id"] for s in collect_synthetic_scenarios(store, 50)} == {"live", "closing"}
+
+        # At/after cutover: dropped.
+        assert deregistered_app_ids(store, 100) == {"closing"}
+        assert {s["app_id"] for s in collect_synthetic_scenarios(store, 100)} == {"live"}
+    finally:
+        tmp.cleanup()
+
+
 def test_per_chain_retirement_is_precise():
     store, tmp = _store()
     try:
