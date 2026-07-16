@@ -84,12 +84,53 @@ class DexCompareWorker:
             remaining -= 1.0
 
     # ── one cycle ────────────────────────────────────────────────────────
-    async def run_once(self) -> bool:
-        """Run a single comparison. Returns True if a row was written."""
-        order = await self._pick_order()
-        if order is None:
-            return False
+    async def run_once(self) -> int:
+        """Run ONE comparison per enabled chain that has candidates.
 
+        A single uniform draw over the whole corpus would starve minority chains
+        (the order book is ~99% one chain), so we draw independently PER CHAIN —
+        every enabled chain advances each cycle regardless of its share of the
+        corpus. Returns the number of rows written this cycle.
+        """
+        orders = await asyncio.to_thread(self._app_store.list_orders)
+        by_chain: dict[int, list[dict[str, Any]]] = {}
+        for order in orders:
+            if self._is_candidate(order):
+                by_chain.setdefault(int(order["chain_id"]), []).append(order)
+        if not by_chain:
+            return 0
+
+        written = 0
+        # Iterate the configured chains (stable order); one random draw within each.
+        for chain_id in self._cfg.supported_chain_ids:
+            pool = by_chain.get(chain_id)
+            if not pool:
+                continue
+            order = self._rng.choice(pool)
+            try:
+                if await self._run_one_comparison(order):
+                    written += 1
+            except Exception as exc:  # noqa: BLE001 — one chain must not kill the rest
+                logger.exception(
+                    "dex-compare comparison error (chain %s): %s", chain_id, exc,
+                )
+
+        # Occasional prune (~1/50 cycles) — keeps growth bounded off the hot path.
+        if written and self._rng.random() < 0.02:
+            cutoff = time.time() - self._cfg.retain_days * 86400
+            deleted = await asyncio.to_thread(
+                self._store.prune, cutoff, self._cfg.max_rows,
+            )
+            if deleted:
+                logger.info("dex-compare pruned %d old rows", deleted)
+        return written
+
+    async def _run_one_comparison(self, order: dict[str, Any]) -> bool:
+        """Quote Minotaur + all aggregators for one order and persist a row.
+
+        Returns True if a row was written; False when the order can't be resolved
+        or the solver is warming up (503).
+        """
         trade = await resolve_trade_tokens(order, self._decimals)
         if trade is None:
             return False
@@ -97,7 +138,7 @@ class DexCompareWorker:
         assert self._session is not None
         mino = await fetch_minotaur_quote(self._session, self._cfg, trade)
         if mino.status == STATUS_WARMING_UP:
-            logger.info("dex-compare: solver warming up (503) — skipping cycle")
+            logger.info("dex-compare: solver warming up (503) — skipping")
             return False
 
         agg_outcomes = await self._fan_out(trade)
@@ -121,24 +162,9 @@ class DexCompareWorker:
             trade.chain_id,
             mino.status,
         )
-
-        # Occasional prune (~1/50 cycles) — keeps growth bounded off the hot path.
-        if self._rng.random() < 0.02:
-            cutoff = time.time() - self._cfg.retain_days * 86400
-            deleted = await asyncio.to_thread(
-                self._store.prune, cutoff, self._cfg.max_rows,
-            )
-            if deleted:
-                logger.info("dex-compare pruned %d old rows", deleted)
         return True
 
     # ── helpers ──────────────────────────────────────────────────────────
-    async def _pick_order(self) -> dict[str, Any] | None:
-        orders = await asyncio.to_thread(self._app_store.list_orders)
-        candidates = [o for o in orders if self._is_candidate(o)]
-        if not candidates:
-            return None
-        return self._rng.choice(candidates)
 
     def _is_candidate(self, order: dict[str, Any]) -> bool:
         if str(order.get("status", "")).lower() not in TERMINAL_STATUSES:
