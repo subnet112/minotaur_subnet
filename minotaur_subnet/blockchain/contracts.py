@@ -280,7 +280,11 @@ def _plan_to_solidity(plan: ExecutionPlan) -> tuple:
     interactions = []
     for ix in plan.interactions:
         interactions.append((
-            Web3.to_checksum_address(ix.target),
+            # Lowercase before checksumming: solver plan targets can arrive
+            # mis-cased (valid 20 bytes, wrong EIP-55 checksum), which makes
+            # strict web3 raise "invalid EIP-55 checksum" instead of
+            # normalizing. Mirrors relayer/encoder.py::_safe_checksum.
+            Web3.to_checksum_address(ix.target.lower()),
             int(ix.value),
             bytes.fromhex(ix.call_data[2:]) if ix.call_data.startswith("0x") else bytes.fromhex(ix.call_data),
         ))
