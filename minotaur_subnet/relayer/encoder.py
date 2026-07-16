@@ -35,11 +35,22 @@ def _safe_checksum(addr: str | None, default: str = "0x" + "00" * 20) -> str:
     if not addr:
         return default
     try:
-        return to_checksum_address(addr)
-    except (ValueError, TypeError):
-        # Malformed hex / wrong length — pass through unchanged so the
-        # downstream web3 call raises with its native (more specific)
-        # error rather than us swallowing the bad input.
+        # Lowercase FIRST, then checksum. A mixed-case address whose EIP-55
+        # checksum is WRONG (but whose 20 hex bytes are perfectly valid) makes
+        # web3's strict ``to_checksum_address`` RAISE rather than normalize — it
+        # only auto-normalizes all-lower / all-upper input. Solver-produced plan
+        # targets routinely arrive mis-cased this way. Without the ``.lower()``
+        # this helper caught that raise and returned the bad address UNCHANGED,
+        # so the very submit it exists to protect still failed downstream at
+        # web3's checksum validation (live: 91 orders rejected on chain 8453
+        # with "invalid EIP-55 checksum"). Discarding the bad case bits lets
+        # to_checksum_address recompute the canonical checksum; the address
+        # encodes to the same 20 bytes either way, so no signed hash changes.
+        return to_checksum_address(addr.lower())
+    except (ValueError, TypeError, AttributeError):
+        # Genuinely malformed hex / wrong length — pass through unchanged so the
+        # downstream web3 call raises with its native (more specific) error
+        # rather than us swallowing the bad input.
         return addr
 
 
@@ -158,7 +169,11 @@ def hash_execution_plan(plan: ExecutionPlan) -> str:
     calls = []
     for ix in plan.interactions:
         call_data = bytes.fromhex(ix.call_data.replace("0x", "")) if ix.call_data != "0x" else b""
-        calls.append((ix.target, int(ix.value), call_data))
+        # Mirror encode_execution_plan: normalize the (possibly mis-cased)
+        # solver target so this hash matches the one built from the encoded
+        # plan. Address → 20 bytes is case-agnostic, so this never changes the
+        # resulting hash vs a correctly-cased target.
+        calls.append((_safe_checksum(ix.target), int(ix.value), call_data))
 
     metadata = b""
     if plan.metadata:
