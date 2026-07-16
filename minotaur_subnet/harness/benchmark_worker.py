@@ -40,6 +40,7 @@ from minotaur_subnet.consensus.round_anchor import ForkPinUnavailable
 from minotaur_subnet.harness.orchestrator import (
     BenchmarkConfig,
     BenchmarkResult,
+    RealSimulationUnavailable,
     SolverOrchestrator,
     SolverSession,
     SolverTimeoutError,
@@ -1060,6 +1061,23 @@ class BenchmarkWorker:
                         sub.submission_id, len(results),
                         "SCORED" if valid else "REJECTED (no order delivered value)",
                     )
+                except RealSimulationUnavailable as exc:
+                    # CONFIG failure (proxy chain routing / sim fork wiring),
+                    # not a verdict on the submission — 2026-07-16 soak: a
+                    # worker missing SOLVER_READ_PROXY_CHAINS terminally
+                    # rejected every chain-1 bench on this handler. Leave the
+                    # sub BENCHMARKING for the next pass (the round decision
+                    # deadline bounds a persistent gap); never judge miners on
+                    # operator config.
+                    print(
+                        f"[BENCHMARK] CONFIG failure for {sub.submission_id} — "
+                        f"NOT judging the submission: {exc}", flush=True,
+                    )
+                    logger.error(
+                        "Benchmark config failure for %s (submission left "
+                        "queued for retry): %s", sub.submission_id, exc,
+                    )
+                    continue
                 except Exception as exc:
                     import traceback
                     print(f"[BENCHMARK] Docker benchmark FAILED for {sub.submission_id}: {exc}", flush=True)

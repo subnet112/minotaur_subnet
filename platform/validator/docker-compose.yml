@@ -534,6 +534,12 @@ services:
       # "shares this SQLite app-store with the api"; this line is what makes
       # that true. Same value the api service uses.
       APP_INTENTS_STORE_PATH: "${APP_INTENTS_STORE_PATH:-/data/store.json}"
+      # Chains the block-pin proxy routes for solver reads — MUST match the
+      # api service (fleet-uniform; multichain benching is default-ON). Found
+      # missing in the 2026-07-16 build-gate soak: without it every chain-1
+      # bench in the worker died RealSimulationUnavailable — and terminally
+      # rejected the submission for a CONFIG failure.
+      SOLVER_READ_PROXY_CHAINS: "${SOLVER_READ_PROXY_CHAINS:-8453,1}"
       # Rotation slate width — must MATCH the api's value: the worker's
       # open-round defer branch and queue capping read it directly from env,
       # and a hand-copied env subset is exactly how the app-store line above
