@@ -91,17 +91,19 @@ class _RowCtx:
         self.gas_price = _int(row.get("gas_price_wei"))
         self.native_usd = _float(row.get("native_usd"))
         self.input_amount = _int(row.get("input_amount"))
+        self.notional_usd = _float(row.get("notional_usd"))
+        # median of the sources' OK output amounts — the trade's typical output
+        oks = [
+            _int((self.results.get(s) or {}).get("output_raw"))
+            for s in SOURCES
+            if (self.results.get(s) or {}).get("status") == "ok"
+        ]
+        oks = [o for o in oks if o and o > 0]
+        self.median_output: int | None = statistics.median(oks) if oks else None
         # shared reference rate: output base-units per 1 input-native wei
         self.ref_rate: float | None = None
-        if self.input_is_native and self.input_amount:
-            oks = [
-                _int((self.results.get(s) or {}).get("output_raw"))
-                for s in SOURCES
-                if (self.results.get(s) or {}).get("status") == "ok"
-            ]
-            oks = [o for o in oks if o and o > 0]
-            if oks and self.input_amount > 0:
-                self.ref_rate = statistics.median(oks) / self.input_amount
+        if self.input_is_native and self.input_amount and self.median_output and self.input_amount > 0:
+            self.ref_rate = self.median_output / self.input_amount
 
     def native_to_output(self, native_wei: int | None) -> int | None:
         """Convert a native (ETH) wei amount to output-token base units."""
@@ -111,6 +113,12 @@ class _RowCtx:
             return 0
         if self.output_is_native:
             return native_wei
+        # Notional-based: a normalized trade's USD size + its output amount give the
+        # output token's USD price directly — robust even when Velora fails (which
+        # it does on illiquid Base tokens, the reason Base `net` was empty).
+        if self.notional_usd and self.native_usd and self.median_output and self.notional_usd > 0:
+            # output_usd_per_unit = notional_usd / median_output
+            return int(native_wei * (self.native_usd / 1e18) * self.median_output / self.notional_usd)
         vel = self.results.get("velora") or {}
         v_out = _int(vel.get("output_raw"))
         v_usd = _float(vel.get("output_usd"))
