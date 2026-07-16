@@ -1701,21 +1701,26 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
             per_fill_input = int(req.params.get("input_amount") or req.params.get("amount") or 0)
         except (ValueError, TypeError):
             per_fill_input = 0
-        per_fill_fee = platform_fee_int
         response["perpetual"] = {
             "max_executions": n,
             "cooldown": req.cooldown,
             "per_fill_input_wei": str(per_fill_input),
-            "per_fill_fee_wei": str(per_fill_fee),
             "required_input_allowance_wei": str(per_fill_input * n),
-            "required_fee_allowance_wei": str(per_fill_fee * n),
             "input_token": req.params.get("input_token", ""),
+            # Fee is informational only — see note. No required_fee_allowance:
+            # the fee is app-dependent and usually needs no approval.
+            "per_fill_fee_wei": str(platform_fee_int),
             "fee_token": quote_result.platform_fee_token or "",
             "fee_symbol": quote_result.platform_fee_symbol or "",
             "note": (
-                "Approve at least these amounts to the app contract before signing "
-                "(or attach an EIP-2612 permit). Each fill draws from your wallet; "
-                "running out of balance or allowance terminates the perpetual."
+                "Approve at least required_input_allowance_wei of input_token to "
+                "the app contract (or attach an EIP-2612 permit if the input token "
+                "supports it). Each fill draws from your wallet; running out of "
+                "balance or allowance terminates the perpetual. The platform fee "
+                "is normally deducted from the swap output (no fee-token approval "
+                "needed) and skipped for native input; only a generic app that "
+                "pulls the fee as WETH needs a separate WETH approve() — and WETH "
+                "has no EIP-2612 permit, so that must be a plain on-chain approve."
             ),
         }
 
@@ -1745,9 +1750,11 @@ def prepare_permit(app_id: str, req: PreparePermitRequest) -> dict:
     signs the returned digest and echoes the ``permit_*`` fields back.
 
     Typical flow: POST /apps/{id}/quote with ``perpetual=true`` → read
-    ``perpetual.required_input_allowance_wei`` / ``required_fee_allowance_wei`` →
-    call this once per token with that value → sign ``digest`` → submit the order
-    with the ``permit_*`` params.
+    ``perpetual.required_input_allowance_wei`` → call this for the input token
+    with that value → sign ``digest`` → submit the order with the ``permit_*``
+    params. The platform fee usually needs no approval (deducted from output);
+    only a generic WETH-pulling app needs a WETH approve(), and WETH has no
+    ERC-2612 permit, so this endpoint returns 400 for it.
 
     400 if the token doesn't implement ERC-2612 (approve() on-chain instead).
     """
