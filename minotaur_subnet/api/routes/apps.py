@@ -665,7 +665,14 @@ def deploy_quote(app_id: str, chain_id: int | None = None) -> dict[str, Any]:
 @router.get("/apps/")
 def list_apps(deployer: str = "", status: str = "") -> dict[str, Any]:
     """List all App Intents, optionally filtered by deployer address or status."""
-    result = _tools.list_minotaur_subnet(_store(), deployer if deployer else None)
+    store = _store()
+    result = _tools.list_minotaur_subnet(store, deployer if deployer else None)
+    # Whole-catalog fingerprint (independent of the deployer/status filters below —
+    # followers fetch this endpoint unfiltered): lets each follower detect that its
+    # synced catalog has diverged from the leader's before that drift surfaces as a
+    # benchmark PACK_HASH_MISMATCH. See validator/app_sync.catalog_fingerprint.
+    from minotaur_subnet.validator.app_sync import catalog_fingerprint
+    result["catalog_fingerprint"] = catalog_fingerprint(store)
     if status:
         allowed = {s.strip().lower() for s in status.split(",")}
         result["apps"] = [
@@ -829,6 +836,29 @@ def retire_deployment_route(
         app_auth.params_hash_for(developer_auth.ACTION_RETIRE_DEPLOYMENT, app_id, chain_id),
     )
     return _tools.retire_deployment(_store(), app_id, chain_id)
+
+
+@router.post("/apps/{app_id}/deregister")
+def deregister_app_route(
+    app_id: str,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
+    """Deregister an app — retire EVERY deployment in one owner-signed call.
+
+    The developer-facing "remove my app" path: it removes the app from routing and
+    the benchmark (synthetic set + historical corpus + pack hash) but KEEPS all
+    order rows (deregister, not delete). Recover any V2 WETH float FIRST via
+    .../float/withdraw.
+
+    Auth: admin key OR a wallet signature (action="deregister_app", paramsHash
+    binds app_id only)."""
+    from minotaur_subnet.api.services import app_auth, developer_auth
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_DEREGISTER_APP,
+        app_auth.params_hash_for(developer_auth.ACTION_DEREGISTER_APP, app_id, None),
+    )
+    return _tools.deregister_app(_store(), app_id)
 
 
 class FloatDepositRequest(BaseModel):

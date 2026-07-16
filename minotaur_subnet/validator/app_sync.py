@@ -70,6 +70,38 @@ def _hash_deployment(d: DeploymentResult) -> str:
     return h.hexdigest()
 
 
+def catalog_fingerprint(store: "AppIntentStore") -> str:
+    """Deterministic hash of the whole app catalog (defs + per-chain statuses).
+
+    The leader serves this at ``GET /v1/apps/``; every follower recomputes it from
+    its local store after each sync. A mismatch means the follower's catalog has
+    DIVERGED from the leader — the precursor to a benchmark ``PACK_HASH_MISMATCH``
+    (the apps/deployment statuses feed the pack hash) — and is logged so the drift
+    is diagnosable BEFORE it silently costs a burn round. It commits to each app's
+    identity (``_hash_definition``) and every deployment's ``(chain_id, status)``,
+    so a retirement/deregistration flips it. Fail-open to "" on a store error (an
+    unreadable store must not masquerade as a specific catalog state)."""
+    h = hashlib.sha256()
+    try:
+        apps = sorted(store.list_apps(), key=lambda a: a.app_id)
+    except Exception as exc:
+        logger.warning("catalog_fingerprint: list_apps failed: %s", exc)
+        return ""
+    for app in apps:
+        h.update(app.app_id.encode())
+        h.update(b"|")
+        h.update(_hash_definition(app).encode())
+        h.update(b"|")
+        try:
+            deps = store.get_deployments(app.app_id)
+        except Exception:
+            deps = {}
+        for chain_id in sorted(deps):
+            h.update(f"{chain_id}:{deps[chain_id].status.value}|".encode())
+        h.update(b";")
+    return h.hexdigest()
+
+
 class ValidatorAppCatalogSync:
     """Periodically pulls the leader's app catalog into the local store."""
 
@@ -153,6 +185,9 @@ class ValidatorAppCatalogSync:
                     raise RuntimeError(f"GET {list_url} returned {resp.status}")
                 data = await resp.json()
                 apps_summary = data.get("apps", []) if isinstance(data, dict) else []
+                leader_fingerprint = (
+                    data.get("catalog_fingerprint") if isinstance(data, dict) else None
+                )
 
             apps_updated = 0
             deployments_updated = 0
@@ -190,6 +225,24 @@ class ValidatorAppCatalogSync:
                 "%d absent non-operational app(s) pruned from %s",
                 apps_updated, deployments_updated, pruned, leader_url,
             )
+
+        # Convergence check: recompute our fingerprint and compare to the leader's.
+        # _prune_absent handles app add/delete, but content drift the upsert missed
+        # (e.g. a per-app /status fetch skipped above on a 5xx) leaves a residual
+        # mismatch. That drift is the precursor to a benchmark PACK_HASH_MISMATCH
+        # (app defs + deployment statuses feed the pack hash), so surface it loudly
+        # instead of letting it silently cost a burn round. A transient mismatch
+        # (the leader mutated between the list and our per-app fetches)
+        # self-reconciles next tick.
+        if leader_fingerprint:
+            local_fingerprint = catalog_fingerprint(self.store)
+            if local_fingerprint != leader_fingerprint:
+                logger.warning(
+                    "App catalog DIVERGED from leader %s (local=%s leader=%s); "
+                    "will reconcile next tick — benchmark quorum may miss until then",
+                    leader_url, local_fingerprint[:12], leader_fingerprint[:12],
+                )
+
         return apps_updated, deployments_updated
 
     def _prune_absent(self, leader_ids: set[str]) -> int:
