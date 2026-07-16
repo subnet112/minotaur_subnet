@@ -30,18 +30,6 @@ _NET_NOTE = (
     "<->output rate is derivable are included; CoW is already gas-net."
 )
 
-CAVEATS = [
-    "Minotaur basis is estimated_output_gross (before our platform fee); "
-    "aggregator outputs are their own gross except CoW, which is net-of-gas (gasless).",
-    "1inch and 0x require API keys; when absent they are reported as 'unsupported' "
-    "and excluded from win-rate denominators.",
-    "Quotes are NOT simultaneous (slow loop) and Minotaur simulates a fork while "
-    "aggregators quote live — timing skew applies.",
-    "Net-of-gas uses a single gas-price snapshot and a derived reference rate; "
-    "it is approximate. Minotaur gas includes framework overhead aggregators don't.",
-    "The historical order's own slippage/min-output is ignored — this is a fresh re-quote.",
-]
-
 
 def _int(value: Any) -> int | None:
     if value is None:
@@ -232,5 +220,4 @@ def build_stats_response(rows: list[dict[str, Any]], window_days: int) -> dict[s
         "total_comparisons": len(rows),
         "sources": list(SOURCES),
         "chains": chains,
-        "caveats": CAVEATS,
     }
