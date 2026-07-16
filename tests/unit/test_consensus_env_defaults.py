@@ -79,7 +79,9 @@ def test_follower_resimulate_reads_env_at_decision_time():
 
     Guards against a refactor that caches the value at module load —
     which would silently make toggling the env useless."""
-    src = inspect.getsource(ScoringEngine.verify_and_score_proposal)
+    # The env read lives in the uncached inner evaluation; the public
+    # verify_and_score_proposal is now the replay-guard wrapper around it.
+    src = inspect.getsource(ScoringEngine._verify_and_score_proposal_inner)
     assert "FOLLOWER_PROPOSAL_RESIMULATE" in src, (
         "verify_and_score_proposal must read FOLLOWER_PROPOSAL_RESIMULATE "
         "directly so the runtime toggle works."
