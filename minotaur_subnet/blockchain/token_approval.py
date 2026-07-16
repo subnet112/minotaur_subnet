@@ -94,6 +94,64 @@ def read_balance_and_allowance(
         return None
 
 
+def build_permit_digest(
+    w3: Web3,
+    token: str,
+    owner: str,
+    spender: str,
+    value: int,
+    deadline: int | None = None,
+) -> dict[str, Any] | None:
+    """Assemble the EIP-2612 permit digest a client signs to set an allowance.
+
+    Reads the token's ``DOMAIN_SEPARATOR()`` and ``nonces(owner)`` on-chain and
+    returns the final 32-byte EIP-712 digest (``0x1901`` prefix already applied)
+    plus the fields that compose it, so a frontend can sign the raw digest and
+    echo the ``permit_*`` params back on the order. Pure read — no signing, no tx.
+
+    Returns ``None`` if the token doesn't implement ERC-2612 (the client must
+    fall back to an on-chain ``approve()``).
+    """
+    token_cs = Web3.to_checksum_address(token)
+    owner_cs = Web3.to_checksum_address(owner)
+    spender_cs = Web3.to_checksum_address(spender)
+
+    try:
+        dsr = w3.eth.call({"to": token_cs, "data": "0x" + _DOMAIN_SEPARATOR_SELECTOR.hex()})
+        domain_separator = bytes(dsr)
+        if len(domain_separator) != 32:
+            return None
+    except Exception as exc:
+        logger.debug("Token %s does not support ERC-2612 (DOMAIN_SEPARATOR): %s", token, exc)
+        return None
+
+    try:
+        nonce_calldata = _NONCES_SELECTOR + abi_encode(["address"], [owner_cs])
+        nr = w3.eth.call({"to": token_cs, "data": "0x" + nonce_calldata.hex()})
+        nonce = int.from_bytes(bytes(nr), "big")
+    except Exception as exc:
+        logger.debug("nonces() call failed for %s: %s", token, exc)
+        return None
+
+    if deadline is None or deadline <= 0:
+        deadline = int(time.time()) + _PERMIT_VALIDITY_SECONDS
+
+    struct_hash = keccak(
+        abi_encode(
+            ["bytes32", "address", "address", "uint256", "uint256", "uint256"],
+            [_PERMIT_TYPEHASH, owner_cs, spender_cs, value, nonce, deadline],
+        )
+    )
+    digest = keccak(b"\x19\x01" + domain_separator + struct_hash)
+    return {
+        "digest": "0x" + digest.hex(),
+        "domain_separator": "0x" + domain_separator.hex(),
+        "nonce": nonce,
+        "deadline": deadline,
+        "value": value,
+    }
+
+
 def try_erc2612_permit(
     w3: Web3,
     bridge_url: str,
