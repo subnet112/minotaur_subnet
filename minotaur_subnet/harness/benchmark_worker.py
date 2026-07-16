@@ -670,6 +670,19 @@ class BenchmarkWorker:
             return current
         return None
 
+    def _current_at_epoch(self) -> int | None:
+        """The current round's ``opened_epoch`` (the round-anchored retirement clock),
+        or None when there is no round store / current round.
+
+        Equals ``opened_epoch_from_round_id(current_round.round_id)`` — the value the
+        pack hash and the historical draw derive from round_id — so the synthetic
+        set, the historical set, and the fingerprint all apply a RETIRING cutover on
+        the identical round."""
+        if self._round_store is None:
+            return None
+        cur = self._round_store.get_current_round()
+        return int(cur.opened_epoch) if cur is not None else None
+
     def _recorded_benched_slate(self, round_id: str) -> list[str] | None:
         """The round's RECORDED rotation slate (``RoundState.benched_slate``),
         or ``None`` when unavailable (no round store, round not found, field
@@ -1477,12 +1490,20 @@ class BenchmarkWorker:
             from minotaur_subnet.harness.snapshot import build_synthetic_intents
             return build_synthetic_intents()
 
+        # Round-anchored retirement cutover: a RETIRING deployment stays in the
+        # synthetic set until its stamped effective epoch, then drops — evaluated
+        # against the CURRENT round's opened_epoch (the same value the pack hash and
+        # the historical draw derive from round_id), so all three flip together.
+        at_epoch = self._current_at_epoch()
+
         intents = []
         for app in self._app_store.list_apps():
             for deployment in self._benchmark_deployments_for_app(app.app_id):
                 if deployment is None:
                     continue
-                if not deployment.status.is_operational():
+                if deployment.is_effectively_retired(at_epoch):
+                    continue
+                if not deployment.status.is_benchmark_loadable():
                     continue
                 if (
                     deployment_statuses is not None

@@ -24,6 +24,10 @@ class ServerContext:
     # ── benchmark / solver rounds ────────────────────────────────────────
     benchmark_worker: Any = None
     benchmark_task: Any = None
+
+    # ── dex-compare service (leader only) ────────────────────────────────
+    dex_compare_worker: Any = None
+    dex_compare_task: Any = None
     epoch_manager: Any = None
     solver_round_task: Any = None
     solver_round_metagraph_sync: Any = None

@@ -67,6 +67,45 @@ def _hash_deployment(d: DeploymentResult) -> str:
     h.update(str(d.chain_id).encode())
     h.update(b"|")
     h.update(d.status.value.encode())
+    h.update(b"|")
+    # Folded so a RETIRING deployment's stamped cutover epoch triggers a follower
+    # re-sync (and the fingerprint below reflects it) — without it, followers would
+    # see status=RETIRING but never learn WHEN it takes effect → divergent corpus.
+    h.update(str(d.retire_effective_epoch if d.retire_effective_epoch is not None else "").encode())
+    return h.hexdigest()
+
+
+def catalog_fingerprint(store: "AppIntentStore") -> str:
+    """Deterministic hash of the whole app catalog (defs + per-chain statuses).
+
+    The leader serves this at ``GET /v1/apps/``; every follower recomputes it from
+    its local store after each sync. A mismatch means the follower's catalog has
+    DIVERGED from the leader — the precursor to a benchmark ``PACK_HASH_MISMATCH``
+    (the apps/deployment statuses feed the pack hash) — and is logged so the drift
+    is diagnosable BEFORE it silently costs a burn round. It commits to each app's
+    identity (``_hash_definition``) and every deployment's ``(chain_id, status)``,
+    so a retirement/deregistration flips it. Fail-open to "" on a store error (an
+    unreadable store must not masquerade as a specific catalog state)."""
+    h = hashlib.sha256()
+    try:
+        apps = sorted(store.list_apps(), key=lambda a: a.app_id)
+    except Exception as exc:
+        logger.warning("catalog_fingerprint: list_apps failed: %s", exc)
+        return ""
+    for app in apps:
+        h.update(app.app_id.encode())
+        h.update(b"|")
+        h.update(_hash_definition(app).encode())
+        h.update(b"|")
+        try:
+            deps = store.get_deployments(app.app_id)
+        except Exception:
+            deps = {}
+        for chain_id in sorted(deps):
+            dep = deps[chain_id]
+            ree = dep.retire_effective_epoch
+            h.update(f"{chain_id}:{dep.status.value}:{ree if ree is not None else ''}|".encode())
+        h.update(b";")
     return h.hexdigest()
 
 
@@ -153,6 +192,9 @@ class ValidatorAppCatalogSync:
                     raise RuntimeError(f"GET {list_url} returned {resp.status}")
                 data = await resp.json()
                 apps_summary = data.get("apps", []) if isinstance(data, dict) else []
+                leader_fingerprint = (
+                    data.get("catalog_fingerprint") if isinstance(data, dict) else None
+                )
 
             apps_updated = 0
             deployments_updated = 0
@@ -190,6 +232,24 @@ class ValidatorAppCatalogSync:
                 "%d absent non-operational app(s) pruned from %s",
                 apps_updated, deployments_updated, pruned, leader_url,
             )
+
+        # Convergence check: recompute our fingerprint and compare to the leader's.
+        # _prune_absent handles app add/delete, but content drift the upsert missed
+        # (e.g. a per-app /status fetch skipped above on a 5xx) leaves a residual
+        # mismatch. That drift is the precursor to a benchmark PACK_HASH_MISMATCH
+        # (app defs + deployment statuses feed the pack hash), so surface it loudly
+        # instead of letting it silently cost a burn round. A transient mismatch
+        # (the leader mutated between the list and our per-app fetches)
+        # self-reconciles next tick.
+        if leader_fingerprint:
+            local_fingerprint = catalog_fingerprint(self.store)
+            if local_fingerprint != leader_fingerprint:
+                logger.warning(
+                    "App catalog DIVERGED from leader %s (local=%s leader=%s); "
+                    "will reconcile next tick — benchmark quorum may miss until then",
+                    leader_url, local_fingerprint[:12], leader_fingerprint[:12],
+                )
+
         return apps_updated, deployments_updated
 
     def _prune_absent(self, leader_ids: set[str]) -> int:
@@ -280,12 +340,14 @@ class ValidatorAppCatalogSync:
                 chain_id = int(chain_id_str)
             except (TypeError, ValueError):
                 continue
+            _ree = dep_dict.get("retire_effective_epoch")
             new_dep = DeploymentResult(
                 app_id=new_def.app_id,
                 status=_app_status_from_str(dep_dict.get("status", "draft")),
                 contract_address=dep_dict.get("contract_address"),
                 chain_id=chain_id,
                 abi=primary_abi,
+                retire_effective_epoch=int(_ree) if _ree is not None else None,
             )
             existing_dep = self.store.get_deployment(new_def.app_id, chain_id=chain_id)
             if existing_dep is None or _hash_deployment(existing_dep) != _hash_deployment(new_dep):

@@ -465,6 +465,9 @@ class AppIntentsValidator:
         # health question is "are enough weight-sets succeeding to keep this
         # validator stable?", which only successes answer.
         self._last_successful_emit_state: dict | None = None
+        # First-observed timestamp of a positively-null champion (see
+        # _should_defer_null_champion_burn); None while a champion resolves.
+        self._null_champion_since: float | None = None
         self._last_successful_emit_state_path = os.environ.get(
             "LAST_SUCCESSFUL_EMIT_STATE_PATH", "/data/last_successful_emit.json",
         )
@@ -1313,6 +1316,56 @@ class AppIntentsValidator:
         self._champion_source = src  # 'api' | 'memo' | 'none' — surfaced on /health
         return hotkey
 
+    def _should_defer_null_champion_burn(self, now: float) -> bool:
+        """True while a positively-null champion (source == "api") should be
+        debounced instead of burned.
+
+        Defers only when BOTH hold:
+        - the persisted last SUCCESSFUL emit was champion-sourced and recent
+          (within ``NULL_CHAMPION_MEMORY_SECONDS``, default 7200 ≈ 2 tempos) —
+          i.e. a champion demonstrably existed just now, so an api null is more
+          likely a handover/boot window than a real vacancy (this survives a
+          validator restart, unlike the resolver's in-memory memo);
+        - the null has persisted less than ``NULL_CHAMPION_BURN_GRACE_SECONDS``
+          (default 600) since first observed.
+
+        After the grace window the burn proceeds as designed — a genuinely
+        dethroned-to-nothing subnet must still burn, just never on a
+        few-seconds-wide race. Genesis nodes (no champion-sourced emit on
+        record) burn immediately, exactly as today."""
+        try:
+            grace = float(os.environ.get(
+                "NULL_CHAMPION_BURN_GRACE_SECONDS", "600").strip() or 600)
+            memory = float(os.environ.get(
+                "NULL_CHAMPION_MEMORY_SECONDS", "7200").strip() or 7200)
+        except ValueError:
+            grace, memory = 600.0, 7200.0
+        if grace <= 0:
+            return False
+        last = self._last_successful_emit_state or {}
+        champion_recent = (
+            last.get("source") == "champion"
+            and (now - float(last.get("attempted_at") or 0)) < memory
+        )
+        if not champion_recent:
+            self._null_champion_since = None
+            return False
+        if self._null_champion_since is None:
+            self._null_champion_since = now
+            logger.warning(
+                "Champion fetch returned null from the api while our last "
+                "successful emit was champion-sourced — deferring any burn for "
+                "up to %.0fs (handover/boot race guard)", grace,
+            )
+            return True
+        if now - self._null_champion_since < grace:
+            return True
+        logger.warning(
+            "Champion still null after %.0fs grace — proceeding with the burn "
+            "(treating the vacancy as real)", now - self._null_champion_since,
+        )
+        return False
+
     async def _epoch_loop(self) -> None:
         """Periodically emit weights — single source of chain set_weights calls.
 
@@ -1401,7 +1454,23 @@ class AppIntentsValidator:
             # outages" safety without holding any champion state. See
             # docs/architecture/state-consolidation.md.
             self._champion_miner_id = await self._local_champion_hotkey()
+            if self._champion_miner_id is not None:
+                self._null_champion_since = None
             if self._champion_miner_id is None and self._champion_source != "api":
+                continue
+            # Positively-null debounce: src == "api" with champion=None can be a
+            # REAL no-champion state (genesis, deregistered champion) — but it is
+            # also what the api serves for a few seconds during a champion
+            # HANDOVER and during its own boot hydration. Live 2026-07-16: the
+            # validator ticked exactly inside the scandinavia-solver-1 activation
+            # window, took the null at face value, and committed a 100% owner
+            # burn for the tempo — only a manual same-tempo re-commit saved the
+            # new champion's first earnings. When our own PERSISTED last
+            # successful emit was champion-sourced and recent, a fresh null must
+            # prove itself by persisting through a grace window before we burn.
+            if self._champion_miner_id is None and self._should_defer_null_champion_burn(
+                time.time()
+            ):
                 continue
             # Tempo mode: the gate already decided the timing — bypass the
             # wall-clock check so it can't veto the boundary commit. Legacy
