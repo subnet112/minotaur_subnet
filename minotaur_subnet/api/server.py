@@ -44,6 +44,7 @@ from minotaur_subnet.api.routes import (
     orders,
     native_bittensor,
     identity,
+    dex_compare,
 )
 from minotaur_subnet.store import AppIntentStore
 
@@ -458,6 +459,7 @@ app.include_router(monitoring.router, prefix="/v1")
 app.include_router(submissions.router, prefix="/v1")
 app.include_router(orders.router, prefix="/v1")
 app.include_router(native_bittensor.router, prefix="/v1")
+app.include_router(dex_compare.router, prefix="/v1")
 
 # Local-testnet routes: Anvil faucet, direct subtensor stake, arbitrary-Python
 # strategy replay. Off by default; opt-in via LOCAL_TESTNET=1. The local

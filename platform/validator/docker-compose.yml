@@ -574,7 +574,11 @@ services:
       # Follower role — these are LEADER-ONLY responsibilities:
       ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # Leader manages round lifecycle
       ENABLE_BENCHMARK_WORKER: "0"          # Proactive bench is leader-only
+      ENABLE_DEX_COMPARE: "0"               # DEX-aggregator comparison is leader-only
       SUBMISSIONS_ACCEPTING: "0"            # Users send submissions to the leader
+      # Optional DEX-compare aggregator keys (leader only; CoW + Velora are keyless):
+      ONEINCH_API_KEY: "${ONEINCH_API_KEY:-}"
+      ZEROX_API_KEY: "${ZEROX_API_KEY:-}"
 
       # Reactive benchmark (runs when a champion proposal arrives) DOES
       # still happen on followers — that's the peer integrity check. The

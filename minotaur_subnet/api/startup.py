@@ -836,11 +836,25 @@ def _build_solver_round_benchmark_pack_hash(
     from minotaur_subnet.harness.benchmark_pack import (
         compute_pack_hash,
         collect_synthetic_scenarios,
+        deregistered_app_ids,
     )
     from minotaur_subnet.harness.order_sampler import sample_historical_orders
+    from minotaur_subnet.harness.round_store import opened_epoch_from_round_id
 
     submission_store = submissions.get_store()
     round_subs = submission_store.list_by_round(round_id)
+    # Round-anchored retirement cutover: the round's opened_epoch (parsed from
+    # round_id, fleet-uniform) decides whether a RETIRING app has crossed its
+    # effective epoch. sample_historical_orders derives the SAME at_epoch from
+    # round_id internally, so both hash halves flip on the identical round.
+    _at_epoch = opened_epoch_from_round_id(round_id)
+    # Fully deregistered apps drop out of the fingerprint, together with their
+    # historical orders (dropped by ``sample_historical_orders`` below). So retiring
+    # an app changes the pack hash even if it had no sampled orders, and a fleet
+    # split on the retirement is caught as a hash mismatch rather than silently
+    # scoring divergent corpora. Keyed on effective retirement only, so the promote
+    # itself is byte-identical — only a deliberate retire flips the hash.
+    _deregistered = deregistered_app_ids(ctx.store, _at_epoch)
     apps_payload = [
         {
             "app_id": app.app_id,
@@ -853,6 +867,7 @@ def _build_solver_round_benchmark_pack_hash(
             ),
         }
         for app in sorted(ctx.store.list_apps(), key=lambda item: item.app_id)
+        if app.app_id not in _deregistered
     ]
     # NOTE: submission `status` is deliberately NOT folded into the hash. status
     # is a MUTABLE lifecycle marker (QUEUED→…→BENCHMARKING→SCORED/REJECTED), and
@@ -876,7 +891,7 @@ def _build_solver_round_benchmark_pack_hash(
     ]
     # Canonical hash of scenarios (Stage 1 + Stage 2)
     try:
-        synthetic_scenarios = collect_synthetic_scenarios(ctx.store)
+        synthetic_scenarios = collect_synthetic_scenarios(ctx.store, _at_epoch)
     except Exception as exc:
         logger.warning("pack_hash: synthetic scenario collection failed: %s", exc)
         synthetic_scenarios = []
@@ -1463,6 +1478,39 @@ async def initialize(ctx: ServerContext) -> dict:
             set_benchmark_worker(ctx.benchmark_worker)
         except Exception:
             pass
+
+    # ── dex-compare service (leader only) ────────────────────────────────
+    # A slow background loop that replays historical orders through /quote and
+    # the external DEX aggregators, persisting per-chain comparison stats.
+    # Leader-only via ENABLE_DEX_COMPARE (default OFF), mirroring the benchmark
+    # worker's gating — a stray follower never starts hitting external APIs.
+    if _env_true("ENABLE_DEX_COMPARE", default=False):
+        try:
+            from minotaur_subnet.dex_compare import (
+                DexCompareStore,
+                DexCompareWorker,
+                load_config,
+            )
+            from minotaur_subnet.api.routes import dex_compare as dex_compare_routes
+
+            _dex_cfg = load_config()
+            _dex_store = DexCompareStore(_dex_cfg.store_path)
+            ctx.dex_compare_worker = DexCompareWorker(
+                app_store=ctx.store,
+                store=_dex_store,
+                config=_dex_cfg,
+            )
+            dex_compare_routes.set_store(_dex_store)
+            ctx.dex_compare_task = asyncio.create_task(
+                ctx.dex_compare_worker.run_loop(),
+            )
+            logger.info(
+                "DEX-compare worker started (store=%s, chains=%s)",
+                _dex_cfg.store_path,
+                list(_dex_cfg.supported_chain_ids),
+            )
+        except Exception:  # noqa: BLE001 — never block API startup on this
+            logger.exception("Failed to start DEX-compare worker (continuing without it)")
 
     # ── relayer ──────────────────────────────────────────────────────────
     # Two modes, picked by env:
@@ -3912,6 +3960,15 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Benchmark worker stopped")
+    if ctx.dex_compare_worker is not None:
+        ctx.dex_compare_worker.stop()
+    if ctx.dex_compare_task is not None:
+        ctx.dex_compare_task.cancel()
+        try:
+            await ctx.dex_compare_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("DEX-compare worker stopped")
     if ctx.round_anchor_task is not None:
         ctx.round_anchor_task.cancel()
         try:

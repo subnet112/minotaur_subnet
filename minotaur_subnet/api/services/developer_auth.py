@@ -64,6 +64,11 @@ ACTION_CREATE_APP: Final[str] = "create_app"
 # real funds / redirect fees on any unauthenticated caller's word.
 ACTION_UPDATE_SOLIDITY: Final[str] = "update_solidity"
 ACTION_RETIRE_DEPLOYMENT: Final[str] = "retire_deployment"
+# App-level deregistration: retires EVERY deployment in one owner-signed call
+# (params bind app_id only, chain_id=None). Deregister-not-delete — order rows
+# are kept; a retired app just leaves the benchmark corpus + pack hash. See
+# app_lifecycle.deregister_app and order_sampler.retired_app_chain_keys.
+ACTION_DEREGISTER_APP: Final[str] = "deregister_app"
 ACTION_FLOAT_DEPOSIT: Final[str] = "float_deposit"
 ACTION_FLOAT_WITHDRAW: Final[str] = "float_withdraw"
 ACTION_SET_CONFIG: Final[str] = "set_app_config"

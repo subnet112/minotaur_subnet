@@ -58,6 +58,17 @@ def _make_stub(*, gate_decision, queued=None, queued_source=None,
     self_stub._do_emit = AppIntentsValidator._do_emit.__get__(
         self_stub, AppIntentsValidator,
     )
+
+    # Bind the real null-champion debounce (a MagicMock here returns truthy and
+    # silently skips every burn) with no champion history — keeps the stubs'
+    # definitive-no-champion burn semantics.
+    self_stub._last_successful_emit_state = None
+    self_stub._null_champion_since = None
+    self_stub._should_defer_null_champion_burn = (
+        AppIntentsValidator._should_defer_null_champion_burn.__get__(
+            self_stub, AppIntentsValidator,
+        )
+    )
     return self_stub
 
 

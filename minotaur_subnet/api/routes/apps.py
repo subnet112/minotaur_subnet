@@ -665,7 +665,14 @@ def deploy_quote(app_id: str, chain_id: int | None = None) -> dict[str, Any]:
 @router.get("/apps/")
 def list_apps(deployer: str = "", status: str = "") -> dict[str, Any]:
     """List all App Intents, optionally filtered by deployer address or status."""
-    result = _tools.list_minotaur_subnet(_store(), deployer if deployer else None)
+    store = _store()
+    result = _tools.list_minotaur_subnet(store, deployer if deployer else None)
+    # Whole-catalog fingerprint (independent of the deployer/status filters below —
+    # followers fetch this endpoint unfiltered): lets each follower detect that its
+    # synced catalog has diverged from the leader's before that drift surfaces as a
+    # benchmark PACK_HASH_MISMATCH. See validator/app_sync.catalog_fingerprint.
+    from minotaur_subnet.validator.app_sync import catalog_fingerprint
+    result["catalog_fingerprint"] = catalog_fingerprint(store)
     if status:
         allowed = {s.strip().lower() for s in status.split(",")}
         result["apps"] = [
@@ -829,6 +836,34 @@ def retire_deployment_route(
         app_auth.params_hash_for(developer_auth.ACTION_RETIRE_DEPLOYMENT, app_id, chain_id),
     )
     return _tools.retire_deployment(_store(), app_id, chain_id)
+
+
+@router.post("/apps/{app_id}/deregister")
+def deregister_app_route(
+    app_id: str,
+    ctx: _AppAuthCtx = Depends(_app_auth_ctx),
+) -> dict[str, Any]:
+    """Deregister an app — schedule EVERY deployment to retire, in one owner-signed call.
+
+    The developer-facing "remove my app" path: the app stops taking new orders
+    immediately and, ~1 tempo later (a round-anchored cutover, so the whole fleet
+    flips together without breaking consensus), leaves the benchmark — synthetic
+    set + historical corpus + pack hash — while KEEPING all order rows (deregister,
+    not delete). Recover any WETH float FIRST via .../float/withdraw.
+
+    Auth: admin key OR a wallet signature (action="deregister_app", paramsHash
+    binds app_id only)."""
+    from minotaur_subnet.api.services import app_auth, developer_auth
+    from minotaur_subnet.api.routes.submissions import get_round_store
+
+    _authorize_or_403(
+        ctx, app_id, developer_auth.ACTION_DEREGISTER_APP,
+        app_auth.params_hash_for(developer_auth.ACTION_DEREGISTER_APP, app_id, None),
+    )
+    # Anchor the cutover to the current round's opened_epoch (fleet-uniform).
+    current = get_round_store().get_current_round()
+    current_epoch = int(current.opened_epoch) if current is not None else None
+    return _tools.deregister_app(_store(), app_id, current_epoch=current_epoch)
 
 
 class FloatDepositRequest(BaseModel):
