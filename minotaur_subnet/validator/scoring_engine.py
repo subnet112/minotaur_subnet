@@ -37,10 +37,19 @@ logger = logging.getLogger("minotaur_subnet.validator.scoring_engine")
 
 
 # ── Replay-protection cache for /consensus/proposal (audit H1) ──────────
-# (order_id, plan_hash) -> first_seen_monotonic. Captured proposals can
-# otherwise be replayed at the follower indefinitely; this short-circuits
-# expensive re-simulation when we've already processed the same payload.
-_SEEN_PROPOSALS: dict[tuple[str, str], float] = {}
+# (order_id, plan_hash) -> (first_seen_monotonic, cached verdict dict or
+# None while the first evaluation is still in flight). Captured proposals
+# can otherwise be replayed at the follower indefinitely; this
+# short-circuits expensive re-simulation when we've already processed the
+# same payload. Duplicates RE-SERVE the cached verdict instead of
+# rejecting: the leader legitimately re-proposes the same (order_id,
+# plan_hash) when a consensus round fails transiently (2026-07-16 peer
+# flap) and the champion regenerates a byte-identical plan — a reject
+# here would permanently defeat that retry. Re-serving is safe: the
+# approval the route derives from it is a deterministic EIP-712 signature
+# over (orderId, planHash, score), so a replayed request yields nothing
+# an attacker didn't already have.
+_SEEN_PROPOSALS: dict[tuple[str, str], tuple[float, dict | None]] = {}
 _SEEN_PROPOSALS_TTL = 600.0       # 10 minutes
 _SEEN_PROPOSALS_MAX = 10_000      # evict oldest entries above this cap
 _SEEN_PROPOSALS_LOCK = asyncio.Lock()
@@ -52,7 +61,7 @@ def _evict_expired_locked(now: float) -> None:
         # cheap path: only walk when the cache is over capacity
         return
     cutoff = now - _SEEN_PROPOSALS_TTL
-    stale = [k for k, ts in _SEEN_PROPOSALS.items() if ts < cutoff]
+    stale = [k for k, entry in _SEEN_PROPOSALS.items() if entry[0] < cutoff]
     for k in stale:
         _SEEN_PROPOSALS.pop(k, None)
     # If still oversized, drop arbitrary entries (LRU-ish via dict order).
@@ -319,7 +328,18 @@ class ScoringEngine:
         body: dict,
         score_threshold: float,
     ) -> dict:
-        """Core proposal verification and scoring logic.
+        """Replay-guard wrapper around ``_verify_and_score_proposal_inner``.
+
+        Idempotent per (order_id, plan_hash): the first request runs the
+        full (expensive, re-simulating) evaluation and caches the verdict;
+        duplicates within the TTL re-serve the cached verdict (marked
+        ``"replayed": True``) — the leader legitimately re-proposes the
+        same pair when a consensus round fails transiently and the
+        deterministic champion regenerates an identical plan. A duplicate
+        arriving while the first evaluation is STILL RUNNING is rejected
+        429 ``duplicate_proposal`` (concurrent duplicates are the abuse
+        shape the guard originally targeted). An evaluation that raises
+        clears its in-flight marker so a retry isn't blocked for the TTL.
 
         Returns a dict with:
         - approved: bool
@@ -329,6 +349,71 @@ class ScoringEngine:
         - simulation: SimulationResult | None
         - contract_address: str | None (resolved for the app/chain)
         """
+        from minotaur_subnet.consensus.dissent import RejectionCode
+
+        order_id = body.get("order_id", "")
+        plan_hash = body.get("plan_hash", "")
+        if not order_id or not plan_hash:
+            return {
+                "approved": False,
+                "reason": "order_id and plan_hash required",
+                "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
+                "status": 400,
+            }
+
+        dedup_key = (order_id, plan_hash)
+        async with _SEEN_PROPOSALS_LOCK:
+            now_mono = time.monotonic()
+            entry = _SEEN_PROPOSALS.get(dedup_key)
+            if entry is not None and (now_mono - entry[0]) < _SEEN_PROPOSALS_TTL:
+                seen_at, cached = entry
+                if cached is not None:
+                    logger.info(
+                        "Replay short-circuit for %s/%s (age=%.1fs) — "
+                        "re-serving cached verdict",
+                        order_id[:10], plan_hash[:10], now_mono - seen_at,
+                    )
+                    # Copy: the route handler pops "status" off rejections.
+                    out = dict(cached)
+                    out["replayed"] = True
+                    return out
+                logger.info(
+                    "Concurrent duplicate proposal for %s/%s (first still "
+                    "in flight) — rejecting",
+                    order_id[:10], plan_hash[:10],
+                )
+                return {
+                    "approved": False,
+                    "reason": "duplicate_proposal",
+                    "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
+                    "status": 429,
+                }
+            # First-seen — mark in flight and evaluate outside the lock.
+            _SEEN_PROPOSALS[dedup_key] = (now_mono, None)
+            _evict_expired_locked(now_mono)
+
+        try:
+            result = await self._verify_and_score_proposal_inner(
+                body, score_threshold,
+            )
+        except BaseException:
+            # Don't leave the in-flight marker poisoning retries for the
+            # whole TTL (same reserve-then-crash bug class as PR #801).
+            async with _SEEN_PROPOSALS_LOCK:
+                _SEEN_PROPOSALS.pop(dedup_key, None)
+            raise
+
+        async with _SEEN_PROPOSALS_LOCK:
+            # Copy: the route handler mutates the served dict.
+            _SEEN_PROPOSALS[dedup_key] = (time.monotonic(), dict(result))
+        return result
+
+    async def _verify_and_score_proposal_inner(
+        self,
+        body: dict,
+        score_threshold: float,
+    ) -> dict:
+        """Core proposal verification and scoring logic (uncached)."""
         order_id = body.get("order_id", "")
         plan_hash = body.get("plan_hash", "")
         score = body.get("score", 0.0)
@@ -353,37 +438,9 @@ class ScoringEngine:
 
         from minotaur_subnet.consensus.dissent import RejectionCode
 
-        if not order_id or not plan_hash:
-            return {
-                "approved": False,
-                "reason": "order_id and plan_hash required",
-                "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
-                "status": 400,
-            }
-
-        # Audit H1 (replay): short-circuit if we've already validated this
-        # exact proposal. Re-simulation is the expensive step; we only need
-        # to do it once per (order_id, plan_hash). The cached entry holds a
-        # monotonic timestamp so eviction can age it out.
-        dedup_key = (order_id, plan_hash)
-        async with _SEEN_PROPOSALS_LOCK:
-            now_mono = time.monotonic()
-            seen_at = _SEEN_PROPOSALS.get(dedup_key)
-            if seen_at is not None and (now_mono - seen_at) < _SEEN_PROPOSALS_TTL:
-                logger.info(
-                    "Replay short-circuit for %s/%s (age=%.1fs)",
-                    order_id[:10], plan_hash[:10], now_mono - seen_at,
-                )
-                return {
-                    "approved": False,
-                    "reason": "duplicate_proposal",
-                    "reason_code": RejectionCode.MALFORMED_PAYLOAD.value,
-                    "status": 429,
-                }
-            # First-seen — record and continue. Eviction happens
-            # opportunistically when the cache grows over the cap.
-            _SEEN_PROPOSALS[dedup_key] = now_mono
-            _evict_expired_locked(now_mono)
+        # Replay/duplicate handling lives in the verify_and_score_proposal
+        # wrapper (idempotent cache); order_id/plan_hash presence was
+        # validated there too.
 
         # Off-chain mirror of the on-chain AppRegistry gate. A compromised
         # leader could propose plans for unregistered apps; a follower that
