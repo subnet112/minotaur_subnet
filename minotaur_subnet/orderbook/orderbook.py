@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from minotaur_subnet.orderbook.rejection import classify_rejection
+
 
 class OrderStatus(str, Enum):
     """Lifecycle status of an order in the book."""
@@ -92,6 +94,10 @@ class Order:
             "score": self.score,
             "tx_hash": self.tx_hash,
             "error": self.error,
+            # Structured, stable classification of a terminal failure so
+            # consumers (frontend success-rate, dashboards) filter on this
+            # instead of string-matching ``error``. None for non-failure states.
+            "rejection_class": classify_rejection(self.status.value, self.error),
             "block_number": self.block_number,
             "consensus_result": self.consensus_result,
             "user_signature": self.user_signature,

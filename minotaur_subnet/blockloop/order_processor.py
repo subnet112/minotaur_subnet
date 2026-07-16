@@ -50,61 +50,17 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-# Revert signatures of a USER-side signature fault at settlement (#229). When
-# executeIntent reverts on one of these, the user's order signature was invalid —
-# the plan still passed JS scoring, on-chain sim scoring, and the validator quorum
-# (scoreIntent never verifies the user sig). So this is NOT the solver's fault and
-# the blameless miner must NOT be debited (record_execution success=False). Covers
-# the OpenZeppelin ECDSA errors and the EIP712Verifier/AppIntentBase revert string.
-_USER_SIG_FAULT_MARKERS = (
-    "0xf645eedf",              # ECDSAInvalidSignature (confirmed in prod, #229)
-    "0xfce698f7",              # ECDSAInvalidSignatureLength
-    "0xd78bce0c",              # ECDSAInvalidSignatureS
-    "invalid user signature",  # AppIntentBase revert string (post-#229 contract)
-    "ecdsainvalidsignature",   # error name (defensive, if surfaced by name)
+# USER-fault settlement-revert attribution (#229) lives in one place —
+# ``orderbook.rejection`` — so the accounting the block loop applies here and the
+# ``rejection_class`` the API exposes can never drift apart. Re-exported under the
+# module-private names this file (and its tests) have always used.
+from minotaur_subnet.orderbook.rejection import (  # noqa: E402
+    USER_FUNDS_FAULT_MARKERS as _USER_FUNDS_FAULT_MARKERS,
+    USER_SIG_FAULT_MARKERS as _USER_SIG_FAULT_MARKERS,
+    is_user_fault as _is_user_fault,
+    is_user_fund_fault as _is_user_fund_fault,
+    is_user_signature_fault as _is_user_signature_fault,
 )
-
-
-def _is_user_signature_fault(error: str | None) -> bool:
-    """True if a settlement revert is a USER signature fault, not a solver fault (#229)."""
-    if not error:
-        return False
-    e = error.lower()
-    return any(m in e for m in _USER_SIG_FAULT_MARKERS)
-
-
-# Revert signatures of a USER-side FUNDS fault at settlement: the user does not
-# actually hold (or has not approved) the input token, so executeIntent's
-# safeTransferFrom(user, proxy, amount) — or the wTAO fee pull — reverts. Like a
-# signature fault this is NOT the solver's fault: the SCORING FORK FABRICATES the
-# user's balance (blockloop/simulation deals the declared amount + max allowance),
-# so a balance-less / impossible order still passes JS + on-chain sim scoring +
-# quorum. Without this, an attacker spamming impossible orders would debit the
-# blameless champion's solver stats. Covers the OpenZeppelin v4 ERC20/SafeERC20
-# revert strings and the v5 custom error names.
-_USER_FUNDS_FAULT_MARKERS = (
-    "transfer amount exceeds balance",     # OZ v4 ERC20 (input-token transferFrom)
-    "transfer amount exceeds allowance",   # OZ v4 ERC20 (no/insufficient approval)
-    "erc20: insufficient allowance",       # OZ v4 ERC20
-    "erc20insufficientbalance",            # OZ v5 custom error
-    "erc20insufficientallowance",          # OZ v5 custom error
-)
-
-
-def _is_user_fund_fault(error: str | None) -> bool:
-    """True if a settlement revert is the USER failing to hold/approve the input
-    token (or fee) — not a solver fault. Blameless to the miner (#229)."""
-    if not error:
-        return False
-    e = error.lower()
-    return any(m in e for m in _USER_FUNDS_FAULT_MARKERS)
-
-
-def _is_user_fault(error: str | None) -> bool:
-    """True if a settlement revert is attributable to the USER (bad signature OR
-    insufficient input-token balance/allowance) rather than the solver. The
-    blameless miner is not debited for either (#229)."""
-    return _is_user_signature_fault(error) or _is_user_fund_fault(error)
 
 
 class OrderProcessor:
