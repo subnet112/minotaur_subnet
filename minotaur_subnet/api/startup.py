@@ -1464,6 +1464,39 @@ async def initialize(ctx: ServerContext) -> dict:
         except Exception:
             pass
 
+    # ── dex-compare service (leader only) ────────────────────────────────
+    # A slow background loop that replays historical orders through /quote and
+    # the external DEX aggregators, persisting per-chain comparison stats.
+    # Leader-only via ENABLE_DEX_COMPARE (default OFF), mirroring the benchmark
+    # worker's gating — a stray follower never starts hitting external APIs.
+    if _env_true("ENABLE_DEX_COMPARE", default=False):
+        try:
+            from minotaur_subnet.dex_compare import (
+                DexCompareStore,
+                DexCompareWorker,
+                load_config,
+            )
+            from minotaur_subnet.api.routes import dex_compare as dex_compare_routes
+
+            _dex_cfg = load_config()
+            _dex_store = DexCompareStore(_dex_cfg.store_path)
+            ctx.dex_compare_worker = DexCompareWorker(
+                app_store=ctx.store,
+                store=_dex_store,
+                config=_dex_cfg,
+            )
+            dex_compare_routes.set_store(_dex_store)
+            ctx.dex_compare_task = asyncio.create_task(
+                ctx.dex_compare_worker.run_loop(),
+            )
+            logger.info(
+                "DEX-compare worker started (store=%s, chains=%s)",
+                _dex_cfg.store_path,
+                list(_dex_cfg.supported_chain_ids),
+            )
+        except Exception:  # noqa: BLE001 — never block API startup on this
+            logger.exception("Failed to start DEX-compare worker (continuing without it)")
+
     # ── relayer ──────────────────────────────────────────────────────────
     # Two modes, picked by env:
     #
@@ -3912,6 +3945,15 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Benchmark worker stopped")
+    if ctx.dex_compare_worker is not None:
+        ctx.dex_compare_worker.stop()
+    if ctx.dex_compare_task is not None:
+        ctx.dex_compare_task.cancel()
+        try:
+            await ctx.dex_compare_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("DEX-compare worker stopped")
     if ctx.round_anchor_task is not None:
         ctx.round_anchor_task.cancel()
         try:
