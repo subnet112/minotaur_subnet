@@ -19,14 +19,26 @@ import aiohttp
 
 from minotaur_subnet.blockchain.chains import get_web3
 
+from dataclasses import replace
+
+from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
+
 from .aggregators import build_aggregators
 from .config import DexCompareConfig
 from .minotaur_client import fetch_minotaur_quote
-from .models import STATUS_WARMING_UP, ComparisonRow, TERMINAL_STATUSES
+from .models import STATUS_WARMING_UP, ComparisonRow, TERMINAL_STATUSES, TradeDescriptor
 from .store import DexCompareStore
 from .tokens_resolve import DecimalsCache, resolve_trade_tokens
 
 logger = logging.getLogger(__name__)
+
+# USDC per chain — the stable used to price the native token for gas/fee conversion.
+_USDC = {
+    1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    42161: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    10: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+}
 
 
 class DexCompareWorker:
@@ -42,10 +54,15 @@ class DexCompareWorker:
         self._running = False
         self._decimals = DecimalsCache()
         self._aggregators = build_aggregators(config)
+        self._velora = next((a for a in self._aggregators if a.name == "velora"), None)
         # Non-deterministic on purpose — unlike the consensus-seeded corpus in
         # order_sampler.py, we want independent random draws here.
         self._rng = random.Random()
         self._session: aiohttp.ClientSession | None = None
+        # (chain, token) -> (usd_per_base_unit, monotonic_ts) — for size normalization.
+        self._price_cache: dict[tuple[int, str], tuple[float, float]] = {}
+        # chain -> (native_usd, monotonic_ts) — ETH/native price for gas/fee conversion.
+        self._native_cache: dict[int, tuple[float, float]] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def run_loop(self, interval: float | None = None) -> None:
@@ -136,6 +153,11 @@ class DexCompareWorker:
             return False
 
         assert self._session is not None
+        # Rescale the (typically dust-sized) historical order to a realistic USD
+        # notional so gas/fees don't dominate the comparison.
+        if self._cfg.normalize_size:
+            trade = await self._normalize(trade)
+
         mino = await fetch_minotaur_quote(self._session, self._cfg, trade)
         if mino.status == STATUS_WARMING_UP:
             logger.info("dex-compare: solver warming up (503) — skipping")
@@ -143,6 +165,7 @@ class DexCompareWorker:
 
         agg_outcomes = await self._fan_out(trade)
         gas_price = await self._snapshot_gas_price(trade.chain_id)
+        native_usd = await self._native_usd(trade.chain_id)
 
         outcomes = {"minotaur": mino}
         for outcome in agg_outcomes:
@@ -153,6 +176,7 @@ class DexCompareWorker:
             trade=trade,
             gas_price_wei=gas_price,
             outcomes=outcomes,
+            native_usd=native_usd,
         )
         await asyncio.to_thread(self._store.insert, row)
         logger.debug(
@@ -163,6 +187,73 @@ class DexCompareWorker:
             mino.status,
         )
         return True
+
+    # ── size normalization ───────────────────────────────────────────────
+    async def _normalize(self, trade: TradeDescriptor) -> TradeDescriptor:
+        """Rescale the input to ~target_usd. Returns the trade unchanged (with
+        notional_usd left None) when the input token can't be priced."""
+        upbu = await self._input_price(trade)   # USD per input base-unit
+        if not upbu or upbu <= 0:
+            return trade
+        scaled = int(self._cfg.target_usd / upbu)
+        if scaled <= 0:
+            return trade
+        return replace(
+            trade,
+            input_amount=str(scaled),
+            notional_usd=self._cfg.target_usd,
+            original_input_amount=trade.input_amount,
+        )
+
+    async def _input_price(self, trade: TradeDescriptor) -> float | None:
+        """USD value of one input base-unit, via Velora's srcUSD (cached per token)."""
+        key = (trade.chain_id, trade.input_token.lower())
+        hit = self._price_cache.get(key)
+        now = time.monotonic()
+        if hit and now - hit[1] < self._cfg.price_cache_ttl:
+            return hit[0]
+        if self._velora is None or not self._velora.supports(trade.chain_id):
+            return None
+        try:
+            amt = int(trade.input_amount)
+        except (TypeError, ValueError):
+            return None
+        if amt <= 0:
+            return None
+        try:
+            outcome = await self._velora.quote(self._session, trade)
+        except Exception:  # noqa: BLE001
+            return None
+        if outcome.status == "ok" and outcome.input_usd and outcome.input_usd > 0:
+            upbu = outcome.input_usd / amt
+            self._price_cache[key] = (upbu, now)
+            return upbu
+        return None
+
+    async def _native_usd(self, chain_id: int) -> float | None:
+        """USD price of the chain's native token, via Velora WETH->USDC (cached)."""
+        hit = self._native_cache.get(chain_id)
+        now = time.monotonic()
+        if hit and now - hit[1] < self._cfg.price_cache_ttl:
+            return hit[0]
+        weth = WRAPPED_NATIVE_TOKEN.get(chain_id)
+        usdc = _USDC.get(chain_id)
+        if not (weth and usdc) or self._velora is None or not self._velora.supports(chain_id):
+            return None
+        probe = TradeDescriptor(
+            order_id="", app_id="", intent_function="swap", chain_id=chain_id,
+            input_token=weth, output_token=usdc, input_amount=str(10 ** 18),
+            input_decimals=18, output_decimals=6, input_symbol="WETH",
+            output_symbol="USDC", input_is_native=True, output_is_native=False,
+        )
+        try:
+            outcome = await self._velora.quote(self._session, probe)
+        except Exception:  # noqa: BLE001
+            return None
+        if outcome.status == "ok" and outcome.input_usd and outcome.input_usd > 0:
+            self._native_cache[chain_id] = (outcome.input_usd, now)  # srcUSD of 1 WETH = ETH price
+            return outcome.input_usd
+        return None
 
     # ── helpers ──────────────────────────────────────────────────────────
 

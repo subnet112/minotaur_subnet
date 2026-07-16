@@ -51,6 +51,7 @@ class OneInchClient(AggregatorClient):
                 "src": trade.input_token,
                 "dst": trade.output_token,
                 "amount": trade.input_amount,
+                "includeGas": "true",   # v6 returns the `gas` estimate only when asked
             }
             headers = {"Authorization": f"Bearer {self._api_key}"}
             result = await request_with_backoff(
