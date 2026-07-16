@@ -23,15 +23,21 @@
 # by the api process (hotkey/identity attestation). Previously installed
 # unpinned at Dockerfile build time — moved here so the version is
 # tracked under source control.
-bittensor==10.1.0
-bittensor-cli==9.18.1
-bittensor-wallet==4.0.1
-async-substrate-interface==1.6.3
+# 2026-07-16: finney runtime change broke bittensor 10.1.0's metagraph encoding
+# (netuid is now a Composite u16). Bump to 10.5.0 (pulls async-substrate-interface
+# 2.2.1). bittensor-cli REMOVED — it pulls scalecodec, which conflicts with 2.x's
+# cyscale (same namespace → import-time RuntimeError); btcli isn't used in the
+# image. KEEP IN SYNC with the root requirements.txt, and REGENERATE
+# requirements.lock (pip-compile --generate-hashes) after any change here — the
+# image installs from the LOCK (--require-hashes), so a bump here alone is inert.
+bittensor==10.5.0
+bittensor-wallet==4.1.1
+async-substrate-interface==2.2.1
 
 # ── HTTP / async core ────────────────────────────────────────────────
-aiohttp==3.13.3
+aiohttp==3.13.4  # bittensor 10.5.0 requires >=3.13.4,<4.0 (was 3.13.3)
 httpx==0.28.1
-requests==2.32.5
+requests>=2.33.0,<3.0  # bittensor 10.5.0 requires >=2.33.0,<3.0 (was 2.32.5)
 
 # ── API surface ──────────────────────────────────────────────────────
 fastapi==0.135.1
