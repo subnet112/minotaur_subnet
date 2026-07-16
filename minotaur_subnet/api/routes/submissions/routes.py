@@ -691,8 +691,11 @@ def _max_submissions_per_round_total() -> int:
     the OPEN window and the slate is selected at close by LRU rotation
     (:func:`apply_round_rotation` — miners benched longest ago go first), so
     round entry is fair instead of first-come. The overflow is rejected at
-    close with a resubmit-next-round reason. Intake flood protection is the
-    separate ``SOLVER_ROUND_INTAKE_MAX`` (:func:`_round_intake_max`).
+    close with a resubmit-next-round reason. Flood protection is the separate
+    per-round BUILD budget (``SOLVER_ROUND_INTAKE_MAX``, dispensed by rotation
+    seniority at the stage-2 entry — see harness/build_budget.py; the old
+    first-come intake 409 it replaces was rejected for handing every slot to
+    open-instant bots).
 
     Like the per-hotkey cap, this is operator-local admission control at the
     leader gateway (the only ingress) — submissions are leader-canonical and
@@ -700,22 +703,6 @@ def _max_submissions_per_round_total() -> int:
     parameter and an env knob is the right shape.
     """
     raw = os.environ.get("SOLVER_ROUND_MAX_SUBMISSIONS", "0").strip()
-    try:
-        return int(raw)
-    except ValueError:
-        return 0
-
-
-def _round_intake_max() -> int:
-    """Round-wide INTAKE bound across all miners — a coarse flood guard for the
-    screening pipeline now that ``SOLVER_ROUND_MAX_SUBMISSIONS`` selects the
-    benched slate at close instead of turning miners away at the gateway.
-
-    Configurable via ``SOLVER_ROUND_INTAKE_MAX`` (default 0 = unlimited; the
-    per-hotkey and per-GitHub-owner caps already bound intake by registered
-    identity). Operator-local, like the other caps.
-    """
-    raw = os.environ.get("SOLVER_ROUND_INTAKE_MAX", "0").strip()
     try:
         return int(raw)
     except ValueError:
@@ -743,6 +730,45 @@ def apply_round_rotation(round_id: str) -> dict[str, Any]:
     from minotaur_subnet.harness.rotation import RotationLedger, apply_rotation_slate
 
     store = get_store()
+
+    # Flush the build-budget gate FIRST: submissions still WAITING for a build
+    # unit can never be benched this round (no image), so park them no-fault
+    # (WAITLISTED, seniority retained) BEFORE apply_rotation_slate computes
+    # candidacy — otherwise a never-built waiter could be "selected" onto the
+    # slate and burn one of the 3 slots, and it would inflate the #797
+    # decision-window autoscale (both consume the shared rotation
+    # terminal-status rule). Best-effort: a flush hiccup must never block the
+    # close; each woken pipeline parks itself as the fallback. No PR comment
+    # for budget-parked miners (the status endpoint carries the waitlist
+    # context) — keeping the close path free of extra network calls.
+    try:
+        from minotaur_subnet.harness.build_budget import get_build_budget_gate
+        from minotaur_subnet.harness.submission_store import OUTCOME_BUILD_BUDGET
+
+        def _park_budget_waiter(waiter: Any, position: int, contenders: int) -> None:
+            store.waitlist(
+                waiter.submission_id,
+                (
+                    f"not built for {round_id} (build budget: {contenders} "
+                    f"still waiting at close) — waitlisted no-fault; miners "
+                    f"benched longest ago go first, resubmit next round"
+                ),
+                outcome_code=OUTCOME_BUILD_BUDGET,
+                position=position,
+                contenders=contenders,
+            )
+
+        _flushed = get_build_budget_gate().flush_round(round_id, _park_budget_waiter)
+        if _flushed:
+            logger.info(
+                "Build budget for %s: %d waiter(s) parked at close: %s",
+                round_id, len(_flushed), _flushed,
+            )
+    except Exception:
+        logger.warning(
+            "build-budget flush failed for %s (ignored — pipelines park "
+            "themselves)", round_id, exc_info=True,
+        )
 
     def _notify_not_selected(sub: Any, reason: str, repo_token: str | None = None) -> None:
         # Runs AFTER the store's terminal reject, in apply_rotation_slate's
@@ -905,23 +931,15 @@ async def create_submission(
                 ),
             )
 
-    # Round-wide INTAKE bound (coarse flood guard, default unlimited). The
-    # benched-slate width (SOLVER_ROUND_MAX_SUBMISSIONS) no longer rejects
-    # intake — the slate is selected at close by LRU rotation so entry is fair
-    # instead of first-come; overflow submissions are rejected at close with a
-    # resubmit-next-round reason. The store re-checks this bound atomically
-    # inside create() as the backstop.
-    max_total = _round_intake_max()
-    if max_total > 0:
-        round_total = store.count_by_round(current_round.round_id)
-        if round_total >= max_total:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Round {current_round.round_id} is full "
-                    f"({round_total}/{max_total} submissions); try again next round."
-                ),
-            )
+    # NOTE: there is deliberately NO round-wide intake bound here. The old
+    # SOLVER_ROUND_INTAKE_MAX first-come 409 was rejected by the operator:
+    # open-instant bots fill every slot at round open and lock slower legit
+    # miners out — the exact arrival-order race the rotation slate exists to
+    # remove. The env var now caps stage-2 DOCKER BUILDS per round instead
+    # (default 8 in code), dispensed by rotation seniority at the stage-2
+    # entry; over-budget submissions are WAITLISTED no-fault at close with
+    # retained seniority. See harness/build_budget.py (2026-07-16 build flood:
+    # 63 builds/hour, 1200 images, 45GB).
 
     # Private path: the PR lives in the miner's OWN private repo, resolved + cloned
     # with the per-submission token. Public path is unchanged (canonical repo, env
@@ -1061,7 +1079,10 @@ async def create_submission(
             round_id=current_round.round_id,
             pr_number=body.pr_number,
             max_per_round=max_per_round,
-            max_total_per_round=max_total,
+            # 0 = no round-wide intake cap: SOLVER_ROUND_INTAKE_MAX is the
+            # BUILD budget now (see the note above the private-path block),
+            # so the store's first-come backstop must stay disabled.
+            max_total_per_round=0,
             is_private=_private,
             private_repo_full=(body.private_repo if _private else None),
             repo_token=(body.repo_token if _private else None),
