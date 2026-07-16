@@ -846,13 +846,16 @@ class OrderProcessor:
                         legs.append((input_token, amt))
                 except (ValueError, TypeError):
                     pass
-        # Fee-token leg (the per-fill platform fee is pulled the same way).
-        fee_wei = int(order.params.get("platform_fee_wei", 0) or 0)
-        if fee_wei > 0:
-            from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
-            fee_token = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
-            if fee_token:
-                legs.append((fee_token, fee_wei))
+        # Deliberately NOT pre-checking the fee token. Fee collection is
+        # app-defined: AppIntentBase._collectPlatformFee is `virtual`, and the
+        # live DexAggregatorApp overrides it to a no-op that deducts the fee from
+        # the swap OUTPUT post-execution (so users never hold/approve WETH), while
+        # the base path skips it entirely for native input. Pre-checking a WETH
+        # allowance we can't know will be pulled would spuriously terminate a
+        # fundable perpetual — and WETH (0xC02a…/0x4200…0006) has no EIP-2612
+        # permit to cure it anyway. If a generic pull-WETH app IS underfunded,
+        # settlement reverts on a user-fund-fault → terminal (blameless), the
+        # same backstop as before; we just don't burn a round pre-checking it.
 
         loop = _asyncio.get_running_loop()
         for token, required in legs:
