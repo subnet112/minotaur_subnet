@@ -35,7 +35,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from minotaur_subnet.relayer.encoder import _safe_checksum, encode_intent_order
+from minotaur_subnet.relayer.encoder import (
+    _safe_checksum,
+    encode_execution_plan,
+    encode_intent_order,
+    hash_execution_plan,
+)
+from minotaur_subnet.shared.types import ExecutionPlan, Interaction
 
 
 # ── Unit-level: _safe_checksum ─────────────────────────────────────────
@@ -55,6 +61,32 @@ def test_lowercase_address_gets_checksummed():
     # what eth_utils.to_checksum_address produces.
     from eth_utils import to_checksum_address
     assert checksummed == to_checksum_address(lower)
+
+
+def test_mixed_case_wrong_checksum_is_repaired():
+    """The 2026-07 live failure: a solver plan target arrives mixed-case with
+    an INVALID EIP-55 checksum (its 20 bytes are valid — only the casing is
+    wrong). Strict web3.py ``to_checksum_address`` RAISES on this rather than
+    normalizing, so the pre-fix helper (which checksummed the string as-is,
+    caught the raise, and returned it UNCHANGED) left the bad address in place
+    and the relayer submit still failed at web3's checksum validation.
+
+    Post-fix ``_safe_checksum`` lowercases first, so the canonical EIP-55 form
+    comes back regardless of the web3 version's leniency.
+    """
+    from eth_utils import to_checksum_address
+
+    # One nibble off the canonical checksum (…5E9bc… vs …5E9bC…) — same bytes.
+    bad = "0x1601843c5E9bc251A3272907010AFa41Fa18347E"
+    canonical = "0x1601843c5E9bC251A3272907010AFa41Fa18347E"
+    assert canonical == to_checksum_address(bad.lower())  # sanity: same address
+    assert bad != canonical                               # sanity: casing differs
+
+    result = _safe_checksum(bad)
+    assert result == canonical, (
+        "mixed-case wrong-checksum address must be repaired to canonical EIP-55, "
+        f"got {result!r}"
+    )
 
 
 def test_already_checksummed_address_is_idempotent():
@@ -166,3 +198,42 @@ def test_encode_intent_order_handles_missing_app_address():
     app = encoded[1]
     # Zero address is already in proper checksum form.
     assert app == "0x" + "00" * 20
+
+
+# ── Plan targets: the actual live crash site ───────────────────────────
+
+# A solver plan target with a valid 20 bytes but a WRONG EIP-55 checksum —
+# the exact shape that failed 91 live submits on chain 8453.
+_BAD_TARGET = "0x1601843c5E9bc251A3272907010AFa41Fa18347E"
+_CANONICAL_TARGET = "0x1601843c5E9bC251A3272907010AFa41Fa18347E"
+
+
+def _plan_with_target(target: str) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent_id="intent_test",
+        interactions=[Interaction(target=target, value="0", call_data="0x")],
+        deadline=1779897596,
+        nonce=0,
+        metadata={},
+    )
+
+
+def test_encode_execution_plan_normalizes_mis_cased_target():
+    """The plan target — the router/pool address from the miner's solver — is
+    what web3 chokes on inside executeIntent. It must land canonical in the
+    encoded call tuple, not verbatim."""
+    plan = _plan_with_target(_BAD_TARGET)
+    calls, _deadline, _nonce, _metadata = encode_execution_plan(plan)
+    encoded_target = calls[0][0]
+    assert encoded_target == _CANONICAL_TARGET
+
+
+def test_hash_execution_plan_is_casing_invariant():
+    """Normalizing the target must NOT change the signed plan hash: the address
+    encodes to the same 20 bytes regardless of casing, so a bad-cased target
+    and its canonical form hash identically. This is what makes the fix safe to
+    apply on the consensus-critical hash path."""
+    assert (
+        hash_execution_plan(_plan_with_target(_BAD_TARGET))
+        == hash_execution_plan(_plan_with_target(_CANONICAL_TARGET))
+    )
