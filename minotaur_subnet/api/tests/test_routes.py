@@ -10,6 +10,7 @@ import contextlib
 import os
 import sys
 import time
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -96,6 +97,40 @@ class TestHealthEndpoint(unittest.TestCase):
         self.assertEqual(data["block_loop"], "disabled")
         self.assertIn("provenance_policy", data)
         self.assertIn("runtime_security_policy", data)
+
+    def _set_metagraph_state(self, *, expected, sync):
+        from minotaur_subnet.api.server import ctx
+        self._saved = (ctx.solver_round_metagraph_expected, ctx.solver_round_metagraph_sync)
+        self.addCleanup(self._restore_metagraph_state)
+        ctx.solver_round_metagraph_expected = expected
+        ctx.solver_round_metagraph_sync = sync
+
+    def _restore_metagraph_state(self):
+        from minotaur_subnet.api.server import ctx
+        ctx.solver_round_metagraph_expected, ctx.solver_round_metagraph_sync = self._saved
+
+    def test_health_503_when_validator_metagraph_unwired(self):
+        # A configured validator whose metagraph sync failed to wire → 503 so
+        # update.sh's health-gate rolls the deploy back.
+        self._set_metagraph_state(expected=True, sync=None)
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 503)
+        data = resp.json()
+        self.assertEqual(data["status"], "degraded")
+        self.assertIn("metagraph", data["degraded_reason"])
+
+    def test_health_ok_when_metagraph_wired(self):
+        # Expected AND wired (sync present) → healthy 200.
+        self._set_metagraph_state(expected=True, sync=types.SimpleNamespace(state=None))
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "ok")
+
+    def test_health_ok_when_not_expected_even_if_sync_none(self):
+        # Legit standalone / testnet / FORCE_LEADER never sets `expected` → 200.
+        self._set_metagraph_state(expected=False, sync=None)
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
