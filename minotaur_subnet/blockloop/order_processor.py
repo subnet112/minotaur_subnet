@@ -846,16 +846,18 @@ class OrderProcessor:
                         legs.append((input_token, amt))
                 except (ValueError, TypeError):
                     pass
-        # Deliberately NOT pre-checking the fee token. Fee collection is
-        # app-defined: AppIntentBase._collectPlatformFee is `virtual`, and the
-        # live DexAggregatorApp overrides it to a no-op that deducts the fee from
-        # the swap OUTPUT post-execution (so users never hold/approve WETH), while
-        # the base path skips it entirely for native input. Pre-checking a WETH
-        # allowance we can't know will be pulled would spuriously terminate a
-        # fundable perpetual — and WETH (0xC02a…/0x4200…0006) has no EIP-2612
-        # permit to cure it anyway. If a generic pull-WETH app IS underfunded,
-        # settlement reverts on a user-fund-fault → terminal (blameless), the
-        # same backstop as before; we just don't burn a round pre-checking it.
+        # Deliberately NOT pre-checking the fee token against the USER. The
+        # platform fee IS collected on every fill on both chains — in WETH, to
+        # platformFeeCollector (the relayer), covering its gas — but it is NOT
+        # pulled from the user's wallet: the live DexAggregatorApp deducts it from
+        # the swap OUTPUT and settles it from the app's own WETH float (V2) /
+        # paymaster (V1), and the base path skips it for native input. So there is
+        # no user-side WETH allowance to check; pre-reading one we can't know will
+        # be pulled would spuriously terminate a fundable perpetual (and WETH
+        # 0xC02a…/0x4200…0006 has no EIP-2612 permit to cure it). A generic app
+        # that DOES pull WETH from the user still terminates when underfunded via
+        # the settlement user-fund-fault backstop — we just don't burn a round
+        # pre-checking it.
 
         loop = _asyncio.get_running_loop()
         for token, required in legs:
