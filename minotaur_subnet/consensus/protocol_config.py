@@ -191,6 +191,24 @@ class ProtocolConfig:
     metagraph_provider: MetagraphPeerProvider | None = None
     probe_timeout_seconds: float = 3.0
 
+    # ── Peer-eviction hysteresis ─────────────────────────────────────────
+    # A previously-verified peer is only evicted from ``peers`` after this
+    # many CONSECUTIVE refresh cycles of failed identity probes (unless it
+    # is de-authorized on-chain, which evicts immediately). Probes are
+    # unreliable under local load: 2026-07-16 a CPU-stalled leader timed
+    # out probing every peer — including ITSELF — zeroed the peer set, and
+    # the order proposed one second later was broadcast to nobody and
+    # terminally rejected ("Consensus not reached"). One bad probe round
+    # must not empty the set. Env: PEER_EVICTION_CONSECUTIVE_MISSES.
+    peer_eviction_misses: int = field(
+        default_factory=lambda: int(
+            os.environ.get("PEER_EVICTION_CONSECUTIVE_MISSES", "").strip() or 3
+        )
+    )
+    # evm_address_lower -> consecutive refresh cycles the peer failed its
+    # probe. Reset on any successful probe; pruned on eviction.
+    _peer_missing_streaks: dict[str, int] = field(default_factory=dict)
+
     # ── Quorum source override (optional) ────────────────────────────────
     # Champion-consensus reads its validator set from BT EVM ValidatorRegistry
     # (same as order-consensus uses on Base) but its quorum threshold from
@@ -505,18 +523,63 @@ class ProtocolConfig:
             session=session,
         )
 
+        # ── Eviction hysteresis ──────────────────────────────────────────
+        # Additions apply immediately; a previously-verified peer that
+        # failed THIS probe round is retained until it misses
+        # ``peer_eviction_misses`` consecutive rounds. De-authorization on
+        # chain (dropped from getValidators()) evicts immediately — the
+        # registry is authoritative and doesn't depend on reachability.
+        # Retention is safe: the peer list is a routing/liveness hint, not
+        # an auth boundary — approvals are signature-verified against
+        # ``on_chain_validators`` when they arrive, and a genuinely-down
+        # peer just costs one failed HTTP send.
+        authorized_lower = {a.lower() for a in authorized}
+        new_by_addr = {p.evm_address.lower(): p for p in new_peers}
+        retained: list[PeerInfo] = []
+        for old in self.peers:
+            key = old.evm_address.lower()
+            if key in new_by_addr:
+                continue
+            streak = self._peer_missing_streaks.get(key, 0) + 1
+            self._peer_missing_streaks[key] = streak
+            if key not in authorized_lower:
+                continue
+            if streak < self.peer_eviction_misses:
+                retained.append(old)
+        if retained:
+            logger.warning(
+                "ProtocolConfig: retaining %d peer(s) that failed this "
+                "probe round (miss streaks %s, evict at %d) — probes lie "
+                "under local load",
+                len(retained),
+                {
+                    p.evm_address[:10]: self._peer_missing_streaks[p.evm_address.lower()]
+                    for p in retained
+                },
+                self.peer_eviction_misses,
+            )
+        final = new_peers + retained
+        # Streak bookkeeping: probes that succeeded reset their streak;
+        # evicted peers' entries are pruned so a later re-appearance
+        # starts clean.
+        final_keys = {p.evm_address.lower() for p in final}
+        self._peer_missing_streaks = {
+            k: v for k, v in self._peer_missing_streaks.items()
+            if k in final_keys and k not in new_by_addr
+        }
+
         # Mutate in place — consumers hold a reference to self.peers.
         before = {p.evm_address.lower() for p in self.peers}
-        after = {p.evm_address.lower() for p in new_peers}
+        after = final_keys
         if before != after:
             added = after - before
             removed = before - after
             logger.warning(
                 "ProtocolConfig: peer set changed (added=%d removed=%d "
                 "total=%d)",
-                len(added), len(removed), len(new_peers),
+                len(added), len(removed), len(final),
             )
-        self.peers[:] = new_peers
+        self.peers[:] = final
 
 
 def _read_override() -> int | None:
