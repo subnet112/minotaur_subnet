@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # ERC-20 function selectors
 _ALLOWANCE_SELECTOR = keccak(b"allowance(address,address)")[:4]
 _APPROVE_SELECTOR = keccak(b"approve(address,uint256)")[:4]
+_BALANCEOF_SELECTOR = keccak(b"balanceOf(address)")[:4]
 
 # ERC-2612 selectors
 _DOMAIN_SEPARATOR_SELECTOR = keccak(b"DOMAIN_SEPARATOR()")[:4]
@@ -60,6 +61,37 @@ def check_allowance(w3: Web3, token: str, owner: str, spender: str) -> int:
     except Exception as exc:
         logger.debug("allowance() call failed for %s: %s", token, exc)
         return 0
+
+
+def read_balance_and_allowance(
+    w3: Web3, token: str, owner: str, spender: str,
+) -> tuple[int, int] | None:
+    """Read *owner*'s ERC-20 balance and their allowance to *spender*.
+
+    Returns ``(balance, allowance)`` on success, or ``None`` if EITHER read
+    fails. Unlike :func:`check_allowance` (which returns 0 on error), this must
+    distinguish a genuine zero from an RPC failure: callers use it to *terminate*
+    an order on a funding shortfall, and a transient read error must never be
+    mistaken for "user is broke" — the caller fails OPEN on ``None``.
+    """
+    try:
+        owner_cs = Web3.to_checksum_address(owner)
+        token_cs = Web3.to_checksum_address(token)
+        bal_raw = w3.eth.call({
+            "to": token_cs,
+            "data": "0x" + (_BALANCEOF_SELECTOR + abi_encode(["address"], [owner_cs])).hex(),
+        })
+        allow_raw = w3.eth.call({
+            "to": token_cs,
+            "data": "0x" + (
+                _ALLOWANCE_SELECTOR
+                + abi_encode(["address", "address"], [owner_cs, Web3.to_checksum_address(spender)])
+            ).hex(),
+        })
+        return int.from_bytes(bytes(bal_raw), "big"), int.from_bytes(bytes(allow_raw), "big")
+    except Exception as exc:
+        logger.debug("balance/allowance read failed for %s: %s", token, exc)
+        return None
 
 
 def try_erc2612_permit(

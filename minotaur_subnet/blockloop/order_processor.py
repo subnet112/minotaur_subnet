@@ -265,6 +265,16 @@ class OrderProcessor:
         if deployment and deployment.contract_address:
             deployed_contract = deployment.contract_address
 
+        # Perpetual pre-flight funds gate. The scoring fork FABRICATES the user's
+        # balance, so without this a perpetual the user can no longer fund would
+        # pass scoring + quorum + relay every cooldown cycle and only revert at
+        # settlement — burning a whole consensus round each time. A cheap LIVE
+        # balance+allowance read lets it terminate immediately (or, if the order
+        # carries an EIP-2612 permit, cure the allowance gaslessly first).
+        if order.perpetual and deployed_contract:
+            if not await self._perpetual_funds_check(order, deployed_contract):
+                return False
+
         # Build intent state from order params
         state = IntentState(
             contract_address=deployed_contract,
@@ -792,6 +802,146 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    async def _perpetual_funds_check(self, order: Any, spender: str) -> bool:
+        """Live balance+allowance gate for a perpetual's NEXT fill (#1/#3).
+
+        Returns True to proceed, False if the perpetual was terminated as
+        unfundable. Reads the user's real on-chain balance and allowance for the
+        input token (and the fee token, if the fee is non-zero). On an allowance
+        shortfall where the order carries an EIP-2612 permit, the relayer submits
+        it to set the standing allowance gaslessly (#3) and the check re-reads
+        rather than terminating. A BALANCE shortfall can't be cured → terminal.
+
+        Fails OPEN on any read error — a transient RPC hiccup must never
+        terminate a fundable perpetual; the settlement path stays the backstop.
+        Native-input fills (msg.value, no ERC-20 allowance) skip the input leg.
+        """
+        import asyncio as _asyncio
+        from minotaur_subnet.blockchain.token_approval import read_balance_and_allowance
+
+        try:
+            from minotaur_subnet.blockchain.chains import get_web3
+            w3 = get_web3(order.chain_id)
+        except Exception as exc:
+            logger.warning(
+                "Perpetual %s: no web3 for funds pre-check (fail-open): %s",
+                order.order_id, exc,
+            )
+            return True
+
+        legs: list[tuple[str, int]] = []
+        # Input-token leg (skip when the input is native — paid as msg.value).
+        if not order.params.get("_input_token_is_native"):
+            input_token = (
+                order.params.get("input_token")
+                or order.params.get("tokenIn")
+                or order.params.get("token_in")
+            )
+            input_amount = order.params.get("input_amount") or order.params.get("amount")
+            if input_token and input_amount:
+                try:
+                    amt = int(input_amount)
+                    if amt > 0:
+                        legs.append((input_token, amt))
+                except (ValueError, TypeError):
+                    pass
+        # Fee-token leg (the per-fill platform fee is pulled the same way).
+        fee_wei = int(order.params.get("platform_fee_wei", 0) or 0)
+        if fee_wei > 0:
+            from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
+            fee_token = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
+            if fee_token:
+                legs.append((fee_token, fee_wei))
+
+        loop = _asyncio.get_running_loop()
+        for token, required in legs:
+            reading = await loop.run_in_executor(
+                None, read_balance_and_allowance, w3, token, order.submitted_by, spender,
+            )
+            if reading is None:
+                continue  # read failed → fail open for this leg
+            balance, allowance = reading
+            if balance < required:
+                self._terminate_perpetual_unfunded(
+                    order,
+                    f"insufficient balance for next fill: {balance} < {required} ({token})",
+                )
+                return False
+            if allowance < required:
+                # Try to cure the allowance gaslessly with a carried permit (#3).
+                cured = await self._submit_order_permit(order, token, spender)
+                if cured:
+                    reading = await loop.run_in_executor(
+                        None, read_balance_and_allowance, w3, token, order.submitted_by, spender,
+                    )
+                    if reading is not None and reading[1] >= required:
+                        continue
+                self._terminate_perpetual_unfunded(
+                    order,
+                    f"insufficient allowance for next fill: {allowance} < {required} to {spender} ({token})",
+                )
+                return False
+        return True
+
+    async def _submit_order_permit(self, order: Any, token: str, spender: str) -> bool:
+        """Submit a user-signed EIP-2612 permit to set a standing allowance (#3).
+
+        External perpetual users sign the permit client-side and carry its fields
+        in ``order.params`` (``permit_deadline``/``permit_v``/``permit_r``/
+        ``permit_s``, optional ``permit_value`` defaulting to unlimited). The
+        relayer submits ``token.permit(...)`` gaslessly for the user — anyone may
+        relay a permit, and the one-time gas is dwarfed by the per-fill fee margin
+        collected over the perpetual's life. Returns True on a successful submit,
+        False when absent/invalid/failed (caller then treats it as unfunded).
+        """
+        p = order.params
+        if not all(k in p for k in ("permit_deadline", "permit_v", "permit_r", "permit_s")):
+            return False
+        try:
+            value = int(p.get("permit_value") or 0) or (2 ** 256 - 1)
+            deadline = int(p["permit_deadline"])
+            v = int(p["permit_v"])
+            r = bytes.fromhex(str(p["permit_r"]).replace("0x", ""))
+            s = bytes.fromhex(str(p["permit_s"]).replace("0x", ""))
+        except (ValueError, TypeError) as exc:
+            logger.warning("Perpetual %s: malformed permit params: %s", order.order_id, exc)
+            return False
+        try:
+            await self.relayer.call_contract_function(
+                contract_address=token,
+                chain_id=order.chain_id,
+                signature="permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+                abi_types=["address", "address", "uint256", "uint256", "uint8", "bytes32", "bytes32"],
+                values=[order.submitted_by, spender, value, deadline, v, r, s],
+                gas=120_000,
+            )
+            logger.info(
+                "Perpetual %s: submitted EIP-2612 permit to set allowance on %s",
+                order.order_id, token,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Perpetual %s: permit submission failed: %s", order.order_id, exc)
+            return False
+
+    def _terminate_perpetual_unfunded(self, order: Any, reason: str) -> None:
+        """Terminate a perpetual the user can no longer fund (REJECTED, no debit).
+
+        A funding shortfall is entirely upstream of the solver (the scoring fork
+        fabricates balance, so the plan still scored as doable), so like any user
+        fund-fault it is blameless — the miner is NOT debited.
+        """
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error=f"Perpetual terminated — user can no longer fund the next fill ({reason})",
+        )
+        self.order_persistence.sync(order.order_id)
+        logger.info(
+            "Perpetual order %s terminated (unfunded, miner not debited): %s",
+            order.order_id, reason,
+        )
 
     def _try_requeue_perpetual(self, order: Any, reason: str) -> bool:
         """Requeue a live perpetual OPEN for a later cycle; return True if done.

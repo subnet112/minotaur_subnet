@@ -367,6 +367,12 @@ class QuoteRequest(BaseModel):
     params: dict[str, Any]  # e.g. {input_token, output_token, input_amount}
     chain_id: int = 1
     slippage_bps: int = 50  # Default 0.5% slippage for suggested_min_output
+    # Perpetual sizing: when set, the quote also returns the standing ERC-20
+    # allowance the user must approve up front to fund all fills (no prefund/
+    # escrow — the wallet + allowance IS the funding, drawn down per fill).
+    perpetual: bool = False
+    max_executions: int = 1
+    cooldown: float = 0.0
 
 
 @router.post("/apps/{app_id}/orders", status_code=201)
@@ -1681,6 +1687,37 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         response["cross_chain"] = True
         response["src_chain_id"] = input_chain
         response["dst_chain_id"] = dest_chain
+
+    # ── Perpetual: required standing allowance ──
+    # A perpetual fills up to max_executions times from ONE signed order, each
+    # fill pulling the input amount (input token) and the platform fee (fee
+    # token) via safeTransferFrom. There is NO prefund/escrow: the user's own
+    # wallet balance + a standing allowance IS the funding, checked per fill;
+    # a shortfall terminates the perpetual. So the client must approve at least
+    # these totals up front (or carry an EIP-2612 permit for the same value).
+    if req.perpetual and req.max_executions > 1:
+        n = req.max_executions
+        try:
+            per_fill_input = int(req.params.get("input_amount") or req.params.get("amount") or 0)
+        except (ValueError, TypeError):
+            per_fill_input = 0
+        per_fill_fee = platform_fee_int
+        response["perpetual"] = {
+            "max_executions": n,
+            "cooldown": req.cooldown,
+            "per_fill_input_wei": str(per_fill_input),
+            "per_fill_fee_wei": str(per_fill_fee),
+            "required_input_allowance_wei": str(per_fill_input * n),
+            "required_fee_allowance_wei": str(per_fill_fee * n),
+            "input_token": req.params.get("input_token", ""),
+            "fee_token": quote_result.platform_fee_token or "",
+            "fee_symbol": quote_result.platform_fee_symbol or "",
+            "note": (
+                "Approve at least these amounts to the app contract before signing "
+                "(or attach an EIP-2612 permit). Each fill draws from your wallet; "
+                "running out of balance or allowance terminates the perpetual."
+            ),
+        }
 
     return response
 
