@@ -972,6 +972,25 @@ def relative_counts(
         champion_bar=champion_bar, bar_age_s=bar_age_s,
         factor_delta=factor_delta, deadwood_delta=deadwood_delta,
     )
+    return counts_from_verdict(res)
+
+
+def counts_from_verdict(res: dict[str, Any]) -> dict[str, Any]:
+    """Map an :func:`evaluate_relative_adoption` RESULT onto the API count shape
+    — PURE, no recomputation.
+
+    :func:`relative_counts` is just ``evaluate_relative_adoption`` followed by
+    this mapping. Split out so a caller that ALREADY holds the authoritative
+    verdict — the adoption DECISION (``EpochManager._evaluate_per_order_adoption``)
+    — can persist the miner-facing badge from the SAME verdict object it decided
+    on, instead of a second, independently-recomputed comparison. That is the fix
+    for a badge that read "dethrone / OUTPERFORMS" while the round it belongs to
+    ended "no change": the display persist and the decision each re-read the
+    champion's freshly re-benched rows, which can drift by a few bps between the
+    two reads (offloaded re-bench settling, sim jitter), so a boundary order at
+    the ``RELATIVE_TOL_BPS`` band flipped win↔matched between them. Mapping the
+    decision's own verdict removes the second read entirely.
+    """
     better = res["n_wins"] + res["n_blind_spots"]
     worse = res["n_regressions"] + res["n_dropped"]
     # Blind-spot REPEATS (armed guard only; 0 while disarmed) are compared-but-
