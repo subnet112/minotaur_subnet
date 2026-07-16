@@ -468,10 +468,43 @@ def test_legacy_shadow_score_key_still_reads():
 # ── relative_reason (display vocabulary) ──────────────────────────────────────
 
 
-def test_reason_dethrone():
+def test_reason_dethrone_adopted():
+    # adopted=True (the round's finalist / status adopted) keeps the past-tense
+    # "adopted <id>" verb and carries no pending tail.
+    counts = relative_counts([_r("o1", "100")], [_r("o1", "200")])
+    msg = relative_reason(counts, candidate_id="sub-7", adopted=True)
+    assert msg == "adopted sub-7: net better — 1 better / 0 worse (regressions within 1% floor)"
+
+
+def test_reason_dethrone_not_adopted_says_beat_not_merged():
+    # DEFAULT (adopted=False): a display "dethrone" verdict only means the
+    # challenger BEAT the champion on the per-order rule — a round can end with
+    # no finalist while every competitor's counts say dethrone. The string must
+    # NOT claim adoption (a miner read this as a merge notification).
     counts = relative_counts([_r("o1", "100")], [_r("o1", "200")])
     msg = relative_reason(counts, candidate_id="sub-7")
-    assert msg == "adopted sub-7: net better — 1 better / 0 worse (regressions within 1% floor)"
+    assert msg == (
+        "beat the champion sub-7: net better — 1 better / 0 worse "
+        "(regressions within 1% floor) (pending round outcome — not yet adopted)"
+    )
+    assert not msg.startswith("adopted")
+
+
+def test_reason_not_adopted_verb_applies_to_tie_break_wins():
+    # The verb swap also covers the saturated-tie phrasings (factor here): a
+    # non-adopted factor-tie win must not read as "adopted" either.
+    counts = {
+        "verdict": "dethrone", "adopt_via": "factorization",
+        "better": 0, "worse": 0, "matched": 5,
+        "factorization": {"factor_delta": 2897, "factor_margin": 100},
+    }
+    msg = relative_reason(counts, candidate_id="sub_x")
+    assert msg.startswith("beat the champion sub_x: better factored")
+    assert msg.endswith("(pending round outcome — not yet adopted)")
+    # adopted=True restores the final past-tense verb with no pending tail.
+    adopted_msg = relative_reason(counts, candidate_id="sub_x", adopted=True)
+    assert adopted_msg.startswith("adopted sub_x: better factored")
+    assert "pending" not in adopted_msg
 
 
 def test_reason_behind_uses_matched_and_regressed():

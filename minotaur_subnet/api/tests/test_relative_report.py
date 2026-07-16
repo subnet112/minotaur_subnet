@@ -99,7 +99,12 @@ def test_report_reads_stored_same_pin_counts():
     assert rpt["relative"] is _STORED_DETHRONE
     assert rpt["relative"]["better"] == 2
     assert rpt["relative"]["verdict"] == "dethrone"
-    assert rpt["reason_relative"].startswith("adopted")
+    # This submission BEAT the champion on the per-order rule but is NOT adopted
+    # (outcome beat_champion, status not adopted), so the reason must say so —
+    # never "adopted", which a miner would read as a merge notification.
+    assert rpt["reason_relative"].startswith("beat the champion")
+    assert not rpt["reason_relative"].startswith("adopted")
+    assert "not yet adopted" in rpt["reason_relative"]
     # Outcome is derived from the per-order verdict (dethrone -> beat_champion),
     # NOT a scalar comparison.
     assert rpt["outcome"] == "beat_champion"
