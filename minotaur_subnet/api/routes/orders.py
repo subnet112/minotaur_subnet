@@ -27,6 +27,7 @@ from minotaur_subnet.api.routes.apps import (
     _require_admin,
     _require_admin_or_signed_miner,
 )
+from minotaur_subnet.orderbook.rejection import classify_rejection
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -962,6 +963,24 @@ def _created_at(order_dict: dict) -> float:
         return 0.0
 
 
+def _with_rejection_class(order_dict: dict) -> dict:
+    """Ensure ``rejection_class`` is present on an order dict.
+
+    In-memory orders carry it from ``Order.to_dict()``, but orders persisted
+    before this field existed (the bulk of the historical store) don't. Compute
+    it on read from the stored ``status`` + ``error`` so both paths — and every
+    historical order — expose the same structured class without a store
+    migration. Cheap pure-string work; safe to run on every read.
+    """
+    if "rejection_class" in order_dict:
+        return order_dict
+    out = dict(order_dict)
+    out["rejection_class"] = classify_rejection(
+        out.get("status", ""), out.get("error"),
+    )
+    return out
+
+
 @router.get("/orders/{order_id}")
 def get_order(
     order_id: str,
@@ -994,6 +1013,7 @@ def get_order(
             raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
         d = stored
 
+    d = _with_rejection_class(d)  # backfill for historical store rows
     submitted_by = (d.get("submitted_by", "") or "")
     if not _verify_reader_sig(submitted_by, order_id, x_reader_sig or ""):
         d = _strip_user_signature(d)
@@ -1004,6 +1024,7 @@ def get_order(
 def list_orders(
     app_id: str | None = None,
     status: str | None = None,
+    rejection_class: str | None = None,
     limit: int = _LIST_DEFAULT_LIMIT,
     offset: int = 0,
     full: bool = False,
@@ -1019,6 +1040,20 @@ def list_orders(
     [1, 500] (default 100); the response carries ``total`` (matches after
     filtering, before paging) so callers can page: ``count``/``limit``/
     ``offset`` describe the returned page.
+
+    Filters:
+      - ``app_id`` / ``status`` — passed through to the store (unchanged).
+      - ``rejection_class`` — structured terminal-failure class (see
+        ``orderbook.rejection``): ``duplicate`` (already served — not a real
+        failure), ``user``, ``solver``, ``infra``, ``expired``, ``other``. Lets
+        a dashboard fetch e.g. only the ``infra`` failures worth fixing, or
+        exclude ``duplicate`` from a service-success rate, without string-
+        matching ``error``.
+
+    Every entry carries ``rejection_class`` (``None`` for non-failures), and the
+    response includes ``rejection_class_counts`` — the breakdown over the
+    ``app_id``/``status`` match set BEFORE the ``rejection_class`` filter and
+    paging — so one call powers both a summary chart and a drill-down page.
 
     PR-2 (audit M-orders-leak): ``user_signature`` is stripped from
     every entry unless the caller presents an ``X-Reader-Sig`` that
@@ -1048,12 +1083,25 @@ def list_orders(
         oid = d.get("order_id")
         if oid:
             merged[oid] = d
+    # Ensure every record carries a rejection_class (historical store rows
+    # predate the field — backfill from status+error on read).
+    ordered = [_with_rejection_class(d) for d in merged.values()]
     # Newest first; order_id tie-break keeps pages stable across requests
     # when created_at collides (or is missing on pre-field orders).
-    ordered = sorted(
-        merged.values(),
-        key=lambda d: (-_created_at(d), str(d.get("order_id") or "")),
-    )
+    ordered.sort(key=lambda d: (-_created_at(d), str(d.get("order_id") or "")))
+
+    # Breakdown over the app_id/status match set (all classes), computed BEFORE
+    # the rejection_class filter so the chart totals stay stable while a caller
+    # drills into one class. None (non-failures) is omitted.
+    rejection_class_counts: dict[str, int] = {}
+    for d in ordered:
+        rc = d.get("rejection_class")
+        if rc:
+            rejection_class_counts[rc] = rejection_class_counts.get(rc, 0) + 1
+
+    if rejection_class:
+        ordered = [d for d in ordered if d.get("rejection_class") == rejection_class]
+
     total = len(ordered)
     out = []
     for d in ordered[offset : offset + limit]:
@@ -1067,6 +1115,7 @@ def list_orders(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "rejection_class_counts": rejection_class_counts,
     }
 
 
