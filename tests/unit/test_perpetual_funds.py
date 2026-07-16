@@ -165,6 +165,20 @@ def test_submit_permit_absent_params_returns_false():
     assert ok is False
 
 
+def test_resolve_spend_token_amount_app_agnostic():
+    from minotaur_subnet.blockchain.tokens import resolve_spend_token_amount
+    # Any conventional alias works — not swap-specific.
+    assert resolve_spend_token_amount({"input_token": TOKEN, "input_amount": "5"}) == (TOKEN, 5)
+    assert resolve_spend_token_amount({"tokenIn": TOKEN, "amount": 9}) == (TOKEN, 9)
+    assert resolve_spend_token_amount({"asset": TOKEN, "amountPerBuy": "3"}) == (TOKEN, 3)
+    assert resolve_spend_token_amount({"token_in": TOKEN, "amount_per_buy": 7}) == (TOKEN, 7)
+    # Unidentifiable → (None, None), never zero — callers skip, not fail.
+    assert resolve_spend_token_amount({}) == (None, None)
+    assert resolve_spend_token_amount({"input_token": TOKEN}) == (None, None)
+    assert resolve_spend_token_amount({"input_token": TOKEN, "input_amount": "0"}) == (None, None)
+    assert resolve_spend_token_amount({"input_token": TOKEN, "input_amount": "nan"}) == (None, None)
+
+
 def test_terminate_unfunded_no_miner_debit():
     p = _processor()
     p._terminate_perpetual_unfunded(_order(), "insufficient balance")
