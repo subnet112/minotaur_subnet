@@ -1688,41 +1688,63 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         response["src_chain_id"] = input_chain
         response["dst_chain_id"] = dest_chain
 
-    # ── Perpetual: required standing allowance ──
-    # A perpetual fills up to max_executions times from ONE signed order, each
-    # fill pulling the input amount (input token) and the platform fee (fee
-    # token) via safeTransferFrom. There is NO prefund/escrow: the user's own
-    # wallet balance + a standing allowance IS the funding, checked per fill;
-    # a shortfall terminates the perpetual. So the client must approve at least
-    # these totals up front (or carry an EIP-2612 permit for the same value).
+    # ── Perpetual: required standing allowances (the TWO per-fill pulls) ──
+    # A perpetual fills up to max_executions times from ONE signed order. There is
+    # NO prefund/escrow — the user's wallet balance + standing allowances ARE the
+    # funding, drawn down per fill; a shortfall terminates the perpetual. Two
+    # independent pulls must be covered for all fills:
+    #   1. INPUT token — the app safeTransferFroms the swap input each fill
+    #      (always required for ERC-20 input).
+    #   2. Platform FEE (WETH) — required from the USER only in FeeMode.USER;
+    #      APP-mode apps (e.g. DexAggregator) deduct it from output / the app
+    #      float, so the user needs no WETH there. WETH has no EIP-2612 permit, so
+    #      a USER-mode fee allowance must be a plain on-chain approve().
     if req.perpetual and req.max_executions > 1:
         n = req.max_executions
         try:
             per_fill_input = int(req.params.get("input_amount") or req.params.get("amount") or 0)
         except (ValueError, TypeError):
             per_fill_input = 0
-        response["perpetual"] = {
+        perp: dict[str, Any] = {
             "max_executions": n,
             "cooldown": req.cooldown,
             "per_fill_input_wei": str(per_fill_input),
             "required_input_allowance_wei": str(per_fill_input * n),
             "input_token": req.params.get("input_token", ""),
-            # Fee is informational only — see note. No required_fee_allowance:
-            # the fee is app-dependent and usually needs no approval.
             "per_fill_fee_wei": str(platform_fee_int),
             "fee_token": quote_result.platform_fee_token or "",
             "fee_symbol": quote_result.platform_fee_symbol or "",
-            "note": (
-                "Approve at least required_input_allowance_wei of input_token to "
-                "the app contract (or attach an EIP-2612 permit if the input token "
-                "supports it). Each fill draws from your wallet; running out of "
-                "balance or allowance terminates the perpetual. The platform fee "
-                "is normally deducted from the swap output (no fee-token approval "
-                "needed) and skipped for native input; only a generic app that "
-                "pulls the fee as WETH needs a separate WETH approve() — and WETH "
-                "has no EIP-2612 permit, so that must be a plain on-chain approve."
-            ),
+            "fee_from_user": False,
         }
+        note = (
+            "Approve at least required_input_allowance_wei of input_token to the "
+            "app contract (or attach an EIP-2612 permit if the input token supports "
+            "it). Each fill draws from your wallet; running out of balance or "
+            "allowance terminates the perpetual. "
+        )
+        # Does THIS app pull the fee from the user (FeeMode.USER)? Read on-chain
+        # so the quote matches the pre-flight gate. Best-effort — omit the fee
+        # requirement (assume deducted-from-output) on any read failure.
+        if _deployed and platform_fee_int > 0:
+            try:
+                from minotaur_subnet.blockchain.chains import get_web3
+                from minotaur_subnet.blockchain.token_approval import fee_mode_is_user
+                if fee_mode_is_user(get_web3(req.chain_id), _deployed):
+                    perp["fee_from_user"] = True
+                    perp["required_fee_allowance_wei"] = str(platform_fee_int * n)
+                    note += (
+                        "This app collects the platform fee from your WETH, so also "
+                        "approve required_fee_allowance_wei of fee_token (WETH) — a "
+                        "plain on-chain approve(), as WETH has no EIP-2612 permit."
+                    )
+                else:
+                    note += "The platform fee is deducted from the swap output — no fee-token approval needed."
+            except Exception:
+                note += "The platform fee is normally deducted from the swap output — no fee-token approval needed."
+        else:
+            note += "The platform fee is normally deducted from the swap output — no fee-token approval needed."
+        perp["note"] = note
+        response["perpetual"] = perp
 
     return response
 

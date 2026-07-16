@@ -120,6 +120,45 @@ def test_native_input_skips_input_leg(monkeypatch):
     assert called["n"] == 0  # no legs read
 
 
+def test_user_fee_mode_checks_weth_and_terminates(monkeypatch):
+    # FeeMode.USER: input OK, but the WETH fee allowance is short → terminate.
+    def _read(w3, token, owner, spender):
+        return (10_000, 10_000) if token == TOKEN else (10_000, 5)  # WETH short
+    monkeypatch.setattr(chains_mod, "get_web3", lambda cid: MagicMock())
+    monkeypatch.setattr(ta_mod, "read_balance_and_allowance", _read)
+    monkeypatch.setattr(ta_mod, "fee_mode_is_user", lambda w3, c: True)
+    p = _processor()
+    ok = asyncio.run(p._perpetual_funds_check(_order({"platform_fee_wei": 100}), SPENDER))
+    assert ok is False
+    kwargs = p.orderbook.update_order.call_args.kwargs
+    assert kwargs["status"] == OrderStatus.REJECTED
+    p.app_store.record_execution.assert_not_called()
+
+
+def test_app_fee_mode_skips_weth_leg(monkeypatch):
+    # FeeMode.APP (DexAggregator): WETH would read broke, but the fee is deducted
+    # from output — the leg must be SKIPPED so the perpetual isn't falsely killed.
+    def _read(w3, token, owner, spender):
+        return (10_000, 10_000) if token == TOKEN else (0, 0)  # WETH ignored
+    monkeypatch.setattr(chains_mod, "get_web3", lambda cid: MagicMock())
+    monkeypatch.setattr(ta_mod, "read_balance_and_allowance", _read)
+    monkeypatch.setattr(ta_mod, "fee_mode_is_user", lambda w3, c: False)
+    p = _processor()
+    ok = asyncio.run(p._perpetual_funds_check(_order({"platform_fee_wei": 100}), SPENDER))
+    assert ok is True
+    p.orderbook.update_order.assert_not_called()
+
+
+def test_fee_mode_is_user_reads_view():
+    from minotaur_subnet.blockchain.token_approval import fee_mode_is_user
+    w3u = MagicMock(); w3u.eth.call.return_value = (0).to_bytes(32, "big")
+    w3a = MagicMock(); w3a.eth.call.return_value = (1).to_bytes(32, "big")
+    w3e = MagicMock(); w3e.eth.call.side_effect = Exception("revert")
+    assert fee_mode_is_user(w3u, TOKEN) is True     # 0 = USER
+    assert fee_mode_is_user(w3a, TOKEN) is False    # 1 = APP
+    assert fee_mode_is_user(w3e, TOKEN) is False    # error → treat as APP (safe)
+
+
 def test_submit_permit_absent_params_returns_false():
     p = _processor()
     ok = asyncio.run(p._submit_order_permit(_order(), TOKEN, SPENDER))
