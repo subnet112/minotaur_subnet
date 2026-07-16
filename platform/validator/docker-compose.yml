@@ -524,6 +524,27 @@ services:
 
       CHAIN_ID: "8453"
       CONSENSUS_MODE: "real"
+
+      # ── SHARED app store (2026-07-16 incident root cause) ────────────
+      # Without this the worker builds a FRESH, EMPTY AppIntentStore at the
+      # image-local default path, _load_benchmark_intents() returns nothing,
+      # and (pre-fix) run_once terminally rejected every enumerated
+      # submission with {"error": "no_active_intents"} — every round aborted
+      # no_champion_candidate. server.py's own comment says the split worker
+      # "shares this SQLite app-store with the api"; this line is what makes
+      # that true. Same value the api service uses.
+      APP_INTENTS_STORE_PATH: "${APP_INTENTS_STORE_PATH:-/data/store.json}"
+      # Rotation slate width — must MATCH the api's value: the worker's
+      # open-round defer branch and queue capping read it directly from env,
+      # and a hand-copied env subset is exactly how the app-store line above
+      # went missing.
+      SOLVER_ROUND_MAX_SUBMISSIONS: "${SOLVER_ROUND_MAX_SUBMISSIONS:-3}"
+      # Short-circuits _resolve_solver_round_hotkey so worker construction
+      # avoids the wallet-path bittensor import (whose btlogging machine pins
+      # every existing logger to CRITICAL — the 2026-07-16 logging blackout).
+      # The code-side restore now runs in worker mode regardless; this is
+      # defense in depth. Same value the api resolves.
+      VALIDATOR_HOTKEY_SS58: "${VALIDATOR_HOTKEY_SS58:-}"
       CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
 
       # Follower role — these are LEADER-ONLY responsibilities:
@@ -767,6 +788,22 @@ services:
       BITTENSOR_EVM_UPSTREAM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
       CHAIN_ID: "8453"
       CONSENSUS_MODE: "real"
+
+      # ── on-chain registries (same values as the api) ─────────────────
+      # REQUIRED: startup's check_required_env_or_exit(REQUIRED_REGISTRY_ENV)
+      # exits 78 without VALIDATOR_REGISTRY_8453 + _964 — the worker runs the
+      # same api server module and hits the same boot check. Found at the first
+      # real activation (leader, 2026-07-16): the profile-gated service had
+      # never actually booted anywhere before.
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1}"
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1}"
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964}"
+      APP_INTENT_BASE_964: "${APP_INTENT_BASE_964}"
+      CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964}"
+      CHAMPION_CONSENSUS_CHAIN_ID: "${CHAMPION_CONSENSUS_CHAIN_ID:-964}"
 
       # ── shared block-pin read proxy (the api's, at sandbox .5) ───────
       # DISABLE_READ_PROXY=1 above means this process does NOT launch a proxy, so
