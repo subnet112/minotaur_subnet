@@ -836,11 +836,19 @@ def _build_solver_round_benchmark_pack_hash(
     from minotaur_subnet.harness.benchmark_pack import (
         compute_pack_hash,
         collect_synthetic_scenarios,
+        deregistered_app_ids,
     )
     from minotaur_subnet.harness.order_sampler import sample_historical_orders
 
     submission_store = submissions.get_store()
     round_subs = submission_store.list_by_round(round_id)
+    # Fully deregistered (all-deployments-RETIRED) apps drop out of the fingerprint,
+    # together with their historical orders (dropped by ``sample_historical_orders``
+    # below). So retiring an app changes the pack hash even if it had no sampled
+    # orders, and a fleet split on the retirement is caught as a hash mismatch
+    # rather than silently scoring divergent corpora. Keyed on RETIRED only, so the
+    # promote itself is byte-identical — only a deliberate retire flips the hash.
+    _deregistered = deregistered_app_ids(ctx.store)
     apps_payload = [
         {
             "app_id": app.app_id,
@@ -853,6 +861,7 @@ def _build_solver_round_benchmark_pack_hash(
             ),
         }
         for app in sorted(ctx.store.list_apps(), key=lambda item: item.app_id)
+        if app.app_id not in _deregistered
     ]
     # NOTE: submission `status` is deliberately NOT folded into the hash. status
     # is a MUTABLE lifecycle marker (QUEUED→…→BENCHMARKING→SCORED/REJECTED), and

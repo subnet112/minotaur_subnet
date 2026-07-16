@@ -20,6 +20,8 @@ import logging
 import random
 from typing import Any
 
+from minotaur_subnet.shared.types import AppStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,49 @@ _BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_a
 STAGE2_CORPUS_SAMPLES: int = 50
 
 
+def retired_app_chain_keys(app_store: Any) -> set[tuple[str, int]]:
+    """``(app_id, chain_id)`` pairs whose deployment is RETIRED — dropped from the draw.
+
+    Deregistration is deregister-NOT-delete: retiring a deployment keeps every
+    order row in the store (still queryable via ``/orders?app_id=...``), but its
+    historical orders leave the Stage-2 corpus so a deregistered app stops driving
+    scoring. Because the benchmark_pack_hash draws from this SAME function, the
+    exclusion propagates to the hash automatically — the scored corpus and the
+    fingerprint stay identical, and a fleet that disagrees on an app's retirement
+    diverges LOUDLY (PACK_HASH_MISMATCH → no adoption) instead of silently scoring
+    different corpora under one hash.
+
+    The exclusion is corpus-membership-affecting, so it MUST be fleet-uniform
+    (same consensus class as ``STAGE2_CORPUS_SAMPLES``). It is derived purely from
+    replicated deployment status (app-sync mirrors ``status`` into every follower's
+    store), so every validator computes the identical set from its synced catalog.
+    Fail-open to empty on a store error: a transient read must never silently
+    shrink one validator's corpus (that validator's hash then simply fails to match
+    and it drops out of quorum, rather than corrupting adoption).
+    """
+    retired: set[tuple[str, int]] = set()
+    try:
+        apps = app_store.list_apps()
+    except Exception as exc:
+        logger.warning("retired_app_chain_keys: list_apps failed: %s", exc)
+        return retired
+    for app in apps:
+        app_id = getattr(app, "app_id", None)
+        if not app_id:
+            continue
+        try:
+            deployments = app_store.get_deployments(app_id)
+        except Exception:
+            continue
+        for chain_id, dep in deployments.items():
+            if getattr(dep, "status", None) == AppStatus.RETIRED:
+                try:
+                    retired.add((app_id, int(chain_id)))
+                except (TypeError, ValueError):
+                    continue
+    return retired
+
+
 def sample_historical_orders(
     app_store: Any,
     round_id: str,
@@ -67,6 +112,7 @@ def sample_historical_orders(
     n_per_chain: int = STAGE2_CORPUS_SAMPLES,
     exclude_statuses: set[str] | None = None,
     records: list[dict[str, Any]] | None = None,
+    exclude_app_chains: set[tuple[str, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically sample historical TERMINAL-DEMAND orders for Stage 2.
 
@@ -110,6 +156,11 @@ def sample_historical_orders(
         records: Pre-built candidate orders (e.g. a chain-derived corpus). When
             provided, they are the source instead of app_store.list_orders() —
             same filter/sample/PII logic. None (default) keeps the local-store path.
+        exclude_app_chains: ``(app_id, chain_id)`` pairs to drop from the draw
+            (retired/deregistered deployments — see ``retired_app_chain_keys``).
+            None (default) auto-derives them from ``app_store`` so EVERY call site
+            (runtime draw, pack hash, veto slice) excludes the identical set; pass
+            an explicit set to override (tests, or to reuse a precomputed set).
 
     Returns:
         List of order dicts, PII-stripped. May be empty if no history exists.
@@ -135,6 +186,12 @@ def sample_historical_orders(
             logger.warning("Failed to list orders for Stage 2 sampling: %s", exc)
             return []
 
+    # Deregistered (RETIRED) deployments drop out of the draw — auto-derived from
+    # the store when not supplied so the runtime draw, the pack hash, and the veto
+    # slice all exclude the identical set. See ``retired_app_chain_keys``.
+    if exclude_app_chains is None:
+        exclude_app_chains = retired_app_chain_keys(app_store)
+
     # Filter by status + chain. NOTE: we do NOT require a block_number. The
     # benchmark forks at self._epoch_block_number (the round/env pin, or live head
     # by default) — never the order's own block — so an order without a fill block
@@ -144,6 +201,7 @@ def sample_historical_orders(
     candidates = _filter_candidates(
         all_orders, include_statuses=include_statuses,
         exclude_statuses=exclude_statuses, chain_ids=chain_ids,
+        exclude_app_chains=exclude_app_chains,
     )
 
     if not candidates:
@@ -192,6 +250,7 @@ def _filter_candidates(
     include_statuses: set[str] | None,
     exclude_statuses: set[str] | None,
     chain_ids: list[int] | None,
+    exclude_app_chains: set[tuple[str, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Status/chain candidate filter shared by the canonical draw and the
     veto-slice partition — one filter so both derive from the identical pool."""
@@ -203,6 +262,11 @@ def _filter_candidates(
         if exclude_statuses is not None and status in exclude_statuses:
             continue
         if chain_ids is not None and order.get("chain_id") not in chain_ids:
+            continue
+        if (
+            exclude_app_chains
+            and (order.get("app_id"), order.get("chain_id")) in exclude_app_chains
+        ):
             continue
         candidates.append(order)
     return candidates
@@ -370,11 +434,15 @@ def partition_follower_slices(
             logger.warning("Failed to list orders for veto-slice partition: %s", exc)
             return []
 
+    # Retired deployments are excluded from BOTH the canonical draw and the
+    # remainder, so a deregistered app's orders never leak into a veto slice.
+    exclude_app_chains = retired_app_chain_keys(app_store)
     candidates = _filter_candidates(
         all_orders,
         include_statuses={"filled", "rejected", "expired"},
         exclude_statuses=None,
         chain_ids=list(chain_ids),
+        exclude_app_chains=exclude_app_chains,
     )
     if not candidates:
         return []
@@ -392,7 +460,10 @@ def partition_follower_slices(
     # the round's pack hash, not re-list at fan-out time.
     leader_ids = {
         o.get("order_id")
-        for o in sample_historical_orders(app_store, round_id, records=all_orders)
+        for o in sample_historical_orders(
+            app_store, round_id, records=all_orders,
+            exclude_app_chains=exclude_app_chains,
+        )
     }
 
     remainder = [o for o in candidates if o.get("order_id") not in leader_ids]

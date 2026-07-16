@@ -112,6 +112,44 @@ def retire_deployment(store: Any, app_id: str, chain_id: int) -> dict[str, Any]:
     }
 
 
+def deregister_app(store: Any, app_id: str) -> dict[str, Any]:
+    """Deregister an app — retire EVERY deployment in one call (deregister, not delete).
+
+    This is the developer-facing "remove my app from the network" primitive. It
+    retires each chain's deployment (RETIRED), which (a) removes the app from order
+    routing and the synthetic benchmark set, and (b) drops its historical orders
+    from the Stage-2 corpus + benchmark_pack_hash (see
+    ``order_sampler.retired_app_chain_keys``) — WITHOUT deleting any order rows, so
+    the history stays queryable via ``/orders?app_id=...`` and the change replicates
+    to followers as a plain status transition (app-sync mirrors ``status``). A
+    deployment mid-deploy (DEPLOYING) is left untouched and reported, matching
+    ``retire_deployment``.
+
+    On-chain contracts are untouched — recover any V2 float FIRST via
+    ``float_withdraw``.
+    """
+    definition = store.get_app(app_id)
+    if definition is None:
+        return {"error": f"App not found: {app_id}"}
+    deployments = store.get_deployments(app_id)
+    retired: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    for chain_id, dep in deployments.items():
+        if dep.status == AppStatus.DEPLOYING:
+            skipped.append({"chain_id": chain_id, "reason": "deploy in progress"})
+            continue
+        if dep.status == AppStatus.RETIRED:
+            continue
+        store.update_deployment_status(app_id, chain_id, AppStatus.RETIRED)
+        retired.append(chain_id)
+    return {
+        "app_id": app_id,
+        "status": "deregistered",
+        "retired_chains": sorted(retired),
+        "skipped": skipped,
+    }
+
+
 def _deployed_address(store: Any, app_id: str, chain_id: int) -> str | None:
     dep = store.get_deployment(app_id, chain_id=chain_id)
     return getattr(dep, "contract_address", None) if dep else None
