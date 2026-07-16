@@ -58,6 +58,25 @@ def test_uniform_and_empty_cases():
         8453: _dep(8453, AppStatus.ACTIVE, BASE_ADDR),
         1: _dep(1, AppStatus.SOLVED, BASE_ADDR),
     }) == "solved"  # mix of order-ready
+
+
+def test_retiring_and_retired_rollup():
+    # All chains RETIRING → "retiring" (was wrongly "draft" — the rollup had no case).
+    assert _derive_overall_status(
+        {8453: _dep(8453, AppStatus.RETIRING, BASE_ADDR)}) == "retiring"
+    # All RETIRED → "retired".
+    assert _derive_overall_status(
+        {8453: _dep(8453, AppStatus.RETIRED, BASE_ADDR)}) == "retired"
+    # Fully closing, one chain not yet cut over → "retiring".
+    assert _derive_overall_status({
+        8453: _dep(8453, AppStatus.RETIRED, BASE_ADDR),
+        1: _dep(1, AppStatus.RETIRING, BASE_ADDR),
+    }) == "retiring"
+    # Live on one chain, retiring on another → still "partial" (not fully closing).
+    assert _derive_overall_status({
+        8453: _dep(8453, AppStatus.ACTIVE, BASE_ADDR),
+        1: _dep(1, AppStatus.RETIRING, BASE_ADDR),
+    }) == "partial"
     assert _derive_overall_status({8453: _dep(8453, AppStatus.DEPLOYING)}) == "deploying"
 
 

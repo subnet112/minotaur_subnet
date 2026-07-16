@@ -598,6 +598,13 @@ def _derive_overall_status(deployments: dict[int, Any]) -> str:
         return AppStatus.SOLVED.value
     if all(s == AppStatus.SOLVING for s in statuses):
         return AppStatus.SOLVING.value
+    # Fully deregistering/deregistered apps read as retiring/retired, not "draft".
+    # (RETIRED first, so all-RETIRED wins over the RETIRING|RETIRED check below.)
+    if all(s == AppStatus.RETIRED for s in statuses):
+        return AppStatus.RETIRED.value
+    if all(s in (AppStatus.RETIRING, AppStatus.RETIRED) for s in statuses):
+        # Every chain is closing; at least one hasn't reached its cutover yet.
+        return AppStatus.RETIRING.value
     if any(s.is_operational() for s in statuses):
         return AppStatus.PARTIAL.value
     if any(s == AppStatus.DEPLOYING for s in statuses):
