@@ -141,6 +141,12 @@ OUTCOME_SCREENING_ERROR = "screening_error"    # unexpected pipeline error
 #   WAITLISTED (no-fault — resubmit keeps seniority):
 OUTCOME_ROTATION_NOT_SELECTED = "rotation_not_selected"
 OUTCOME_WINDOW_ELAPSED = "window_elapsed"
+# The round's per-round BUILD budget (SOLVER_ROUND_INTAKE_MAX, default 8) was
+# spent before this submission's seniority reached the front of the two-pool
+# dispatch queue (harness/build_budget.py, 2026-07-16 build-flood control).
+# Flow-control, not a verdict: the code was never built, the miner keeps full
+# rotation seniority, resubmit next round.
+OUTCOME_BUILD_BUDGET = "build_budget_deferred"
 
 
 # Statuses meaning the submission actually occupied a benchmark slate slot (was

@@ -10,7 +10,7 @@ finalist, certify, and die at relayer-finalize "no token — FAIL-CLOSED"
 (observed live 2026-07-07: 5 consecutive merge_failed round aborts).
 
 Three guards close the class (the screening re-queue leg is already covered by
-``_rejected_during_screening`` / test_screening_respects_rotation_reject):
+``_terminal_during_screening`` / test_screening_respects_rotation_reject):
   1. store: ``set_benchmark_result`` records details but never resurrects.
   2. store: a legitimate SCORED transition clears any stale rejection_reason.
   3. worker: the bench loop re-fetches status and skips submissions that are
