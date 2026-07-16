@@ -243,8 +243,15 @@ def build_submission_report(
         try:
             from minotaur_subnet.epoch.relative_scoring import relative_reason
 
+            # ``adopted`` gates the past-tense "adopted <id>" verb: only when
+            # this submission ACTUALLY became champion (status adopted) or is the
+            # round's chosen finalist (``won``). Otherwise a "dethrone" counts
+            # block phrases as "beat the champion … (pending)", so a non-finalist
+            # is never told it merged (the /submissions/{id}/status field a miner
+            # polls). See relative_reason.
             rel_reason = relative_reason(
                 rel, candidate_id=getattr(sub, "submission_id", None),
+                adopted=(status == "adopted" or won),
             )
             if rel_reason:
                 report["reason_relative"] = rel_reason
