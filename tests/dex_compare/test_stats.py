@@ -150,7 +150,7 @@ def test_build_response_groups_by_chain():
     assert resp["total_comparisons"] == 2
     assert {c["chain_id"] for c in resp["chains"]} == {1, 8453}
     assert resp["sources"][0] == "minotaur"
-    assert isinstance(resp["caveats"], list) and resp["caveats"]
+    assert "caveats" not in resp
 
 
 def test_empty_is_valid():
