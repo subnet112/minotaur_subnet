@@ -92,3 +92,54 @@ def test_unknown_class_returns_empty_page_not_error(client):
     assert body["orders"] == []
     # Counts still reflect the real distribution.
     assert body["rejection_class_counts"] == {"duplicate": 2, "infra": 1, "user": 1}
+
+
+def test_multi_value_include(client):
+    """rejection_class accepts a comma-separated allowlist."""
+    body = client.get("/v1/orders", params={"rejection_class": "infra,user"}).json()
+    assert body["total"] == 2
+    assert {o["rejection_class"] for o in body["orders"]} == {"infra", "user"}
+
+
+def test_exclude_drops_duplicate_keeps_the_rest(client):
+    """exclude_rejection_class removes the named classes. Without a status
+    filter, the filled order (class None) is NOT a duplicate, so it stays."""
+    body = client.get("/v1/orders", params={"exclude_rejection_class": "duplicate"}).json()
+    assert "duplicate" not in {o["rejection_class"] for o in body["orders"]}
+    # infra(1) + user(1) + filled(1, class None)
+    assert body["total"] == 3
+
+
+def test_real_failures_only_idiom(client):
+    """The documented 'real failures only' query: rejected minus duplicate."""
+    body = client.get(
+        "/v1/orders",
+        params={"status": "rejected", "exclude_rejection_class": "duplicate"},
+    ).json()
+    assert body["total"] == 2  # infra + user; duplicates and the filled order gone
+    assert {o["rejection_class"] for o in body["orders"]} == {"infra", "user"}
+
+
+def test_include_then_exclude_precedence(client):
+    """Include is applied first, then exclude."""
+    body = client.get(
+        "/v1/orders",
+        params={"rejection_class": "duplicate,infra", "exclude_rejection_class": "duplicate"},
+    ).json()
+    assert body["total"] == 1
+    assert body["orders"][0]["rejection_class"] == "infra"
+
+
+def test_exclude_multi_value(client):
+    body = client.get(
+        "/v1/orders",
+        params={"status": "rejected", "exclude_rejection_class": "duplicate,user"},
+    ).json()
+    assert body["total"] == 1
+    assert body["orders"][0]["rejection_class"] == "infra"
+
+
+def test_counts_stable_under_exclude(client):
+    """The breakdown ignores the include/exclude filters entirely."""
+    body = client.get("/v1/orders", params={"exclude_rejection_class": "duplicate"}).json()
+    assert body["rejection_class_counts"] == {"duplicate": 2, "infra": 1, "user": 1}
