@@ -30,7 +30,11 @@ DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
 # bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
 MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 
-from minotaur_subnet.harness.submission_store import SubmissionStatus, offload_write
+from minotaur_subnet.harness.submission_store import (
+    OUTCOME_BUILD_BUDGET,
+    SubmissionStatus,
+    offload_write,
+)
 from minotaur_subnet.harness.provenance import create_signed_provenance
 
 from .state import get_store
@@ -721,6 +725,12 @@ async def resume_stranded_screenings() -> int:
                 "restart (in-memory repo token lost)", sub.submission_id,
             )
             continue
+        # Rebuild the build-budget gate's charged set from the PRISTINE
+        # boot-time statuses BEFORE this pipeline re-runs (its stage-1 re-walk
+        # resets the status back to SCREENING_STAGE_1, erasing the evidence a
+        # build already started) — so a restart re-dispatch passes the gate
+        # without consuming a second budget unit. See _ensure_budget_round.
+        _ensure_budget_round(store, getattr(sub, "round_id", "") or "")
         asyncio.get_running_loop().create_task(
             _run_screening_pipeline(sub.submission_id)
         )
@@ -736,20 +746,155 @@ async def resume_stranded_screenings() -> int:
     return resumed
 
 
-def _rejected_during_screening(store: Any, submission_id: str) -> str | None:
-    """Return the reject reason if this submission was rejected while its
-    screening ran, else None.
+# Statuses proving a stage-2 BUILD already started for this submission (in
+# this or a previous process life). Used to rebuild the build-budget gate's
+# charged set after a restart and to re-dispatch resumed pipelines without
+# consuming a second unit: resume_stranded_screenings re-runs the pipeline
+# from scratch, so without this a restart would re-charge (or re-flood) the
+# round's budget for work that already happened.
+_BUILD_ATTEMPT_STATUSES = (
+    SubmissionStatus.SCREENING_STAGE_2,
+    SubmissionStatus.SCREENING_STAGE_3,
+    SubmissionStatus.BENCHMARKING,
+    SubmissionStatus.SCORED,
+    SubmissionStatus.ADOPTED,
+)
 
-    Close-time rotation (apply_rotation_slate) rejects the round's overflow to
+
+def _has_prior_build_attempt(sub: Any) -> bool:
+    """Did a stage-2 build already start for this submission?
+
+    True when the CURRENT status is at/past the build, or a stage-2 screening
+    result was recorded (covers terminal states that already paid for a build:
+    build_failed rejects, window-elapsed waitlists of built submissions, …).
+    """
+    if sub is None:
+        return False
+    if getattr(sub, "status", None) in _BUILD_ATTEMPT_STATUSES:
+        return True
+    stage2 = (getattr(sub, "screening", None) or {}).get("stage_2") or {}
+    return stage2.get("passed") is not None
+
+
+def _round_open_window_seconds() -> float:
+    """The round OPEN window length — same env + default as the round
+    coordinator's close check (api/startup.py). Read here only to time the
+    build budget's newcomer→proven spill delay."""
+    try:
+        return float(os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "300").strip() or "300")
+    except ValueError:
+        return 300.0
+
+
+def _ensure_budget_round(store: Any, round_id: str) -> None:
+    """Bootstrap the build-budget gate's state for a round (idempotent).
+
+    Scans the round's submissions for prior build attempts so the gate's
+    charged set survives a restart (each counted exactly once — the gate never
+    double-charges or re-floods a round whose builds already ran). MUST run
+    before the resumed pipelines re-walk their statuses: the pipeline resets a
+    stranded submission back to SCREENING_STAGE_1 at its stage-1 re-run, which
+    would erase the "build already started" evidence this scan reads — so
+    resume_stranded_screenings calls this FIRST, on the pristine boot-time
+    statuses. Best-effort (test doubles may lack the store surface).
+    """
+    from minotaur_subnet.harness.build_budget import get_build_budget_gate
+
+    from .state import get_round_store
+
+    gate = get_build_budget_gate()
+    if not round_id or not gate.needs_round(round_id):
+        return
+    try:
+        opened_at = 0.0
+        try:
+            round_state = get_round_store().get_round(round_id)
+            opened_at = float(getattr(round_state, "created_at", 0.0) or 0.0)
+        except Exception:
+            logger.warning(
+                "[build-budget] no round state for %s (newcomer-spill delay "
+                "disabled for the round)", round_id, exc_info=True,
+            )
+        prior = [
+            (s.submission_id, s.hotkey or "")
+            for s in store.list_by_round(round_id)
+            if _has_prior_build_attempt(s)
+        ]
+        gate.ensure_round(
+            round_id,
+            opened_at=opened_at,
+            open_seconds=_round_open_window_seconds(),
+            prior_attempts=prior,
+        )
+    except Exception:
+        logger.warning(
+            "[build-budget] bootstrap for %s failed (gate will bootstrap "
+            "lazily without restart history)", round_id, exc_info=True,
+        )
+
+
+async def _acquire_build_grant(store: Any, sub: Any):
+    """Wire the pipeline into the per-round build-budget gate (may WAIT).
+
+    Gathers the leader-local context the gate needs — the round's open window
+    (for the newcomer-spill delay), a liveness probe (so a waiter never
+    outlives a round closed without a rotation flush), and the restart-rebuild
+    input (prior build attempts, charged exactly once) — then asks for a
+    unit. See harness/build_budget.py for the allocation rules and the
+    2026-07-16 build-flood rationale.
+    """
+    from minotaur_subnet.harness.build_budget import get_build_budget_gate
+
+    from .state import get_round_store
+
+    gate = get_build_budget_gate()
+    round_id = sub.round_id or ""
+
+    def _round_is_open() -> bool:
+        try:
+            current = get_round_store().get_round(round_id)
+        except Exception:
+            return False
+        if current is None:
+            return False
+        status = getattr(current.status, "value", current.status)
+        return str(status) == "open"
+
+    _ensure_budget_round(store, round_id)
+
+    fresh = store.get(sub.submission_id) or sub
+    return await gate.acquire(
+        submission_id=sub.submission_id,
+        hotkey=sub.hotkey or "",
+        round_id=round_id,
+        prior_attempt=_has_prior_build_attempt(fresh),
+        round_is_open=_round_is_open,
+    )
+
+
+def _terminal_during_screening(store: Any, submission_id: str) -> str | None:
+    """Return the terminal reason if this submission reached a terminal state
+    while its screening ran, else None.
+
+    Close-time rotation (apply_rotation_slate) parks the round's overflow to
     hold the benched slate at SOLVER_ROUND_MAX_SUBMISSIONS. If it fires while a
     skipped submission is still screening — or a restart resumes an already
     -skipped one — the pipeline must NOT re-queue it for benchmark (that
-    overwrites the terminal reject and busts the slate cap). Returns the reason
+    overwrites the terminal state and busts the slate cap). Returns the reason
     (possibly empty str) so the caller can log it; None means still eligible.
+
+    Checks the SHARED rotation terminal rule, not just REJECTED: rotation has
+    parked overflow as WAITLISTED (no-fault) since #620, and this guard's old
+    REJECTED-only check let a late-finishing screening overwrite that terminal
+    waitlist back to BENCHMARKING — the live slate-cap leak this fixes. The
+    build-budget flush parks its waiters as WAITLISTED too, so the same rule
+    covers both.
     """
+    from minotaur_subnet.harness.rotation import is_terminal_status
+
     current = store.get(submission_id)
-    if current is not None and current.status == SubmissionStatus.REJECTED:
-        return current.rejection_reason or ""
+    if current is not None and is_terminal_status(current):
+        return current.rejection_reason or current.status.value
     return None
 
 
@@ -854,12 +999,61 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 )
                 return
 
-        # Stage 2: Build check
-        await offload_write(store.update_status,submission_id, SubmissionStatus.SCREENING_STAGE_2)
+        # Terminal check BEFORE asking for a build unit: close-time rotation can
+        # have parked this submission (waitlist/reject) while stage 1 was still
+        # running — building it would waste a budget unit on a submission that
+        # can no longer be benched this round.
+        pre_gate_terminal = _terminal_during_screening(store, submission_id)
+        if pre_gate_terminal is not None:
+            logger.info(
+                "Submission %s reached a terminal state during stage 1 (%s) — "
+                "not requesting a build", submission_id, pre_gate_terminal,
+            )
+            return
+
+        # Stage 2 gate: the docker build is the resource the 2026-07-16 flood
+        # weaponized (63 builds/hour from sybil intake), so builds are dispensed
+        # from a per-round budget (SOLVER_ROUND_INTAKE_MAX, default 8, 0 =
+        # unlimited) by ROTATION SENIORITY — proven miners LRU-first with a
+        # reserved newcomer lottery share — instead of arrival order. This
+        # acquire may WAIT (until a unit frees, or the close-time flush parks
+        # us); budget-winners proceed immediately, so their near-immediate
+        # feedback is preserved. See harness/build_budget.py.
+        grant = await _acquire_build_grant(store, sub)
+        if not grant.granted:
+            # No-fault denial: never a REJECT for flow control. The close-time
+            # flush usually parked us already (grant.parked); otherwise park
+            # here — unless a terminal state landed meanwhile (rotation).
+            if not grant.parked and _terminal_during_screening(store, submission_id) is None:
+                await offload_write(
+                    store.waitlist,
+                    submission_id,
+                    grant.reason or (
+                        "this round's build budget was spent before your "
+                        "seniority reached the front of the queue — waitlisted, "
+                        "seniority retained; resubmit next round"
+                    ),
+                    outcome_code=OUTCOME_BUILD_BUDGET,
+                )
+            logger.info(
+                "Submission %s denied a build unit (%s) — waitlisted no-fault",
+                submission_id, grant.reason,
+            )
+            return
+
+        # Stage 2: Build check. The gate slot is released as soon as the build
+        # finishes (pass OR fail) so the next-priority waiter dispatches
+        # immediately — NOT held through stage 3 / the GHCR push (up to ~10 min),
+        # which would stall the whole dispatch queue behind one slow push.
+        from minotaur_subnet.harness.build_budget import get_build_budget_gate
 
         image_tag = f"solver-{sub.commit_hash[:12]}:screening"
         from minotaur_subnet.harness.screening import run_stage_2
-        s2 = await run_stage_2(repo_dir, image_tag)
+        try:
+            await offload_write(store.update_status,submission_id, SubmissionStatus.SCREENING_STAGE_2)
+            s2 = await run_stage_2(repo_dir, image_tag)
+        finally:
+            get_build_budget_gate().release(sub.round_id or "", submission_id)
         await offload_write(store.set_screening_result,
             submission_id, stage=2,
             passed=s2.passed,
@@ -975,18 +1169,21 @@ async def _run_screening_pipeline(submission_id: str) -> None:
             return
 
         # All screening passed -- move to benchmarking queue. But re-read the
-        # status first: close-time rotation (apply_rotation_slate) can REJECT
+        # status first: close-time rotation (apply_rotation_slate) can PARK
         # this submission while its screening was still in flight (and a restart
         # can resume an already-skipped one). Without this guard the async
-        # pipeline overwrites that terminal reject back to BENCHMARKING, so the
+        # pipeline overwrites that terminal state back to BENCHMARKING, so the
         # round benches MORE than its SOLVER_ROUND_MAX_SUBMISSIONS slate — the
-        # leak that showed 9-11 "scored" in a 3-slot round on restart-heavy days.
-        rejected = _rejected_during_screening(store, submission_id)
-        if rejected is not None:
+        # leak that showed 9-11 "scored" in a 3-slot round on restart-heavy
+        # days. Must use the SHARED terminal rule: rotation parks overflow as
+        # WAITLISTED (not REJECTED) since #620, and the old REJECTED-only check
+        # let a late-finishing screening resurrect a terminal waitlist.
+        terminal = _terminal_during_screening(store, submission_id)
+        if terminal is not None:
             logger.info(
-                "Submission %s passed screening but was already rejected "
+                "Submission %s passed screening but is already terminal "
                 "(%s) — not queuing for benchmark (rotation slate full)",
-                submission_id, rejected or "rejected",
+                submission_id, terminal or "terminal",
             )
             return
         # All screening passed -- move to benchmarking queue
