@@ -578,6 +578,14 @@ class EpochManager:
 
         finalist = None
         rejections: list[tuple[Submission, str]] = []
+        # Champion record snapshot for the decision-authored badge overwrite
+        # below — read once here so every evaluated candidate's badge is stamped
+        # against the same incumbent the walk decides on.
+        champ_sub_for_badge = (
+            self._sub_store.get(self._champion.submission_id)
+            if (self._sub_store and self._champion.submission_id)
+            else None
+        )
         for candidate in candidates:
             # Record the leader's would-be vote (observability), then proceed on
             # the PURE verdict. The DISABLE_CHAMPION_ADOPTION freeze is enforced
@@ -586,7 +594,13 @@ class EpochManager:
             # quorum (observe-only) before the commit is blocked, letting the
             # fleet's cross-host agreement be measured without ever adopting.
             self._record_would_be_vote(candidate)
-            if self._meets_adoption_criteria(candidate):
+            adopted = self._meets_adoption_criteria(candidate)
+            # Author this candidate's miner-facing `relative` badge from the SAME
+            # verdict the decision just used, so an evaluated candidate's stored
+            # block can never contradict the round outcome (no more OUTPERFORMS on
+            # a no-change round). Best-effort; never affects the verdict.
+            await self._author_candidate_badge(candidate, champ_sub_for_badge, round_id)
+            if adopted:
                 finalist = candidate
                 break
             # Relative-rule reject reason (e.g. "reject: N regression(s)/drop(s)" /
@@ -1557,6 +1571,12 @@ class EpochManager:
         # round-abort label + PR-reject message reflect WHY (no challenger delivered
         # more / N regressions), not the obsolete "dethrone_margin_not_met".
         self._last_adopt_reason = None
+        # Stash the authoritative verdict so the round walk can AUTHOR this
+        # candidate's miner-facing ``relative`` badge from the exact object it
+        # decided on (see ``_author_candidate_badge``). Reset every call so a
+        # candidate that abstains below (same-sub / stale bar / no data) can never
+        # inherit the PREVIOUS candidate's verdict.
+        self._last_adopt_verdict: dict[str, Any] | None = None
 
         # Same submission — no change needed
         if challenger.submission_id == self._champion.submission_id:
@@ -1595,6 +1615,7 @@ class EpochManager:
             return False
         adopt = bool(verdict["adopt"])
         self._last_adopt_reason = verdict["reason"]
+        self._last_adopt_verdict = verdict
         logger.info(
             "adoption decision for %s: adopt=%s (relative per-order: %s)",
             getattr(challenger, "submission_id", "?"), adopt, verdict["reason"],
@@ -1775,10 +1796,6 @@ class EpochManager:
         """
         try:
             from minotaur_subnet.epoch.relative_scoring import (
-                FACTOR_MARGIN,
-                GAS_BASIS,
-                GAS_MARGIN_BPS,
-                UNPRODUCTIVE_MARGIN,
                 deadwood_delta_between,
                 factor_delta_between,
                 has_raw_output_rows,
@@ -1832,42 +1849,11 @@ class EpochManager:
                         factor_delta=delta, deadwood_delta=dw_delta,
                         **self._blind_spot_bar_kwargs(),
                     )
-                    counts["factorization"] = {
-                        "candidate_nodes": comp_nodes,
-                        "champion_nodes": champ_nodes,
-                        "factor_delta": delta,
-                        "factor_margin": FACTOR_MARGIN,
-                        "armed": FACTOR_MARGIN is not None,
-                    }
-                    # Deadwood rule context beside factorization/gas — the one
-                    # display pass with both records in hand, so the report
-                    # reads it without any cross-record lookup and a
-                    # deadwood-tie dethrone is stored as "dethrone" with its
-                    # actionable numbers. None-safe by construction.
-                    counts["deadwood"] = {
-                        "candidate_nodes": comp_dw_nodes,
-                        "champion_nodes": champ_dw_nodes,
-                        "deadwood_delta": dw_delta,
-                        "margin": UNPRODUCTIVE_MARGIN,
-                        "armed": UNPRODUCTIVE_MARGIN is not None,
-                    }
-                    # GAS-PAR (ships DISARMED): same-pin gas context beside the
-                    # factorization block. relative_counts carries the ``gas``
-                    # sub-dict (verdict totals/coverage) ONLY when the clause is
-                    # armed (GAS_MARGIN_BPS is not None); disarmed ⇒ no key, so
-                    # the persisted counts stay byte-identical to pre-gas
-                    # rounds. Enriched here with the rule context (margin /
-                    # armed / basis), mirroring the factorization attach.
-                    # NOTHING else threads — gas rides on the per_intent rows
-                    # themselves, unlike factor_delta.
-                    gas_ctx = counts.get("gas")
-                    if isinstance(gas_ctx, dict):
-                        counts["gas"] = {
-                            **gas_ctx,
-                            "gas_margin_bps": GAS_MARGIN_BPS,
-                            "armed": GAS_MARGIN_BPS is not None,
-                            "basis": GAS_BASIS,
-                        }
+                    # Attach same-pin factorization / deadwood / gas rule context
+                    # via the ONE shared builder, so this display pass and the
+                    # decision-authored overwrite (_author_candidate_badge) can
+                    # never carry different block shapes.
+                    self._attach_relative_context(counts, champ_sub, competitor)
                     counts["round_id"] = round_id
                     await offload_write(
                         self._sub_store.merge_benchmark_details,
@@ -1881,6 +1867,102 @@ class EpochManager:
                     )
         except Exception:
             logger.debug("relative-counts persist pass failed for round %s", round_id, exc_info=True)
+
+    def _attach_relative_context(
+        self, counts: dict[str, Any], champ_sub: Submission | None,
+        comp_sub: Submission | None,
+    ) -> dict[str, Any]:
+        """Attach same-pin factorization / deadwood / gas RULE CONTEXT to a counts
+        dict — the ONE builder shared by the display persist pass
+        (:meth:`_persist_round_relative_counts`) and the decision-authored badge
+        overwrite (:meth:`_author_candidate_badge`), so the two can never carry
+        different block shapes. PURE over the two submission records; the deltas
+        are recomputed here (deterministic — identical to the values the verdict
+        used). Mutates and returns ``counts``.
+        """
+        from minotaur_subnet.epoch.relative_scoring import (
+            FACTOR_MARGIN,
+            GAS_BASIS,
+            GAS_MARGIN_BPS,
+            UNPRODUCTIVE_MARGIN,
+            deadwood_delta_between,
+            factor_delta_between,
+        )
+
+        champ_nodes = getattr(champ_sub, "max_region_nodes", None)
+        comp_nodes = getattr(comp_sub, "max_region_nodes", None)
+        counts["factorization"] = {
+            "candidate_nodes": comp_nodes,
+            "champion_nodes": champ_nodes,
+            "factor_delta": factor_delta_between(champ_nodes, comp_nodes),
+            "factor_margin": FACTOR_MARGIN,
+            "armed": FACTOR_MARGIN is not None,
+        }
+        champ_dw_nodes = getattr(champ_sub, "unproductive_nodes", None)
+        champ_dw_version = getattr(champ_sub, "unproductive_metric_version", None)
+        comp_dw_nodes = getattr(comp_sub, "unproductive_nodes", None)
+        comp_dw_version = getattr(comp_sub, "unproductive_metric_version", None)
+        counts["deadwood"] = {
+            "candidate_nodes": comp_dw_nodes,
+            "champion_nodes": champ_dw_nodes,
+            "deadwood_delta": deadwood_delta_between(
+                champ_dw_nodes, comp_dw_nodes, champ_dw_version, comp_dw_version,
+            ),
+            "margin": UNPRODUCTIVE_MARGIN,
+            "armed": UNPRODUCTIVE_MARGIN is not None,
+        }
+        # GAS-PAR (ships DISARMED): relative_counts / counts_from_verdict carry a
+        # ``gas`` sub-dict ONLY when the clause is armed, so disarmed rounds stay
+        # byte-identical to the pre-gas shape. Enrich with the rule context.
+        gas_ctx = counts.get("gas")
+        if isinstance(gas_ctx, dict):
+            counts["gas"] = {
+                **gas_ctx,
+                "gas_margin_bps": GAS_MARGIN_BPS,
+                "armed": GAS_MARGIN_BPS is not None,
+                "basis": GAS_BASIS,
+            }
+        return counts
+
+    async def _author_candidate_badge(
+        self, candidate: Submission, champ_sub: Submission | None, round_id: str,
+    ) -> None:
+        """Overwrite a walked candidate's persisted ``relative`` badge from the
+        AUTHORITATIVE adoption verdict (``self._last_adopt_verdict``), so the
+        miner-facing block is the DECISION's verdict by construction.
+
+        The display persist pass (:meth:`_persist_round_relative_counts`) and the
+        adoption decision each independently re-read the champion's freshly
+        re-benched rows; those reads can drift by a few bps between passes
+        (offloaded re-bench settling, sim jitter), so a boundary order at the
+        ``RELATIVE_TOL_BPS`` band could flip win↔matched between them — leaving a
+        candidate's badge reading ``dethrone``/OUTPERFORMS on a round the same
+        candidate's authoritative verdict scored ``matched`` (the no-change round
+        a miner mistook for a merge). Authoring the badge from the decision's own
+        verdict removes the second read entirely for every evaluated candidate.
+
+        Best-effort / display-only: swallows all errors and must never affect the
+        decision or the round outcome. Runs AFTER the awaited pre-walk persist, so
+        this later write supersedes it for the same submission.
+        """
+        try:
+            verdict = getattr(self, "_last_adopt_verdict", None)
+            if verdict is None or self._sub_store is None:
+                return  # abstained (no comparable data / stale bar) → leave block
+            from minotaur_subnet.epoch.relative_scoring import counts_from_verdict
+
+            counts = counts_from_verdict(verdict)
+            self._attach_relative_context(counts, champ_sub, candidate)
+            counts["round_id"] = round_id
+            await offload_write(
+                self._sub_store.merge_benchmark_details,
+                candidate.submission_id, {"relative": counts},
+            )
+        except Exception:
+            logger.debug(
+                "badge author failed for %s",
+                getattr(candidate, "submission_id", "?"), exc_info=True,
+            )
 
     def _get_scorecard(self, submission: Submission) -> dict[str, Any] | None:
         """Extract the scorecard from a submission's benchmark details."""
