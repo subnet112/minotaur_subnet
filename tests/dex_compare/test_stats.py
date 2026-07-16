@@ -241,6 +241,19 @@ def test_net_by_size_segments_realistic_vs_dust():
     assert nbs["small"]["vs_source"]["cow"]["minotaur_losses"] == 1
 
 
+def test_net_notional_conversion_without_velora():
+    # neither-native normalized row, Velora ABSENT/failed, but notional_usd +
+    # native_usd + the output amounts let us convert the fee -> row is INCLUDED
+    # in net (previously excluded -> this was why Base net was empty).
+    rows = [_row(
+        {"minotaur": _r(out=100000, fee=10 ** 15), "1inch": _r(out=100000)},
+        input_is_native=False, output_is_native=False,
+        native_usd=2000.0, notional_usd=5000.0,
+    )]
+    cs = compute_chain_stats(rows, 8453)
+    assert cs["net"]["vs_source"]["1inch"]["comparable"] == 1
+
+
 def test_empty_is_valid():
     resp = build_stats_response([], 30)
     assert resp["chains"] == [] and resp["total_comparisons"] == 0
