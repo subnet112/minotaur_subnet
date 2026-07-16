@@ -768,6 +768,22 @@ services:
       CHAIN_ID: "8453"
       CONSENSUS_MODE: "real"
 
+      # ── on-chain registries (same values as the api) ─────────────────
+      # REQUIRED: startup's check_required_env_or_exit(REQUIRED_REGISTRY_ENV)
+      # exits 78 without VALIDATOR_REGISTRY_8453 + _964 — the worker runs the
+      # same api server module and hits the same boot check. Found at the first
+      # real activation (leader, 2026-07-16): the profile-gated service had
+      # never actually booted anywhere before.
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1}"
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1}"
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964}"
+      APP_INTENT_BASE_964: "${APP_INTENT_BASE_964}"
+      CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964}"
+      CHAMPION_CONSENSUS_CHAIN_ID: "${CHAMPION_CONSENSUS_CHAIN_ID:-964}"
+
       # ── shared block-pin read proxy (the api's, at sandbox .5) ───────
       # DISABLE_READ_PROXY=1 above means this process does NOT launch a proxy, so
       # it must be TOLD where the api's proxy is. The solver containers it spawns
