@@ -6,7 +6,7 @@ from minotaur_subnet.dex_compare.stats import build_stats_response, compute_chai
 
 
 def _r(status="ok", out=None, gas=None, net=False, after_fee=None,
-       gas_native=None, gas_usd=None, out_usd=None, fee=None):
+       gas_native=None, gas_usd=None, out_usd=None, in_usd=None, fee=None):
     return {
         "status": status,
         "output_raw": None if out is None else str(out),
@@ -15,6 +15,7 @@ def _r(status="ok", out=None, gas=None, net=False, after_fee=None,
         "gas_native_wei": None if gas_native is None else str(gas_native),
         "gas_usd": gas_usd,
         "output_usd": out_usd,
+        "input_usd": in_usd,
         "fee_raw": None if fee is None else str(fee),   # minotaur platform fee (ETH wei)
         "is_net_of_gas": net,
     }
@@ -205,6 +206,39 @@ def test_build_response_groups_by_chain():
     assert {c["chain_id"] for c in resp["chains"]} == {1, 8453}
     assert resp["sources"][0] == "minotaur"
     assert "caveats" not in resp
+
+
+def test_cost_breakdown_fee_and_gas_in_usd_and_pct():
+    # native_usd=2000; fee 1e15 wei -> $2 ; gas 100000*1e9 wei -> $0.2 ; trade $1000
+    rows = [_row(
+        {"minotaur": _r(out=100, fee=10 ** 15, gas=100000)},
+        native_usd=2000.0, notional_usd=1000.0, gas_price_wei="1000000000",
+    )]
+    cs = compute_chain_stats(rows, 8453)
+    cb = cs["cost_breakdown"]["all"]
+    assert abs(cb["platform_fee_usd_median"] - 2.0) < 1e-6
+    assert abs(cb["platform_fee_pct_of_trade_median"] - 0.2) < 1e-6      # $2 / $1000
+    assert abs(cb["gas_usd_median"] - 0.2) < 1e-6
+    assert abs(cb["gas_pct_of_trade_median"] - 0.02) < 1e-6             # $0.2 / $1000
+
+
+def test_net_by_size_segments_realistic_vs_dust():
+    # realistic ($5000 notional): Minotaur wins vs cow. dust ($1 via velora srcUSD):
+    # Minotaur loses. The split must sort each row into the right bucket.
+    realistic = _row(
+        {"minotaur": _r(out=100), "cow": _r(out=90, net=True)},
+        output_is_native=True, notional_usd=5000.0,
+    )
+    dust = _row(
+        {"minotaur": _r(out=100), "cow": _r(out=110, net=True),
+         "velora": _r(out=105, after_fee=105, in_usd=1.0)},
+        output_is_native=True,
+    )
+    cs = compute_chain_stats([realistic, dust], 8453)
+    nbs = cs["net_by_size"]
+    assert nbs["realistic"]["comparisons"] == 1 and nbs["small"]["comparisons"] == 1
+    assert nbs["realistic"]["vs_source"]["cow"]["minotaur_wins"] == 1
+    assert nbs["small"]["vs_source"]["cow"]["minotaur_losses"] == 1
 
 
 def test_empty_is_valid():
