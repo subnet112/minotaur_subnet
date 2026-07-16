@@ -214,15 +214,16 @@ async def test_eviction_drops_stale_entries_when_over_cap():
         now = time.monotonic()
         for i in range(10_001):
             ts = now - 1000.0 if i < 5000 else now - 1.0  # 5000 stale
-            se_mod._SEEN_PROPOSALS[(f"ord{i}", f"hash{i}")] = ts
+            # value schema: (first_seen_monotonic, cached verdict | None)
+            se_mod._SEEN_PROPOSALS[(f"ord{i}", f"hash{i}")] = (ts, None)
         assert len(se_mod._SEEN_PROPOSALS) == 10_001
         se_mod._evict_expired_locked(now)
         # Stale ones should be gone; size should be back at or below the cap.
         assert len(se_mod._SEEN_PROPOSALS) <= se_mod._SEEN_PROPOSALS_MAX
         # No stale entries should remain.
         cutoff = now - se_mod._SEEN_PROPOSALS_TTL
-        for ts in se_mod._SEEN_PROPOSALS.values():
-            assert ts >= cutoff
+        for entry in se_mod._SEEN_PROPOSALS.values():
+            assert entry[0] >= cutoff
     finally:
         se_mod._SEEN_PROPOSALS.clear()
         se_mod._SEEN_PROPOSALS.update(saved)
@@ -241,7 +242,7 @@ def test_eviction_noop_when_below_cap():
         now = time.monotonic()
         # Seed 5 stale entries, well under cap.
         for i in range(5):
-            se_mod._SEEN_PROPOSALS[(f"o{i}", f"h{i}")] = now - 1000.0
+            se_mod._SEEN_PROPOSALS[(f"o{i}", f"h{i}")] = (now - 1000.0, None)
         se_mod._evict_expired_locked(now)
         # All 5 still present — eviction only kicks in over cap.
         assert len(se_mod._SEEN_PROPOSALS) == 5

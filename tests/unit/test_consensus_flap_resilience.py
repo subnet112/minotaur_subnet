@@ -164,13 +164,16 @@ async def test_evicted_peer_streak_pruned():
 # ── 2. Order-processor defer/retry ───────────────────────────────────────
 
 
-def _processor():
+def _processor(spacing: float = 0.0):
     from minotaur_subnet.blockloop.order_processor import OrderProcessor
 
     proc = OrderProcessor.__new__(OrderProcessor)
     proc.orderbook = MagicMock()
     proc.order_persistence = MagicMock()
     proc._consensus_retries = {}
+    # Most tests exercise attempt counting, not pacing — disable spacing
+    # unless the test is specifically about it.
+    proc._CONSENSUS_RETRY_SPACING_S = spacing
     return proc
 
 
@@ -235,6 +238,50 @@ def test_terminal_rejection_carries_consensus_result():
     assert "consensus_result" in kwargs
 
 
+def test_retry_spacing_does_not_consume_attempts():
+    """Failures inside the spacing window requeue WITHOUT consuming an
+    attempt — counted attempts stay >= spacing apart, so the retry budget
+    spans at least one discovery-refresh interval (the review-confirmed
+    gap: unspaced retries burned out in ~36s vs the 60s refresh)."""
+    from minotaur_subnet.orderbook.orderbook import OrderStatus
+
+    proc = _processor(spacing=3600.0)
+    order = _order()
+    for _ in range(10):  # tick-cadence hammering
+        proc._defer_or_reject_consensus(order, "Consensus not reached")
+        kwargs = proc.orderbook.update_order.call_args.kwargs
+        assert kwargs["status"] == OrderStatus.OPEN
+    assert proc._consensus_retries["ord_flap"][0] == 1, (
+        "attempts inside the spacing window must not be consumed"
+    )
+
+
+def test_no_deadline_order_still_gets_retries():
+    """deadline<=0 means 'no deadline' (Order.deadline docs) — it must
+    count as unlimited headroom, not as already-expired."""
+    from minotaur_subnet.orderbook.orderbook import OrderStatus
+
+    proc = _processor()
+    order = SimpleNamespace(order_id="ord_flap", deadline=0)
+    proc._defer_or_reject_consensus(order, "Consensus not reached")
+    assert proc.orderbook.update_order.call_args.kwargs["status"] == OrderStatus.OPEN
+
+
+def test_terminal_error_wording_is_unambiguous():
+    """The terminal form must not read like a deferral — it says
+    'terminal after N attempt(s)' even on the first attempt."""
+    from minotaur_subnet.orderbook.orderbook import OrderStatus
+
+    proc = _processor()
+    proc._defer_or_reject_consensus(
+        _order(deadline_offset_s=30.0),
+        "No reachable validator peers for consensus",
+    )
+    kwargs = proc.orderbook.update_order.call_args.kwargs
+    assert kwargs["status"] == OrderStatus.REJECTED
+    assert "terminal after 1 attempt(s)" in kwargs["error"]
+
+
 # ── 3. Empty-peer broadcast warns instead of silently no-oping ──────────
 
 
@@ -258,3 +305,106 @@ async def test_broadcast_proposal_empty_peers_warns(caplog):
         )
     assert out == []
     assert any("peer list is EMPTY" in r.message for r in caplog.records)
+
+
+# ── 4. Follower replay guard is idempotent, not a retry killer ──────────
+
+
+def _scoring_engine(inner_result=None, inner=None):
+    from unittest.mock import AsyncMock
+
+    from minotaur_subnet.validator import scoring_engine as se
+    from minotaur_subnet.validator.scoring_engine import ScoringEngine
+
+    se._SEEN_PROPOSALS.clear()
+    eng = ScoringEngine.__new__(ScoringEngine)
+    eng._verify_and_score_proposal_inner = inner or AsyncMock(
+        return_value=dict(inner_result or {
+            "approved": True,
+            "order_id": "ord_flap",
+            "plan_hash": "0x" + "11" * 32,
+            "local_score": 1.0,
+            "chain_id": 8453,
+            "contract_address": "0x" + "22" * 20,
+        })
+    )
+    return eng
+
+
+_PROPOSAL_BODY = {
+    "order_id": "ord_flap",
+    "plan_hash": "0x" + "11" * 32,
+    "score": 1.0,
+}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_proposal_reserves_cached_verdict():
+    """A leader retry re-proposing the same (order_id, plan_hash) —
+    deterministic champion, identical plan — must get the SAME verdict
+    back, not a 'duplicate_proposal' rejection that defeats the retry."""
+    eng = _scoring_engine()
+    first = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    second = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+
+    assert first["approved"] is True
+    assert second["approved"] is True
+    assert second["replayed"] is True
+    assert second["local_score"] == first["local_score"]
+    eng._verify_and_score_proposal_inner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cached_verdict_survives_route_mutation():
+    """The route handler pops 'status' off served rejections — the cache
+    must serve copies so the first consumer can't corrupt the second's."""
+    eng = _scoring_engine(inner_result={
+        "approved": False, "reason": "nope", "status": 403,
+    })
+    first = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    first.pop("status")  # what proposal_handler does before serving
+    second = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    assert second.get("status") == 403
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_rejected_while_first_in_flight():
+    """Two CONCURRENT identical proposals: the second must be rejected
+    (the original abuse shape) — only completed verdicts are re-served."""
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def _slow_inner(body, threshold):
+        await gate.wait()
+        return {"approved": True, "order_id": "ord_flap",
+                "plan_hash": "0x" + "11" * 32, "local_score": 1.0,
+                "chain_id": 8453, "contract_address": None}
+
+    eng = _scoring_engine(inner=_slow_inner)
+    t1 = asyncio.create_task(eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5))
+    await asyncio.sleep(0.05)
+    dup = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    assert dup["approved"] is False
+    assert dup["reason"] == "duplicate_proposal"
+    gate.set()
+    assert (await t1)["approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_inner_exception_clears_inflight_marker():
+    """An evaluation that crashes must not poison retries for the TTL
+    (the reserve-then-crash bug class from PR #801)."""
+    from unittest.mock import AsyncMock
+
+    inner = AsyncMock(side_effect=[RuntimeError("boom"), {
+        "approved": True, "order_id": "ord_flap",
+        "plan_hash": "0x" + "11" * 32, "local_score": 1.0,
+        "chain_id": 8453, "contract_address": None,
+    }])
+    eng = _scoring_engine(inner=inner)
+    with pytest.raises(RuntimeError):
+        await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    result = await eng.verify_and_score_proposal(dict(_PROPOSAL_BODY), 0.5)
+    assert result["approved"] is True
+    assert inner.await_count == 2

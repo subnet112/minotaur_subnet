@@ -40,6 +40,16 @@ from minotaur_subnet.v3.flags import load_v3_flags
 logger = logging.getLogger(__name__)
 
 
+def _int_env(name: str, default: int) -> int:
+    """Env int with fallback — malformed values must not crash import
+    (same posture as ``relayer.safeguards.Safeguards.from_env``)."""
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, os.environ.get(name), default)
+        return default
+
+
 # Revert signatures of a USER-side signature fault at settlement (#229). When
 # executeIntent reverts on one of these, the user's order signature was invalid —
 # the plan still passed JS scoring, on-chain sim scoring, and the validator quorum
@@ -174,8 +184,16 @@ class OrderProcessor:
         self._consensus_retries: dict[str, tuple[int, float]] = {}
 
     # How many consensus attempts an order gets before the failure is
-    # terminal, and how much order-deadline headroom a retry requires.
-    _CONSENSUS_RETRY_MAX = int(os.environ.get("ORDER_CONSENSUS_RETRY_MAX", "").strip() or 3)
+    # terminal, how much order-deadline headroom a retry requires, and the
+    # minimum spacing between counted attempts. Spacing matters: the block
+    # loop re-picks a requeued order every ~12s tick, but the peer set can
+    # only recover on a discovery refresh (60s cadence — and the refresh
+    # loop sleeps a full interval before its FIRST pass after boot).
+    # Without spacing, all attempts burn in ~36s and the retry mechanism
+    # mathematically cannot outlast the very condition it waits out.
+    # Requeues inside the spacing window don't consume an attempt.
+    _CONSENSUS_RETRY_MAX = _int_env("ORDER_CONSENSUS_RETRY_MAX", 3)
+    _CONSENSUS_RETRY_SPACING_S = float(_int_env("ORDER_CONSENSUS_RETRY_SPACING_S", 45))
     _CONSENSUS_RETRY_MIN_DEADLINE_S = 60.0
 
     def _defer_or_reject_consensus(
@@ -186,7 +204,8 @@ class OrderProcessor:
 
         The requeued order re-runs the whole pipeline next tick (fresh
         plan, fresh simulation) — same pattern as the perpetual no-plan
-        requeue below.
+        requeue below. ``deadline<=0`` means "no deadline" (see
+        ``Order.deadline``) and counts as unlimited headroom.
         """
         # Opportunistic prune so abandoned entries (order expired outside
         # this path) don't accumulate.
@@ -196,15 +215,40 @@ class OrderProcessor:
                 k: v for k, v in self._consensus_retries.items()
                 if now - v[1] < 7200
             }
-        attempts, _ = self._consensus_retries.get(order.order_id, (0, 0.0))
-        deadline_left = float(order.deadline or 0) - now
+        attempts, last_ts = self._consensus_retries.get(order.order_id, (0, 0.0))
+        deadline = float(order.deadline or 0)
+        deadline_left = (deadline - now) if deadline > 0 else float("inf")
+
+        # Inside the spacing window: requeue without consuming an attempt,
+        # so counted attempts stay >= spacing apart and the retry budget
+        # spans at least one full discovery-refresh interval.
+        if (
+            attempts > 0
+            and (now - last_ts) < self._CONSENSUS_RETRY_SPACING_S
+            and deadline_left > self._CONSENSUS_RETRY_MIN_DEADLINE_S
+        ):
+            logger.info(
+                "Order %s: %s — inside retry spacing window "
+                "(%.0fs/%.0fs since attempt %d), requeued OPEN",
+                order.order_id, reason, now - last_ts,
+                self._CONSENSUS_RETRY_SPACING_S, attempts,
+            )
+            self.orderbook.update_order(
+                order.order_id,
+                status=OrderStatus.OPEN,
+                error=f"{reason} (retry {attempts}/{self._CONSENSUS_RETRY_MAX} pending)",
+            )
+            self.order_persistence.sync(order.order_id)
+            return
+
         if attempts < self._CONSENSUS_RETRY_MAX and deadline_left > self._CONSENSUS_RETRY_MIN_DEADLINE_S:
             self._consensus_retries[order.order_id] = (attempts + 1, now)
             logger.warning(
-                "Order %s: %s (attempt %d/%d, %.0fs of deadline left) — "
-                "requeued OPEN for retry next tick",
+                "Order %s: %s (attempt %d/%d, %s of deadline left) — "
+                "requeued OPEN for retry",
                 order.order_id, reason, attempts + 1,
-                self._CONSENSUS_RETRY_MAX, deadline_left,
+                self._CONSENSUS_RETRY_MAX,
+                "unlimited" if deadline_left == float("inf") else f"{deadline_left:.0f}s",
             )
             self.orderbook.update_order(
                 order.order_id,
@@ -220,10 +264,7 @@ class OrderProcessor:
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.REJECTED,
-            error=(
-                f"{reason} after {attempts + 1} attempt(s)"
-                if attempts else reason
-            ),
+            error=f"{reason} — terminal after {attempts + 1} attempt(s)",
             **update_kwargs,
         )
         self.order_persistence.sync(order.order_id)
@@ -557,7 +598,7 @@ class OrderProcessor:
                 and not self.peer_network.peers
             ):
                 self._defer_or_reject_consensus(
-                    order, "Consensus deferred: no reachable validator peers",
+                    order, "No reachable validator peers for consensus",
                 )
                 return False
 
@@ -609,6 +650,9 @@ class OrderProcessor:
         self.orderbook.update_order(
             order.order_id,
             status=OrderStatus.APPROVED,
+            # Clear any "retry N/M pending" note a prior consensus failure
+            # left — a filled order must not carry a stale error forever.
+            error=None,
             consensus_result=_json_safe(consensus_result) if consensus_result is not None else None,
         )
         self.order_persistence.sync(order.order_id)

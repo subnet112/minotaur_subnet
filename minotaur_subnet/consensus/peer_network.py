@@ -294,6 +294,10 @@ class ValidatorPeerNetwork:
         """Broadcast an authenticated JSON payload to all peers."""
         peers = self.peers
         if not peers:
+            logger.warning(
+                "broadcast_json(%s): peer list is EMPTY — payload sent to nobody",
+                path,
+            )
             return []
 
         if self._session is None or self._session.closed:
@@ -345,6 +349,11 @@ class ValidatorPeerNetwork:
         """
         peers = self.peers
         if not peers:
+            logger.warning(
+                "broadcast_champion_proposal(%s): peer list is EMPTY — "
+                "proposal sent to nobody; quorum > 1 cannot succeed this round",
+                getattr(proposal, "round_id", proposal),
+            )
             return []
 
         if self._session is None or self._session.closed:
