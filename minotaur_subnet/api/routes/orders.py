@@ -963,6 +963,19 @@ def _created_at(order_dict: dict) -> float:
         return 0.0
 
 
+def _parse_class_csv(value: str | None) -> set[str]:
+    """Parse a ``rejection_class`` filter param into a normalized set.
+
+    Accepts a single class or a comma-separated list (``infra,solver``),
+    case-insensitive, whitespace-tolerant. Empty / missing → empty set (no
+    constraint). Used for both the include (``rejection_class``) and exclude
+    (``exclude_rejection_class``) filters.
+    """
+    if not value:
+        return set()
+    return {part.strip().lower() for part in value.split(",") if part.strip()}
+
+
 def _with_rejection_class(order_dict: dict) -> dict:
     """Ensure ``rejection_class`` is present on an order dict.
 
@@ -1025,6 +1038,7 @@ def list_orders(
     app_id: str | None = None,
     status: str | None = None,
     rejection_class: str | None = None,
+    exclude_rejection_class: str | None = None,
     limit: int = _LIST_DEFAULT_LIMIT,
     offset: int = 0,
     full: bool = False,
@@ -1045,10 +1059,18 @@ def list_orders(
       - ``app_id`` / ``status`` — passed through to the store (unchanged).
       - ``rejection_class`` — structured terminal-failure class (see
         ``orderbook.rejection``): ``duplicate`` (already served — not a real
-        failure), ``user``, ``solver``, ``infra``, ``expired``, ``other``. Lets
-        a dashboard fetch e.g. only the ``infra`` failures worth fixing, or
-        exclude ``duplicate`` from a service-success rate, without string-
-        matching ``error``.
+        failure), ``user``, ``solver``, ``infra``, ``expired``, ``other``.
+        Accepts a single class or a comma-separated allowlist
+        (``infra,solver``) — an entry matches if its class is in the list.
+      - ``exclude_rejection_class`` — the inverse: a single class or
+        comma-separated denylist to drop. The idiomatic "real failures only"
+        query is ``?status=rejected&exclude_rejection_class=duplicate`` (the
+        ``duplicate`` bucket was already served, so it's not a failure).
+        ``include`` is applied first, then ``exclude``.
+
+        These let a dashboard fetch only the ``infra`` failures worth fixing,
+        or a clean service-failure denominator, without string-matching
+        ``error``.
 
     Every entry carries ``rejection_class`` (``None`` for non-failures), and the
     response includes ``rejection_class_counts`` — the breakdown over the
@@ -1099,8 +1121,15 @@ def list_orders(
         if rc:
             rejection_class_counts[rc] = rejection_class_counts.get(rc, 0) + 1
 
-    if rejection_class:
-        ordered = [d for d in ordered if d.get("rejection_class") == rejection_class]
+    # Include (allowlist) first, then exclude (denylist). Both accept a single
+    # class or a comma-separated list. "Real failures only" is
+    # exclude_rejection_class=duplicate.
+    include = _parse_class_csv(rejection_class)
+    exclude = _parse_class_csv(exclude_rejection_class)
+    if include:
+        ordered = [d for d in ordered if (d.get("rejection_class") or "") in include]
+    if exclude:
+        ordered = [d for d in ordered if (d.get("rejection_class") or "") not in exclude]
 
     total = len(ordered)
     out = []
