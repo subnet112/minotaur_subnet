@@ -495,7 +495,14 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                     )
 
         # ── Auto-resolve: user nonce for managed wallets ──
-        if "user_nonce" not in req.params and deployment and deployment.contract_address:
+        # Perpetuals are exempt: they must be signed ONCE with the sentinel
+        # nonce (type(uint256).max) so the single signature stays valid across
+        # every fill — the contract neither verifies nor increments the
+        # sentinel. Pinning a concrete per-user nonce here would bind the
+        # signature to a value the contract advances after fill #1, reverting
+        # every fill thereafter. Leaving user_nonce absent resolves to the
+        # sentinel downstream (see relayer.encoder._resolve_nonce).
+        if not req.perpetual and "user_nonce" not in req.params and deployment and deployment.contract_address:
             wallet = _app_store.get_wallet(ia.address)
             if wallet is None:
                 for w in _app_store.list_wallets():
@@ -542,6 +549,7 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                 req.params["intent_selector"] = selector
 
     # Validate perpetual order parameters
+    import time as _time
     if req.perpetual:
         if req.cooldown < _MIN_PERPETUAL_COOLDOWN:
             raise HTTPException(
@@ -553,9 +561,47 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                 status_code=400,
                 detail=f"max_executions cannot exceed {_MAX_PERPETUAL_EXECUTIONS}",
             )
+        # One signature authorizes N fills, which only works with the sentinel
+        # nonce (type(uint256).max): the contract skips the nonce check and never
+        # increments it. A concrete nonce is spent on fill #1 and reverts every
+        # fill after — reject it here rather than let the order die at fill #2.
+        from minotaur_subnet.relayer.encoder import _resolve_nonce, _SENTINEL_NONCE
+        _pnonce = req.params.get("user_nonce")
+        if _pnonce is not None and _resolve_nonce(_pnonce) != _SENTINEL_NONCE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual orders must use the sentinel nonce "
+                    "(type(uint256).max) so one signature authorizes every fill; "
+                    "a concrete user_nonce is only valid for one-shot orders."
+                ),
+            )
+        # A perpetual is bound by its signed deadline on EVERY fill (the contract
+        # enforces block.timestamp <= deadline each time), so the 1-hour default
+        # below would silently cap it at ~1h regardless of max_executions. Require
+        # an explicit, far-enough deadline instead of silently defaulting.
+        _now = _time.time()
+        if req.deadline <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual orders require an explicit far-future deadline: the "
+                    "signed deadline caps every fill, so set one that spans the "
+                    "intended schedule."
+                ),
+            )
+        if req.deadline < _now + req.cooldown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual deadline too soon: must be at least one cooldown "
+                    f"({req.cooldown:.0f}s) in the future so more than one fill is "
+                    "possible."
+                ),
+            )
 
-    # Default deadline: 1 hour from now (on-chain rejects deadline=0)
-    import time as _time
+    # Default deadline: 1 hour from now (on-chain rejects deadline=0).
+    # Perpetuals are already validated to carry an explicit deadline above.
     effective_deadline = req.deadline
     if effective_deadline == 0:
         effective_deadline = _time.time() + 3600
