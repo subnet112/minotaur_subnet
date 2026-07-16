@@ -1722,6 +1722,101 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     return response
 
 
+class PreparePermitRequest(BaseModel):
+    """Request the EIP-2612 permit digest for a standing-allowance approval."""
+    token: str            # ERC-20 to approve (e.g. the perpetual's input or fee token)
+    owner: str            # the user's wallet (permit signer)
+    value: int            # allowance amount, raw units (e.g. required_*_allowance_wei)
+    chain_id: int = 1
+    deadline: int = 0     # 0 → default (now + 30 min)
+
+
+@router.post("/apps/{app_id}/prepare-permit")
+def prepare_permit(app_id: str, req: PreparePermitRequest) -> dict:
+    """Build the EIP-2612 permit digest the user signs to set a standing allowance.
+
+    Perpetual funding uses the user's wallet balance + a standing ERC-20 allowance
+    (no prefund/escrow). Instead of an on-chain ``approve()``, the user can sign a
+    gasless permit that the relayer submits to set the allowance (carried on the
+    order as ``permit_value``/``permit_deadline``/``permit_v``/``permit_r``/
+    ``permit_s``). This endpoint assembles the exact digest for
+    ``(token, owner, spender=app contract, value)`` by reading the token's
+    ``DOMAIN_SEPARATOR()`` and ``nonces(owner)`` on-chain, so the frontend just
+    signs the returned digest and echoes the ``permit_*`` fields back.
+
+    Typical flow: POST /apps/{id}/quote with ``perpetual=true`` → read
+    ``perpetual.required_input_allowance_wei`` / ``required_fee_allowance_wei`` →
+    call this once per token with that value → sign ``digest`` → submit the order
+    with the ``permit_*`` params.
+
+    400 if the token doesn't implement ERC-2612 (approve() on-chain instead).
+    """
+    s = _app_store
+    if s is None:
+        from minotaur_subnet.api.server import store as _s
+        s = _s
+    if s is None:
+        raise HTTPException(status_code=503, detail="App store not initialized")
+
+    deployment = s.get_deployment(app_id, chain_id=req.chain_id)
+    if deployment is None or not deployment.contract_address:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No operational deployment for {app_id} on chain {req.chain_id}",
+        )
+    spender = deployment.contract_address
+
+    try:
+        from minotaur_subnet.blockchain.chains import get_web3
+        w3 = get_web3(req.chain_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"No web3 for chain {req.chain_id}: {exc}")
+
+    if req.value <= 0:
+        raise HTTPException(status_code=400, detail="value must be > 0")
+
+    from minotaur_subnet.blockchain.token_approval import build_permit_digest
+    result = build_permit_digest(
+        w3, req.token, req.owner, spender, req.value,
+        req.deadline if req.deadline > 0 else None,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Token does not support ERC-2612 permit — approve() the app "
+                "contract on-chain for the required allowance instead."
+            ),
+        )
+
+    return {
+        "app_id": app_id,
+        "chain_id": req.chain_id,
+        "token": req.token,
+        "owner": req.owner,
+        "spender": spender,
+        "value": str(req.value),
+        "nonce": result["nonce"],
+        "deadline": result["deadline"],
+        "domain_separator": result["domain_separator"],
+        # The final EIP-712 digest (0x1901 prefix already applied). Sign this raw
+        # 32-byte hash with the owner wallet; split the 65-byte signature into
+        # v/r/s. NB: sign the raw hash, NOT a personal_sign/EIP-191 message.
+        "digest": result["digest"],
+        # Echo these on the order params after signing (v/r/s from the signature):
+        "order_params": {
+            "permit_value": str(req.value),
+            "permit_deadline": result["deadline"],
+        },
+        "note": (
+            "Sign `digest` (raw 32-byte hash) with the owner wallet, split the "
+            "signature into permit_v/permit_r/permit_s, and include those plus "
+            "permit_value/permit_deadline in the order params so the relayer sets "
+            "the allowance gaslessly. Repeat per token (input + fee)."
+        ),
+    }
+
+
 @router.get("/orders/{order_id}/bridge")
 def get_bridge_status(order_id: str) -> dict:
     """Get bridge transfer status for a cross-chain order.
