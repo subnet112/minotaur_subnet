@@ -40,6 +40,16 @@ def to_int(value: Any) -> int | None:
             return None
 
 
+def to_float(value: Any) -> float | None:
+    """Best-effort parse of a numeric/string value to float (None on failure)."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def str_or_none(value: Any) -> str | None:
     if value is None:
         return None
@@ -64,6 +74,10 @@ class TradeDescriptor:
     output_symbol: str | None
     input_is_native: bool   # resolved token == wrapped native for the chain
     output_is_native: bool
+    # Size-normalization metadata (set when the worker rescales the order to a
+    # target USD notional). input_amount above is the amount actually QUOTED.
+    notional_usd: float | None = None       # USD value the trade was scaled to
+    original_input_amount: str | None = None  # the untouched historical amount
 
 
 @dataclass
@@ -72,21 +86,36 @@ class QuoteOutcome:
 
     source: str
     status: str
-    output_raw: str | None = None      # base units of the OUTPUT token (decimal string)
+    output_raw: str | None = None      # base units of the OUTPUT token (GROSS, decimal string)
     gas_units: int | None = None       # estimated gas units for the swap
     fee_raw: str | None = None         # CoW feeAmount / Minotaur platform_fee_wei
     is_net_of_gas: bool = False        # True only for CoW (gasless/solver-pays-gas)
     dex: str | None = None             # protocol/route label
     latency_ms: int | None = None
     error: str | None = None
+    # ── net-comparison fields (populated where the source provides them) ──
+    output_after_fee_raw: str | None = None  # output net of the source's OWN protocol fee
+    gas_native_wei: str | None = None        # gas cost in native (ETH) wei, if given directly (0x)
+    protocol_fee_raw: str | None = None      # the source's protocol fee amount (informational)
+    input_usd: float | None = None           # USD value of the input (Velora srcUSD)
+    output_usd: float | None = None          # USD value of the output (Velora destUSD)
+    gas_usd: float | None = None             # gas cost in USD (Velora gasCostUSD)
+    price_impact_reached: bool = False       # source flagged excessive price impact
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "output_raw": self.output_raw,
+            "output_after_fee_raw": self.output_after_fee_raw,
             "gas_units": self.gas_units,
+            "gas_native_wei": self.gas_native_wei,
             "fee_raw": self.fee_raw,
+            "protocol_fee_raw": self.protocol_fee_raw,
             "is_net_of_gas": self.is_net_of_gas,
+            "input_usd": self.input_usd,
+            "output_usd": self.output_usd,
+            "gas_usd": self.gas_usd,
+            "price_impact_reached": self.price_impact_reached,
             "dex": self.dex,
             "latency_ms": self.latency_ms,
             "error": self.error,
@@ -101,3 +130,4 @@ class ComparisonRow:
     trade: TradeDescriptor
     gas_price_wei: str | None
     outcomes: dict[str, QuoteOutcome] = field(default_factory=dict)
+    native_usd: float | None = None   # USD price of the chain's native token (for gas/fee conversion)

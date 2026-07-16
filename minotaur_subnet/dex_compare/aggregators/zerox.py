@@ -60,17 +60,28 @@ class ZeroxClient(AggregatorClient):
             if not result.ok:
                 return self._error(result.error, latency)
             data = result.data or {}
-            out = to_int(data.get("buyAmount"))
-            if out is None or out <= 0:
+            # 0x v2 `buyAmount` is NET of the zeroExFee; `grossBuyAmount` is the
+            # pre-fee gross. Use gross for the raw board, buyAmount for after-fee.
+            buy = to_int(data.get("buyAmount"))
+            if buy is None or buy <= 0:
                 return self._failed("no buyAmount / no liquidity", latency)
+            gross = to_int(data.get("grossBuyAmount"))
+            out = gross if (gross is not None and gross >= buy) else buy
             # 0x returns a routing "source" list; best-effort protocol label.
             dex = None
             route = (data.get("route") or {}).get("fills")
             if isinstance(route, list) and route:
                 dex = route[0].get("source")
+            zerox_fee = (data.get("fees") or {}).get("zeroExFee") or {}
             return self._ok(
-                str(out),
+                str(out),                        # gross (grossBuyAmount when given)
+                output_after_fee_raw=str(buy),   # buyAmount is net of zeroExFee
                 gas_units=to_int(data.get("gas")),
+                # totalNetworkFee = exact gas cost in NATIVE (ETH) wei.
+                gas_native_wei=(str(to_int(data.get("totalNetworkFee")))
+                                if data.get("totalNetworkFee") is not None else None),
+                protocol_fee_raw=(str(zerox_fee.get("amount"))
+                                  if zerox_fee.get("amount") is not None else None),
                 is_net_of_gas=False,
                 dex=dex or "0x",
                 latency_ms=latency,

@@ -38,6 +38,7 @@ def _cfg(store_path, chains=(8453,)) -> DexCompareConfig:
         api_base_url="http://127.0.0.1:8080", slippage_bps=50, http_timeout=5.0,
         max_retries=1, retain_days=90, max_rows=1000, supported_chain_ids=chains,
         store_path=str(store_path),
+        normalize_size=False, target_usd=5000.0, price_cache_ttl=600.0, max_price_impact_bps=300,
         cow_base_url="https://api.cow.fi", velora_base_url="https://api.velora.xyz",
         oneinch_api_key=None, oneinch_base_url="https://api.1inch.dev", oneinch_version="v6.0",
         zerox_api_key=None, zerox_base_url="https://api.0x.org",
