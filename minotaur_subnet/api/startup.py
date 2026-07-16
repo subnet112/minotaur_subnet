@@ -3755,6 +3755,14 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 while True:
                     try:
+                        # Time-weighted emission OBSERVE (Phase 0): sample the
+                        # current champion into the throne-time accumulator each
+                        # tick (finer than one epoch). No-op unless
+                        # EMISSION_TIME_WEIGHTED_OBSERVE is set; never raises.
+                        _em = getattr(ctx, "epoch_manager", None)
+                        if _em is not None:
+                            _em.observe_accrue_throne_time()
+
                         current = round_store.get_current_round()
                         if current is None:
                             incumbent = round_store.get_active_champion()
