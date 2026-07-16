@@ -123,6 +123,25 @@ _OVERRIDE_ENV = "QUORUM_BPS_OVERRIDE"
 MetagraphPeerProvider = Callable[[], Awaitable[Sequence[MetagraphPeer]]]
 
 
+def _peer_eviction_misses_from_env() -> int:
+    """PEER_EVICTION_CONSECUTIVE_MISSES with fallback + floor.
+
+    Malformed values must not crash ProtocolConfig construction, and a
+    value < 1 would evict peers that answered their probe — clamp to 1
+    (which reproduces the pre-hysteresis evict-on-first-miss behavior).
+    """
+    raw = os.environ.get("PEER_EVICTION_CONSECUTIVE_MISSES", "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        logger.warning(
+            "PEER_EVICTION_CONSECUTIVE_MISSES=%r is not an integer; using 3",
+            raw,
+        )
+        return 3
+    return max(1, value)
+
+
 @dataclass
 class ProtocolConfig:
     """Network parameters shared by all off-chain components."""
@@ -201,9 +220,7 @@ class ProtocolConfig:
     # terminally rejected ("Consensus not reached"). One bad probe round
     # must not empty the set. Env: PEER_EVICTION_CONSECUTIVE_MISSES.
     peer_eviction_misses: int = field(
-        default_factory=lambda: int(
-            os.environ.get("PEER_EVICTION_CONSECUTIVE_MISSES", "").strip() or 3
-        )
+        default_factory=lambda: _peer_eviction_misses_from_env()
     )
     # evm_address_lower -> consecutive refresh cycles the peer failed its
     # probe. Reset on any successful probe; pruned on eviction.
