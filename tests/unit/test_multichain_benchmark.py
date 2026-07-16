@@ -30,6 +30,10 @@ BASE = 8453
 def _dep(chain_id: int, status: AppStatus, addr: str = "0xabc"):
     return SimpleNamespace(
         chain_id=chain_id, status=status, contract_address=addr, app_id="app_x",
+        # #848 deregister-not-delete: intent loading asks every deployment
+        # whether it is effectively retired at the round's opened_epoch.
+        # These stubs model live deployments — never retired.
+        is_effectively_retired=lambda at_epoch=None: False,
     )
 
 
