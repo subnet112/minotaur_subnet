@@ -839,16 +839,22 @@ def _build_solver_round_benchmark_pack_hash(
         deregistered_app_ids,
     )
     from minotaur_subnet.harness.order_sampler import sample_historical_orders
+    from minotaur_subnet.harness.round_store import opened_epoch_from_round_id
 
     submission_store = submissions.get_store()
     round_subs = submission_store.list_by_round(round_id)
-    # Fully deregistered (all-deployments-RETIRED) apps drop out of the fingerprint,
-    # together with their historical orders (dropped by ``sample_historical_orders``
-    # below). So retiring an app changes the pack hash even if it had no sampled
-    # orders, and a fleet split on the retirement is caught as a hash mismatch
-    # rather than silently scoring divergent corpora. Keyed on RETIRED only, so the
-    # promote itself is byte-identical — only a deliberate retire flips the hash.
-    _deregistered = deregistered_app_ids(ctx.store)
+    # Round-anchored retirement cutover: the round's opened_epoch (parsed from
+    # round_id, fleet-uniform) decides whether a RETIRING app has crossed its
+    # effective epoch. sample_historical_orders derives the SAME at_epoch from
+    # round_id internally, so both hash halves flip on the identical round.
+    _at_epoch = opened_epoch_from_round_id(round_id)
+    # Fully deregistered apps drop out of the fingerprint, together with their
+    # historical orders (dropped by ``sample_historical_orders`` below). So retiring
+    # an app changes the pack hash even if it had no sampled orders, and a fleet
+    # split on the retirement is caught as a hash mismatch rather than silently
+    # scoring divergent corpora. Keyed on effective retirement only, so the promote
+    # itself is byte-identical — only a deliberate retire flips the hash.
+    _deregistered = deregistered_app_ids(ctx.store, _at_epoch)
     apps_payload = [
         {
             "app_id": app.app_id,
@@ -885,7 +891,7 @@ def _build_solver_round_benchmark_pack_hash(
     ]
     # Canonical hash of scenarios (Stage 1 + Stage 2)
     try:
-        synthetic_scenarios = collect_synthetic_scenarios(ctx.store)
+        synthetic_scenarios = collect_synthetic_scenarios(ctx.store, _at_epoch)
     except Exception as exc:
         logger.warning("pack_hash: synthetic scenario collection failed: %s", exc)
         synthetic_scenarios = []

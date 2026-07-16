@@ -67,6 +67,11 @@ def _hash_deployment(d: DeploymentResult) -> str:
     h.update(str(d.chain_id).encode())
     h.update(b"|")
     h.update(d.status.value.encode())
+    h.update(b"|")
+    # Folded so a RETIRING deployment's stamped cutover epoch triggers a follower
+    # re-sync (and the fingerprint below reflects it) — without it, followers would
+    # see status=RETIRING but never learn WHEN it takes effect → divergent corpus.
+    h.update(str(d.retire_effective_epoch if d.retire_effective_epoch is not None else "").encode())
     return h.hexdigest()
 
 
@@ -97,7 +102,9 @@ def catalog_fingerprint(store: "AppIntentStore") -> str:
         except Exception:
             deps = {}
         for chain_id in sorted(deps):
-            h.update(f"{chain_id}:{deps[chain_id].status.value}|".encode())
+            dep = deps[chain_id]
+            ree = dep.retire_effective_epoch
+            h.update(f"{chain_id}:{dep.status.value}:{ree if ree is not None else ''}|".encode())
         h.update(b";")
     return h.hexdigest()
 
@@ -333,12 +340,14 @@ class ValidatorAppCatalogSync:
                 chain_id = int(chain_id_str)
             except (TypeError, ValueError):
                 continue
+            _ree = dep_dict.get("retire_effective_epoch")
             new_dep = DeploymentResult(
                 app_id=new_def.app_id,
                 status=_app_status_from_str(dep_dict.get("status", "draft")),
                 contract_address=dep_dict.get("contract_address"),
                 chain_id=chain_id,
                 abi=primary_abi,
+                retire_effective_epoch=int(_ree) if _ree is not None else None,
             )
             existing_dep = self.store.get_deployment(new_def.app_id, chain_id=chain_id)
             if existing_dep is None or _hash_deployment(existing_dep) != _hash_deployment(new_dep):

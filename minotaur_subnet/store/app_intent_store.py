@@ -161,6 +161,7 @@ def _deployment_from_dict(d: dict[str, Any]) -> DeploymentResult:
         error=d.get("error"),
         tx_hash=d.get("tx_hash"),
         abi=d.get("abi"),
+        retire_effective_epoch=d.get("retire_effective_epoch"),
     )
 
 
@@ -661,8 +662,13 @@ class AppIntentStore:
 
     def update_deployment_status(
         self, app_id: str, chain_id: int, status: AppStatus,
+        *, retire_effective_epoch: int | None = None,
     ) -> bool:
-        """Update a deployment's status without replacing the record."""
+        """Update a deployment's status without replacing the record.
+
+        ``retire_effective_epoch``: when provided, stamps the round-anchored
+        retirement cutover (used by ``deregister_app`` alongside status=RETIRING).
+        Left unchanged when None so ordinary status transitions don't clear it."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -675,6 +681,8 @@ class AppIntentStore:
                     return False
                 dep = _deployment_from_dict(json.loads(row["data"]))
                 dep.status = status
+                if retire_effective_epoch is not None:
+                    dep.retire_effective_epoch = retire_effective_epoch
                 conn.execute(
                     "UPDATE deployments SET data=? WHERE app_id=? AND chain_id=?",
                     (_dumps(dep), app_id, chain_id),

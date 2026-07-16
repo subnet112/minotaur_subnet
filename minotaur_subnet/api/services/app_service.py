@@ -729,6 +729,7 @@ def get_app_status(
                 "contract_address": d.contract_address,
                 "chain_id": d.chain_id,
                 "status": d.status.value,
+                "retire_effective_epoch": d.retire_effective_epoch,
             }
             for cid, d in deployments.items()
         },

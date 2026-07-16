@@ -20,7 +20,7 @@ import logging
 import random
 from typing import Any
 
-from minotaur_subnet.shared.types import AppStatus
+from minotaur_subnet.harness.round_store import opened_epoch_from_round_id
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,11 @@ _BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_a
 STAGE2_CORPUS_SAMPLES: int = 50
 
 
-def retired_app_chain_keys(app_store: Any) -> set[tuple[str, int]]:
-    """``(app_id, chain_id)`` pairs whose deployment is RETIRED — dropped from the draw.
+def retired_app_chain_keys(
+    app_store: Any, at_epoch: int | None = None,
+) -> set[tuple[str, int]]:
+    """``(app_id, chain_id)`` pairs effectively retired for a round at ``at_epoch``
+    — dropped from the draw.
 
     Deregistration is deregister-NOT-delete: retiring a deployment keeps every
     order row in the store (still queryable via ``/orders?app_id=...``), but its
@@ -74,13 +77,16 @@ def retired_app_chain_keys(app_store: Any) -> set[tuple[str, int]]:
     diverges LOUDLY (PACK_HASH_MISMATCH → no adoption) instead of silently scoring
     different corpora under one hash.
 
-    The exclusion is corpus-membership-affecting, so it MUST be fleet-uniform
-    (same consensus class as ``STAGE2_CORPUS_SAMPLES``). It is derived purely from
-    replicated deployment status (app-sync mirrors ``status`` into every follower's
-    store), so every validator computes the identical set from its synced catalog.
-    Fail-open to empty on a store error: a transient read must never silently
-    shrink one validator's corpus (that validator's hash then simply fails to match
-    and it drops out of quorum, rather than corrupting adoption).
+    ``at_epoch`` is the round's ``opened_epoch`` (parsed from round_id). RETIRED
+    deployments drop immediately; RETIRING ones drop only once the round reaches
+    their ``retire_effective_epoch`` — a round-anchored, fleet-uniform cutover
+    (see ``DeploymentResult.is_effectively_retired``). The exclusion is
+    corpus-membership-affecting, so it MUST be fleet-uniform (same consensus class
+    as ``STAGE2_CORPUS_SAMPLES``): both status and effective-epoch are replicated by
+    app-sync, so every validator computes the identical set. Fail-open to empty on a
+    store error: a transient read must never silently shrink one validator's corpus
+    (that validator's hash then simply fails to match and it drops out of quorum,
+    rather than corrupting adoption).
     """
     retired: set[tuple[str, int]] = set()
     try:
@@ -97,7 +103,7 @@ def retired_app_chain_keys(app_store: Any) -> set[tuple[str, int]]:
         except Exception:
             continue
         for chain_id, dep in deployments.items():
-            if getattr(dep, "status", None) == AppStatus.RETIRED:
+            if dep.is_effectively_retired(at_epoch):
                 try:
                     retired.add((app_id, int(chain_id)))
                 except (TypeError, ValueError):
@@ -186,11 +192,15 @@ def sample_historical_orders(
             logger.warning("Failed to list orders for Stage 2 sampling: %s", exc)
             return []
 
-    # Deregistered (RETIRED) deployments drop out of the draw — auto-derived from
-    # the store when not supplied so the runtime draw, the pack hash, and the veto
-    # slice all exclude the identical set. See ``retired_app_chain_keys``.
+    # Deregistered deployments drop out of the draw — auto-derived from the store
+    # when not supplied so the runtime draw, the pack hash, and the veto slice all
+    # exclude the identical set. The round-anchored cutover (RETIRING → effective at
+    # a stamped epoch) is applied via the round's opened_epoch, parsed from round_id
+    # so this stays a pure function of the id that already seeds the draw. See
+    # ``retired_app_chain_keys``.
     if exclude_app_chains is None:
-        exclude_app_chains = retired_app_chain_keys(app_store)
+        at_epoch = opened_epoch_from_round_id(round_id)
+        exclude_app_chains = retired_app_chain_keys(app_store, at_epoch)
 
     # Filter by status + chain. NOTE: we do NOT require a block_number. The
     # benchmark forks at self._epoch_block_number (the round/env pin, or live head
@@ -435,8 +445,11 @@ def partition_follower_slices(
             return []
 
     # Retired deployments are excluded from BOTH the canonical draw and the
-    # remainder, so a deregistered app's orders never leak into a veto slice.
-    exclude_app_chains = retired_app_chain_keys(app_store)
+    # remainder, so a deregistered app's orders never leak into a veto slice. Uses
+    # the SAME round-anchored at_epoch (parsed from round_id) as the canonical draw,
+    # or the RETIRING cutover could diverge between the two.
+    exclude_app_chains = retired_app_chain_keys(
+        app_store, opened_epoch_from_round_id(round_id))
     candidates = _filter_candidates(
         all_orders,
         include_statuses={"filled", "rejected", "expired"},
