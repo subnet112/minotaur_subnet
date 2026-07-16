@@ -286,13 +286,67 @@ class ValidatorPeerNetwork:
         )
         return approvals
 
+    async def _await_peers_for_lifecycle(self, label: str) -> list:
+        """Bounded wait for a non-empty peer set before a LIFECYCLE broadcast.
+
+        A broadcast fired in the leader's first seconds after a restart —
+        before peer discovery completes its first verified pass — goes to
+        NOBODY. Live 2026-07-16: the champion certify broadcast at
+        api-boot+27s reached zero peers, both followers 409'd the later
+        activate ("Round is closed; expected certified"), and only a manual
+        reattest healed the fleet. Orders already defer at their caller
+        (#827); champion/round-lifecycle broadcasts get this bounded wait:
+        poll the discovery-refreshed peer list up to
+        ``LIFECYCLE_BROADCAST_PEER_WAIT_SECONDS`` (default 90; 0 disables),
+        then fall through to the to-nobody warning — pull-reconcile and
+        reattest remain the catch-alls, this just stops making them
+        necessary on every restart-adjacent handover.
+
+        Waits ONLY when peers are plausibly expected: a protocol_config with
+        >1 on-chain validator (single-node/dev setups must not stall every
+        round sync for the full bound).
+        """
+        peers = self.peers
+        if peers:
+            return peers
+        try:
+            bound = float(os.environ.get(
+                "LIFECYCLE_BROADCAST_PEER_WAIT_SECONDS", "90",
+            ).strip() or 90)
+        except ValueError:
+            bound = 90.0
+        expected = 0
+        cfg = self.protocol_config
+        if cfg is not None:
+            expected = len(getattr(cfg, "on_chain_validators", None) or [])
+        if bound <= 0 or expected <= 1:
+            return peers
+        logger.warning(
+            "%s: peer list is EMPTY with %d on-chain validators — waiting up "
+            "to %.0fs for peer discovery before broadcasting",
+            label, expected, bound,
+        )
+        waited = 0.0
+        while waited < bound:
+            step = min(3.0, bound - waited)
+            await asyncio.sleep(step)
+            waited += step
+            peers = self.peers
+            if peers:
+                logger.info(
+                    "%s: peer discovery caught up after %.0fs — broadcasting "
+                    "to %d peer(s)", label, waited, len(peers),
+                )
+                return peers
+        return self.peers
+
     async def broadcast_json(
         self,
         path: str,
         payload: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Broadcast an authenticated JSON payload to all peers."""
-        peers = self.peers
+        peers = await self._await_peers_for_lifecycle(f"broadcast_json({path})")
         if not peers:
             logger.warning(
                 "broadcast_json(%s): peer list is EMPTY — payload sent to nobody",
@@ -347,7 +401,9 @@ class ValidatorPeerNetwork:
         followers run a full reactive benchmark (minutes) before signing, far
         longer than the default session timeout. ``None`` keeps the session default.
         """
-        peers = self.peers
+        peers = await self._await_peers_for_lifecycle(
+            f"broadcast_champion_proposal({getattr(proposal, 'round_id', proposal)})"
+        )
         if not peers:
             logger.warning(
                 "broadcast_champion_proposal(%s): peer list is EMPTY — "
