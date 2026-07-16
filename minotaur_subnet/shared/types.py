@@ -71,11 +71,32 @@ class AppStatus(str, Enum):
     ACTIVE = "active"            # Legacy — treated same as SOLVED
     PARTIAL = "partial"          # Some chains deployed, some not yet
     PAUSED = "paused"            # Temporarily stopped
+    RETIRING = "retiring"        # Deregistering — benchmarked until a stamped
+    #                              future epoch, then treated as RETIRED (the
+    #                              round-anchored cutover; see
+    #                              DeploymentResult.retire_effective_epoch)
     RETIRED = "retired"          # Permanently stopped
 
     def is_operational(self) -> bool:
-        """Can this app be loaded for benchmarking/solving?"""
+        """Can this app be loaded for benchmarking/solving?
+
+        RETIRING is deliberately NOT operational — it is closing and takes no new
+        orders. Its transitional "still benchmarked until the cutover epoch"
+        window is handled by ``is_benchmark_loadable`` +
+        ``DeploymentResult.is_effectively_retired``, NOT here, so no other
+        is_operational consumer (routing, order acceptance) treats it as live.
+        """
         return self in (AppStatus.SOLVING, AppStatus.SOLVED, AppStatus.ACTIVE)
+
+    def is_benchmark_loadable(self) -> bool:
+        """Eligible to appear in the benchmark corpus THIS round (before any
+        round-anchored retirement cutover is applied on top).
+
+        Operational apps plus RETIRING ones: a RETIRING deployment keeps being
+        benchmarked until its ``retire_effective_epoch`` so the corpus (and the
+        pack hash) change atomically fleet-wide at that round boundary rather than
+        the instant the operator calls deregister."""
+        return self.is_operational() or self is AppStatus.RETIRING
 
     def is_order_ready(self) -> bool:
         """Can users submit orders for this app?"""
@@ -876,6 +897,29 @@ class DeploymentResult:
     error: str | None = None
     tx_hash: str | None = None
     abi: list | None = None
+    # Round (opened_epoch) at which a RETIRING deployment's deregistration takes
+    # effect — the app leaves the benchmark corpus + pack hash for every round
+    # whose opened_epoch >= this. Stamped ~1 tempo ahead by deregister_app so the
+    # cutover is round-anchored (fleet-uniform) instead of racing app-sync
+    # propagation. None for every non-RETIRING deployment.
+    retire_effective_epoch: int | None = None
+
+    def is_effectively_retired(self, at_epoch: int | None) -> bool:
+        """Has this deployment's retirement taken effect for a round at ``at_epoch``
+        (the round's ``opened_epoch``)?
+
+        RETIRED is immediate. RETIRING takes effect only once the round's epoch
+        reaches the stamped ``retire_effective_epoch`` — both operands are
+        fleet-uniform per round, so every validator flips on the SAME round and the
+        corpus/pack-hash change is atomic (no app-sync propagation race). When
+        ``at_epoch`` is None (round epoch unresolvable) a RETIRING deployment is
+        conservatively treated as NOT yet retired — it stays benchmarked rather
+        than dropping non-deterministically."""
+        if self.status == AppStatus.RETIRED:
+            return True
+        if self.status == AppStatus.RETIRING and self.retire_effective_epoch is not None:
+            return at_epoch is not None and at_epoch >= self.retire_effective_epoch
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

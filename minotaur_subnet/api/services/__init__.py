@@ -71,6 +71,7 @@ from .app_admin import get_app_admin_state  # noqa: F401
 from .app_lifecycle import (  # noqa: F401
     update_app_solidity,
     retire_deployment,
+    deregister_app,
     float_deposit,
     float_withdraw,
     set_app_config,
