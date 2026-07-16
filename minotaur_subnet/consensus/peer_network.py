@@ -235,6 +235,18 @@ class ValidatorPeerNetwork:
         # Snapshot once — discovery loop may swap the list during broadcast.
         peers = self.peers
         if not peers:
+            # Was a silent `return []` — live incident 2026-07-16: the peer
+            # set flapped to empty one second before an order's proposal,
+            # nobody was asked to approve, and the leader waited out the
+            # full consensus timeout before terminally rejecting the order.
+            # The order processor now defers instead of burning the timeout
+            # (it checks `peers` before proposing); this warning covers any
+            # other caller reaching here with an empty set.
+            logger.warning(
+                "broadcast_proposal(%s): peer list is EMPTY — proposal sent "
+                "to nobody; quorum > 1 cannot succeed this round",
+                order_id,
+            )
             return []
 
         if self._session is None or self._session.closed:
