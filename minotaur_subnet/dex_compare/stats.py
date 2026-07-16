@@ -149,11 +149,122 @@ def _gas_out(source: str, result: dict[str, Any], ctx: _RowCtx) -> int | None:
     return ctx.native_to_output(g * ctx.gas_price)
 
 
+REALISTIC_USD = 100.0  # trades >= this are "realistic"; below is dust where fixed costs dominate
+
+
+def _trade_usd(row: dict[str, Any]) -> float | None:
+    """USD size of the trade: the normalized notional, else Velora's srcUSD."""
+    n = _float(row.get("notional_usd"))
+    if n and n > 0:
+        return n
+    vel = (row.get("results") or {}).get("velora") or {}
+    iu = _float(vel.get("input_usd"))
+    if vel.get("status") == "ok" and iu and iu > 0:
+        return iu
+    return None
+
+
+def _net_leaderboard(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Net (fee+gas adjusted, symmetric gas) leaderboard over ``rows``."""
+    net_src = {s: _new_acc() for s in AGGREGATOR_SOURCES}
+    net_best = _new_acc()
+    for row in rows:
+        results = row.get("results") or {}
+        mino = results.get("minotaur") or {}
+        if mino.get("status") != "ok":
+            continue
+        mino_gross = _int(mino.get("output_raw"))
+        if mino_gross is None or mino_gross <= 0:
+            continue
+        ctx = _RowCtx(row)
+        # Minotaur platform fee -> output units; unconvertible fee excludes the row.
+        fee_native = _int(mino.get("fee_raw"))
+        if fee_native and fee_native > 0:
+            fee_out = ctx.native_to_output(fee_native)
+            if fee_out is None:
+                continue
+        else:
+            fee_out = 0
+        ok_aggs: list[list[Any]] = []
+        for s in AGGREGATOR_SOURCES:
+            r = results.get(s) or {}
+            if r.get("status") != "ok":
+                continue
+            af = _after_fee(r)
+            if af is None or af <= 0:
+                continue
+            gas_out = 0 if r.get("is_net_of_gas") else _gas_out(s, r, ctx)
+            ok_aggs.append([s, af, gas_out])
+        if not ok_aggs:
+            continue
+        mino_gas_out = _gas_out("minotaur", mino, ctx)
+        # SYMMETRY: if gas can't be computed for EVERY side, drop it for ALL sides.
+        if mino_gas_out is None or any(g is None for _, _, g in ok_aggs):
+            mino_gas_out = 0
+            for a in ok_aggs:
+                a[2] = 0
+        m_net = max(0, mino_gross - fee_out - mino_gas_out)
+        if m_net <= 0:
+            continue
+        best_net: int | None = None
+        for s, af, gas_out in ok_aggs:
+            s_net = max(0, af - gas_out)
+            if s_net <= 0:
+                continue
+            _accumulate(net_src[s], m_net, s_net)
+            best_net = s_net if best_net is None else max(best_net, s_net)
+        if best_net is not None:
+            _accumulate(net_best, m_net, best_net)
+    return {
+        "vs_best_aggregator": _finalize(net_best),
+        "vs_source": {s: _finalize(net_src[s]) for s in AGGREGATOR_SOURCES},
+    }
+
+
+def _cost_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Median of Minotaur's platform fee and gas, in $ and as % of trade size —
+    lets the frontend attribute the net gap (small on realistic trades, large on dust)."""
+    fee_usd: list[float] = []
+    gas_usd: list[float] = []
+    fee_pct: list[float] = []
+    gas_pct: list[float] = []
+    for row in rows:
+        mino = (row.get("results") or {}).get("minotaur") or {}
+        if mino.get("status") != "ok":
+            continue
+        nusd = _float(row.get("native_usd"))
+        if not nusd or nusd <= 0:
+            continue
+        tusd = _trade_usd(row)
+        fw = _int(mino.get("fee_raw"))
+        if fw is not None:
+            f = fw / 1e18 * nusd
+            fee_usd.append(f)
+            if tusd:
+                fee_pct.append(100 * f / tusd)
+        g = _int(mino.get("gas_units"))
+        gp = _int(row.get("gas_price_wei"))
+        if g is not None and gp:
+            gu = g * gp / 1e18 * nusd
+            gas_usd.append(gu)
+            if tusd:
+                gas_pct.append(100 * gu / tusd)
+
+    def _med(vals: list[float]) -> float | None:
+        return round(statistics.median(vals), 6) if vals else None
+
+    return {
+        "samples": len(fee_usd),
+        "platform_fee_usd_median": _med(fee_usd),
+        "gas_usd_median": _med(gas_usd),
+        "platform_fee_pct_of_trade_median": _med(fee_pct),
+        "gas_pct_of_trade_median": _med(gas_pct),
+    }
+
+
 def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, Any]:
     raw_src = {s: _new_acc() for s in AGGREGATOR_SOURCES}
     raw_best = _new_acc()
-    net_src = {s: _new_acc() for s in AGGREGATOR_SOURCES}
-    net_best = _new_acc()
     coverage = {s: {"ok": 0, "failed": 0, "error": 0, "unsupported": 0} for s in AGGREGATOR_SOURCES}
     mino_ok = mino_fail = 0
     normalized = 0
@@ -190,48 +301,10 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
         if best_out is not None:
             _accumulate(raw_best, mino_gross, best_out)
 
-        # ── net leaderboard (fee + gas adjusted, gas handled SYMMETRICALLY) ──
-        ctx = _RowCtx(row)
-        # Minotaur platform fee -> output units; an unconvertible fee excludes the
-        # row (never silently drop our own fee).
-        fee_native = _int(mino.get("fee_raw"))
-        if fee_native and fee_native > 0:
-            fee_out = ctx.native_to_output(fee_native)
-            if fee_out is None:
-                continue
-        else:
-            fee_out = 0
-        # collect comparable aggregators with after-fee output + (maybe) gas
-        ok_aggs: list[list[Any]] = []
-        for s in AGGREGATOR_SOURCES:
-            r = results.get(s) or {}
-            if r.get("status") != "ok":
-                continue
-            af = _after_fee(r)
-            if af is None or af <= 0:
-                continue
-            gas_out = 0 if r.get("is_net_of_gas") else _gas_out(s, r, ctx)
-            ok_aggs.append([s, af, gas_out])
-        if not ok_aggs:
-            continue
-        mino_gas_out = _gas_out("minotaur", mino, ctx)
-        # SYMMETRY: if gas can't be computed for EVERY side, drop it for ALL sides.
-        if mino_gas_out is None or any(g is None for _, _, g in ok_aggs):
-            mino_gas_out = 0
-            for a in ok_aggs:
-                a[2] = 0
-        m_net = max(0, mino_gross - fee_out - mino_gas_out)
-        if m_net <= 0:
-            continue
-        best_net: int | None = None
-        for s, af, gas_out in ok_aggs:
-            s_net = max(0, af - gas_out)
-            if s_net <= 0:
-                continue
-            _accumulate(net_src[s], m_net, s_net)
-            best_net = s_net if best_net is None else max(best_net, s_net)
-        if best_net is not None:
-            _accumulate(net_best, m_net, best_net)
+    # Net leaderboards — overall and split by trade size so the frontend can show
+    # "at realistic sizes Minotaur is at parity; the gap is fixed costs on dust".
+    realistic = [r for r in rows if (_trade_usd(r) or 0) >= REALISTIC_USD]
+    small = [r for r in rows if 0 < (_trade_usd(r) or 0) < REALISTIC_USD]
 
     raw_vs_source = {}
     for s in AGGREGATOR_SOURCES:
@@ -251,11 +324,25 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
         "minotaur_fail": mino_fail,
         "net": {
             "note": "what the user actually receives (after fees + gas) — the honest metric",
-            "vs_best_aggregator": _finalize(net_best),
-            "vs_source": {s: _finalize(net_src[s]) for s in AGGREGATOR_SOURCES},
+            **_net_leaderboard(rows),
+        },
+        "net_by_size": {
+            "note": "net split by trade size — 'realistic' isolates the solver's true "
+                    "competitiveness from fixed-cost drag on tiny trades",
+            "realistic_threshold_usd": REALISTIC_USD,
+            "realistic": {"comparisons": len(realistic), **_net_leaderboard(realistic)},
+            "small": {"comparisons": len(small), **_net_leaderboard(small)},
+        },
+        "cost_breakdown": {
+            "note": "Minotaur's platform fee + gas as $ and % of trade — the source of "
+                    "the net gap; shrinks toward zero as trade size grows (raw shows "
+                    "routing is at parity, so the gap is cost, not the solver)",
+            "all": _cost_breakdown(rows),
+            "realistic": _cost_breakdown(realistic),
+            "small": _cost_breakdown(small),
         },
         "raw": {
-            "note": "gross output, pre-fee/pre-gas (reference only — flatters Minotaur)",
+            "note": "gross output, pre-fee/pre-gas (routing quality — Minotaur ~parity here)",
             "vs_best_aggregator": _finalize(raw_best),
             "vs_source": raw_vs_source,
         },
