@@ -47,7 +47,16 @@ from minotaur_subnet.harness.round_store import (
     RoundStatus,
     RoundStore,
 )
+from minotaur_subnet.epoch.clock import EPOCH_SECONDS
+from minotaur_subnet.epoch.reign_attribution import (
+    DEFAULT_MIN_REIGN_EPOCHS,
+    MAX_SAMPLE_GAP_EPOCHS,
+    TEMPO_EPOCHS,
+    ThroneTimeAccumulator,
+    build_time_weighted_mapping,
+)
 from minotaur_subnet.weight_policy import (
+    CHAMPION_MINER_WEIGHT_FRACTION,
     GENESIS_EPOCH,
     GENESIS_HOTKEY,
     build_bootstrap_or_champion_weights,
@@ -88,6 +97,23 @@ def _adoption_disabled() -> bool:
     at call time so it can be flipped without a restart.
     """
     return os.environ.get("DISABLE_CHAMPION_ADOPTION", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _time_weighted_observe_enabled() -> bool:
+    """DEFAULT OFF: when on, ``_build_weights_mapping`` additionally computes the
+    time-weighted (throne-time proportional) emission vector and LOGS it next to
+    the winner-take-all vector actually emitted. Pure observation — it never
+    changes what is emitted. Enable per-node with ``EMISSION_TIME_WEIGHTED_OBSERVE``
+    in {1,true,yes,on}. Read at call time so it can be flipped without a restart.
+
+    This is Phase 0. Emitting the time-weighted vector for real is UNSAFE until a
+    leader-minted, quorum-signed reign ledger exists (a node's local round history
+    is not a fleet-identical source — see reign_attribution module docstring), so
+    there is deliberately no "enforce" switch here yet.
+    """
+    return os.environ.get("EMISSION_TIME_WEIGHTED_OBSERVE", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -225,6 +251,10 @@ class EpochManager:
         self._weights_emitter = weights_emitter
         self._weight_decay = weight_decay
         self._owner_hotkey = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
+        # Time-weighted emission OBSERVE (Phase 0): accrues throne-time by
+        # sampling the current champion each coordinator tick. In-memory,
+        # observe-only; inert unless EMISSION_TIME_WEIGHTED_OBSERVE is set.
+        self._throne_accumulator = ThroneTimeAccumulator()
         # Chain-primary owner resolution: a wired chain source (MetagraphSync with
         # resolve_subnet_owner()) takes precedence over the env/constructor owner.
         self._owner_chain_source: Any = None
@@ -2187,10 +2217,87 @@ class EpochManager:
         if not self._sub_store:
             return {}
 
-        return build_bootstrap_or_champion_weights(
+        mapping = build_bootstrap_or_champion_weights(
             self._champion.hotkey,
             owner_hotkey=self._resolve_owner_hotkey(),
         )
+
+        # Phase 0 OBSERVE-ONLY: log the time-weighted vector alongside the vector
+        # actually emitted above. Never raises, never alters `mapping`.
+        if _time_weighted_observe_enabled():
+            self._observe_time_weighted_emission(mapping, epoch)
+
+        return mapping
+
+    def observe_accrue_throne_time(self) -> None:
+        """Sample the CURRENT champion into the throne-time accumulator.
+
+        Called on every coordinator tick (finer than one epoch) when the observe
+        flag is on; a no-op otherwise, and inexpensive/idempotent within an epoch
+        (the accumulator credits whole epochs, so repeated same-epoch samples do
+        nothing). Samples ``self._champion.hotkey`` — the SAME champion
+        ``_build_weights_mapping`` emits — so the accrual tracks exactly what
+        winner-take-all would pay. Best-effort: never raises into the coordinator
+        loop.
+        """
+        if not _time_weighted_observe_enabled():
+            return
+        try:
+            now_epoch = int(time.time() // max(1, EPOCH_SECONDS))
+            # OBSERVE-ONLY tempo bucketing from wall-clock; the real (Phase 1) path
+            # resets on the chain tempo index (a shared integer), not this.
+            tempo_index = now_epoch // max(1, TEMPO_EPOCHS)
+            self._throne_accumulator.sample(
+                now_epoch=now_epoch,
+                tempo_index=tempo_index,
+                champion_hotkey=self._champion.hotkey,
+                max_gap_epochs=MAX_SAMPLE_GAP_EPOCHS,
+            )
+        except Exception as exc:  # pragma: no cover - never break the coordinator loop
+            logger.debug("throne-time accrual sample skipped (non-fatal): %s", exc)
+
+    def _observe_time_weighted_emission(
+        self, emitted_mapping: dict[str, float], epoch: int
+    ) -> None:
+        """Log the accrued time-weighted vector alongside the winner-take-all
+        vector actually emitted. Best-effort: any failure is swallowed so
+        observation can never disturb the real emit path (the burn-fallback
+        safety net)."""
+        try:
+            # Fold in the epochs since the last coordinator sample so the settled
+            # snapshot is current at emit time.
+            self.observe_accrue_throne_time()
+            attribution = self._throne_accumulator.settle(
+                min_reign_epochs=DEFAULT_MIN_REIGN_EPOCHS,
+            )
+            owner = self._resolve_owner_hotkey()
+            time_weighted = build_time_weighted_mapping(
+                attribution,
+                owner_hotkey=owner,
+                miner_fraction=CHAMPION_MINER_WEIGHT_FRACTION,
+            )
+
+            def _short(mapping: dict[str, float]) -> dict[str, float]:
+                return {f"{hk[:8]}…": round(w, 4) for hk, w in sorted(mapping.items())}
+
+            miners = {
+                f"{hk[:8]}…": ep
+                for hk, ep in sorted(attribution.per_hotkey_epochs.items())
+            }
+            logger.info(
+                "[time-weighted OBSERVE] epoch=%d accrued_epochs=%d hotkeys=%d "
+                "accrued=%s unattributed_epochs=%d | emitted(winner-take-all)=%s "
+                "would_emit(time-weighted)=%s",
+                epoch,
+                attribution.window_epochs,
+                len(attribution.per_hotkey_epochs),
+                miners or "{}",
+                attribution.unattributed_epochs,
+                _short(emitted_mapping),
+                _short(time_weighted),
+            )
+        except Exception as exc:  # pragma: no cover - observation must never break emit
+            logger.debug("time-weighted OBSERVE skipped (non-fatal): %s", exc)
 
     async def _emit_weights(self, epoch: int, *, round_id: str | None = None) -> bool:
         """Queue weights for emission by POSTing to the validator daemon.

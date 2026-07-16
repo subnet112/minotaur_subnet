@@ -1688,3 +1688,66 @@ def test_finalist_tiebreak_prefers_cleaner_factorization():
     a = _make_submission(submission_id="sub_aaa", score=0.9)
     b = _make_submission(submission_id="sub_bbb", score=0.9)
     assert [s.submission_id for s in mgr._eligible_candidates([b, a])] == ["sub_aaa", "sub_bbb"]
+
+
+# ── time-weighted emission: Phase 0 observe-only accrual wiring ───────────────
+
+_TW_HK_B = "5MinerTimeWeightedBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+_TW_OWNER = "5OwnerBurnTimeWeightedAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def _make_observe_manager():
+    store = _make_store_with_subs(
+        _make_submission(submission_id="sub_tw_b", hotkey=_TW_HK_B),
+    )
+    mgr = EpochManager(
+        submission_store=store, round_store=RoundStore(), owner_hotkey=_TW_OWNER,
+    )
+    mgr._champion = ChampionInfo(submission_id="sub_tw_b", hotkey=_TW_HK_B)
+    return mgr
+
+
+def test_time_weighted_observe_does_not_change_emitted_mapping(monkeypatch):
+    """With the observe flag ON, _build_weights_mapping still returns the exact
+    winner-take-all vector — observation must never alter emission."""
+    mgr = _make_observe_manager()
+
+    monkeypatch.delenv("EMISSION_TIME_WEIGHTED_OBSERVE", raising=False)
+    baseline = mgr._build_weights_mapping(1)
+    # Current champion (B) takes the miner share; owner takes the remainder.
+    assert set(baseline) == {_TW_HK_B, _TW_OWNER}
+    assert baseline[_TW_HK_B] == pytest.approx(CHAMPION_MINER_WEIGHT_FRACTION)
+    assert baseline[_TW_OWNER] == pytest.approx(1.0 - CHAMPION_MINER_WEIGHT_FRACTION)
+
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    mgr.observe_accrue_throne_time()  # a coordinator-loop tick
+    with_observe = mgr._build_weights_mapping(1)
+    assert with_observe == baseline
+
+
+def test_observe_accrue_is_noop_when_flag_off(monkeypatch):
+    """The accumulator is never touched while the observe flag is off."""
+    monkeypatch.delenv("EMISSION_TIME_WEIGHTED_OBSERVE", raising=False)
+    mgr = _make_observe_manager()
+    mgr.observe_accrue_throne_time()
+    assert mgr._throne_accumulator.debug_state()["tempo_index"] is None
+
+
+def test_observe_accrue_samples_current_champion_when_on(monkeypatch):
+    """With the flag on, a tick anchors the accumulator to the current tempo."""
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    mgr = _make_observe_manager()
+    mgr.observe_accrue_throne_time()
+    assert mgr._throne_accumulator.debug_state()["tempo_index"] is not None
+
+
+def test_time_weighted_observe_survives_missing_stores(monkeypatch):
+    """Observation is best-effort: a manager without a round store must not raise
+    from _build_weights_mapping or a sample tick when the flag is on."""
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    store = _make_store_with_subs(_make_submission(submission_id="sub_only"))
+    mgr = EpochManager(submission_store=store, owner_hotkey=_TW_OWNER)
+    mgr._champion = ChampionInfo()  # no champion → 100% owner burn
+    mgr.observe_accrue_throne_time()  # must not raise
+    mapping = mgr._build_weights_mapping(1)
+    assert mapping == {_TW_OWNER: 1.0}
