@@ -152,6 +152,29 @@ def build_permit_digest(
     }
 
 
+_FEE_MODE_SELECTOR = keccak(b"feeMode()")[:4]
+
+
+def fee_mode_is_user(w3: Web3, contract: str) -> bool:
+    """True iff the app contract is in ``FeeMode.USER`` (0) — the path that pulls
+    the platform fee from the user's WETH via ``safeTransferFrom`` each fill.
+
+    Reads the on-chain ``feeMode()`` view (0=USER, 1=APP). Returns ``False``
+    (treat as APP → the fee is deducted from output / the app float, nothing to
+    pull from the user) on APP mode OR any read error, so callers fail safe: they
+    never pre-check / demand a user WETH allowance they can't confirm is needed.
+    """
+    try:
+        raw = w3.eth.call({
+            "to": Web3.to_checksum_address(contract),
+            "data": "0x" + _FEE_MODE_SELECTOR.hex(),
+        })
+        return int.from_bytes(bytes(raw), "big") == 0
+    except Exception as exc:
+        logger.debug("feeMode() read failed for %s (treat as APP): %s", contract, exc)
+        return False
+
+
 def try_erc2612_permit(
     w3: Web3,
     bridge_url: str,

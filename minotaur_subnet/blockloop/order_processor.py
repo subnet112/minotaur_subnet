@@ -830,6 +830,7 @@ class OrderProcessor:
             )
             return True
 
+        loop = _asyncio.get_running_loop()
         legs: list[tuple[str, int]] = []
         # Input-token leg (skip when the input is native — paid as msg.value).
         if not order.params.get("_input_token_is_native"):
@@ -846,20 +847,27 @@ class OrderProcessor:
                         legs.append((input_token, amt))
                 except (ValueError, TypeError):
                     pass
-        # Deliberately NOT pre-checking the fee token against the USER. The
-        # platform fee IS collected on every fill on both chains — in WETH, to
-        # platformFeeCollector (the relayer), covering its gas — but it is NOT
-        # pulled from the user's wallet: the live DexAggregatorApp deducts it from
-        # the swap OUTPUT and settles it from the app's own WETH float (V2) /
-        # paymaster (V1), and the base path skips it for native input. So there is
-        # no user-side WETH allowance to check; pre-reading one we can't know will
-        # be pulled would spuriously terminate a fundable perpetual (and WETH
-        # 0xC02a…/0x4200…0006 has no EIP-2612 permit to cure it). A generic app
-        # that DOES pull WETH from the user still terminates when underfunded via
-        # the settlement user-fund-fault backstop — we just don't burn a round
-        # pre-checking it.
+        # Fee-token leg — ONLY when the app collects the fee directly from the
+        # user (FeeMode.USER: the base _collectPlatformFee pulls WETH via
+        # safeTransferFrom on every fill). APP-mode apps (e.g. DexAggregatorApp)
+        # instead deduct the fee from the swap output and settle it from their own
+        # WETH float — nothing is pulled from the user — so pre-checking WETH there
+        # would falsely terminate a fundable perpetual. The fee IS collected in
+        # both modes (it covers the relayer's gas); only USER mode collects it
+        # from the user's wallet. Read the on-chain feeMode() to decide, and skip
+        # the leg (fail-open) on APP mode / unreadable / zero fee / native input.
+        # NB WETH (0xC02a…/0x4200…0006) has no EIP-2612 permit, so a USER-mode WETH
+        # shortfall can't be cured by a carried permit — the user must approve().
+        fee_wei = int(order.params.get("platform_fee_wei", 0) or 0)
+        if fee_wei > 0 and not order.params.get("_input_token_is_native"):
+            from minotaur_subnet.blockchain.token_approval import fee_mode_is_user
+            user_mode = await loop.run_in_executor(None, fee_mode_is_user, w3, spender)
+            if user_mode:
+                from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
+                fee_token = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
+                if fee_token:
+                    legs.append((fee_token, fee_wei))
 
-        loop = _asyncio.get_running_loop()
         for token, required in legs:
             reading = await loop.run_in_executor(
                 None, read_balance_and_allowance, w3, token, order.submitted_by, spender,
