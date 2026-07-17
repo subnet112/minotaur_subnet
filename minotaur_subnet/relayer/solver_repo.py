@@ -1726,13 +1726,20 @@ class MergeResult:
     round store's ``abort_reason`` (``merge_failed:<code>``) and older callers.
     """
 
-    __slots__ = ("ok", "code", "stage", "detail")
+    __slots__ = ("ok", "code", "stage", "detail", "main_sha")
 
-    def __init__(self, ok: bool, code: str = "", stage: str = "", detail: str = "") -> None:
+    def __init__(
+        self, ok: bool, code: str = "", stage: str = "", detail: str = "",
+        *, main_sha: str = "",
+    ) -> None:
         self.ok = bool(ok)
         self.code = str(code or "")
         self.stage = str(stage or "")
         self.detail = str(detail or "")
+        # Canonical ``main`` HEAD SHA after a SUCCESSFUL publish — recorded on adoption
+        # so the champion-main reconciler can later detect an orphaned merge. Empty on
+        # failure or when it couldn't be read.
+        self.main_sha = str(main_sha or "")
 
     @property
     def reason(self) -> str:
@@ -1790,6 +1797,26 @@ class FinalizeOutcome:
                 "code": self.code, "stage": self.stage, "detail": self.detail,
             },
         }
+
+
+def _canonical_main_head_sha() -> str:
+    """Canonical solver-repo ``main`` HEAD commit SHA (empty on any error). Read right
+    after a successful publish so the reconciler can record where ``main`` should be for
+    the just-adopted champion — works for private champions (the published-to-main
+    commit is on canonical, unlike the miner's private commit)."""
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None:
+        return ""
+    owner, repo = owner_repo
+    token = (
+        os.environ.get("SOLVER_REPO_PR_TOKEN") or os.environ.get("SOLVER_REPO_TOKEN") or ""
+    ).strip() or None
+    ok, ref = _gh_json(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/main", token=token,
+    )
+    if not ok or not isinstance(ref, dict):
+        return ""
+    return ((ref.get("object") or {}).get("sha") or "").strip()
 
 
 def on_champion_adopted_pr(
@@ -1932,7 +1959,8 @@ def on_champion_adopted_pr(
             logger.warning("close-stale failed after champion merge: %s", exc)
     _ok = bool(tx_hash) and bool(merged)
     if _ok:
-        _result = MergeResult(True)
+        # Record where main landed so the reconciler can later detect an orphaned merge.
+        _result = MergeResult(True, main_sha=_canonical_main_head_sha())
     elif _attest_reason:                     # attest is the ROOT failure
         _result = MergeResult(
             False, _attest_reason, "attest",
@@ -2150,7 +2178,13 @@ def on_champion_adopted_via_relayer(
         "Champion finalization via relayer: round=%s submission=%s ok=%s reason=%s",
         rid, submission_id, ok, code or "-",
     )
-    return MergeResult(ok, code, stage, detail)
+    # On success, record where ``main`` landed so the reconciler can later detect an
+    # orphaned merge. Prefer a relayer-provided ``main_sha`` if present; else read
+    # canonical main HEAD ourselves (works for private champions — canonical commit).
+    _main_sha = str(payload.get("main_sha") or "") if isinstance(payload, dict) else ""
+    if not _main_sha and ok:
+        _main_sha = _canonical_main_head_sha()
+    return MergeResult(ok, code, stage, detail, main_sha=_main_sha)
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────

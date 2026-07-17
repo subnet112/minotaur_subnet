@@ -387,5 +387,144 @@ def test_real_builder_maps_sentinel_receiver_to_anvil_default(monkeypatch):
     assert io["submitted_by"] == anvil
 
 
+class _RetireStore:
+    """App store whose single deployment carries a configurable retirement status.
+
+    Uses the REAL ``DeploymentResult`` so ``is_effectively_retired`` (the gate's
+    predicate) is exercised, not faked.
+    """
+
+    def __init__(self, status, retire_effective_epoch=None) -> None:
+        from minotaur_subnet.shared.types import DeploymentResult
+        self._dep = DeploymentResult(
+            app_id="testapp", status=status, chain_id=_CHAIN,
+            contract_address=_DEPLOYED, retire_effective_epoch=retire_effective_epoch,
+        )
+        self.attempts: list[tuple] = []
+
+    def get_app(self, app_id):
+        return SimpleNamespace(
+            app_id=app_id, name="DexAggregator",
+            js_code="function score(){return 1;}",
+        )
+
+    def get_deployment(self, app_id, chain_id=None):
+        return self._dep
+
+    def record_quote_attempt(self, app_id, success=True, error=""):
+        self.attempts.append((app_id, success, error))
+
+
+class TestQuoteRetirementGate(unittest.TestCase):
+    """POST /apps/{id}/quote must reject a deregistered deployment (RETIRED, or
+    RETIRING past its round-anchored cutover) — mirroring the order path — while
+    still quoting a live or pre-cutover app. See app_lifecycle.deregister_app."""
+
+    def setUp(self):
+        self._prev_rl = os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE")
+        os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = "0"
+        orders_module.set_js_engine(None)
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self):
+        orders_module.set_block_loop(None)
+        orders_module.set_app_store(None)
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        if self._prev_rl is None:
+            os.environ.pop("QUOTE_RATE_LIMIT_PER_MINUTE", None)
+        else:
+            os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = self._prev_rl
+
+    def _post_quote(self):
+        return self.client.post(
+            "/v1/apps/testapp/quote",
+            json={
+                "intent_function": "swap",
+                "chain_id": _CHAIN,
+                "params": {
+                    "input_token": _USDC,
+                    "output_token": _DONALDPUMP,
+                    "input_amount": "1000000000",
+                },
+            },
+        )
+
+    @staticmethod
+    def _round_store(opened_epoch):
+        cur = None if opened_epoch is None else SimpleNamespace(opened_epoch=opened_epoch)
+        return SimpleNamespace(get_current_round=lambda: cur)
+
+    def _set_solver_and_sim(self):
+        sim = _FakeSimRunner()
+        orders_module.set_block_loop(SimpleNamespace(
+            solver=_FakeSolver(quote_zero=False), _simulation_runner=sim,
+        ))
+        return sim
+
+    def test_quote_rejected_for_retired_deployment(self):
+        """RETIRED is epoch-independent → 400 regardless of the current round."""
+        from minotaur_subnet.shared.types import AppStatus
+        orders_module.set_app_store(_RetireStore(AppStatus.RETIRED))
+        sim = self._set_solver_and_sim()
+
+        resp = self._post_quote()
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("retired", resp.json()["detail"].lower())
+        # Gate must fire BEFORE the expensive plan simulation.
+        self.assertEqual(sim.calls, [])
+
+    def test_quote_rejected_for_retiring_past_cutover(self):
+        """RETIRING drops once the round's opened_epoch reaches the cutover."""
+        from unittest.mock import patch
+        from minotaur_subnet.shared.types import AppStatus
+        orders_module.set_app_store(
+            _RetireStore(AppStatus.RETIRING, retire_effective_epoch=1000))
+        sim = self._set_solver_and_sim()
+
+        with patch(
+            "minotaur_subnet.api.routes.submissions.get_round_store",
+            return_value=self._round_store(1000),  # opened_epoch == cutover
+        ):
+            resp = self._post_quote()
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("retired", resp.json()["detail"].lower())
+        self.assertEqual(sim.calls, [])
+
+    def test_quote_allowed_for_retiring_before_cutover(self):
+        """Before the cutover round, a RETIRING app still quotes (not yet effective)."""
+        from unittest.mock import patch
+        from minotaur_subnet.shared.types import AppStatus
+        orders_module.set_app_store(
+            _RetireStore(AppStatus.RETIRING, retire_effective_epoch=1000))
+        self._set_solver_and_sim()
+
+        with patch(
+            "minotaur_subnet.api.routes.submissions.get_round_store",
+            return_value=self._round_store(999),  # one epoch before cutover
+        ):
+            resp = self._post_quote()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["estimated_output"], _DELIVERED)
+
+    def test_quote_allowed_for_retiring_when_no_open_round(self):
+        """No open round → epoch unresolvable → RETIRING treated as not-yet-retired
+        (conservative), so the quote still serves rather than dropping on a
+        transient no-round window."""
+        from unittest.mock import patch
+        from minotaur_subnet.shared.types import AppStatus
+        orders_module.set_app_store(
+            _RetireStore(AppStatus.RETIRING, retire_effective_epoch=1000))
+        self._set_solver_and_sim()
+
+        with patch(
+            "minotaur_subnet.api.routes.submissions.get_round_store",
+            return_value=self._round_store(None),  # no current round
+        ):
+            resp = self._post_quote()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["estimated_output"], _DELIVERED)
+
+
 if __name__ == "__main__":
     unittest.main()

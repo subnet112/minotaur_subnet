@@ -1,6 +1,7 @@
 """Tests for the champion-main reconcile sweep + auto-revert (Part 2).
 
-See ``docs/champion-finalize-reconcile.md`` and
+SHA-based: compares live ``main`` HEAD to the champion's recorded ``canonical_main_sha``
+(works for private champions). See ``docs/champion-finalize-reconcile.md`` and
 ``minotaur_subnet/relayer/champion_reconcile.py``.
 """
 from __future__ import annotations
@@ -10,42 +11,42 @@ from unittest.mock import MagicMock, patch
 import minotaur_subnet.relayer.champion_reconcile as R
 
 
-# ── classify_main_reconcile (pure decision) ──────────────────────────────────
-def test_classify_noop_when_main_matches_adopted():
+# ── classify_main_reconcile (pure decision, SHA equality) ────────────────────
+def test_classify_noop_when_main_matches_recorded():
     action, _ = R.classify_main_reconcile(
-        main_tree_sha="t1", adopted_tree_sha="t1", onchain_throne_is_adopted=True,
+        main_head_sha="abc", expected_main_sha="abc", onchain_throne_is_adopted=True,
     )
     assert action == R.RECONCILE_NOOP
 
 
-def test_classify_noop_when_no_adopted_tree():
+def test_classify_noop_when_no_recorded_sha():
     action, _ = R.classify_main_reconcile(
-        main_tree_sha="t1", adopted_tree_sha=None, onchain_throne_is_adopted=True,
+        main_head_sha="abc", expected_main_sha=None, onchain_throne_is_adopted=True,
     )
     assert action == R.RECONCILE_NOOP
 
 
-def test_classify_alert_when_main_tree_unreadable():
+def test_classify_alert_when_main_head_unreadable():
     action, _ = R.classify_main_reconcile(
-        main_tree_sha=None, adopted_tree_sha="t1", onchain_throne_is_adopted=True,
+        main_head_sha=None, expected_main_sha="abc", onchain_throne_is_adopted=True,
     )
     assert action == R.RECONCILE_ALERT
 
 
-def test_classify_revert_on_orphan_drift_when_throne_unchanged():
-    # main drifted from the adopted champion, but the on-chain throne is STILL the
-    # adopted champion => the merge on main never took the throne => orphan => revert.
+def test_classify_revert_on_drift_when_throne_unchanged():
+    # live main drifted from the recorded champion sha, but the on-chain throne is STILL
+    # the adopted champion => the merge never took the throne => orphan => revert.
     action, _ = R.classify_main_reconcile(
-        main_tree_sha="orphan", adopted_tree_sha="adopted", onchain_throne_is_adopted=True,
+        main_head_sha="orphan", expected_main_sha="recorded", onchain_throne_is_adopted=True,
     )
     assert action == R.RECONCILE_REVERT
 
 
 def test_classify_alert_when_throne_actually_moved():
-    # main drifted AND the on-chain throne moved off the adopted champion => a real win
-    # the leader hasn't adopted locally => never auto-revert.
+    # drift AND the on-chain throne moved => a real win the leader hasn't adopted =>
+    # never auto-revert.
     action, _ = R.classify_main_reconcile(
-        main_tree_sha="winner", adopted_tree_sha="adopted", onchain_throne_is_adopted=False,
+        main_head_sha="winner", expected_main_sha="recorded", onchain_throne_is_adopted=False,
     )
     assert action == R.RECONCILE_ALERT
 
@@ -64,7 +65,7 @@ def test_revert_creates_commit_and_advances_main():
 
     with patch.object(R, "_gh_json", fake_gh):
         ok = R.revert_main_to_tree(
-            owner="o", repo="r", target_tree_sha="adopted",
+            owner="o", repo="r", target_tree_sha="recorded_tree",
             current_head_sha="orphanhead", message="m", token="t",
         )
     assert ok is True
@@ -98,41 +99,37 @@ def _env():
 
 
 def test_reconcile_noop_when_consistent():
-    with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "SAME"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("head", "SAME")):
+    with _env(), patch.object(R, "_main_head_sha", lambda *a, **k: "SAME"):
         revert = MagicMock()
         res = R.reconcile_champion_main(
-            adopted_commit_hash="c", onchain_throne_is_adopted=True, revert_fn=revert,
+            expected_main_sha="SAME", onchain_throne_is_adopted=True, revert_fn=revert,
         )
     assert res["action"] == R.RECONCILE_NOOP
     assert res["reverted"] is False
     revert.assert_not_called()
 
 
-def test_reconcile_reverts_orphan_and_restores_adopted_tree():
+def test_reconcile_reverts_orphan_to_recorded_tree():
     with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "ADOPTED"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("orphanhead", "ORPHAN")):
+            patch.object(R, "_main_head_sha", lambda *a, **k: "ORPHANHEAD"), \
+            patch.object(R, "_commit_tree_sha", lambda *a, **k: "RECORDED_TREE"):
         revert = MagicMock(return_value=True)
         res = R.reconcile_champion_main(
-            adopted_commit_hash="c", onchain_throne_is_adopted=True, revert_fn=revert,
+            expected_main_sha="RECORDED", onchain_throne_is_adopted=True, revert_fn=revert,
         )
     assert res["action"] == R.RECONCILE_REVERT
     assert res["reverted"] is True
     revert.assert_called_once()
-    # restores to the ADOPTED tree, parented on the orphan head — never to the orphan.
-    assert revert.call_args.kwargs["target_tree_sha"] == "ADOPTED"
-    assert revert.call_args.kwargs["current_head_sha"] == "orphanhead"
+    # restores to the RECORDED champion's tree, parented on the orphan head.
+    assert revert.call_args.kwargs["target_tree_sha"] == "RECORDED_TREE"
+    assert revert.call_args.kwargs["current_head_sha"] == "ORPHANHEAD"
 
 
 def test_reconcile_alerts_when_throne_moved_never_reverts():
-    with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "ADOPTED"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("winnerhead", "WINNER")):
+    with _env(), patch.object(R, "_main_head_sha", lambda *a, **k: "WINNERHEAD"):
         revert = MagicMock()
         res = R.reconcile_champion_main(
-            adopted_commit_hash="c", onchain_throne_is_adopted=False, revert_fn=revert,
+            expected_main_sha="RECORDED", onchain_throne_is_adopted=False, revert_fn=revert,
         )
     assert res["action"] == R.RECONCILE_ALERT
     revert.assert_not_called()
@@ -140,11 +137,11 @@ def test_reconcile_alerts_when_throne_moved_never_reverts():
 
 def test_reconcile_dry_run_detects_but_does_not_revert():
     with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "ADOPTED"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("orphanhead", "ORPHAN")):
+            patch.object(R, "_main_head_sha", lambda *a, **k: "ORPHANHEAD"), \
+            patch.object(R, "_commit_tree_sha", lambda *a, **k: "RECORDED_TREE"):
         revert = MagicMock()
         res = R.reconcile_champion_main(
-            adopted_commit_hash="c", onchain_throne_is_adopted=True, dry_run=True, revert_fn=revert,
+            expected_main_sha="RECORDED", onchain_throne_is_adopted=True, dry_run=True, revert_fn=revert,
         )
     assert res["action"] == R.RECONCILE_REVERT
     assert res["reverted"] is False
@@ -154,19 +151,34 @@ def test_reconcile_dry_run_detects_but_does_not_revert():
 def test_reconcile_noop_when_not_leader():
     revert = MagicMock()
     res = R.reconcile_champion_main(
-        adopted_commit_hash="c", onchain_throne_is_adopted=True, is_leader=False, revert_fn=revert,
+        expected_main_sha="RECORDED", onchain_throne_is_adopted=True, is_leader=False, revert_fn=revert,
     )
     assert res["action"] == R.RECONCILE_NOOP
     revert.assert_not_called()
 
 
+def test_reconcile_alert_when_recorded_tree_unreadable():
+    # Orphan detected, but the recorded champion sha's tree can't be read => ALERT, do
+    # NOT revert (never restore to an unknown tree).
+    with _env(), \
+            patch.object(R, "_main_head_sha", lambda *a, **k: "ORPHANHEAD"), \
+            patch.object(R, "_commit_tree_sha", lambda *a, **k: None):
+        revert = MagicMock()
+        res = R.reconcile_champion_main(
+            expected_main_sha="RECORDED", onchain_throne_is_adopted=True, revert_fn=revert,
+        )
+    assert res["action"] == R.RECONCILE_ALERT
+    assert res["reverted"] is False
+    revert.assert_not_called()
+
+
 def test_reconcile_downgrades_to_alert_when_revert_write_fails():
     with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "ADOPTED"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("orphanhead", "ORPHAN")):
+            patch.object(R, "_main_head_sha", lambda *a, **k: "ORPHANHEAD"), \
+            patch.object(R, "_commit_tree_sha", lambda *a, **k: "RECORDED_TREE"):
         revert = MagicMock(return_value=False)  # write blocked
         res = R.reconcile_champion_main(
-            adopted_commit_hash="c", onchain_throne_is_adopted=True, revert_fn=revert,
+            expected_main_sha="RECORDED", onchain_throne_is_adopted=True, revert_fn=revert,
         )
     assert res["reverted"] is False
     assert res["action"] == R.RECONCILE_ALERT
@@ -183,8 +195,6 @@ def test_onchain_throne_false_on_read_error_is_fail_safe():
         raise RuntimeError("rpc down")
 
     with patch("minotaur_subnet.relayer.solver_repo._onchain_cert_binds", boom):
-        # A read error must NOT be read as "throne unchanged" (which would revert) —
-        # it degrades to False => classify ALERTs, never REVERTs.
         assert R.onchain_throne_is_adopted("commit", "round") is False
 
 
@@ -195,11 +205,12 @@ def test_onchain_throne_false_on_missing_input():
 
 def test_run_reconcile_pass_observe_detects_without_revert():
     with _env(), \
-            patch.object(R, "_commit_tree_sha", lambda *a, **k: "ADOPTED"), \
-            patch.object(R, "_main_head", lambda *a, **k: ("orphan", "ORPHAN")), \
+            patch.object(R, "_main_head_sha", lambda *a, **k: "ORPHANHEAD"), \
+            patch.object(R, "_commit_tree_sha", lambda *a, **k: "RECORDED_TREE"), \
             patch.object(R, "onchain_throne_is_adopted", lambda *a, **k: True):
         res = R.run_reconcile_pass(
-            adopted_commit_hash="c", adopted_round_id="r", is_leader=True, enforce=False,
+            expected_main_sha="RECORDED", onchain_commit_hash="c", onchain_round_id="r",
+            is_leader=True, enforce=False,
         )
     assert res["action"] == R.RECONCILE_REVERT   # drift detected
     assert res["reverted"] is False              # OBSERVE => no write

@@ -2874,10 +2874,15 @@ async def initialize(ctx: ServerContext) -> dict:
                                 champ = submissions.get_store().get_champion()
                                 if champ is None:
                                     continue
+                                # expected main sha = the champion's recorded canonical
+                                # main HEAD at adoption (works for private champions);
+                                # commit+round drive the on-chain throne check.
+                                active = submissions.get_round_store().get_active_champion()
                                 res = await asyncio.to_thread(
                                     run_reconcile_pass,
-                                    adopted_commit_hash=getattr(champ, "commit_hash", None),
-                                    adopted_round_id=getattr(champ, "round_id", None),
+                                    expected_main_sha=getattr(active, "canonical_main_sha", None),
+                                    onchain_commit_hash=getattr(champ, "commit_hash", None),
+                                    onchain_round_id=getattr(champ, "round_id", None),
                                     is_leader=True,
                                     enforce=_mr_enforce,
                                 )
@@ -3005,6 +3010,10 @@ async def initialize(ctx: ServerContext) -> dict:
                     "benchmark_pack_hash": round_state.benchmark_pack_hash,
                     "shadow_case_log_hash": round_state.shadow_case_log_hash,
                     "effective_epoch": round_state.effective_epoch or 0,
+                    # B3: real round-open anchor for the certify path — kept byte-for-byte
+                    # equal to round_manager._certify_round_sync_payload.
+                    "benchmark_anchor_epoch": getattr(
+                        round_state, "benchmark_anchor_epoch", None),
                     "quorum_required": round_state.quorum_required or 0,
                     "commit_hash": getattr(_lead, "commit_hash", None),
                     "nonce": int(getattr(_lead, "nonce", 0) or 0),

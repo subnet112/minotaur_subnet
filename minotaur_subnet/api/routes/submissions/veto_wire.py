@@ -492,7 +492,9 @@ def build_assignments(
 
     ``entropy`` MUST be post-close (a close-block hash — see
     ``assign_slices``). ``fork_pins`` is the round's per-chain pin map;
-    ``chain_ids`` defaults to the round-anchored chains. ``records`` should be
+    ``chain_ids`` defaults to the round's FORK-PINNED chains (``fork_pins`` keys —
+    Base plus Ethereum et al. under BENCHMARK_ALL_DEPLOYMENT_CHAINS), so the veto
+    cross-checks exactly the chains the scored corpus benched. ``records`` should be
     the SAME corpus snapshot the round's pack hash was sealed from when the
     caller has one (see ``partition_follower_slices``).
 
@@ -502,8 +504,16 @@ def build_assignments(
     skips fan-out entirely in that case, mirroring the quorum>1 digest gate.
     """
     if chain_ids is None:
-        from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CHAINS
-        chain_ids = list(ROUND_ANCHOR_CHAINS)
+        # Cover exactly the chains the round PINNED (= the chains the scored corpus
+        # can bench), so the veto's burden-of-proof matches the scored set. With
+        # BENCHMARK_ALL_DEPLOYMENT_CHAINS armed this includes Ethereum, not just the
+        # anchor chain; each pinned chain becomes its own single-chain slices. Fall
+        # back to the static anchor set only if the round carries no pins.
+        if fork_pins:
+            chain_ids = sorted({int(c) for c in fork_pins})
+        else:
+            from minotaur_subnet.consensus.round_anchor import ROUND_ANCHOR_CHAINS
+            chain_ids = list(ROUND_ANCHOR_CHAINS)
 
     from minotaur_subnet.harness.image_transport import (
         candidate_repo,
@@ -526,15 +536,27 @@ def build_assignments(
     calibration = calibration_overlap(
         app_store, round_id, chain_ids=chain_ids, records=records,
     )
+    # Calibration is appended per SLICE and MUST match that slice's chain — a slice
+    # mixing an order-chain with a calibration-chain would be REFUSED as multi_chain
+    # by run_slice_bench. Index calibration by chain so each single-chain slice gets
+    # only its own chain's overlap rows.
+    calib_by_chain: dict[Any, list[dict[str, Any]]] = {}
+    for c in calibration:
+        calib_by_chain.setdefault(c.get("chain_id"), []).append(c)
+
     mapping = assign_slices(validator_evms, len(slices), entropy)
 
     pins = {str(k): int(v) for k, v in (fork_pins or {}).items()}
     assignments: list[SliceAssignment] = []
     for evm, idx in sorted(mapping.items(), key=lambda kv: kv[1]):
         orders = slices[idx]
+        # Each slice is single-chain (partition_follower_slices groups by chain).
+        slice_calib = calib_by_chain.get(
+            orders[0].get("chain_id") if orders else None, [],
+        )
         hashes = {
             str(o.get("order_id")): order_replay_hash(o)
-            for o in list(orders) + list(calibration)
+            for o in list(orders) + list(slice_calib)
         }
         assignments.append(SliceAssignment(
             round_id=round_id,
@@ -548,7 +570,7 @@ def build_assignments(
             order_ids=[str(o.get("order_id")) for o in orders],
             order_hashes=hashes,
             calibration_order_ids=[
-                str(o.get("order_id")) for o in calibration
+                str(o.get("order_id")) for o in slice_calib
             ],
             fork_pins=pins,
             deadline_epoch=deadline_epoch,
@@ -842,8 +864,11 @@ async def run_slice_bench(
         else:
             slice_orders.append(record)
 
-    # 2. Pins: single-chain slices only (the harness has ONE scalar
-    #    fork_block), and that chain's pin MUST be in the assignment.
+    # 2. Pins: each slice is single-chain (the leader partitions the corpus per
+    #    chain), and THIS slice's chain pin MUST be in the assignment. Different
+    #    slices may cover different chains — each is forked at its own chain's pin
+    #    below — so multi-chain veto coverage is many single-chain slices, never a
+    #    slice that mixes chains (which the harness forks with one block and so refuses).
     chains = {o.get("chain_id") for o in slice_orders + calib_orders}
     if len(chains) != 1:
         return _refused(assignment, f"multi_chain_slice:{sorted(map(str, chains))}")
@@ -1353,21 +1378,38 @@ async def reverify_dissents(
     if not orders:
         return empty
 
-    chains = {o.get("chain_id") for o in orders}
-    if len(chains) != 1:
-        return empty
-    pin = a0.fork_pins.get(str(next(iter(chains))))
-    if not pin:
-        return empty
+    # PER-CHAIN reverify. The veto now spans every fork-pinned chain, so the UNION of
+    # responders' planned violations can mix chains (e.g. a Base veto from one follower
+    # and an Ethereum veto from another arriving in the same coordinator tick). Bench
+    # each chain at ITS OWN pin — replaying a mixed-chain batch at one scalar block
+    # would fork the wrong chain and confirm nothing, silently disabling the veto for
+    # that round (the exact dual-chain-regression case this feature targets). Each SLICE
+    # stays single-chain via partition_follower_slices; only this cross-responder union
+    # can span chains, so we group here. A chain with no pin (can't happen — chain_ids
+    # derive from fork_pins — but defensive) is skipped, leaving its violations
+    # unconfirmed → re-verified, never a false confirm.
+    by_chain: dict[Any, list[dict[str, Any]]] = {}
+    for o in orders:
+        by_chain.setdefault(o.get("chain_id"), []).append(o)
 
+    confirmed_ids: set[str] = set()
+    benched_ids: set[str] = set()
     try:
         for ref in (a0.candidate_image_ref, a0.incumbent_image_ref):
             if not await pull_image(ref):
                 return empty
-        worker = worker_factory()
-        worker._epoch_block_number = int(pin)
-        champ = await worker.benchmark_explicit_orders(a0.incumbent_image_ref, orders)
-        chal = await worker.benchmark_explicit_orders(a0.candidate_image_ref, orders)
+        for chain_id, chain_orders in sorted(by_chain.items(), key=lambda kv: str(kv[0])):
+            pin = a0.fork_pins.get(str(chain_id))
+            if not pin:
+                continue
+            worker = worker_factory()
+            worker._epoch_block_number = int(pin)
+            champ = await worker.benchmark_explicit_orders(a0.incumbent_image_ref, chain_orders)
+            chal = await worker.benchmark_explicit_orders(a0.candidate_image_ref, chain_orders)
+            verdict = evaluate_relative_adoption(champ, chal)
+            violations, _c, _cal, _m = extract_slice_evidence(verdict, chain_orders, [], chal)
+            confirmed_ids.update(v.order_id for v in violations)
+            benched_ids.update(o.get("order_id") for o in chain_orders if o.get("order_id"))
     except (ExplicitOrderUnavailable, RealSimulationUnavailable):
         return empty
     except asyncio.CancelledError:
@@ -1376,9 +1418,8 @@ async def reverify_dissents(
         logger.warning("[distributed-veto] re-verify bench failed: %s", exc)
         return empty
 
-    verdict = evaluate_relative_adoption(champ, chal)
-    violations, _c, _cal, _m = extract_slice_evidence(verdict, orders, [], chal)
-    confirmed_ids = {v.order_id for v in violations}
+    if not benched_ids:
+        return empty
     per_order = {v.order_id: (v.order_id in confirmed_ids) for v in planned}
     n_confirmed = sum(1 for ok in per_order.values() if ok)
     return {
@@ -1388,11 +1429,11 @@ async def reverify_dissents(
         "discarded": len(planned) - n_confirmed,
         "orders": per_order,
         # Order_ids ACTUALLY looked-up-and-benched (a planned order whose lookup
-        # missed is NOT here). The streaming caller commits coverage per-responder
-        # against this set — a responder with an unbenched order stays uncovered
-        # and is re-verified, never a silent covered-but-unbenched fail-open. Not
-        # persisted: merge_reverify_results drops it before the observe record.
-        "benched": {o.get("order_id") for o in orders if o.get("order_id")},
+        # missed OR whose chain had no pin is NOT here). The streaming caller commits
+        # coverage per-responder against this set — a responder with an unbenched order
+        # stays uncovered and is re-verified, never a silent covered-but-unbenched
+        # fail-open. Not persisted: merge_reverify_results drops it before the record.
+        "benched": benched_ids,
     }
 
 

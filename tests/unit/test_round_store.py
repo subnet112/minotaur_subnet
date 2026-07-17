@@ -187,3 +187,13 @@ def test_veto_observe_missing_key_loads_as_none():
         raw = st.to_dict()
         del raw["veto_observe"]
         assert RoundState.from_dict(raw).veto_observe is None
+
+
+def test_champion_snapshot_canonical_main_sha_roundtrips():
+    # The reconciler baseline (canonical main HEAD at adoption) survives persist/reload.
+    snap = ChampionSnapshot(submission_id="sub_1", canonical_main_sha="cafef00d")
+    assert ChampionSnapshot.from_dict(snap.to_dict()).canonical_main_sha == "cafef00d"
+    # Absent in legacy data => None (champions adopted before this field existed).
+    legacy = snap.to_dict()
+    del legacy["canonical_main_sha"]
+    assert ChampionSnapshot.from_dict(legacy).canonical_main_sha is None
