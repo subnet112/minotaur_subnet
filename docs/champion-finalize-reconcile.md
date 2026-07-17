@@ -58,10 +58,33 @@ Part 1 alone would have prevented the 2026-07-17 split: `relayer_unreachable`
 (`stage="client"`) now defers, and the coordinator completes the adoption once the
 relayer is reachable — well within the ~30-min `decision_deadline` window.
 
+## In this PR (Part 2 — reconciler + auto-revert)
+
+`minotaur_subnet/relayer/champion_reconcile.py`:
+
+- `classify_main_reconcile(main_tree, adopted_tree, onchain_throne_is_adopted)` — the
+  pure decision. **REVERT only** when `main` drifted from the adopted champion **and**
+  the on-chain throne is still the adopted champion (the merge never took the throne =
+  orphan). A moved throne → **ALERT** (a real win the leader hasn't adopted — never
+  auto-reverted). Missing/ambiguous input → NOOP/ALERT. Exhaustively unit-tested.
+- `revert_main_to_tree(...)` — the auto-revert: a forward commit whose tree == the
+  adopted champion's tree, parented on the drifted head (restores content regardless of
+  drift depth, no history rewrite). FAIL-CLOSED on any write error.
+- `onchain_throne_is_adopted(commit, round)` — the throne signal via `_onchain_cert_binds`;
+  **False on any read error** so a bad read can never force a revert.
+- `reconcile_champion_main(...)` / `run_reconcile_pass(...)` — orchestration + `dry_run`.
+- `api/startup.py`: a leader-only sweep loop, **OBSERVE-ONLY by default** (detect + log,
+  no write). Arm the auto-revert with `CHAMPION_RECONCILE_ENFORCE=1` after soak. Kill:
+  `CHAMPION_MAIN_RECONCILE=0`; cadence `CHAMPION_MAIN_RECONCILE_SECONDS` (default 300s).
+
+Together with Part 1, a half-completed finalization now (a) defers + completes when the
+relayer returns, and (b) if it still stranded an orphaned merge, the sweep reverts `main`
+back to the adopted champion — automating exactly the 2026-07-17 manual heal.
+
 ## Follow-ups (tracked)
 
-- [ ] Reconciler sweep (complete missed win / auto-revert orphaned or uncertified merge).
-- [ ] `_revert_champion_merge` compensation helper (built on `_publish_certified_tree_to_canonical`).
+- [x] Reconciler sweep + auto-revert (this PR, Part 2 — observe-default).
 - [ ] Leader-side relayer health-gate + bounded retry in `on_champion_adopted_via_relayer`.
 - [ ] `update.sh` / compose ordering: api finalizes only after the relayer is healthy.
 - [ ] Durable finalize journal for cross-restart resume (belt-and-suspenders to the deadline-bounded retry).
+- [ ] Soak the reconciler in observe, validate the drift/throne signal, then arm `CHAMPION_RECONCILE_ENFORCE=1`.
