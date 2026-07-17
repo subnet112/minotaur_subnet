@@ -9,14 +9,32 @@
 # commit. Never drift to >= without a matching upgrade-plan test.
 
 # Bittensor subnet integration
-bittensor==10.1.0
-bittensor-cli==9.18.1
-bittensor-wallet==4.0.1
-async-substrate-interface==1.6.3
+# 2026-07-16: finney upgraded its runtime so the neurons_lite runtime-API netuid
+# param is now a Composite-wrapped u16. bittensor 10.1.0 / async-substrate-interface
+# 1.6.3 encode it as a bare int → `ValueError: Invalid type for data: 112 ...
+# Composite(... u16 ...)` on subtensor.metagraph(netuid=), which broke BOTH the API
+# metagraph-sync (submissions 503 / standalone) AND validator weight emission,
+# fleet-wide. Fix = bump to bittensor 10.5.0, which pulls the fixed
+# async-substrate-interface 2.2.1. Verified empirically against live finney
+# (subtensor.metagraph(netuid=112) → n=256). Stay on the 10.x line: bittensor 11.x
+# is the new unified SDK (opentensor/bittensor archived; moved to
+# RaoFoundation/subtensor) with a rewritten API (no Subtensor.metagraph) — a
+# separate migration, not this hotfix.
+bittensor==10.5.0
+# bittensor-cli REMOVED: it pulls scalecodec (py-scale-codec), which conflicts
+# with async-substrate-interface 2.x's `cyscale` (shared namespace → an import-time
+# `_check_conflicts()` RuntimeError that breaks every bittensor import). btcli is
+# NOT used inside the image at runtime — only operators install it host-side to
+# register a wallet (scripts/install_prereqs.sh). Wallet loading in the image uses
+# bittensor-wallet, which stays.
+bittensor-wallet==4.1.1
+async-substrate-interface==2.2.1
 
 # HTTP / core
-requests==2.32.5
-aiohttp==3.13.3
+# bittensor 10.5.0 requires requests>=2.33.0,<3.0 (was pinned 2.32.5).
+requests>=2.33.0,<3.0
+# bittensor 10.5.0 requires aiohttp>=3.13.4,<4.0 (was pinned 3.13.3).
+aiohttp==3.13.4
 httpx==0.28.1
 numpy==2.4.2
 # Fast JSON for the large store files (~44MB submissions.json re-serialized per

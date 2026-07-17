@@ -12,8 +12,12 @@ import logging
 import aiohttp
 
 from ..backoff import request_with_backoff
-from ..models import QuoteOutcome, TradeDescriptor, to_int
+from ..models import QuoteOutcome, TradeDescriptor, to_float, to_int
 from .base import AggregatorClient
+
+
+def _to_float(value):
+    return to_float(value)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,9 @@ class VeloraClient(AggregatorClient):
             dest = to_int(route.get("destAmount"))
             if dest is None or dest <= 0:
                 return self._failed("no destAmount", latency)
+            # destAmountAfterFee = output net of Velora's (default "anon") partner
+            # fee. Fall back to gross when absent so we never overstate.
+            after_fee = to_int(route.get("destAmountAfterFee"))
             dex = None
             best = route.get("bestRoute")
             if isinstance(best, list) and best:
@@ -66,8 +73,13 @@ class VeloraClient(AggregatorClient):
                     dex = exch.get("exchange")
             return self._ok(
                 str(dest),
+                output_after_fee_raw=str(after_fee) if after_fee is not None else None,
                 gas_units=to_int(route.get("gasCost")),
                 is_net_of_gas=False,
+                input_usd=_to_float(route.get("srcUSD")),
+                output_usd=_to_float(route.get("destUSD")),
+                gas_usd=_to_float(route.get("gasCostUSD")),
+                price_impact_reached=bool(route.get("maxImpactReached")),
                 dex=dex or "velora",
                 latency_ms=latency,
             )

@@ -261,8 +261,11 @@ def _round_relative_extra(state: RoundState) -> dict[str, Any]:
         counts = details.get("relative") if isinstance(details, dict) else None
         if isinstance(counts, dict):
             extra["finalist_relative"] = counts
+            # This branch is reached ONLY for the round's chosen finalist (early
+            # return above when there is none), i.e. the candidate the round
+            # actually adopted — so the past-tense "adopted <id>" verb is correct.
             rel_reason = relative_reason(
-                counts, candidate_id=state.finalist_submission_id,
+                counts, candidate_id=state.finalist_submission_id, adopted=True,
             )
             if rel_reason:
                 extra["reason_relative"] = rel_reason

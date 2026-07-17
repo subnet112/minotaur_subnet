@@ -928,6 +928,11 @@ class TestEpochManager:
             {"intent_id": "o1", "raw_output": "1000000"},  # matched vs stored bar
             {"intent_id": "o2", "raw_output": "1000000"},
         ]}
+        # Stale OUTPERFORMS badges from an earlier pass — the walk must overwrite
+        # them from each candidate's authoritative (reject) verdict so a
+        # no-change round never leaves a "dethrone" badge standing.
+        top.benchmark_details["relative"] = {"verdict": "dethrone", "better": 1}
+        runner.benchmark_details["relative"] = {"verdict": "dethrone", "better": 1}
         # Fresh bar: o1=2000000 -> top is cut ~50% (hard floor), runner too.
         mgr, current_round, rejected = self._fallthrough_fixture(
             [{"intent_id": "o1", "raw_output": "2000000"},
@@ -940,6 +945,11 @@ class TestEpochManager:
         assert result["status_after"] == RoundStatus.ABORTED.value
         assert "hard floor" in result["abort_reason"]  # top candidate's reason
         assert {r[0] for r in rejected} == {"sub_top", "sub_runner"}
+        # Both evaluated candidates' badges reflect the reject verdict, not the
+        # stale dethrone (no OUTPERFORMS survives the no-change round).
+        for sid in ("sub_top", "sub_runner"):
+            rel = mgr._sub_store.get(sid).benchmark_details.get("relative")
+            assert rel is not None and rel["verdict"] != "dethrone"
 
     @pytest.mark.asyncio
     async def test_evaluate_round_is_noop_on_follower(self):
@@ -1030,6 +1040,60 @@ class TestEpochManager:
         # Champion + no-shadow competitor untouched.
         assert "relative" not in store.get("champ").benchmark_details
         assert "relative" not in store.get("noshadow").benchmark_details
+
+    @pytest.mark.asyncio
+    async def test_author_candidate_badge_overwrites_stale_dethrone(self):
+        """The decision authors the badge: after the adoption walk evaluates a
+        candidate, its stored `relative` block is overwritten from the SAME
+        verdict the decision used. A STALE `dethrone` block (e.g. persisted in an
+        earlier pass against slightly-drifted champion rows) must NOT survive a
+        `matched` authoritative verdict — that stale OUTPERFORMS badge on a
+        no-change round is exactly what a miner misread as a merge."""
+        from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+
+        champ = _make_submission(submission_id="champ")
+        champ.benchmark_details = {"per_intent": [{"intent_id": "o1", "raw_output": "1000"}]}
+        cand = _make_submission(submission_id="cand", round_id="round-e1-n1")
+        cand.benchmark_details = {
+            "per_intent": [{"intent_id": "o1", "raw_output": "1000"}],  # matched
+            # Stale winning badge left over from a prior pass.
+            "relative": {"verdict": "dethrone", "better": 1, "worse": 0, "matched": 0},
+        }
+        store = _make_store_with_subs(champ, cand)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+
+        # Authoritative verdict for THIS candidate vs the champion: all-matched.
+        mgr._last_adopt_verdict = evaluate_relative_adoption(
+            mgr._per_intent(champ), mgr._per_intent(cand),
+        )
+        assert mgr._last_adopt_verdict["adopt"] is False  # matched, not adopted
+
+        await mgr._author_candidate_badge(cand, champ, "round-e1-n1")
+
+        rel = store.get("cand").benchmark_details["relative"]
+        assert rel["verdict"] == "matched"          # overwrote the stale dethrone
+        assert rel["better"] == 0 and rel["worse"] == 0
+        assert rel["round_id"] == "round-e1-n1"
+        assert "factorization" in rel and "deadwood" in rel  # shared context attached
+
+    @pytest.mark.asyncio
+    async def test_author_candidate_badge_noop_when_abstained(self):
+        """When the verdict is unavailable (abstain: no data / stale bar), the
+        badge author leaves any existing block untouched — it never writes a
+        previous candidate's verdict onto this one."""
+        cand = _make_submission(submission_id="cand", round_id="round-e1-n1")
+        stale = {"verdict": "dethrone", "better": 1, "worse": 0, "matched": 0}
+        cand.benchmark_details = {"per_intent": [{"intent_id": "o1", "raw_output": "1"}],
+                                  "relative": dict(stale)}
+        store = _make_store_with_subs(cand)
+        mgr = EpochManager(submission_store=store, round_store=RoundStore())
+        mgr._champion = ChampionInfo(submission_id="champ")
+        mgr._last_adopt_verdict = None  # abstained
+
+        await mgr._author_candidate_badge(cand, None, "round-e1-n1")
+
+        assert store.get("cand").benchmark_details["relative"] == stale
 
     @pytest.mark.asyncio
     async def test_activate_certified_round_adopts_finalist(self):
@@ -1688,3 +1752,66 @@ def test_finalist_tiebreak_prefers_cleaner_factorization():
     a = _make_submission(submission_id="sub_aaa", score=0.9)
     b = _make_submission(submission_id="sub_bbb", score=0.9)
     assert [s.submission_id for s in mgr._eligible_candidates([b, a])] == ["sub_aaa", "sub_bbb"]
+
+
+# ── time-weighted emission: Phase 0 observe-only accrual wiring ───────────────
+
+_TW_HK_B = "5MinerTimeWeightedBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+_TW_OWNER = "5OwnerBurnTimeWeightedAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def _make_observe_manager():
+    store = _make_store_with_subs(
+        _make_submission(submission_id="sub_tw_b", hotkey=_TW_HK_B),
+    )
+    mgr = EpochManager(
+        submission_store=store, round_store=RoundStore(), owner_hotkey=_TW_OWNER,
+    )
+    mgr._champion = ChampionInfo(submission_id="sub_tw_b", hotkey=_TW_HK_B)
+    return mgr
+
+
+def test_time_weighted_observe_does_not_change_emitted_mapping(monkeypatch):
+    """With the observe flag ON, _build_weights_mapping still returns the exact
+    winner-take-all vector — observation must never alter emission."""
+    mgr = _make_observe_manager()
+
+    monkeypatch.delenv("EMISSION_TIME_WEIGHTED_OBSERVE", raising=False)
+    baseline = mgr._build_weights_mapping(1)
+    # Current champion (B) takes the miner share; owner takes the remainder.
+    assert set(baseline) == {_TW_HK_B, _TW_OWNER}
+    assert baseline[_TW_HK_B] == pytest.approx(CHAMPION_MINER_WEIGHT_FRACTION)
+    assert baseline[_TW_OWNER] == pytest.approx(1.0 - CHAMPION_MINER_WEIGHT_FRACTION)
+
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    mgr.observe_accrue_throne_time()  # a coordinator-loop tick
+    with_observe = mgr._build_weights_mapping(1)
+    assert with_observe == baseline
+
+
+def test_observe_accrue_is_noop_when_flag_off(monkeypatch):
+    """The accumulator is never touched while the observe flag is off."""
+    monkeypatch.delenv("EMISSION_TIME_WEIGHTED_OBSERVE", raising=False)
+    mgr = _make_observe_manager()
+    mgr.observe_accrue_throne_time()
+    assert mgr._throne_accumulator.debug_state()["tempo_index"] is None
+
+
+def test_observe_accrue_samples_current_champion_when_on(monkeypatch):
+    """With the flag on, a tick anchors the accumulator to the current tempo."""
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    mgr = _make_observe_manager()
+    mgr.observe_accrue_throne_time()
+    assert mgr._throne_accumulator.debug_state()["tempo_index"] is not None
+
+
+def test_time_weighted_observe_survives_missing_stores(monkeypatch):
+    """Observation is best-effort: a manager without a round store must not raise
+    from _build_weights_mapping or a sample tick when the flag is on."""
+    monkeypatch.setenv("EMISSION_TIME_WEIGHTED_OBSERVE", "1")
+    store = _make_store_with_subs(_make_submission(submission_id="sub_only"))
+    mgr = EpochManager(submission_store=store, owner_hotkey=_TW_OWNER)
+    mgr._champion = ChampionInfo()  # no champion → 100% owner burn
+    mgr.observe_accrue_throne_time()  # must not raise
+    mapping = mgr._build_weights_mapping(1)
+    assert mapping == {_TW_OWNER: 1.0}

@@ -689,6 +689,19 @@ services:
       # is on (the live path already derives + logs + binds).
       # ROUND_ANCHOR_SHADOW: "0"  # default off; flip to 1 to observe before enabling
       #
+      # TIME-WEIGHTED EMISSION OBSERVE (Phase 0, default OFF — safe to soak on the
+      # LEADER ALONE before any fleet change). When set, the epoch manager
+      # ADDITIONALLY accrues throne-time by sampling the current champion each
+      # coordinator tick and LOGS the vector it WOULD emit — the miner share split
+      # across every miner that held the throne this tempo, proportional to epochs
+      # held — next to the winner-take-all vector it actually emits. It NEVER
+      # changes what is emitted, so enabling it on the leader only cannot split the
+      # fleet (unlike a real weight change). Soak procedure: set this on the leader,
+      # diff the `[time-weighted OBSERVE]` log lines to validate the accrual, THEN
+      # (later, optionally) enable fleet-wide to measure cross-node divergence.
+      # Emitting the time-weighted vector for real is a SEPARATE, gated change.
+      # EMISSION_TIME_WEIGHTED_OBSERVE: "1"  # default off; leader-soak flag
+      #
       # The env pins below are DEV/TEST-ONLY manual overrides and are IGNORED
       # when ROUND_ANCHORED_PIN is on (do not set them in production):
       # BENCHMARK_EPOCH_BLOCK: "<base block>"      # dev/test only

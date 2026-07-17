@@ -25,14 +25,20 @@ _CROSS_ORDER = {
     },
 }
 _WRONG_CHAIN_ORDER = {**_VALID_ORDER, "order_id": "o3", "chain_id": 999}
+_ETH_ORDER = {
+    "order_id": "e1", "app_id": "app_1", "intent_function": "swap",
+    "status": "filled", "chain_id": 1,
+    "params": {"input_token": "0xIN", "output_token": "0xOUT", "input_amount": "1000"},
+}
 
 
-def _cfg(store_path) -> DexCompareConfig:
+def _cfg(store_path, chains=(8453,)) -> DexCompareConfig:
     return DexCompareConfig(
         enabled=True, interval_seconds=0.01, jitter_seconds=0.0, startup_delay_seconds=0.0,
         api_base_url="http://127.0.0.1:8080", slippage_bps=50, http_timeout=5.0,
-        max_retries=1, retain_days=90, max_rows=1000, supported_chain_ids=(8453,),
+        max_retries=1, retain_days=90, max_rows=1000, supported_chain_ids=chains,
         store_path=str(store_path),
+        normalize_size=False, target_usd=5000.0, price_cache_ttl=600.0, max_price_impact_bps=300,
         cow_base_url="https://api.cow.fi", velora_base_url="https://api.velora.xyz",
         oneinch_api_key=None, oneinch_base_url="https://api.1inch.dev", oneinch_version="v6.0",
         zerox_api_key=None, zerox_base_url="https://api.0x.org",
@@ -60,9 +66,9 @@ class StubAgg:
         return QuoteOutcome("cow", "ok", output_raw="90", is_net_of_gas=True)
 
 
-def _make_worker(orders, tmp_path):
+def _make_worker(orders, tmp_path, chains=(8453,)):
     store = DexCompareStore(tmp_path / "dc.db")
-    worker = DexCompareWorker(FakeAppStore(orders), store, _cfg(tmp_path / "dc.db"))
+    worker = DexCompareWorker(FakeAppStore(orders), store, _cfg(tmp_path / "dc.db", chains))
     worker._aggregators = [StubAgg()]
     worker._session = object()
 
@@ -83,7 +89,7 @@ def test_run_once_writes_one_row(tmp_path):
         new=AsyncMock(return_value=QuoteOutcome("minotaur", "ok", output_raw="100", gas_units=1)),
     ):
         wrote = asyncio.run(worker.run_once())
-    assert wrote is True
+    assert wrote == 1
     assert store.count() == 1
     row = store.fetch_since(None, 0.0)[0]
     assert row["results"]["cow"]["output_raw"] == "90"
@@ -94,7 +100,7 @@ def test_no_candidates_writes_nothing(tmp_path):
     # Only a cross-chain + a wrong-chain order -> filtered out -> no candidates.
     worker, store = _make_worker([_CROSS_ORDER, _WRONG_CHAIN_ORDER], tmp_path)
     wrote = asyncio.run(worker.run_once())
-    assert wrote is False and store.count() == 0
+    assert wrote == 0 and store.count() == 0
 
 
 def test_warming_up_skips_write(tmp_path):
@@ -107,7 +113,29 @@ def test_warming_up_skips_write(tmp_path):
         new=AsyncMock(return_value=QuoteOutcome("minotaur", "warming_up")),
     ):
         wrote = asyncio.run(worker.run_once())
-    assert wrote is False and store.count() == 0
+    assert wrote == 0 and store.count() == 0
+
+
+def test_draws_one_per_chain(tmp_path):
+    # Corpus has a Base and an Ethereum candidate (+ a cross-chain to be filtered).
+    # One run_once must draw once PER enabled chain -> exactly one row per chain.
+    worker, store = _make_worker(
+        [_VALID_ORDER, _ETH_ORDER, _CROSS_ORDER], tmp_path, chains=(1, 8453),
+    )
+
+    async def _resolve(order, _cache):
+        return make_trade(chain_id=int(order["chain_id"]))
+
+    with patch(
+        "minotaur_subnet.dex_compare.worker.resolve_trade_tokens", new=_resolve,
+    ), patch(
+        "minotaur_subnet.dex_compare.worker.fetch_minotaur_quote",
+        new=AsyncMock(return_value=QuoteOutcome("minotaur", "ok", output_raw="100", gas_units=1)),
+    ):
+        wrote = asyncio.run(worker.run_once())
+    assert wrote == 2
+    chains = {r["chain_id"] for r in store.fetch_since(None, 0.0)}
+    assert chains == {1, 8453}
 
 
 def test_run_loop_runs_then_stops(tmp_path):

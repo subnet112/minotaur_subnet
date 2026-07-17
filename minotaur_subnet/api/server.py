@@ -22,7 +22,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 import os
 
@@ -237,7 +239,7 @@ app.add_middleware(
 
 
 @app.get("/health")
-def health() -> dict:
+def health():
     worker_running = ctx.benchmark_worker is not None and ctx.benchmark_worker._running
     loop_running = ctx.block_loop is not None and ctx.block_loop.running
     coordinator_running = ctx.solver_round_task is not None and not ctx.solver_round_task.done()
@@ -447,6 +449,24 @@ def health() -> dict:
         data["orderbook"] = store.count_orders_by_status()
     except Exception:
         data["orderbook"] = None
+
+    # A node CONFIGURED as a validator (hotkey + SUBTENSOR_URL set, not
+    # FORCE_LEADER) whose metagraph sync failed to wire is DEGRADED: submissions
+    # 503 and the weight emitter can't resolve UIDs. Report 503 so update.sh's
+    # health-gate rolls the deploy back — as it already does for the validator
+    # daemon — instead of leaving a stuck standalone api serving 503s while the
+    # container reports "healthy" (what happened when a finney runtime change
+    # broke metagraph encoding 2026-07-16). Legit standalone / testnet /
+    # FORCE_LEADER nodes never set ``solver_round_metagraph_expected`` and stay
+    # healthy; the healthcheck's 180s start_period covers the normal boot-time
+    # sync window so this never fires transiently during startup.
+    if ctx.solver_round_metagraph_expected and ctx.solver_round_metagraph_sync is None:
+        data["status"] = "degraded"
+        data["degraded_reason"] = (
+            "solver-round metagraph sync not wired (validator role expected)"
+        )
+        return JSONResponse(content=jsonable_encoder(data), status_code=503)
+
     return data
 
 

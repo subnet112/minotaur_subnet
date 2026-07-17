@@ -34,6 +34,12 @@ class ServerContext:
     solver_round_metagraph_task: Any = None
     solver_round_role_task: Any = None
     solver_round_role: str = "standalone"
+    # True once startup INTENDED to wire the solver-round metagraph sync (a
+    # configured validator: hotkey + SUBTENSOR_URL set, not FORCE_LEADER). Set
+    # BEFORE the sync attempt so /health can distinguish "validator that failed to
+    # wire metagraph" (unhealthy → 503, so update.sh's health-gate rolls the deploy
+    # back) from a legit standalone/testnet/force-leader node (stays healthy).
+    solver_round_metagraph_expected: bool = False
     solver_round_epoch_clock: SolverRoundEpochClock | None = None
 
     # ── orderbook / block loop ───────────────────────────────────────────
