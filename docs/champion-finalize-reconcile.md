@@ -81,10 +81,32 @@ Together with Part 1, a half-completed finalization now (a) defers + completes w
 relayer returns, and (b) if it still stranded an orphaned merge, the sweep reverts `main`
 back to the adopted champion — automating exactly the 2026-07-17 manual heal.
 
+## In this PR (Part 3a — relayer health-gate)
+
+`on_champion_adopted_via_relayer` (`solver_repo.py`) now **probes the relayer's
+`/health` before POSTing the finalize** (`_relayer_ready`). If the relayer isn't ready
+— the exact window the 08:00 `update.sh` recreate opened, where the api came up before
+the relayer's DNS/port — it returns `stage="client"` so the merge-gate **DEFERS** (Part
+1) instead of aborting, and it **never POSTs** a finalize the relayer might half-apply.
+Single fast probe (no in-line sleep — the coordinator's re-drive cadence is the retry,
+so the event loop is never blocked). Kill switch `RELAYER_HEALTH_GATE=0`. Tests in
+`test_champion_adopted_via_relayer.py`.
+
+## Why the ordering fix (3b) is *not* viable — health-gate supersedes it
+
+Investigated on the leader: **`relayer.depends_on: [api]`** — the relayer is
+*designed* to start **after** the api. Adding `api.depends_on: relayer` is therefore a
+**dependency cycle** (`docker compose config` → "dependency cycle detected: api ->
+relayer -> api"), and reordering `update.sh`'s service list just fights that dependency.
+So compose/`update.sh` ordering **cannot** guarantee relayer-before-api. This is
+precisely why the api can finalize before the relayer is ready — and it's exactly what
+the Part-3a health-gate handles by deferring. **The health-gate is the correct and
+sufficient fix; the ordering follow-up is closed as not-viable.**
+
 ## Follow-ups (tracked)
 
-- [x] Reconciler sweep + auto-revert (this PR, Part 2 — observe-default).
-- [ ] Leader-side relayer health-gate + bounded retry in `on_champion_adopted_via_relayer`.
-- [ ] `update.sh` / compose ordering: api finalizes only after the relayer is healthy.
+- [x] Reconciler sweep + auto-revert (Part 2 — observe-default).
+- [x] Relayer health-gate before finalize (Part 3a).
+- [x] ~~`update.sh`/compose ordering~~ — closed: blocked by the `relayer → api` dependency cycle; the health-gate supersedes it.
 - [ ] Durable finalize journal for cross-restart resume (belt-and-suspenders to the deadline-bounded retry).
 - [ ] Soak the reconciler in observe, validate the drift/throne signal, then arm `CHAMPION_RECONCILE_ENFORCE=1`.
