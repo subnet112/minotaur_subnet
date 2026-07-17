@@ -166,3 +166,39 @@ def test_close_round_request_accepts_benchmark_anchor_epoch():
     assert body.benchmark_anchor_epoch == 77
     # absent on a pre-B2 leader's payload → None (follower falls back)
     assert CloseRoundRequest(close_epoch=100).benchmark_anchor_epoch is None
+
+
+# ── B1: the AUTOMATED close broadcast (nested builder) now carries the field ──
+#
+# The coordinator-loop close builder used to duplicate the payload field list and
+# had DRIFTED — it omitted benchmark_anchor_epoch, so the leader's per-tempo close
+# broadcast materialized the round on every follower with None → PACK_HASH_MISMATCH
+# at quorum>1. It now delegates to the single module-level _close_round_sync_payload,
+# so the two can never diverge again (covered by the Builder-A test above). Here we
+# lock the CONSUMER side: a follower adopting a close that carries the anchor applies
+# it, and a None anchor (pre-B2 leader) never clobbers an existing value.
+
+def test_adopt_round_applies_benchmark_anchor_epoch(tmp_path):
+    store = RoundStore(persist_path=tmp_path / "rounds.json")
+    adopted = store.adopt_round(
+        round_id="round-e100-n1", opened_epoch=100, status=RoundStatus.CLOSED,
+        close_epoch=100, benchmark_anchor_epoch=77,
+    )
+    assert adopted.benchmark_anchor_epoch == 77
+    # The pin then anchors to the adopted real-open epoch (default-ON), not opened_epoch.
+    assert startup._round_fork_anchor_epoch(adopted) == 77
+
+
+def test_adopt_round_none_anchor_does_not_clobber(tmp_path):
+    store = RoundStore(persist_path=tmp_path / "rounds.json")
+    store.adopt_round(
+        round_id="round-e100-n1", opened_epoch=100, status=RoundStatus.CLOSED,
+        benchmark_anchor_epoch=77,
+    )
+    # A later re-sync from a pre-B2 leader carries None → adopt_round SKIPS it, so the
+    # already-adopted anchor survives (never falls back to opened_epoch).
+    re = store.adopt_round(
+        round_id="round-e100-n1", opened_epoch=100, status=RoundStatus.CLOSED,
+        benchmark_anchor_epoch=None,
+    )
+    assert re.benchmark_anchor_epoch == 77
