@@ -391,6 +391,7 @@ class ValidatorPeerNetwork:
         quorum_required: int | None = None,
         decision_deadline_epoch: int | None = None,
         committee_block: int | None = None,
+        benchmark_anchor_epoch: int | None = None,
         request_timeout: float | None = None,
         path: str = "/v1/solver/round/consensus/proposal",
     ) -> list[ChampionApproval]:
@@ -421,6 +422,7 @@ class ValidatorPeerNetwork:
             quorum_required=quorum_required,
             decision_deadline_epoch=decision_deadline_epoch,
             committee_block=committee_block,
+            benchmark_anchor_epoch=benchmark_anchor_epoch,
         )
 
         dissent_codes: list[str] = []
@@ -576,6 +578,7 @@ class ValidatorPeerNetwork:
         quorum_required: int | None = None,
         decision_deadline_epoch: int | None = None,
         committee_block: int | None = None,
+        benchmark_anchor_epoch: int | None = None,
     ) -> dict[str, Any]:
         """Build the JSON payload for champion certification."""
         payload = {
@@ -591,18 +594,21 @@ class ValidatorPeerNetwork:
             "quorum_required": quorum_required,
             "decision_deadline_epoch": decision_deadline_epoch,
             "committee_block": committee_block,
+            # B3: the leader's real round-open anchor epoch, so a follower adopting via
+            # the proposal path anchors its fork pin identically. Safe now that B2 verifies
+            # the RAW wire dict (not model_dump); MUST NOT ship before B2 is fleet-wide.
+            "benchmark_anchor_epoch": benchmark_anchor_epoch,
             # v2 signed digest fields — peers must reconstruct the exact same
             # EIP-712 tuple to verify signatures, so propagate these.
             "commit_hash": getattr(proposal, "commit_hash", None),
             "nonce": int(getattr(proposal, "nonce", 0) or 0),
             "deadline": int(getattr(proposal, "deadline", 0) or 0),
             "proposer": self.validator_id,
-            # NB: every key here MUST be a field of ChampionConsensusProposalRequest.
-            # The follower verifies the signature over body.model_dump() (model fields
-            # only), so any extra key would be in the SIGNED canonical here but DROPPED
-            # on the verify side → signer mismatch. A non-deterministic `timestamp` here
-            # made the recovered signer wrong AND varying per attempt, so followers
-            # rejected every champion proposal (quorum could never be reached). Removed.
+            # Post-B2 the follower verifies this dict as the RAW wire bytes
+            # (request.json()), so a key that isn't a model field no longer breaks the
+            # signature. benchmark_anchor_epoch IS a declared field anyway (B3). The old
+            # constraint — and the #378 `timestamp` outage it caused — is documented in
+            # routes._verify_champion_proposal_signature.
         }
 
         # Sign the canonical JSON of the payload so peers can verify the
