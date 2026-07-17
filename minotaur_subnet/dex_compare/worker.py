@@ -26,7 +26,8 @@ from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
 from .aggregators import build_aggregators
 from .config import DexCompareConfig
 from .minotaur_client import fetch_minotaur_quote
-from .models import STATUS_WARMING_UP, ComparisonRow, TERMINAL_STATUSES, TradeDescriptor
+from .models import STATUS_WARMING_UP, ComparisonRow, TradeDescriptor
+from .sources import build_source, is_candidate
 from .store import DexCompareStore
 from .tokens_resolve import DecimalsCache, resolve_trade_tokens
 
@@ -58,6 +59,9 @@ class DexCompareWorker:
         # Non-deterministic on purpose — unlike the consensus-seeded corpus in
         # order_sampler.py, we want independent random draws here.
         self._rng = random.Random()
+        # Pluggable trade source: "historical" (our orders) | "cow_onchain"
+        # (real executed CoW trades). Selected by config.source.
+        self._source = build_source(config, app_store, self._rng)
         self._session: aiohttp.ClientSession | None = None
         # (chain, token) -> (usd_per_base_unit, monotonic_ts) — for size normalization.
         self._price_cache: dict[tuple[int, str], tuple[float, float]] = {}
@@ -102,35 +106,23 @@ class DexCompareWorker:
 
     # ── one cycle ────────────────────────────────────────────────────────
     async def run_once(self) -> int:
-        """Run ONE comparison per enabled chain that has candidates.
+        """Run ONE comparison per enabled chain that has a sampled trade.
 
-        A single uniform draw over the whole corpus would starve minority chains
-        (the order book is ~99% one chain), so we draw independently PER CHAIN —
-        every enabled chain advances each cycle regardless of its share of the
-        corpus. Returns the number of rows written this cycle.
+        The trade SOURCE yields at most one order-shaped trade per chain (a
+        random draw), so every enabled chain advances each cycle regardless of
+        corpus share. Returns the number of rows written this cycle.
         """
-        orders = await asyncio.to_thread(self._app_store.list_orders)
-        by_chain: dict[int, list[dict[str, Any]]] = {}
-        for order in orders:
-            if self._is_candidate(order):
-                by_chain.setdefault(int(order["chain_id"]), []).append(order)
-        if not by_chain:
+        orders = await self._source.sample(self._cfg.supported_chain_ids)
+        if not orders:
             return 0
 
         written = 0
-        # Iterate the configured chains (stable order); one random draw within each.
-        for chain_id in self._cfg.supported_chain_ids:
-            pool = by_chain.get(chain_id)
-            if not pool:
-                continue
-            order = self._rng.choice(pool)
+        for order in orders:
             try:
                 if await self._run_one_comparison(order):
                     written += 1
-            except Exception as exc:  # noqa: BLE001 — one chain must not kill the rest
-                logger.exception(
-                    "dex-compare comparison error (chain %s): %s", chain_id, exc,
-                )
+            except Exception as exc:  # noqa: BLE001 — one trade must not kill the rest
+                logger.exception("dex-compare comparison error: %s", exc)
 
         # Occasional prune (~1/50 cycles) — keeps growth bounded off the hot path.
         if written and self._rng.random() < 0.02:
@@ -151,11 +143,13 @@ class DexCompareWorker:
         trade = await resolve_trade_tokens(order, self._decimals)
         if trade is None:
             return False
+        trade.trade_source = self._source.name
 
         assert self._session is not None
         # Rescale the (typically dust-sized) historical order to a realistic USD
-        # notional so gas/fees don't dominate the comparison.
-        if self._cfg.normalize_size:
+        # notional so gas/fees don't dominate. CoW trades are already real,
+        # liquid executed sizes — never rescale them.
+        if self._cfg.normalize_size and self._source.name != "cow_onchain":
             trade = await self._normalize(trade)
 
         mino = await fetch_minotaur_quote(self._session, self._cfg, trade)
@@ -258,34 +252,9 @@ class DexCompareWorker:
     # ── helpers ──────────────────────────────────────────────────────────
 
     def _is_candidate(self, order: dict[str, Any]) -> bool:
-        if str(order.get("status", "")).lower() not in TERMINAL_STATUSES:
-            return False
-        try:
-            chain_id = int(order.get("chain_id"))
-        except (TypeError, ValueError):
-            return False
-        if chain_id not in self._cfg.supported_chain_ids:
-            return False
-        params = order.get("params") or {}
-        if not (
-            params.get("input_token")
-            and params.get("output_token")
-            and params.get("input_amount") is not None
-        ):
-            return False
-        # Cross-chain orders can't be quoted apples-to-apples by same-chain
-        # aggregators — filter them out.
-        if params.get("dest_chain_id") is not None:
-            return False
-        in_chain = params.get("input_chain_id")
-        out_chain = params.get("output_chain_id")
-        if in_chain is not None and out_chain is not None:
-            try:
-                if int(in_chain) != int(out_chain):
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
+        # Candidate logic now lives in sources.is_candidate (shared with the
+        # HistoricalOrderSource). Kept as a thin delegator for back-compat.
+        return is_candidate(order, self._cfg.supported_chain_ids)
 
     async def _fan_out(self, trade: Any) -> list[Any]:
         return await asyncio.gather(
