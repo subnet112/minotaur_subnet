@@ -265,6 +265,16 @@ class OrderProcessor:
         if deployment and deployment.contract_address:
             deployed_contract = deployment.contract_address
 
+        # Perpetual pre-flight funds gate. The scoring fork FABRICATES the user's
+        # balance, so without this a perpetual the user can no longer fund would
+        # pass scoring + quorum + relay every cooldown cycle and only revert at
+        # settlement — burning a whole consensus round each time. A cheap LIVE
+        # balance+allowance read lets it terminate immediately (or, if the order
+        # carries an EIP-2612 permit, cure the allowance gaslessly first).
+        if order.perpetual and deployed_contract:
+            if not await self._perpetual_funds_check(order, deployed_contract):
+                return False
+
         # Build intent state from order params
         state = IntentState(
             contract_address=deployed_contract,
@@ -516,6 +526,10 @@ class OrderProcessor:
         # onchain_score_fail_closed() so they gate identically (break-glass:
         # ONCHAIN_SCORE_FAIL_CLOSED in {0,false,no,off} to fail-open fleet-wide).
         if contract_address and oc_score is None and onchain_score_fail_closed():
+            if self._try_requeue_perpetual(
+                order, "on-chain score unavailable this cycle (fail-closed)",
+            ):
+                return False
             self.orderbook.update_order(
                 order.order_id,
                 status=OrderStatus.REJECTED,
@@ -525,6 +539,11 @@ class OrderProcessor:
             self.app_store.record_execution(order.app_id, stat_bps, success=False)
             return False
         if oc_score is not None and oc_score < on_chain_threshold:
+            if self._try_requeue_perpetual(
+                order,
+                f"on-chain score {oc_score} BPS < threshold {on_chain_threshold}",
+            ):
+                return False
             self.orderbook.update_order(
                 order.order_id,
                 status=OrderStatus.REJECTED,
@@ -666,8 +685,14 @@ class OrderProcessor:
                 # Re-open perpetual orders if under max_executions
                 # Note: execution_count was already incremented by update_order above
                 if order.execution_count < order.max_executions:
-                    # Sync on-chain nonce so next execution doesn't revert
-                    await self._refresh_perpetual_nonce(order)
+                    # Perpetuals are signed ONCE with the sentinel nonce
+                    # (type(uint256).max): the contract neither verifies nor
+                    # increments it (AppIntentBase replay protection for a
+                    # perpetual is executionCounts + cooldown + maxExecutions),
+                    # so there is no per-fill nonce to refresh and the single
+                    # user signature stays valid across every fill. Refreshing
+                    # it to a concrete value would mutate a signed EIP-712 field
+                    # and break signature verification on fill #2.
                     self.orderbook.update_order(
                         order.order_id,
                         status=OrderStatus.OPEN,
@@ -778,88 +803,218 @@ class OrderProcessor:
         )
         return sig
 
+    async def _perpetual_funds_check(self, order: Any, spender: str) -> bool:
+        """Live balance+allowance gate for a perpetual's NEXT fill (#1/#3).
+
+        Returns True to proceed, False if the perpetual was terminated as
+        unfundable. Reads the user's real on-chain balance and allowance for the
+        input token (and the fee token, if the fee is non-zero). On an allowance
+        shortfall where the order carries an EIP-2612 permit, the relayer submits
+        it to set the standing allowance gaslessly (#3) and the check re-reads
+        rather than terminating. A BALANCE shortfall can't be cured → terminal.
+
+        Fails OPEN on any read error — a transient RPC hiccup must never
+        terminate a fundable perpetual; the settlement path stays the backstop.
+        Native-input fills (msg.value, no ERC-20 allowance) skip the input leg.
+        """
+        import asyncio as _asyncio
+        from minotaur_subnet.blockchain.token_approval import read_balance_and_allowance
+
+        try:
+            from minotaur_subnet.blockchain.chains import get_web3
+            w3 = get_web3(order.chain_id)
+        except Exception as exc:
+            logger.warning(
+                "Perpetual %s: no web3 for funds pre-check (fail-open): %s",
+                order.order_id, exc,
+            )
+            return True
+
+        loop = _asyncio.get_running_loop()
+        legs: list[tuple[str, int]] = []
+        # Spend-token leg — the token the app pulls from the user for THIS intent,
+        # identified app-agnostically (shared resolve_spend_token_amount, same
+        # convention as order submission). Skipped when the input is native (paid
+        # as msg.value) or unidentifiable (unknown → settlement backstop, never a
+        # false terminate). Works for any app, not just swaps.
+        if not order.params.get("_input_token_is_native"):
+            from minotaur_subnet.blockchain.tokens import resolve_spend_token_amount
+            spend_token, spend_amount = resolve_spend_token_amount(order.params)
+            if spend_token and spend_amount:
+                legs.append((spend_token, spend_amount))
+        # Fee-token leg — ONLY when the app collects the fee directly from the
+        # user (FeeMode.USER: the base _collectPlatformFee pulls WETH via
+        # safeTransferFrom on every fill). APP-mode apps (e.g. DexAggregatorApp)
+        # instead deduct the fee from the swap output and settle it from their own
+        # WETH float — nothing is pulled from the user — so pre-checking WETH there
+        # would falsely terminate a fundable perpetual. The fee IS collected in
+        # both modes (it covers the relayer's gas); only USER mode collects it
+        # from the user's wallet. Read the on-chain feeMode() to decide, and skip
+        # the leg (fail-open) on APP mode / unreadable / zero fee / native input.
+        # NB WETH (0xC02a…/0x4200…0006) has no EIP-2612 permit, so a USER-mode WETH
+        # shortfall can't be cured by a carried permit — the user must approve().
+        fee_wei = int(order.params.get("platform_fee_wei", 0) or 0)
+        if fee_wei > 0 and not order.params.get("_input_token_is_native"):
+            from minotaur_subnet.blockchain.token_approval import fee_mode_is_user
+            user_mode = await loop.run_in_executor(None, fee_mode_is_user, w3, spender)
+            if user_mode:
+                from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
+                fee_token = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
+                if fee_token:
+                    legs.append((fee_token, fee_wei))
+
+        for token, required in legs:
+            reading = await loop.run_in_executor(
+                None, read_balance_and_allowance, w3, token, order.submitted_by, spender,
+            )
+            if reading is None:
+                continue  # read failed → fail open for this leg
+            balance, allowance = reading
+            if balance < required:
+                self._terminate_perpetual_unfunded(
+                    order,
+                    f"insufficient balance for next fill: {balance} < {required} ({token})",
+                )
+                return False
+            if allowance < required:
+                # Try to cure the allowance gaslessly with a carried permit (#3).
+                cured = await self._submit_order_permit(order, token, spender)
+                if cured:
+                    reading = await loop.run_in_executor(
+                        None, read_balance_and_allowance, w3, token, order.submitted_by, spender,
+                    )
+                    if reading is not None and reading[1] >= required:
+                        continue
+                self._terminate_perpetual_unfunded(
+                    order,
+                    f"insufficient allowance for next fill: {allowance} < {required} to {spender} ({token})",
+                )
+                return False
+        return True
+
+    async def _submit_order_permit(self, order: Any, token: str, spender: str) -> bool:
+        """Submit a user-signed EIP-2612 permit to set a standing allowance (#3).
+
+        External perpetual users sign the permit client-side and carry its fields
+        in ``order.params`` (``permit_deadline``/``permit_v``/``permit_r``/
+        ``permit_s``, optional ``permit_value`` defaulting to unlimited). The
+        relayer submits ``token.permit(...)`` gaslessly for the user — anyone may
+        relay a permit, and the one-time gas is dwarfed by the per-fill fee margin
+        collected over the perpetual's life. Returns True on a successful submit,
+        False when absent/invalid/failed (caller then treats it as unfunded).
+        """
+        p = order.params
+        if not all(k in p for k in ("permit_deadline", "permit_v", "permit_r", "permit_s")):
+            return False
+        try:
+            value = int(p.get("permit_value") or 0) or (2 ** 256 - 1)
+            deadline = int(p["permit_deadline"])
+            v = int(p["permit_v"])
+            r = bytes.fromhex(str(p["permit_r"]).replace("0x", ""))
+            s = bytes.fromhex(str(p["permit_s"]).replace("0x", ""))
+        except (ValueError, TypeError) as exc:
+            logger.warning("Perpetual %s: malformed permit params: %s", order.order_id, exc)
+            return False
+        try:
+            await self.relayer.call_contract_function(
+                contract_address=token,
+                chain_id=order.chain_id,
+                signature="permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+                abi_types=["address", "address", "uint256", "uint256", "uint8", "bytes32", "bytes32"],
+                values=[order.submitted_by, spender, value, deadline, v, r, s],
+                gas=120_000,
+            )
+            logger.info(
+                "Perpetual %s: submitted EIP-2612 permit to set allowance on %s",
+                order.order_id, token,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Perpetual %s: permit submission failed: %s", order.order_id, exc)
+            return False
+
+    def _terminate_perpetual_unfunded(self, order: Any, reason: str) -> None:
+        """Terminate a perpetual the user can no longer fund (REJECTED, no debit).
+
+        A funding shortfall is entirely upstream of the solver (the scoring fork
+        fabricates balance, so the plan still scored as doable), so like any user
+        fund-fault it is blameless — the miner is NOT debited.
+        """
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error=f"Perpetual terminated — user can no longer fund the next fill ({reason})",
+        )
+        self.order_persistence.sync(order.order_id)
+        logger.info(
+            "Perpetual order %s terminated (unfunded, miner not debited): %s",
+            order.order_id, reason,
+        )
+
+    def _try_requeue_perpetual(self, order: Any, reason: str) -> bool:
+        """Requeue a live perpetual OPEN for a later cycle; return True if done.
+
+        A perpetual's trigger condition is simply *"can this execute now?"* —
+        answered every cycle by the on-chain score gate. A non-fatal miss this
+        cycle (solver produced no plan, on-chain score below threshold, contract
+        didn't bless the plan) is the perpetual's normal resting state: a
+        limit-order perpetual only clears the gate when the price is favorable,
+        and may rest below threshold for most of its life. So a live perpetual —
+        still under ``max_executions`` and not past its ``deadline`` — is requeued
+        OPEN **without consuming an execution slot and without debiting the miner**
+        (the user's price simply not being hit is not a solver failure).
+        ``last_filled_at=now`` reuses the cooldown gate to back off one cycle. The
+        requeue is unbounded (unlike the consensus retry budget) because resting
+        below threshold indefinitely is expected, not a transient fault.
+
+        Returns False and leaves the order untouched for one-shot orders and for
+        perpetuals that are exhausted or past deadline, so the caller applies its
+        normal terminal handling (REJECTED, with its existing miner-debit policy).
+        ``deadline<=0`` means "no deadline" (see ``Order.deadline``).
+        """
+        now = time.time()
+        deadline = float(getattr(order, "deadline", 0) or 0)
+        live_perpetual = (
+            order.perpetual
+            and order.execution_count < order.max_executions
+            and (deadline <= 0 or now < deadline)
+        )
+        if not live_perpetual:
+            return False
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.OPEN,
+            last_filled_at=now,
+        )
+        self.order_persistence.sync(order.order_id)
+        logger.info(
+            "Perpetual order %s: %s — requeued OPEN "
+            "(execution slot not consumed, miner not debited)",
+            order.order_id, reason,
+        )
+        return True
+
     def _handle_no_plan(self, order: Any) -> None:
         """Resolve an order whose solver produced no plan (#225/#226).
 
-        Perpetual orders (still under max_executions) are requeued to OPEN to be
-        retried on a later cycle — the champion solver hot-swaps over the order's
-        lifetime, so a future champion may solve it; ``last_filled_at=now`` reuses
-        the existing cooldown gate for per-cycle backoff and the execution slot is
-        NOT consumed. One-shot orders (and exhausted perpetuals) are terminal:
-        ``REJECTED`` with a clear reason + ``record_execution(success=False)`` for
-        miner accountability — matching the bad-plan path, instead of a silent
-        ASSIGNED→EXPIRED with no signal.
+        Live perpetuals are requeued via ``_try_requeue_perpetual`` — the champion
+        solver hot-swaps over the order's lifetime, so a future champion may solve
+        it, and the execution slot is not consumed. One-shot orders (and exhausted
+        or expired perpetuals) are terminal: ``REJECTED`` with a clear reason +
+        ``record_execution(success=False)`` for miner accountability — matching the
+        bad-plan path, instead of a silent ASSIGNED→EXPIRED with no signal.
         """
-        if order.perpetual and order.execution_count < order.max_executions:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.OPEN,
-                last_filled_at=time.time(),
-            )
-            self.order_persistence.sync(order.order_id)
-            logger.info(
-                "Perpetual order %s: no plan this cycle — requeued OPEN for retry",
-                order.order_id,
-            )
-        else:
-            self.orderbook.update_order(
-                order.order_id,
-                status=OrderStatus.REJECTED,
-                error="solver produced no plan",
-            )
-            self.order_persistence.sync(order.order_id)
-            self.app_store.record_execution(order.app_id, 0.0, success=False)
-            logger.info(
-                "Order %s: solver produced no plan — REJECTED + miner debited",
-                order.order_id,
-            )
+        if self._try_requeue_perpetual(order, "no plan this cycle"):
+            return
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.REJECTED,
+            error="solver produced no plan",
+        )
+        self.order_persistence.sync(order.order_id)
+        self.app_store.record_execution(order.app_id, 0.0, success=False)
+        logger.info(
+            "Order %s: solver produced no plan — REJECTED + miner debited",
+            order.order_id,
+        )
 
-    async def _refresh_perpetual_nonce(self, order: "Order") -> None:
-        """Fetch the user's current on-chain nonce and update the order params.
-
-        After a perpetual order fills, the on-chain nonce advances but the
-        off-chain order params still hold the old value.  Without this sync,
-        subsequent fills revert with "Invalid nonce".
-
-        Uses the simulator's web3 connection to call ``nonces(address)`` on
-        the app contract.  If the fetch fails, a warning is logged but the
-        re-open is not blocked.
-        """
-        try:
-            w3 = None
-            if self.simulator is not None:
-                w3 = getattr(self.simulator, "w3", None)
-            if w3 is None:
-                return
-
-            contract_address = order.params.get("contract_address")
-            if not contract_address:
-                # Try to look up from app store deployment
-                dep = self.app_store.get_deployment(order.app_id) if self.app_store else None
-                if dep:
-                    contract_address = getattr(dep, "contract_address", None)
-            if not contract_address:
-                return
-
-            # Call nonces(address) -- returns uint256
-            nonce_selector = "0x7ecebe00"  # keccak256("nonces(address)")[:4]
-            padded_addr = order.submitted_by.lower().replace("0x", "").zfill(64)
-            call_data = nonce_selector + padded_addr
-
-            result = w3.eth.call({
-                "to": w3.to_checksum_address(contract_address),
-                "data": call_data,
-            })
-            new_nonce = int(result.hex(), 16)
-            order.params["user_nonce"] = new_nonce
-            # Also update the order in the orderbook
-            self.orderbook.update_order(order.order_id, params=order.params)
-            logger.info(
-                "Refreshed on-chain nonce for perpetual order %s (user=%s, nonce=%d)",
-                order.order_id, order.submitted_by, new_nonce,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to refresh on-chain nonce for perpetual order %s: %s",
-                order.order_id, exc,
-            )
