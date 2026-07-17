@@ -618,6 +618,20 @@ class EpochManager:
             )
 
         if finalist is None:
+            # DEFER (don't abort) while the benched slate still has IN-FLIGHT
+            # submissions that could yet score and become a finalist. Every SCORED
+            # candidate lost, but a slower one — e.g. delayed because a mid-round
+            # restart (the hourly update.sh recreate) re-benchmarked the slate on a
+            # fresh worker — may still be BENCHMARKING. Aborting now would ORPHAN it
+            # (reaped as "benchmark window elapsed") and strand its report, for a round
+            # it might have won. Mirrors the finalist-is-None defer above; bounded by
+            # decision_deadline_epoch (_maybe_abort_expired_round aborts a round whose
+            # subs never score). The coordinator re-evaluates next tick once the
+            # straggler scores, so the full slate is judged before the round terminates.
+            if self._round_has_inflight_submissions(round_id):
+                result["deferred"] = True
+                result["status_after"] = round_state.status.value
+                return result
             # Abort with the TOP-RANKED candidate's reason (the round's headline,
             # same as the pre-fall-through behavior).
             reject_reason = rejections[0][1] if rejections else "did not beat the champion"
