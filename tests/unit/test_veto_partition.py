@@ -108,6 +108,34 @@ class TestPartition:
         with pytest.raises(ValueError):
             partition_follower_slices(store, "round-e1-n1", chain_ids=[])
 
+    def test_multichain_partition_is_per_chain(self):
+        # Multi-chain chain_ids → disjoint SINGLE-chain slices per chain (run_slice_bench
+        # forks one chain per slice), both chains covered, canonical draw still excluded.
+        store = _FakeAppStore(
+            [_make_order(f"e_{i:04d}", chain_id=1) for i in range(120)]
+            + [_make_order(f"b_{i:04d}", chain_id=8453) for i in range(120)]
+        )
+        slices = partition_follower_slices(store, "round-e1-n1", chain_ids=[1, 8453])
+        assert slices
+        for s in slices:
+            assert len({o["chain_id"] for o in s}) == 1, "a slice mixes chains"
+        assert {o["chain_id"] for s in slices for o in s} == {1, 8453}
+        draw_ids = {o["order_id"] for o in sample_historical_orders(store, "round-e1-n1")}
+        slice_ids = {o["order_id"] for s in slices for o in s}
+        assert not (draw_ids & slice_ids), "slice overlaps the canonical draw"
+
+    def test_multichain_slices_interleaved_not_concatenated(self):
+        # Round-robin across chains: positional slice→validator assignment covers the
+        # LOWEST indices first, so per-chain concatenation would starve a chain. With
+        # two multi-slice chains the first two slices must be DIFFERENT chains.
+        store = _FakeAppStore(
+            [_make_order(f"e_{i:04d}", chain_id=1) for i in range(200)]
+            + [_make_order(f"b_{i:04d}", chain_id=8453) for i in range(200)]
+        )
+        slices = partition_follower_slices(store, "round-e1-n1", chain_ids=[1, 8453])
+        seq = [next(iter({o["chain_id"] for o in s})) for s in slices]
+        assert set(seq[:2]) == {1, 8453}, f"first slices not interleaved: {seq}"
+
     def test_pii_stripped(self):
         store = _FakeAppStore(_corpus())
         slices = partition_follower_slices(store, "round-e1-n1", chain_ids=[8453])
@@ -198,6 +226,20 @@ class TestCalibration:
     def test_small_draw_caps_size(self):
         store = _FakeAppStore(_corpus(3))
         assert len(calibration_overlap(store, "round-e1-n1", chain_ids=[8453])) == 3
+
+    def test_multichain_calibration_is_per_chain(self):
+        # Multi-chain chain_ids → n calibration orders PER chain (each single-chain
+        # slice gets its own chain's overlap; mixing would be refused as multi_chain).
+        store = _FakeAppStore(
+            [_make_order(f"e_{i:04d}", chain_id=1) for i in range(20)]
+            + [_make_order(f"b_{i:04d}", chain_id=8453) for i in range(20)]
+        )
+        calib = calibration_overlap(store, "round-e1-n1", chain_ids=[1, 8453])
+        by_chain: dict[int, list] = {}
+        for o in calib:
+            by_chain.setdefault(o["chain_id"], []).append(o)
+        assert set(by_chain) == {1, 8453}
+        assert all(len(v) == VETO_CALIBRATION_ORDERS for v in by_chain.values())
 
 
 # ── replay hash ───────────────────────────────────────────────────────────────

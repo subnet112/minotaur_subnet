@@ -94,14 +94,14 @@ def quote_corpus_enabled() -> bool:
         - Phase-1 leader soak (env override, quorum=1): quote draw folds into the pack
           hash + scores (verified live: "Loaded N historical scenarios (… quote)"),
           the round closes clean at quorum=1, QuoteSync replicates the store to followers.
-        - Phase-2 default ON fleet-wide — THIS change.
+        - Phase-2 default ON fleet-wide.
+        - Distributed veto covers EVERY fork-pinned chain (Base + Ethereum under
+          BENCHMARK_ALL_DEPLOYMENT_CHAINS), via per-chain single-chain slices, so the
+          burden-of-proof cross-check matches the scored set on both chains.
 
       REMAINING before raising champion quorum above 1:
         1. benchmark_anchor_epoch plumbed leader→follower through the champion
            proposal/certify path (B1 #904 + B2 #907 + B3 #908) — the standing blocker
            for quorum>1 on the WHOLE benchmark (orders included), not just quotes.
-        2. Distributed veto covers only anchor chains (Base); widen it to the chains
-           the scored corpus actually draws (Ethereum quotes today) so the
-           burden-of-proof cross-check matches the scored set before quorum>1.
     """
     return _env_bool("BENCHMARK_QUOTE_CORPUS", default=True)
