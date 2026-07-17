@@ -68,16 +68,41 @@ pure-wasm EC (no host BLS); (3) a `chopsticks-executor` build that provides the 
 host functions. Impersonation itself is solved (`--mock-signature-host` +
 `EnsureAddressTruncated` truncated-account) — it's only the block-build hook that traps.
 
-## Integration path into Minotaur
+## Integration into Minotaur (IMPLEMENTED)
 
-The scoring plumbing is already backend-agnostic (see the
-`minotaur-964-benchmark-backend-path` memory): `MultiChainSimulator`
-(`simulator/anvil_simulator.py:1827`) maps `chain_id → AnvilSimulator`. Add a
-`SubtensorSimulator` conforming to the same surface (`simulate`, `pin_read_fork`,
-`get_block_timestamp`, `is_connected`), backed by this shim: on `simulate()`, run the
-plan's interactions as an `eth_call` and populate `SimulationResult.state_changes`
-(getStake deltas) and `token_transfers` (from `logs`). `raw_output` is an opaque
-BigInt downstream, so the per-App scorer JS and `relative_scoring` need no change.
+Wired the same way anvil is:
+
+- `chains/registry.py` — `ChainSpec.sim_backend`; chain 964 = `"substrate_chopsticks"`.
+- `simulator/anvil_simulator.py` — `MultiChainSimulator` dispatches 964 →
+  `SubtensorSimulator`, all else → `AnvilSimulator` (same duck-typed surface).
+  **Gated** on `BITTENSOR_CHOPSTICKS_SIM_RPC_URL` being set → ships INERT (964 stays
+  on anvil-btevm, byte-identical) until turned on fleet-wide.
+- `simulator/subtensor_simulator.py` — the Python backend; drives this sidecar over
+  JSON-RPC, populates `SimulationResult` `token_transfers` (logs) + `gas_used`/
+  `gas_metered` (real pre-refund EVM gas) + `return_data`. `raw_output` is an opaque
+  BigInt downstream, so the per-App scorer JS + `relative_scoring` are unchanged.
+- `platform/validator/docker-compose.yml` — `chopsticks-btevm` service behind the
+  `chopsticks` profile (inert like the -bench forks), `--db` lazy-storage fork cache,
+  `CK_ENDPOINT` = the leader's blockmachine subtensor node.
+
+Test: `minotaur_subnet/simulator/test_subtensor_simulator.py` (dispatch gate on/off +
+an SN112 stake integration test).
+
+### To activate on the leader
+1. `COMPOSE_PROFILES=chopsticks` (starts `chopsticks-btevm`).
+2. `BITTENSOR_CHOPSTICKS_SIM_RPC_URL=http://chopsticks-btevm:8545` on api + validator.
+3. `BITTENSOR_SUBSTRATE_WS_URL=<blockmachine subtensor wss>` (fork upstream).
+4. `CK_BLOCK=<round fork block>` per round (see the per-round re-pin follow-up below).
+
+### Known follow-ups (not blocking the integration)
+- **Per-round re-pin**: the fork is pinned at container launch (`CK_BLOCK`); live
+  re-pin to the round's fork block (`dev_setHead`) so `pin_read_fork` re-anchors
+  without a restart. Until then the sidecar must be (re)launched at the round block
+  for cross-validator determinism.
+- **scoreIntent decode**: `simulate()` surfaces the terminal call's `return_data`;
+  wiring the App's `scoreIntent` tuple + a substrate raw-output scorer JS that reads
+  it is the next step for full parity with the DexAggregator scorer.
+- **Throughput**: the JS-wasm executor is slow — shard for hundreds of candidates.
 
 ## Running it
 
