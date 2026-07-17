@@ -67,6 +67,46 @@ async def test_964_stays_on_anvil_when_sidecar_env_unset(monkeypatch):
     assert type(sim.simulators[964]).__name__ == "AnvilSimulator"
 
 
+async def test_score_intent_calldata_encoder_roundtrips():
+    """The ported scoreIntent encoder produces the right selector + a tuple that
+    round-trips through abi_decode (offline; no fork)."""
+    from eth_abi import decode as abi_decode
+    from eth_hash.auto import keccak
+
+    sim = SubtensorSimulator.__new__(SubtensorSimulator)  # no connect
+    sim.chain_id = 964
+    order = {
+        "order_id": "0x" + "ab" * 32,
+        "app": "0x0000000000000000000000000000000000009999",
+        "intent_selector": "0xdeadbeef",
+        "intent_params": "0x" + "11" * 32,
+        "submitted_by": "0x000000000000000000000000000000000000c0de",
+        "chain_id": 964, "deadline": 123, "nonce": 7,
+        "perpetual": False, "max_executions": 1, "cooldown": 0,
+    }
+    plan = ExecutionPlan(
+        intent_id="x",
+        interactions=[Interaction(target="0x0000000000000000000000000000000000000805",
+                                  value="0", call_data="0xabcd", chain_id=964)],
+        deadline=999, nonce=3,
+    )
+    cd = sim._build_score_intent_calldata(order["app"], order, plan)
+    sig = ("scoreIntent((bytes32,address,bytes4,bytes,address,uint256,uint256,"
+           "uint256,bool,uint256,uint256),((address,uint256,bytes)[],uint256,uint256,bytes))")
+    assert cd[:10] == "0x" + keccak(sig.encode())[:4].hex()  # correct selector
+    raw = bytes.fromhex(cd[10:])
+    io, ep = abi_decode(
+        ["(bytes32,address,bytes4,bytes,address,uint256,uint256,uint256,bool,uint256,uint256)",
+         "((address,uint256,bytes)[],uint256,uint256,bytes)"], raw)
+    assert io[0] == bytes.fromhex("ab" * 32)          # order_id
+    assert io[2] == bytes.fromhex("deadbeef")          # intent_selector
+    assert io[3] == bytes.fromhex("11" * 32)           # intent_params
+    assert io[6] == 123 and io[7] == 7                 # deadline, nonce
+    assert ep[1] == 999 and ep[2] == 3                 # plan deadline, nonce
+    assert ep[0][0][0].lower() == plan.interactions[0].target.lower()  # first call target
+    assert ep[0][0][2] == bytes.fromhex("abcd")        # first call data
+
+
 # ── SN112 stake integration (needs a live sidecar) ────────────────────────────
 
 def _sidecar_url() -> str | None:
@@ -105,9 +145,19 @@ async def test_simulate_sn112_stake_delivers_alpha():
         deadline=0,
         nonce=0,
     )
-    result = await sim.simulate(plan, meter_gas=True)
+    # contract_address + intent_order -> backend builds scoreIntent calldata itself
+    # (ported generic encoder) and reads on_chain_score from the App.
+    intent_order = {
+        "order_id": "ord_sn112_test", "app": ROUTER,
+        "submitted_by": "0x000000000000000000000000000000000000c0de",
+        "chain_id": 964, "deadline": 0, "nonce": 0, "intent_params": "0x",
+    }
+    result = await sim.simulate(plan, contract_address=ROUTER,
+                                intent_order=intent_order, meter_gas=True)
 
     assert result.success, result.error
+    # StakeMeter.scoreIntent returns (4242, true) -> backend decoded on_chain_score
+    assert result.on_chain_score == 4242
     assert result.gas_used > 0
     assert result.gas_metered == result.gas_used
     # the measuring router returns (before, after, delta) in return_data

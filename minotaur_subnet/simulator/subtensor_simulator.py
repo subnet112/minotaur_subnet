@@ -268,31 +268,95 @@ class SubtensorSimulator:
                 })
         result.state_changes = state_changes
 
-        # ── optional on-chain score (BPS) ────────────────────────────────────
-        # If the order carries pre-built scoreIntent calldata for the App, call it
-        # (read-only) and decode (uint256 score, bool valid) into on_chain_score,
-        # mirroring the anvil scoreIntent path. Best-effort: absent/failed leaves
-        # on_chain_score=None (raw_output still drives scoring).
+        # ── on-chain score (BPS) via the App's scoreIntent ───────────────────
+        # Build the generic AppIntentBase scoreIntent((IntentOrder),(ExecutionPlan))
+        # calldata from the order the orchestrator passed (identical encoding to the
+        # anvil path — the outer tuple is app-agnostic; app-specific data lives in
+        # intent_params), call it read-only, decode (uint256 score, bool valid).
+        # An order may still supply pre-built score_intent_calldata to override.
+        # Best-effort: absent/failed leaves on_chain_score=None (raw_output drives
+        # scoring). NOTE from=executor; an App that gates scoreIntent on a specific
+        # relayer msg.sender would return invalid here — raw_output still scores.
         sic = (intent_order or {}).get("score_intent_calldata") if intent_order else None
+        if contract_address and not sic and intent_order:
+            try:
+                sic = self._build_score_intent_calldata(contract_address, intent_order, plan)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("scoreIntent calldata build failed: %s", exc)
         if contract_address and sic:
             try:
                 r = self.eth_call(to=contract_address, data=sic, from_addr=executor, url=url)
                 if r.get("success"):
-                    score = self._word((r.get("returnData") or "0x"), 0)  # (uint256 score, bool valid)
-                    if score is not None:
-                        result.on_chain_score = score
-            except Exception:  # noqa: BLE001
-                pass
+                    from eth_abi import decode as abi_decode
+                    ret = r.get("returnData") or "0x"
+                    raw = bytes.fromhex(ret[2:] if ret.startswith("0x") else ret)
+                    score_val, valid = abi_decode(["uint256", "bool"], raw)
+                    result.on_chain_score = int(score_val) if valid else None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("scoreIntent read failed: %s", exc)
         return result
 
-    @staticmethod
-    def _word(ret_hex: str, index: int) -> int | None:
-        """Decode the ``index``-th 32-byte ABI word of a return blob as uint256."""
-        h = ret_hex[2:] if ret_hex.startswith("0x") else ret_hex
-        lo, hi = index * 64, (index + 1) * 64
-        if len(h) < hi:
-            return None
-        return int(h[lo:hi], 16)
+    def _build_score_intent_calldata(self, contract_address, intent_order, plan) -> str:
+        """Encode scoreIntent((IntentOrder),(ExecutionPlan)) — ported verbatim from
+        AnvilSimulator._simulate_via_score_intent so a 964 App following the generic
+        AppIntentBase convention is scored identically. App-specific params live in
+        the ``intent_params`` bytes (manifest-encoded upstream by the orchestrator)."""
+        from eth_abi import encode as abi_encode
+        from eth_hash.auto import keccak
+        from eth_utils import to_checksum_address
+
+        sig = ("scoreIntent((bytes32,address,bytes4,bytes,address,uint256,uint256,"
+               "uint256,bool,uint256,uint256),((address,uint256,bytes)[],uint256,"
+               "uint256,bytes))")
+        selector = keccak(sig.encode())[:4]
+
+        order_id = intent_order.get("order_id", b"\x00" * 32)
+        if isinstance(order_id, str):
+            try:
+                order_id = bytes.fromhex(order_id.replace("0x", "").ljust(64, "0"))[:32]
+            except ValueError:
+                order_id = keccak(order_id.encode())
+
+        app_addr = intent_order.get("app", contract_address)
+        intent_sel = intent_order.get("intent_selector", b"\x00" * 4)
+        if isinstance(intent_sel, str):
+            intent_sel = bytes.fromhex(intent_sel.replace("0x", ""))[:4]
+
+        intent_params = intent_order.get("intent_params", b"")
+        if isinstance(intent_params, str):
+            if intent_params.startswith("0x"):
+                intent_params = bytes.fromhex(intent_params[2:])
+            else:
+                intent_params = (bytes.fromhex(intent_params)
+                                 if all(c in "0123456789abcdefABCDEF" for c in intent_params)
+                                 else intent_params.encode())
+
+        submitted_by = intent_order.get("submitted_by", "0x" + "00" * 20)
+        chain_id = intent_order.get("chain_id", self.chain_id)
+        deadline = intent_order.get("deadline", 0)
+        nonce = intent_order.get("nonce", 0)
+        perpetual = intent_order.get("perpetual", False)
+        max_executions = intent_order.get("max_executions", 1)
+        cooldown = intent_order.get("cooldown", 0)
+
+        calls = []
+        for ix in plan.interactions:
+            cd = ix.call_data
+            if isinstance(cd, str):
+                cd = bytes.fromhex(cd[2:] if cd.startswith("0x") else cd) if cd else b""
+            calls.append((to_checksum_address(ix.target), int(ix.value) if ix.value else 0, cd))
+
+        plan_metadata = json.dumps(plan.metadata).encode() if plan.metadata else b""
+
+        encoded = abi_encode(
+            ["(bytes32,address,bytes4,bytes,address,uint256,uint256,uint256,bool,uint256,uint256)",
+             "((address,uint256,bytes)[],uint256,uint256,bytes)"],
+            [(order_id, to_checksum_address(app_addr), intent_sel, intent_params,
+              to_checksum_address(submitted_by), chain_id, deadline, nonce,
+              perpetual, max_executions, cooldown),
+             (calls, plan.deadline, plan.nonce, plan_metadata)],
+        )
+        return "0x" + (selector + encoded).hex()
 
     @classmethod
     def _last_word(cls, ret_hex: str) -> int | None:

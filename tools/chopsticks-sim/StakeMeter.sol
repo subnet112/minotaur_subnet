@@ -22,4 +22,21 @@ contract StakeMeter {
         after_ = S.getStake(hotkey, coldkey, netuid);
         delta = after_ - before_;
     }
+
+    // AppIntentBase scoreIntent surface — the generic (IntentOrder, ExecutionPlan)
+    // tuple. Present so the substrate backend's ported encoder can be exercised
+    // end-to-end; returns a constant here (the real scoring lives in raw_output).
+    struct IntentOrder {
+        bytes32 orderId; address app; bytes4 selector; bytes intentParams; address submittedBy;
+        uint256 chainId; uint256 deadline; uint256 nonce; bool perpetual;
+        uint256 maxExecutions; uint256 cooldown;
+    }
+    struct Call { address target; uint256 value; bytes data; }
+    struct Plan { Call[] calls; uint256 deadline; uint256 nonce; bytes metadata; }
+
+    function scoreIntent(IntentOrder calldata, Plan calldata)
+        external pure returns (uint256 score, bool valid)
+    {
+        return (4242, true);
+    }
 }
