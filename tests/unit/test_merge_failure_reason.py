@@ -42,6 +42,16 @@ def test_finalize_outcome_serialization_v1_minimal_v2_structured():
     assert FinalizeOutcome.from_merge(False).to_v2()["reason"]["code"] == "merge_refused"
 
 
+def test_mergeresult_carries_main_sha_on_success():
+    # The published main HEAD SHA rides back on a successful adoption so the reconciler
+    # can record the champion's canonical baseline. Keyword-only + defaults to "".
+    assert MergeResult(True).main_sha == ""
+    ok = MergeResult(True, main_sha="deadbeef")
+    assert bool(ok) is True and ok.main_sha == "deadbeef"
+    # Positional args unchanged — a failed result carries no main_sha.
+    assert MergeResult(False, "no_quorum_cert", "merge").main_sha == ""
+
+
 def test_mergeresult_truthiness_is_ok():
     ok = MergeResult(True)
     bad = MergeResult(False, "no_quorum_cert")

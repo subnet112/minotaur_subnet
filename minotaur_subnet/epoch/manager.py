@@ -618,6 +618,20 @@ class EpochManager:
             )
 
         if finalist is None:
+            # DEFER (don't abort) while the benched slate still has IN-FLIGHT
+            # submissions that could yet score and become a finalist. Every SCORED
+            # candidate lost, but a slower one — e.g. delayed because a mid-round
+            # restart (the hourly update.sh recreate) re-benchmarked the slate on a
+            # fresh worker — may still be BENCHMARKING. Aborting now would ORPHAN it
+            # (reaped as "benchmark window elapsed") and strand its report, for a round
+            # it might have won. Mirrors the finalist-is-None defer above; bounded by
+            # decision_deadline_epoch (_maybe_abort_expired_round aborts a round whose
+            # subs never score). The coordinator re-evaluates next tick once the
+            # straggler scores, so the full slate is judged before the round terminates.
+            if self._round_has_inflight_submissions(round_id):
+                result["deferred"] = True
+                result["status_after"] = round_state.status.value
+                return result
             # Abort with the TOP-RANKED candidate's reason (the round's headline,
             # same as the pre-fall-through behavior).
             reject_reason = rejections[0][1] if rejections else "did not beat the champion"
@@ -746,6 +760,7 @@ class EpochManager:
         merge_ok = True
         merge_reason = ""  # specific abort code from the callback (empty on success)
         merge_stage = ""   # where it failed; "client" => UNKNOWN outcome => defer+reconcile
+        merge_main_sha = ""  # canonical main HEAD after a successful publish (for the reconciler)
         # Finalization (on-chain attest + squash-merge the miner's PR) is the
         # LEADER's job: it alone holds the solver-repo PAT and is the single
         # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
@@ -771,6 +786,7 @@ class EpochManager:
                 merge_ok = bool(cb_result)
                 merge_reason = str(getattr(cb_result, "reason", "") or "")
                 merge_stage = str(getattr(cb_result, "stage", "") or "")
+                merge_main_sha = str(getattr(cb_result, "main_sha", "") or "")
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
@@ -930,7 +946,10 @@ class EpochManager:
                 "self-verified" if _self_verified else "quorum<=1 leader-trust",
             )
 
-        await self._hot_swap(submission, effective_epoch, round_id=round_id)
+        await self._hot_swap(
+            submission, effective_epoch, round_id=round_id,
+            canonical_main_sha=merge_main_sha,
+        )
         activated = self._round_store.activate_round(
             round_id,
             effective_epoch=effective_epoch,
@@ -2027,6 +2046,7 @@ class EpochManager:
         round_id: str | None = None,
         force: bool = False,
         capture_previous: bool = True,
+        canonical_main_sha: str | None = None,
     ) -> None:
         """Load the winning submission and swap it into the block loop.
 
@@ -2156,6 +2176,7 @@ class EpochManager:
                     activated_round_id=round_id,
                     activated_epoch=epoch,
                     activated_at=adopted_at,
+                    canonical_main_sha=canonical_main_sha,
                 ),
                 sync_open_round=False,
             )

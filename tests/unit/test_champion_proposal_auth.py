@@ -262,13 +262,16 @@ def test_raw_dict_verify_tolerates_non_model_field(monkeypatch, unlock_leader):
     from minotaur_subnet.api.routes.submissions.models import ChampionConsensusProposalRequest
 
     acct = Account.create()
+    # Use a key the model genuinely does NOT declare (the #378 outage was a stray
+    # `timestamp`). NB: benchmark_anchor_epoch USED to be the example here, but B3 made
+    # it a real model field — which is exactly the field-addition this raw-dict verify
+    # makes safe. Any non-model key proves the same tolerance.
+    _extra = "x_non_model_probe"
+    assert _extra not in ChampionConsensusProposalRequest.model_fields
     payload = {
         "round_id": "round-1", "proposer": acct.address,
-        # a field the current request model does NOT declare — mimics a future B3 field
-        # (or the #378 `timestamp`) present in the SIGNED canonical:
-        "benchmark_anchor_epoch": 42,
+        _extra: 42,  # present in the SIGNED canonical but not a model field
     }
-    assert "benchmark_anchor_epoch" not in ChampionConsensusProposalRequest.model_fields
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["proposer_signature"] = Account.sign_message(
         encode_defunct(text=canonical), private_key=acct.key,

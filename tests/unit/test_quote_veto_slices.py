@@ -54,7 +54,7 @@ def _all_ids(slices):
 
 class TestQuoteVetoMerge:
     def test_inert_when_flag_off(self, monkeypatch):
-        monkeypatch.delenv("BENCHMARK_QUOTE_CORPUS", raising=False)
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "0")  # explicit OFF (default is now ON)
         s = _store()
         off = partition_follower_slices(s, _ROUND, chain_ids=[8453])
         ids = _all_ids(off)
@@ -71,7 +71,7 @@ class TestQuoteVetoMerge:
     def test_flag_on_is_superset_of_flag_off_orders(self, monkeypatch):
         # Merging quotes must NOT drop or change the order slices' membership.
         s = _store()
-        monkeypatch.delenv("BENCHMARK_QUOTE_CORPUS", raising=False)
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "0")  # explicit OFF (default is now ON)
         off_orders = {i for i in _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))}
         monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "1")
         on_ids = _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))
@@ -108,15 +108,37 @@ class TestQuoteVetoMerge:
         assert "q_thisround" not in ids and "q_thisround" not in canonical
         assert "q_unanchored" not in ids and "q_unanchored" not in canonical
 
-    def test_single_chain_only(self, monkeypatch):
-        # Quotes on a non-anchor chain must not enter slices (harness has one scalar
-        # fork_block; run_slice_bench refuses multi-chain).
+    def test_chain_filter_excludes_unlisted_chains(self, monkeypatch):
+        # chain_ids gates which chains enter slices: a quote on a chain NOT in
+        # chain_ids is dropped (the caller passes only the round's fork-pinned chains).
         monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "1")
         quotes = ([_quote(f"q_{i}", f"0xQ{i}") for i in range(60)]
                   + [{**_quote("q_offchain", "0xX"), "chain_id": 1}])
         s = _DualStore([], quotes)
-        ids = _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))
-        assert "q_offchain" not in ids
+        slices = partition_follower_slices(s, _ROUND, chain_ids=[8453])
+        assert all(o.get("chain_id") == 8453 for sl in slices for o in sl)
+
+    def test_multichain_slices_are_single_chain_and_cover_both(self, monkeypatch):
+        # chain_ids spanning both chains → per-chain slices: EACH slice is single-chain
+        # (run_slice_bench forks one chain per slice) and BOTH chains are covered. Orders
+        # AND quotes on both chains (a real round has both) so the quote merge runs.
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "1")
+        orders = ([_order(f"ord_b{i:03d}", f"0xOB{i}") for i in range(70)]                       # Base
+                  + [{**_order(f"ord_e{i:03d}", f"0xOE{i}"), "chain_id": 1} for i in range(70)])  # Ethereum
+        quotes = ([_quote(f"q_b{i:03d}", f"0xB{i}") for i in range(60)]                          # Base
+                  + [{**_quote(f"q_e{i:03d}", f"0xE{i}"), "chain_id": 1} for i in range(60)])     # Ethereum
+        s = _DualStore(orders, quotes)
+        slices = partition_follower_slices(s, _ROUND, chain_ids=[1, 8453])
+        assert slices, "expected non-empty per-chain slices"
+        for sl in slices:  # no slice may mix chains — else run_slice_bench refuses it
+            assert len({o.get("chain_id") for o in sl}) == 1
+        assert {o.get("chain_id") for sl in slices for o in sl} == {1, 8453}
+        # both order ids (ord_) and quote ids (q_) appear, spread across both chains
+        by_chain = {1: set(), 8453: set()}
+        for sl in slices:
+            for o in sl:
+                by_chain[o["chain_id"]].add(o["order_id"])
+        assert all(by_chain[c] for c in (1, 8453))
 
 
 class TestQuoteParamsFrozen:
