@@ -2874,10 +2874,15 @@ async def initialize(ctx: ServerContext) -> dict:
                                 champ = submissions.get_store().get_champion()
                                 if champ is None:
                                     continue
+                                # expected main sha = the champion's recorded canonical
+                                # main HEAD at adoption (works for private champions);
+                                # commit+round drive the on-chain throne check.
+                                active = submissions.get_round_store().get_active_champion()
                                 res = await asyncio.to_thread(
                                     run_reconcile_pass,
-                                    adopted_commit_hash=getattr(champ, "commit_hash", None),
-                                    adopted_round_id=getattr(champ, "round_id", None),
+                                    expected_main_sha=getattr(active, "canonical_main_sha", None),
+                                    onchain_commit_hash=getattr(champ, "commit_hash", None),
+                                    onchain_round_id=getattr(champ, "round_id", None),
                                     is_leader=True,
                                     enforce=_mr_enforce,
                                 )

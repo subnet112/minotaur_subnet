@@ -62,14 +62,24 @@ relayer is reachable — well within the ~30-min `decision_deadline` window.
 
 `minotaur_subnet/relayer/champion_reconcile.py`:
 
-- `classify_main_reconcile(main_tree, adopted_tree, onchain_throne_is_adopted)` — the
-  pure decision. **REVERT only** when `main` drifted from the adopted champion **and**
-  the on-chain throne is still the adopted champion (the merge never took the throne =
-  orphan). A moved throne → **ALERT** (a real win the leader hasn't adopted — never
-  auto-reverted). Missing/ambiguous input → NOOP/ALERT. Exhaustively unit-tested.
+**SHA-based (works for private champions).** The leader records the canonical `main`
+HEAD SHA at adoption on `ChampionSnapshot.canonical_main_sha` — threaded from the
+finalize result (`MergeResult.main_sha`, read via `_canonical_main_head_sha` on a
+successful publish). The reconciler compares the **live `main` HEAD to that recorded
+SHA** — plain SHA equality, **no reading of the miner's commit** — so it covers private
+champions too (the published-to-`main` commit is always on canonical; the miner's own
+commit lives in a private fork and 404s). *An earlier tree-comparison version read the
+miner commit off canonical and was blind for private champions — replaced.*
+
+- `classify_main_reconcile(main_head_sha, expected_main_sha, onchain_throne_is_adopted)`
+  — the pure decision. **REVERT only** when `main` HEAD drifted from the recorded
+  champion SHA **and** the on-chain throne is still the adopted champion (the merge
+  never took the throne = orphan). A moved throne → **ALERT** (a real win the leader
+  hasn't adopted — never auto-reverted). No recorded SHA / unreadable HEAD → NOOP/ALERT.
 - `revert_main_to_tree(...)` — the auto-revert: a forward commit whose tree == the
-  adopted champion's tree, parented on the drifted head (restores content regardless of
-  drift depth, no history rewrite). FAIL-CLOSED on any write error.
+  **recorded champion SHA's** tree (a canonical commit, always readable), parented on
+  the drifted head (restores content regardless of drift depth, no history rewrite).
+  FAIL-CLOSED on any write error; if the recorded tree can't be read → ALERT, no revert.
 - `onchain_throne_is_adopted(commit, round)` — the throne signal via `_onchain_cert_binds`;
   **False on any read error** so a bad read can never force a revert.
 - `reconcile_champion_main(...)` / `run_reconcile_pass(...)` — orchestration + `dry_run`.
