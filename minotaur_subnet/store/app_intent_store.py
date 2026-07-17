@@ -330,7 +330,7 @@ class AppIntentStore:
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS quotes(
                     quote_id TEXT PRIMARY KEY, app_id TEXT, chain_id INTEGER,
-                    created_at REAL, data TEXT NOT NULL);
+                    created_at REAL, captured_opened_epoch INTEGER, data TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS idx_quotes_app ON quotes(app_id);
                 CREATE INDEX IF NOT EXISTS idx_quotes_chain ON quotes(chain_id);
                 CREATE INDEX IF NOT EXISTS idx_quotes_created ON quotes(created_at);
@@ -350,6 +350,26 @@ class AppIntentStore:
                 CREATE TABLE IF NOT EXISTS meta(
                     key TEXT PRIMARY KEY, value TEXT);
                 """
+            )
+            # Additive column migrations for tables that predate a column (CREATE
+            # TABLE IF NOT EXISTS won't alter an existing table). Guarded by
+            # PRAGMA table_info so re-runs are no-ops. quotes.captured_opened_epoch
+            # (Phase-2 round-anchored cutoff/retention) was added after the quotes
+            # table shipped, so existing Phase-1 DBs need the ALTER.
+            cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(quotes)").fetchall()
+            }
+            if "captured_opened_epoch" not in cols:
+                conn.execute(
+                    "ALTER TABLE quotes ADD COLUMN captured_opened_epoch INTEGER"
+                )
+            # Created here (not in the CREATE-TABLE script) so it works for BOTH a
+            # fresh table and a just-ALTERed legacy one — the script's index on a
+            # not-yet-added column would fail on a legacy DB.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quotes_epoch "
+                "ON quotes(captured_opened_epoch)"
             )
 
     def _migrate_from_json_if_needed(self) -> None:
@@ -800,37 +820,63 @@ class AppIntentStore:
     # sample_historical_quotes) and QuoteSync replicates leader → follower.
 
     def save_quote(self, quote_dict: dict[str, Any]) -> None:
-        """Save or update (UPSERT) a quote case, keyed by quote_id."""
+        """Save or update (UPSERT) a quote case, keyed by quote_id.
+
+        LAST-WRITE on every column, ``captured_opened_epoch`` included. First-seen of
+        that anchor is enforced upstream at the SINGLE leader capture site (orders.
+        get_quote reads the existing row and feeds the frozen epoch back in), so this
+        writer stays dumb. Crucially it must NOT COALESCE-preserve the local value on a
+        follower: after the leader prunes a hot shape (aged out) and RE-captures it at a
+        new epoch, a follower that never observed the sub-second prune→recapture gap must
+        still adopt the leader's NEW epoch when QuoteSync re-upserts the row — COALESCE
+        would pin the follower's stale epoch forever and split the pack hash. Mirroring
+        the leader verbatim is what keeps captured_opened_epoch fleet-uniform.
+        """
         quote_id = quote_dict["quote_id"]
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO quotes(quote_id, app_id, chain_id, created_at, data) "
-                "VALUES(?, ?, ?, ?, ?) "
+                "INSERT INTO quotes(quote_id, app_id, chain_id, created_at, "
+                "captured_opened_epoch, data) "
+                "VALUES(?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(quote_id) DO UPDATE SET "
                 "app_id=excluded.app_id, chain_id=excluded.chain_id, "
-                "created_at=excluded.created_at, data=excluded.data",
+                "created_at=excluded.created_at, "
+                "captured_opened_epoch=excluded.captured_opened_epoch, "
+                "data=excluded.data",
                 (
                     quote_id,
                     quote_dict.get("app_id"),
                     quote_dict.get("chain_id"),
                     quote_dict.get("created_at"),
+                    quote_dict.get("captured_opened_epoch"),
                     _dumps(quote_dict),
                 ),
             )
+
+    @staticmethod
+    def _quote_row_to_dict(row: Any) -> dict[str, Any]:
+        """Deserialize a quotes row, with the COLUMN as the authoritative source of
+        ``captured_opened_epoch`` (the COALESCE first-seen value), overriding any
+        possibly-stale copy in the JSON blob. The round-anchored cutoff/retention
+        both key on this, so the column — never the blob — is the source of truth."""
+        d = json.loads(row["data"])
+        d["captured_opened_epoch"] = row["captured_opened_epoch"]
+        return d
 
     def get_quote(self, quote_id: str) -> dict[str, Any] | None:
         """Return a quote case by ID, or None if not found."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT data FROM quotes WHERE quote_id=?", (quote_id,)
+                "SELECT data, captured_opened_epoch FROM quotes WHERE quote_id=?",
+                (quote_id,),
             ).fetchone()
-        return json.loads(row["data"]) if row else None
+        return self._quote_row_to_dict(row) if row else None
 
     def list_quotes(
         self, app_id: str | None = None, chain_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """List quote cases, optionally filtered by app and/or chain."""
-        query = "SELECT data FROM quotes"
+        query = "SELECT data, captured_opened_epoch FROM quotes"
         clauses: list[str] = []
         params: list[Any] = []
         if app_id:
@@ -843,7 +889,7 @@ class AppIntentStore:
             query += " WHERE " + " AND ".join(clauses)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [json.loads(r["data"]) for r in rows]
+        return [self._quote_row_to_dict(r) for r in rows]
 
     def list_quote_ids(self) -> set[str]:
         """Return the set of all stored quote_ids (cheap — id column only).
@@ -872,28 +918,25 @@ class AppIntentStore:
                 n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         return n
 
-    def prune_quotes(self, max_rows: int) -> int:
-        """Keep only the newest ``max_rows`` quote cases (by created_at, quote_id
-        tie-break). Returns the number pruned. No-op when at/under the cap.
+    def prune_quotes(self, min_keep_epoch: int) -> int:
+        """Round-anchored retention: delete quote cases captured strictly BEFORE
+        ``min_keep_epoch`` (and legacy rows with no captured_opened_epoch). Returns
+        the number pruned.
 
-        Bounds unauthenticated /quote growth. NOT consensus-anchored (wall-clock
-        arrival order); safe only while BENCHMARK_QUOTE_CORPUS is OFF — before
-        Phase 2 this must become a round-anchored, fleet-uniform retention.
+        Consensus-safe once BENCHMARK_QUOTE_CORPUS is on: the deletion is a pure
+        function of the fleet-uniform, first-seen-frozen captured_opened_epoch, not
+        wall-clock arrival — so it can never remove a row inside a live round's
+        sampling window (the round cutoff includes only captured < drawing epoch,
+        and min_keep_epoch = current_epoch − retention ≪ any live cutoff). Legacy
+        NULL-epoch rows (captured before Phase-2 stamping) are never eligible for the
+        draw, so they are pruned here too. Followers inherit the leader's pruned set
+        verbatim via QuoteSync's authoritative reconcile.
         """
-        if max_rows <= 0:
-            return 0
         with self._connect() as conn:
-            total = conn.execute("SELECT COUNT(*) AS n FROM quotes").fetchone()["n"]
-            if total <= max_rows:
-                return 0
-            # Delete everything OUTSIDE the newest max_rows window. ORDER BY matches
-            # the /v1/quotes list ordering so leader + follower keep the same window.
             cur = conn.execute(
-                "DELETE FROM quotes WHERE quote_id NOT IN ("
-                "  SELECT quote_id FROM quotes "
-                "  ORDER BY created_at DESC, quote_id DESC LIMIT ?"
-                ")",
-                (int(max_rows),),
+                "DELETE FROM quotes "
+                "WHERE captured_opened_epoch IS NULL OR captured_opened_epoch < ?",
+                (int(min_keep_epoch),),
             )
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 

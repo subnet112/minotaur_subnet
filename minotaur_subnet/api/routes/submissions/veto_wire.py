@@ -918,12 +918,15 @@ async def run_slice_bench(
 
 
 def _order_label(order: dict[str, Any]) -> str:
-    """The harness row label for a historical order: f'{app_id}:hist:{order_id}'
+    """The harness row label for a corpus case: f'{app_id}:{kind}:{order_id}'
     (orchestrator builds intent_id = f'{app_id}:{scenario_name}', scenario_name
-    = f'hist:{order_id}'). Map rows back via the RESOLVED records — never by
-    string-stripping — so a shape drift fails the coverage assert, not silently
-    skips every row into a vacuous OK."""
-    return f"{order.get('app_id')}:hist:{order.get('order_id')}"
+    = f'{kind}:{order_id}'). ``kind`` is 'quote' for a content-addressed q_ id
+    (matching build_explicit_scenarios' prefix) else 'hist'. Map rows back via the
+    RESOLVED records — never by string-stripping — so a shape drift fails the
+    coverage assert, not silently skips every row into a vacuous OK."""
+    oid = str(order.get("order_id") or "")
+    kind = "quote" if oid.startswith("q_") else "hist"
+    return f"{order.get('app_id')}:{kind}:{oid}"
 
 
 def extract_slice_evidence(
@@ -1191,6 +1194,18 @@ def _production_order_lookup(order_id: str) -> dict[str, Any] | None:
     if store is None:
         return None
     try:
+        # Quote cases (content-addressed q_ id) live in the quotes table, not the
+        # orders table. Resolve them via get_quote and alias quote_id -> order_id so
+        # the order-shaped veto helpers (_order_label, _order_to_scenario) work
+        # unchanged; else the lookup returns None and the slice bench REFUSES
+        # corpus_missing / reverify silently drops the row once the corpus has quotes.
+        if str(order_id).startswith("q_"):
+            if not hasattr(store, "get_quote"):
+                return None
+            q = store.get_quote(order_id)
+            if q is not None and q.get("order_id") is None:
+                q = {**q, "order_id": order_id}
+            return q
         return store.get_order(order_id)
     except Exception:  # noqa: BLE001 — lookup failure = corpus_missing
         return None
