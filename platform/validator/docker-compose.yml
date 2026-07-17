@@ -201,6 +201,46 @@ services:
     # minotaur ONLY — see anvil-eth. Solver reaches BT EVM state via the pin proxy.
     networks: [minotaur]
 
+  # ── Bittensor (964) substrate simulation — Chopsticks fork + anvil-dialect sidecar ──
+  # Anvil (revm) cannot execute subtensor's NATIVE precompiles (staking/alpha/swap):
+  # they are Substrate runtime code, invisible on an anvil fork. This service runs the
+  # REAL subtensor runtime via a Chopsticks fork and exposes the anvil-dialect JSON-RPC
+  # the Python SubtensorSimulator drives (registry ChainSpec 964 sim_backend =
+  # "substrate_chopsticks"). Gated behind the `chopsticks` profile → INERT on every node
+  # (followers on :stable get this file but never start it), exactly like the -bench
+  # forks. Activate on the leader: COMPOSE_PROFILES=chopsticks AND set
+  # BITTENSOR_CHOPSTICKS_SIM_RPC_URL=http://chopsticks-btevm:8545 on the api/validator.
+  chopsticks-btevm:
+    profiles: ["chopsticks"]
+    build:
+      context: ../..
+      dockerfile: tools/chopsticks-sim/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Substrate WSS upstream to fork from. The leader points this at its more
+      # reliable blockmachine subtensor node; default = public finney entrypoint.
+      CK_ENDPOINT: "${BITTENSOR_SUBSTRATE_WS_URL:-wss://entrypoint-finney.opentensor.ai:443}"
+      # Pin block (empty = head-30). For deterministic cross-validator scoring this
+      # MUST be the round's benchmark fork block — set per round when activated.
+      CK_BLOCK: "${BITTENSOR_CHOPSTICKS_BLOCK:-}"
+      # Fork cache: lazy-storage sqlite, warmed across restarts (skips the cold
+      # re-fetch storm to the upstream node — the Chopsticks analog of fork-cache).
+      CK_DB: "/var/cache/chopsticks/fork.sqlite"
+      PORT: "8545"
+    tmpfs:
+      - /tmp:size=512m
+    volumes:
+      - chopsticks-cache:/var/cache/chopsticks
+    ports:
+      - "127.0.0.1:8548:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8545',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'sim_health',params:[]})}).then(r=>r.json()).then(j=>process.exit(j.result&&j.result.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 150s
+    networks: [minotaur]
+
   # ── Dedicated benchmark-worker forks (Phase 2 split — LEADER ONLY) ────
   # These three anvils exist ONLY for the split `benchmark-worker` service below.
   # They are gated behind the `benchmark-worker` compose profile, so they are
@@ -396,6 +436,10 @@ services:
       ETH_SIM_RPC_URL: http://anvil-eth:8545
       BASE_SIM_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+      # Chopsticks substrate sim sidecar (chain 964 native precompiles). Empty =
+      # 964 stays on anvil-btevm (default, inert). Set to http://chopsticks-btevm:8545
+      # WITH COMPOSE_PROFILES=chopsticks to route 964 sims through the real runtime.
+      BITTENSOR_CHOPSTICKS_SIM_RPC_URL: "${BITTENSOR_CHOPSTICKS_SIM_RPC_URL:-}"
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
       # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app
       # contract (or any live on-chain state) must be visible immediately, not
@@ -527,6 +571,10 @@ services:
       ETH_SIM_RPC_URL: http://anvil-eth:8545
       BASE_SIM_RPC_URL: http://anvil-base:8546
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm:8547
+      # Chopsticks substrate sim sidecar (chain 964 native precompiles). Empty =
+      # 964 stays on anvil-btevm (default, inert). Set to http://chopsticks-btevm:8545
+      # WITH COMPOSE_PROFILES=chopsticks to route 964 sims through the real runtime.
+      BITTENSOR_CHOPSTICKS_SIM_RPC_URL: "${BITTENSOR_CHOPSTICKS_SIM_RPC_URL:-}"
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
       # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app
       # contract (or any live on-chain state) must be visible immediately, not
@@ -1011,6 +1059,9 @@ volumes:
   # Fork-cache snapshot (immutable historical state) — survives restarts so the
   # cache warm-loads instead of cold-refetching from the archive provider.
   fork-cache-data:
+  # Chopsticks lazy-storage fork cache (sqlite) for the Bittensor substrate sim —
+  # same purpose as fork-cache-data, warmed across chopsticks-btevm restarts.
+  chopsticks-cache:
 
 networks:
   # Main bridge — validator, api, anvils, docker-socket-proxy.
