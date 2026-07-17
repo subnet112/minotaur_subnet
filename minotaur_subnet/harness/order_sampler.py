@@ -15,6 +15,7 @@ outputs feed the authoritative relative adoption rule
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import random
@@ -591,11 +592,14 @@ def partition_follower_slices(
     itself before honoring, which is also the cheap-verification piece #242
     noted was missing.
 
-    ``chain_ids`` is REQUIRED and must stay within the round-anchored pin
-    chains (``consensus/round_anchor.ROUND_ANCHOR_CHAINS``): the harness takes
-    ONE scalar fork_block, so an order from an unpinned chain would replay at
-    live head and produce unconfirmable veto claims. Widening needs the
-    per-chain fork_block map the round_anchor comment demands.
+    ``chain_ids`` is REQUIRED and must stay within the round's FORK-PINNED chains
+    (``RoundState.fork_pins`` keys — the anchor chain plus, when
+    BENCHMARK_ALL_DEPLOYMENT_CHAINS is armed, every deployment chain incl.
+    Ethereum). Each slice is single-chain (grouped by chain below) and
+    ``run_slice_bench`` forks that chain at the pin the assignment carries for it,
+    so multi-chain coverage is just multiple single-chain slices. An order on a
+    chain with NO pin would replay at live head → an unconfirmable veto, so the
+    caller derives chain_ids from ``fork_pins`` and never passes an unpinned chain.
 
     Deterministic from ``round_id`` alone (shuffle seed ``{round_id}:veto-slices``)
     — anyone can re-derive and audit the partition. Slice→validator ASSIGNMENT
@@ -610,8 +614,8 @@ def partition_follower_slices(
     """
     if not chain_ids:
         raise ValueError(
-            "chain_ids is required (round-anchored pin chains only — the "
-            "harness has a single scalar fork_block)"
+            "chain_ids is required (must be the round's fork-pinned chains; "
+            "each slice is single-chain and forked at that chain's pin)"
         )
 
     if records is not None:
@@ -709,15 +713,38 @@ def partition_follower_slices(
     )
     random.Random(seed).shuffle(remainder)
 
+    # Per-chain slices: run_slice_bench forks exactly ONE chain per slice (at that
+    # chain's pin from the assignment), so a slice must never mix chains. Group the
+    # already-shuffled remainder by chain — preserving the shuffle order WITHIN each
+    # chain — then chunk each chain independently. A single-chain chain_ids yields one
+    # group whose slices are byte-identical to the pre-multichain flat chunking; a
+    # multi-chain chain_ids (e.g. Base + Ethereum under BENCHMARK_ALL_DEPLOYMENT_CHAINS)
+    # yields disjoint single-chain slices per chain. Chains are sorted so the partition
+    # stays deterministic and auditable.
+    by_chain: dict[Any, list[dict[str, Any]]] = {}
+    for o in remainder:
+        by_chain.setdefault(o.get("chain_id"), []).append(o)
+    per_chain = [
+        [col[i:i + slice_size] for i in range(0, len(col), slice_size)]
+        for _chain, col in sorted(by_chain.items(), key=lambda kv: str(kv[0]))
+    ]
+    # ROUND-ROBIN interleave across chains. Slice→validator assignment
+    # (epoch/distributed_veto) covers the LOWEST slice indices first, so a plain
+    # per-chain concatenation would hand the first-sorted chain every low index and
+    # STARVE the others (notably the corpus-dominant Base) of coverage at a small
+    # validator count. Interleaving spreads coverage evenly across chains. A single
+    # chain yields one column → order unchanged → byte-identical to the old chunking.
     slices = [
-        [_strip_pii(o) for o in remainder[i:i + slice_size]]
-        for i in range(0, len(remainder), slice_size)
+        [_strip_pii(o) for o in sl]
+        for tier in itertools.zip_longest(*per_chain)
+        for sl in tier
+        if sl is not None
     ]
     logger.info(
         "[distributed-veto] partitioned %d remainder (%d order + %d quote) into %d "
-        "slice(s) of <=%d for round %s (order corpus %d, order canonical draw %d)",
+        "slice(s) of <=%d across %d chain(s) for round %s (order corpus %d, canonical draw %d)",
         len(remainder), n_order_remainder, len(remainder) - n_order_remainder,
-        len(slices), slice_size, round_id, len(candidates), len(leader_ids),
+        len(slices), slice_size, len(by_chain), round_id, len(candidates), len(leader_ids),
     )
     return slices
 
@@ -739,15 +766,21 @@ def calibration_overlap(
     misread. Never contributes veto evidence itself.
     """
     draw = sample_historical_orders(app_store, round_id, records=records)
-    pool = [
-        o for o in draw
-        if o.get("chain_id") in set(chain_ids)
-    ]
-    pool.sort(key=lambda o: o.get("order_id", ""))
-    if not pool:
-        return []
-    seed = int.from_bytes(
-        hashlib.sha256(f"{round_id}:veto-calibration".encode("utf-8")).digest()[:8],
-        "big",
-    )
-    return random.Random(seed).sample(pool, min(n, len(pool)))
+    # ``n`` calibration orders PER chain: each single-chain slice is appended only its
+    # OWN chain's calibration (a slice mixing an order-chain with a calibration-chain
+    # would be REFUSED as multi_chain by run_slice_bench). Flat, chain-sorted result;
+    # a single-chain chain_ids returns exactly ``n`` as before.
+    result: list[dict[str, Any]] = []
+    for chain_id in sorted(set(chain_ids), key=str):
+        pool = [o for o in draw if o.get("chain_id") == chain_id]
+        pool.sort(key=lambda o: o.get("order_id", ""))
+        if not pool:
+            continue
+        seed = int.from_bytes(
+            hashlib.sha256(
+                f"{round_id}:veto-calibration:{chain_id}".encode("utf-8")
+            ).digest()[:8],
+            "big",
+        )
+        result.extend(random.Random(seed).sample(pool, min(n, len(pool))))
+    return result
