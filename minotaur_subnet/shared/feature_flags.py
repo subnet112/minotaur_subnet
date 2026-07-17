@@ -82,17 +82,18 @@ def quote_corpus_enabled() -> bool:
         - Veto DEFENSIVE fixes: veto_wire._order_label / _production_order_lookup and
           benchmark_worker.build_explicit_scenarios handle q_ quote ids, so the leader
           reverify + coverage assert hold the moment quotes enter the scored corpus.
+        - Distributed-veto SLICE partition: partition_follower_slices merges the quote
+          REMAINDER into the same follower slice pool (gated on this flag), so followers
+          independently cross-check quote scenarios — a quote-overfit throne no longer
+          escapes the per-order HARD-VETO. Ids-only assignment + q_ prefix means no
+          wire/protocol change. INERT while the flag is off.
 
       REMAINING before flipping this default ON / raising quorum:
         1. Flag ON fleet-wide (same image + env), verified via a soak where followers
            have synced quotes and recompute MATCHING pack hashes. The flip is a
            deliberate, atomic, separately-reviewed step (per the staging model).
         2. [quorum>1 only] benchmark_anchor_epoch plumbed leader→follower through the
-           champion proposal/certify path — the SIBLING PR; it is the standing blocker
-           for quorum>1 on the WHOLE benchmark (orders included), not just quotes.
-        3. [quorum>1 only] Distributed-veto SLICE partition extended to quotes
-           (partition_follower_slices / calibration_overlap) so a quote-overfit throne
-           has an independent cross-check. Ships with the quorum-raise batch alongside
-           (2); the leader-side reverify is already quote-aware (see DONE above).
+           champion proposal/certify path (B1 #904 + B2 #907 + B3 #908) — the standing
+           blocker for quorum>1 on the WHOLE benchmark (orders included), not just quotes.
     """
     return _env_bool("BENCHMARK_QUOTE_CORPUS", default=False)
