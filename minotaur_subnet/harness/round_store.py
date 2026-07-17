@@ -81,6 +81,12 @@ class ChampionSnapshot:
     activated_round_id: str | None = None
     activated_epoch: int = 0
     activated_at: float = 0.0
+    # Canonical solver-repo ``main`` HEAD SHA at the moment this champion was published
+    # to main (captured at adoption from the finalize result). The champion-main
+    # reconciler compares the LIVE main HEAD to this to detect an orphaned merge — and
+    # it works for PRIVATE champions too, because the published-to-main commit is always
+    # on canonical (unlike the miner's own commit, which lives in a private fork).
+    canonical_main_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +99,7 @@ class ChampionSnapshot:
             "activated_round_id": self.activated_round_id,
             "activated_epoch": self.activated_epoch,
             "activated_at": self.activated_at,
+            "canonical_main_sha": self.canonical_main_sha,
         }
 
     @classmethod
@@ -108,6 +115,7 @@ class ChampionSnapshot:
             activated_round_id=data.get("activated_round_id"),
             activated_epoch=int(data.get("activated_epoch") or 0),
             activated_at=float(data.get("activated_at") or 0.0),
+            canonical_main_sha=data.get("canonical_main_sha"),
         )
 
 

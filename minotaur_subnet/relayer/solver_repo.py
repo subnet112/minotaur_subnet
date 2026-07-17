@@ -1726,13 +1726,20 @@ class MergeResult:
     round store's ``abort_reason`` (``merge_failed:<code>``) and older callers.
     """
 
-    __slots__ = ("ok", "code", "stage", "detail")
+    __slots__ = ("ok", "code", "stage", "detail", "main_sha")
 
-    def __init__(self, ok: bool, code: str = "", stage: str = "", detail: str = "") -> None:
+    def __init__(
+        self, ok: bool, code: str = "", stage: str = "", detail: str = "",
+        *, main_sha: str = "",
+    ) -> None:
         self.ok = bool(ok)
         self.code = str(code or "")
         self.stage = str(stage or "")
         self.detail = str(detail or "")
+        # Canonical ``main`` HEAD SHA after a SUCCESSFUL publish — recorded on adoption
+        # so the champion-main reconciler can later detect an orphaned merge. Empty on
+        # failure or when it couldn't be read.
+        self.main_sha = str(main_sha or "")
 
     @property
     def reason(self) -> str:
@@ -1790,6 +1797,26 @@ class FinalizeOutcome:
                 "code": self.code, "stage": self.stage, "detail": self.detail,
             },
         }
+
+
+def _canonical_main_head_sha() -> str:
+    """Canonical solver-repo ``main`` HEAD commit SHA (empty on any error). Read right
+    after a successful publish so the reconciler can record where ``main`` should be for
+    the just-adopted champion — works for private champions (the published-to-main
+    commit is on canonical, unlike the miner's private commit)."""
+    owner_repo = _parse_github_owner_repo()
+    if owner_repo is None:
+        return ""
+    owner, repo = owner_repo
+    token = (
+        os.environ.get("SOLVER_REPO_PR_TOKEN") or os.environ.get("SOLVER_REPO_TOKEN") or ""
+    ).strip() or None
+    ok, ref = _gh_json(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/main", token=token,
+    )
+    if not ok or not isinstance(ref, dict):
+        return ""
+    return ((ref.get("object") or {}).get("sha") or "").strip()
 
 
 def on_champion_adopted_pr(
@@ -1932,7 +1959,8 @@ def on_champion_adopted_pr(
             logger.warning("close-stale failed after champion merge: %s", exc)
     _ok = bool(tx_hash) and bool(merged)
     if _ok:
-        _result = MergeResult(True)
+        # Record where main landed so the reconciler can later detect an orphaned merge.
+        _result = MergeResult(True, main_sha=_canonical_main_head_sha())
     elif _attest_reason:                     # attest is the ROOT failure
         _result = MergeResult(
             False, _attest_reason, "attest",
@@ -1956,6 +1984,21 @@ def on_champion_adopted_pr(
 # the relayer's POST /v1/finalize-champion (which re-verifies the validator quorum
 # independently) and gates its local adoption on the boolean reply. This mirrors
 # the on_champion_adopted_pr signature so it drops straight into the #326 gate.
+
+
+def _relayer_ready(base: str, *, timeout: float = 5.0) -> bool:
+    """Readiness probe for the finalize health-gate: ``GET {base}/health`` → True on a
+    2xx. NEVER raises (any error => not ready => the caller defers). The relayer is
+    commonly briefly unreachable right after an update.sh recreate — the api can come up
+    before the relayer's DNS/port is ready, which is exactly what orphaned the
+    2026-07-17 merge."""
+    import requests
+
+    try:
+        r = requests.get(base.rstrip("/") + "/health", timeout=timeout)
+        return 200 <= int(getattr(r, "status_code", 0) or 0) < 300
+    except Exception:
+        return False
 
 
 def on_champion_adopted_via_relayer(
@@ -2074,6 +2117,23 @@ def on_champion_adopted_via_relayer(
     }
 
     base = relayer_url.rstrip("/")
+
+    # Health-gate: probe the relayer's /health BEFORE POSTing the finalize. If it isn't
+    # ready — commonly a brief window right after an update.sh recreate where the api
+    # comes up before the relayer's DNS/port is ready, which is exactly what orphaned
+    # the 2026-07-17 merge — return stage="client" so the #326 merge-gate DEFERS (not
+    # aborts). The coordinator's re-drive cadence IS the retry, so we never block the
+    # event loop with an in-line sleep. Disable with RELAYER_HEALTH_GATE=0.
+    if (os.environ.get("RELAYER_HEALTH_GATE", "1").strip() or "1") != "0":
+        if not _relayer_ready(base):
+            logger.warning(
+                "on_champion_adopted_via_relayer: relayer at %s not ready (/health) — "
+                "stage=client so the merge-gate DEFERS; the coordinator re-drives once "
+                "the relayer is reachable (not aborting a possibly-landed finalize).",
+                base,
+            )
+            return MergeResult(False, "relayer_unready", "client", "relayer /health not ready")
+
     # Prefer the structured v2 contract; fall back to v1 for a relayer still on an
     # older image (the api + relayer recreate seconds apart during an update, so a
     # brief version skew is possible). Generous timeout: the on-chain attest (up to
@@ -2118,7 +2178,13 @@ def on_champion_adopted_via_relayer(
         "Champion finalization via relayer: round=%s submission=%s ok=%s reason=%s",
         rid, submission_id, ok, code or "-",
     )
-    return MergeResult(ok, code, stage, detail)
+    # On success, record where ``main`` landed so the reconciler can later detect an
+    # orphaned merge. Prefer a relayer-provided ``main_sha`` if present; else read
+    # canonical main HEAD ourselves (works for private champions — canonical commit).
+    _main_sha = str(payload.get("main_sha") or "") if isinstance(payload, dict) else ""
+    if not _main_sha and ok:
+        _main_sha = _canonical_main_head_sha()
+    return MergeResult(ok, code, stage, detail, main_sha=_main_sha)
 
 
 # ── Legacy compat ────────────────────────────────────────────────────────────
