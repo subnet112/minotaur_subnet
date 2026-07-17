@@ -2964,31 +2964,22 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
 
             def _close_sync_payload(round_state) -> dict[str, object]:
-                payload: dict[str, object] = {
-                    "round_id": round_state.round_id,
-                    "close_epoch": round_state.close_epoch,
-                    "benchmark_pack_hash": round_state.benchmark_pack_hash,
-                    "committee_block": round_state.committee_block,
-                    "committee_hash": round_state.committee_hash,
-                    "quorum_required": round_state.quorum_required,
-                    "decision_deadline_epoch": round_state.decision_deadline_epoch,
-                    "effective_epoch": round_state.effective_epoch,
-                }
-                # Bind the leader's close-time submission snapshot to the close
-                # broadcast so followers reproduce the SAME pack hash. The leader
-                # awaits this broadcast before proposing, so the snapshot lands
-                # before the follower's pack-hash check. ALWAYS ON — the
-                # SUBMISSION_SNAPSHOT_SYNC env gate was removed after fleet pack-hash
-                # parity was validated; the snapshot is required for cross-host
-                # determinism. Best-effort: a store hiccup must never break the broadcast.
-                try:
-                    _subs = submissions.get_store().list_by_round(round_state.round_id)
-                    payload["submissions"] = [s.to_dict() for s in _subs]
-                except Exception:
-                    logger.warning(
-                        "close payload: submission snapshot failed", exc_info=True,
-                    )
-                return payload
+                # B1: DELEGATE to the single module-level close-payload builder rather
+                # than duplicate its field list. The nested copy that used to live here
+                # had drifted — it OMITTED benchmark_anchor_epoch, so the leader's
+                # AUTOMATED per-tempo close broadcast (this path) materialized the round
+                # on every follower with benchmark_anchor_epoch=None → the follower
+                # anchored its fork pin to opened_epoch while the leader anchored to the
+                # real-open epoch → PACK_HASH_MISMATCH the instant quorum>1. The operator
+                # close endpoint used the (correct) module builder, which is why the two
+                # disagreed. Collapsing to one builder makes drift impossible and is
+                # covered by test_close_sync_payload_carries_benchmark_anchor_epoch. The
+                # payload is byte-identical to the old inline dict plus the anchor field;
+                # both use the same submission-store singleton (state.get_store).
+                from minotaur_subnet.api.routes.submissions.round_manager import (
+                    _close_round_sync_payload,
+                )
+                return _close_round_sync_payload(round_state)
 
             def _certify_sync_payload(round_state) -> dict[str, object]:
                 certificate = round_state.certificate
