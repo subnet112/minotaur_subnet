@@ -72,6 +72,21 @@ class TestRoundAnchoredCutoff:
     def test_retention_window_is_a_code_constant(self):
         assert isinstance(QUOTE_RETENTION_EPOCHS, int) and QUOTE_RETENTION_EPOCHS > 0
 
+    def test_cutoff_excludes_below_retention_floor(self):
+        # TWO-SIDED cutoff: a row older than draw_epoch - QUOTE_RETENTION_EPOCHS is
+        # NOT eligible, even though it is captured < draw_epoch — because retention
+        # would have pruned it, and including it would split the pack hash during the
+        # prune→reconcile gap. draw round-e{D} → floor = D - QUOTE_RETENTION_EPOCHS.
+        D = 30000
+        floor = D - QUOTE_RETENTION_EPOCHS
+        quotes = [
+            _q("q_below", floor - 1, "0xA"),   # below floor → excluded (prunable)
+            _q("q_at", floor, "0xB"),          # exactly at floor → eligible (retained)
+            _q("q_recent", D - 1, "0xC"),      # earlier round, in window → eligible
+        ]
+        got = sample_historical_quotes(_FakeQuoteStore(quotes), f"round-e{D}-n1", n_per_chain=50)
+        assert {q["quote_id"] for q in got} == {"q_at", "q_recent"}
+
 
 class TestStoreEpochColumn:
     def _store(self, tmp_path):
@@ -92,20 +107,52 @@ class TestStoreEpochColumn:
         assert s.get_quote("q_x")["captured_opened_epoch"] == 123
         assert s.list_quotes()[0]["captured_opened_epoch"] == 123
 
-    def test_first_seen_preserved_on_requote(self, tmp_path):
+    def test_save_quote_is_last_write(self, tmp_path):
+        # save_quote is a DUMB last-write mirror — first-seen is NOT enforced here (it
+        # is enforced upstream at the single leader capture site). This is what lets a
+        # follower adopt the leader's re-anchored epoch after a prune+recapture.
         s = self._store(tmp_path)
         s.save_quote(self._row(epoch=100))
-        # A later-round re-quote must NOT bump the anchor forward (COALESCE keeps it).
         s.save_quote(self._row(epoch=200))
-        assert s.get_quote("q_x")["captured_opened_epoch"] == 100
+        assert s.get_quote("q_x")["captured_opened_epoch"] == 200
 
-    def test_column_is_authoritative_over_stale_blob(self, tmp_path):
-        # Even if a caller's blob carries a different epoch than the column, reads
-        # return the COLUMN value (the COALESCE first-seen source of truth).
+    def _capture(self, s, epoch):
+        # Mimic the leader capture site's first-seen freeze: reuse the existing row's
+        # epoch if present, else stamp the current one; then last-write it.
+        existing = s.get_quote("q_x")
+        e = existing["captured_opened_epoch"] if (
+            existing and existing.get("captured_opened_epoch") is not None) else epoch
+        s.save_quote(self._row(epoch=e))
+        return e
+
+    def test_capture_site_first_seen_and_reanchor(self, tmp_path):
         s = self._store(tmp_path)
-        s.save_quote(self._row(epoch=100))
-        s.save_quote(self._row(epoch=200))  # column stays 100; blob would be 200
-        assert s.get_quote("q_x")["captured_opened_epoch"] == 100
+        assert self._capture(s, 100) == 100          # first capture stamps E1=100
+        assert self._capture(s, 200) == 100          # re-quote keeps first-seen E1
+        s.delete_quotes({"q_x"})                     # retention prunes the aged-out shape
+        assert self._capture(s, 300) == 300          # recapture re-anchors to E2=300 (new demand)
+
+    def test_follower_mirror_adopts_leader_reanchor(self, tmp_path):
+        # The finding-#2 fix: a follower holding the OLD epoch must adopt the leader's
+        # NEW epoch when QuoteSync re-upserts the row (last-write), even though its old
+        # row was never observed absent (reconcile only deletes leader-absent ids).
+        follower = self._store(tmp_path)
+        follower.save_quote(self._row(epoch=100))                 # follower has E1=100
+        follower.save_quote(self._row(epoch=300))                 # leader row now E2=300 → mirror
+        assert follower.get_quote("q_x")["captured_opened_epoch"] == 300
+
+    def test_column_authoritative_over_stale_blob(self, tmp_path):
+        # get_quote/list_quotes read the COLUMN, not the JSON blob — verified by
+        # writing a row whose blob epoch disagrees with the column via raw SQL.
+        s = self._store(tmp_path)
+        with s._connect() as conn:
+            conn.execute(
+                "INSERT INTO quotes(quote_id, app_id, chain_id, created_at, "
+                "captured_opened_epoch, data) VALUES(?,?,?,?,?,?)",
+                ("q_x", "app_test", 8453, 1.0, 55,
+                 '{"quote_id":"q_x","captured_opened_epoch":999}'),  # blob says 999
+            )
+        assert s.get_quote("q_x")["captured_opened_epoch"] == 55    # column wins
 
 
 class TestMigration:
@@ -196,12 +243,17 @@ class TestVetoQuoteAware:
         o = veto_wire._production_order_lookup("ord_1")
         assert o["src"] == "orders"
 
-    def test_label_and_scenario_prefix_agree(self):
-        # The veto coverage assert holds only if _order_label and the scenario
-        # builder's prefix use the SAME discriminator (q_ prefix). Assert the
-        # discriminator is identical on both sides.
+    def test_label_matches_scenario_intent_id_byte_for_byte(self):
+        # The veto coverage assert matches per_order rows by intent_id == _order_label.
+        # The orchestrator builds intent_id = f"{app_id}:{scenario_name}" where
+        # _order_to_scenario sets scenario_name = f"{prefix}:{order_id}". So the WHOLE
+        # string must agree — a separator or app_id-prefix drift would silently drop
+        # every quote row into a vacuous OK. Assert full-string equality on both sides
+        # against the actual _order_to_scenario prefix rule (q_ → quote, else hist).
         from minotaur_subnet.api.routes.submissions.veto_wire import _order_label
-        for oid, kind in [("q_x", "quote"), ("ord_x", "hist")]:
-            label_kind = _order_label({"app_id": "a", "order_id": oid}).split(":")[1]
-            scenario_kind = "quote" if oid.startswith("q_") else "hist"
-            assert label_kind == scenario_kind == kind
+        for oid in ("q_abc", "ord_1"):
+            order = {"app_id": "myapp", "order_id": oid}
+            prefix = "quote" if oid.startswith("q_") else "hist"      # build_explicit_scenarios rule
+            scenario_name = f"{prefix}:{oid}"                          # _order_to_scenario
+            intent_id = f"{order['app_id']}:{scenario_name}"          # orchestrator
+            assert _order_label(order) == intent_id
