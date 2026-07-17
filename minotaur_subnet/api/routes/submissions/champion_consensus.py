@@ -624,6 +624,7 @@ async def _maybe_prepare_round_for_certification(
     quorum_required: int | None = None,
     decision_deadline_epoch: int | None = None,
     effective_epoch: int | None = None,
+    benchmark_anchor_epoch: int | None = None,
     candidate_submission_id: str | None = None,
 ) -> RoundState:
     """Close/evaluate a round on demand so peers can verify the same tuple.
@@ -646,29 +647,16 @@ async def _maybe_prepare_round_for_certification(
     # 404s on the leader's unknown round_id. Adopt as CLOSED so the existing prep
     # flow (close->evaluate->CERTIFYING) advances it normally.
     #
-    # KNOWN GAP — benchmark_anchor_epoch is NOT carried here, and this is deliberate.
-    # A follower that adopts a round via THIS path (i.e. it missed the close
-    # broadcast, which does carry the field) gets benchmark_anchor_epoch=None and so
-    # anchors its fork pin to opened_epoch, while the leader anchored to the real-open
-    # epoch → different pin → PACK_HASH_MISMATCH for that follower on that round.
-    #
-    # It is not fixed here because the fix is not local: the field rides in
-    # **field_updates (so its absence is silent — no signature error, no test), and
-    # the field exists on CloseRoundRequest only, NOT on CertifyRoundRequest or
-    # ChampionConsensusProposalRequest. The proposal route authenticates by
-    # canonicalizing body.model_dump() (routes.py _verify_champion_proposal_signature),
-    # so ADDING a field to that model breaks signature verification in BOTH directions
-    # during any staggered rollout — the exact shape of the #378 outage where a stray
-    # `timestamp` key made followers reject every champion proposal and quorum could
-    # never be reached (see peer_network.py).
-    #
-    # HARD INVARIANT: this gap is free at quorum <= 1 (FOLLOWER_TRUST_LEADER_QUORUM1 —
-    # the follower adopts the leader's signed champion without self-verifying, so its
-    # own pin never gates anything). QUORUM MUST NOT BE RAISED ABOVE 1 until
-    # benchmark_anchor_epoch is plumbed through the proposal/certify path — and that
-    # plumbing requires a PREREQUISITE PR converting proposal-sig verification to
-    # raw-dict canonicalization (mirroring _verify_internal_round_signature) so adding
-    # a field is not itself a fleet-wide quorum outage.
+    # B3: benchmark_anchor_epoch IS now carried on this path (the leader's real round-open
+    # anchor epoch), so a follower that adopts a round here — because it missed the close
+    # broadcast — anchors its fork pin to the SAME epoch as the leader instead of falling
+    # back to opened_epoch. This closes the last PACK_HASH_MISMATCH gap for quorum>1. The
+    # field rides on CertifyRoundRequest / ChampionConsensusProposalRequest, and adding it
+    # to the proposal model is signature-safe because B2 moved proposal-sig verification to
+    # raw-dict canonicalization. None from a pre-B3 leader → adopt_round skips it (the
+    # value is only applied when non-None), so the follower keeps the opened_epoch fallback
+    # and mixed-version rounds never diverge. HARD SEQUENCING: B1 (close broadcast) + B2
+    # (raw-dict proposal verify) must be fleet-wide before this ships.
     if round_store.get_round(round_id) is None:
         _adopt_leader_round_if_behind(
             round_id,
@@ -680,6 +668,7 @@ async def _maybe_prepare_round_for_certification(
             quorum_required=quorum_required,
             decision_deadline_epoch=decision_deadline_epoch,
             effective_epoch=effective_epoch,
+            benchmark_anchor_epoch=benchmark_anchor_epoch,
         )
     round_state = round_store.get_round(round_id)
     if round_state is None:
@@ -1167,6 +1156,7 @@ async def _run_best_effort_champion_quorum(
                 quorum_required=consensus_manager.quorum_required,
                 decision_deadline_epoch=round_state.decision_deadline_epoch,
                 committee_block=round_state.committee_block,
+                benchmark_anchor_epoch=getattr(round_state, "benchmark_anchor_epoch", None),
                 request_timeout=_best_effort_request_timeout(),
             )
         except asyncio.CancelledError:
@@ -1309,6 +1299,7 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
     round_state = await _maybe_prepare_round_for_certification(
         body.round_id,
         candidate_submission_id=body.candidate_submission_id,
+        benchmark_anchor_epoch=body.benchmark_anchor_epoch,  # B3 (applied only if adopting)
     )
     if round_state.status not in (RoundStatus.CERTIFYING, RoundStatus.CERTIFIED):
         raise HTTPException(
@@ -1467,6 +1458,7 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                     quorum_required=consensus_manager.quorum_required,
                     decision_deadline_epoch=round_state.decision_deadline_epoch,
                     committee_block=round_state.committee_block,
+                    benchmark_anchor_epoch=getattr(round_state, "benchmark_anchor_epoch", None),
                 )
             )
         result = await consensus_manager.propose(proposal)

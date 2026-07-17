@@ -601,6 +601,11 @@ def _certify_round_sync_payload(state: RoundState) -> dict[str, Any]:
         "benchmark_pack_hash": state.benchmark_pack_hash,
         "shadow_case_log_hash": state.shadow_case_log_hash,
         "effective_epoch": state.effective_epoch or 0,
+        # B3: carry the leader's real round-open anchor so a follower adopting via the
+        # certify path anchors its fork pin identically (else opened_epoch fallback →
+        # PACK_HASH_MISMATCH at quorum>1). Keep byte-for-byte equal to the coordinator's
+        # _certify_sync_payload in startup.py.
+        "benchmark_anchor_epoch": getattr(state, "benchmark_anchor_epoch", None),
         "quorum_required": state.quorum_required or 0,
         "commit_hash": getattr(_lead, "commit_hash", None),
         "nonce": int(getattr(_lead, "nonce", 0) or 0),
