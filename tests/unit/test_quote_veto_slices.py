@@ -117,3 +117,39 @@ class TestQuoteVetoMerge:
         s = _DualStore([], quotes)
         ids = _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))
         assert "q_offchain" not in ids
+
+
+class TestQuoteParamsFrozen:
+    """Capture freezes a quote's whole row at first-seen. quote_id is decade-bucketed,
+    so re-quoting the same SHAPE at a different exact amount must NOT churn the stored
+    params — else order_replay_hash (the veto slice digest) AND the benched output would
+    differ across validators under QuoteSync's 30s last-write lag → the follower refuses
+    the slice / diverges the adoption verdict at quorum>1 (audit finding)."""
+
+    def test_reshape_requote_keeps_first_seen_params_and_hash(self, tmp_path):
+        from minotaur_subnet.store.app_intent_store import AppIntentStore
+        from minotaur_subnet.harness.order_sampler import quote_case_id, order_replay_hash
+        s = AppIntentStore(store_path=tmp_path / "s.db")
+
+        def capture(amount):  # mirrors orders.py get_quote: leader saves only if new
+            params = {"input_token": "0xA", "output_token": "0xB", "input_amount": amount}
+            qid = quote_case_id("app", 8453, "swap", params)
+            if s.get_quote(qid) is None:
+                s.save_quote({"quote_id": qid, "app_id": "app", "chain_id": 8453,
+                              "intent_function": "swap", "params": params,
+                              "captured_opened_epoch": 100, "created_at": 1.0})
+            return qid
+
+        q1 = capture("10")                      # decade e1
+        q2 = capture("99")                      # same decade → SAME shape id
+        assert q1 == q2
+        row = s.get_quote(q1)
+        assert row["params"]["input_amount"] == "10"   # FROZEN at first-seen (not 99)
+
+        def _replay_hash(qid):
+            r = dict(s.get_quote(qid)); r["order_id"] = qid
+            return order_replay_hash(r)
+
+        h1 = _replay_hash(q1)
+        capture("55")                           # another same-shape re-quote
+        assert _replay_hash(q1) == h1           # hash unchanged → synced follower won't refuse
