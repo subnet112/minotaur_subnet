@@ -119,12 +119,16 @@ an SN112 stake integration test).
   the App read-only, and decodes `(uint256 score, bool valid)` → `on_chain_score`. Any
   964 App following AppIntentBase is now scored on both `raw_output` and `on_chain_score`.
 
+- **Relayer as msg.sender** ✓ — like the anvil path, the backend calls `relayer()`
+  on the App to discover its configured relayer and uses that address as the
+  `from`/msg.sender for BOTH the plan execution and the `scoreIntent` read (an
+  AppIntentBase App gates both on it). Because the backend is dry-run-only, NO
+  impersonation is needed (anvil impersonates only for the state-changing *send*).
+  Falls back to `metadata.executor`/default when the target has no `relayer()`.
+
 ### Still open
 - A concrete production 964 App + its manifest to soak against (the machinery is
   complete; it just hasn't been exercised by a real miner App yet).
-- `msg.sender` for the `scoreIntent` read is the executor, not an impersonated
-  relayer — an App that gates its scoreIntent *view* on a specific relayer would
-  return invalid (raw_output still scores). Wire the relayer identity if needed.
 
 ## Running it
 

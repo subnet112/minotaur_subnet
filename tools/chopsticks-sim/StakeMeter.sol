@@ -39,4 +39,11 @@ contract StakeMeter {
     {
         return (4242, true);
     }
+
+    // AppIntentBase exposes the configured relayer; the simulator discovers it via
+    // this getter and uses it as the msg.sender for the scored call (see
+    // SubtensorSimulator._discover_relayer). Fixed sentinel here for the test.
+    function relayer() external pure returns (address) {
+        return 0x000000000000000000000000000000000000bEEF;
+    }
 }

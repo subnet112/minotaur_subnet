@@ -201,7 +201,19 @@ class SubtensorSimulator:
         if fork_block is not None:
             self._repin_one(url, self.chain_id, fork_block)
 
+        # Resolve the `from` address exactly as the anvil path does: discover the
+        # App's OWN configured relayer via `relayer()` and use it for BOTH the plan
+        # execution and the scoreIntent read (an AppIntentBase App gates both on
+        # msg.sender == relayer()). Dry-runs accept an arbitrary `from`, so — unlike
+        # anvil's state-changing send — NO impersonation is needed. Falls back to
+        # metadata.executor / the default when the target has no relayer() (e.g. the
+        # measuring router).
         executor = (plan.metadata.get("executor") if plan.metadata else None) or self.default_executor
+        if contract_address:
+            relayer = self._discover_relayer(contract_address, url)
+            if relayer:
+                executor = relayer
+
         # Fund the executor's mapped (coldkey) account so precompile stakes/txs
         # have balance. token_balances is EVM-wei keyed by token; for native TAO
         # we fund generously in rao.
@@ -295,6 +307,24 @@ class SubtensorSimulator:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("scoreIntent read failed: %s", exc)
         return result
+
+    def _discover_relayer(self, contract_address: str, url: str) -> str | None:
+        """Call ``relayer()`` on the App (as the anvil path does) to get the address
+        its scoreIntent/executeIntent gate on as msg.sender. Returns None if the
+        target has no relayer() getter (e.g. the bare measuring router) or returns
+        the zero address, so callers fall back to the default executor."""
+        from eth_hash.auto import keccak
+        try:
+            r = self.eth_call(to=contract_address,
+                              data="0x" + keccak(b"relayer()")[:4].hex(), url=url)
+        except Exception:  # noqa: BLE001
+            return None
+        ret = (r or {}).get("returnData") or "0x"
+        h = ret[2:] if ret.startswith("0x") else ret
+        if not r.get("success") or len(h) < 64:
+            return None
+        addr = "0x" + h[-40:]
+        return addr if int(addr, 16) != 0 else None
 
     def _build_score_intent_calldata(self, contract_address, intent_order, plan) -> str:
         """Encode scoreIntent((IntentOrder),(ExecutionPlan)) — ported verbatim from

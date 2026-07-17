@@ -158,6 +158,8 @@ async def test_simulate_sn112_stake_delivers_alpha():
     assert result.success, result.error
     # StakeMeter.scoreIntent returns (4242, true) -> backend decoded on_chain_score
     assert result.on_chain_score == 4242
+    # backend discovers the App's relayer() and uses it as the scored-call msg.sender
+    assert sim._discover_relayer(ROUTER, sim._urls[0]) == "0x000000000000000000000000000000000000beef"
     assert result.gas_used > 0
     assert result.gas_metered == result.gas_used
     # the measuring router returns (before, after, delta) in return_data
