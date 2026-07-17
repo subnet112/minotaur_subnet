@@ -98,6 +98,7 @@ const HANDLERS = {
   },
   async sim_forkBlock() { return await ck.forkBlock() },
   async sim_forkTimestamp() { return await ck.forkTimestamp() },
+  async sim_repin([block]) { const b = await ck.repin(block); pinBlock = b; return b },
   sim_mappedAccount([h160]) { return ck.mappedAccount(h160) },
   async anvil_setBalance([h160, rao]) { await ck.setBalance(h160, BigInt(rao)); return true },
   async anvil_setCode([h160, code]) { await ck.setCode(h160, code); return true },

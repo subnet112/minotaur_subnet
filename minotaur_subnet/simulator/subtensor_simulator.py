@@ -58,52 +58,71 @@ class SubtensorSimulator:
         default_executor: str = _DEFAULT_EXECUTOR,
         rpc_timeout: float = 60.0,
     ) -> None:
-        self.sidecar_url = sidecar_url.rstrip("/")
+        # sidecar_url may be a comma-separated POOL of sidecars for horizontal
+        # throughput (the JS-wasm executor is single-threaded, so scoring hundreds
+        # of candidates/round means fanning out across replicas). Each simulate()
+        # picks one sidecar round-robin and does ALL its work (re-pin, fund, call)
+        # on that one — the operations are stateful per fork instance.
+        self._urls = [u.strip().rstrip("/") for u in str(sidecar_url).split(",") if u.strip()]
+        if not self._urls:
+            self._urls = [str(sidecar_url).rstrip("/")]
+        self.sidecar_url = self._urls[0]
         self.chain_id = chain_id
         self.default_executor = default_executor
         self.rpc_timeout = rpc_timeout
-        self._pinned_block: int | None = None
-        try:
-            h = self._rpc("sim_health")
-            self._pinned_block = h.get("pinBlock")
-            logger.info(
-                "SubtensorSimulator connected: %s (chain %d, fork block %s)",
-                self.sidecar_url, chain_id, h.get("block"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("SubtensorSimulator: sidecar %s not reachable: %s", self.sidecar_url, exc)
+        self._rr = 0
+        self._pinned: dict[str, int | None] = {u: None for u in self._urls}
+        for url in self._urls:
+            try:
+                h = self._rpc("sim_health", url=url)
+                self._pinned[url] = h.get("pinBlock")
+                logger.info(
+                    "SubtensorSimulator connected: %s (chain %d, fork block %s)",
+                    url, chain_id, h.get("block"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SubtensorSimulator: sidecar %s not reachable: %s", url, exc)
+
+    @property
+    def _pinned_block(self) -> int | None:
+        """Back-compat: the first sidecar's pinned block."""
+        return self._pinned.get(self.sidecar_url)
+
+    def _pick_url(self) -> str:
+        url = self._urls[self._rr % len(self._urls)]
+        self._rr += 1
+        return url
 
     # ── sidecar JSON-RPC ──────────────────────────────────────────────────────
-    def _rpc(self, method: str, params: list | None = None) -> Any:
+    def _rpc(self, method: str, params: list | None = None, url: str | None = None) -> Any:
+        target = (url or self.sidecar_url)
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
-        req = urllib.request.Request(
-            self.sidecar_url, data=body, headers={"content-type": "application/json"}
-        )
+        req = urllib.request.Request(target, data=body, headers={"content-type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.rpc_timeout) as resp:
             msg = json.loads(resp.read())
         if msg.get("error"):
             raise RuntimeError(f"{method}: {msg['error'].get('message')}")
         return msg.get("result")
 
-    # ── cheatcodes ────────────────────────────────────────────────────────────
-    def set_balance(self, h160: str, rao: int) -> None:
-        self._rpc("anvil_setBalance", [h160, str(int(rao))])
+    # ── cheatcodes (url defaults to the first sidecar; simulate() threads its own) ─
+    def set_balance(self, h160: str, rao: int, url: str | None = None) -> None:
+        self._rpc("anvil_setBalance", [h160, str(int(rao))], url=url)
 
-    def set_code(self, h160: str, code_hex: str) -> None:
-        self._rpc("anvil_setCode", [h160, code_hex])
+    def set_code(self, h160: str, code_hex: str, url: str | None = None) -> None:
+        self._rpc("anvil_setCode", [h160, code_hex], url=url)
 
-    def set_storage_at(self, h160: str, slot: str, value: str) -> None:
-        self._rpc("anvil_setStorageAt", [h160, slot, value])
+    def set_storage_at(self, h160: str, slot: str, value: str, url: str | None = None) -> None:
+        self._rpc("anvil_setStorageAt", [h160, slot, value], url=url)
 
-    def mapped_account(self, h160: str) -> str:
-        return self._rpc("sim_mappedAccount", [h160])
+    def mapped_account(self, h160: str, url: str | None = None) -> str:
+        return self._rpc("sim_mappedAccount", [h160], url=url)
 
     def eth_call(self, to: str, data: str, from_addr: str | None = None,
-                 value: int = 0, gas: str | None = None) -> dict:
+                 value: int = 0, gas: str | None = None, url: str | None = None) -> dict:
         return self._rpc("ck_ethCall", [{
             "from": from_addr or self.default_executor,
             "to": to, "data": data, "value": value, "gas": gas,
-        }])
+        }], url=url)
 
     # ── the AnvilSimulator-compatible surface ─────────────────────────────────
     def is_connected(self) -> bool:
@@ -113,25 +132,38 @@ class SubtensorSimulator:
             return False
 
     def pin_read_fork(self, chain_id: int, block_number: int) -> bool:
-        """The Chopsticks fork is pinned at container launch (``--block``). Live
-        re-pinning to an arbitrary historical block needs a re-fork, so this
-        reports whether the sidecar is already pinned at ``block_number`` and
-        warns otherwise — the deterministic contract is that the sidecar is
-        launched at the round's benchmark fork block (CK_BLOCK). Per-round live
-        re-pin (dev_setHead) is a follow-up."""
-        if self._pinned_block is None:
-            try:
-                self._pinned_block = self._rpc("sim_health").get("pinBlock")
-            except Exception:  # noqa: BLE001
-                return False
-        if self._pinned_block == block_number:
+        """Re-anchor the Chopsticks fork to ``block_number`` for this round via the
+        sidecar's ``sim_repin`` (dev_setHead) — no restart. Verified that this
+        re-anchors STATE, not just the block number (native precompile reads match
+        the archive node at the re-pinned block). Idempotent: a no-op when already
+        pinned there, so scoring many candidates at one block re-pins once.
+
+        Requires the sidecar's upstream (CK_ENDPOINT) to be an ARCHIVE node for a
+        jump beyond its pruning window — the leader's blockmachine node is archive.
+        Re-pin drops cheatcode overrides, so ``simulate`` re-pins BEFORE funding.
+        Pins EVERY sidecar in the pool; True iff all landed on ``block_number``."""
+        ok = True
+        for url in self._urls:
+            ok = self._repin_one(url, chain_id, block_number) and ok
+        return ok
+
+    def _repin_one(self, url: str, chain_id: int, block_number: int) -> bool:
+        if self._pinned.get(url) == block_number:
             return True
-        logger.warning(
-            "SubtensorSimulator: requested pin block %s != launch pin %s (chain %s); "
-            "chopsticks fork stays at its launch block — launch the sidecar at the "
-            "round fork block for determinism", block_number, self._pinned_block, chain_id,
-        )
-        return False
+        try:
+            new_head = self._rpc("sim_repin", [int(block_number)], url=url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SubtensorSimulator: re-pin %s to %s failed (chain %s): %s",
+                           url, block_number, chain_id, exc)
+            return False
+        self._pinned[url] = new_head
+        if new_head != block_number:
+            logger.warning(
+                "SubtensorSimulator: re-pin %s landed on %s, requested %s — upstream "
+                "may lack that block's state (needs an archive node)",
+                url, new_head, block_number)
+            return False
+        return True
 
     def get_block_timestamp(self, chain_id: int, block_number: int | None = None) -> int | None:
         """Timestamp of the pinned fork block (from pallet_timestamp via the sidecar)."""
@@ -162,15 +194,19 @@ class SubtensorSimulator:
         if not plan.interactions:
             return SimulationResult(success=False, error="empty plan")
 
+        # Pick ONE sidecar for this whole simulate() (round-robin across the pool)
+        # — re-pin, fund, and call all target the same fork instance.
+        url = self._pick_url()
+
         if fork_block is not None:
-            self.pin_read_fork(self.chain_id, fork_block)
+            self._repin_one(url, self.chain_id, fork_block)
 
         executor = (plan.metadata.get("executor") if plan.metadata else None) or self.default_executor
         # Fund the executor's mapped (coldkey) account so precompile stakes/txs
         # have balance. token_balances is EVM-wei keyed by token; for native TAO
         # we fund generously in rao.
         try:
-            self.set_balance(executor, _DEFAULT_FUND_RAO)
+            self.set_balance(executor, _DEFAULT_FUND_RAO, url=url)
         except Exception as exc:  # noqa: BLE001
             return SimulationResult(success=False, error=f"fund failed: {exc}")
 
@@ -183,7 +219,7 @@ class SubtensorSimulator:
             try:
                 r = self.eth_call(
                     to=ix.target, data=ix.call_data,
-                    from_addr=executor, value=int(ix.value or "0"),
+                    from_addr=executor, value=int(ix.value or "0"), url=url,
                 )
             except Exception as exc:  # noqa: BLE001
                 return SimulationResult(success=False, error=f"interaction {i} rpc: {exc}")
@@ -208,15 +244,63 @@ class SubtensorSimulator:
         # GAS-PAR "scoreintent_prerefund_v1" intent — so we surface it directly.
         if meter_gas:
             result.gas_metered = total_gas
-        # Surface the terminal call's raw return so an App/router that measures
-        # delivered output (e.g. staking alpha delta) can be scored. The per-App
-        # scorer reads state_changes; we stash the raw return so a substrate
-        # scorer JS can decode it. (Full scoreIntent decode: follow-up.)
+
+        # ── delivered-output convention ──────────────────────────────────────
+        # A substrate App's scored (terminal) call returns the exact delivered
+        # output as its LAST 32-byte return word — for StakeMeter.stakeAndMeasure
+        # -> (before, after, delta) that's `delta` (alpha received); for an App
+        # whose scoreIntent returns (…, rawOutput) it's rawOutput; for a bare
+        # `rawOutput` return it's the only word. We surface it as a TYPED
+        # state_change so the per-App raw-output scorer JS
+        # (harness/scoring_shadow/subtensor_stake_raw.js) reads it exactly like
+        # the DEX scorer reads token_transfers. raw_output stays an opaque BigInt
+        # downstream, so relative_scoring is unchanged.
+        state_changes: list[dict[str, Any]] = []
         if last_return and last_return != "0x":
-            result.state_changes = [{
+            state_changes.append({
                 "type": "return_data", "chain_id": self.chain_id, "data": last_return,
-            }]
+            })
+            delivered = self._last_word(last_return)
+            if delivered is not None:
+                state_changes.append({
+                    "type": "delivered_output", "chain_id": self.chain_id,
+                    "token": "alpha", "amount": str(delivered),
+                })
+        result.state_changes = state_changes
+
+        # ── optional on-chain score (BPS) ────────────────────────────────────
+        # If the order carries pre-built scoreIntent calldata for the App, call it
+        # (read-only) and decode (uint256 score, bool valid) into on_chain_score,
+        # mirroring the anvil scoreIntent path. Best-effort: absent/failed leaves
+        # on_chain_score=None (raw_output still drives scoring).
+        sic = (intent_order or {}).get("score_intent_calldata") if intent_order else None
+        if contract_address and sic:
+            try:
+                r = self.eth_call(to=contract_address, data=sic, from_addr=executor, url=url)
+                if r.get("success"):
+                    score = self._word((r.get("returnData") or "0x"), 0)  # (uint256 score, bool valid)
+                    if score is not None:
+                        result.on_chain_score = score
+            except Exception:  # noqa: BLE001
+                pass
         return result
+
+    @staticmethod
+    def _word(ret_hex: str, index: int) -> int | None:
+        """Decode the ``index``-th 32-byte ABI word of a return blob as uint256."""
+        h = ret_hex[2:] if ret_hex.startswith("0x") else ret_hex
+        lo, hi = index * 64, (index + 1) * 64
+        if len(h) < hi:
+            return None
+        return int(h[lo:hi], 16)
+
+    @classmethod
+    def _last_word(cls, ret_hex: str) -> int | None:
+        """Decode the LAST 32-byte ABI word of a return blob as uint256."""
+        h = ret_hex[2:] if ret_hex.startswith("0x") else ret_hex
+        if len(h) < 64:
+            return None
+        return int(h[-64:], 16)
 
     @staticmethod
     def _parse_transfers(logs: list[dict]) -> list[TokenTransfer]:

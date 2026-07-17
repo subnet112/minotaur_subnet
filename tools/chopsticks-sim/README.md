@@ -94,15 +94,28 @@ an SN112 stake integration test).
 3. `BITTENSOR_SUBSTRATE_WS_URL=<blockmachine subtensor wss>` (fork upstream).
 4. `CK_BLOCK=<round fork block>` per round (see the per-round re-pin follow-up below).
 
-### Known follow-ups (not blocking the integration)
-- **Per-round re-pin**: the fork is pinned at container launch (`CK_BLOCK`); live
-  re-pin to the round's fork block (`dev_setHead`) so `pin_read_fork` re-anchors
-  without a restart. Until then the sidecar must be (re)launched at the round block
-  for cross-validator determinism.
-- **scoreIntent decode**: `simulate()` surfaces the terminal call's `return_data`;
-  wiring the App's `scoreIntent` tuple + a substrate raw-output scorer JS that reads
-  it is the next step for full parity with the DexAggregator scorer.
-- **Throughput**: the JS-wasm executor is slow — shard for hundreds of candidates.
+### Follow-ups (DONE)
+- **Per-round re-pin** ✓ — `pin_read_fork` re-anchors the live fork to the round's
+  block via the sidecar's `sim_repin` (`dev_setHead`), no restart. Verified it
+  re-anchors STATE (native precompile reads match the archive node at the re-pinned
+  block), and it's idempotent (many candidates at one block re-pin once). Requires an
+  ARCHIVE upstream (`CK_ENDPOINT`) for jumps beyond the node's pruning window — the
+  leader's blockmachine node is archive.
+- **Delivered-output + scorer JS** ✓ — the App's scored (terminal) call returns the
+  delivered output as its last 32-byte word; `simulate()` surfaces it as a typed
+  `delivered_output` state_change, and `harness/scoring_shadow/subtensor_stake_raw.js`
+  (the substrate analog of `dex_aggregator_raw.js`) reads it into
+  `metadata.raw_output`. Optional `scoreIntent` calldata in the order → `on_chain_score`.
+- **Throughput / sharding** ✓ — `BITTENSOR_CHOPSTICKS_SIM_RPC_URL` accepts a
+  COMMA-SEPARATED pool of sidecar URLs; `SubtensorSimulator` round-robins each
+  `simulate()` across the pool (each call does re-pin+fund+call on one instance),
+  and `pin_read_fork` pins every instance. Run N replicas of `chopsticks-btevm` to
+  fan out the single-threaded JS-wasm executor across candidates.
+
+### Still open
+- Full `scoreIntent` tuple *encoding* for arbitrary Apps (the DexAggregator's
+  12-field order builder has no substrate equivalent yet — the App defines its ABI;
+  `simulate()` accepts pre-built `score_intent_calldata` today).
 
 ## Running it
 

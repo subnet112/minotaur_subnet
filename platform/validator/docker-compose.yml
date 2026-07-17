@@ -439,6 +439,8 @@ services:
       # Chopsticks substrate sim sidecar (chain 964 native precompiles). Empty =
       # 964 stays on anvil-btevm (default, inert). Set to http://chopsticks-btevm:8545
       # WITH COMPOSE_PROFILES=chopsticks to route 964 sims through the real runtime.
+      # Accepts a COMMA-SEPARATED pool for throughput (round-robined per simulate),
+      # e.g. "http://chopsticks-btevm-1:8545,http://chopsticks-btevm-2:8545".
       BITTENSOR_CHOPSTICKS_SIM_RPC_URL: "${BITTENSOR_CHOPSTICKS_SIM_RPC_URL:-}"
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
       # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app
@@ -574,6 +576,8 @@ services:
       # Chopsticks substrate sim sidecar (chain 964 native precompiles). Empty =
       # 964 stays on anvil-btevm (default, inert). Set to http://chopsticks-btevm:8545
       # WITH COMPOSE_PROFILES=chopsticks to route 964 sims through the real runtime.
+      # Accepts a COMMA-SEPARATED pool for throughput (round-robined per simulate),
+      # e.g. "http://chopsticks-btevm-1:8545,http://chopsticks-btevm-2:8545".
       BITTENSOR_CHOPSTICKS_SIM_RPC_URL: "${BITTENSOR_CHOPSTICKS_SIM_RPC_URL:-}"
       # Live-chain read RPCs — AppRegistry / ValidatorRegistry / score / gas.
       # MUST be the LIVE chains, NOT the sim forks: a freshly-registered app

@@ -62,6 +62,17 @@ export class ChopsticksAnvil {
     return Math.floor(Number(ms.toString()) / 1000)
   }
 
+  // Re-anchor the fork to a different historical block WITHOUT restarting
+  // (per-round re-pin). dev_setHead moves the head; subsequent state reads
+  // lazy-load from the upstream at that block — so the upstream MUST be an
+  // archive node for a jump beyond its pruning window. Returns the new head.
+  // Any pending cheatcode overrides (setBalance/setCode) are dropped by the
+  // re-pin (fresh state), so re-pin FIRST, then seed, then dry-run.
+  async repin(blockNumber) {
+    await this.provider.send('dev_setHead', [Number(blockNumber)])
+    return await this.forkBlock()
+  }
+
   // H160 -> the ss58 account that owns its balance/gas (HashedAddressMapping):
   // blake2_256("evm:" ++ h160). This is the coldkey a contract stakes under.
   mappedAccount(h160) {

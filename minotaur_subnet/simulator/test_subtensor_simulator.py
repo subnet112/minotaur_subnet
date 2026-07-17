@@ -110,12 +110,44 @@ async def test_simulate_sn112_stake_delivers_alpha():
     assert result.success, result.error
     assert result.gas_used > 0
     assert result.gas_metered == result.gas_used
-    # the measuring router returns (before, after, delta); delta must be > 0
-    assert result.state_changes, "no return_data captured"
-    ret = result.state_changes[0]["data"]
-    h = ret[2:] if ret.startswith("0x") else ret
+    # the measuring router returns (before, after, delta) in return_data
+    rd = next(c for c in result.state_changes if c["type"] == "return_data")
+    h = rd["data"][2:] if rd["data"].startswith("0x") else rd["data"]
     before, after, delta = (int(h[i:i + 64], 16) for i in (0, 64, 128))
     assert before == 0
     assert delta > 0
     assert after == delta
+    # ...and the typed delivered_output the scorer JS reads as raw_output
+    do = next(c for c in result.state_changes if c["type"] == "delivered_output")
+    assert do["token"] == "alpha"
+    assert int(do["amount"]) == delta
+    # re-pin is idempotent (scoring many candidates at one block re-pins once)
+    assert sim.pin_read_fork(964, sim._pinned_block) is True
     print(f"\nSN112 stake via SubtensorSimulator: 1 TAO -> {delta} alpha (gas {result.gas_used})")
+
+
+async def test_subtensor_stake_raw_scorer_emits_delivered_alpha():
+    """The raw-output scorer JS reads delivered_output → metadata.raw_output."""
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    scorer = Path(__file__).resolve().parents[1] / "harness" / "scoring_shadow" / "subtensor_stake_raw.js"
+    state = {
+        "simulation": {"state_changes": [
+            {"type": "return_data", "data": "0x00"},
+            {"type": "delivered_output", "token": "alpha", "amount": "219598620325"},
+        ]},
+        "typed_context": {"min_output_amount": "1"},
+    }
+    js = (
+        f"const m=require({json.dumps(str(scorer))});"
+        f"console.log(JSON.stringify(m.score({json.dumps(state)})));"
+    )
+    out = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["metadata"]["raw_output"] == "219598620325"
+    assert res["valid"] is True
+    assert res["score"] == 1
