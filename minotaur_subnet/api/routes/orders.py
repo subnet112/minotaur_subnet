@@ -1424,6 +1424,33 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                 if fallback and fallback.status.is_operational():
                     req.chain_id = fallback.chain_id
 
+    # ── Retirement gate ──
+    # A deregistered deployment (RETIRED, or RETIRING past its round-anchored
+    # cutover) takes no new orders — POST /orders rejects it on is_order_ready().
+    # Serving it a quote is misleading (the follow-up order would 400), so gate
+    # here too. Scoped to RETIREMENT only (is_effectively_retired, NOT the full
+    # is_order_ready) so quotes still preview pre-champion SOLVING/PARTIAL apps.
+    # Retirement is round-anchored: resolve the current round's opened_epoch the
+    # same way quote-capture does. None (no open round) → is_effectively_retired
+    # treats RETIRING as not-yet-effective (conservative, matches the corpus
+    # side); RETIRED is immediate regardless.
+    _gate_dep = s.get_deployment(app_id, chain_id=req.chain_id) if s is not None else None
+    if _gate_dep is not None and hasattr(_gate_dep, "is_effectively_retired"):
+        _gate_epoch = None
+        try:
+            from minotaur_subnet.api.routes import submissions as _subs
+            _gate_epoch = getattr(
+                _subs.get_round_store().get_current_round(), "opened_epoch", None
+            )
+        except Exception:
+            _gate_epoch = None
+        if _gate_dep.is_effectively_retired(_gate_epoch):
+            _label = getattr(getattr(_gate_dep, "status", None), "value", "retired")
+            raise HTTPException(
+                status_code=400,
+                detail=f"App {app_id} is retired (status: {_label})",
+            )
+
     # ── Auto-resolve: intent_function ──
     if _js_engine is not None and req.intent_function == "execute":
         manifest = _js_engine.get_manifest(app_id) if hasattr(_js_engine, "get_manifest") else None
