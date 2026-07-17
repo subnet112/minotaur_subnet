@@ -328,6 +328,12 @@ class AppIntentStore:
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS quote_stats(
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS quotes(
+                    quote_id TEXT PRIMARY KEY, app_id TEXT, chain_id INTEGER,
+                    created_at REAL, data TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_quotes_app ON quotes(app_id);
+                CREATE INDEX IF NOT EXISTS idx_quotes_chain ON quotes(chain_id);
+                CREATE INDEX IF NOT EXISTS idx_quotes_created ON quotes(created_at);
                 CREATE TABLE IF NOT EXISTS native_permissions(
                     permission_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS native_executions(
@@ -778,6 +784,61 @@ class AppIntentStore:
         if status:
             clauses.append("status=?")
             params.append(_enum_value(status))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    # ── quote cases (demand corpus — mirrors the orders table) ──────────
+    #
+    # A quote CASE is the trade descriptor of a served /quote (app_id, chain_id,
+    # intent_function, params), keyed by a CONTENT-ADDRESSED quote_id so exact
+    # re-quotes of one trade collapse to a single row on write (cheap spam
+    # resistance). Distinct from the aggregate ``quote_stats`` counter table.
+    # This is the source the Stage-2 quote draw samples (order_sampler.
+    # sample_historical_quotes) and QuoteSync replicates leader → follower.
+
+    def save_quote(self, quote_dict: dict[str, Any]) -> None:
+        """Save or update (UPSERT) a quote case, keyed by quote_id."""
+        quote_id = quote_dict["quote_id"]
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO quotes(quote_id, app_id, chain_id, created_at, data) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(quote_id) DO UPDATE SET "
+                "app_id=excluded.app_id, chain_id=excluded.chain_id, "
+                "created_at=excluded.created_at, data=excluded.data",
+                (
+                    quote_id,
+                    quote_dict.get("app_id"),
+                    quote_dict.get("chain_id"),
+                    quote_dict.get("created_at"),
+                    _dumps(quote_dict),
+                ),
+            )
+
+    def get_quote(self, quote_id: str) -> dict[str, Any] | None:
+        """Return a quote case by ID, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT data FROM quotes WHERE quote_id=?", (quote_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_quotes(
+        self, app_id: str | None = None, chain_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List quote cases, optionally filtered by app and/or chain."""
+        query = "SELECT data FROM quotes"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if app_id:
+            clauses.append("app_id=?")
+            params.append(app_id)
+        if chain_id is not None:
+            clauses.append("chain_id=?")
+            params.append(int(chain_id))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         with self._connect() as conn:

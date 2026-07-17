@@ -28,6 +28,10 @@ from minotaur_subnet.api.routes.apps import (
     _require_admin_or_signed_miner,
 )
 from minotaur_subnet.orderbook.rejection import classify_rejection
+from minotaur_subnet.shared.feature_flags import (
+    quote_capture_enabled,
+    quote_corpus_enabled,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1200,6 +1204,55 @@ def list_orders(
     }
 
 
+@router.get("/quotes")
+def list_quotes(
+    app_id: str | None = None,
+    chain_id: int | None = None,
+    limit: int = _LIST_DEFAULT_LIMIT,
+    offset: int = 0,
+    full: bool = False,
+) -> dict:
+    """List captured quote CASES — the demand corpus (newest-first, paginated).
+
+    A quote case is the trade descriptor of a served ``/quote`` (app_id, chain_id,
+    intent_function, params), keyed by a content-addressed ``quote_id``. This
+    endpoint powers two consumers:
+
+      * The follower ``QuoteSync`` loop (``full=1`` for the complete params blob),
+        which upserts the leader's quotes so every validator's Stage-2 quote draw
+        matches — the quote analogue of ``/orders?full=1``.
+      * MINERS hunting blind spots: quotes are DEMAND (including pairs the champion
+        can't route — the zero-output cases), so this is the "what do users want
+        that nobody serves yet" feed. It is served regardless of whether quotes are
+        in the scored corpus yet (BENCHMARK_QUOTE_CORPUS), so miners can widen
+        coverage ahead of the soak.
+
+    Quote cases carry NO PII (a quote never had a submitted_by or signature), so —
+    unlike ``/orders`` — there is no reader-sig gate. ``limit`` is clamped to
+    [1, 500] (default 100); ``total`` is the match count before paging.
+    """
+    if _app_store is None or not hasattr(_app_store, "list_quotes"):
+        return {"quotes": [], "count": 0, "total": 0, "limit": limit, "offset": offset}
+    limit = max(1, min(int(limit), _LIST_MAX_LIMIT))
+    offset = max(0, int(offset))
+    rows = _app_store.list_quotes(app_id=app_id, chain_id=chain_id)
+    # Newest first; quote_id tie-break keeps pages stable when created_at collides.
+    rows.sort(key=lambda d: (-_created_at(d), str(d.get("quote_id") or "")))
+    total = len(rows)
+    # ``full`` is accepted for parity with /orders (QuoteSync passes full=1) but is
+    # currently a no-op: a quote case is only its small trade descriptor, so there
+    # is no heavy blob to project away. Kept in the signature so the sync contract
+    # and a future slim view stay backward-compatible.
+    page = rows[offset : offset + limit]
+    return {
+        "quotes": page,
+        "count": len(page),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @router.delete("/orders/{order_id}")
 def cancel_order(
     order_id: str,
@@ -1581,6 +1634,38 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     if s is not None:
         _ok = estimated_output_gross != "0"
         s.record_quote_attempt(app_id, success=_ok, error="" if _ok else "zero_output")
+
+    # Persist the quote CASE for the demand corpus (Phase-1 soak). Best-effort and
+    # fully isolated from the response — capture never fails a quote. The row is
+    # keyed by a content-addressed quote_id so exact re-quotes collapse to one row;
+    # QuoteSync replicates it leader → follower, and the round-seeded quote draw
+    # samples it once BENCHMARK_QUOTE_CORPUS is enabled. A zero-output quote (a pair
+    # the champion can't route) is captured too — that's the blind-spot demand we
+    # want miners to chase. PII fields are stripped from params before storage.
+    if s is not None and hasattr(s, "save_quote") and quote_capture_enabled():
+        try:
+            from minotaur_subnet.harness.order_sampler import (
+                _PII_FIELDS as _QUOTE_PII_FIELDS,
+                quote_case_id,
+            )
+            _q_params = {
+                k: v for k, v in (req.params or {}).items()
+                if k not in _QUOTE_PII_FIELDS
+            }
+            _q_id = quote_case_id(
+                app_id, req.chain_id, req.intent_function, _q_params,
+            )
+            s.save_quote({
+                "quote_id": _q_id,
+                "app_id": app_id,
+                "chain_id": req.chain_id,
+                "intent_function": req.intent_function,
+                "params": _q_params,
+                "estimated_output": estimated_output_gross,
+                "created_at": time.time(),
+            })
+        except Exception:
+            logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
 
     # Net output = gross - platform fee, but ONLY when the fee is
     # denominated in the same token as the output. The fee can come back
