@@ -367,6 +367,12 @@ class QuoteRequest(BaseModel):
     params: dict[str, Any]  # e.g. {input_token, output_token, input_amount}
     chain_id: int = 1
     slippage_bps: int = 50  # Default 0.5% slippage for suggested_min_output
+    # Perpetual sizing: when set, the quote also returns the standing ERC-20
+    # allowance the user must approve up front to fund all fills (no prefund/
+    # escrow — the wallet + allowance IS the funding, drawn down per fill).
+    perpetual: bool = False
+    max_executions: int = 1
+    cooldown: float = 0.0
 
 
 @router.post("/apps/{app_id}/orders", status_code=201)
@@ -495,7 +501,14 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                     )
 
         # ── Auto-resolve: user nonce for managed wallets ──
-        if "user_nonce" not in req.params and deployment and deployment.contract_address:
+        # Perpetuals are exempt: they must be signed ONCE with the sentinel
+        # nonce (type(uint256).max) so the single signature stays valid across
+        # every fill — the contract neither verifies nor increments the
+        # sentinel. Pinning a concrete per-user nonce here would bind the
+        # signature to a value the contract advances after fill #1, reverting
+        # every fill thereafter. Leaving user_nonce absent resolves to the
+        # sentinel downstream (see relayer.encoder._resolve_nonce).
+        if not req.perpetual and "user_nonce" not in req.params and deployment and deployment.contract_address:
             wallet = _app_store.get_wallet(ia.address)
             if wallet is None:
                 for w in _app_store.list_wallets():
@@ -542,6 +555,7 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                 req.params["intent_selector"] = selector
 
     # Validate perpetual order parameters
+    import time as _time
     if req.perpetual:
         if req.cooldown < _MIN_PERPETUAL_COOLDOWN:
             raise HTTPException(
@@ -553,9 +567,47 @@ def submit_order(app_id: str, req: SubmitOrderRequest) -> dict:
                 status_code=400,
                 detail=f"max_executions cannot exceed {_MAX_PERPETUAL_EXECUTIONS}",
             )
+        # One signature authorizes N fills, which only works with the sentinel
+        # nonce (type(uint256).max): the contract skips the nonce check and never
+        # increments it. A concrete nonce is spent on fill #1 and reverts every
+        # fill after — reject it here rather than let the order die at fill #2.
+        from minotaur_subnet.relayer.encoder import _resolve_nonce, _SENTINEL_NONCE
+        _pnonce = req.params.get("user_nonce")
+        if _pnonce is not None and _resolve_nonce(_pnonce) != _SENTINEL_NONCE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual orders must use the sentinel nonce "
+                    "(type(uint256).max) so one signature authorizes every fill; "
+                    "a concrete user_nonce is only valid for one-shot orders."
+                ),
+            )
+        # A perpetual is bound by its signed deadline on EVERY fill (the contract
+        # enforces block.timestamp <= deadline each time), so the 1-hour default
+        # below would silently cap it at ~1h regardless of max_executions. Require
+        # an explicit, far-enough deadline instead of silently defaulting.
+        _now = _time.time()
+        if req.deadline <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual orders require an explicit far-future deadline: the "
+                    "signed deadline caps every fill, so set one that spans the "
+                    "intended schedule."
+                ),
+            )
+        if req.deadline < _now + req.cooldown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Perpetual deadline too soon: must be at least one cooldown "
+                    f"({req.cooldown:.0f}s) in the future so more than one fill is "
+                    "possible."
+                ),
+            )
 
-    # Default deadline: 1 hour from now (on-chain rejects deadline=0)
-    import time as _time
+    # Default deadline: 1 hour from now (on-chain rejects deadline=0).
+    # Perpetuals are already validated to carry an explicit deadline above.
     effective_deadline = req.deadline
     if effective_deadline == 0:
         effective_deadline = _time.time() + 3600
@@ -1636,7 +1688,206 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         response["src_chain_id"] = input_chain
         response["dst_chain_id"] = dest_chain
 
+    # ── Perpetual: required standing allowances (the TWO per-fill pulls) ──
+    # A perpetual fills up to max_executions times from ONE signed order. There is
+    # NO prefund/escrow — the user's wallet balance + standing allowances ARE the
+    # funding, drawn down per fill; a shortfall terminates the perpetual. Two
+    # independent pulls must be covered for all fills (app-agnostic — the input
+    # token is whatever this app declares, not swap-specific):
+    #   1. INPUT/spend token — the token the app safeTransferFroms from the user
+    #      each fill (always required for ERC-20 input).
+    #   2. Platform FEE (WETH) — required from the USER only in FeeMode.USER;
+    #      APP-mode apps (e.g. DexAggregator) settle it from output / the app
+    #      float, so the user needs no WETH there. WETH has no EIP-2612 permit, so
+    #      a USER-mode fee allowance must be a plain on-chain approve().
+    if req.perpetual and req.max_executions > 1:
+        n = req.max_executions
+        from minotaur_subnet.blockchain.tokens import resolve_spend_token_amount
+        spend_token, spend_amount = resolve_spend_token_amount(req.params)
+        per_fill_input = spend_amount or 0
+        perp: dict[str, Any] = {
+            "max_executions": n,
+            "cooldown": req.cooldown,
+            "per_fill_input_wei": str(per_fill_input),
+            "required_input_allowance_wei": str(per_fill_input * n),
+            "input_token": spend_token or req.params.get("input_token", ""),
+            "per_fill_fee_wei": str(platform_fee_int),
+            "fee_token": quote_result.platform_fee_token or "",
+            "fee_symbol": quote_result.platform_fee_symbol or "",
+            "fee_from_user": False,
+        }
+        note = (
+            "Approve at least required_input_allowance_wei of input_token to the "
+            "app contract (or attach an EIP-2612 permit if the input token supports "
+            "it). Each fill draws from your wallet; running out of balance or "
+            "allowance terminates the perpetual. "
+        )
+        # Does THIS app pull the fee from the user (FeeMode.USER)? Read on-chain
+        # so the quote matches the pre-flight gate. Best-effort — omit the fee
+        # requirement (assume deducted-from-output) on any read failure.
+        if _deployed and platform_fee_int > 0:
+            try:
+                from minotaur_subnet.blockchain.chains import get_web3
+                from minotaur_subnet.blockchain.token_approval import fee_mode_is_user
+                if fee_mode_is_user(get_web3(req.chain_id), _deployed):
+                    perp["fee_from_user"] = True
+                    perp["required_fee_allowance_wei"] = str(platform_fee_int * n)
+                    note += (
+                        "This app collects the platform fee from your WETH, so also "
+                        "approve required_fee_allowance_wei of fee_token (WETH) — a "
+                        "plain on-chain approve(), as WETH has no EIP-2612 permit."
+                    )
+                else:
+                    note += "This app settles the platform fee from its output/float (FeeMode.APP) — no fee-token approval needed."
+            except Exception:
+                note += "The platform fee is normally settled from the app's output/float — no fee-token approval needed."
+        else:
+            note += "The platform fee is normally settled from the app's output/float — no fee-token approval needed."
+        perp["note"] = note
+        response["perpetual"] = perp
+
     return response
+
+
+class PreparePermitRequest(BaseModel):
+    """Request the EIP-2612 permit digest for a standing-allowance approval."""
+    token: str            # ERC-20 to approve (e.g. the perpetual's input or fee token)
+    owner: str            # the user's wallet (permit signer)
+    value: int            # allowance amount, raw units (e.g. required_*_allowance_wei)
+    chain_id: int = 1
+    deadline: int = 0     # 0 → default (now + 30 min)
+
+
+@router.post("/apps/{app_id}/prepare-permit")
+def prepare_permit(app_id: str, req: PreparePermitRequest) -> dict:
+    """Build the EIP-2612 permit digest the user signs to set a standing allowance.
+
+    Perpetual funding uses the user's wallet balance + a standing ERC-20 allowance
+    (no prefund/escrow). Instead of an on-chain ``approve()``, the user can sign a
+    gasless permit that the relayer submits to set the allowance (carried on the
+    order as ``permit_value``/``permit_deadline``/``permit_v``/``permit_r``/
+    ``permit_s``). This endpoint assembles the exact digest for
+    ``(token, owner, spender=app contract, value)`` by reading the token's
+    ``DOMAIN_SEPARATOR()`` and ``nonces(owner)`` on-chain, so the frontend just
+    signs the returned digest and echoes the ``permit_*`` fields back.
+
+    Typical flow: POST /apps/{id}/quote with ``perpetual=true`` → read
+    ``perpetual.required_input_allowance_wei`` → call this for the input token
+    with that value → sign ``digest`` → submit the order with the ``permit_*``
+    params. The platform fee usually needs no approval (deducted from output);
+    only a generic WETH-pulling app needs a WETH approve(), and WETH has no
+    ERC-2612 permit, so this endpoint returns 400 for it.
+
+    400 if the token doesn't implement ERC-2612 (approve() on-chain instead).
+    """
+    s = _app_store
+    if s is None:
+        from minotaur_subnet.api.server import store as _s
+        s = _s
+    if s is None:
+        raise HTTPException(status_code=503, detail="App store not initialized")
+
+    deployment = s.get_deployment(app_id, chain_id=req.chain_id)
+    if deployment is None or not deployment.contract_address:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No operational deployment for {app_id} on chain {req.chain_id}",
+        )
+    spender = deployment.contract_address
+
+    try:
+        from minotaur_subnet.blockchain.chains import get_web3
+        w3 = get_web3(req.chain_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"No web3 for chain {req.chain_id}: {exc}")
+
+    if req.value <= 0:
+        raise HTTPException(status_code=400, detail="value must be > 0")
+
+    from minotaur_subnet.blockchain.token_approval import build_permit_digest
+    result = build_permit_digest(
+        w3, req.token, req.owner, spender, req.value,
+        req.deadline if req.deadline > 0 else None,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Token does not support ERC-2612 permit — approve() the app "
+                "contract on-chain for the required allowance instead."
+            ),
+        )
+
+    return {
+        "app_id": app_id,
+        "chain_id": req.chain_id,
+        "token": req.token,
+        "owner": req.owner,
+        "spender": spender,
+        "value": str(req.value),
+        "nonce": result["nonce"],
+        "deadline": result["deadline"],
+        "domain_separator": result["domain_separator"],
+        # The final EIP-712 digest (0x1901 prefix already applied). Sign this raw
+        # 32-byte hash with the owner wallet; split the 65-byte signature into
+        # v/r/s. NB: sign the raw hash, NOT a personal_sign/EIP-191 message.
+        "digest": result["digest"],
+        # Echo these on the order params after signing (v/r/s from the signature):
+        "order_params": {
+            "permit_value": str(req.value),
+            "permit_deadline": result["deadline"],
+        },
+        "note": (
+            "Sign `digest` (raw 32-byte hash) with the owner wallet, split the "
+            "signature into permit_v/permit_r/permit_s, and include those plus "
+            "permit_value/permit_deadline in the order params so the relayer sets "
+            "the allowance gaslessly. Repeat per token (input + fee)."
+        ),
+    }
+
+
+@router.get("/orders/{order_id}/signing-payload")
+def get_order_signing_payload(order_id: str) -> dict:
+    """Return the EIP-712 payload the user signs to authorize this order.
+
+    ``order_id`` is minted server-side at submit and the signed digest depends on
+    it, so signing happens AFTER creation:
+    submit → GET signing-payload → sign → PATCH /signature.
+
+    Returns the full typed data (``domain``/``types``/``message`` for
+    ``eth_signTypedData_v4``) AND the final ``digest`` (for raw-hash signing),
+    built from the SAME fields the server verifies — so the resulting signature
+    always passes PATCH /signature. Works for one-shot and perpetual orders alike;
+    for a perpetual, ``message`` carries the perpetual/maxExecutions/cooldown terms
+    and the uint256-max sentinel ``nonce`` a perpetual must sign with (so a client
+    can't accidentally sign a concrete nonce and fail at settlement).
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    if not order.params.get("app_address"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Order has no app_address yet — its signing payload isn't ready. "
+                "Submit through the leader so intent params/app address are resolved."
+            ),
+        )
+    from minotaur_subnet.api.routes._signature_verify import build_order_signing_payload
+    payload = build_order_signing_payload(order)
+    return {
+        "order_id": order_id,
+        "submitted_by": order.submitted_by,
+        "perpetual": bool(order.perpetual),
+        **payload,
+        "note": (
+            "Sign with eth_signTypedData_v4(domain, types, message) OR sign the raw "
+            "32-byte `digest`, then PATCH /orders/{id}/signature with "
+            "{user_signature}. Do NOT change message.nonce — perpetuals use the "
+            "uint256-max sentinel shown."
+        ),
+    }
 
 
 @router.get("/orders/{order_id}/bridge")
