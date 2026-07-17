@@ -61,6 +61,35 @@ _BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_a
 # while bare followers defaulted to 50 — the concrete live split this removes).
 STAGE2_CORPUS_SAMPLES: int = 50
 
+# Stage-2 quote-corpus size per chain. Capped at the SAME fleet-uniform constant
+# as the historical-order draw (per the user requirement) so quotes cannot
+# out-weight real orders in the scored set, and — like STAGE2_CORPUS_SAMPLES —
+# a per-validator value would split the pack hash. A CODE constant, never env.
+QUOTE_CORPUS_SAMPLES: int = STAGE2_CORPUS_SAMPLES
+
+
+def quote_case_id(
+    app_id: str, chain_id: Any, intent_function: str, params: dict[str, Any] | None,
+) -> str:
+    """Content-addressed id for a quote CASE — the storage-time collapse key.
+
+    A pure function of the trade identity (app, chain, intent function, and the
+    non-volatile params), so two identical re-quotes upsert to ONE row while
+    different amounts of the same pair stay distinct rows (then collapse at draw
+    time by ``_dedup_key``'s order-of-magnitude bucket, exactly like orders).
+    Identical across validators, which is what lets the round-seeded quote draw
+    and the pack hash agree fleet-wide. ``q_`` prefix + 32 hex chars.
+    """
+    core = {k: v for k, v in (params or {}).items() if k not in _VOLATILE_PARAMS}
+    payload = {
+        "app_id": app_id or "",
+        "chain_id": chain_id,
+        "intent_function": intent_function or "swap",
+        "params": {k: core[k] for k in sorted(core)},
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return "q_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
 
 def retired_app_chain_keys(
     app_store: Any, at_epoch: int | None = None,
@@ -252,6 +281,94 @@ def sample_historical_orders(
 
     # Strip PII
     return [_strip_pii(o) for o in sampled]
+
+
+def sample_historical_quotes(
+    app_store: Any,
+    round_id: str,
+    chain_ids: list[int] | None = None,
+    n_per_chain: int = QUOTE_CORPUS_SAMPLES,
+    records: list[dict[str, Any]] | None = None,
+    exclude_app_chains: set[tuple[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically sample historical QUOTE cases for the Stage-2 corpus.
+
+    The quote analogue of :func:`sample_historical_orders`. Quotes are DEMAND the
+    champion may or may not serve — a quote for a pair the champion can't route is
+    exactly the blind-spot signal we want challengers scored on (it becomes a
+    ``blind_spot_cover`` win the instant a solver fills it). Fake/low-provenance
+    demand is acceptable here BY DESIGN: it still pushes miners to widen coverage.
+
+    Quote cases are ORDER-SHAPED (app_id / chain_id / intent_function / params),
+    so this reuses the SAME dedup, chain filter, retirement exclusion and PII
+    strip as the order draw — the quote_id is aliased onto ``order_id`` so those
+    shared helpers key on it unchanged. The draw is seeded by ``{round_id}:quotes``
+    (a distinct salt from the order draw, so the two selections are independent
+    yet each is a pure function of round_id — every validator derives the identical
+    quote subset without broadcasting it). Capped at ``QUOTE_CORPUS_SAMPLES`` per
+    chain — the same fleet-uniform cap as historical orders.
+
+    Returns a list of quote dicts (PII-stripped, each carrying both ``quote_id``
+    and the aliased ``order_id``). Empty when no quotes exist.
+    """
+    if records is not None:
+        rows = records
+    else:
+        try:
+            rows = app_store.list_quotes()
+        except Exception as exc:
+            logger.warning("Failed to list quotes for Stage 2 sampling: %s", exc)
+            return []
+
+    # Order-shape the quote rows so the shared order helpers (_filter_candidates,
+    # _dedup_candidates, _representative_rank, _strip_pii) apply unchanged: alias
+    # quote_id -> order_id (rows missing a quote_id are skipped).
+    candidates_raw: list[dict[str, Any]] = []
+    for q in rows:
+        qid = q.get("quote_id")
+        if not qid:
+            continue
+        o = dict(q)
+        o["order_id"] = qid
+        candidates_raw.append(o)
+
+    # Same round-anchored retirement exclusion as the order draw.
+    if exclude_app_chains is None:
+        at_epoch = opened_epoch_from_round_id(round_id)
+        exclude_app_chains = retired_app_chain_keys(app_store, at_epoch)
+
+    # Quotes carry no status, so no status filter (include/exclude both None) —
+    # only the chain filter and the retirement exclusion apply.
+    candidates = _filter_candidates(
+        candidates_raw, include_statuses=None, exclude_statuses=None,
+        chain_ids=chain_ids, exclude_app_chains=exclude_app_chains,
+    )
+    if not candidates:
+        return []
+
+    # Collapse near-duplicate demand before the draw (same pair + order-of-
+    # magnitude amount → one representative), identical to the order path.
+    candidates = _dedup_candidates(candidates)
+
+    seed = int.from_bytes(
+        hashlib.sha256(f"{round_id}:quotes".encode("utf-8")).digest()[:8], "big"
+    )
+    rng = random.Random(seed)
+
+    by_chain: dict[int, list[dict[str, Any]]] = {}
+    for q in candidates:
+        chain_id = q.get("chain_id")
+        if chain_id is None:
+            continue
+        by_chain.setdefault(chain_id, []).append(q)
+
+    sampled: list[dict[str, Any]] = []
+    for chain_id, quotes in sorted(by_chain.items()):
+        quotes_sorted = sorted(quotes, key=lambda o: o.get("order_id", ""))
+        k = min(n_per_chain, len(quotes_sorted))
+        sampled.extend(rng.sample(quotes_sorted, k))
+
+    return [_strip_pii(q) for q in sampled]
 
 
 def _filter_candidates(

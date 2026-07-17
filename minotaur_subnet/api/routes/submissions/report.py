@@ -455,6 +455,17 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                 )
             if len(diffs) > _MAX_PER_ORDER_ROWS:
                 lines.append(f"| _…and {len(diffs) - _MAX_PER_ORDER_ROWS} more_ | | |")
+            # Legend for quote-demand rows (only when the quote corpus is live and
+            # some quote case actually diverges). A `quote:`-prefixed case is DEMAND
+            # (a user requested this trade); one the champion scores 0 on is a blind
+            # spot — filling it is a ✅ new (blind_spot_cover) win.
+            if any(str(o.get("intent_id", "")).startswith("quote:") for o in diffs):
+                lines.append(
+                    "_Rows prefixed `quote:` are quote-demand cases (a user asked "
+                    "for this trade). A `quote:` row the champion delivers 0 on is a "
+                    "blind spot — fill it for a ✅ new. Browse all demand at "
+                    "`/v1/quotes`._"
+                )
             lines.append("")
         elif rel.get("matched") and not rel.get("better") and not rel.get("worse"):
             n = rel.get("compared") or rel.get("matched")
