@@ -116,17 +116,23 @@ _QUOTE_VALID_SECONDS = 30
 # Bound the leader's quote-CASE table so unauthenticated /quote traffic can't grow
 # it without limit. Capture is LEADER-ONLY, so the leader is the sole writer and
 # QuoteSync mirrors its (pruned) set to followers — pruning the leader bounds the
-# whole fleet. The prune keeps the newest N rows by created_at and runs amortized
-# (once per _QUOTE_PRUNE_EVERY captures) to keep it off the hot path. Phase-1 flag
-# is OFF so this prune is NOT on the consensus path; before Phase 2 arms the corpus,
-# retention must be made round-anchored / fleet-uniform (a documented preflight).
-_QUOTE_STORE_MAX_ROWS = 50_000
+# whole fleet. Retention is ROUND-ANCHORED (Phase-2): drop quotes captured more than
+# QUOTE_RETENTION_EPOCHS opened-epochs before the current round (and legacy unstamped
+# rows). Because the key is the fleet-uniform, first-seen-frozen captured_opened_epoch
+# (not wall-clock), the deletion is consensus-safe once BENCHMARK_QUOTE_CORPUS is on —
+# it can never remove a row inside a live round's sampling window. Runs amortized
+# (once per _QUOTE_PRUNE_EVERY captures) to keep it off the hot path.
 _QUOTE_PRUNE_EVERY = 200
 _quote_capture_counter = 0
 
 
-def _maybe_prune_quotes(store: Any) -> None:
-    """Amortized newest-N prune of the quotes table (leader-only writer)."""
+def _maybe_prune_quotes(store: Any, current_opened_epoch: int) -> None:
+    """Amortized round-anchored prune of the quotes table (leader-only writer).
+
+    ``current_opened_epoch`` is the live round's opened_epoch; everything captured
+    before ``current_opened_epoch - QUOTE_RETENTION_EPOCHS`` (plus legacy null-epoch
+    rows) is dropped. Followers inherit the pruned set via QuoteSync reconcile.
+    """
     global _quote_capture_counter
     _quote_capture_counter += 1
     if _quote_capture_counter % _QUOTE_PRUNE_EVERY != 0:
@@ -134,7 +140,8 @@ def _maybe_prune_quotes(store: Any) -> None:
     if not hasattr(store, "prune_quotes"):
         return
     try:
-        store.prune_quotes(_QUOTE_STORE_MAX_ROWS)
+        from minotaur_subnet.harness.order_sampler import QUOTE_RETENTION_EPOCHS
+        store.prune_quotes(int(current_opened_epoch) - QUOTE_RETENTION_EPOCHS)
     except Exception:
         logger.debug("quote prune failed", exc_info=True)
 
@@ -1694,23 +1701,59 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                 QUOTE_PARAM_STRIP_FIELDS,
                 quote_case_id,
             )
-            _q_params = {
-                k: v for k, v in (req.params or {}).items()
-                if k not in QUOTE_PARAM_STRIP_FIELDS
-            }
-            _q_id = quote_case_id(
-                app_id, req.chain_id, req.intent_function, _q_params,
-            )
-            s.save_quote({
-                "quote_id": _q_id,
-                "app_id": app_id,
-                "chain_id": req.chain_id,
-                "intent_function": req.intent_function,
-                "params": _q_params,
-                "estimated_output": estimated_output_gross,
-                "created_at": time.time(),
-            })
-            _maybe_prune_quotes(s)
+            # ROUND ANCHOR (Phase-2): stamp the quote with the CURRENT round's
+            # opened_epoch so the sampling cutoff/retention are pure functions of
+            # fleet-uniform round epochs, not wall-clock. The leader owns the round
+            # coordinator, so the live round is always resolvable here. If there is
+            # NO current round we cannot anchor the quote — SKIP capture rather than
+            # store an un-anchored row that the round cutoff can never place.
+            _cur_round = None
+            try:
+                from minotaur_subnet.api.routes import submissions as _subs
+                _cur_round = _subs.get_round_store().get_current_round()
+            except Exception:
+                _cur_round = None
+            _cur_epoch = getattr(_cur_round, "opened_epoch", None)
+            if _cur_epoch is None:
+                logger.debug("quote-case capture skipped: no current round to anchor")
+            else:
+                _q_params = {
+                    k: v for k, v in (req.params or {}).items()
+                    if k not in QUOTE_PARAM_STRIP_FIELDS
+                }
+                _q_id = quote_case_id(
+                    app_id, req.chain_id, req.intent_function, _q_params,
+                )
+                # FIRST-SEEN FREEZE of the WHOLE row. quote_id is content-addressed on the
+                # dedup SHAPE (pair + order-of-magnitude amount), so re-quoting the same
+                # shape at a DIFFERENT exact amount collapses to the same quote_id. If we
+                # last-wrote the row, the stored params (exact input_amount/min_output) —
+                # and therefore order_replay_hash AND the benched output — would churn while
+                # quote_id/captured_opened_epoch stay frozen. Two consequences at quorum>1,
+                # both consensus-breaking: (a) a QuoteSync-lagged follower recomputes a
+                # different order_replay_hash → refuses the veto slice; (b) leader vs
+                # follower bench different amounts → divergent relative-adoption verdict.
+                # So the leader is the sole writer and FREEZES the row at first-seen: only
+                # the FIRST capture of a shape writes it; re-quotes are no-ops. A shape that
+                # was pruned (aged out) and re-quoted re-anchors correctly (get_quote → None
+                # → new first-seen row). Followers mirror this frozen row verbatim via
+                # QuoteSync's last-write, so params are fleet-uniform per quote_id.
+                try:
+                    _existing = s.get_quote(_q_id) if hasattr(s, "get_quote") else None
+                except Exception:
+                    _existing = None
+                if _existing is None:
+                    s.save_quote({
+                        "quote_id": _q_id,
+                        "app_id": app_id,
+                        "chain_id": req.chain_id,
+                        "intent_function": req.intent_function,
+                        "params": _q_params,
+                        "estimated_output": estimated_output_gross,
+                        "created_at": time.time(),
+                        "captured_opened_epoch": int(_cur_epoch),
+                    })
+                _maybe_prune_quotes(s, int(_cur_epoch))
         except Exception:
             logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
 

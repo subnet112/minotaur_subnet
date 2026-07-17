@@ -90,28 +90,38 @@ STAGE2_CORPUS_SAMPLES: int = 50
 # a per-validator value would split the pack hash. A CODE constant, never env.
 QUOTE_CORPUS_SAMPLES: int = STAGE2_CORPUS_SAMPLES
 
+# Round-anchored quote retention window, in opened_epoch units (EPOCH_SECONDS=60s,
+# so 20160 ≈ 14 days). A quote is kept while its first-seen capturing opened_epoch
+# is >= current_opened_epoch − this. CONSENSUS-RELEVANT and fleet-uniform (it bounds
+# the population the round draw sees), so a CODE constant, never env — same class as
+# QUOTE_CORPUS_SAMPLES. Must comfortably exceed the span between any live round's
+# opened_epoch and the oldest still-benchmarkable round so retention can never delete
+# a row inside a live sampling window.
+QUOTE_RETENTION_EPOCHS: int = 20160
+
 
 def quote_case_id(
     app_id: str, chain_id: Any, intent_function: str, params: dict[str, Any] | None,
 ) -> str:
     """Content-addressed id for a quote CASE — the storage-time collapse key.
 
-    A pure function of the trade identity (app, chain, intent function, and the
-    non-volatile params), so two identical re-quotes upsert to ONE row while
-    different amounts of the same pair stay distinct rows (then collapse at draw
-    time by ``_dedup_key``'s order-of-magnitude bucket, exactly like orders).
-    Identical across validators, which is what lets the round-seeded quote draw
-    and the pack hash agree fleet-wide. ``q_`` prefix + 32 hex chars.
+    Keyed by the SAME trade-SHAPE the sampler dedups on (``_dedup_key``): same pair +
+    order-of-magnitude amount + other non-bucketed params collapse to ONE id. So exact-
+    amount spam upserts to a single stored row at CAPTURE — bounding table growth to
+    distinct demand shapes with no wall-clock/arrival ordering (the removed newest-N
+    row cap was arrival-ordered, hence non-deterministic; this is not). The storage key
+    and the draw-time dedup are now the SAME function, so ``_dedup_candidates`` is a
+    no-op over the stored set and the corpus stores exactly what it scores. Fleet-
+    uniform → the round-seeded quote draw and the pack hash agree across validators.
+    ``q_`` prefix + 32 hex chars.
     """
-    core = {k: v for k, v in (params or {}).items() if k not in _VOLATILE_PARAMS}
-    payload = {
+    order_shaped = {
         "app_id": app_id or "",
-        "chain_id": chain_id,
         "intent_function": intent_function or "swap",
-        "params": {k: core[k] for k in sorted(core)},
+        "chain_id": chain_id,
+        "params": params or {},
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return "q_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return "q_" + hashlib.sha256(_dedup_key(order_shaped).encode("utf-8")).hexdigest()[:32]
 
 
 def retired_app_chain_keys(
@@ -306,6 +316,67 @@ def sample_historical_orders(
     return [_strip_pii(o) for o in sampled]
 
 
+def _quote_candidates(
+    app_store: Any,
+    round_id: str,
+    *,
+    chain_ids: list[int] | None = None,
+    records: list[dict[str, Any]] | None = None,
+    exclude_app_chains: set[tuple[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """The deduped, round-anchored-cutoff quote CANDIDATE pool (order-shaped).
+
+    Shared by :func:`sample_historical_quotes` (the canonical draw) and the veto
+    quote-remainder partition, so BOTH see the identical eligible set. If the veto
+    partition rebuilt candidates any other way, the remainder could include quotes
+    the canonical draw never saw — quotes with no leader row to re-verify a veto
+    claim against → junk vetoes. Applies the TWO-SIDED round-anchored cutoff (see
+    ``sample_historical_quotes`` docstring), the quote_id→order_id alias, the chain
+    filter, retirement exclusion, and near-dup dedup. NO status filter (quotes have
+    no status).
+    """
+    if records is not None:
+        rows = records
+    else:
+        try:
+            rows = app_store.list_quotes()
+        except Exception as exc:
+            logger.warning("Failed to list quotes for Stage 2 sampling: %s", exc)
+            return []
+
+    # Round-anchored TWO-SIDED cutoff: eligible iff captured_opened_epoch is in
+    # [draw_epoch - QUOTE_RETENTION_EPOCHS, draw_epoch). Unstamped (None) excluded.
+    # See sample_historical_quotes for the full determinism rationale.
+    draw_epoch = opened_epoch_from_round_id(round_id)
+    _floor_epoch = None if draw_epoch is None else int(draw_epoch) - QUOTE_RETENTION_EPOCHS
+
+    # Order-shape (alias quote_id -> order_id) so the shared order helpers apply.
+    candidates_raw: list[dict[str, Any]] = []
+    for q in rows:
+        qid = q.get("quote_id")
+        if not qid:
+            continue
+        if draw_epoch is not None:
+            ce = q.get("captured_opened_epoch")
+            if ce is None or int(ce) >= int(draw_epoch) or int(ce) < _floor_epoch:
+                continue  # unanchored, captured this-round-or-later, or below retention
+        o = dict(q)
+        o["order_id"] = qid
+        candidates_raw.append(o)
+
+    if exclude_app_chains is None:
+        exclude_app_chains = retired_app_chain_keys(
+            app_store, opened_epoch_from_round_id(round_id))
+
+    candidates = _filter_candidates(
+        candidates_raw, include_statuses=None, exclude_statuses=None,
+        chain_ids=chain_ids, exclude_app_chains=exclude_app_chains,
+    )
+    if not candidates:
+        return []
+    return _dedup_candidates(candidates)
+
+
 def sample_historical_quotes(
     app_store: Any,
     round_id: str,
@@ -334,44 +405,12 @@ def sample_historical_quotes(
     Returns a list of quote dicts (PII-stripped, each carrying both ``quote_id``
     and the aliased ``order_id``). Empty when no quotes exist.
     """
-    if records is not None:
-        rows = records
-    else:
-        try:
-            rows = app_store.list_quotes()
-        except Exception as exc:
-            logger.warning("Failed to list quotes for Stage 2 sampling: %s", exc)
-            return []
-
-    # Order-shape the quote rows so the shared order helpers (_filter_candidates,
-    # _dedup_candidates, _representative_rank, _strip_pii) apply unchanged: alias
-    # quote_id -> order_id (rows missing a quote_id are skipped).
-    candidates_raw: list[dict[str, Any]] = []
-    for q in rows:
-        qid = q.get("quote_id")
-        if not qid:
-            continue
-        o = dict(q)
-        o["order_id"] = qid
-        candidates_raw.append(o)
-
-    # Same round-anchored retirement exclusion as the order draw.
-    if exclude_app_chains is None:
-        at_epoch = opened_epoch_from_round_id(round_id)
-        exclude_app_chains = retired_app_chain_keys(app_store, at_epoch)
-
-    # Quotes carry no status, so no status filter (include/exclude both None) —
-    # only the chain filter and the retirement exclusion apply.
-    candidates = _filter_candidates(
-        candidates_raw, include_statuses=None, exclude_statuses=None,
-        chain_ids=chain_ids, exclude_app_chains=exclude_app_chains,
+    candidates = _quote_candidates(
+        app_store, round_id, chain_ids=chain_ids, records=records,
+        exclude_app_chains=exclude_app_chains,
     )
     if not candidates:
         return []
-
-    # Collapse near-duplicate demand before the draw (same pair + order-of-
-    # magnitude amount → one representative), identical to the order path.
-    candidates = _dedup_candidates(candidates)
 
     seed = int.from_bytes(
         hashlib.sha256(f"{round_id}:quotes".encode("utf-8")).digest()[:8], "big"
@@ -620,6 +659,46 @@ def partition_follower_slices(
     }
 
     remainder = [o for o in candidates if o.get("order_id") not in leader_ids]
+    n_order_remainder = len(remainder)
+
+    # QUOTE-REMAINDER MERGE (quorum>1 hardening). When BENCHMARK_QUOTE_CORPUS is armed
+    # the quote draw is part of the SCORED corpus, so followers must independently
+    # cross-check quote scenarios too. Merge the quote remainder INTO this same slice
+    # pool (rather than a parallel quote-slice set): the veto registry is strictly one
+    # assignment + one response per validator, so a parallel set would be dropped as a
+    # stale assignment; and merging gives every assigned follower a quote cross-check
+    # regardless of fleet size (a concatenated set would starve later quote slices at
+    # low follower count via assign_slices' opportunistic coverage). The quote CANONICAL
+    # draw is excluded exactly as the order one above, so slices never overlap either
+    # adoption corpus. Quote cases are order-shaped + share the anchor chains, so they
+    # keep each slice single-chain (run_slice_bench refuses multi-chain). INERT while the
+    # flag is off → slices byte-identical to today. order_replay_hash / _order_label /
+    # _production_order_lookup already handle the content-addressed q_ ids (Phase 2).
+    from minotaur_subnet.shared.feature_flags import quote_corpus_enabled
+    if quote_corpus_enabled():
+        try:
+            all_quotes = app_store.list_quotes()
+        except Exception as exc:
+            logger.warning("veto: list_quotes failed, skipping quote slices: %s", exc)
+            all_quotes = []
+        q_candidates = _quote_candidates(
+            app_store, round_id, chain_ids=list(chain_ids),
+            records=all_quotes, exclude_app_chains=exclude_app_chains,
+        )
+        if q_candidates:
+            # Exclude the canonical QUOTE draw with the SAME-snapshot / chain_ids=None
+            # discipline the order path uses above (per-chain rng-consumption order).
+            q_leader_ids = {
+                q.get("order_id")
+                for q in sample_historical_quotes(
+                    app_store, round_id, records=all_quotes,
+                    exclude_app_chains=exclude_app_chains,
+                )
+            }
+            remainder.extend(
+                q for q in q_candidates if q.get("order_id") not in q_leader_ids
+            )
+
     if not remainder:
         return []
     remainder.sort(key=lambda o: o.get("order_id", ""))
@@ -635,10 +714,10 @@ def partition_follower_slices(
         for i in range(0, len(remainder), slice_size)
     ]
     logger.info(
-        "[distributed-veto] partitioned %d remainder orders into %d slice(s) "
-        "of <=%d for round %s (corpus %d, canonical draw %d)",
-        len(remainder), len(slices), slice_size, round_id,
-        len(candidates), len(leader_ids),
+        "[distributed-veto] partitioned %d remainder (%d order + %d quote) into %d "
+        "slice(s) of <=%d for round %s (order corpus %d, order canonical draw %d)",
+        len(remainder), n_order_remainder, len(remainder) - n_order_remainder,
+        len(slices), slice_size, round_id, len(candidates), len(leader_ids),
     )
     return slices
 
