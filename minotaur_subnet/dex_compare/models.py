@@ -78,6 +78,9 @@ class TradeDescriptor:
     # target USD notional). input_amount above is the amount actually QUOTED.
     notional_usd: float | None = None       # USD value the trade was scaled to
     original_input_amount: str | None = None  # the untouched historical amount
+    # Which source produced this trade — "historical" | "cow_onchain".
+    # None == legacy rows (predate the pluggable source == historical).
+    trade_source: str | None = None
 
 
 @dataclass

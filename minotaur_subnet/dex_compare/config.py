@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _env_true(name: str, default: bool = False) -> bool:
@@ -29,6 +29,38 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_str(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
+
+
+def _env_int_map(name: str, default: dict[int, int]) -> dict[int, int]:
+    """Parse ``"1:1500,8453:3000"`` into ``{1: 1500, 8453: 3000}`` (int keys+vals)."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return dict(default)
+    out: dict[int, int] = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        k, v = pair.split(":", 1)
+        k, v = k.strip(), v.strip()
+        if k.lstrip("-").isdigit() and v.lstrip("-").isdigit():
+            out[int(k)] = int(v)
+    return out or dict(default)
+
+
+def _env_str_map(name: str, default: dict[int, str]) -> dict[int, str]:
+    """Parse ``"1:0xapp,8453:0xapp2"`` into ``{1: "0xapp", 8453: "0xapp2"}``."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return dict(default)
+    out: dict[int, str] = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        k, v = pair.split(":", 1)
+        k, v = k.strip(), v.strip()
+        if k.lstrip("-").isdigit() and v:
+            out[int(k)] = v
+    return out or dict(default)
 
 
 @dataclass(frozen=True)
@@ -67,6 +99,22 @@ class DexCompareConfig:
     oneinch_version: str
     zerox_api_key: str | None
     zerox_base_url: str
+
+    # ── trade source (pluggable) ─────────────────────────────────────────
+    # "historical" replays our own terminal orders (default). "cow_onchain"
+    # samples REAL executed trades from CoW GPv2Settlement events — a neutral,
+    # liquid corpus that also yields a coverage metric (trades we can't serve).
+    # All fields below have defaults so existing constructions need no changes.
+    source: str = "historical"
+    # Optional per-chain app surface to requote CoW trades through. Empty ->
+    # borrow a chain-matching app_id from a recent order automatically.
+    cow_app_ids: dict = field(default_factory=dict)
+    # Block lookback per chain (block times differ: ~12s ETH vs ~2s Base).
+    cow_lookback_blocks: dict = field(default_factory=lambda: {1: 1500, 8453: 3000})
+    cow_lookback_default: int = 1500        # fallback lookback for unlisted chains
+    cow_max_block_span: int = 2000          # per-request getLogs chunk cap
+    cow_min_block_span: int = 100           # floor when adaptively halving on range caps
+    cow_dedup_by_pair: bool = False         # OFF -> uniform over distinct trades (recommended)
 
 
 def load_config() -> DexCompareConfig:
@@ -108,4 +156,11 @@ def load_config() -> DexCompareConfig:
         oneinch_version=_env_str("ONEINCH_VERSION", "v6.0"),
         zerox_api_key=os.environ.get("ZEROX_API_KEY") or None,
         zerox_base_url=_env_str("ZEROX_BASE_URL", "https://api.0x.org"),
+        source=_env_str("DEX_COMPARE_SOURCE", "historical"),
+        cow_app_ids=_env_str_map("DEX_COMPARE_COW_APP_ID", {}),
+        cow_lookback_blocks=_env_int_map("DEX_COMPARE_COW_LOOKBACK_BLOCKS", {1: 1500, 8453: 3000}),
+        cow_lookback_default=_env_int("DEX_COMPARE_COW_LOOKBACK", 1500),
+        cow_max_block_span=_env_int("DEX_COMPARE_COW_MAX_SPAN", 2000),
+        cow_min_block_span=_env_int("DEX_COMPARE_COW_MIN_SPAN", 100),
+        cow_dedup_by_pair=_env_true("DEX_COMPARE_COW_DEDUP_PAIR", False),
     )

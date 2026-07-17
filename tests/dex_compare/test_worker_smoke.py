@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 
 from minotaur_subnet.dex_compare.config import DexCompareConfig
@@ -10,6 +11,21 @@ from minotaur_subnet.dex_compare.models import QuoteOutcome
 from minotaur_subnet.dex_compare.store import DexCompareStore
 from minotaur_subnet.dex_compare.worker import DexCompareWorker
 from tests.dex_compare._helpers import make_trade
+
+_COW_ORDER = {
+    "order_id": "cow:8453:x", "app_id": "app_1", "chain_id": 8453,
+    "intent_function": "swap", "status": "filled",
+    "params": {"input_token": "0xIN", "output_token": "0xOUT", "input_amount": "1000"},
+}
+
+
+class _StubSource:
+    def __init__(self, name, orders):
+        self.name = name
+        self._orders = orders
+
+    async def sample(self, chains):
+        return list(self._orders)
 
 _VALID_ORDER = {
     "order_id": "o1", "app_id": "app_1", "intent_function": "swap",
@@ -136,6 +152,55 @@ def test_draws_one_per_chain(tmp_path):
     assert wrote == 2
     chains = {r["chain_id"] for r in store.fetch_since(None, 0.0)}
     assert chains == {1, 8453}
+
+
+def test_worker_uses_injected_source_and_stamps_trade_source(tmp_path):
+    worker, store = _make_worker([], tmp_path)  # no orders; the source supplies trades
+    worker._source = _StubSource("cow_onchain", [_COW_ORDER])
+    with patch(
+        "minotaur_subnet.dex_compare.worker.resolve_trade_tokens",
+        new=AsyncMock(return_value=make_trade()),
+    ), patch(
+        "minotaur_subnet.dex_compare.worker.fetch_minotaur_quote",
+        new=AsyncMock(return_value=QuoteOutcome("minotaur", "ok", output_raw="100", gas_units=1)),
+    ):
+        wrote = asyncio.run(worker.run_once())
+    assert wrote == 1
+    assert store.fetch_since(None, 0.0)[0]["trade_source"] == "cow_onchain"
+
+
+def test_cow_source_skips_normalization(tmp_path):
+    worker, store = _make_worker([], tmp_path)
+    worker._cfg = replace(worker._cfg, normalize_size=True)  # normalization ON...
+    worker._source = _StubSource("cow_onchain", [_COW_ORDER])  # ...but source is CoW
+    norm = AsyncMock(return_value=make_trade())
+    worker._normalize = norm
+    with patch(
+        "minotaur_subnet.dex_compare.worker.resolve_trade_tokens",
+        new=AsyncMock(return_value=make_trade()),
+    ), patch(
+        "minotaur_subnet.dex_compare.worker.fetch_minotaur_quote",
+        new=AsyncMock(return_value=QuoteOutcome("minotaur", "ok", output_raw="100", gas_units=1)),
+    ):
+        asyncio.run(worker.run_once())
+    assert norm.await_count == 0  # CoW real sizes are never rescaled
+
+
+def test_historical_source_normalizes(tmp_path):
+    worker, store = _make_worker([], tmp_path)
+    worker._cfg = replace(worker._cfg, normalize_size=True)
+    worker._source = _StubSource("historical", [_COW_ORDER])
+    norm = AsyncMock(return_value=make_trade())
+    worker._normalize = norm
+    with patch(
+        "minotaur_subnet.dex_compare.worker.resolve_trade_tokens",
+        new=AsyncMock(return_value=make_trade()),
+    ), patch(
+        "minotaur_subnet.dex_compare.worker.fetch_minotaur_quote",
+        new=AsyncMock(return_value=QuoteOutcome("minotaur", "ok", output_raw="100", gas_units=1)),
+    ):
+        asyncio.run(worker.run_once())
+    assert norm.await_count == 1  # historical dust IS rescaled
 
 
 def test_run_loop_runs_then_stops(tmp_path):

@@ -270,32 +270,95 @@ def _cost_breakdown(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# ── Liquidity gate ────────────────────────────────────────────────────────────
+# A trade only counts toward the leaderboards when it is genuinely tradeable at the
+# target size. Velora's router applies a max-price-impact guard and REJECTS trades
+# whose impact exceeds real pool liquidity (it errors with
+# ESTIMATED_LOSS_GREATER_THAN_MAX_IMPACT); a successful Velora quote is therefore a
+# per-trade liquidity signal. Gating on it drops the illiquid Base trades where
+# Velora max-impacts but the other routers still quote optimistically — there
+# Minotaur "beats" a depleted competitor set, producing a bogus >100% "receives"
+# that contradicts the per-source view (we trail Velora when it CAN quote). Liquid
+# chains (Ethereum: Velora quotes every trade) are unaffected. Measured effect on
+# Base: vs_best 1.0002 → 0.9985 (behind best, reconciled with the field), at the
+# cost of a smaller, honest sample. A spread/consensus filter does NOT work — the
+# other routers agree tightly on illiquid trades Velora rejects, so disagreement is
+# not the signal; Velora's coverage is.
+LIQUIDITY_GATE_SOURCE = "velora"
+
+
+def _tradeable_at_size(row: dict[str, Any]) -> bool:
+    gate = (row.get("results") or {}).get(LIQUIDITY_GATE_SOURCE) or {}
+    return gate.get("status") == "ok"
+
+
+def _top_unservable(rows: list[dict[str, Any]], n: int = 10) -> list[dict[str, Any]]:
+    """Most-frequent real (cow_onchain) token pairs the solver could NOT route —
+    the addressable demand we don't serve yet. Only genuine no-route ('failed')
+    gaps count; transient errors are excluded."""
+    counts: dict[tuple, int] = {}
+    last_err: dict[tuple, Any] = {}
+    for row in rows:
+        if row.get("trade_source") != "cow_onchain":
+            continue
+        mino = (row.get("results") or {}).get("minotaur") or {}
+        if mino.get("status") != "failed":
+            continue
+        pair = (
+            row.get("input_symbol") or row.get("input_token"),
+            row.get("output_symbol") or row.get("output_token"),
+        )
+        counts[pair] = counts.get(pair, 0) + 1
+        last_err[pair] = mino.get("error")
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:n]
+    return [
+        {"input": p[0], "output": p[1], "count": c, "last_error": last_err[p]}
+        for p, c in ranked
+    ]
+
+
 def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, Any]:
-    raw_src = {s: _new_acc() for s in AGGREGATOR_SOURCES}
-    raw_best = _new_acc()
     coverage = {s: {"ok": 0, "failed": 0, "error": 0, "unsupported": 0} for s in AGGREGATOR_SOURCES}
     mino_ok = mino_fail = 0
     normalized = 0
+    # Coverage buckets — real (cow_onchain) trades the solver could/couldn't requote.
+    cov_ok = cov_no_route = cov_error = 0
 
+    # Pass 1 — collection stats over EVERY row (describe what we gathered, gate-independent).
     for row in rows:
         results = row.get("results") or {}
         if row.get("notional_usd"):
             normalized += 1
         mino = results.get("minotaur") or {}
-        mino_gross = _int(mino.get("output_raw")) if mino.get("status") == "ok" else None
+        mino_status = mino.get("status")
+        mino_gross = _int(mino.get("output_raw")) if mino_status == "ok" else None
         present = mino_gross is not None and mino_gross > 0
         mino_ok += 1 if present else 0
         mino_fail += 0 if present else 1
-
+        if row.get("trade_source") == "cow_onchain":  # coverage: real executed trades only
+            if present:
+                cov_ok += 1
+            elif mino_status == "failed":            # genuine no-route -> coverage gap
+                cov_no_route += 1
+            else:                                    # transient RPC/solver error / warming_up
+                cov_error += 1
         for s in AGGREGATOR_SOURCES:
             st = (results.get(s) or {}).get("status")
             if st in coverage[s]:
                 coverage[s][st] += 1
 
-        if not present:
+    # ── raw leaderboard (gross output) over ALL present rows ──
+    # RAW is the reference "routing quality" view (flatters Minotaur, pre-fee/gas)
+    # and is deliberately NOT liquidity-gated — the gate applies only to the honest
+    # NET metrics below.
+    raw_src = {s: _new_acc() for s in AGGREGATOR_SOURCES}
+    raw_best = _new_acc()
+    for row in rows:
+        results = row.get("results") or {}
+        mino = results.get("minotaur") or {}
+        mino_gross = _int(mino.get("output_raw")) if mino.get("status") == "ok" else None
+        if mino_gross is None or mino_gross <= 0:
             continue
-
-        # ── raw leaderboard (gross output) ──
         best_out: int | None = None
         for s in AGGREGATOR_SOURCES:
             r = results.get(s) or {}
@@ -309,10 +372,19 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
         if best_out is not None:
             _accumulate(raw_best, mino_gross, best_out)
 
-    # Net leaderboards — overall and split by trade size so the frontend can show
-    # "at realistic sizes Minotaur is at parity; the gap is fixed costs on dust".
-    realistic = [r for r in rows if (_trade_usd(r) or 0) >= REALISTIC_USD]
-    small = [r for r in rows if 0 < (_trade_usd(r) or 0) < REALISTIC_USD]
+    # NET is the honest 'receives' metric (drives the meter) and IS liquidity-gated:
+    # only trades the gate source can quote at the traded size are cleanly
+    # comparable, so Minotaur can't 'win' against a field depleted by illiquidity
+    # (the Base >100% artifact). Split by trade size for the frontend. See
+    # _tradeable_at_size.
+    tradeable = [r for r in rows if _tradeable_at_size(r)]
+    net_realistic = [r for r in tradeable if (_trade_usd(r) or 0) >= REALISTIC_USD]
+    net_small = [r for r in tradeable if 0 < (_trade_usd(r) or 0) < REALISTIC_USD]
+
+    # cost_breakdown is Minotaur's OWN fee/gas (no competitor needed) — computed
+    # over ALL normalized rows, UNGATED, split by trade size.
+    cost_realistic = [r for r in rows if (_trade_usd(r) or 0) >= REALISTIC_USD]
+    cost_small = [r for r in rows if 0 < (_trade_usd(r) or 0) < REALISTIC_USD]
 
     raw_vs_source = {}
     for s in AGGREGATOR_SOURCES:
@@ -328,31 +400,56 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
         "chain_name": get_chain_name(chain_id),
         "total_comparisons": len(rows),
         "normalized_comparisons": normalized,
+        "tradeable_comparisons": len(tradeable),
         "minotaur_ok": mino_ok,
         "minotaur_fail": mino_fail,
+        "coverage": {
+            "note": "fraction of REAL executed CoW trades the current solver can "
+                    "requote; coverage_rate excludes transient RPC/solver errors. "
+                    "Inert (zeros/None) for historical-only chains.",
+            "source": "cow_onchain",
+            "real_trades_attempted": cov_ok + cov_no_route + cov_error,
+            "minotaur_ok": cov_ok,
+            "minotaur_no_route": cov_no_route,
+            "minotaur_error": cov_error,
+            "coverage_rate": round(cov_ok / (cov_ok + cov_no_route), 4)
+                             if (cov_ok + cov_no_route) else None,
+            "top_unservable_pairs": _top_unservable(rows, 10),
+        },
         "net": {
             "note": "what the user actually receives (after fees + gas) — the honest metric",
-            **_net_leaderboard(rows),
+            **_net_leaderboard(tradeable),
         },
         "net_by_size": {
             "note": "net split by trade size — 'realistic' isolates the solver's true "
                     "competitiveness from fixed-cost drag on tiny trades",
             "realistic_threshold_usd": REALISTIC_USD,
-            "realistic": {"comparisons": len(realistic), **_net_leaderboard(realistic)},
-            "small": {"comparisons": len(small), **_net_leaderboard(small)},
+            "realistic": {"comparisons": len(net_realistic), **_net_leaderboard(net_realistic)},
+            "small": {"comparisons": len(net_small), **_net_leaderboard(net_small)},
         },
         "cost_breakdown": {
             "note": "Minotaur's platform fee + gas as $ and % of trade — the source of "
                     "the net gap; shrinks toward zero as trade size grows (raw shows "
                     "routing is at parity, so the gap is cost, not the solver)",
             "all": _cost_breakdown(rows),
-            "realistic": _cost_breakdown(realistic),
-            "small": _cost_breakdown(small),
+            "realistic": _cost_breakdown(cost_realistic),
+            "small": _cost_breakdown(cost_small),
         },
         "raw": {
             "note": "gross output, pre-fee/pre-gas (routing quality — Minotaur ~parity here)",
             "vs_best_aggregator": _finalize(raw_best),
             "vs_source": raw_vs_source,
+        },
+        "liquidity_gate": {
+            "note": "the NET / net_by_size metrics count only trades tradeable at the "
+                    f"traded size — those where {LIQUIDITY_GATE_SOURCE} (max-impact-guarded) "
+                    "returns a quote; illiquid trades it rejects are excluded so Minotaur "
+                    "can't 'win' against a depleted field. raw + cost_breakdown are ungated. "
+                    "total-tradeable = trades too illiquid to compare.",
+            "gate_source": LIQUIDITY_GATE_SOURCE,
+            "applies_to": ["net", "net_by_size"],
+            "total": len(rows),
+            "tradeable": len(tradeable),
         },
     }
 
