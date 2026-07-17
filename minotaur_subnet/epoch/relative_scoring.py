@@ -972,6 +972,25 @@ def relative_counts(
         champion_bar=champion_bar, bar_age_s=bar_age_s,
         factor_delta=factor_delta, deadwood_delta=deadwood_delta,
     )
+    return counts_from_verdict(res)
+
+
+def counts_from_verdict(res: dict[str, Any]) -> dict[str, Any]:
+    """Map an :func:`evaluate_relative_adoption` RESULT onto the API count shape
+    — PURE, no recomputation.
+
+    :func:`relative_counts` is just ``evaluate_relative_adoption`` followed by
+    this mapping. Split out so a caller that ALREADY holds the authoritative
+    verdict — the adoption DECISION (``EpochManager._evaluate_per_order_adoption``)
+    — can persist the miner-facing badge from the SAME verdict object it decided
+    on, instead of a second, independently-recomputed comparison. That is the fix
+    for a badge that read "dethrone / OUTPERFORMS" while the round it belongs to
+    ended "no change": the display persist and the decision each re-read the
+    champion's freshly re-benched rows, which can drift by a few bps between the
+    two reads (offloaded re-bench settling, sim jitter), so a boundary order at
+    the ``RELATIVE_TOL_BPS`` band flipped win↔matched between them. Mapping the
+    decision's own verdict removes the second read entirely.
+    """
     better = res["n_wins"] + res["n_blind_spots"]
     worse = res["n_regressions"] + res["n_dropped"]
     # Blind-spot REPEATS (armed guard only; 0 while disarmed) are compared-but-
@@ -1045,12 +1064,16 @@ def relative_reason(
     counts: dict[str, Any] | None,
     *,
     candidate_id: str | None = None,
+    adopted: bool = False,
 ) -> str | None:
     """Phrase a round reason in relative vocabulary from a counts dict — PURE.
 
-      * ``dethrone`` -> ``"adopted <id>: net better — N better / M worse
-                          (regressions within 1% floor)"``.
-      * otherwise    -> ``"not adopted: N better / M worse / K matched"``.
+      * ``dethrone`` + ``adopted=True``  -> ``"adopted <id>: net better — N
+                          better / M worse (regressions within 1% floor)"``.
+      * ``dethrone`` + ``adopted=False`` -> ``"beat the champion <id>: net
+                          better — … (pending round outcome — not yet adopted)"``.
+      * otherwise                        -> ``"not adopted: N better / M worse /
+                          K matched"``.
 
     Phrases the counts honestly under the bounded-regression rule: a dethrone may
     carry within-floor regressions, and a non-dethrone challenger may still be
@@ -1058,11 +1081,27 @@ def relative_reason(
     Returns ``None`` when there are no counts (nothing to phrase). This is a
     DISPLAY-only derivation: callers attach it as a separate ``reason_relative``
     field and never mutate the stored legacy ``abort_reason``.
+
+    ``adopted`` controls the VERB, and it fixes a miner-facing lie: a ``counts``
+    ``"dethrone"`` verdict only means this challenger BEAT the champion on the
+    per-order rule — NOT that the round adopted it. A round routinely ends with
+    NO finalist (eligibility, ranking, or quorum) while EVERY competitor's stored
+    counts still say ``"dethrone"``; phrasing all of those as "adopted <id>" told
+    non-finalists they had merged when they had not (observed: a miner read the
+    ``reason_relative`` on ``/submissions/{id}/status`` as a merge notification).
+    So only callers that KNOW the submission actually became champion — the
+    round's chosen finalist, or ``status == "adopted"`` — pass ``adopted=True``
+    to keep the past-tense "adopted"; everyone else leaves it ``False`` and the
+    string reads "beat the champion … (pending round outcome — not yet adopted)".
     """
     if not counts:
         return None
     if counts.get("verdict") == "dethrone":
         who = f" {candidate_id}" if candidate_id else ""
+        # Only an ACTUAL adoption is stated as final; a mere per-order win is
+        # explicitly marked pending so a non-finalist can never read it as a merge.
+        verb = f"adopted{who}" if adopted else f"beat the champion{who}"
+        tail = "" if adopted else " (pending round outcome — not yet adopted)"
         if counts.get("adopt_via") == "gas":
             # A gas-tie dethrone has 0 better / 0 worse by definition — the
             # performance phrasing would read as nonsense. Name the real reason.
@@ -1071,11 +1110,11 @@ def relative_reason(
             champ_t = g.get("champ_total")
             margin = g.get("gas_margin_bps")
             return (
-                f"adopted{who}: materially cheaper — matched all "
+                f"{verb}: materially cheaper — matched all "
                 f"{counts['matched']} order(s), total gas "
                 f"{chal_t if chal_t is not None else '?'} vs "
                 f"{champ_t if champ_t is not None else '?'} "
-                f"(margin {margin if margin is not None else '?'} bps)"
+                f"(margin {margin if margin is not None else '?'} bps){tail}"
             )
         if counts.get("adopt_via") == "factorization":
             # A factor-tie dethrone has 0 better / 0 worse by definition — the
@@ -1084,10 +1123,10 @@ def relative_reason(
             delta = fz.get("factor_delta")
             margin = fz.get("factor_margin")
             return (
-                f"adopted{who}: better factored — matched all "
+                f"{verb}: better factored — matched all "
                 f"{counts['matched']} order(s), max region "
                 f"{delta if delta is not None else '?'} nodes smaller "
-                f"(margin {margin if margin is not None else '?'})"
+                f"(margin {margin if margin is not None else '?'}){tail}"
             )
         if counts.get("adopt_via") == "deadwood":
             # A deadwood-tie dethrone has 0 better / 0 worse by definition —
@@ -1097,14 +1136,14 @@ def relative_reason(
             delta = dz.get("deadwood_delta")
             margin = dz.get("margin")
             return (
-                f"adopted{who}: less dead code — matched all "
+                f"{verb}: less dead code — matched all "
                 f"{counts['matched']} order(s), unproductive "
                 f"{delta if delta is not None else '?'} nodes fewer "
-                f"(margin {margin if margin is not None else '?'})"
+                f"(margin {margin if margin is not None else '?'}){tail}"
             )
         return (
-            f"adopted{who}: net better — {counts['better']} better / "
-            f"{counts['worse']} worse (regressions within 1% floor)"
+            f"{verb}: net better — {counts['better']} better / "
+            f"{counts['worse']} worse (regressions within 1% floor){tail}"
         )
     reason = (
         f"not adopted: {counts['better']} better / {counts['worse']} worse / "

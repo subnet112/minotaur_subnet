@@ -2573,6 +2573,13 @@ async def initialize(ctx: ServerContext) -> dict:
                 and os.environ.get("SUBTENSOR_URL", "").strip()
                 and not solver_round_force_leader
             ):
+                # This node is CONFIGURED as a validator that must have metagraph
+                # sync. Record it BEFORE the attempt so /health can report unhealthy
+                # (503) when the wiring fails — letting update.sh's health-gate roll
+                # the deploy back, instead of leaving a stuck standalone api (which
+                # is what happened when a finney runtime change broke metagraph
+                # encoding 2026-07-16 and the lenient healthcheck stayed green).
+                ctx.solver_round_metagraph_expected = True
                 try:
                     from minotaur_subnet.validator.metagraph_sync import MetagraphSync
 
@@ -3755,6 +3762,14 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
                 while True:
                     try:
+                        # Time-weighted emission OBSERVE (Phase 0): sample the
+                        # current champion into the throne-time accumulator each
+                        # tick (finer than one epoch). No-op unless
+                        # EMISSION_TIME_WEIGHTED_OBSERVE is set; never raises.
+                        _em = getattr(ctx, "epoch_manager", None)
+                        if _em is not None:
+                            _em.observe_accrue_throne_time()
+
                         current = round_store.get_current_round()
                         if current is None:
                             incumbent = round_store.get_active_champion()

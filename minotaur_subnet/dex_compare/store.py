@@ -23,7 +23,7 @@ from .models import ComparisonRow
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class DexCompareStore:
@@ -71,6 +71,8 @@ class DexCompareStore:
                     mino_gas_units   INTEGER,
                     mino_fee_wei     TEXT,
                     mino_dex         TEXT,
+                    notional_usd     REAL,
+                    native_usd       REAL,
                     results_json     TEXT NOT NULL,
                     schema_version   INTEGER NOT NULL DEFAULT 1
                 );
@@ -80,6 +82,11 @@ class DexCompareStore:
                     ON comparisons(created_at);
                 """
             )
+            # Migrate pre-existing DBs (leader) that lack the newer columns.
+            existing = {r["name"] for r in conn.execute("PRAGMA table_info(comparisons)")}
+            for col in ("notional_usd", "native_usd"):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE comparisons ADD COLUMN {col} REAL")
 
     # ── writes ───────────────────────────────────────────────────────────
     def insert(self, row: ComparisonRow) -> int:
@@ -95,8 +102,8 @@ class DexCompareStore:
                     output_decimals, input_symbol, output_symbol,
                     input_is_native, output_is_native, gas_price_wei,
                     mino_status, mino_output, mino_gas_units, mino_fee_wei, mino_dex,
-                    results_json, schema_version
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    notional_usd, native_usd, results_json, schema_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.created_at, trade.chain_id, trade.order_id, trade.app_id,
@@ -111,6 +118,7 @@ class DexCompareStore:
                     mino.gas_units if mino else None,
                     mino.fee_raw if mino else None,
                     mino.dex if mino else None,
+                    trade.notional_usd, row.native_usd,
                     json.dumps(results, separators=(",", ":")),
                     _SCHEMA_VERSION,
                 ),
@@ -199,5 +207,7 @@ class DexCompareStore:
             "input_is_native": bool(row["input_is_native"]),
             "output_is_native": bool(row["output_is_native"]),
             "gas_price_wei": row["gas_price_wei"],
+            "notional_usd": row["notional_usd"] if "notional_usd" in row.keys() else None,
+            "native_usd": row["native_usd"] if "native_usd" in row.keys() else None,
             "results": results,
         }

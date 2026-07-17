@@ -62,8 +62,13 @@ class CowClient(AggregatorClient):
                 return self._failed("no buyAmount", latency)
             return self._ok(
                 str(buy),
+                # buyAmount is already the user's net receive (gasless, fee taken
+                # from the sell side) — it IS the after-fee, net-of-gas output.
+                output_after_fee_raw=str(buy),
                 gas_units=None,  # gasless — no on-chain gas the taker pays
+                gas_native_wei="0",
                 fee_raw=str_or_none(quote.get("feeAmount")),
+                protocol_fee_raw=str_or_none(quote.get("feeAmount")),
                 is_net_of_gas=True,
                 dex="cow",
                 latency_ms=latency,
