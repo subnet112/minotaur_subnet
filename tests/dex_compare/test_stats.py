@@ -32,6 +32,11 @@ def _row(
     native_usd=None,
     notional_usd=None,
     created_at=1000.0,
+    trade_source=None,
+    input_symbol=None,
+    output_symbol=None,
+    input_token=None,
+    output_token=None,
 ):
     return {
         "chain_id": chain_id,
@@ -42,6 +47,11 @@ def _row(
         "native_usd": native_usd,
         "notional_usd": notional_usd,
         "created_at": created_at,
+        "trade_source": trade_source,
+        "input_symbol": input_symbol,
+        "output_symbol": output_symbol,
+        "input_token": input_token,
+        "output_token": output_token,
         "results": results,
     }
 
@@ -93,6 +103,7 @@ def test_net_output_native_subtracts_minotaur_fee_and_gas():
         {
             "minotaur": _r(out=1_000_000, gas=100, fee=50_000),
             "cow": _r(out=800_000, net=True),
+            "velora": _r(out=1, net=True),  # tradeable: NET is liquidity-gated on Velora
         },
         output_is_native=True,
         gas_price_wei="1000",
@@ -109,6 +120,7 @@ def test_net_cow_not_double_charged():
         {
             "minotaur": _r(out=1_000_000, gas=100, fee=0),
             "cow": _r(out=950_000, net=True, gas_native=999_999_999_999),
+            "velora": _r(out=1, net=True),  # tradeable: NET is liquidity-gated on Velora
         },
         output_is_native=True,
         gas_price_wei="1000",
@@ -169,7 +181,11 @@ def test_net_gas_symmetric_when_gas_price_missing():
     # If asymmetric, 0x_net = 800-500 = 300 and ratio = 1000/300 = 3.33 (bug).
     # Symmetric: gas dropped for all -> 0x_net = 800, ratio = 1000/800 = 1.25.
     rows = [_row(
-        {"minotaur": _r(out=1000, gas=100, fee=0), "0x": _r(out=800, gas_native=500)},
+        {
+            "minotaur": _r(out=1000, gas=100, fee=0),
+            "0x": _r(out=800, gas_native=500),
+            "velora": _r(out=1, net=True),  # tradeable: NET is liquidity-gated on Velora
+        },
         output_is_native=True, gas_price_wei=None,
     )]
     cs = compute_chain_stats(rows, 8453)
@@ -226,7 +242,8 @@ def test_net_by_size_segments_realistic_vs_dust():
     # realistic ($5000 notional): Minotaur wins vs cow. dust ($1 via velora srcUSD):
     # Minotaur loses. The split must sort each row into the right bucket.
     realistic = _row(
-        {"minotaur": _r(out=100), "cow": _r(out=90, net=True)},
+        {"minotaur": _r(out=100), "cow": _r(out=90, net=True),
+         "velora": _r(out=1, net=True)},  # tradeable: NET is liquidity-gated on Velora
         output_is_native=True, notional_usd=5000.0,
     )
     dust = _row(
@@ -241,12 +258,14 @@ def test_net_by_size_segments_realistic_vs_dust():
     assert nbs["small"]["vs_source"]["cow"]["minotaur_losses"] == 1
 
 
-def test_net_notional_conversion_without_velora():
-    # neither-native normalized row, Velora ABSENT/failed, but notional_usd +
-    # native_usd + the output amounts let us convert the fee -> row is INCLUDED
-    # in net (previously excluded -> this was why Base net was empty).
+def test_net_notional_conversion_prioritized_over_velora_usd():
+    # neither-native normalized row: notional_usd + native_usd + output amounts
+    # convert the platform fee via the NOTIONAL path (prioritized over Velora's
+    # USD fields). Velora must be present (NET is liquidity-gated) but its USD
+    # fields go unused because the notional path wins -> row is INCLUDED in net.
     rows = [_row(
-        {"minotaur": _r(out=100000, fee=10 ** 15), "1inch": _r(out=100000)},
+        {"minotaur": _r(out=100000, fee=10 ** 15), "1inch": _r(out=100000),
+         "velora": _r(out=100000, net=True)},
         input_is_native=False, output_is_native=False,
         native_usd=2000.0, notional_usd=5000.0,
     )]
@@ -257,3 +276,80 @@ def test_net_notional_conversion_without_velora():
 def test_empty_is_valid():
     resp = build_stats_response([], 30)
     assert resp["chains"] == [] and resp["total_comparisons"] == 0
+
+
+# ── liquidity gate (NET only; raw + cost_breakdown ungated) ──────────────────
+def test_liquidity_gate_excludes_velora_absent_from_net():
+    # Velora absent -> row NOT tradeable -> excluded from NET, but RAW still counts it.
+    rows = [_row({"minotaur": _r(out=100), "cow": _r(out=90)}, output_is_native=True)]
+    cs = compute_chain_stats(rows, 8453)
+    assert cs["net"]["vs_source"]["cow"]["comparable"] == 0        # gated out of net
+    assert cs["raw"]["vs_source"]["cow"]["comparable"] == 1        # raw is ungated
+    assert cs["liquidity_gate"]["tradeable"] == 0 and cs["liquidity_gate"]["total"] == 1
+
+
+def test_liquidity_gate_includes_velora_present_in_net():
+    rows = [_row(
+        {"minotaur": _r(out=100), "cow": _r(out=90, net=True), "velora": _r(out=1, net=True)},
+        output_is_native=True,
+    )]
+    cs = compute_chain_stats(rows, 8453)
+    assert cs["net"]["vs_source"]["cow"]["comparable"] == 1
+    assert cs["liquidity_gate"]["tradeable"] == 1
+
+
+def test_cost_breakdown_is_ungated():
+    # A velora-absent (non-tradeable) normalized row must STILL feed cost_breakdown.
+    rows = [_row(
+        {"minotaur": _r(out=100, fee=10 ** 15, gas=100000)},
+        native_usd=2000.0, notional_usd=1000.0, gas_price_wei="1000000000",
+    )]
+    cb = compute_chain_stats(rows, 8453)["cost_breakdown"]["all"]
+    assert cb["platform_fee_usd_median"] is not None  # not gated away
+
+
+# ── coverage (cow_onchain real trades) ───────────────────────────────────────
+def test_coverage_counts_only_cow_rows():
+    rows = [
+        _row({"minotaur": _r(out=100)}, trade_source="cow_onchain"),
+        _row({"minotaur": _r(out=100)}, trade_source="historical"),  # excluded
+        _row({"minotaur": _r(out=100)}),                             # None -> excluded
+    ]
+    cov = compute_chain_stats(rows, 8453)["coverage"]
+    assert cov["real_trades_attempted"] == 1 and cov["minotaur_ok"] == 1
+
+
+def test_coverage_rate_excludes_transient_error():
+    rows = [
+        _row({"minotaur": _r(out=100)}, trade_source="cow_onchain"),
+        _row({"minotaur": _r(out=100)}, trade_source="cow_onchain"),
+        _row({"minotaur": _r(status="failed")}, trade_source="cow_onchain"),   # no-route
+        _row({"minotaur": _r(status="error")}, trade_source="cow_onchain"),    # transient
+    ]
+    cov = compute_chain_stats(rows, 8453)["coverage"]
+    assert cov["minotaur_ok"] == 2 and cov["minotaur_no_route"] == 1 and cov["minotaur_error"] == 1
+    assert cov["coverage_rate"] == round(2 / 3, 4)  # error excluded from denominator
+
+
+def test_coverage_rate_none_when_no_cow_rows():
+    rows = [_row({"minotaur": _r(out=100)}, trade_source="historical")]
+    cov = compute_chain_stats(rows, 8453)["coverage"]
+    assert cov["real_trades_attempted"] == 0 and cov["coverage_rate"] is None
+    assert cov["top_unservable_pairs"] == []
+
+
+def test_top_unservable_pairs_ranked():
+    rows = [
+        _row({"minotaur": _r(status="failed", after_fee=None)}, trade_source="cow_onchain",
+             input_symbol="A", output_symbol="B"),
+        _row({"minotaur": _r(status="failed")}, trade_source="cow_onchain",
+             input_symbol="A", output_symbol="B"),
+        _row({"minotaur": _r(status="failed")}, trade_source="cow_onchain",
+             input_symbol="C", output_symbol="D"),
+        # a transient error is NOT an unservable gap
+        _row({"minotaur": _r(status="error")}, trade_source="cow_onchain",
+             input_symbol="E", output_symbol="F"),
+    ]
+    top = compute_chain_stats(rows, 8453)["coverage"]["top_unservable_pairs"]
+    assert top[0] == {"input": "A", "output": "B", "count": 2, "last_error": None}
+    assert {t["input"] for t in top} == {"A", "C"}  # E (error) excluded

@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # ERC-20 function selectors
 _ALLOWANCE_SELECTOR = keccak(b"allowance(address,address)")[:4]
 _APPROVE_SELECTOR = keccak(b"approve(address,uint256)")[:4]
+_BALANCEOF_SELECTOR = keccak(b"balanceOf(address)")[:4]
 
 # ERC-2612 selectors
 _DOMAIN_SEPARATOR_SELECTOR = keccak(b"DOMAIN_SEPARATOR()")[:4]
@@ -60,6 +61,118 @@ def check_allowance(w3: Web3, token: str, owner: str, spender: str) -> int:
     except Exception as exc:
         logger.debug("allowance() call failed for %s: %s", token, exc)
         return 0
+
+
+def read_balance_and_allowance(
+    w3: Web3, token: str, owner: str, spender: str,
+) -> tuple[int, int] | None:
+    """Read *owner*'s ERC-20 balance and their allowance to *spender*.
+
+    Returns ``(balance, allowance)`` on success, or ``None`` if EITHER read
+    fails. Unlike :func:`check_allowance` (which returns 0 on error), this must
+    distinguish a genuine zero from an RPC failure: callers use it to *terminate*
+    an order on a funding shortfall, and a transient read error must never be
+    mistaken for "user is broke" — the caller fails OPEN on ``None``.
+    """
+    try:
+        owner_cs = Web3.to_checksum_address(owner)
+        token_cs = Web3.to_checksum_address(token)
+        bal_raw = w3.eth.call({
+            "to": token_cs,
+            "data": "0x" + (_BALANCEOF_SELECTOR + abi_encode(["address"], [owner_cs])).hex(),
+        })
+        allow_raw = w3.eth.call({
+            "to": token_cs,
+            "data": "0x" + (
+                _ALLOWANCE_SELECTOR
+                + abi_encode(["address", "address"], [owner_cs, Web3.to_checksum_address(spender)])
+            ).hex(),
+        })
+        return int.from_bytes(bytes(bal_raw), "big"), int.from_bytes(bytes(allow_raw), "big")
+    except Exception as exc:
+        logger.debug("balance/allowance read failed for %s: %s", token, exc)
+        return None
+
+
+def build_permit_digest(
+    w3: Web3,
+    token: str,
+    owner: str,
+    spender: str,
+    value: int,
+    deadline: int | None = None,
+) -> dict[str, Any] | None:
+    """Assemble the EIP-2612 permit digest a client signs to set an allowance.
+
+    Reads the token's ``DOMAIN_SEPARATOR()`` and ``nonces(owner)`` on-chain and
+    returns the final 32-byte EIP-712 digest (``0x1901`` prefix already applied)
+    plus the fields that compose it, so a frontend can sign the raw digest and
+    echo the ``permit_*`` params back on the order. Pure read — no signing, no tx.
+
+    Returns ``None`` if the token doesn't implement ERC-2612 (the client must
+    fall back to an on-chain ``approve()``).
+    """
+    token_cs = Web3.to_checksum_address(token)
+    owner_cs = Web3.to_checksum_address(owner)
+    spender_cs = Web3.to_checksum_address(spender)
+
+    try:
+        dsr = w3.eth.call({"to": token_cs, "data": "0x" + _DOMAIN_SEPARATOR_SELECTOR.hex()})
+        domain_separator = bytes(dsr)
+        if len(domain_separator) != 32:
+            return None
+    except Exception as exc:
+        logger.debug("Token %s does not support ERC-2612 (DOMAIN_SEPARATOR): %s", token, exc)
+        return None
+
+    try:
+        nonce_calldata = _NONCES_SELECTOR + abi_encode(["address"], [owner_cs])
+        nr = w3.eth.call({"to": token_cs, "data": "0x" + nonce_calldata.hex()})
+        nonce = int.from_bytes(bytes(nr), "big")
+    except Exception as exc:
+        logger.debug("nonces() call failed for %s: %s", token, exc)
+        return None
+
+    if deadline is None or deadline <= 0:
+        deadline = int(time.time()) + _PERMIT_VALIDITY_SECONDS
+
+    struct_hash = keccak(
+        abi_encode(
+            ["bytes32", "address", "address", "uint256", "uint256", "uint256"],
+            [_PERMIT_TYPEHASH, owner_cs, spender_cs, value, nonce, deadline],
+        )
+    )
+    digest = keccak(b"\x19\x01" + domain_separator + struct_hash)
+    return {
+        "digest": "0x" + digest.hex(),
+        "domain_separator": "0x" + domain_separator.hex(),
+        "nonce": nonce,
+        "deadline": deadline,
+        "value": value,
+    }
+
+
+_FEE_MODE_SELECTOR = keccak(b"feeMode()")[:4]
+
+
+def fee_mode_is_user(w3: Web3, contract: str) -> bool:
+    """True iff the app contract is in ``FeeMode.USER`` (0) — the path that pulls
+    the platform fee from the user's WETH via ``safeTransferFrom`` each fill.
+
+    Reads the on-chain ``feeMode()`` view (0=USER, 1=APP). Returns ``False``
+    (treat as APP → the fee is deducted from output / the app float, nothing to
+    pull from the user) on APP mode OR any read error, so callers fail safe: they
+    never pre-check / demand a user WETH allowance they can't confirm is needed.
+    """
+    try:
+        raw = w3.eth.call({
+            "to": Web3.to_checksum_address(contract),
+            "data": "0x" + _FEE_MODE_SELECTOR.hex(),
+        })
+        return int.from_bytes(bytes(raw), "big") == 0
+    except Exception as exc:
+        logger.debug("feeMode() read failed for %s (treat as APP): %s", contract, exc)
+        return False
 
 
 def try_erc2612_permit(

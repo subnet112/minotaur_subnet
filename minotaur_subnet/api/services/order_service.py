@@ -132,27 +132,11 @@ def ensure_token_approval(
     if wallet is None:
         return {}  # Not a managed wallet -- user handles approval
 
-    # 2. Extract token and amount from order params (support multiple naming)
-    input_token = (
-        params.get("input_token")
-        or params.get("tokenIn")
-        or params.get("token_in")
-        or params.get("asset")
-    )
-    input_amount = (
-        params.get("input_amount")
-        or params.get("amountPerBuy")
-        or params.get("amount_per_buy")
-        or params.get("amount")
-    )
-    if not input_token or not input_amount:
-        return {}
-
-    try:
-        amount_int = int(input_amount)
-    except (ValueError, TypeError):
-        return {}
-    if amount_int <= 0:
+    # 2. Identify the token + amount the app pulls from the user (shared,
+    #    app-agnostic convention — the single source of truth).
+    from minotaur_subnet.blockchain.tokens import resolve_spend_token_amount
+    input_token, amount_int = resolve_spend_token_amount(params)
+    if not input_token or not amount_int:
         return {}
 
     # 3. Get the contract address (= spender) from deployment

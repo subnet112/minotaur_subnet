@@ -1,0 +1,17 @@
+{
+  "name": "minotaur-chopsticks-sim",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "anvil-compatible simulation shim over a Chopsticks fork of Bittensor subtensor (chain 964), for benchmarking Minotaur Apps that touch native staking/alpha/swap precompiles",
+  "scripts": {
+    "launch": "node launch.mjs",
+    "poc": "node sn112_stake_poc.mjs"
+  },
+  "dependencies": {
+    "@acala-network/chopsticks": "^1.5.0",
+    "@polkadot/api": "^16.4.1",
+    "@polkadot/util": "^14.0.1",
+    "@polkadot/util-crypto": "^14.0.1"
+  }
+}
