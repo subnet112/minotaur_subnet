@@ -97,6 +97,7 @@ class ServerContext:
     # is initialized, so the refresh loop can do real peer discovery.
     champion_protocol_config: Any = None
     champion_protocol_config_task: Any = None
+    champion_main_reconcile_task: Any = None
 
     # ── order-consensus ProtocolConfig ───────────────────────────────────
     # Sibling of champion's: pointed at Base ValidatorRegistry. Used by

@@ -1169,6 +1169,104 @@ class TestEpochManager:
         block_loop.set_solver.assert_called_once_with(live_solver)
 
     @pytest.mark.asyncio
+    async def test_activate_certified_round_defers_on_unknown_finalize(self):
+        """UNKNOWN finalize outcome (stage='client': the leader couldn't reach or
+        parse the relayer) must DEFER — leave the round CERTIFIED for the
+        coordinator to re-drive — NOT abort. Aborting here orphaned the 2026-07-17
+        merge: the relayer had already merged, the leader lost the reply across an
+        update.sh restart, aborted, and stranded the win on main."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "relayer_unreachable", "client", "conn dropped")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)  # leader runs the finalize
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        # Deferred: neither adopted nor aborted — the round STAYS certified for retry.
+        assert result.get("deferred") is True
+        assert result.get("champion_changed") is False
+        assert result.get("abort_reason") is None
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.CERTIFIED
+        )
+        block_loop.set_solver.assert_not_called()  # champion unchanged, no hot-swap
+
+    @pytest.mark.asyncio
+    async def test_activate_certified_round_aborts_on_definitive_refusal(self):
+        """A DEFINITIVE relayer refusal (stage='merge': e.g. no on-chain quorum
+        cert) still ABORTS — champion unchanged — as before. Only an UNKNOWN
+        outcome defers, so a genuinely-invalid win is never pinned open."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "no_quorum_cert", "merge", "no cert binds head")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("deferred") is not True
+        assert result.get("champion_changed") is False
+        assert result.get("abort_reason") == "merge_failed:no_quorum_cert"
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.ABORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_activate_certified_round_aborts_unknown_past_deadline(self):
+        """An UNKNOWN outcome stops deferring past ``decision_deadline_epoch`` and
+        ABORTS (bounded retry) — a permanently-unreachable relayer cannot pin a
+        certified round open forever."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        # get_round returns a deepcopy, so set the bound on the STORED round object.
+        round_store._rounds[current_round.round_id].decision_deadline_epoch = 10
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "relayer_unreachable", "client")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=11)
+
+        assert result.get("deferred") is not True
+        assert str(result.get("abort_reason") or "").startswith("merge_failed")
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.ABORTED
+        )
+
+    @pytest.mark.asyncio
     async def test_follower_adopts_verified_cert_without_finalizing(self):
         """A FOLLOWER adopts the quorum-certified champion on the verified
         certificate WITHOUT running the leader-only finalization (attest + PR

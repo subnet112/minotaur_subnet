@@ -23,7 +23,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from minotaur_subnet.harness.round_store import ChampionApproval, ChampionCertificate
-from minotaur_subnet.relayer.solver_repo import on_champion_adopted_via_relayer
+from minotaur_subnet.relayer.solver_repo import (
+    _relayer_ready,
+    on_champion_adopted_via_relayer,
+)
 
 ROUND_ID = "round-client-001"
 SUBMISSION_ID = "sub_xyz789"
@@ -71,6 +74,14 @@ def _resp(status: int, payload: dict | None) -> MagicMock:
     else:
         r.json.return_value = payload
     return r
+
+
+@pytest.fixture(autouse=True)
+def _relayer_health_ok():
+    """Default the finalize health-gate to READY so the POST-path tests exercise the
+    POST. Individual tests override ``requests.get`` to simulate a down relayer."""
+    with patch("requests.get", MagicMock(return_value=_resp(200, {"status": "ok"}))):
+        yield
 
 
 def test_merge_ok_true_returns_true():
@@ -173,6 +184,49 @@ def test_non_git_submission_returns_false_without_posting():
         )
     assert not result
     post.assert_not_called()
+
+
+# ── Relayer health-gate (Part 3a): defer, not abort, when the relayer isn't ready ──
+def test_relayer_ready_true_on_200():
+    with patch("requests.get", MagicMock(return_value=_resp(200, {"status": "ok"}))):
+        assert _relayer_ready("http://relayer:8091") is True
+
+
+def test_relayer_ready_false_on_exception():
+    with patch("requests.get", MagicMock(side_effect=ConnectionError("no route"))):
+        assert _relayer_ready("http://relayer:8091") is False
+
+
+def test_relayer_ready_false_on_non_2xx():
+    with patch("requests.get", MagicMock(return_value=_resp(503, {"status": "starting"}))):
+        assert _relayer_ready("http://relayer:8091") is False
+
+
+def test_health_gate_defers_without_posting_when_relayer_down():
+    # /health unreachable => stage="client" (the #326 merge-gate DEFERS, not aborts) and
+    # we NEVER POST a finalize the relayer might half-apply (the 2026-07-17 orphan).
+    post = MagicMock(return_value=_resp(200, {"ok": True, "reason": None}))
+    with patch.dict("os.environ", _env(), clear=False), \
+            patch("requests.get", MagicMock(side_effect=TimeoutError("relayer down"))), \
+            patch("requests.post", post):
+        result = on_champion_adopted_via_relayer(_submission(), ROUND_ID, certificate=_certificate())
+    assert not result
+    assert result.reason == "relayer_unready"
+    assert result.stage == "client"  # => Part-1 merge-gate DEFERS
+    post.assert_not_called()
+
+
+def test_health_gate_can_be_disabled():
+    # RELAYER_HEALTH_GATE=0 skips the gate: the finalize POSTs even if /health is down.
+    env = _env()
+    env["RELAYER_HEALTH_GATE"] = "0"
+    post = MagicMock(return_value=_resp(200, {"ok": True, "reason": None}))
+    with patch.dict("os.environ", env, clear=False), \
+            patch("requests.get", MagicMock(side_effect=TimeoutError("relayer down"))), \
+            patch("requests.post", post):
+        result = on_champion_adopted_via_relayer(_submission(), ROUND_ID, certificate=_certificate())
+    assert result  # adopted — gate disabled, POST proceeded
+    post.assert_called_once()
 
 
 def test_no_relayer_url_returns_false_without_posting():
