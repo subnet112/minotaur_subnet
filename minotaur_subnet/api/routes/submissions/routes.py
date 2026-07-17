@@ -1392,6 +1392,7 @@ async def solver_round_consensus_proposal(
             quorum_required=body.quorum_required,
             decision_deadline_epoch=body.decision_deadline_epoch,
             effective_epoch=body.effective_epoch,
+            benchmark_anchor_epoch=body.benchmark_anchor_epoch,  # B3
             # Pass the leader's candidate so prepare SKIPS evaluate_round and
             # transitions the round straight to CERTIFYING with that candidate (same
             # as the leader's own certify path). Without it, prepare runs the full
