@@ -54,7 +54,7 @@ def _all_ids(slices):
 
 class TestQuoteVetoMerge:
     def test_inert_when_flag_off(self, monkeypatch):
-        monkeypatch.delenv("BENCHMARK_QUOTE_CORPUS", raising=False)
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "0")  # explicit OFF (default is now ON)
         s = _store()
         off = partition_follower_slices(s, _ROUND, chain_ids=[8453])
         ids = _all_ids(off)
@@ -71,7 +71,7 @@ class TestQuoteVetoMerge:
     def test_flag_on_is_superset_of_flag_off_orders(self, monkeypatch):
         # Merging quotes must NOT drop or change the order slices' membership.
         s = _store()
-        monkeypatch.delenv("BENCHMARK_QUOTE_CORPUS", raising=False)
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "0")  # explicit OFF (default is now ON)
         off_orders = {i for i in _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))}
         monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "1")
         on_ids = _all_ids(partition_follower_slices(s, _ROUND, chain_ids=[8453]))

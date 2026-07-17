@@ -242,13 +242,19 @@ class TestFeatureFlags:
         from minotaur_subnet.shared import feature_flags
         monkeypatch.delenv("BENCHMARK_QUOTE_CORPUS", raising=False)
         monkeypatch.delenv("BENCHMARK_QUOTE_CAPTURE", raising=False)
-        assert feature_flags.quote_corpus_enabled() is False   # scored corpus OFF by default
+        assert feature_flags.quote_corpus_enabled() is True    # scored corpus ON by default (Phase 2)
         assert feature_flags.quote_capture_enabled() is True   # capture ON by default
 
     def test_corpus_flag_on(self, monkeypatch):
         from minotaur_subnet.shared import feature_flags
         monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "1")
         assert feature_flags.quote_corpus_enabled() is True
+
+    def test_corpus_flag_off_kill_switch(self, monkeypatch):
+        # Explicit "0" is the fleet-wide kill switch restoring the INERT pack-hash path.
+        from minotaur_subnet.shared import feature_flags
+        monkeypatch.setenv("BENCHMARK_QUOTE_CORPUS", "0")
+        assert feature_flags.quote_corpus_enabled() is False
 
 
 class TestStoreRoundtrip:
