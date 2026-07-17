@@ -465,3 +465,62 @@ class TestQuotesRoute:
             assert out["total"] == 2
         finally:
             m.set_app_store(prev)
+
+
+class _RetiringQuoteStore:
+    """App store with ONE quote for (app_test, 8453) whose deployment carries a
+    configurable retirement status — exercises the retirement exclusion that the
+    plain ``_FakeQuoteStore`` skips (its ``list_apps()`` is empty)."""
+
+    def __init__(self, status, retire_effective_epoch=None, captured_opened_epoch=500):
+        from minotaur_subnet.shared.types import DeploymentResult
+        self._dep = DeploymentResult(
+            app_id="app_test", status=status, chain_id=8453,
+            contract_address="0x" + "ab" * 20,
+            retire_effective_epoch=retire_effective_epoch,
+        )
+        self._quote = _make_quote(quote_id="q_ret", chain_id=8453)
+        self._quote["captured_opened_epoch"] = captured_opened_epoch
+
+    def list_quotes(self):
+        return [dict(self._quote)]
+
+    def list_apps(self):
+        from types import SimpleNamespace
+        return [SimpleNamespace(app_id="app_test")]
+
+    def get_deployments(self, app_id):
+        return {8453: self._dep}
+
+
+class TestQuoteRetirementExclusion:
+    """``sample_historical_quotes`` must drop a deregistered app's quotes at the
+    SAME round-anchored epoch as the order draw — otherwise a stale quote (captured
+    while the app was live) re-injects a retired app into the Stage-2 corpus once
+    BENCHMARK_QUOTE_CORPUS is on, contradicting the synthetic + historical-order
+    halves that already drop it (see order_sampler.retired_app_chain_keys /
+    benchmark_pack.deregistered_app_ids). The quote is captured @500 and retention
+    is 20160 epochs, so it is ALWAYS within the retention window — the only variable
+    under test is retirement, not the two-sided cutoff."""
+
+    def _sampled_ids(self, store, opened_epoch):
+        rid = f"round-e{opened_epoch}-n1"
+        return [q["quote_id"] for q in sample_historical_quotes(store, rid, n_per_chain=10)]
+
+    def test_retiring_past_cutover_excluded(self):
+        from minotaur_subnet.shared.types import AppStatus
+        store = _RetiringQuoteStore(AppStatus.RETIRING, retire_effective_epoch=1000)
+        # opened_epoch == cutover → effectively retired → quote dropped.
+        assert self._sampled_ids(store, 1000) == []
+
+    def test_retiring_before_cutover_included(self):
+        from minotaur_subnet.shared.types import AppStatus
+        store = _RetiringQuoteStore(AppStatus.RETIRING, retire_effective_epoch=1000)
+        # one epoch before the cutover → not yet effective → quote still sampled.
+        assert self._sampled_ids(store, 999) == ["q_ret"]
+
+    def test_retired_excluded_immediately(self):
+        from minotaur_subnet.shared.types import AppStatus
+        store = _RetiringQuoteStore(AppStatus.RETIRED)
+        # RETIRED is epoch-independent → dropped even well before any cutover.
+        assert self._sampled_ids(store, 999) == []
