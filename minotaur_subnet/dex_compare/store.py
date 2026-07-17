@@ -23,7 +23,7 @@ from .models import ComparisonRow
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class DexCompareStore:
@@ -71,6 +71,7 @@ class DexCompareStore:
                     mino_gas_units   INTEGER,
                     mino_fee_wei     TEXT,
                     mino_dex         TEXT,
+                    trade_source     TEXT,
                     notional_usd     REAL,
                     native_usd       REAL,
                     results_json     TEXT NOT NULL,
@@ -87,6 +88,10 @@ class DexCompareStore:
             for col in ("notional_usd", "native_usd"):
                 if col not in existing:
                     conn.execute(f"ALTER TABLE comparisons ADD COLUMN {col} REAL")
+            # ALTER ... ADD COLUMN (no default) is O(1) and back-fills NULL on
+            # existing rows — NULL reads as legacy/"historical" downstream.
+            if "trade_source" not in existing:
+                conn.execute("ALTER TABLE comparisons ADD COLUMN trade_source TEXT")
 
     # ── writes ───────────────────────────────────────────────────────────
     def insert(self, row: ComparisonRow) -> int:
@@ -102,8 +107,8 @@ class DexCompareStore:
                     output_decimals, input_symbol, output_symbol,
                     input_is_native, output_is_native, gas_price_wei,
                     mino_status, mino_output, mino_gas_units, mino_fee_wei, mino_dex,
-                    notional_usd, native_usd, results_json, schema_version
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    trade_source, notional_usd, native_usd, results_json, schema_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.created_at, trade.chain_id, trade.order_id, trade.app_id,
@@ -118,7 +123,7 @@ class DexCompareStore:
                     mino.gas_units if mino else None,
                     mino.fee_raw if mino else None,
                     mino.dex if mino else None,
-                    trade.notional_usd, row.native_usd,
+                    trade.trade_source, trade.notional_usd, row.native_usd,
                     json.dumps(results, separators=(",", ":")),
                     _SCHEMA_VERSION,
                 ),
@@ -207,6 +212,7 @@ class DexCompareStore:
             "input_is_native": bool(row["input_is_native"]),
             "output_is_native": bool(row["output_is_native"]),
             "gas_price_wei": row["gas_price_wei"],
+            "trade_source": row["trade_source"] if "trade_source" in row.keys() else None,
             "notional_usd": row["notional_usd"] if "notional_usd" in row.keys() else None,
             "native_usd": row["native_usd"] if "native_usd" in row.keys() else None,
             "results": results,
