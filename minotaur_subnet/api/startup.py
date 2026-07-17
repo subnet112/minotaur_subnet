@@ -906,6 +906,25 @@ def _build_solver_round_benchmark_pack_hash(
         logger.warning("pack_hash: historical sampling failed: %s", exc)
         historical_order_ids = []
 
+    # Historical QUOTE draw — folded into the hash ONLY when the corpus flag is on
+    # (Phase-1 soak default OFF). ``None`` keeps compute_pack_hash + the payload
+    # below byte-identical to a fleet without this feature, so promoting the code
+    # with the flag off is hash-invisible. Turning it on is a fleet-uniform,
+    # atomic change (see feature_flags.quote_corpus_enabled).
+    from minotaur_subnet.shared.feature_flags import quote_corpus_enabled
+    historical_quote_ids: list[str] | None = None
+    if quote_corpus_enabled():
+        try:
+            from minotaur_subnet.harness.order_sampler import sample_historical_quotes
+            historical_quotes = sample_historical_quotes(
+                app_store=ctx.store,
+                round_id=round_id,
+            )
+            historical_quote_ids = [q.get("quote_id", "") for q in historical_quotes]
+        except Exception as exc:
+            logger.warning("pack_hash: quote sampling failed: %s", exc)
+            historical_quote_ids = []
+
     # Fold the block-pin rewrite-table version AND the deterministic compute
     # budget into the pack hash when (and only when) this round routes solver
     # reads through the proxy (proxy configured + round pinned), with the budget
@@ -923,6 +942,7 @@ def _build_solver_round_benchmark_pack_hash(
         historical_order_ids,
         compute_budget=pack_hash_compute_budget(),
         block_rewrite=pack_hash_block_rewrite(),
+        historical_quote_ids=historical_quote_ids,
     )
 
     payload = {
@@ -938,6 +958,11 @@ def _build_solver_round_benchmark_pack_hash(
             "require_asymmetric_provenance": _env_true("REQUIRE_ASYMMETRIC_PROVENANCE", default=False),
         },
     }
+    # Quote-corpus size — attached ONLY when quotes are included, so the payload
+    # (and thus the outer pack hash) is byte-identical to a default-OFF fleet.
+    if historical_quote_ids is not None:
+        payload["historical_quote_count"] = len(historical_quote_ids)
+
     # Bind the round-anchored fork pins into the pack hash (gated, default-off).
     # Added only when present so the default hash is byte-for-byte unchanged.
     #
@@ -2737,6 +2762,26 @@ async def initialize(ctx: ServerContext) -> dict:
             except Exception:
                 logger.warning("Order-book sync not started", exc_info=True)
 
+            # Quote-case sync: followers pull the leader's quote-demand corpus so
+            # their Stage-2 quote draw (and thus benchmark pack hash) matches the
+            # leader's once BENCHMARK_QUOTE_CORPUS is on. Runs unconditionally (like
+            # order-sync) so the store is already warm when the flag flips fleet-wide.
+            # Same metagraph leader-resolution + follower gate as order-sync above.
+            try:
+                from minotaur_subnet.blockloop.quote_sync import QuoteSync
+                _quote_sync = QuoteSync(
+                    app_store=ctx.store,
+                    leader_api_url=_resolve_leader_api_url,
+                    is_follower=(
+                        lambda: ctx.solver_round_metagraph_sync is not None
+                        and not _is_solver_round_leader()
+                    ),
+                )
+                ctx.quote_sync_task = asyncio.create_task(_quote_sync.run_loop())
+                logger.info("Quote-case sync loop started (followers pull the leader's quotes)")
+            except Exception:
+                logger.warning("Quote-case sync not started", exc_info=True)
+
             # App-catalog sync — followers pull the leader's apps + manifests so their
             # benchmark pack hash matches the leader's. Without it ctx.store.list_apps()
             # stays EMPTY on a follower, _build_solver_round_benchmark_pack_hash hashes
@@ -3991,6 +4036,14 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Round-anchor parity probe stopped")
+    _quote_sync_task = getattr(ctx, "quote_sync_task", None)
+    if _quote_sync_task is not None:
+        _quote_sync_task.cancel()
+        try:
+            await _quote_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Quote-case sync loop stopped")
     # Cancel any in-flight distributed-veto leader re-verification bench.
     veto_tasks = getattr(ctx, "veto_reverify_tasks", None)
     if veto_tasks:

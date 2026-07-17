@@ -328,6 +328,12 @@ class AppIntentStore:
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS quote_stats(
                     app_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS quotes(
+                    quote_id TEXT PRIMARY KEY, app_id TEXT, chain_id INTEGER,
+                    created_at REAL, data TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_quotes_app ON quotes(app_id);
+                CREATE INDEX IF NOT EXISTS idx_quotes_chain ON quotes(chain_id);
+                CREATE INDEX IF NOT EXISTS idx_quotes_created ON quotes(created_at);
                 CREATE TABLE IF NOT EXISTS native_permissions(
                     permission_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS native_executions(
@@ -783,6 +789,113 @@ class AppIntentStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(r["data"]) for r in rows]
+
+    # ── quote cases (demand corpus — mirrors the orders table) ──────────
+    #
+    # A quote CASE is the trade descriptor of a served /quote (app_id, chain_id,
+    # intent_function, params), keyed by a CONTENT-ADDRESSED quote_id so exact
+    # re-quotes of one trade collapse to a single row on write (cheap spam
+    # resistance). Distinct from the aggregate ``quote_stats`` counter table.
+    # This is the source the Stage-2 quote draw samples (order_sampler.
+    # sample_historical_quotes) and QuoteSync replicates leader → follower.
+
+    def save_quote(self, quote_dict: dict[str, Any]) -> None:
+        """Save or update (UPSERT) a quote case, keyed by quote_id."""
+        quote_id = quote_dict["quote_id"]
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO quotes(quote_id, app_id, chain_id, created_at, data) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(quote_id) DO UPDATE SET "
+                "app_id=excluded.app_id, chain_id=excluded.chain_id, "
+                "created_at=excluded.created_at, data=excluded.data",
+                (
+                    quote_id,
+                    quote_dict.get("app_id"),
+                    quote_dict.get("chain_id"),
+                    quote_dict.get("created_at"),
+                    _dumps(quote_dict),
+                ),
+            )
+
+    def get_quote(self, quote_id: str) -> dict[str, Any] | None:
+        """Return a quote case by ID, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT data FROM quotes WHERE quote_id=?", (quote_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_quotes(
+        self, app_id: str | None = None, chain_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List quote cases, optionally filtered by app and/or chain."""
+        query = "SELECT data FROM quotes"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if app_id:
+            clauses.append("app_id=?")
+            params.append(app_id)
+        if chain_id is not None:
+            clauses.append("chain_id=?")
+            params.append(int(chain_id))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def list_quote_ids(self) -> set[str]:
+        """Return the set of all stored quote_ids (cheap — id column only).
+
+        Used by QuoteSync to reconcile a follower's table to an exact mirror of the
+        leader's (delete rows the leader no longer has).
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT quote_id FROM quotes").fetchall()
+        return {r["quote_id"] for r in rows}
+
+    def delete_quotes(self, quote_ids: "set[str] | list[str]") -> int:
+        """Delete the given quote cases by id. Returns the number removed."""
+        ids = list(quote_ids)
+        if not ids:
+            return 0
+        n = 0
+        with self._connect() as conn:
+            # Chunk to stay well under SQLite's variable limit.
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"DELETE FROM quotes WHERE quote_id IN ({placeholders})", chunk
+                )
+                n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return n
+
+    def prune_quotes(self, max_rows: int) -> int:
+        """Keep only the newest ``max_rows`` quote cases (by created_at, quote_id
+        tie-break). Returns the number pruned. No-op when at/under the cap.
+
+        Bounds unauthenticated /quote growth. NOT consensus-anchored (wall-clock
+        arrival order); safe only while BENCHMARK_QUOTE_CORPUS is OFF — before
+        Phase 2 this must become a round-anchored, fleet-uniform retention.
+        """
+        if max_rows <= 0:
+            return 0
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM quotes").fetchone()["n"]
+            if total <= max_rows:
+                return 0
+            # Delete everything OUTSIDE the newest max_rows window. ORDER BY matches
+            # the /v1/quotes list ordering so leader + follower keep the same window.
+            cur = conn.execute(
+                "DELETE FROM quotes WHERE quote_id NOT IN ("
+                "  SELECT quote_id FROM quotes "
+                "  ORDER BY created_at DESC, quote_id DESC LIMIT ?"
+                ")",
+                (int(max_rows),),
+            )
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     # ── solver rounds (history mirror of RoundStore) ────────────────────
 

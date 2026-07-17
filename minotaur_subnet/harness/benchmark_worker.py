@@ -1619,9 +1619,32 @@ class BenchmarkWorker:
             if scenario is not None:
                 scenarios.append(scenario)
 
+        # Quote-demand draw (Phase-1 soak, default OFF). Same round_id, distinct
+        # ``{round_id}:quotes`` seed and its own per-chain cap (QUOTE_CORPUS_SAMPLES
+        # == STAGE2_CORPUS_SAMPLES), replayed as ``quote:``-prefixed scenarios that
+        # join the flat set. Folded into the pack hash under the SAME flag
+        # (startup._build_solver_round_benchmark_pack_hash), so the scored corpus
+        # and the fingerprint stay identical. INERT while the flag is off.
+        n_quotes = 0
+        from minotaur_subnet.shared.feature_flags import quote_corpus_enabled
+        if quote_corpus_enabled():
+            from minotaur_subnet.harness.order_sampler import sample_historical_quotes
+            q_sampled = sample_historical_quotes(
+                app_store=self._app_store,
+                round_id=round_id,
+                n_per_chain=n_per_chain,
+            )
+            for quote in q_sampled:
+                scenario = self._order_to_scenario(
+                    quote, apps_by_id, snapshots_by_chain, scenario_prefix="quote",
+                )
+                if scenario is not None:
+                    scenarios.append(scenario)
+                    n_quotes += 1
+
         logger.info(
-            "Loaded %d historical scenarios for round %s",
-            len(scenarios), round_id,
+            "Loaded %d historical scenarios (%d order, %d quote) for round %s",
+            len(scenarios), len(scenarios) - n_quotes, n_quotes, round_id,
         )
         return scenarios
 
@@ -1630,6 +1653,7 @@ class BenchmarkWorker:
         order: dict,
         apps_by_id: dict,
         snapshots_by_chain: dict[int, MarketSnapshot],
+        scenario_prefix: str = "hist",
     ) -> tuple[AppIntentDefinition, IntentState, MarketSnapshot] | None:
         """Build ONE (app_def, IntentState, snapshot) replay tuple from an order
         record — the shared builder for the canonical historical draw AND the
@@ -1661,9 +1685,11 @@ class BenchmarkWorker:
             owner="",
             raw_params=dict(order.get("params", {})),
             control={
-                # hist: prefix is the per-order JOIN id the relative rule keys
-                # on, NOT a stage marker — benchmarking is one flat set now.
-                "_scenario_name": f"hist:{order.get('order_id', '?')}",
+                # The prefix is the per-case JOIN id the relative rule keys on,
+                # NOT a stage marker — benchmarking is one flat set. "hist:" for
+                # historical orders, "quote:" for the quote-demand draw; a quote's
+                # order_id is its content-addressed quote_id, so ids never collide.
+                "_scenario_name": f"{scenario_prefix}:{order.get('order_id', '?')}",
                 "_intent_function": order.get("intent_function", "swap"),
                 "_original_block_number": order.get("block_number"),
                 "_original_tx_hash": order.get("tx_hash"),

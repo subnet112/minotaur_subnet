@@ -46,6 +46,10 @@ class ServerContext:
     orderbook: Any = None
     block_loop: Any = None
     block_loop_task: Any = None
+    # Follower-side sync loops (pull the leader's order + quote corpora). The
+    # order-sync task is set dynamically in startup; the quote-sync task is
+    # declared here so shutdown can find and cancel it.
+    quote_sync_task: Any = None
 
     # ── round-anchor parity probe (observability) ────────────────────────
     # Latest snapshot of the canonical fork pins THIS node derives for the
