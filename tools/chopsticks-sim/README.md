@@ -112,10 +112,19 @@ an SN112 stake integration test).
   and `pin_read_fork` pins every instance. Run N replicas of `chopsticks-btevm` to
   fan out the single-threaded JS-wasm executor across candidates.
 
+- **scoreIntent for arbitrary Apps** ✓ — the `scoreIntent((IntentOrder),(ExecutionPlan))`
+  tuple is app-agnostic (app-specific data is in the `intent_params` bytes), so the
+  encoder ports directly. `SubtensorSimulator._build_score_intent_calldata` builds it
+  from the orchestrator's `intent_order` (identical encoding to the anvil path), calls
+  the App read-only, and decodes `(uint256 score, bool valid)` → `on_chain_score`. Any
+  964 App following AppIntentBase is now scored on both `raw_output` and `on_chain_score`.
+
 ### Still open
-- Full `scoreIntent` tuple *encoding* for arbitrary Apps (the DexAggregator's
-  12-field order builder has no substrate equivalent yet — the App defines its ABI;
-  `simulate()` accepts pre-built `score_intent_calldata` today).
+- A concrete production 964 App + its manifest to soak against (the machinery is
+  complete; it just hasn't been exercised by a real miner App yet).
+- `msg.sender` for the `scoreIntent` read is the executor, not an impersonated
+  relayer — an App that gates its scoreIntent *view* on a specific relayer would
+  return invalid (raw_output still scores). Wire the relayer identity if needed.
 
 ## Running it
 
