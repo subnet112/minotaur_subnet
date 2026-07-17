@@ -822,12 +822,15 @@ class AppIntentStore:
     def save_quote(self, quote_dict: dict[str, Any]) -> None:
         """Save or update (UPSERT) a quote case, keyed by quote_id.
 
-        ``captured_opened_epoch`` is FIRST-SEEN preserved on conflict (COALESCE keeps
-        the existing value): the round a demand shape was first captured is a
-        monotone, fleet-uniform anchor — a re-quote in a later round must NOT bump it
-        forward, or the round-anchored sampling cutoff / retention could churn the row
-        across a boundary. On a follower, QuoteSync replays the leader's row whose
-        epoch is already frozen, so COALESCE keeps that same value — consistent.
+        LAST-WRITE on every column, ``captured_opened_epoch`` included. First-seen of
+        that anchor is enforced upstream at the SINGLE leader capture site (orders.
+        get_quote reads the existing row and feeds the frozen epoch back in), so this
+        writer stays dumb. Crucially it must NOT COALESCE-preserve the local value on a
+        follower: after the leader prunes a hot shape (aged out) and RE-captures it at a
+        new epoch, a follower that never observed the sub-second prune→recapture gap must
+        still adopt the leader's NEW epoch when QuoteSync re-upserts the row — COALESCE
+        would pin the follower's stale epoch forever and split the pack hash. Mirroring
+        the leader verbatim is what keeps captured_opened_epoch fleet-uniform.
         """
         quote_id = quote_dict["quote_id"]
         with self._connect() as conn:
@@ -838,8 +841,7 @@ class AppIntentStore:
                 "ON CONFLICT(quote_id) DO UPDATE SET "
                 "app_id=excluded.app_id, chain_id=excluded.chain_id, "
                 "created_at=excluded.created_at, "
-                "captured_opened_epoch=COALESCE("
-                "quotes.captured_opened_epoch, excluded.captured_opened_epoch), "
+                "captured_opened_epoch=excluded.captured_opened_epoch, "
                 "data=excluded.data",
                 (
                     quote_id,

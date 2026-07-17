@@ -74,10 +74,12 @@ class TestQuoteCaseId:
         assert quote_case_id("app", 8453, "swap", base) == \
             quote_case_id("app", 8453, "swap", noisy)
 
-    def test_different_trade_differs(self):
+    def test_different_shape_differs(self):
+        # Phase-2: quote_case_id is keyed by trade SHAPE (pair + order-of-magnitude
+        # amount), so distinct shapes differ...
         p1 = {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"}
-        p2 = {"input_token": "0xA", "output_token": "0xC", "input_amount": "10"}
-        p3 = {"input_token": "0xA", "output_token": "0xB", "input_amount": "11"}
+        p2 = {"input_token": "0xA", "output_token": "0xC", "input_amount": "10"}  # pair
+        p3 = {"input_token": "0xA", "output_token": "0xB", "input_amount": "1000"}  # decade
         ids = {
             quote_case_id("app", 8453, "swap", p1),
             quote_case_id("app", 8453, "swap", p2),
@@ -86,6 +88,15 @@ class TestQuoteCaseId:
             quote_case_id("app2", 8453, "swap", p1),    # app differs
         }
         assert len(ids) == 5
+
+    def test_same_shape_collapses(self):
+        # ...but different amounts in the SAME order-of-magnitude collapse to one id,
+        # so exact-amount spam upserts to a single stored row (bounded growth).
+        a = quote_case_id("app", 8453, "swap",
+                          {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"})
+        b = quote_case_id("app", 8453, "swap",
+                          {"input_token": "0xA", "output_token": "0xB", "input_amount": "99"})
+        assert a == b
 
 
 class TestDeterminism:
