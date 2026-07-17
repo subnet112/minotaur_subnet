@@ -310,6 +310,57 @@ class TestReverify:
         )
         assert out["ran"] is False and out["planned"] == 0
 
+    @pytest.mark.asyncio
+    async def test_reverify_benches_each_chain_at_its_own_pin(self):
+        # MULTI-CHAIN batch: two responders veto on DIFFERENT chains in one pass. The
+        # leader must bench EACH chain at its own pin and confirm both — NOT bail on the
+        # mixed batch (the fail-open regression the multi-chain veto would otherwise
+        # introduce: a dual-chain-regressing challenger escaping the veto).
+        base_rec = {**_order("ord_base"), "chain_id": 8453}
+        eth_rec = {**_order("ord_eth"), "chain_id": 1}
+        pins = {"1": 25_000_000, "8453": 28_000_000}
+
+        def _mk(evm, oid, rec):
+            return SliceAssignment(
+                round_id="round-e9-n1", slice_index=0, validator_evm=evm,
+                candidate_submission_id="sub_1",
+                candidate_image_id=_DA, incumbent_image_id=_DB,
+                candidate_image_ref=f"ghcr.io/x@sha256:{_DA}",
+                incumbent_image_ref=f"ghcr.io/x@sha256:{_DB}",
+                order_ids=[oid], order_hashes={oid: order_replay_hash(rec)},
+                calibration_order_ids=[], fork_pins=pins, deadline_epoch=100,
+                leader_api_url="http://leader:8080",
+            )
+
+        ph = _phase([_mk("0xv1", "ord_base", base_rec), _mk("0xv2", "ord_eth", eth_rec)])
+        ph.responses["0xv1"] = _resp(ph.assignments[0], verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_base", "dropped", "1000000", ""),
+        ])
+        ph.responses["0xv2"] = _resp(ph.assignments[1], verdict=VERDICT_VETO, violations=[
+            SliceViolation("ord_eth", "dropped", "2000000", ""),
+        ])
+        orders = {"ord_base": base_rec, "ord_eth": eth_rec}
+        # Chains bench in sorted str order: "1"(ETH) then "8453"(Base). Both regressions
+        # reproduce (champ delivers, challenger drops).
+        worker = SimpleNamespace()
+        worker.benchmark_explicit_orders = AsyncMock(side_effect=[
+            [_row("ord_eth", "2000000")], [_row("ord_eth", None)],     # ETH: champ, chal
+            [_row("ord_base", "1000000")], [_row("ord_base", None)],   # Base: champ, chal
+        ])
+
+        async def pull(ref):
+            return True
+
+        out = await reverify_dissents(
+            ph, order_lookup=lambda oid: orders.get(oid),
+            worker_factory=lambda: worker, pull_image=pull,
+        )
+        assert out["ran"] is True and out["planned"] == 2
+        assert out["confirmed"] == 2          # BOTH chains confirmed (no mixed-batch no-op)
+        assert out["orders"]["ord_base"] is True
+        assert out["orders"]["ord_eth"] is True
+        assert out["benched"] == {"ord_base", "ord_eth"}
+
 
 class TestMergeReverifyResults:
     """Accumulating disjoint streaming re-verify passes into one running result."""
