@@ -906,6 +906,48 @@ class TestEpochManager:
         assert "sub_top" in rejected[0][1]
 
     @pytest.mark.asyncio
+    async def test_evaluate_round_defers_when_a_candidate_still_benchmarking(self):
+        """Restart-survival: when every SCORED candidate rejects but a benched
+        candidate is still BENCHMARKING (e.g. a mid-round update.sh restart re-scored
+        the slate and one is a straggler), the round DEFERS instead of aborting — so
+        the straggler is not orphaned ("benchmark window elapsed") and its report is
+        not stranded for a round it might still win. Mirrors the finalist-is-None
+        defer; bounded by the decision deadline."""
+        top = _make_submission(
+            submission_id="sub_top", epoch=4, image_id="sha256:" + "a" * 64,
+        )
+        top.pr_number = 41
+        top.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "1010000"},
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        # A still-BENCHMARKING straggler in the SAME round — no score yet.
+        straggler = _make_submission(
+            submission_id="sub_straggler", epoch=4,
+            image_id="sha256:" + "c" * 64, status=SubmissionStatus.BENCHMARKING,
+        )
+        straggler.benchmark_details = None
+        # Fresh bar rejects the only scored candidate (o1 doubled -> hard-floor cut).
+        mgr, current_round, _rejected = self._fallthrough_fixture(
+            [{"intent_id": "o1", "raw_output": "2000000"},
+             {"intent_id": "o2", "raw_output": "1000000"}],
+            top, straggler,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        # DEFERRED, not aborted — the round stays REPLAYING for the straggler to finish.
+        assert result.get("deferred") is True
+        assert result.get("abort_reason") is None
+        assert result["status_after"] != RoundStatus.ABORTED.value
+        assert (
+            mgr._round_store.get_round(current_round.round_id).status
+            != RoundStatus.ABORTED
+        )
+        # The straggler was NOT reaped/waitlisted — it stays BENCHMARKING to finish.
+        assert mgr._sub_store.get("sub_straggler").status == SubmissionStatus.BENCHMARKING
+
+    @pytest.mark.asyncio
     async def test_evaluate_round_aborts_with_top_reason_when_fresh_bar_rejects_all(self):
         """When the fresh bar rejects every ranked candidate, the round aborts
         with the TOP-RANKED candidate's reason (the pre-fall-through headline)
