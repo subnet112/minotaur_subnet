@@ -1724,26 +1724,35 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                 _q_id = quote_case_id(
                     app_id, req.chain_id, req.intent_function, _q_params,
                 )
-                # FIRST-SEEN: a re-quote in a later round must not bump the anchor
-                # forward (it must stay monotone). Reuse the existing row's epoch if
-                # present; save_quote also COALESCE-preserves it as defense-in-depth.
-                _captured_epoch = int(_cur_epoch)
+                # FIRST-SEEN FREEZE of the WHOLE row. quote_id is content-addressed on the
+                # dedup SHAPE (pair + order-of-magnitude amount), so re-quoting the same
+                # shape at a DIFFERENT exact amount collapses to the same quote_id. If we
+                # last-wrote the row, the stored params (exact input_amount/min_output) —
+                # and therefore order_replay_hash AND the benched output — would churn while
+                # quote_id/captured_opened_epoch stay frozen. Two consequences at quorum>1,
+                # both consensus-breaking: (a) a QuoteSync-lagged follower recomputes a
+                # different order_replay_hash → refuses the veto slice; (b) leader vs
+                # follower bench different amounts → divergent relative-adoption verdict.
+                # So the leader is the sole writer and FREEZES the row at first-seen: only
+                # the FIRST capture of a shape writes it; re-quotes are no-ops. A shape that
+                # was pruned (aged out) and re-quoted re-anchors correctly (get_quote → None
+                # → new first-seen row). Followers mirror this frozen row verbatim via
+                # QuoteSync's last-write, so params are fleet-uniform per quote_id.
                 try:
                     _existing = s.get_quote(_q_id) if hasattr(s, "get_quote") else None
                 except Exception:
                     _existing = None
-                if _existing and _existing.get("captured_opened_epoch") is not None:
-                    _captured_epoch = int(_existing["captured_opened_epoch"])
-                s.save_quote({
-                    "quote_id": _q_id,
-                    "app_id": app_id,
-                    "chain_id": req.chain_id,
-                    "intent_function": req.intent_function,
-                    "params": _q_params,
-                    "estimated_output": estimated_output_gross,
-                    "created_at": time.time(),
-                    "captured_opened_epoch": _captured_epoch,
-                })
+                if _existing is None:
+                    s.save_quote({
+                        "quote_id": _q_id,
+                        "app_id": app_id,
+                        "chain_id": req.chain_id,
+                        "intent_function": req.intent_function,
+                        "params": _q_params,
+                        "estimated_output": estimated_output_gross,
+                        "created_at": time.time(),
+                        "captured_opened_epoch": int(_cur_epoch),
+                    })
                 _maybe_prune_quotes(s, int(_cur_epoch))
         except Exception:
             logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
