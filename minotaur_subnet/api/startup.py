@@ -2843,6 +2843,68 @@ async def initialize(ctx: ServerContext) -> dict:
             except Exception:
                 logger.warning("Champion pull-reconcile not started", exc_info=True)
 
+            # Champion main-reconcile (LEADER) — Part 2 of the finalize-reconcile
+            # design (docs/champion-finalize-reconcile.md). Heals a canonical `main`
+            # that drifted from the ADOPTED champion because a finalization
+            # half-completed (PR merged, throne never moved — the 2026-07-17
+            # orphaned-merge split). OBSERVE-ONLY by default (detect + log, no write);
+            # arm the auto-revert with CHAMPION_RECONCILE_ENFORCE=1 after soak. Never
+            # reverts unless main drifted AND the on-chain throne is still the adopted
+            # champion (a real newer win is ALERTed, never reverted). Kill switch:
+            # CHAMPION_MAIN_RECONCILE=0.
+            try:
+                if (os.environ.get("CHAMPION_MAIN_RECONCILE", "1").strip() or "1") != "0":
+                    from minotaur_subnet.relayer.champion_reconcile import (
+                        run_reconcile_pass,
+                    )
+                    _mr_interval = float(
+                        os.environ.get("CHAMPION_MAIN_RECONCILE_SECONDS", "300").strip()
+                        or "300"
+                    )
+                    _mr_enforce = (
+                        os.environ.get("CHAMPION_RECONCILE_ENFORCE", "0").strip() or "0"
+                    ) == "1"
+
+                    async def _champion_main_reconcile_loop() -> None:
+                        while True:
+                            await asyncio.sleep(_mr_interval)
+                            try:
+                                if not _is_solver_round_leader():
+                                    continue
+                                champ = submissions.get_store().get_champion()
+                                if champ is None:
+                                    continue
+                                res = await asyncio.to_thread(
+                                    run_reconcile_pass,
+                                    adopted_commit_hash=getattr(champ, "commit_hash", None),
+                                    adopted_round_id=getattr(champ, "round_id", None),
+                                    is_leader=True,
+                                    enforce=_mr_enforce,
+                                )
+                                if res.get("action") != "noop":
+                                    logger.info(
+                                        "[reconcile] main sweep: action=%s reverted=%s "
+                                        "throne_adopted=%s reason=%s",
+                                        res.get("action"), res.get("reverted"),
+                                        res.get("onchain_throne_is_adopted"), res.get("reason"),
+                                    )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.debug(
+                                    "champion main-reconcile pass failed", exc_info=True,
+                                )
+
+                    ctx.champion_main_reconcile_task = asyncio.create_task(
+                        _champion_main_reconcile_loop()
+                    )
+                    logger.info(
+                        "Champion main-reconcile loop started (leader heals main drift; "
+                        "enforce=%s, interval=%.0fs)", _mr_enforce, _mr_interval,
+                    )
+            except Exception:
+                logger.warning("Champion main-reconcile not started", exc_info=True)
+
             def _solver_round_validator_set() -> list[str]:
                 manager = submissions.get_champion_consensus_manager()
                 network = submissions.get_champion_peer_network()
@@ -2902,31 +2964,22 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
 
             def _close_sync_payload(round_state) -> dict[str, object]:
-                payload: dict[str, object] = {
-                    "round_id": round_state.round_id,
-                    "close_epoch": round_state.close_epoch,
-                    "benchmark_pack_hash": round_state.benchmark_pack_hash,
-                    "committee_block": round_state.committee_block,
-                    "committee_hash": round_state.committee_hash,
-                    "quorum_required": round_state.quorum_required,
-                    "decision_deadline_epoch": round_state.decision_deadline_epoch,
-                    "effective_epoch": round_state.effective_epoch,
-                }
-                # Bind the leader's close-time submission snapshot to the close
-                # broadcast so followers reproduce the SAME pack hash. The leader
-                # awaits this broadcast before proposing, so the snapshot lands
-                # before the follower's pack-hash check. ALWAYS ON — the
-                # SUBMISSION_SNAPSHOT_SYNC env gate was removed after fleet pack-hash
-                # parity was validated; the snapshot is required for cross-host
-                # determinism. Best-effort: a store hiccup must never break the broadcast.
-                try:
-                    _subs = submissions.get_store().list_by_round(round_state.round_id)
-                    payload["submissions"] = [s.to_dict() for s in _subs]
-                except Exception:
-                    logger.warning(
-                        "close payload: submission snapshot failed", exc_info=True,
-                    )
-                return payload
+                # B1: DELEGATE to the single module-level close-payload builder rather
+                # than duplicate its field list. The nested copy that used to live here
+                # had drifted — it OMITTED benchmark_anchor_epoch, so the leader's
+                # AUTOMATED per-tempo close broadcast (this path) materialized the round
+                # on every follower with benchmark_anchor_epoch=None → the follower
+                # anchored its fork pin to opened_epoch while the leader anchored to the
+                # real-open epoch → PACK_HASH_MISMATCH the instant quorum>1. The operator
+                # close endpoint used the (correct) module builder, which is why the two
+                # disagreed. Collapsing to one builder makes drift impossible and is
+                # covered by test_close_sync_payload_carries_benchmark_anchor_epoch. The
+                # payload is byte-identical to the old inline dict plus the anchor field;
+                # both use the same submission-store singleton (state.get_store).
+                from minotaur_subnet.api.routes.submissions.round_manager import (
+                    _close_round_sync_payload,
+                )
+                return _close_round_sync_payload(round_state)
 
             def _certify_sync_payload(round_state) -> dict[str, object]:
                 certificate = round_state.certificate
@@ -3429,6 +3482,19 @@ async def initialize(ctx: ServerContext) -> dict:
                     current.round_id,
                     epoch=current_epoch,
                 )
+                if result.get("deferred"):
+                    # Finalize outcome was UNKNOWN (relayer unreachable / lost reply).
+                    # The round stays CERTIFIED; return False so the loop does NOT open
+                    # the next round and re-drives activation on a later tick once the
+                    # relayer is reachable (the finalize is idempotent). Prevents the
+                    # 2026-07-17 orphaned-merge split.
+                    logger.warning(
+                        "Solver round activation DEFERRED for round=%s (finalize "
+                        "unconfirmed: %s) — staying certified; will re-drive when the "
+                        "relayer is reachable.",
+                        current.round_id, result.get("defer_reason") or "-",
+                    )
+                    return False
                 logger.info(
                     "Solver round activated by leader: round=%s changed=%s next=%s",
                     result.get("round_id"),

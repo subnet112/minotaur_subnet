@@ -90,28 +90,38 @@ STAGE2_CORPUS_SAMPLES: int = 50
 # a per-validator value would split the pack hash. A CODE constant, never env.
 QUOTE_CORPUS_SAMPLES: int = STAGE2_CORPUS_SAMPLES
 
+# Round-anchored quote retention window, in opened_epoch units (EPOCH_SECONDS=60s,
+# so 20160 ≈ 14 days). A quote is kept while its first-seen capturing opened_epoch
+# is >= current_opened_epoch − this. CONSENSUS-RELEVANT and fleet-uniform (it bounds
+# the population the round draw sees), so a CODE constant, never env — same class as
+# QUOTE_CORPUS_SAMPLES. Must comfortably exceed the span between any live round's
+# opened_epoch and the oldest still-benchmarkable round so retention can never delete
+# a row inside a live sampling window.
+QUOTE_RETENTION_EPOCHS: int = 20160
+
 
 def quote_case_id(
     app_id: str, chain_id: Any, intent_function: str, params: dict[str, Any] | None,
 ) -> str:
     """Content-addressed id for a quote CASE — the storage-time collapse key.
 
-    A pure function of the trade identity (app, chain, intent function, and the
-    non-volatile params), so two identical re-quotes upsert to ONE row while
-    different amounts of the same pair stay distinct rows (then collapse at draw
-    time by ``_dedup_key``'s order-of-magnitude bucket, exactly like orders).
-    Identical across validators, which is what lets the round-seeded quote draw
-    and the pack hash agree fleet-wide. ``q_`` prefix + 32 hex chars.
+    Keyed by the SAME trade-SHAPE the sampler dedups on (``_dedup_key``): same pair +
+    order-of-magnitude amount + other non-bucketed params collapse to ONE id. So exact-
+    amount spam upserts to a single stored row at CAPTURE — bounding table growth to
+    distinct demand shapes with no wall-clock/arrival ordering (the removed newest-N
+    row cap was arrival-ordered, hence non-deterministic; this is not). The storage key
+    and the draw-time dedup are now the SAME function, so ``_dedup_candidates`` is a
+    no-op over the stored set and the corpus stores exactly what it scores. Fleet-
+    uniform → the round-seeded quote draw and the pack hash agree across validators.
+    ``q_`` prefix + 32 hex chars.
     """
-    core = {k: v for k, v in (params or {}).items() if k not in _VOLATILE_PARAMS}
-    payload = {
+    order_shaped = {
         "app_id": app_id or "",
-        "chain_id": chain_id,
         "intent_function": intent_function or "swap",
-        "params": {k: core[k] for k in sorted(core)},
+        "chain_id": chain_id,
+        "params": params or {},
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return "q_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return "q_" + hashlib.sha256(_dedup_key(order_shaped).encode("utf-8")).hexdigest()[:32]
 
 
 def retired_app_chain_keys(
@@ -343,6 +353,25 @@ def sample_historical_quotes(
             logger.warning("Failed to list quotes for Stage 2 sampling: %s", exc)
             return []
 
+    # ROUND-ANCHORED CUTOFF (Phase-2 consensus determinism) — TWO-SIDED, matching the
+    # round-anchored retention window exactly. Eligible iff the first-seen capturing
+    # opened_epoch is in [draw_epoch - QUOTE_RETENTION_EPOCHS, draw_epoch):
+    #   * upper (< draw_epoch): captured in a STRICTLY EARLIER round;
+    #   * lower (>= draw_epoch - RETENTION): NOT older than what retention keeps.
+    # The lower bound is REQUIRED: retention deletes captured < current_opened_epoch -
+    # RETENTION (store.prune_quotes), and at hash time draw_epoch == current_opened_epoch,
+    # so without it the draw would include retention-tail rows the leader may have already
+    # pruned while a follower (30s QuoteSync lag) still holds them → divergent population
+    # → PACK_HASH_MISMATCH. With it, every prunable row is ALSO ineligible on every node
+    # regardless of prune/reconcile timing (opened_epoch is monotone, so the prune boundary
+    # <= draw_epoch - RETENTION), closing the race. captured_opened_epoch is a monotone,
+    # fleet-uniform, first-seen-frozen anchor, so the eligible set is identical across
+    # validators regardless of sync/prune timing. Unstamped rows (None) are NOT eligible,
+    # fleet-wide. A non-round drawing id (e.g. "dryrun:{app_id}" preview) parses to None →
+    # no cutoff, since the preview is not consensus-critical.
+    draw_epoch = opened_epoch_from_round_id(round_id)
+    _floor_epoch = None if draw_epoch is None else int(draw_epoch) - QUOTE_RETENTION_EPOCHS
+
     # Order-shape the quote rows so the shared order helpers (_filter_candidates,
     # _dedup_candidates, _representative_rank, _strip_pii) apply unchanged: alias
     # quote_id -> order_id (rows missing a quote_id are skipped).
@@ -351,6 +380,10 @@ def sample_historical_quotes(
         qid = q.get("quote_id")
         if not qid:
             continue
+        if draw_epoch is not None:
+            ce = q.get("captured_opened_epoch")
+            if ce is None or int(ce) >= int(draw_epoch) or int(ce) < _floor_epoch:
+                continue  # unanchored, captured this-round-or-later, or below retention
         o = dict(q)
         o["order_id"] = qid
         candidates_raw.append(o)

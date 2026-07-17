@@ -401,7 +401,7 @@ def _champion_proposal_rate_limit_check(
     return None
 
 
-def _verify_champion_proposal_signature(body: Any) -> str | None:
+def _verify_champion_proposal_signature(raw: dict[str, Any]) -> str | None:
     """Verify the leader's EIP-712 signature over the canonical proposal.
 
     ALWAYS required: this signature is the sole cross-validator auth for the
@@ -415,10 +415,23 @@ def _verify_champion_proposal_signature(body: Any) -> str | None:
     verifies the signature covers the canonical JSON of the proposal payload
     with the signature field stripped.
 
+    B2: canonicalizes the RAW WIRE dict (``request.json()``), mirroring
+    ``_verify_internal_round_signature``, NOT ``body.model_dump()``. The leader
+    already signs the raw hand-built dict (peer_network._build_champion_proposal_payload),
+    so verifying the raw bytes as received makes the signature check independent of the
+    pydantic model shape. This closes the #378 fragility: a new field on
+    ChampionConsensusProposalRequest no longer changes the verified canonical (an extra
+    wire key is tolerated; an absent-but-defaulted model field no longer injects a phantom
+    key), so B3 can add ``benchmark_anchor_epoch`` without a staggered-rollout auth break.
+    Transparent to swap in: for the current payload, model_dump()==the raw dict (the
+    system authenticated today), so an unchanged proposal validates identically — the
+    signer is unchanged, only the verifier moves off the model projection. MUST be
+    fleet-wide before B3 adds the field.
+
     Returns an error string on failure, or None on pass.
     """
-    signer_declared = (getattr(body, "proposer", "") or "").strip()
-    sig_hex = (getattr(body, "proposer_signature", "") or "").strip()
+    signer_declared = str(raw.get("proposer", "") or "").strip()
+    sig_hex = str(raw.get("proposer_signature", "") or "").strip()
     if not signer_declared or not sig_hex:
         return "Missing proposer / proposer_signature — signed proposals required"
 
@@ -429,7 +442,7 @@ def _verify_champion_proposal_signature(body: Any) -> str | None:
     except Exception as exc:
         return f"eth_account unavailable: {exc}"
 
-    payload = body.model_dump()
+    payload = dict(raw)
     payload.pop("proposer_signature", None)
     canonical = _json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -1357,7 +1370,17 @@ async def solver_round_consensus_proposal(
     # metagraph don't hold it, and signing the canonical payload with the
     # leader validator key already proves the caller is the round leader.
     from minotaur_subnet.consensus.dissent import RejectionCode
-    auth_err = _verify_champion_proposal_signature(body)
+    # B2: verify over the RAW wire dict (the exact bytes the leader signed), not the
+    # parsed model. Starlette caches the body, so request.json() after model binding is
+    # safe (same pattern as _authorize_internal_round). A malformed/absent body can't
+    # have a valid signature, so treat a read failure as unauthenticated.
+    try:
+        _raw_body = await request.json()
+        if not isinstance(_raw_body, dict):
+            _raw_body = {}
+    except Exception:
+        _raw_body = {}
+    auth_err = _verify_champion_proposal_signature(_raw_body)
     if auth_err:
         return {
             "approved": False,

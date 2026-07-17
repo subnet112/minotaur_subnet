@@ -1958,6 +1958,21 @@ def on_champion_adopted_pr(
 # the on_champion_adopted_pr signature so it drops straight into the #326 gate.
 
 
+def _relayer_ready(base: str, *, timeout: float = 5.0) -> bool:
+    """Readiness probe for the finalize health-gate: ``GET {base}/health`` → True on a
+    2xx. NEVER raises (any error => not ready => the caller defers). The relayer is
+    commonly briefly unreachable right after an update.sh recreate — the api can come up
+    before the relayer's DNS/port is ready, which is exactly what orphaned the
+    2026-07-17 merge."""
+    import requests
+
+    try:
+        r = requests.get(base.rstrip("/") + "/health", timeout=timeout)
+        return 200 <= int(getattr(r, "status_code", 0) or 0) < 300
+    except Exception:
+        return False
+
+
 def on_champion_adopted_via_relayer(
     submission: Any,
     round_id: str | None = None,
@@ -2074,6 +2089,23 @@ def on_champion_adopted_via_relayer(
     }
 
     base = relayer_url.rstrip("/")
+
+    # Health-gate: probe the relayer's /health BEFORE POSTing the finalize. If it isn't
+    # ready — commonly a brief window right after an update.sh recreate where the api
+    # comes up before the relayer's DNS/port is ready, which is exactly what orphaned
+    # the 2026-07-17 merge — return stage="client" so the #326 merge-gate DEFERS (not
+    # aborts). The coordinator's re-drive cadence IS the retry, so we never block the
+    # event loop with an in-line sleep. Disable with RELAYER_HEALTH_GATE=0.
+    if (os.environ.get("RELAYER_HEALTH_GATE", "1").strip() or "1") != "0":
+        if not _relayer_ready(base):
+            logger.warning(
+                "on_champion_adopted_via_relayer: relayer at %s not ready (/health) — "
+                "stage=client so the merge-gate DEFERS; the coordinator re-drives once "
+                "the relayer is reachable (not aborting a possibly-landed finalize).",
+                base,
+            )
+            return MergeResult(False, "relayer_unready", "client", "relayer /health not ready")
+
     # Prefer the structured v2 contract; fall back to v1 for a relayer still on an
     # older image (the api + relayer recreate seconds apart during an update, so a
     # brief version skew is possible). Generous timeout: the on-chain attest (up to
