@@ -1156,7 +1156,7 @@ async def _run_best_effort_champion_quorum(
                 quorum_required=consensus_manager.quorum_required,
                 decision_deadline_epoch=round_state.decision_deadline_epoch,
                 committee_block=round_state.committee_block,
-                benchmark_anchor_epoch=round_state.benchmark_anchor_epoch,
+                benchmark_anchor_epoch=getattr(round_state, "benchmark_anchor_epoch", None),
                 request_timeout=_best_effort_request_timeout(),
             )
         except asyncio.CancelledError:
@@ -1458,7 +1458,7 @@ async def _certify_solver_round_state(body: CertifyRoundRequest) -> RoundState:
                     quorum_required=consensus_manager.quorum_required,
                     decision_deadline_epoch=round_state.decision_deadline_epoch,
                     committee_block=round_state.committee_block,
-                    benchmark_anchor_epoch=round_state.benchmark_anchor_epoch,
+                    benchmark_anchor_epoch=getattr(round_state, "benchmark_anchor_epoch", None),
                 )
             )
         result = await consensus_manager.propose(proposal)
