@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -1855,15 +1856,11 @@ class MultiChainSimulator:
 
         for chain_id, url in rpc_urls.items():
             try:
-                sim = AnvilSimulator(
-                    rpc_url=url,
-                    upstream_rpc_url=upstream_rpc_urls.get(chain_id),
-                    **kwargs,
-                )
+                sim = self._build_backend(chain_id, url, upstream_rpc_urls.get(chain_id), kwargs)
                 self.simulators[chain_id] = sim
                 logger.info(
-                    "MultiChainSimulator: chain %d → %s (upstream %s)",
-                    chain_id, url,
+                    "MultiChainSimulator: chain %d → %s (%s, upstream %s)",
+                    chain_id, url, type(sim).__name__,
                     "configured" if upstream_rpc_urls.get(chain_id) else "none",
                 )
             except Exception as exc:
@@ -1871,6 +1868,35 @@ class MultiChainSimulator:
                     "MultiChainSimulator: failed to init chain %d: %s",
                     chain_id, exc,
                 )
+
+    @staticmethod
+    def _build_backend(chain_id: int, url: str, upstream: str | None, kwargs: dict):
+        """Pick the simulation backend for a chain from its registry ``sim_backend``.
+
+        ``"substrate_chopsticks"`` (Bittensor 964) → SubtensorSimulator, which drives
+        a Chopsticks fork of the real subtensor runtime so native staking/alpha/swap
+        precompiles execute. Everything else → AnvilSimulator. Both conform to the
+        same duck-typed surface (simulate / pin_read_fork / get_block_timestamp /
+        is_connected), so MultiChainSimulator routes to either transparently."""
+        backend = "evm"
+        try:
+            from minotaur_subnet.chains import registry
+            spec = registry.spec(chain_id)
+            if spec is not None:
+                backend = spec.sim_backend
+        except Exception:
+            pass
+        # Activation gate: use the substrate backend ONLY when the Chopsticks
+        # sidecar env is actually deployed (BITTENSOR_CHOPSTICKS_SIM_RPC_URL set).
+        # Without it, 964 stays on anvil-btevm — byte-identical to today, so this
+        # ships INERT and is turned on fleet-wide (a coordinated step, like any
+        # backend change) by deploying the sidecar + setting the env everywhere.
+        if backend == "substrate_chopsticks" and os.environ.get(
+            "BITTENSOR_CHOPSTICKS_SIM_RPC_URL", ""
+        ).strip():
+            from minotaur_subnet.simulator.subtensor_simulator import SubtensorSimulator
+            return SubtensorSimulator(sidecar_url=url, chain_id=chain_id)
+        return AnvilSimulator(rpc_url=url, upstream_rpc_url=upstream, **kwargs)
 
     def _get_simulator(self, plan: ExecutionPlan) -> AnvilSimulator | None:
         """Resolve the correct simulator for a plan's chain.

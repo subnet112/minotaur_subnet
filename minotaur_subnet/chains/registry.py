@@ -102,6 +102,19 @@ class ChainSpec:
     # Arbitrum/Optimism that have metadata but no sim/benchmark plumbing).
     wired: bool = True
 
+    # ── simulator backend ─────────────────────────────────────────────────────
+    # Which simulation engine MultiChainSimulator builds for this chain:
+    #   "evm"                 -> AnvilSimulator (anvil fork; the default, all EVM chains).
+    #   "substrate_chopsticks"-> SubtensorSimulator (a Chopsticks fork of the real
+    #                            subtensor runtime, driven via the anvil-dialect
+    #                            sidecar). REQUIRED for chains whose Apps call NATIVE
+    #                            precompiles (staking/alpha/swap) that a plain anvil
+    #                            fork cannot execute — i.e. Bittensor (964). The
+    #                            sim_rpc_url for such a chain is the sidecar URL, not
+    #                            an eth JSON-RPC. See minotaur_subnet/simulator/
+    #                            subtensor_simulator.py + tools/chopsticks-sim/.
+    sim_backend: str = "evm"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  THE TABLE — add a chain by adding a row.
@@ -179,8 +192,12 @@ _SPECS: tuple[ChainSpec, ...] = (
             "BITTENSOR_EVM_UPSTREAM_RPC_URL", "BITTENSOR_EVM_RPC_URL",
         ),
         consensus_public_fallback="https://lite.chain.opentensor.ai",
-        sim_rpc_envs=("BITTENSOR_EVM_RPC_URL",),
+        # Sim target = the Chopsticks anvil-dialect sidecar (native precompiles
+        # execute there); falls back to the legacy anvil-btevm eth RPC only if the
+        # sidecar env is unset (EVM-native-only degraded mode).
+        sim_rpc_envs=("BITTENSOR_CHOPSTICKS_SIM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
         upstream_rpc_env="BITTENSOR_EVM_UPSTREAM_RPC_URL",
+        sim_backend="substrate_chopsticks",
         benchmark_rpc_envs=(
             "BENCHMARK_ANVIL_RPC_BTEVM",
             "BITTENSOR_EVM_SIM_RPC_URL",
