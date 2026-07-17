@@ -745,6 +745,7 @@ class EpochManager:
         # a testnet without a solver repo), merge_ok stays True and the gate no-ops.
         merge_ok = True
         merge_reason = ""  # specific abort code from the callback (empty on success)
+        merge_stage = ""   # where it failed; "client" => UNKNOWN outcome => defer+reconcile
         # Finalization (on-chain attest + squash-merge the miner's PR) is the
         # LEADER's job: it alone holds the solver-repo PAT and is the single
         # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
@@ -769,10 +770,14 @@ class EpochManager:
                 # or a bare bool (legacy/tests). getattr keeps both shapes working.
                 merge_ok = bool(cb_result)
                 merge_reason = str(getattr(cb_result, "reason", "") or "")
+                merge_stage = str(getattr(cb_result, "stage", "") or "")
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
                 merge_reason = "callback_exception"
+                # Unexpected leader-side error => UNKNOWN finalize outcome; treat like
+                # a lost relayer reply (defer + reconcile, never strand a landed win).
+                merge_stage = "client"
         elif _is_follower:
             logger.info(
                 "[merge-gate] round %s: follower adopts quorum-certified champion %s "
@@ -787,6 +792,40 @@ class EpochManager:
         # provenance can't be established. The fleet still RUNS the certified image
         # digest at runtime, but a champion that can't be recorded is not adopted.
         if not merge_ok:
+            # An UNKNOWN finalize outcome (``stage == "client"``: the leader could not
+            # reach or parse the relayer's reply) is NOT the same as a DEFINITIVE
+            # refusal (the relayer answered with a specific reason — quorum miss, cert
+            # invalid, CI-disarm, merge error — carrying stage in {validation, attest,
+            # merge, internal}). On an UNKNOWN outcome the finalize may have ALREADY
+            # attested + merged: the 2026-07-17 split was exactly this — the relayer
+            # merged the PR, the leader then lost the connection across an update.sh
+            # restart, aborted the round, and orphaned the merge on main while the
+            # throne stayed with the old champion. DEFER instead of aborting: leave the
+            # round CERTIFIED so the coordinator re-drives activation once the relayer
+            # is reachable. The finalize is idempotent (already-attested /
+            # already-merged => success), so the retry COMPLETES rather than stranding a
+            # landed win. Bound the defer by ``decision_deadline_epoch``; past it we
+            # abort, and a reconcile pass reverts any orphaned merge.
+            _finalize_unknown = merge_stage == "client"
+            _defer_deadline = int(getattr(round_state, "decision_deadline_epoch", 0) or 0)
+            if _finalize_unknown and (not _defer_deadline or epoch <= _defer_deadline):
+                logger.warning(
+                    "[merge-gate] round %s: finalize outcome UNKNOWN (stage=client "
+                    "code=%s) — DEFERRING activation (round stays certified; the "
+                    "coordinator re-drives when the relayer is reachable), champion "
+                    "unchanged for now. epoch=%s defer_deadline=%s",
+                    round_id, merge_reason or "-", epoch, _defer_deadline or "none",
+                )
+                result["deferred"] = True
+                result["defer_reason"] = merge_reason or "finalize_unconfirmed"
+                return result
+            if _finalize_unknown:
+                logger.error(
+                    "[merge-gate] round %s: finalize outcome still UNKNOWN past the "
+                    "defer deadline (epoch=%s > %s) — aborting; a reconcile pass will "
+                    "revert any orphaned merge.",
+                    round_id, epoch, _defer_deadline,
+                )
             logger.error(
                 "[merge-gate] round %s certified, but on-chain attest + PR merge did "
                 "NOT both succeed for %s — REFUSING to adopt (no hot-swap / weights); "
