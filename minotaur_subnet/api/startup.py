@@ -4036,6 +4036,14 @@ async def shutdown(ctx: ServerContext, locals_bag: dict) -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Round-anchor parity probe stopped")
+    _quote_sync_task = getattr(ctx, "quote_sync_task", None)
+    if _quote_sync_task is not None:
+        _quote_sync_task.cancel()
+        try:
+            await _quote_sync_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Quote-case sync loop stopped")
     # Cancel any in-flight distributed-veto leader re-verification bench.
     veto_tasks = getattr(ctx, "veto_reverify_tasks", None)
     if veto_tasks:

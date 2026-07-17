@@ -845,6 +845,58 @@ class AppIntentStore:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(r["data"]) for r in rows]
 
+    def list_quote_ids(self) -> set[str]:
+        """Return the set of all stored quote_ids (cheap — id column only).
+
+        Used by QuoteSync to reconcile a follower's table to an exact mirror of the
+        leader's (delete rows the leader no longer has).
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT quote_id FROM quotes").fetchall()
+        return {r["quote_id"] for r in rows}
+
+    def delete_quotes(self, quote_ids: "set[str] | list[str]") -> int:
+        """Delete the given quote cases by id. Returns the number removed."""
+        ids = list(quote_ids)
+        if not ids:
+            return 0
+        n = 0
+        with self._connect() as conn:
+            # Chunk to stay well under SQLite's variable limit.
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"DELETE FROM quotes WHERE quote_id IN ({placeholders})", chunk
+                )
+                n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return n
+
+    def prune_quotes(self, max_rows: int) -> int:
+        """Keep only the newest ``max_rows`` quote cases (by created_at, quote_id
+        tie-break). Returns the number pruned. No-op when at/under the cap.
+
+        Bounds unauthenticated /quote growth. NOT consensus-anchored (wall-clock
+        arrival order); safe only while BENCHMARK_QUOTE_CORPUS is OFF — before
+        Phase 2 this must become a round-anchored, fleet-uniform retention.
+        """
+        if max_rows <= 0:
+            return 0
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM quotes").fetchone()["n"]
+            if total <= max_rows:
+                return 0
+            # Delete everything OUTSIDE the newest max_rows window. ORDER BY matches
+            # the /v1/quotes list ordering so leader + follower keep the same window.
+            cur = conn.execute(
+                "DELETE FROM quotes WHERE quote_id NOT IN ("
+                "  SELECT quote_id FROM quotes "
+                "  ORDER BY created_at DESC, quote_id DESC LIMIT ?"
+                ")",
+                (int(max_rows),),
+            )
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     # ── solver rounds (history mirror of RoundStore) ────────────────────
 
     def save_round(self, round_dict: dict[str, Any]) -> None:

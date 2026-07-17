@@ -113,6 +113,31 @@ def set_js_engine(js_engine: Any) -> None:
 # How long (seconds) a quote is considered indicative
 _QUOTE_VALID_SECONDS = 30
 
+# Bound the leader's quote-CASE table so unauthenticated /quote traffic can't grow
+# it without limit. Capture is LEADER-ONLY, so the leader is the sole writer and
+# QuoteSync mirrors its (pruned) set to followers — pruning the leader bounds the
+# whole fleet. The prune keeps the newest N rows by created_at and runs amortized
+# (once per _QUOTE_PRUNE_EVERY captures) to keep it off the hot path. Phase-1 flag
+# is OFF so this prune is NOT on the consensus path; before Phase 2 arms the corpus,
+# retention must be made round-anchored / fleet-uniform (a documented preflight).
+_QUOTE_STORE_MAX_ROWS = 50_000
+_QUOTE_PRUNE_EVERY = 200
+_quote_capture_counter = 0
+
+
+def _maybe_prune_quotes(store: Any) -> None:
+    """Amortized newest-N prune of the quotes table (leader-only writer)."""
+    global _quote_capture_counter
+    _quote_capture_counter += 1
+    if _quote_capture_counter % _QUOTE_PRUNE_EVERY != 0:
+        return
+    if not hasattr(store, "prune_quotes"):
+        return
+    try:
+        store.prune_quotes(_QUOTE_STORE_MAX_ROWS)
+    except Exception:
+        logger.debug("quote prune failed", exc_info=True)
+
 # The /quote endpoint now derives estimated_output ENTIRELY from generate_plan +
 # an anvil-fork simulation of that plan (see get_quote). That fork sim is
 # expensive and runs on EVERY quote, so its result is cached briefly keyed by
@@ -1227,9 +1252,12 @@ def list_quotes(
         in the scored corpus yet (BENCHMARK_QUOTE_CORPUS), so miners can widen
         coverage ahead of the soak.
 
-    Quote cases carry NO PII (a quote never had a submitted_by or signature), so —
-    unlike ``/orders`` — there is no reader-sig gate. ``limit`` is clamped to
-    [1, 500] (default 100); ``total`` is the match count before paging.
+    Quote cases are served without a reader-sig gate because they hold only the
+    trade descriptor: a quote never had a submitted_by or signature, and capture
+    strips identity/derived params (receiver, intent_params_hex, permit, …) via
+    ``QUOTE_PARAM_STRIP_FIELDS`` before storage, so the public body carries only
+    tokens/amounts/chain. ``limit`` is clamped to [1, 500] (default 100); ``total``
+    is the match count before paging.
     """
     if _app_store is None or not hasattr(_app_store, "list_quotes"):
         return {"quotes": [], "count": 0, "total": 0, "limit": limit, "offset": offset}
@@ -1641,16 +1669,34 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     # QuoteSync replicates it leader → follower, and the round-seeded quote draw
     # samples it once BENCHMARK_QUOTE_CORPUS is enabled. A zero-output quote (a pair
     # the champion can't route) is captured too — that's the blind-spot demand we
-    # want miners to chase. PII fields are stripped from params before storage.
-    if s is not None and hasattr(s, "save_quote") and quote_capture_enabled():
+    # want miners to chase.
+    #
+    # LEADER-ONLY (consensus-critical): capture is gated on _IS_LEADER_NODE, mirroring
+    # the order-submit gate two functions up. /quote is a public read any node can
+    # answer, but the benchmark corpus MUST have a single writer — the leader — or a
+    # follower that answers even one /quote would persist a leader-absent quote_id
+    # that upsert-only QuoteSync never removes, making its store a superset of the
+    # leader's and diverging the pack hash the instant BENCHMARK_QUOTE_CORPUS is armed
+    # fleet-wide (PACK_HASH_MISMATCH → quorum strands). Followers get quotes ONLY via
+    # QuoteSync, which reconciles to an exact mirror of the leader.
+    #
+    # Identity/derived params (receiver, intent_params_hex, permit, …) are stripped
+    # before storage: quote cases are served on the PUBLIC /v1/quotes, so only the
+    # trade descriptor is retained. See QUOTE_PARAM_STRIP_FIELDS.
+    if (
+        _IS_LEADER_NODE
+        and s is not None
+        and hasattr(s, "save_quote")
+        and quote_capture_enabled()
+    ):
         try:
             from minotaur_subnet.harness.order_sampler import (
-                _PII_FIELDS as _QUOTE_PII_FIELDS,
+                QUOTE_PARAM_STRIP_FIELDS,
                 quote_case_id,
             )
             _q_params = {
                 k: v for k, v in (req.params or {}).items()
-                if k not in _QUOTE_PII_FIELDS
+                if k not in QUOTE_PARAM_STRIP_FIELDS
             }
             _q_id = quote_case_id(
                 app_id, req.chain_id, req.intent_function, _q_params,
@@ -1664,6 +1710,7 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                 "estimated_output": estimated_output_gross,
                 "created_at": time.time(),
             })
+            _maybe_prune_quotes(s)
         except Exception:
             logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
 

@@ -49,6 +49,29 @@ _VOLATILE_PARAMS = {"quoted_output", "platform_fee_wei", "intent_params_hex"}
 _BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_amount"}
 
 
+# Identity / derived params that must NEVER enter a stored quote CASE. A quote case
+# is served PUBLICLY (/v1/quotes) and replicated fleet-wide, so any caller- or
+# server-supplied address / authorization / identity field is stripped before
+# storage. This is a DENYLIST (consistent with _PII_FIELDS): the trade-defining
+# params (input_token/output_token/input_amount/min_output_amount and app-generic
+# trade keys) are deliberately NOT listed and survive. Union'd with _PII_FIELDS and
+# the volatile quote fields into QUOTE_PARAM_STRIP_FIELDS. NOTE: if a non-swap app
+# is ever added whose trade legitimately needs an address param, revisit this as an
+# allowlist — a denylist can miss a novel identity key.
+_QUOTE_IDENTITY_PARAMS = {
+    "receiver", "recipient", "to", "beneficiary", "owner", "user_address",
+    "from", "sender", "spender", "user_nonce", "nonce", "deadline",
+    "app_address", "intent_selector", "intent_params_hex",
+    "permit", "permit_signature", "signature",
+}
+
+# The full set stripped from a quote's params at capture time (identity + PII +
+# volatile). quote_case_id already ignores _VOLATILE_PARAMS internally; capture
+# strips the whole set so the STORED (and publicly served) params carry only the
+# trade descriptor.
+QUOTE_PARAM_STRIP_FIELDS = _PII_FIELDS | _VOLATILE_PARAMS | _QUOTE_IDENTITY_PARAMS
+
+
 # Stage-2 SHARED corpus size per chain — THE SINGLE SOURCE OF TRUTH, consensus-
 # relevant and fleet-uniform. The corpus is a round-seeded SHARED draw (#242), but
 # the size is a MULTIPLIER on that draw: ``rng.sample(orders, k=min(N, len))`` with a
