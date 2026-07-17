@@ -71,17 +71,28 @@ def quote_corpus_enabled() -> bool:
     ON fleet-wide (Phase 2 flips the default and promotes to main), or a mixed
     fleet computes divergent pack hashes and strands quorum (PACK_HASH_MISMATCH).
 
-    PHASE-2 PREFLIGHT (must all hold before this is armed with quorum>1):
-      1. Flag ON fleet-wide (every validator on the same image + env), verified via
-         a soak where followers have synced quotes and recompute matching pack hashes.
-      2. Retention made round-anchored / fleet-uniform. Phase-1 uses an amortized
-         newest-N prune (orders._maybe_prune_quotes + store.prune_quotes) that is
-         wall-clock ordered — safe only while this flag is OFF. Once armed, two
-         validators pruning at different times could keep different newest-N windows
-         and diverge; retention must key on a round-anchored cutoff instead.
-      3. Distributed-veto slices extended to quotes. partition_follower_slices /
-         calibration_overlap / veto_wire currently cover only ``hist:`` orders, so a
-         throne won by concentrating on quote-demand scenarios has no independent
-         per-order HARD-VETO cross-check until the veto path samples quotes too.
+    PHASE-2 STATUS:
+      DONE (this PR, inert while the flag is OFF):
+        - Round-anchored SAMPLING CUTOFF: sample_historical_quotes includes only
+          quotes first-captured in a strictly earlier round (captured_opened_epoch <
+          drawing round's opened_epoch), so the draw is a pure function of round_id +
+          frozen pre-round membership — immune to the capture/prune/QuoteSync race.
+        - Round-anchored RETENTION: store.prune_quotes drops by captured_opened_epoch
+          (keep last QUOTE_RETENTION_EPOCHS), not wall-clock newest-N.
+        - Veto DEFENSIVE fixes: veto_wire._order_label / _production_order_lookup and
+          benchmark_worker.build_explicit_scenarios handle q_ quote ids, so the leader
+          reverify + coverage assert hold the moment quotes enter the scored corpus.
+
+      REMAINING before flipping this default ON / raising quorum:
+        1. Flag ON fleet-wide (same image + env), verified via a soak where followers
+           have synced quotes and recompute MATCHING pack hashes. The flip is a
+           deliberate, atomic, separately-reviewed step (per the staging model).
+        2. [quorum>1 only] benchmark_anchor_epoch plumbed leader→follower through the
+           champion proposal/certify path — the SIBLING PR; it is the standing blocker
+           for quorum>1 on the WHOLE benchmark (orders included), not just quotes.
+        3. [quorum>1 only] Distributed-veto SLICE partition extended to quotes
+           (partition_follower_slices / calibration_overlap) so a quote-overfit throne
+           has an independent cross-check. Ships with the quorum-raise batch alongside
+           (2); the leader-side reverify is already quote-aware (see DONE above).
     """
     return _env_bool("BENCHMARK_QUOTE_CORPUS", default=False)

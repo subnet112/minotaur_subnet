@@ -1724,8 +1724,13 @@ class BenchmarkWorker:
             if app_id not in apps_by_id:
                 raise ExplicitOrderUnavailable(order_id, f"missing_app:{app_id}")
             try:
+                # A quote case (content-addressed q_ id) must bench under the
+                # "quote:" scenario name, matching the canonical quote draw and
+                # veto_wire._order_label, so the veto coverage assert still holds
+                # when the corpus includes quotes. Orders keep the "hist:" default.
+                _prefix = "quote" if order_id.startswith("q_") else "hist"
                 scenario = self._order_to_scenario(
-                    order, apps_by_id, snapshots_by_chain,
+                    order, apps_by_id, snapshots_by_chain, scenario_prefix=_prefix,
                 )
             except ExplicitOrderUnavailable:
                 raise

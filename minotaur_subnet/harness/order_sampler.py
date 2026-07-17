@@ -90,6 +90,15 @@ STAGE2_CORPUS_SAMPLES: int = 50
 # a per-validator value would split the pack hash. A CODE constant, never env.
 QUOTE_CORPUS_SAMPLES: int = STAGE2_CORPUS_SAMPLES
 
+# Round-anchored quote retention window, in opened_epoch units (EPOCH_SECONDS=60s,
+# so 20160 ≈ 14 days). A quote is kept while its first-seen capturing opened_epoch
+# is >= current_opened_epoch − this. CONSENSUS-RELEVANT and fleet-uniform (it bounds
+# the population the round draw sees), so a CODE constant, never env — same class as
+# QUOTE_CORPUS_SAMPLES. Must comfortably exceed the span between any live round's
+# opened_epoch and the oldest still-benchmarkable round so retention can never delete
+# a row inside a live sampling window.
+QUOTE_RETENTION_EPOCHS: int = 20160
+
 
 def quote_case_id(
     app_id: str, chain_id: Any, intent_function: str, params: dict[str, Any] | None,
@@ -343,6 +352,20 @@ def sample_historical_quotes(
             logger.warning("Failed to list quotes for Stage 2 sampling: %s", exc)
             return []
 
+    # ROUND-ANCHORED CUTOFF (Phase-2 consensus determinism). Include only quotes
+    # first captured in a STRICTLY EARLIER round than the drawing round — i.e.
+    # captured_opened_epoch < opened_epoch_from_round_id(round_id). Because
+    # captured_opened_epoch is a monotone, fleet-uniform, first-seen-frozen anchor
+    # (opened_epoch increases every round), "captured in an earlier round" is a set
+    # every validator computes identically REGARDLESS of when its QuoteSync delivered
+    # a row or when the leader pruned — closing the capture/prune/sync race that would
+    # otherwise split the pack hash the instant BENCHMARK_QUOTE_CORPUS is armed.
+    # Unstamped rows (captured_opened_epoch is None — legacy Phase-1 or captured with
+    # no live round) are NOT eligible, fleet-wide, mirroring the RETIRING None-fallback.
+    # A non-round drawing id (e.g. "dryrun:{app_id}" from the miner preview) parses to
+    # None → no cutoff, since the preview is not consensus-critical.
+    draw_epoch = opened_epoch_from_round_id(round_id)
+
     # Order-shape the quote rows so the shared order helpers (_filter_candidates,
     # _dedup_candidates, _representative_rank, _strip_pii) apply unchanged: alias
     # quote_id -> order_id (rows missing a quote_id are skipped).
@@ -351,6 +374,10 @@ def sample_historical_quotes(
         qid = q.get("quote_id")
         if not qid:
             continue
+        if draw_epoch is not None:
+            ce = q.get("captured_opened_epoch")
+            if ce is None or int(ce) >= int(draw_epoch):
+                continue  # captured this round or later, or unanchored → not eligible
         o = dict(q)
         o["order_id"] = qid
         candidates_raw.append(o)
