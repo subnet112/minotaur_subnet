@@ -359,6 +359,14 @@ def _result(oid: str, raw: str | None, app_id: str = "app_dex", error=None):
     )
 
 
+def _qresult(oid: str, raw: str | None, app_id: str = "app_dex", error=None):
+    # A QUOTE row: build_explicit_scenarios prefixes a content-addressed q_ id with
+    # "quote:", so the harness labels it f"{app_id}:quote:{oid}" — must match _order_label.
+    return SimpleNamespace(
+        intent_id=f"{app_id}:quote:{oid}", raw_output=raw, error=error,
+    )
+
+
 def _runner_kwargs(orders: dict[str, dict], champ, chal, *, pull_ok=True):
     async def pull_image(ref):
         return pull_ok
@@ -424,6 +432,41 @@ class TestRunSliceBench:
         assert resp.status == STATUS_COMPLETED
         assert resp.verdict == VERDICT_OK
         assert resp.violations == []
+
+    @pytest.mark.asyncio
+    async def test_quote_slice_benches_and_vetoes(self):
+        # A merged slice carrying content-addressed q_ ids must bench + surface a veto
+        # end-to-end. The scoring side labels a q_ row "{app}:quote:{oid}" (build_explicit_
+        # scenarios prefix); the coverage assert joins rows via _order_label (also quote-
+        # aware). This exercises that byte-agreement — the linchpin of "Phase-2 defensive
+        # fixes already handle q_" — which no other test touches.
+        a, orders = _assignment(order_ids=("q_a", "q_b"), calib_ids=("ord_c",))
+        champ = [_qresult("q_a", "1000000"), _qresult("q_b", "500000"),
+                 _result("ord_c", "42")]
+        chal = [_qresult("q_a", "900000"),           # 10% cut → catastrophic
+                _qresult("q_b", None),                # dropped
+                _result("ord_c", "40")]
+        kwargs, _ = _runner_kwargs(orders, champ, chal)
+        resp = await run_slice_bench(a, **kwargs)
+        assert resp.status == STATUS_COMPLETED
+        assert resp.verdict == VERDICT_VETO
+        assert {(v.order_id, v.kind) for v in resp.violations} == {
+            ("q_a", "catastrophic"), ("q_b", "dropped"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_quote_row_wrong_label_trips_coverage_refuse(self):
+        # NEGATIVE twin: if the scoring side ever labeled a q_ row "hist:" instead of
+        # "quote:" (discriminator drift between build_explicit_scenarios and _order_label),
+        # the row would not join → matched_rows short → row_coverage REFUSE (fail-safe),
+        # never a vacuous OK. Proves the kind discriminator is load-bearing.
+        a, orders = _assignment(order_ids=("q_a",), calib_ids=())
+        champ = [_result("q_a", "1000000")]   # WRONG: hist-labeled q_ row
+        chal = [_result("q_a", "1000000")]
+        kwargs, _ = _runner_kwargs(orders, champ, chal)
+        resp = await run_slice_bench(a, **kwargs)
+        assert resp.status == STATUS_REFUSED
+        assert "row_coverage" in (resp.error or "")
 
     @pytest.mark.asyncio
     async def test_small_regression_is_not_a_violation(self):
