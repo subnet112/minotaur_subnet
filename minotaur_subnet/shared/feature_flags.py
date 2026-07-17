@@ -70,5 +70,18 @@ def quote_corpus_enabled() -> bool:
     changes corpus membership, so before quorum is ever raised above 1 it MUST be
     ON fleet-wide (Phase 2 flips the default and promotes to main), or a mixed
     fleet computes divergent pack hashes and strands quorum (PACK_HASH_MISMATCH).
+
+    PHASE-2 PREFLIGHT (must all hold before this is armed with quorum>1):
+      1. Flag ON fleet-wide (every validator on the same image + env), verified via
+         a soak where followers have synced quotes and recompute matching pack hashes.
+      2. Retention made round-anchored / fleet-uniform. Phase-1 uses an amortized
+         newest-N prune (orders._maybe_prune_quotes + store.prune_quotes) that is
+         wall-clock ordered — safe only while this flag is OFF. Once armed, two
+         validators pruning at different times could keep different newest-N windows
+         and diverge; retention must key on a round-anchored cutoff instead.
+      3. Distributed-veto slices extended to quotes. partition_follower_slices /
+         calibration_overlap / veto_wire currently cover only ``hist:`` orders, so a
+         throne won by concentrating on quote-demand scenarios has no independent
+         per-order HARD-VETO cross-check until the veto path samples quotes too.
     """
     return _env_bool("BENCHMARK_QUOTE_CORPUS", default=False)

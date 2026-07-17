@@ -97,6 +97,10 @@ class QuoteSync:
                 break
             page_offset += _SYNC_PAGE_SIZE
         if not quotes:
+            # Empty pull: could be a genuinely empty leader OR a transient error
+            # mid-page. Never RECONCILE (delete) on an empty pull — that would let
+            # one failed request wipe the follower's mirror. Just no-op; the next
+            # cycle re-pulls.
             return 0
         n = 0
         for quote in quotes:
@@ -108,6 +112,29 @@ class QuoteSync:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Quote sync: save_quote failed for %s: %s",
                                quote.get("quote_id"), exc)
+
+        # AUTHORITATIVE mirror: delete any local quote the leader no longer has, so
+        # the follower's quote set is an EXACT mirror of the leader's — never a
+        # superset. This is the belt-and-suspenders half of the leader-only capture
+        # gate (a follower must not carry leader-absent quote_ids, or its Stage-2
+        # quote draw and pack hash diverge once the corpus flag is armed) AND it
+        # propagates the leader's retention prune to followers. Guarded above: only
+        # runs on a non-empty pull. Best-effort — reconcile failure just retries.
+        try:
+            if hasattr(self._app_store, "list_quote_ids") and hasattr(
+                self._app_store, "delete_quotes"
+            ):
+                leader_ids = seen  # the deduped set of leader quote_ids just pulled
+                stale = self._app_store.list_quote_ids() - leader_ids
+                if stale:
+                    removed = self._app_store.delete_quotes(stale)
+                    logger.info(
+                        "Quote sync: reconciled — removed %d leader-absent quote(s)",
+                        removed,
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Quote sync: reconcile failed: %r", exc)
+
         if n:
             logger.info("Quote sync: upserted %d quote cases from leader %s", n, url)
         return n
