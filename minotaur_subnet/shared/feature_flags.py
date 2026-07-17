@@ -36,3 +36,52 @@ CROSS_CHAIN_DISABLED_MESSAGE = (
     "Beta scope is single-chain Base (chain 8453). "
     "Set CROSS_CHAIN_ENABLED=1 on a staging target to exercise the dev-track path."
 )
+
+
+def quote_capture_enabled() -> bool:
+    """Persist each served /quote as a durable quote-CASE for demand tracking.
+
+    Capture is a LOCAL, best-effort side effect of the quote endpoint (it never
+    affects the quote response) and is NOT consensus-relevant on its own — it
+    only fills the ``quotes`` store that ``QuoteSync`` then replicates leader →
+    follower. It defaults ON so the store fills during the Phase-1 soak while the
+    corpus-inclusion flag below is still OFF; flip to 0 as a kill switch if
+    capture ever misbehaves. Turning capture off does NOT change any pack hash.
+    """
+    return _env_bool("BENCHMARK_QUOTE_CAPTURE", default=True)
+
+
+def quote_corpus_enabled() -> bool:
+    """Include sampled historical QUOTES in the scored benchmark corpus.
+
+    CONSENSUS-RELEVANT. When ON, the round-seeded quote draw is folded into the
+    benchmark pack hash (``benchmark_pack.compute_pack_hash`` — a separate
+    ``QUOTES`` section) and replayed as scored scenarios
+    (``benchmark_worker._load_historical_scenarios`` — ``quote:`` prefix). The
+    fold is INERT while OFF: with this flag off the pack hash is byte-identical to
+    a fleet that has no quote-corpus code at all, so a default-OFF rollout is
+    hash-invisible and safe to promote.
+
+    This is an env var ONLY to enable the Phase-1 SOAK: at the production quorum=1
+    the leader alone benchmarks + certifies (followers do not independently gate),
+    so the leader can flip this ON to soak the behaviour while the store replicates
+    quotes to every follower. It is otherwise held to the SAME fleet-uniform
+    discipline as ``STAGE2_CORPUS_SAMPLES`` / ``BENCHMARK_PACK_V2``: turning it ON
+    changes corpus membership, so before quorum is ever raised above 1 it MUST be
+    ON fleet-wide (Phase 2 flips the default and promotes to main), or a mixed
+    fleet computes divergent pack hashes and strands quorum (PACK_HASH_MISMATCH).
+
+    PHASE-2 PREFLIGHT (must all hold before this is armed with quorum>1):
+      1. Flag ON fleet-wide (every validator on the same image + env), verified via
+         a soak where followers have synced quotes and recompute matching pack hashes.
+      2. Retention made round-anchored / fleet-uniform. Phase-1 uses an amortized
+         newest-N prune (orders._maybe_prune_quotes + store.prune_quotes) that is
+         wall-clock ordered — safe only while this flag is OFF. Once armed, two
+         validators pruning at different times could keep different newest-N windows
+         and diverge; retention must key on a round-anchored cutoff instead.
+      3. Distributed-veto slices extended to quotes. partition_follower_slices /
+         calibration_overlap / veto_wire currently cover only ``hist:`` orders, so a
+         throne won by concentrating on quote-demand scenarios has no independent
+         per-order HARD-VETO cross-check until the veto path samples quotes too.
+    """
+    return _env_bool("BENCHMARK_QUOTE_CORPUS", default=False)

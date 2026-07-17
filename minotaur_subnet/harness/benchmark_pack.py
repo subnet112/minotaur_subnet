@@ -46,6 +46,7 @@ def compute_pack_hash(
     historical_order_ids: Iterable[str],
     compute_budget: dict[str, Any] | None = None,
     block_rewrite: dict[str, Any] | None = None,
+    historical_quote_ids: Iterable[str] | None = None,
 ) -> str:
     """Compute the canonical SHA-256 hash of a benchmark pack.
 
@@ -108,6 +109,26 @@ def compute_pack_hash(
         h.update(b"HISTORICAL\n")
         for order_id in historical_sorted:
             h.update(order_id.encode("utf-8"))
+            h.update(b"\n")
+
+    # Historical QUOTE corpus (round-seeded quote draw — the demand blind-spot
+    # cases). Folded in ONLY when quotes are included (feature_flags.
+    # quote_corpus_enabled → the caller passes the sampled ids, else None), so the
+    # hash is byte-identical to a fleet with no quote-corpus code while inert. Once
+    # a fleet includes quotes this binds the quote draw into consensus: a validator
+    # sampling a different quote set produces a different pack hash and cannot reach
+    # quorum. CONSENSUS-BREAKING the instant it goes non-None fleet-wide — flip the
+    # BENCHMARK_QUOTE_CORPUS default + roll out atomically (same discipline as
+    # ROUND_ANCHORED_PIN / the compute budget). quote_ids are their own sorted
+    # section so they never collide with historical order_ids.
+    if historical_quote_ids is not None:
+        h.update(b"QUOTES_V1\n")
+        quote_tokens = sorted(
+            json.dumps({"quote_id": qid}, separators=(",", ":"))
+            for qid in historical_quote_ids
+        )
+        for tok in quote_tokens:
+            h.update(tok.encode("utf-8"))
             h.update(b"\n")
 
     # Deterministic RPC compute budget (the budget proxy's {budget, cost_table}

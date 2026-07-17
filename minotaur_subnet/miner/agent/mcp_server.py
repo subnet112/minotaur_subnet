@@ -898,6 +898,12 @@ def score_strategy_all(app_id: str, code: str) -> dict:
             resp = _http_get(f"{base}/v1/apps/{app_id}/historical-scenarios")
             if isinstance(resp, dict) and "error" not in resp:
                 historical = resp.get("scenarios") or []
+                # Quote-demand cases are scored by the live benchmark too (once
+                # BENCHMARK_QUOTE_CORPUS is armed) and are returned under a separate
+                # key; merge them so the local tester replays the SAME set. They
+                # carry a "quote:" scenario prefix, so downstream bucketing that
+                # keys on "hist:"/"quote:" attributes them correctly.
+                historical = historical + (resp.get("quote_scenarios") or [])
         except Exception:
             historical = []
 
