@@ -3429,6 +3429,19 @@ async def initialize(ctx: ServerContext) -> dict:
                     current.round_id,
                     epoch=current_epoch,
                 )
+                if result.get("deferred"):
+                    # Finalize outcome was UNKNOWN (relayer unreachable / lost reply).
+                    # The round stays CERTIFIED; return False so the loop does NOT open
+                    # the next round and re-drives activation on a later tick once the
+                    # relayer is reachable (the finalize is idempotent). Prevents the
+                    # 2026-07-17 orphaned-merge split.
+                    logger.warning(
+                        "Solver round activation DEFERRED for round=%s (finalize "
+                        "unconfirmed: %s) — staying certified; will re-drive when the "
+                        "relayer is reachable.",
+                        current.round_id, result.get("defer_reason") or "-",
+                    )
+                    return False
                 logger.info(
                     "Solver round activated by leader: round=%s changed=%s next=%s",
                     result.get("round_id"),
