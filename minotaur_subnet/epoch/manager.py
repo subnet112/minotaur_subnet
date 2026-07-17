@@ -746,6 +746,7 @@ class EpochManager:
         merge_ok = True
         merge_reason = ""  # specific abort code from the callback (empty on success)
         merge_stage = ""   # where it failed; "client" => UNKNOWN outcome => defer+reconcile
+        merge_main_sha = ""  # canonical main HEAD after a successful publish (for the reconciler)
         # Finalization (on-chain attest + squash-merge the miner's PR) is the
         # LEADER's job: it alone holds the solver-repo PAT and is the single
         # on-chain writer. A FOLLOWER must NOT re-attest or re-merge — it has no
@@ -771,6 +772,7 @@ class EpochManager:
                 merge_ok = bool(cb_result)
                 merge_reason = str(getattr(cb_result, "reason", "") or "")
                 merge_stage = str(getattr(cb_result, "stage", "") or "")
+                merge_main_sha = str(getattr(cb_result, "main_sha", "") or "")
             except Exception as exc:
                 logger.warning("on_champion_adopted callback failed: %s", exc)
                 merge_ok = False
@@ -930,7 +932,10 @@ class EpochManager:
                 "self-verified" if _self_verified else "quorum<=1 leader-trust",
             )
 
-        await self._hot_swap(submission, effective_epoch, round_id=round_id)
+        await self._hot_swap(
+            submission, effective_epoch, round_id=round_id,
+            canonical_main_sha=merge_main_sha,
+        )
         activated = self._round_store.activate_round(
             round_id,
             effective_epoch=effective_epoch,
@@ -2027,6 +2032,7 @@ class EpochManager:
         round_id: str | None = None,
         force: bool = False,
         capture_previous: bool = True,
+        canonical_main_sha: str | None = None,
     ) -> None:
         """Load the winning submission and swap it into the block loop.
 
@@ -2156,6 +2162,7 @@ class EpochManager:
                     activated_round_id=round_id,
                     activated_epoch=epoch,
                     activated_at=adopted_at,
+                    canonical_main_sha=canonical_main_sha,
                 ),
                 sync_open_round=False,
             )
