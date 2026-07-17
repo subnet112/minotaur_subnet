@@ -42,7 +42,7 @@ def test_sig_verify_on_by_default(monkeypatch):
     """PR-2 flipped the default from opt-in to opt-out (audit C2)."""
     monkeypatch.delenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", raising=False)
     body = _make_body()  # empty proposer/signature
-    err = _verify_champion_proposal_signature(body)
+    err = _verify_champion_proposal_signature(body.model_dump())
     assert err is not None
     assert "Missing proposer" in err
 
@@ -56,7 +56,7 @@ def test_sig_verify_env_opt_out_now_ignored(monkeypatch):
     """
     monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "0")
     body = _make_body()  # empty proposer/signature
-    err = _verify_champion_proposal_signature(body)
+    err = _verify_champion_proposal_signature(body.model_dump())
     assert err is not None
     assert "Missing proposer" in err
 
@@ -64,7 +64,7 @@ def test_sig_verify_env_opt_out_now_ignored(monkeypatch):
 def test_sig_verify_on_rejects_missing(monkeypatch):
     monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
     body = _make_body(proposer="", proposer_signature="")
-    err = _verify_champion_proposal_signature(body)
+    err = _verify_champion_proposal_signature(body.model_dump())
     assert err is not None
     assert "Missing proposer" in err
 
@@ -87,7 +87,7 @@ def test_sig_verify_on_accepts_real_signature(monkeypatch, unlock_leader):
     # model_dump must include the updated signature so the helper strips it
     body.model_dump.return_value["proposer_signature"] = body.proposer_signature
 
-    assert _verify_champion_proposal_signature(body) is None
+    assert _verify_champion_proposal_signature(body.model_dump()) is None
 
 
 def test_sig_verify_locked_leader_accepts_matching_signer(monkeypatch):
@@ -111,7 +111,7 @@ def test_sig_verify_locked_leader_accepts_matching_signer(monkeypatch):
     body.proposer_signature = signed.signature.hex()
     body.model_dump.return_value["proposer_signature"] = body.proposer_signature
 
-    assert _verify_champion_proposal_signature(body) is None
+    assert _verify_champion_proposal_signature(body.model_dump()) is None
 
 
 def test_sig_verify_locked_leader_rejects_other_signer(monkeypatch):
@@ -136,7 +136,7 @@ def test_sig_verify_locked_leader_rejects_other_signer(monkeypatch):
     body.proposer_signature = signed.signature.hex()
     body.model_dump.return_value["proposer_signature"] = body.proposer_signature
 
-    err = _verify_champion_proposal_signature(body)
+    err = _verify_champion_proposal_signature(body.model_dump())
     assert err is not None
     assert "locked leader" in err
 
@@ -159,7 +159,7 @@ def test_sig_verify_on_rejects_wrong_signer(monkeypatch):
     body.proposer_signature = signed.signature.hex()
     body.model_dump.return_value["proposer_signature"] = body.proposer_signature
 
-    err = _verify_champion_proposal_signature(body)
+    err = _verify_champion_proposal_signature(body.model_dump())
     assert err is not None
     assert "Signer mismatch" in err
 
@@ -233,32 +233,45 @@ def _peer_net():
     return net, acct
 
 
-def test_champion_proposal_sign_then_model_parse_then_verify(monkeypatch, unlock_leader):
-    """REGRESSION: leader builds+signs via PeerNetwork, follower PARSES into the request
-    model and verifies. A non-model field in the signed payload (the old `timestamp`)
-    is dropped by model_dump on the verify side → signer mismatch. This is the exact
-    live quorum path; before the fix it failed with 'Signer mismatch'."""
+def test_champion_proposal_sign_then_verify_raw_wire_dict(monkeypatch, unlock_leader):
+    """B2: leader builds+signs via PeerNetwork (raw dict); follower verifies over the
+    RAW WIRE dict (request.json()), NOT the parsed model. This is the exact live quorum
+    path — verifying the bytes the leader actually signed."""
     monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
     monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
-    from minotaur_subnet.api.routes.submissions.models import ChampionConsensusProposalRequest
 
     net, _acct = _peer_net()
     payload = net._build_champion_proposal_payload(
         _proposal(), close_epoch=7, quorum_required=2,
         decision_deadline_epoch=8, committee_block=9,
     )
-    assert payload.get("proposer_signature")            # the leader signed it
-    body = ChampionConsensusProposalRequest(**payload)   # the follower's parse (drops extras)
-    assert _verify_champion_proposal_signature(body) is None  # recovery == leader
+    assert payload.get("proposer_signature")                    # the leader signed it
+    assert _verify_champion_proposal_signature(payload) is None  # verify the raw wire dict
 
 
-def test_champion_proposal_payload_has_no_non_model_fields():
-    """STRUCTURAL GUARD: every signed-payload key must be a request-model field, else
-    model_dump() drops it on verify and breaks the signature (the timestamp bug).
-    Prevents re-introducing a non-model field into the signed canonical."""
+def test_raw_dict_verify_tolerates_non_model_field(monkeypatch, unlock_leader):
+    """B2 DUAL-VERIFY PROOF (the inverse of the old structural guard): a signed-payload
+    key that is NOT a ChampionConsensusProposalRequest field NO LONGER breaks verification
+    — the follower verifies the raw wire bytes, so the leader can add a new field (B3's
+    benchmark_anchor_epoch) without a staggered-rollout auth break. The old model_dump
+    verifier would drop such a key and fail 'Signer mismatch' (the #378 outage)."""
+    monkeypatch.setenv("CONSENSUS_REQUIRE_SIGNED_CHAMPION_PROPOSALS", "1")
+    monkeypatch.delenv("CONSENSUS_ENFORCE_ONCHAIN_REGISTRY", raising=False)
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
     from minotaur_subnet.api.routes.submissions.models import ChampionConsensusProposalRequest
 
-    net, _acct = _peer_net()
-    payload = net._build_champion_proposal_payload(_proposal())
-    extra = set(payload) - set(ChampionConsensusProposalRequest.model_fields.keys())
-    assert not extra, f"signed payload has non-model fields (dropped on verify): {extra}"
+    acct = Account.create()
+    payload = {
+        "round_id": "round-1", "proposer": acct.address,
+        # a field the current request model does NOT declare — mimics a future B3 field
+        # (or the #378 `timestamp`) present in the SIGNED canonical:
+        "benchmark_anchor_epoch": 42,
+    }
+    assert "benchmark_anchor_epoch" not in ChampionConsensusProposalRequest.model_fields
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["proposer_signature"] = Account.sign_message(
+        encode_defunct(text=canonical), private_key=acct.key,
+    ).signature.hex()
+    # Raw-dict verify PASSES despite the non-model field (the model_dump path would fail).
+    assert _verify_champion_proposal_signature(payload) is None
