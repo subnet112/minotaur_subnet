@@ -1200,23 +1200,39 @@ async def get_historical_scenarios(
     sample set. Use ``n_per_chain`` to cap sample size.
     """
     from minotaur_subnet.harness.order_sampler import sample_historical_orders
+    from minotaur_subnet.shared.feature_flags import quote_corpus_enabled
 
     s = _store()
+    _cap = max(1, min(n_per_chain, 50))
     # App_id stands in as the pseudo-round-id for deterministic sampling
     # — miners aren't running inside a solver round, but repeatability
     # across dry-runs is still desirable.
     sampled = sample_historical_orders(
         app_store=s,
         round_id=f"dryrun:{app_id}",
-        n_per_chain=max(1, min(n_per_chain, 50)),
+        n_per_chain=_cap,
     )
     # Filter to this app only (the sampler doesn't filter by app_id)
     for_app = [o for o in sampled if o.get("app_id") == app_id]
-    return {
+    result: dict[str, Any] = {
         "app_id": app_id,
         "scenarios": for_app,
         "total": len(for_app),
     }
+    # Quote-demand cases the miner is (or will be) scored on. Shown whenever the
+    # corpus flag is on so the preview matches the real Stage-2 set; the raw quote
+    # feed for blind-spot hunting is always available at /v1/quotes?app_id=.
+    if quote_corpus_enabled():
+        from minotaur_subnet.harness.order_sampler import sample_historical_quotes
+        q_sampled = sample_historical_quotes(
+            app_store=s,
+            round_id=f"dryrun:{app_id}",
+            n_per_chain=_cap,
+        )
+        q_for_app = [q for q in q_sampled if q.get("app_id") == app_id]
+        result["quote_scenarios"] = q_for_app
+        result["quote_total"] = len(q_for_app)
+    return result
 
 
 @router.post("/apps/{app_id}/activate")

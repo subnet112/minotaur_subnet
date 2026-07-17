@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from minotaur_subnet.dex_compare.store import DexCompareStore
 from tests.dex_compare._helpers import make_row, make_trade, outcome
 
@@ -58,6 +60,57 @@ def test_distinct_chains(tmp_path):
     store.insert(make_row({"minotaur": outcome("minotaur", output_raw="1")},
                           trade=make_trade(chain_id=1)))
     assert store.distinct_chains() == [1, 8453]
+
+
+def test_insert_roundtrips_trade_source(tmp_path):
+    store = DexCompareStore(tmp_path / "dc.db")
+    trade = make_trade()
+    trade.trade_source = "cow_onchain"
+    store.insert(make_row({"minotaur": outcome("minotaur", output_raw="1")}, trade=trade))
+    rows = store.fetch_since(None, 0.0)
+    assert rows[0]["trade_source"] == "cow_onchain"
+
+
+def test_trade_source_defaults_null(tmp_path):
+    store = DexCompareStore(tmp_path / "dc.db")
+    store.insert(make_row({"minotaur": outcome("minotaur", output_raw="1")}))  # default trade
+    assert store.fetch_since(None, 0.0)[0]["trade_source"] is None
+
+
+def test_migration_adds_trade_source_column(tmp_path):
+    # Build a pre-trade_source DB by hand, then let the store migrate it.
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE comparisons(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            chain_id INTEGER NOT NULL, order_id TEXT, app_id TEXT, intent_function TEXT,
+            input_token TEXT NOT NULL, output_token TEXT NOT NULL, input_amount TEXT NOT NULL,
+            input_decimals INTEGER, output_decimals INTEGER, input_symbol TEXT, output_symbol TEXT,
+            input_is_native INTEGER NOT NULL DEFAULT 0, output_is_native INTEGER NOT NULL DEFAULT 0,
+            gas_price_wei TEXT, mino_status TEXT NOT NULL, mino_output TEXT, mino_gas_units INTEGER,
+            mino_fee_wei TEXT, mino_dex TEXT, results_json TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1)"""
+    )
+    conn.execute(
+        "INSERT INTO comparisons(created_at,chain_id,input_token,output_token,input_amount,"
+        "mino_status,results_json) VALUES(?,?,?,?,?,?,?)",
+        (1.0, 8453, "0xIN", "0xOUT", "1", "ok", "{}"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = DexCompareStore(db)  # __init__ -> _ensure_schema migrates
+    with store._connect() as c:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(comparisons)")}
+    assert "trade_source" in cols
+    rows = store.fetch_since(None, 0.0)
+    assert len(rows) == 1 and rows[0]["trade_source"] is None  # old rows read as legacy
+    # new inserts still work post-migration
+    trade = make_trade()
+    trade.trade_source = "cow_onchain"
+    store.insert(make_row({"minotaur": outcome("minotaur", output_raw="1")}, trade=trade))
+    assert any(r["trade_source"] == "cow_onchain" for r in store.fetch_since(None, 0.0))
 
 
 def test_wal_mode_and_indexes(tmp_path):

@@ -31,6 +31,7 @@ def set_store(store: Any) -> None:
 async def dex_compare_stats(
     window_days: int = Query(30, ge=1, le=365),
     chain_id: int | None = Query(None),
+    source: str | None = Query(None, description="filter by trade source: historical | cow_onchain"),
 ) -> dict[str, Any]:
     """Per-chain comparison of the Minotaur solver vs external DEX aggregators."""
     if _store is None:
@@ -41,6 +42,11 @@ async def dex_compare_stats(
         }
     since = time.time() - window_days * 86400
     rows = await asyncio.to_thread(_store.fetch_since, chain_id, since, None)
+    # isinstance guard: when this handler is called directly (tests, not via
+    # FastAPI) an unset Query param is a truthy Query sentinel, not None.
+    if isinstance(source, str) and source:
+        # NULL trade_source == legacy == "historical".
+        rows = [r for r in rows if (r.get("trade_source") or "historical") == source]
     response = build_stats_response(rows, window_days)
     response["enabled"] = True
     return response
