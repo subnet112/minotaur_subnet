@@ -320,6 +320,12 @@ class CertifyRoundRequest(BaseModel):
     benchmark_pack_hash: str | None = None
     shadow_case_log_hash: str | None = None
     effective_epoch: int = Field(..., ge=0)
+    # B3: the leader's real round-open anchor epoch (RoundState.benchmark_anchor_epoch),
+    # carried so a follower that adopts via the certify path anchors its fork pin to the
+    # SAME epoch as the leader (else it falls back to opened_epoch → PACK_HASH_MISMATCH at
+    # quorum>1). Safe to add on the certify model any time: this path already verifies the
+    # RAW wire dict. None from a pre-B3 leader → follower falls back to opened_epoch.
+    benchmark_anchor_epoch: int | None = Field(default=None, ge=0)
     quorum_required: int = Field(0, ge=0)
     # v2 EIP-712 digest fields from the leader's SIGNED proposal. MUST be declared so
     # the /certify broadcast can carry the leader's signed commit_hash/nonce/deadline to
@@ -375,6 +381,12 @@ class ChampionConsensusProposalRequest(BaseModel):
     benchmark_pack_hash: str | None = None
     shadow_case_log_hash: str | None = None
     effective_epoch: int = Field(..., ge=0)
+    # B3: leader's real round-open anchor epoch, so a follower adopting via the PROPOSAL
+    # path anchors its fork pin identically. Adding this field is signature-safe ONLY
+    # because B2 moved proposal-sig verification to raw-dict canonicalization; it MUST NOT
+    # ship before B2 is fleet-wide. None from a pre-B3 leader → follower falls back to
+    # opened_epoch (the current, quorum=1-safe behavior).
+    benchmark_anchor_epoch: int | None = Field(default=None, ge=0)
     close_epoch: int | None = Field(default=None, ge=0)
     quorum_required: int | None = Field(default=None, ge=0)
     decision_deadline_epoch: int | None = Field(default=None, ge=0)

@@ -66,7 +66,7 @@ async def test_certify_handler_forwards_v2_overrides_without_attributeerror():
         captured.update(kwargs)
         raise RuntimeError("stop-after-builder")  # we only need the forwarded kwargs
 
-    async def _fake_prepare(round_id, *, candidate_submission_id=None):
+    async def _fake_prepare(round_id, *, candidate_submission_id=None, benchmark_anchor_epoch=None):
         return certifying
 
     with patch.object(cc, "_maybe_prepare_round_for_certification", _fake_prepare), \
@@ -98,7 +98,7 @@ async def test_certify_handler_absent_v2_fields_passes_none_override():
         captured.update(kwargs)
         raise RuntimeError("stop")
 
-    async def _fake_prepare(round_id, *, candidate_submission_id=None):
+    async def _fake_prepare(round_id, *, candidate_submission_id=None, benchmark_anchor_epoch=None):
         return certifying
 
     with patch.object(cc, "_maybe_prepare_round_for_certification", _fake_prepare), \
@@ -141,7 +141,7 @@ async def test_certify_handler_forwards_incumbent_override():
 
     certifying = SimpleNamespace(status=RoundStatus.CERTIFYING, decision_deadline_epoch=None)
 
-    async def _fake_prepare(round_id, *, candidate_submission_id=None):
+    async def _fake_prepare(round_id, *, candidate_submission_id=None, benchmark_anchor_epoch=None):
         return certifying
 
     async def _run(body):
