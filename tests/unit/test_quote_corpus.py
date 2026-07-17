@@ -268,17 +268,19 @@ class TestStoreRoundtrip:
     def test_missing_returns_none(self, tmp_path):
         assert self._store(tmp_path).get_quote("absent") is None
 
-    def test_prune_keeps_newest(self, tmp_path):
+    def test_prune_round_anchored(self, tmp_path):
+        # Phase-2: prune_quotes(min_keep_epoch) keeps captured_opened_epoch >= arg,
+        # dropping older + unstamped (None) rows — a pure function of the anchor.
         s = self._store(tmp_path)
         for i in range(10):
             q = _make_quote(quote_id=f"q_{i:02d}")
-            q["created_at"] = 1_700_000_000.0 + i  # ascending; higher = newer
+            q["captured_opened_epoch"] = 100 + i  # 100..109
             s.save_quote(q)
-        pruned = s.prune_quotes(4)
+        pruned = s.prune_quotes(106)          # keep captured >= 106 -> q_06..q_09
         assert pruned == 6
         kept = {q["quote_id"] for q in s.list_quotes()}
         assert kept == {"q_06", "q_07", "q_08", "q_09"}
-        assert s.prune_quotes(4) == 0  # idempotent at/under cap
+        assert s.prune_quotes(0) == 0         # nothing older than 0 -> no-op
 
     def test_list_ids_and_delete(self, tmp_path):
         s = self._store(tmp_path)
