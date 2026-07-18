@@ -211,12 +211,13 @@ def _create_body(**kw):
     return b
 
 
-def test_create_no_auth_is_403(client):
+def test_create_no_auth_is_401(client):
+    # SECURITY 2026-07-18: app creation runs untrusted JS in the scoring sandbox,
+    # so it is now admin-only (previously self-serve). No admin key -> 401.
     c, _ = client
     r = c.post("/v1/apps/", json=_create_body())
-    assert r.status_code == 403
-    d = r.json()["detail"].lower()
-    assert "owner_signature" in d or "admin" in d
+    assert r.status_code == 401
+    assert "admin" in r.json()["detail"].lower()
 
 
 def test_create_admin_key_passes_gate(client):
@@ -226,7 +227,12 @@ def test_create_admin_key_passes_gate(client):
     assert r.status_code == 200, r.text  # past the gate; create_app_intent runs
 
 
-def test_create_owner_signature_no_admin_binds_owner(client):
+def test_create_owner_signature_without_admin_now_rejected(client):
+    # SECURITY 2026-07-18: the self-serve owner_signature create path executed
+    # untrusted JS in the api process (the credential-exfil vector that leaked
+    # RELAYER_PRIVATE_KEY). Creation is now admin-only; an owner_signature alone
+    # no longer passes the gate. (Re-opening a hardened self-serve path — real
+    # isolate, env-scrubbed sandbox — is a follow-up.)
     c, _ = client
     dl = _future(c)
     ph = app_auth.create_owner_binding_hash(_CJS.strip(), _CSOL.strip())
@@ -235,11 +241,7 @@ def test_create_owner_signature_no_admin_binds_owner(client):
         app_id="", params_hash=ph, nonce=0, deadline=dl,
     )
     r = c.post("/v1/apps/", json=_create_body(owner_signature=sig, owner_deadline=dl))
-    assert r.status_code == 200, r.text
-    out = r.json()
-    assert "app_id" in out, out
-    # Ownership PROVEN by key + bound to the signer — no admin key used.
-    assert out.get("deployer", "").lower() == OWNER.address.lower()
+    assert r.status_code == 401, r.text
 
 
 # ── update_scoring: admin-key-only gate replaced by the standard matrix ──

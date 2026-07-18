@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import asdict
 from typing import Any
@@ -65,6 +66,39 @@ _SANDBOX_ACQUIRE_TIMEOUT_SEC = float(
 )
 _SANDBOX_SEMAPHORE: asyncio.Semaphore | None = None
 _SANDBOX_SEMAPHORE_LOCK = asyncio.Lock()
+
+
+# ── SECURITY: sandbox subprocess environment allowlist ──────────────────────
+# ``create_subprocess_exec`` inherits the FULL parent environment by default.
+# The api container env holds RELAYER_PRIVATE_KEY, VALIDATOR_PRIVATE_KEY,
+# ADMIN_API_KEY, SOLVER_REPO_TOKEN, SUBMISSION_GIT_CLONE_PASSWORD, etc. Node's
+# ``vm`` module is NOT a security boundary (a prototype/constructor escape
+# reaches the real host ``process.env``), so untrusted scoring JS that escapes
+# the sandbox could read every secret and exfiltrate it (e.g. straight back in
+# the score/validate response). We therefore pass an EXPLICIT allowlist as
+# ``env=`` so the Node child sees ONLY the non-secret inputs runner.js actually
+# reads — the per-chain RPC endpoints + the HTTP domain allowlist. Everything
+# else (all secrets) is dropped. runner.js needs nothing more: node is exec'd
+# by absolute path (``shutil.which`` in the parent), requires only built-ins,
+# and takes its heap cap via a CLI flag — so PATH/NODE_OPTIONS are unneeded.
+_SANDBOX_ENV_PASSTHROUGH = frozenset(
+    {"ANVIL_RPC_URL", "BASE_RPC_URL", "JS_SCORING_ALLOWED_DOMAINS"}
+)
+_SANDBOX_ENV_RPC_RE = re.compile(r"^RPC_URL_\d+$")  # per-chain override, e.g. RPC_URL_8453
+
+
+def _sandbox_child_env() -> dict[str, str]:
+    """The MINIMAL, secret-free environment for the Node sandbox subprocess.
+
+    Returns only the RPC endpoint URLs and the HTTP domain allowlist that
+    ``runner.js`` reads from ``process.env`` — never any credential. This is a
+    full replacement env (not additive), so the child inherits NOTHING else.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k in _SANDBOX_ENV_PASSTHROUGH or _SANDBOX_ENV_RPC_RE.match(k)
+    }
 
 
 async def _get_sandbox_semaphore() -> asyncio.Semaphore:
@@ -189,6 +223,11 @@ class JsSandbox:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # SECURITY: strict allowlist — the child must NEVER inherit the
+                # container's secrets (see _sandbox_child_env). Without this the
+                # Node process holds RELAYER_PRIVATE_KEY et al. and a vm escape
+                # exfiltrates them.
+                env=_sandbox_child_env(),
             )
 
             try:
