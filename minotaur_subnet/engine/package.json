@@ -1,0 +1,13 @@
+{
+  "name": "minotaur-js-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated-VM runner for UNTRUSTED App Intent scoring JS (runner.js). isolated-vm is a real V8 isolate — Node's built-in `vm` is not a security boundary.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "isolated-vm": "5.0.1"
+  }
+}
