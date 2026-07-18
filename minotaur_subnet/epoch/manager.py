@@ -101,6 +101,22 @@ def _adoption_disabled() -> bool:
     )
 
 
+def _finalize_transient_defer_epochs() -> int:
+    """Epochs past a certified round's activation (``effective_epoch``) to keep
+    DEFERRING + re-driving a TRANSIENT pre-write finalize failure (e.g.
+    ``vr_read_failed`` — a BT-EVM ValidatorRegistry read timing out, which lands
+    nothing on-chain) before giving up and aborting. The merge-gate only runs at/after
+    ``effective_epoch``, so the retry window is measured from there. ~1 epoch ≈
+    EPOCH_SECONDS (~60s), so the default 10 gives a ~10-min recovery window for a
+    cold-boot RPC blip. Bounded so a SUSTAINED outage still aborts rather than pinning
+    the round open. Env-overridable; read at call time; floored at 0.
+    """
+    try:
+        return max(0, int(os.environ.get("FINALIZE_TRANSIENT_DEFER_EPOCHS", "10") or "10"))
+    except (TypeError, ValueError):
+        return 10
+
+
 def _time_weighted_observe_enabled() -> bool:
     """DEFAULT OFF: when on, ``_build_weights_mapping`` additionally computes the
     time-weighted (throne-time proportional) emission vector and LOGS it next to
@@ -822,25 +838,67 @@ class EpochManager:
             # already-merged => success), so the retry COMPLETES rather than stranding a
             # landed win. Bound the defer by ``decision_deadline_epoch``; past it we
             # abort, and a reconcile pass reverts any orphaned merge.
+            #
+            # A transient PRE-WRITE finalize failure gets its OWN, differently-bounded
+            # defer. ``vr_read_failed`` (the relayer's BT-EVM ValidatorRegistry
+            # re-verification RPC read timing out — the 2026-07-18 13:34 cold-boot case)
+            # fails BEFORE any attest or merge, so NOTHING lands on-chain; it is infra,
+            # not a validation refusal, and the finalize is idempotent. Crucially this
+            # merge-gate only ever runs at ``epoch >= effective_epoch`` (the guard
+            # above), and ``effective_epoch`` is structurally >= ``decision_deadline_epoch``
+            # (activation delay >= decision window + 2) — so the UNKNOWN-case deadline
+            # bound is ALREADY spent for a transient read; bounding by it would abort on
+            # the first attempt and discard the win. Bound the retry window from
+            # ACTIVATION instead: defer + re-drive (the coordinator retries every tick)
+            # while ``epoch <= effective_epoch + grace``, so a recovering RPC COMPLETES
+            # the certified win; ABORT past it so a SUSTAINED outage can't pin the round
+            # open. Scoped to ``vr_read_failed`` only — every other outcome, including
+            # other ``validation``-stage refusals (quorum miss, invalid cert), aborts.
+            _TRANSIENT_DEFERRABLE = frozenset({"vr_read_failed"})
             _finalize_unknown = merge_stage == "client"
+            _transient_read = merge_reason in _TRANSIENT_DEFERRABLE
             _defer_deadline = int(getattr(round_state, "decision_deadline_epoch", 0) or 0)
-            if _finalize_unknown and (not _defer_deadline or epoch <= _defer_deadline):
+            # #906 UNKNOWN-outcome defer: bounded by the decision deadline (unchanged).
+            _unknown_defer = _finalize_unknown and (
+                not _defer_deadline or epoch <= _defer_deadline
+            )
+            # Transient pre-write read defer: bounded from the round's OWN activation
+            # epoch. Anchor on the STORED effective epoch (certificate/round_state), NOT
+            # the ``or epoch`` fallback used for the line ~742 guard — otherwise a
+            # degenerate round with no stored effective epoch would track ``epoch``
+            # forward on every re-drive and defer UNBOUNDEDLY. Certify guarantees a
+            # positive effective_epoch, so a zero anchor can't arise on the normal path;
+            # binding here just makes the window fail-closed (anchor 0 => never defer).
+            _activation_anchor = int(
+                (certificate.effective_epoch or 0)
+                or (getattr(round_state, "effective_epoch", 0) or 0)
+            )
+            _read_defer_until = _activation_anchor + _finalize_transient_defer_epochs()
+            _read_defer = (
+                _transient_read and _activation_anchor > 0 and epoch <= _read_defer_until
+            )
+            if _unknown_defer or _read_defer:
                 logger.warning(
-                    "[merge-gate] round %s: finalize outcome UNKNOWN (stage=client "
-                    "code=%s) — DEFERRING activation (round stays certified; the "
-                    "coordinator re-drives when the relayer is reachable), champion "
-                    "unchanged for now. epoch=%s defer_deadline=%s",
-                    round_id, merge_reason or "-", epoch, _defer_deadline or "none",
+                    "[merge-gate] round %s: finalize DEFERRED (%s, code=%s) — round "
+                    "stays certified; the coordinator re-drives the idempotent finalize "
+                    "when the relayer/chain recovers, champion unchanged for now. "
+                    "epoch=%s defer_until=%s",
+                    round_id,
+                    "UNKNOWN outcome (stage=client)" if _finalize_unknown
+                    else "transient pre-write read failure",
+                    merge_reason or "-", epoch,
+                    (_defer_deadline or "none") if _finalize_unknown else _read_defer_until,
                 )
                 result["deferred"] = True
                 result["defer_reason"] = merge_reason or "finalize_unconfirmed"
                 return result
-            if _finalize_unknown:
+            if _finalize_unknown or _transient_read:
                 logger.error(
-                    "[merge-gate] round %s: finalize outcome still UNKNOWN past the "
-                    "defer deadline (epoch=%s > %s) — aborting; a reconcile pass will "
-                    "revert any orphaned merge.",
-                    round_id, epoch, _defer_deadline,
+                    "[merge-gate] round %s: finalize still unresolved past its defer "
+                    "window (epoch=%s stage=%s code=%s) — aborting%s.",
+                    round_id, epoch, merge_stage or "-", merge_reason or "-",
+                    "; a reconcile pass will revert any orphaned merge"
+                    if _finalize_unknown else "",
                 )
             logger.error(
                 "[merge-gate] round %s certified, but on-chain attest + PR merge did "
