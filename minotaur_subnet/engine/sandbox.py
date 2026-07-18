@@ -21,6 +21,11 @@ import shutil
 from dataclasses import asdict
 from typing import Any
 
+try:
+    import resource  # POSIX-only; used to disable core dumps in the Node child
+except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows dev box)
+    resource = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 # Path to the Node.js runner script (co-located with this module)
@@ -71,6 +76,32 @@ _SANDBOX_ACQUIRE_TIMEOUT_SEC = float(
 )
 _SANDBOX_SEMAPHORE: asyncio.Semaphore | None = None
 _SANDBOX_SEMAPHORE_LOCK = asyncio.Lock()
+
+# Hard ceiling on bytes read back from the Node child's stdout. runner.js already
+# caps its own serialized result (MAX_RESULT_BYTES = 4 MB), so this is a
+# defence-in-depth guard against a runaway/oversized response ballooning the api
+# process memory — comfortably above any legitimate scoring result.
+_MAX_STDOUT_BYTES = int(
+    os.environ.get("JS_SANDBOX_MAX_STDOUT_BYTES", str(8 * 1024 * 1024))
+)
+
+
+def _drop_core_dumps() -> None:
+    """``preexec_fn`` for the Node child — disable core dumps.
+
+    A malicious App's scoring JS can deterministically SIGSEGV the isolated-vm
+    runner (a ``dispose()``-with-pending-async bug in isolated-vm 5.0.1): the JSON
+    result line is flushed BEFORE the crash so scoring stays correct, but without
+    this every such submission would also write a core file (disk pressure + apport
+    churn) and is trivially repeatable. ``setrlimit(RLIMIT_CORE, 0)`` is a single
+    async-signal-safe syscall — safe from ``preexec_fn`` — and is scoped to the
+    child, so the api process's own core dumps are unaffected. Best-effort.
+    """
+    if resource is not None:
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except (ValueError, OSError):  # pragma: no cover - platform dependent
+            pass
 
 
 # ── SECURITY: sandbox subprocess environment allowlist ──────────────────────
@@ -236,6 +267,9 @@ class JsSandbox:
                 # Node process holds RELAYER_PRIVATE_KEY et al. and a vm escape
                 # exfiltrates them.
                 env=_sandbox_child_env(),
+                # Disable core dumps in the child: untrusted scoring JS can
+                # deterministically SIGSEGV the runner (see _drop_core_dumps).
+                preexec_fn=_drop_core_dumps if resource is not None else None,
             )
 
             try:
@@ -271,6 +305,14 @@ class JsSandbox:
             raise JsSandboxError(
                 "Node.js process produced no output. "
                 f"Exit code: {proc.returncode}"
+            )
+
+        # Defence-in-depth: runner.js caps its own result, but never parse an
+        # oversized blob (a runaway response ballooning api memory).
+        if len(stdout) > _MAX_STDOUT_BYTES:
+            raise JsRuntimeError(
+                f"JS sandbox produced oversized output ({len(stdout)} bytes > "
+                f"{_MAX_STDOUT_BYTES}-byte cap) — refusing to parse"
             )
 
         stdout_text = stdout.decode("utf-8", errors="replace").strip()
