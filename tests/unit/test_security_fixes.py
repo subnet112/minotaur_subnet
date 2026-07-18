@@ -153,18 +153,21 @@ class TestChampionProvenance:
 # ── #19: JS Prototype Pollution Prevention ─────────────────────────────────
 
 class TestJsPrototypeFreezing:
-    """Issue #19: Built-in prototypes must be frozen in JS sandbox."""
+    """Issue #19 (SUPERSEDED by isolated-vm): guest prototype pollution must not
+    escape the JS sandbox. The legacy ``vm.createContext`` path froze built-in
+    prototypes inside the context as a mitigation. runner.js now runs untrusted
+    scoring JS in a real V8 isolate (isolated-vm) — a separate heap, disposed
+    after each call — so guest prototype pollution can reach neither the host nor
+    a subsequent call; the explicit prototype freeze is structurally unnecessary.
+    Pin the stronger mechanism instead of the obsolete freeze strings. Behavioural
+    escape/isolation coverage lives in test_sandbox_isolate_escape.py."""
 
-    def test_runner_js_contains_freeze_calls(self):
-        runner_path = REPO_ROOT / "minotaur_subnet" / "engine" / "runner.js"
-        content = runner_path.read_text()
-
-        assert "Object.freeze(Object.prototype)" in content, \
-            "runner.js must freeze Object.prototype"
-        assert "Object.freeze(Array.prototype)" in content, \
-            "runner.js must freeze Array.prototype"
-        assert "Object.freeze(Promise.prototype)" in content, \
-            "runner.js must freeze Promise.prototype"
+    def test_runner_js_uses_isolated_vm(self):
+        content = (REPO_ROOT / "minotaur_subnet" / "engine" / "runner.js").read_text()
+        assert 'require("isolated-vm")' in content, \
+            "runner.js must run untrusted JS in an isolated-vm isolate — Node's vm is not a security boundary"
+        assert "new ivm.Isolate" in content, \
+            "runner.js must create a real V8 isolate per execution"
 
 
 # ── #20: Path Traversal in Compiler ────────────────────────────────────────
