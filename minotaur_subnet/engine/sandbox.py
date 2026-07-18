@@ -1,13 +1,15 @@
 """
 JsSandbox - Sandboxed JS execution via Node.js subprocess.
 
-Executes JavaScript code in an isolated Node.js VM context with:
-- No access to require/import (no filesystem, network, child_process)
-- No access to process object (no env vars, exit, etc.)
-- Configurable timeout (enforced by both Python asyncio and Node VM)
+Executes JavaScript code in a real V8 isolate (isolated-vm) with:
+- No host realm at all (no require/import, no process, no Buffer, no network)
+- Configurable timeout (enforced by both Python asyncio and the isolate)
 - JSON-based communication over stdin/stdout
 
-The actual sandboxing is done by runner.js using Node's vm.createContext().
+The actual sandboxing is done by runner.js using isolated-vm — a separate V8
+heap with no path back to the host process. Node's ``vm.createContext`` (the
+prior mechanism) is explicitly NOT a security boundary and was escaped in the
+2026-07-18 incident; do not reintroduce it for untrusted code.
 """
 
 import asyncio
@@ -125,8 +127,9 @@ class JsSandbox:
     """Sandboxed JS execution environment using Node.js subprocess.
 
     Each call to execute() or execute_async() spawns a fresh Node.js process,
-    ensuring complete isolation between invocations. The JS code runs inside
-    a vm.createContext sandbox with no access to Node built-ins.
+    ensuring complete isolation between invocations. Within that process the JS
+    code runs inside an isolated-vm isolate (a separate V8 heap) with no access
+    to Node built-ins or the host realm.
     """
 
     def __init__(self, timeout_ms: int = 5000, max_memory_mb: int = 128):
