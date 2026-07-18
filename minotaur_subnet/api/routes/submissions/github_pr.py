@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -85,11 +86,25 @@ def _github_headers(token: str | None = None) -> dict[str, str]:
 def _fetch_pr(
     owner: str, repo: str, pr_number: int, *, timeout: float = 15.0, token: str | None = None,
 ) -> dict:
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers=_github_headers(token),
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed host
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = _github_headers(token)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 fixed host
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if token is not None or exc.code != 401 or "Authorization" not in headers:
+            raise
+
+    # A revoked validator token makes GitHub reject even public resources. The
+    # host and canonical repository are fixed by the caller, so retrying this
+    # public lookup without the bad bearer restores availability without
+    # weakening the explicit-token private submission path.
+    logger.warning("GitHub rejected the public PR token; retrying unauthenticated")
+    public_headers = dict(headers)
+    public_headers.pop("Authorization", None)
+    retry = urllib.request.Request(url, headers=public_headers)
+    with urllib.request.urlopen(retry, timeout=timeout) as resp:  # noqa: S310 fixed host
         return json.loads(resp.read().decode("utf-8"))
 
 
