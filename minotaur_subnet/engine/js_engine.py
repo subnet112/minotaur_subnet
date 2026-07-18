@@ -23,7 +23,12 @@ from minotaur_subnet.shared.types import (
 )
 
 from .context import JsContext
-from .sandbox import JsSandbox, JsSandboxError, JsTimeoutError
+from .sandbox import (
+    JsSandbox,
+    JsSandboxError,
+    JsTimeoutError,
+    SandboxOverloadedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +134,8 @@ class JsExecutionEngine:
         plan: ExecutionPlan,
         simulation: SimulationResult,
         state: IntentState,
+        *,
+        propagate_overload: bool = False,
     ) -> ScoreResult:
         """Execute the JS scoring function and return the score.
 
@@ -142,6 +149,10 @@ class JsExecutionEngine:
             plan: The execution plan submitted by a solver.
             simulation: Result of simulating the plan.
             state: Current on-chain state of the intent.
+            propagate_overload: If True, let ``SandboxOverloadedError`` propagate
+                instead of degrading to ``score=0``. The consensus proposal path
+                sets this so the caller can shed load as a retryable 503 rather
+                than spuriously rejecting a legitimate champion under saturation.
 
         Returns:
             ScoreResult with the score, validity, and breakdown.
@@ -162,6 +173,18 @@ class JsExecutionEngine:
         try:
             raw_result = await self._sandbox.execute_async(
                 js_code, "score", [plan_dict, state_dict, ctx_dict]
+            )
+        except SandboxOverloadedError:
+            # Backpressure, not a scoring outcome. Degrading this to score=0
+            # would REJECT a legitimate proposal under load; on the consensus
+            # path we re-raise so it maps to a retryable 503 instead.
+            if propagate_overload:
+                raise
+            logger.warning("Scoring sandbox overloaded for intent %s", app_id)
+            return ScoreResult(
+                score=0.0,
+                valid=False,
+                reason="JS scoring sandbox overloaded",
             )
         except JsTimeoutError:
             logger.error("Scoring timed out for intent %s", app_id)
@@ -186,6 +209,8 @@ class JsExecutionEngine:
         plan: ExecutionPlan,
         simulation: SimulationResult,
         state: IntentState,
+        *,
+        propagate_overload: bool = False,
     ) -> ScoreResult:
         """Run JS validation (structural checks before scoring).
 
@@ -217,6 +242,15 @@ class JsExecutionEngine:
             raw_result = await self._sandbox.execute_async(
                 js_code, "validate", [plan_dict, state_dict, ctx_dict]
             )
+        except SandboxOverloadedError:
+            if propagate_overload:
+                raise
+            logger.warning("Validation sandbox overloaded for intent %s", app_id)
+            return ScoreResult(
+                score=0.0,
+                valid=False,
+                reason="JS validation sandbox overloaded",
+            )
         except JsTimeoutError:
             logger.error("Validation timed out for intent %s", app_id)
             return ScoreResult(
@@ -245,6 +279,8 @@ class JsExecutionEngine:
         self,
         app_id: str,
         state: IntentState,
+        *,
+        propagate_overload: bool = False,
     ) -> bool:
         """For auto-triggered intents: check if conditions are met.
 
@@ -275,6 +311,13 @@ class JsExecutionEngine:
             result = await self._sandbox.execute_async(
                 js_code, "shouldTrigger", [state_dict, ctx_dict]
             )
+        except SandboxOverloadedError:
+            if propagate_overload:
+                raise
+            logger.warning(
+                "shouldTrigger sandbox overloaded for intent %s", app_id
+            )
+            return False
         except JsSandboxError as exc:
             if "not found in module.exports" in str(exc):
                 logger.debug(
