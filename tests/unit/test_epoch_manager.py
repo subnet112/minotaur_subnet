@@ -1309,6 +1309,114 @@ class TestEpochManager:
         )
 
     @pytest.mark.asyncio
+    async def test_activate_certified_round_defers_on_vr_read_failed(self):
+        """A transient PRE-WRITE finalize failure (``vr_read_failed``) DEFERS — even at
+        the PRODUCTION timing the naive bound got wrong. The merge-gate only runs at
+        ``effective_epoch``, which is ALWAYS past ``decision_deadline_epoch`` (effective
+        = close+22, deadline = close+20). Here deadline=4 < effective=6 and the gate runs
+        at epoch=6, so a decision-deadline bound would abort on the first attempt and
+        discard the win — but the transient defer is measured from ACTIVATION, so it
+        correctly defers + leaves the round CERTIFIED for the coordinator to re-drive."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        # Production relationship: decision deadline is already PAST when the gate runs
+        # (effective_epoch=6 from the helper; set the deadline strictly below it).
+        round_store._rounds[current_round.round_id].decision_deadline_epoch = 4
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "vr_read_failed", "validation", "VR read timed out")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        # Gate runs at epoch == effective_epoch (6) — PAST the decision deadline (4).
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("deferred") is True
+        assert result.get("champion_changed") is False
+        assert result.get("abort_reason") is None
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.CERTIFIED
+        )
+        block_loop.set_solver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_activate_certified_round_aborts_vr_read_past_window(self):
+        """``vr_read_failed`` defers only within ``effective_epoch + grace`` — a
+        SUSTAINED BT-EVM RPC outage (not a transient blip) cannot pin a certified round
+        open forever; past the activation-relative window it ABORTS."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+        from minotaur_subnet.epoch.manager import _finalize_transient_defer_epochs
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        round_store._rounds[current_round.round_id].decision_deadline_epoch = 4
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "vr_read_failed", "validation")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        # effective_epoch=6; step one epoch PAST the activation-relative retry window.
+        past = 6 + _finalize_transient_defer_epochs() + 1
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=past)
+
+        assert result.get("deferred") is not True
+        assert result.get("abort_reason") == "merge_failed:vr_read_failed"
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.ABORTED
+        )
+
+    @pytest.mark.asyncio
+    async def test_activate_certified_round_aborts_other_validation_refusal(self):
+        """The transient defer is scoped to ``vr_read_failed`` ONLY. A DIFFERENT
+        validation-stage outcome — a genuine refusal, not a transient read — still
+        ABORTS at the SAME epoch where ``vr_read_failed`` would defer, so a truly invalid
+        win is never pinned open merely for sharing the 'validation' stage. Guards
+        against the scope silently widening to all validation failures."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        round_store._rounds[current_round.round_id].decision_deadline_epoch = 4
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "no_quorum_cert", "validation", "quorum not reached")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        # epoch=6 is WITHIN the vr_read window, but this is a different code → abort.
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("deferred") is not True
+        assert result.get("abort_reason") == "merge_failed:no_quorum_cert"
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.ABORTED
+        )
+
+    @pytest.mark.asyncio
     async def test_follower_adopts_verified_cert_without_finalizing(self):
         """A FOLLOWER adopts the quorum-certified champion on the verified
         certificate WITHOUT running the leader-only finalization (attest + PR
