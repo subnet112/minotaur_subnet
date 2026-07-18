@@ -57,8 +57,11 @@ class SandboxOverloadedError(JsSandboxError):
 # semaphore caps total in-flight subprocesses so a flood can't take
 # down the host.
 #
-# At the default cap of 4 × ~128 MB heap = ~512 MB peak — survivable on
-# the 4 GB prod box even alongside the 7 Python services. Bump via env
+# Each subprocess now holds TWO heaps: the Node process heap
+# (--max-old-space-size, ~128 MB) AND the isolated-vm isolate's own heap
+# (ivm memoryLimit = 128 MB, runner.js) ≈ ~256 MB peak per subprocess. At the
+# default cap of 4 that is ~1 GB peak — survivable on the 4 GB prod box
+# alongside the 7 Python services, but bump JS_SANDBOX_MAX_CONCURRENT via env
 # only on boxes that can absorb the larger working set.
 _SANDBOX_CONCURRENCY = int(os.environ.get("JS_SANDBOX_MAX_CONCURRENT", "4"))
 _SANDBOX_ACQUIRE_TIMEOUT_SEC = float(
@@ -71,16 +74,18 @@ _SANDBOX_SEMAPHORE_LOCK = asyncio.Lock()
 # ── SECURITY: sandbox subprocess environment allowlist ──────────────────────
 # ``create_subprocess_exec`` inherits the FULL parent environment by default.
 # The api container env holds RELAYER_PRIVATE_KEY, VALIDATOR_PRIVATE_KEY,
-# ADMIN_API_KEY, SOLVER_REPO_TOKEN, SUBMISSION_GIT_CLONE_PASSWORD, etc. Node's
-# ``vm`` module is NOT a security boundary (a prototype/constructor escape
-# reaches the real host ``process.env``), so untrusted scoring JS that escapes
-# the sandbox could read every secret and exfiltrate it (e.g. straight back in
-# the score/validate response). We therefore pass an EXPLICIT allowlist as
-# ``env=`` so the Node child sees ONLY the non-secret inputs runner.js actually
-# reads — the per-chain RPC endpoints + the HTTP domain allowlist. Everything
-# else (all secrets) is dropped. runner.js needs nothing more: node is exec'd
-# by absolute path (``shutil.which`` in the parent), requires only built-ins,
-# and takes its heap cap via a CLI flag — so PATH/NODE_OPTIONS are unneeded.
+# ADMIN_API_KEY, SOLVER_REPO_TOKEN, SUBMISSION_GIT_CLONE_PASSWORD, etc. This
+# env-scrub is DEFENCE-IN-DEPTH: runner.js now runs guest JS in a real V8
+# isolate (isolated-vm), which has no host realm to escape into, but stripping
+# the child's secrets means even a hypothetical addon/host bug can't hand
+# scoring JS a credential. We pass an EXPLICIT allowlist as ``env=`` so the Node
+# child sees ONLY the non-secret inputs runner.js reads — the per-chain RPC
+# endpoints + the HTTP domain allowlist. Everything else (all secrets) is
+# dropped. runner.js needs nothing more: node is exec'd by absolute path
+# (``shutil.which`` in the parent), requires only built-ins + the isolated-vm
+# native addon (resolved from ``engine/node_modules`` by Node relative to the
+# runner.js path — no NODE_PATH), and takes its heap cap via a CLI flag — so
+# PATH/NODE_OPTIONS are unneeded.
 _SANDBOX_ENV_PASSTHROUGH = frozenset(
     {"ANVIL_RPC_URL", "BASE_RPC_URL", "JS_SCORING_ALLOWED_DOMAINS"}
 )

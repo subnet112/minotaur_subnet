@@ -28,11 +28,18 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER = _REPO_ROOT / "minotaur_subnet" / "engine" / "runner.js"
+# runner.js now requires the isolated-vm native addon (real V8 isolate for the
+# untrusted scoring JS). It lives in engine/node_modules, built by the Docker
+# builder stage / the CI `npm install` step.
+_ISOLATED_VM = _RUNNER.parent / "node_modules" / "isolated-vm"
 
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("node") is None,
-    reason="Node.js not installed on this host — H8 runner-level tests skipped",
+    shutil.which("node") is None or not _ISOLATED_VM.exists(),
+    reason=(
+        "node or engine/node_modules/isolated-vm not present — run "
+        "`npm --prefix minotaur_subnet/engine install --omit=dev` first"
+    ),
 )
 
 
