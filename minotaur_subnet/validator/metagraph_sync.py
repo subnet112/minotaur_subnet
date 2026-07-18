@@ -43,7 +43,10 @@ logger = logging.getLogger(__name__)
 # other). Both values are public information already published in the
 # on-chain ValidatorRegistry / metagraph.
 LOCKED_LEADER_HOTKEY = os.environ.get("LOCKED_LEADER_HOTKEY", "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt")
-LOCKED_LEADER_EVM_ADDRESS = os.environ.get("LOCKED_LEADER_EVM_ADDRESS", "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D")
+# Default EVM = the NEW lead validator (post 2026-07-18 rebuild). The prior default
+# 0x3f1649…504D is the RETIRED lead key; leaving it as the default made every follower
+# on an unset env reject the new leader's proposals ("not the locked leader").
+LOCKED_LEADER_EVM_ADDRESS = os.environ.get("LOCKED_LEADER_EVM_ADDRESS", "0x34883C5f753AA36f1A9AA5BFCD2f51FaEA1166A5")
 
 if not LOCKED_LEADER_EVM_ADDRESS:
     logger.warning(
