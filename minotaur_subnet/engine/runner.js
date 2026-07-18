@@ -25,6 +25,12 @@ const RPC_TIMEOUT_MS = 10000;
 const HTTP_TIMEOUT_MS = 10000;
 const HTTP_MAX_RESPONSE_BYTES = 1024 * 1024; // 1 MB
 
+// Cap the serialized scoring result the host will ingest. A guest can only
+// return a JSON-cloned value (already bounded by the isolate heap), but a large
+// return still balloons the parent api's memory when it reads this stdout line —
+// so bound it here and surface a clean error instead of emitting a multi-MB line.
+const MAX_RESULT_BYTES = 4 * 1024 * 1024; // 4 MB serialized result
+
 // RPC URLs per chain (configured via environment)
 const RPC_URLS = {};
 if (process.env.ANVIL_RPC_URL) {
@@ -454,8 +460,16 @@ async function main() {
 
     try {
         const result = await execute(jsCode, functionName, args || []);
-        const response = { success: true, result };
-        process.stdout.write(JSON.stringify(response) + "\n");
+        let serialized = JSON.stringify({ success: true, result }) + "\n";
+        if (serialized.length > MAX_RESULT_BYTES) {
+            // Don't hand the host a multi-MB line; report a bounded error instead.
+            serialized = JSON.stringify({
+                success: false,
+                error: `scoring result exceeds ${MAX_RESULT_BYTES}-byte limit (${serialized.length} bytes)`,
+                errorType: "ResultTooLarge",
+            }) + "\n";
+        }
+        process.stdout.write(serialized);
     } catch (err) {
         const msg = err && err.message ? err.message : String(err);
         // isolated-vm surfaces a timeout as an Error whose message contains
