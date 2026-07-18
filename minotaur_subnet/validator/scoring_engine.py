@@ -319,8 +319,17 @@ class ScoringEngine:
         simulation: SimulationResult,
         state: IntentState,
     ) -> float:
-        """Score a plan via JS engine. Returns the score value."""
-        score_result = await self.js_engine.score(app_id, plan, simulation, state)
+        """Score a plan via JS engine. Returns the score value.
+
+        ``propagate_overload=True``: this runs only on the consensus proposal
+        path (via ``_verify_and_score_proposal_inner`` → ``proposal_handler``,
+        which maps ``SandboxOverloadedError`` to a retryable 503). Degrading
+        sandbox saturation to ``score=0`` here would REJECT a legitimate
+        champion under load and can trip spurious consensus/dethrone failures.
+        """
+        score_result = await self.js_engine.score(
+            app_id, plan, simulation, state, propagate_overload=True
+        )
         return score_result.score
 
     async def verify_and_score_proposal(
@@ -470,6 +479,12 @@ class ScoringEngine:
         contract_address = None
 
         if app_id and app_id in self.js_engine.list_loaded_intents() and plan_data:
+            # Sandbox backpressure must NOT be swallowed into "use leader score"
+            # by the broad handler below (that would rubber-stamp the leader's
+            # asserted score under load, violating CON-4/VAL-14). Let it
+            # propagate to proposal_handler's 503 map so the leader retries.
+            from minotaur_subnet.engine import SandboxOverloadedError
+
             try:
                 deployment = self.store.get_deployment(app_id, chain_id=chain_id)
                 interactions = [
@@ -565,6 +580,11 @@ class ScoringEngine:
                     print(f"[VALIDATOR] bridge leg sim passed, score={local_score}", flush=True)
                 else:
                     local_score = await self._score_via_js(app_id, plan, simulation, state)
+            except SandboxOverloadedError:
+                # Backpressure, not a scoring failure: re-raise past the broad
+                # handler so the request maps to a retryable 503 instead of
+                # falling back to the leader's unverified score.
+                raise
             except Exception as exc:
                 logger.warning("Re-scoring failed, using leader score: %s", exc)
 
