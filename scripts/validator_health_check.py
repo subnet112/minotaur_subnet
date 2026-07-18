@@ -101,7 +101,7 @@ REGISTRY_ABI = [
 # operator's row falls back to "registry-only" when their axon is
 # unreachable — same behaviour the script had before this map existed.
 KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
-    "0x3f1649704bacf67eeed4b373f761dfadd9df504d": {
+    "0x34883c5f753aa36f1a9aa5bfcd2f51faea1166a5": {
         "hotkey": "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt",
         "name": "Minotaur Leader",
         "url": "https://minotaursubnet.com",
@@ -121,7 +121,7 @@ KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
         "name": "Kraken",
         "url": None,
     },
-    "0x7ef6fafcd590ad9f60fda6de093dbd238f3845b7": {
+    "0xcd3e41fd2a12080e060dc50f8b26dbc7c89195e9": {
         "hotkey": "5C7N4wGWX2QhRtyHqknp2agx4wzu3q8zP1kNvqdwkCJ7HGHa",
         "name": "Yuma, a DCG Company",
         "url": None,

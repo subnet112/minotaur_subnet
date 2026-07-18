@@ -283,7 +283,7 @@ class TestMetagraphSync:
 # ── Locked-leader constants are env-overridable ─────────────────────────────
 
 _PROD_LOCKED_LEADER_HOTKEY = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
-_PROD_LOCKED_LEADER_EVM = "0x3f1649704bAcf67EEeD4B373F761dFAdd9df504D"
+_PROD_LOCKED_LEADER_EVM = "0x34883C5f753AA36f1A9AA5BFCD2f51FaEA1166A5"
 
 
 class TestLockedLeaderEnvOverride:
