@@ -789,7 +789,7 @@ services:
     volumes:
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data
-    networks: [minotaur]
+    networks: [minotaur, docker-control]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
       interval: 10s
@@ -927,7 +927,7 @@ services:
     volumes:
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data              # SHARED with the api (read-only sharer of round state)
-    networks: [minotaur]              # NOT benchmark-sandbox — see the router-gate note
+    networks: [minotaur, docker-control]  # NOT benchmark-sandbox; docker-control = reach the socket-proxy (see router-gate note)
     healthcheck:
       # FORWARD-PROGRESS, not just liveness: run_loop bumps the heartbeat file
       # AFTER each completed pass AND each per-image bench step. So both a HUNG sim
@@ -1054,9 +1054,10 @@ services:
       VOLUMES: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [minotaur]
-    # Not exposed to host — only the api service can reach it via the
-    # internal docker network.
+    networks: [docker-control]
+    # Not exposed to host — and NOT on `minotaur`, so an untrusted solver
+    # (live-solver or reactive-bench) cannot reach the Docker-control endpoint.
+    # Only the api + benchmark-worker (also on docker-control) can reach it.
 
 volumes:
   store-data:
@@ -1114,3 +1115,13 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+
+  # Isolated control-plane net: ONLY the api + benchmark-worker reach the
+  # docker-socket-proxy here. The proxy is REMOVED from `minotaur`, so an
+  # untrusted solver on `minotaur` (live-solver or reactive-bench) can no
+  # longer reach the Docker-control endpoint (container create/build → host
+  # escalation — the original-breach class). internal: true — the proxy talks
+  # to the daemon via the socket MOUNT, not the network, so it needs no egress.
+  docker-control:
+    driver: bridge
+    internal: true
