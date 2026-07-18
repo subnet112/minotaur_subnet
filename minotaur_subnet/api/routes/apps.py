@@ -471,7 +471,7 @@ def _store():
 # ── routes ───────────────────────────────────────────────────────────────────
 
 
-@router.post("/apps/")
+@router.post("/apps/", dependencies=[Depends(_require_admin)])
 def create_app(
     body: CreateAppRequest,
     request: Request,
@@ -479,19 +479,18 @@ def create_app(
 ) -> dict[str, Any]:
     """Create a new App Intent with developer-provided JS and Solidity code.
 
-    Auth (either):
-      * ``X-Admin-Key`` (legacy operator path), OR
-      * a self-serve ``owner_signature`` — an EIP-712 ``create_app`` signature
-        over the app content. ``create_app_intent`` recovers the signer and
-        records THAT as the deployer (ownership PROVEN by key, not a shared
-        secret), so a browser frontend can create + own an app with just a
-        MetaMask signature. The non-admin path spawns a Forge/JS validation
-        pass, so it is per-IP rate-limited (``APP_CREATE_RATE_PER_MIN``,
-        default 5/min).
+    ADMIN-GATED (SECURITY 2026-07-18). Creation spawns a Forge/JS validation
+    pass that EXECUTES the submitted JS in the scoring sandbox. The former
+    self-serve ``owner_signature`` path let anonymous callers run arbitrary JS
+    inside the api process — the credential-exfil vector that leaked
+    RELAYER_PRIVATE_KEY. Untrusted-JS execution is now admin-only
+    (``X-Admin-Key``); the sandbox is additionally env-scrubbed
+    (engine/sandbox.py) so no secret is reachable even by an admin-submitted
+    escape. Still per-IP rate-limited (``APP_CREATE_RATE_PER_MIN``, 5/min).
 
-    The on-chain AppRegistry gate is still the final authority — an
-    unregistered app can't be routed against — this gate only stops
-    anonymous callers from burning validation CPU.
+    The on-chain AppRegistry gate remains the final authority — an unregistered
+    app can't be routed against. (Re-opening a hardened self-serve path — real
+    isolate, no secrets in env — is a follow-up.)
     """
     if not ctx.admin_ok and not (body.owner_signature or "").strip():
         raise HTTPException(
@@ -525,19 +524,22 @@ def create_app(
     )
 
 
-@router.post("/apps/validate")
+@router.post("/apps/validate", dependencies=[Depends(_require_admin)])
 async def validate_app(
     body: ValidateAppRequest,
     request: Request,
 ) -> dict[str, Any]:
     """Pre-flight validation for App Intent JS and/or Solidity code.
 
-    PUBLIC (not admin-gated) so the self-serve app-management frontend can
-    check "does my JS parse / does my contract build?" straight from the
-    browser without a shared secret. It spawns a Forge subprocess to compile
-    submitted Solidity — a CPU-DoS surface — so it is per-IP rate-limited
-    (``APP_VALIDATE_RATE_PER_MIN``, default 5/min) and the compile has a hard
-    timeout (compiler.py). No state is changed and nothing is deployed.
+    ADMIN-GATED (SECURITY 2026-07-18). This endpoint EXECUTES the submitted JS
+    in the scoring sandbox (validate_app_intent loads the module to check it
+    exports score()). It was previously PUBLIC, which let an unauthenticated
+    caller run arbitrary JS in the api process — the credential-exfil vector
+    that leaked RELAYER_PRIVATE_KEY. Untrusted-JS execution is now admin-only;
+    the sandbox is additionally env-scrubbed (engine/sandbox.py) so no secret
+    is reachable even by an admin-submitted escape. Still per-IP rate-limited
+    (``APP_VALIDATE_RATE_PER_MIN``, default 5/min); the Solidity compile is a
+    CPU-DoS surface. No state is changed and nothing is deployed.
     """
     per_min = 5
     try:
