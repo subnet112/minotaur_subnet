@@ -1,7 +1,7 @@
 /**
  * App Intent JS Scoring Runner
  *
- * Executes JS scoring functions in a sandboxed VM context.
+ * Executes UNTRUSTED JS scoring functions in a real V8 isolate (isolated-vm).
  * Communicates with the Python JsExecutionEngine via stdin/stdout (JSON).
  *
  * Protocol:
@@ -12,14 +12,14 @@
 
 "use strict";
 
-const vm = require("vm");
+const ivm = require("isolated-vm");
 const http = require("http");
 const https = require("https");
 
 // ── Network helpers for JS scoring code ─────────────────────────────────────
-// These are injected into the sandbox so scoring code can independently
-// verify on-chain state and fetch external data. All calls are read-only
-// and subject to timeouts + domain restrictions.
+// These run in the HOST (trusted) process and are bridged into the isolate as
+// ivm.References (see execute()). All calls are read-only and subject to
+// timeouts + domain/method allowlists.
 
 const RPC_TIMEOUT_MS = 10000;
 const HTTP_TIMEOUT_MS = 10000;
@@ -292,135 +292,124 @@ function readStdin() {
     });
 }
 
-/**
- * Build a minimal sandbox context. No access to Node built-ins
- * (require, process, fs, network, etc.). Only safe globals are exposed.
- */
-function buildSandbox(contextExtras) {
-    const sandbox = {
-        // Safe JS built-ins
-        console: {
-            log: (...args) => {
-                // Redirect to stderr so it doesn't pollute the JSON result on stdout
-                process.stderr.write("[js:log] " + args.map(String).join(" ") + "\n");
-            },
-            warn: (...args) => {
-                process.stderr.write("[js:warn] " + args.map(String).join(" ") + "\n");
-            },
-            error: (...args) => {
-                process.stderr.write("[js:error] " + args.map(String).join(" ") + "\n");
-            },
-            info: (...args) => {
-                process.stderr.write("[js:info] " + args.map(String).join(" ") + "\n");
-            },
-            debug: (...args) => {
-                process.stderr.write("[js:debug] " + args.map(String).join(" ") + "\n");
-            },
-        },
-        // Math and JSON are useful for scoring
-        Math,
-        JSON,
-        // Timing helpers that scoring code might use
-        Date,
-        parseInt,
-        parseFloat,
-        isNaN,
-        isFinite,
-        Number,
-        // Exact arbitrary-precision integers — required by raw-output shadow
-        // scoring to sum token wei (1e18..1e22+) above Number's 2^53 safe limit
-        // without IEEE-754 precision loss. Pure built-in, no host access.
-        BigInt,
-        String,
-        Boolean,
-        Array,
-        Object,
-        Map,
-        Set,
-        Promise,
-        Error,
-        TypeError,
-        RangeError,
-        // Module system stub - the scoring code uses module.exports
-        module: { exports: {} },
-        exports: {},
-    };
+// ── Isolated-VM sandbox ─────────────────────────────────────────────────────
+// SECURITY: app scoring JS is UNTRUSTED. Node's built-in `vm` module is
+// explicitly NOT a security boundary — a guest escapes `vm.createContext` into
+// the host realm via an injected function's `.constructor`
+// (`ethCall.constructor('return process')()`) and reaches process.env,
+// require('fs'), require('child_process'), and the network (this was exploited,
+// incident 2026-07-18). We therefore run the guest in a real V8 isolate
+// (isolated-vm): a separate heap with NO host realm — no `require`, no
+// `process`, no `Buffer`, no network. The RPC/HTTP host helpers are bridged as
+// ivm.References captured inside a closure the guest cannot reach; the guest
+// only ever receives structured-clone COPIES, never a host object. All standard
+// JS built-ins (Object/Array/Math/JSON/BigInt/Date/Promise/Map/Set/…) are
+// present natively in the isolate, so existing scoring code is unaffected.
 
-    // Network helpers — controlled RPC and HTTP access for scoring code.
-    // These run outside the VM sandbox (in the Node.js host process) but
-    // are injected as callable functions the scoring code can await.
-    sandbox.ethCall = ethCall;
-    sandbox.ethBlockNumber = ethBlockNumber;
-    sandbox.httpGet = httpGet;
-
-    // Merge any extra context
-    if (contextExtras) {
-        Object.assign(sandbox, contextExtras);
-    }
-
-    return sandbox;
-}
+const MEMORY_LIMIT_MB = 128;
+const EVAL_TIMEOUT_MS = 10000;
 
 /**
- * Execute JS code in the sandbox, call a function by name, and return the result.
+ * Execute untrusted JS in an isolated-vm isolate, invoke the named export, and
+ * return a structured-clone copy of its result. The isolate is always disposed.
  */
 async function execute(jsCode, functionName, args) {
-    const sandbox = buildSandbox();
-    const ctx = vm.createContext(sandbox, {
-        name: "AppIntentSandbox",
-        // Prevent code from breaking out of the sandbox
-        codeGeneration: {
-            strings: false, // Disallow eval("...")
-            wasm: false,    // Disallow WebAssembly compilation
-        },
-    });
+    const isolate = new ivm.Isolate({ memoryLimit: MEMORY_LIMIT_MB });
+    try {
+        const context = await isolate.createContext();
+        const jail = context.global;
+        // Node-style `global` self-reference (points at the ISOLATE's own global,
+        // never the host). `globalThis` already exists natively in the isolate.
+        await jail.set("global", jail.derefInto());
 
-    // Security: freeze all built-in prototypes inside the sandbox to prevent
-    // prototype pollution attacks. Malicious scoring code could otherwise
-    // modify shared prototypes (e.g., Object.prototype.toString) to escape
-    // the sandbox or corrupt host state. This runs on the VM-internal copies,
-    // not the host's originals, so the host process is unaffected.
-    vm.runInContext(`
-        Object.freeze(Object.prototype);
-        Object.freeze(Array.prototype);
-        Object.freeze(Function.prototype);
-        Object.freeze(String.prototype);
-        Object.freeze(Number.prototype);
-        Object.freeze(Boolean.prototype);
-        Object.freeze(Error.prototype);
-        Object.freeze(Promise.prototype);
-        Object.freeze(RegExp.prototype);
-        Object.freeze(Map.prototype);
-        Object.freeze(Set.prototype);
-    `, ctx);
-
-    // Execute the scoring module code to populate module.exports
-    const script = new vm.Script(jsCode, {
-        filename: "app_intent_scoring.js",
-        timeout: 10000, // 10s compile timeout (execution timeout handled by Python)
-    });
-    script.runInContext(ctx);
-
-    // Retrieve the exported module
-    const mod = sandbox.module.exports;
-    if (!mod || typeof mod !== "object") {
-        throw new Error("JS code did not set module.exports to an object");
-    }
-
-    const fn = mod[functionName];
-    if (typeof fn !== "function") {
-        const available = Object.keys(mod)
-            .filter((k) => typeof mod[k] === "function")
-            .join(", ");
-        throw new Error(
-            `Function "${functionName}" not found in module.exports. ` +
-            `Available functions: ${available || "(none)"}`
+        // console.* -> host stderr. The guest passes only a pre-joined STRING to
+        // the host writer (copied in); it never holds the host function object.
+        await context.evalClosure(
+            `globalThis.console = Object.freeze({
+                log:   function(){ $0.applyIgnored(undefined, ['[js:log] '   + Array.prototype.map.call(arguments, String).join(' ')], { arguments: { copy: true } }); },
+                warn:  function(){ $0.applyIgnored(undefined, ['[js:warn] '  + Array.prototype.map.call(arguments, String).join(' ')], { arguments: { copy: true } }); },
+                error: function(){ $0.applyIgnored(undefined, ['[js:error] ' + Array.prototype.map.call(arguments, String).join(' ')], { arguments: { copy: true } }); },
+                info:  function(){ $0.applyIgnored(undefined, ['[js:info] '  + Array.prototype.map.call(arguments, String).join(' ')], { arguments: { copy: true } }); },
+                debug: function(){ $0.applyIgnored(undefined, ['[js:debug] ' + Array.prototype.map.call(arguments, String).join(' ')], { arguments: { copy: true } }); },
+            });`,
+            [(line) => { process.stderr.write(String(line) + "\n"); }],
+            { arguments: { reference: true } },
         );
-    }
 
-    // Call the function. It may be sync or async.
-    const result = await fn.apply(mod, args);
-    return result;
+        // Bridge the async RPC/HTTP helpers. Each guest function copies its args
+        // to the host, awaits the host Promise, and receives a COPIED result.
+        // Pass the RAW host fn: `{arguments:{reference:true}}` makes isolated-vm
+        // wrap it as the Reference $0 exactly ONCE (passing an already-made
+        // ivm.Reference double-wraps it → the guest's $0.apply invokes a
+        // Reference-to-a-Reference and throws "Reference is not a function"). $0
+        // lives ONLY in this closure's scope — never assigned to a guest-reachable
+        // property — so the guest cannot walk `.constructor` back to the host realm.
+        const bridge = async (name, fn) => {
+            // Wrap the host fn so it ALWAYS RESOLVES with an envelope. A REJECTED
+            // host promise escapes isolated-vm's cross-isolate result marshaling as
+            // an uncaught host exception (crashing the runner with empty stdout);
+            // resolving an {ok:false,error} envelope and re-throwing INSIDE the
+            // guest keeps the rejection on the guest side where the scoring code's
+            // try/catch can handle it.
+            const wrapped = async (...callArgs) => {
+                try { return { ok: true, value: await fn(...callArgs) }; }
+                catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+            };
+            await context.evalClosure(
+                `globalThis[${JSON.stringify(name)}] = function() {
+                    return $0.apply(undefined, Array.prototype.slice.call(arguments), {
+                        arguments: { copy: true },
+                        result: { copy: true, promise: true },
+                    }).then(function(env){
+                        if (env && env.ok) return env.value;
+                        throw new Error((env && env.error) || (${JSON.stringify(name)} + ' failed'));
+                    });
+                };`,
+                [wrapped],
+                { arguments: { reference: true } },
+            );
+        };
+        await bridge("ethCall", ethCall);
+        await bridge("ethBlockNumber", ethBlockNumber);
+        await bridge("httpGet", httpGet);
+
+        // CommonJS shim so existing `module.exports = { ... }` scoring code works.
+        await context.eval("var module = { exports: {} }; var exports = module.exports;");
+
+        // Compile + run the untrusted scoring module. The isolate {timeout} bounds
+        // SYNCHRONOUS execution (e.g. infinite loops); the overall wall-clock —
+        // including async awaits and a never-settling promise — is bounded by the
+        // outer asyncio.wait_for + proc.kill in sandbox.py, which is the effective
+        // ceiling for the async path.
+        const script = await isolate.compileScript(jsCode, {
+            filename: "app_intent_scoring.js",
+        });
+        await script.run(context, { timeout: EVAL_TIMEOUT_MS });
+
+        // Invoke the named export INSIDE the isolate. Args are copied in; the
+        // return value (sync or async) is awaited and copied out. A non-clonable
+        // result throws inside isolated-vm and surfaces as a normal error.
+        const result = await context.evalClosure(
+            `const _exports = (typeof module === 'object' && module) ? module.exports : undefined;
+             const _fn = _exports && _exports[$0];
+             if (typeof _fn !== 'function') {
+                 const _avail = _exports
+                     ? Object.keys(_exports).filter(function(k){ return typeof _exports[k] === 'function'; }).join(', ')
+                     : '';
+                 throw new Error('Function "' + $0 + '" not found in module.exports. Available functions: ' + (_avail || '(none)'));
+             }
+             return Promise.resolve(_fn.apply(_exports, $1));`,
+            [functionName, args],
+            {
+                arguments: { copy: true },
+                result: { copy: true, promise: true },
+                timeout: EVAL_TIMEOUT_MS,
+            },
+        );
+        return result;
+    } finally {
+        isolate.dispose();
+    }
 }
 
 /**
@@ -468,13 +457,18 @@ async function main() {
         const response = { success: true, result };
         process.stdout.write(JSON.stringify(response) + "\n");
     } catch (err) {
-        const errorType =
-            err.code === "ERR_SCRIPT_EXECUTION_TIMEOUT"
-                ? "TimeoutError"
-                : err.constructor.name || "RuntimeError";
+        const msg = err && err.message ? err.message : String(err);
+        // isolated-vm surfaces a timeout as an Error whose message contains
+        // "timed out"; the legacy vm path used the ERR_SCRIPT_EXECUTION_TIMEOUT code.
+        const isTimeout =
+            (err && err.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") ||
+            /script execution timed out|timed out/i.test(msg);
+        const errorType = isTimeout
+            ? "TimeoutError"
+            : (err && err.constructor && err.constructor.name) || "RuntimeError";
         const response = {
             success: false,
-            error: err.message || String(err),
+            error: msg,
             errorType,
         };
         process.stdout.write(JSON.stringify(response) + "\n");

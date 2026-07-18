@@ -128,6 +128,35 @@ RUN cd /build/contracts \
 # intent — "forge install must succeed" — is preserved at the
 # different layer of `forge build`.)
 
+# ─── Stage 1b: isolated-vm native addon (dedicated Node builder) ──────
+# minotaur_subnet/engine/runner.js runs UNTRUSTED App scoring JS in a real V8
+# isolate (isolated-vm) — Node's built-in `vm` is NOT a security boundary: a
+# guest escapes it into the host realm via an injected function's `.constructor`
+# and reaches process.env / require('fs'|'child_process') / the docker socket
+# (exploited 2026-07-18). isolated-vm is a native addon.
+#
+# Build it in the OFFICIAL node:18 image, NOT the python:3.12 `builder` above.
+# On arches without an isolated-vm prebuilt binary (e.g. linux/arm64) npm has to
+# compile from source with node-gyp, and Debian bookworm's bundled node-gyp v9
+# crashes under Python 3.12 ("No package metadata was found for gyp" — its gyp
+# predates 3.12's stricter importlib.metadata). node:18-bookworm-slim ships a
+# modern npm + node-gyp (v11) on Debian's Python 3.11 and compiles cleanly on
+# every arch. Node 18 here matches the runtime stage's Debian `nodejs` 18 ABI
+# (NODE_MODULE_VERSION 108), so the copied addon loads there. Digest-pinned;
+# refresh via `docker buildx imagetools inspect node:18-bookworm-slim`.
+FROM node:18-bookworm-slim@sha256:f9ab18e354e6855ae56ef2b290dd225c1e51a564f87584b9bd21dd651838830e AS js-sandbox-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build/js-sandbox
+COPY minotaur_subnet/engine/package.json minotaur_subnet/engine/package-lock.json /build/js-sandbox/
+# Compile from source when no prebuilt binary matches this arch; then INSTANTIATE
+# an isolate so a broken/mismatched addon fails HERE, not at validator runtime
+# (where it would silently break all App scoring).
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && node -e "const ivm=require('/build/js-sandbox/node_modules/isolated-vm'); new ivm.Isolate({memoryLimit:8}).createContextSync(); console.log('isolated-vm build OK; NODE_MODULE_VERSION', process.versions.modules)"
+
 # ─── Stage 2: final runtime ───────────────────────────────────────────
 # Same digest-pinned base as the builder. Keep the two in sync — refresh
 # procedure documented above the builder FROM.
@@ -238,6 +267,13 @@ COPY --chown=minotaur:minotaur contracts/foundry.toml /home/minotaur/app/contrac
 # context so they don't end up here.
 COPY --chown=minotaur:minotaur minotaur_subnet/ /home/minotaur/app/minotaur_subnet/
 COPY --chown=minotaur:minotaur platform/ /home/minotaur/app/platform/
+
+# The compiled isolated-vm native addon, placed next to runner.js so Node's
+# module resolution finds `require("isolated-vm")` WITHOUT NODE_PATH — which the
+# sandbox env-scrub (sandbox.py:_sandbox_child_env) deliberately withholds from
+# the child. Copied AFTER the app COPY above (which brings runner.js/package.json
+# from the build context but no node_modules — those aren't committed).
+COPY --from=js-sandbox-builder --chown=minotaur:minotaur /build/js-sandbox/node_modules /home/minotaur/app/minotaur_subnet/engine/node_modules
 
 # /data is the store volume mount target. Owned by uid 1000 so the
 # non-root process can write store.json without a runtime chown.

@@ -25,6 +25,14 @@ jobs:
           python -m venv .venv
           ./.venv/bin/pip install --upgrade pip
           ./.venv/bin/pip install -r requirements.txt
+      - name: Build JS sandbox native dep (isolated-vm)
+        # runner.js runs UNTRUSTED App-scoring JS in a real V8 isolate; the
+        # node-based sandbox tests (test_runner_js_*, test_sandbox_*) shell out
+        # to `node runner.js`, which requires isolated-vm from engine/node_modules.
+        # ubuntu-latest ships node + npm + a C++ toolchain. `npm ci` installs the
+        # exact, hash-verified lockfile.
+        working-directory: minotaur_subnet/engine
+        run: npm ci --omit=dev --no-audit --no-fund
       - name: Unit tests
         run: make test-unit
 

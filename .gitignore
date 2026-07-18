@@ -76,3 +76,6 @@ minotaur_subnet/blockchain/data/
 minotaur_subnet/store/data/*.db
 minotaur_subnet/store/data/*.db-wal
 minotaur_subnet/store/data/*.db-shm
+
+# JS sandbox native deps (isolated-vm) — built in the Docker builder stage, never committed
+minotaur_subnet/engine/node_modules/
