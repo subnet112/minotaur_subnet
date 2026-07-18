@@ -128,6 +128,19 @@ RUN cd /build/contracts \
 # intent — "forge install must succeed" — is preserved at the
 # different layer of `forge build`.)
 
+# ─── isolated-vm native addon for the JS scoring sandbox ──────────────
+# minotaur_subnet/engine/runner.js runs UNTRUSTED App scoring JS in a real V8
+# isolate (isolated-vm) — Node's built-in `vm` is NOT a security boundary: a
+# guest escapes it into the host realm via an injected function's `.constructor`
+# and reaches process.env / require('fs'|'child_process') / the docker socket
+# (exploited 2026-07-18). isolated-vm is a native addon; build it HERE (this
+# stage has npm + g++ + python3-dev) and copy the compiled module into the slim
+# runtime stage next to runner.js. Pinned via minotaur_subnet/engine/package.json.
+WORKDIR /build/js-sandbox
+COPY minotaur_subnet/engine/package.json minotaur_subnet/engine/package-lock.json /build/js-sandbox/
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && node -e "require('/build/js-sandbox/node_modules/isolated-vm'); console.log('isolated-vm build OK')"
+
 # ─── Stage 2: final runtime ───────────────────────────────────────────
 # Same digest-pinned base as the builder. Keep the two in sync — refresh
 # procedure documented above the builder FROM.
@@ -238,6 +251,13 @@ COPY --chown=minotaur:minotaur contracts/foundry.toml /home/minotaur/app/contrac
 # context so they don't end up here.
 COPY --chown=minotaur:minotaur minotaur_subnet/ /home/minotaur/app/minotaur_subnet/
 COPY --chown=minotaur:minotaur platform/ /home/minotaur/app/platform/
+
+# The compiled isolated-vm native addon, placed next to runner.js so Node's
+# module resolution finds `require("isolated-vm")` WITHOUT NODE_PATH — which the
+# sandbox env-scrub (sandbox.py:_sandbox_child_env) deliberately withholds from
+# the child. Copied AFTER the app COPY above (which brings runner.js/package.json
+# from the build context but no node_modules — those aren't committed).
+COPY --from=builder --chown=minotaur:minotaur /build/js-sandbox/node_modules /home/minotaur/app/minotaur_subnet/engine/node_modules
 
 # /data is the store volume mount target. Owned by uid 1000 so the
 # non-root process can write store.json without a runtime chown.
