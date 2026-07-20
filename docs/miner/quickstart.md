@@ -210,9 +210,8 @@ All three are public, read-only endpoints on any validator/API node. Hit the pro
 
 - `GET /v1/apps/{app_id}/historical-scenarios?n_per_chain=10` — PII-stripped historical filled-order scenarios for one app: the same real orders the benchmark replays as Stage 2. Deterministic (seeded by `app_id`), so it's a **repeatable preview sample, not the set your submission is scored on**. `n_per_chain` is capped at 50.
 - `GET /v1/apps/manifests` — every app's manifest in one call (bulk discovery), including its synthetic `benchmark_scenarios`. Single-app variant: `GET /v1/apps/{app_id}/manifest`.
-- `GET /v1/orders?full=true&limit=100` — the raw order feed, newest-first, from the same store the benchmark samples. Without `full=true` you get a slim summary projection (no `plan`).
 
-Feed any of these into the local testnet or the plan dry-run below.
+Feed either of these into the local testnet or the plan dry-run below.
 
 ### Debug a single plan without your own archive node
 
