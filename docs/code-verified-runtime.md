@@ -71,8 +71,8 @@ Mounted routers in `api/server.py`:
 
 Create / validate / deploy:
 
-- `POST /v1/apps/` (create; `X-Admin-Key` **or** EIP-712 `owner_signature`, rate-limited via `APP_CREATE_RATE_PER_MIN`)
-- `POST /v1/apps/validate` (open preflight — no longer admin-gated; rate-limited via `APP_VALIDATE_RATE_PER_MIN`)
+- `POST /v1/apps/` (create; **admin-gated** `X-Admin-Key` — executes submitted App JS in the scoring sandbox, so untrusted-JS is admin-only (PR #933); rate-limited via `APP_CREATE_RATE_PER_MIN`)
+- `POST /v1/apps/validate` (**admin-gated** `X-Admin-Key` — also executes submitted JS; re-gated after the credential-exfil incident (PR #933); rate-limited via `APP_VALIDATE_RATE_PER_MIN`)
 - `POST /v1/apps/{app_id}/deploy` (**async by default**; `?wait=true` for the synchronous body. Wallet-signature or fee-payment authorized)
 - `GET /v1/apps/`  (per-chain `deployments` map + unified `status`, `partial` for mixed states)
 - `GET /v1/apps/{app_id}/status`
@@ -139,23 +139,19 @@ Other:
 
 ## Validator Service Surface (`:9100`)
 
-The standalone validator currently exposes:
+The standalone validator daemon (`validator/main.py`) registers exactly these 9 routes:
 
 - `GET /health`
-- `GET /intents/available`
-- `POST /intents/{app_id}/submit`
-- `POST /reload`
+- `GET /identity`
+- `POST /consensus/proposal`
+- `POST /internal/weights/queue`
 - `GET /weights`
 - `GET /weights/history`
 - `GET /blockloop/status`
-- `POST /orders/submit`
-- `GET /orders`
-- `GET /intents/{app_id}/details`
-- `GET /intents/{app_id}/scores`
-- `POST /apps/{app_id}/quote`
-- `POST /consensus/proposal`
 - `GET /consensus/info`
 - `GET /leader`
+
+The former `/intents/*`, `/orders/*`, `/apps/{app_id}/quote`, and `/reload` daemon routes were removed in the 2026-05-25 audit cleanup; the miner-/order-facing equivalents live on the API service (`:8080`, `/v1/…`).
 
 ## Execution Flow (Order Lifecycle)
 
@@ -206,9 +202,11 @@ Adoption is **relative** and resolved by a fixed ladder (`epoch/relative_scoring
 1. **Output (primary, always armed).** Per-order `win` / `regression` / `matched` (within ±0.1% / `RELATIVE_TOL_BPS=10`) / `blind_spot_cover` / `dropped`; adopt if net better on breadth: `(wins + blind_spot_covers) − regressions ≥ DETHRONE_WIN_MARGIN (1)`. Regressions are **tolerated within a 1% floor** (`FLOOR_BPS=100`) and netted against wins — the older "any regression = reject / matching everywhere rejected" rule is gone.
 2. **Tie-breaks (fully-matched saturated tie only):** gas (`GAS_MARGIN_BPS=200`, pre-refund metered gas) → factorization (`FACTOR_MARGIN=100`, `max_region_nodes`) → deadwood (`UNPRODUCTIVE_MARGIN=2000`, `unproductive_nodes`). All armed on `develop`; each fires "by data" (inert until both champion and challenger carry the metric). The verdict dict carries `adopt_via` (`performance`/`gas`/`factorization`/`deadwood`), `factor_delta`, `deadwood_delta`.
 
-**Hard vetoes** (override every rung): `n_catastrophic == 0` (no order cut > 1%) and `n_dropped == 0`. The blind-spot *repeat* bar is wired but disarmed (`BLIND_SPOT_BAR_TTL_S = None`).
+**Hard vetoes** (override every rung): `n_catastrophic == 0` (no order cut > 1%) and `n_dropped == 0`. The blind-spot *repeat* bar is **armed** (`BLIND_SPOT_BAR_TTL_S = 24 * 3600`, i.e. 24h; anti-treadmill rule, leader-only, safe at quorum==1): a `blind_spot_cover` only counts toward dethrone if the challenger **exceeds** the incumbent's adoption-time delivered value on that order (unless that recorded value is older than the 24h TTL). A cover that merely re-delivers what the same order already paid within the TTL is downgraded to a neutral `blind_spot_repeat` — compared but neither win nor regression, so it can never be the +1 that dethrones.
 
 **Scoring definition — static quote.** The benchmark no longer calls `solver.quote()` or runs a champion reference-quote pre-pass; it injects a static zero quote purely to satisfy the on-chain ABI, and scores on the raw per-order delivered output. The `BENCHMARK_STATIC_QUOTE` / `BENCHMARK_REFQUOTE_CHECKPOINT` flags and the legacy quote path were deleted (PRs #595/#600) — those host envs and `/data/refquote_checkpoints.json` are now inert.
+
+**Quote-demand corpus (default ON — consensus-relevant).** Separately from the removed reference-quote pre-pass above, a sampled set of historical served `/quote` requests is folded into scoring. `BENCHMARK_QUOTE_CAPTURE` (default ON) records served quotes; `BENCHMARK_QUOTE_CORPUS` (default ON, `shared/feature_flags.py`) replays a round-seeded draw of them as scored `quote:`-prefixed scenarios **and** folds them into `benchmark_pack_hash` under a `QUOTES_V1` section. Must be fleet-uniform — a mixed fleet computes a divergent pack hash → `PACK_HASH_MISMATCH`. Set `BENCHMARK_QUOTE_CORPUS=0` to restore the inert path.
 
 **Stage-1 screening floor (PR #585):** new submissions are rejected `too_entangled` when their largest AST region exceeds `MAX_REGION_NODES=4200`, or `dynamic_code` on bare `exec()`/`eval()`. The metric is persisted even on reject so the miner sees the number. The standing champion is never re-screened.
 
@@ -247,10 +245,10 @@ Current policy controls in `api/routes/submissions.py` and worker/server wiring:
 - `ALLOW_SUBPROCESS_BENCHMARK` (default `false`) — required for `solver_path` benchmarking.
 - `SCREENING_BUILD_CONCURRENCY` (default `1`) — bounds concurrent stage-2 Docker builds (PR #583; AST metrics also moved off the event loop).
 - `SUBMISSION_BENCHMARK_DETAILS_RETENTION` (default `300`) — caps stored `benchmark_details` to the N most-recent terminal submissions so the store can't freeze the event loop (PR #569). In-flight submissions always keep details.
-- `SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT` (default `0` = OFF) — leader-gateway quota on distinct benched rounds per normalized code fingerprint, **across all hotkeys** (PR #594). Only benched statuses burn quota; a comment-only / nonce-only resubmit of an identical tree is rejected pre-build (`fingerprint_repeat`).
+- `SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT` (default `2`, armed — the default lives in code, `screening_pipeline.py`) — leader-gateway quota on distinct benched rounds per normalized code fingerprint, **across all hotkeys** (PR #594). Only benched statuses burn quota; a comment-only / nonce-only resubmit of an identical tree is rejected pre-build (`fingerprint_repeat`). Set to `0` to disable.
 - `SUBMISSION_INTAKE_ACK` (default on; `0` disables) — posts a "Submission received" ACK on the miner's PR to probe `Pull requests: Write` scope, so an under-scoped private-repo PAT is rejected at intake with a clear 400 rather than silently 403-ing days later (PR #526).
 - **Removed:** `ENABLE_SOURCE_SUBMISSIONS` and the `/v1/submissions/source` endpoint (PR #599); `BENCHMARK_STATIC_QUOTE` and `BENCHMARK_REFQUOTE_CHECKPOINT` (PR #600). These envs are now inert.
-- `ALLOW_CHAMPION_HOT_SWAP` (default `false`) — enables runtime champion swaps when explicitly set.
+- `ALLOW_CHAMPION_HOT_SWAP` (default `true`) — runtime champion hot-swap is enabled by default (`startup.py`); set to `0`/`false` to disable.
 - `CHAMPION_SWAP_TIMEOUT_SECONDS` (default `90`) — timeout when starting champion Docker runtime.
 - `SUBMISSION_PROVENANCE_SIGNING_PRIVATE_KEY` (unset by default) — if set, submission screening signs provenance with EIP-191 secp256k1.
 - `SUBMISSION_PROVENANCE_SIGNING_ADDRESS` (optional) — expected signer address for the configured private key.
