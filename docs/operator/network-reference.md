@@ -51,7 +51,7 @@ Miners pointing the agent loop at production use `--validator-url https://api.mi
 
 > The string `0x0B5fE44e9...` appears on both chains (Base `AppRegistry`, BT EVM `ValidatorRegistry`). They are independent contracts on independent chains — the deployer's nonce happened to align across the two deploys. Different code at each address; the collision is purely cosmetic.
 
-ChampionRegistry holds its own independent `quorumBps` for champion-certification consensus. The validator-side env var `CHAMPION_QUORUM_BPS` should mirror whatever `cast call $CHAMPION_REGISTRY 'quorumBps()(uint256)' --rpc-url https://lite.chain.opentensor.ai` returns (currently `6666`).
+ChampionRegistry holds its own independent `quorumBps` for champion-certification consensus. The daemon reads it **live from the on-chain contract** (`ChampionRegistry.quorumBps()`, via `ProtocolConfig`) — there is no `CHAMPION_QUORUM_BPS` env var to set. Inspect the current value with `cast call $CHAMPION_REGISTRY 'quorumBps()(uint256)' --rpc-url https://lite.chain.opentensor.ai` (currently `6666`).
 
 Each chain's `AppRegistry` address is now published on `GET /v1/chains` as `app_registry_address` (PR #553), so app deployers and frontends can read the gate without hardcoding it. The app-deployment, fee, and moderation env flags (`ENABLE_PUBLIC_DEPLOYMENT`, `DEPLOY_FEE_*`, `APP_ADMIN_SIGNERS`, `REQUIRE_APP_ACTION_SIGNATURE`, `AUTO_REGISTER_APPS`) are documented in the [App-Management API reference](../api/app-management.md#related-operator-env).
 
@@ -65,9 +65,9 @@ The platform supports Ethereum mainnet execution, but the canonical DexAggregato
 |---|---|
 | Active validator count | 3 (post-refactor migration may grow this) |
 | Quorum threshold (`quorumBps` on `ValidatorRegistry`) | `6666` (2-of-3 BFT). Read live with `cast call $VALIDATOR_REGISTRY 'quorumBps()(uint256)' --rpc-url $BASE_RPC`. |
-| Champion quorum (`quorumBps` on `ChampionRegistry`) | `6666` — mirror the on-chain value with `CHAMPION_QUORUM_BPS` |
+| Champion quorum (`quorumBps` on `ChampionRegistry`) | `6666` — read live from `ChampionRegistry.quorumBps()` on-chain (no env var to set) |
 | Tick interval | `12s` (matches Ethereum block time) |
-| Weight emission cadence | **Tempo-aligned by default** (`TEMPO_ALIGNED_EMIT=1`, PR #524): one commit-reveal per tempo epoch, fired ~`TEMPO_EMIT_LEAD_BLOCKS` (20) blocks before the epoch step. The chain keeps only one pending commit per validator per tempo, so this replaces tuning `--epoch-seconds` for cadence. Set `TEMPO_ALIGNED_EMIT=0` to fall back to the legacy wall-clock cadence (`--epoch-seconds 1200`). |
+| Weight emission cadence | **Tempo-aligned by default** (`TEMPO_ALIGNED_EMIT=1`, PR #524): one commit-reveal per tempo epoch, fired ~`TEMPO_EMIT_LEAD_BLOCKS` (20) blocks before the epoch step. The chain keeps only one pending commit per validator per tempo, so this replaces tuning `--epoch-seconds` for cadence. Set `TEMPO_ALIGNED_EMIT=0` to fall back to the legacy wall-clock cadence (`--epoch-seconds 1300`). |
 | `ProtocolConfig` refresh cadence | `60s` — how often the daemon re-reads `quorumBps` and the validator set from `ValidatorRegistry`. Independent of weight emission. |
 | Stake requirement for emissions | (TBD — set by Bittensor subnet rules; check current `metagraph` output) |
 
@@ -75,7 +75,7 @@ The platform supports Ethereum mainnet execution, but the canonical DexAggregato
 
 New validators need their EVM signing address added to the on-chain `ValidatorRegistry` on every chain they operate on. See the [validator quickstart Step 4](../validator/quickstart.md#step-4-get-onboarded-to-the-on-chain-validatorregistry) for the required information you send to the registry owner and the `cast` commands the owner runs to add you.
 
-After the on-chain handshake, your daemon's signatures count toward order-consensus quorum and your hotkey can be assigned to the leader role when stake rotation puts you on top.
+After the on-chain handshake, your daemon's signatures count toward order-consensus quorum. **Leadership is not stake-assigned:** during the early-network period the leader is locked to the subnet team's hotkey via `LOCKED_LEADER_HOTKEY` (with `LOCKED_LEADER_EVM_ADDRESS` pinning the signer), so a newly onboarded validator participates as a follower/signer and does **not** take the leader role by stake. Stake-based election applies only once the team clears the lock (announced ahead of time).
 
 ## Operational runbooks
 
