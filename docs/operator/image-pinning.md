@@ -122,10 +122,11 @@ updating**: the digest is the version, and only an explicit `.env` edit
 for security-conscious operators. If you want Watchtower back on, drop
 the digest and go back to `MINOTAUR_IMAGE_TAG=stable`.
 
-## Verifying against the cosign signature (after PR-5)
+## Verifying against the cosign signature
 
-Once PR-5 lands, every `:stable` image is signed by the subnet team's
-cosign key and the signature is attached to the GHCR registry. To
+Every `:stable` image is signed with cosign **keyless (OIDC)** signing in CI
+(already live on every push to `main`/`develop`/tags) and the signature is
+attached to the GHCR registry. To
 verify before pulling:
 
 ```bash

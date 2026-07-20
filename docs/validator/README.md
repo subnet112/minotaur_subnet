@@ -26,9 +26,9 @@ Validators perform six core functions:
 
 Validators operate in a leader/follower topology:
 
-- **Leader**: The validator with the highest TAO stake on subnet 112. Ties are broken by hotkey (lexicographic ascending). The leader runs the BlockLoop, processes all orders, and broadcasts proposals to followers.
+- **Leader**: During the early-network operating period, leadership is **locked** to the subnet team's hotkey via `LOCKED_LEADER_HOTKEY` (default set in `validator/metagraph_sync.py`; the matching EVM signer is pinned by `LOCKED_LEADER_EVM_ADDRESS`). `elect_leader()` returns **only** the peer whose hotkey equals `LOCKED_LEADER_HOTKEY` and **ignores stake entirely** — a third-party validator does **not** become leader while the lock is active, regardless of stake. Highest-TAO-stake election (ties broken by hotkey, lexicographic ascending) is only the fallback that applies once the lock is cleared (both env vars set empty). The leader runs the BlockLoop, processes all orders, and broadcasts proposals to followers.
 - **Followers**: All other registered validators. They receive proposals from the leader, independently re-simulate and re-score each plan, and sign EIP-712 approvals if both scores pass threshold.
-- **Leader failover**: When the leader changes (e.g., stake rebalancing), the Relayer drops all in-flight work. The new leader reprocesses everything from scratch.
+- **Leader failover**: The leader changes only when the lock is repointed or cleared (not by stake rebalancing under the default). On a leader change, the Relayer drops all in-flight work and the new leader reprocesses everything from scratch.
 
 ### BlockLoop Pipeline
 
@@ -62,7 +62,7 @@ Both layers must pass. Champion adoption is then **relative** and resolved by a 
 1. **Output (primary, always armed).** Adopt if net better on breadth: `(wins + blind-spot covers) − regressions ≥ 1`. Regressions are **tolerated within a 1% per-order floor** and netted against wins — this is a bounded-regression, net-better rule, not the older "any regression = reject".
 2. **Gas → Factorization → Deadwood tie-breaks** — fire only on a *fully-matched, saturated tie* (every compared order matched, zero regressions): cheaper total metered (pre-refund) gas by ≥200 bps, then smaller worst AST region (`max_region_nodes`) by ≥100, then less dead code (`unproductive_nodes`) by ≥2000. All three are **armed** on `develop` but fire "by data" — inert until both the champion and challenger records carry the metric.
 
-**Hard vetoes** (override every rung): no order cut by more than 1% and no dropped order the champion serves. The blind-spot *repeat* bar is wired but **disarmed** (`BLIND_SPOT_BAR_TTL_S = None`), so it does not yet affect adoption.
+**Hard vetoes** (override every rung): no order cut by more than 1% and no dropped order the champion serves. The blind-spot *repeat* bar is **armed** (`BLIND_SPOT_BAR_TTL_S = 24h`): a `blind_spot_cover` counts toward dethrone only if the challenger **exceeds** the incumbent's adoption-time value on that order (unless that value is older than 24h). A cover that merely re-delivers what the order already paid within 24h is a neutral `blind_spot_repeat` and can't be the +1 that dethrones (anti-treadmill; leader-only, safe at quorum==1).
 
 ### Intent OrderBook
 
@@ -83,20 +83,17 @@ The canonical third-party validator stack exposes HTTP on two ports.
 |--------|------|-------------|
 | `GET` | `/health` | Service health, loaded intents, uptime |
 | `GET` | `/identity` | Self-attested EIP-712 binding `(evm_address, hotkey, axon_url)` for peer discovery |
-| `GET` | `/intents/available` | Active intents available for miners |
-| `GET` | `/intents/{app_id}/details` | Detailed info for a specific app |
-| `GET` | `/intents/{app_id}/scores` | Score history for a specific app |
-| `POST` | `/intents/{app_id}/submit` | Accept a miner plan submission |
+| `POST` | `/consensus/proposal` | Receive an order-consensus proposal from the leader (followers) |
+| `POST` | `/internal/weights/queue` | Internal: enqueue weights for the emitter (leader-internal) |
 | `GET` | `/weights` | Current champion and weight mapping |
 | `GET` | `/weights/history` | Historical weight emissions |
 | `GET` | `/blockloop/status` | Block loop tick statistics |
-| `POST` | `/orders/submit` | Submit an order to the OrderBook |
-| `GET` | `/orders` | List orders in the OrderBook |
-| `POST` | `/apps/{app_id}/quote` | Get a dry-run quote for an intent |
-| `POST` | `/consensus/proposal` | Receive an order-consensus proposal from the leader (followers) |
 | `GET` | `/consensus/info` | Order-consensus configuration and peer info |
 | `GET` | `/leader` | Leader status and metagraph info |
-| `POST` | `/reload` | Reload app definitions from store |
+
+> The former `/intents/*`, `/orders/*`, `/apps/{app_id}/quote`, and `/reload`
+> routes were removed from the daemon (2026-05-25 audit cleanup). The
+> miner-/order-facing equivalents live on the **API service (`:8080`, `/v1/…`)**.
 
 ### API service — port 8080
 
@@ -130,7 +127,7 @@ There are three ways to run a validator:
 
 2. **Standalone validator daemon** -- Direct Python process, you bring your own Anvil + Subtensor connections. Useful for advanced operators who want systemd supervision instead of Docker:
    ```bash
-   python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1200
+   python -m minotaur_subnet.validator.main --port 9100 --epoch-seconds 1300
    ```
 
 3. **Local testnet (development only)** -- Full Docker Compose stack including subtensor, Anvil forks, API, validator, miner, relayer, and frontend. For local development of the protocol itself, not for connecting to mainnet:

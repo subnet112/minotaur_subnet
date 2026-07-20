@@ -60,8 +60,10 @@ unreachable) · `3` rollback also failed (node down, manual intervention).
 
 ### Recommended for high-stake validators: disable Watchtower + cron the updater
 
-Turn Watchtower off (bring the stack up **without** the `autoupdate` profile, or
-set `MINOTAUR_DISABLE_WATCHTOWER=1` in `.env`) and run the gated updater on the
+Turn Watchtower off by bringing the stack up **without** the `autoupdate` profile
+(Watchtower is opt-in via that profile — `MINOTAUR_DISABLE_WATCHTOWER` is **not read**
+by any compose service or script, so it is a no-op; dropping the profile is the only
+way to keep Watchtower off). Run the gated updater on the
 subnet's publish cadence:
 
 ```cron

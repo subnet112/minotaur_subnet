@@ -166,7 +166,7 @@ class Interaction:
     target: str       # Contract address (0x-prefixed, 42 chars)
     value: str        # Wei value as decimal string ("0" for no ETH)
     call_data: str    # ABI-encoded calldata (0x-prefixed hex)
-    chain_id: int     # Target chain (default: 1)
+    chain_id: int     # Target chain (default: 0 — must be set explicitly)
 ```
 
 ### MarketSnapshot
@@ -446,7 +446,7 @@ There is no absolute 0–1 score. For every order in the benchmark set the chall
 | `win` | challenger delivered **more** (beyond the ±0.1% / 10 bps tie band) |
 | `regression` | challenger delivered **less** (beyond the band; tolerated only within the 1% floor) |
 | `matched` | within the ±0.1% band (effectively tied) |
-| `blind_spot_cover` | champion can't serve this order at all; the challenger can (counts as a win) |
+| `blind_spot_cover` | champion can't serve this order at all; the challenger can (counts as a win — but see the repeat guard below) |
 | `dropped` | champion serves it; the challenger produced nothing (a hard veto) |
 | `skip` | neither side produced comparable output |
 
@@ -456,6 +456,8 @@ Adoption resolves a fixed ladder (exact-integer, cross-multiplied wei — so the
 2. **Tie-breaks (fully-matched, saturated tie only):** cheaper total metered (pre-refund) gas (≥200 bps), then smaller worst AST region `max_region_nodes` (by ≥100), then less dead code `unproductive_nodes` (by ≥2000). Armed, but each fires only once both champion and challenger carry the metric.
 
 **Hard vetoes** override every rung: no order may be cut by more than 1%, and the challenger may not drop any order the champion serves. The verdict dict carries `adopt_via` (`performance`/`gas`/`factorization`/`deadwood`).
+
+**Blind-spot repeat guard (anti-treadmill).** A `blind_spot_cover` only counts as a win if the challenger **exceeds** the incumbent's adoption-time delivered value on that order (by the tie band) — unless that recorded value is older than 24h (`BLIND_SPOT_BAR_TTL_S`), in which case coverage credit works as normal. A cover that merely re-delivers what the same order already paid within 24h is downgraded to a neutral `blind_spot_repeat`: compared but neither win nor regression, so it can't be the +1 that dethrones. This blocks byte-for-byte copycats that "win" only by re-covering an order whose canned calldata went stale.
 
 ### Scoring Pipeline
 
@@ -481,7 +483,7 @@ Per-command timeouts enforced by the harness:
 | `restore_state` | 30s |
 | `metadata` | 5s |
 
-Total container lifetime: **10 minutes** maximum.
+Total container lifetime: **15 minutes** maximum.
 
 ## JSON-over-stdio Protocol
 
@@ -552,8 +554,8 @@ The agent loop (`minotaur_subnet.miner.agent`) runs continuously:
 
 ```bash
 python -m minotaur_subnet.miner.main agent \
-    --validator-url http://localhost:9100 \
-    --interval 300
+    --validator-url http://localhost:8080 \
+    --loop-interval 300
 ```
 
 The agent generates `Strategy` subclasses (one per app) and registers them with a `RoutingSolver`. Each strategy targets a specific `APP_ID` and set of `INTENT_FUNCTIONS`.
