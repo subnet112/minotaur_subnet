@@ -1349,6 +1349,42 @@ class TestEpochManager:
         block_loop.set_solver.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_activate_certified_round_defers_on_publish_failed(self):
+        """``publish_failed`` is the POST-attest transient: the certify() already
+        landed on-chain and a transient GitHub 5xx failed the publish. It DEFERS on
+        the same activation-relative window as ``vr_read_failed`` — the re-drive
+        relies on the finalize's on-chain-cert idempotency to complete the merge
+        (incident 2026-07-20). stage='merge' (not 'validation') also proves the defer
+        matches on the reason CODE, not the stage."""
+        from minotaur_subnet.relayer.solver_repo import MergeResult
+
+        round_store, current_round, _sub, store = _make_certified_round()
+        round_store._rounds[current_round.round_id].decision_deadline_epoch = 4
+        block_loop = _make_mock_block_loop()
+
+        def merge_cb(submission, round_id, *, certificate):
+            return MergeResult(False, "publish_failed", "merge", "GitHub 503 at publish")
+
+        async def runtime_builder(submission, epoch):
+            return MagicMock()
+
+        mgr = EpochManager(
+            block_loop=block_loop, submission_store=store, round_store=round_store,
+            runtime_builder=runtime_builder, on_champion_adopted=merge_cb,
+        )
+        mgr.set_leader_check(lambda: True)
+
+        result = await mgr.activate_certified_round(current_round.round_id, epoch=6)
+
+        assert result.get("deferred") is True
+        assert result.get("champion_changed") is False
+        assert result.get("abort_reason") is None
+        assert (
+            round_store.get_round(current_round.round_id).status == RoundStatus.CERTIFIED
+        )
+        block_loop.set_solver.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_activate_certified_round_aborts_vr_read_past_window(self):
         """``vr_read_failed`` defers only within ``effective_epoch + grace`` — a
         SUSTAINED BT-EVM RPC outage (not a transient blip) cannot pin a certified round
