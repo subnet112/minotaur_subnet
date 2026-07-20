@@ -71,8 +71,8 @@ Mounted routers in `api/server.py`:
 
 Create / validate / deploy:
 
-- `POST /v1/apps/` (create; `X-Admin-Key` **or** EIP-712 `owner_signature`, rate-limited via `APP_CREATE_RATE_PER_MIN`)
-- `POST /v1/apps/validate` (open preflight — no longer admin-gated; rate-limited via `APP_VALIDATE_RATE_PER_MIN`)
+- `POST /v1/apps/` (create; **admin-gated** `X-Admin-Key` — executes submitted App JS in the scoring sandbox, so untrusted-JS is admin-only (PR #933); rate-limited via `APP_CREATE_RATE_PER_MIN`)
+- `POST /v1/apps/validate` (**admin-gated** `X-Admin-Key` — also executes submitted JS; re-gated after the credential-exfil incident (PR #933); rate-limited via `APP_VALIDATE_RATE_PER_MIN`)
 - `POST /v1/apps/{app_id}/deploy` (**async by default**; `?wait=true` for the synchronous body. Wallet-signature or fee-payment authorized)
 - `GET /v1/apps/`  (per-chain `deployments` map + unified `status`, `partial` for mixed states)
 - `GET /v1/apps/{app_id}/status`
