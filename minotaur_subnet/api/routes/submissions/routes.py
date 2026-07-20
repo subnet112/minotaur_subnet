@@ -1824,6 +1824,8 @@ async def list_submissions(
     epoch: int | None = None,
     hotkey: str | None = None,
     include_details: bool = False,
+    limit: int = 0,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """List submissions, optionally filtered by round, epoch, and/or hotkey.
 
@@ -1833,6 +1835,12 @@ async def list_submissions(
     list consumers (e.g. the dashboard's /miners page, polled every 15s) only
     read the light fields. Pass ``include_details=true`` to keep it, or fetch a
     single submission's full report via ``GET /v1/submissions/{id}/status``.
+
+    ``limit``/``offset`` paginate the (newest-first) result; ``limit<=0`` (the
+    default) returns everything, so callers that omit it are unaffected. The full
+    corpus is now ~20k rows / ~44 MB per call and unbounded fetches drove the bulk
+    of validator egress — many clients already send ``?limit=N`` (it was
+    previously ignored). ``total`` in the response is the unpaginated count.
     """
     store = get_store()
 
@@ -1841,10 +1849,23 @@ async def list_submissions(
     elif epoch is not None:
         subs = store.list_by_epoch(epoch)
     else:
-        subs = sorted(store._submissions.values(), key=lambda s: s.created_at, reverse=True)
+        subs = list(store._submissions.values())
 
     if hotkey:
         subs = [s for s in subs if s.hotkey == hotkey]
+
+    # Deterministic newest-first order so limit/offset paginate stably regardless
+    # of the filter path above.
+    subs.sort(key=lambda s: s.created_at, reverse=True)
+
+    total = len(subs)
+    # Pagination — limit<=0 means "all" (backward-compatible default). Clamp so a
+    # negative offset/limit can't error or return an unexpected slice.
+    off = max(0, offset)
+    if off:
+        subs = subs[off:]
+    if limit and limit > 0:
+        subs = subs[:limit]
 
     # One metagraph read per request, shared across all shaped rows.
     uid_by_hotkey = _hotkey_to_uid_map()
@@ -1865,9 +1886,13 @@ async def list_submissions(
         d["coined_by_uid"] = uid_by_hotkey.get(_coiner) if _coiner else None
         return d
 
+    shaped = [_shape(s) for s in subs]
     return {
-        "count": len(subs),
-        "submissions": [_shape(s) for s in subs],
+        "count": len(shaped),
+        "total": total,
+        "limit": limit if (limit and limit > 0) else 0,
+        "offset": off,
+        "submissions": shaped,
     }
 
 
