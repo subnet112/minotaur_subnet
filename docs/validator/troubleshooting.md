@@ -87,10 +87,12 @@ Discovery requires four things to line up. Check each in order:
 
 **Symptom**: JS scores are always 0.0, NaN, or scoring errors in logs.
 
-- Verify Node.js 20.x is installed:
+- Verify Node.js 18.x is installed:
   ```bash
-  node --version  # Should be v20.x
+  node --version  # Should be v18.x
   ```
+  (The validator image ships Node 18 — the isolated-vm scoring addon is built
+  against the Node 18 ABI; do not swap in Node 20.)
 - The JS engine runs app scoring code in a Node.js sandbox. Check that the app's JS code exports the required functions:
   ```javascript
   module.exports = { config, manifest, score };
@@ -115,9 +117,10 @@ Discovery requires four things to line up. Check each in order:
   ```bash
   curl http://localhost:9100/blockloop/status
   ```
-- Verify orders exist and are in OPEN status:
+- Verify orders exist and are in OPEN status (orders live on the API service,
+  not the `:9100` daemon):
   ```bash
-  curl http://localhost:9100/orders
+  curl http://localhost:8080/v1/orders
   ```
 - Check that app definitions are loaded:
   ```bash
