@@ -2,20 +2,36 @@
 
 ## What this is
 
-Each Minotaur validator runs three Anvil forks (eth / base / btevm) and
-multi-homes them onto a sealed `benchmark-sandbox` Docker network so that
-solver containers spawned during reactive champion benchmarking can hit
-them for price discovery without being able to egress to the internet.
+Each Minotaur validator runs three Anvil forks (eth / base / btevm). The forks
+live on the `minotaur` Docker network **only** — the validator / API / simulator
+reach them there. They are **deliberately NOT on the sealed `benchmark-sandbox`
+network** (PR-7 / audit finding C4). Solver containers spawned during reactive
+champion benchmarking run on `benchmark-sandbox` and can reach **only the
+read-only block-pin proxy (`172.30.0.5`)** for price discovery — never a raw
+anvil RPC — and cannot egress to the internet.
 
-The catch: Anvil's `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC namespaces
+Why the split: Anvil's `anvil_*` / `hardhat_*` / `evm_*` JSON-RPC namespaces
 (set-storage, set-balance, impersonate, snapshot, etc.) are
-**unauthenticated by design**. Foundry has no flag to disable them. Any
-container that can reach the anvil RPC can mutate fork state.
+**unauthenticated by design** and Foundry has no flag to disable them. Any
+container that could reach the anvil RPC could mutate fork state — so no
+untrusted container is allowed to reach it. The block-pin proxy serves only
+deterministic read methods and refuses the `anvil_*` / `hardhat_*` / `evm_*`
+cheat-code namespace outright.
 
 ## What we do about it (defense-in-depth)
 
-Application-layer boundary in
-`minotaur_subnet/simulator/anvil_simulator.py`:
+**Primary containment is the network layer** (PR-7 / audit finding C4): because
+the anvil forks are off `benchmark-sandbox`, an untrusted benchmark solver can
+dial only the read-only block-pin proxy (`172.30.0.5`), which refuses the
+cheat-code namespace. A malicious solver therefore has no path to a raw anvil RPC.
+
+> ⚠️ Do **not** re-attach the anvil forks to `benchmark-sandbox`. That would put a
+> raw, unauthenticated anvil RPC back in reach of untrusted solver containers and
+> re-open the closed cheat-code vulnerability.
+
+As a **backstop** for an in-process failed revert (not for an external attacker,
+which the network layer already cuts off), the simulator keeps an
+application-layer boundary in `minotaur_subnet/simulator/anvil_simulator.py`:
 
 1. **Baseline snapshot** at simulator init (immediately after first
    connect). Recovery anchor if any later revert fails.

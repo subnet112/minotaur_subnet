@@ -74,9 +74,10 @@ reason. Common non-adoption cases:
 - **Hard veto.** You cut at least one order by more than 1% (`n_catastrophic`), or
   you **dropped** an order the champion serves (`n_dropped`) — either vetoes
   adoption regardless of how many other orders you won.
-- **Screening reject (`too_entangled` / `dynamic_code`).** Stage 1 now rejects a
-  solver whose largest AST region exceeds **4,200 nodes** (`too_entangled`) or that
-  uses bare `exec()`/`eval()` (`dynamic_code`). The reject still reports your
+- **Screening reject (`too_entangled` / `static_checks_failed`).** Stage 1 now rejects a
+  solver whose largest AST region exceeds **4,200 nodes** (`outcome_code` = `too_entangled`) or that
+  uses bare `exec()`/`eval()` (`outcome_code` = `static_checks_failed`; `dynamic_code` appears only in the
+  human-readable reason, not as an `outcome_code`). The reject still reports your
   `max_region_nodes` so you can see the number to get under.
 - **`waitlisted`, not rejected.** If your `outcome_code` is `rotation_not_selected`
   or `window_elapsed`, you were not benchmarked this round through no fault of your
@@ -84,8 +85,10 @@ reason. Common non-adoption cases:
   help (see below).
 - **`fingerprint_repeat`.** A comment-only / nonce-only resubmit of an identical
   code tree is rejected pre-build — "comments don't make code new". Change at least
-  one semantic byte. (Cross-hotkey resubmit quota is operator-gated and off by
-  default.)
+  one semantic byte. A **cross-hotkey** quota also applies by default
+  (`SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT=2`): the same normalized code fingerprint
+  can be benched at most twice **across all hotkeys**, so copy-pasting another
+  miner's solver under a fresh hotkey is rejected once the quota is spent.
 
 Use status endpoint to inspect:
 

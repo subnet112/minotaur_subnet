@@ -103,10 +103,12 @@ Terminal states:
 - `scored`
 - `adopted`
 - `rejected`
+- `waitlisted` — no-fault: not selected onto this round's benched slate (or its bench window elapsed); carries a next-round priority. (The `status` poll command treats only scored/adopted/rejected as terminal, so a waitlisted submission polls until the 30s timeout — re-check next round.)
 
 ## Environment variables
 
 - `BT_WALLET_PATH` - fallback wallet root for signed submissions
+- `SUBMISSIONS_API_KEY` - when the target validator runs with submission-API-key gating (hardened/production), the `submit` and `agent` CLIs send this as the `x-submission-api-key` header; a gated validator rejects submissions without a matching key (HTTP 401).
 
 ## Examples
 

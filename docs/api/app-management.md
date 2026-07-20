@@ -1,10 +1,14 @@
 # App-Management API Reference
 
 The API service (`:8080`, e.g. `https://api.minotaursubnet.com`) exposes the
-create → validate → deploy → lifecycle surface for App Intents. As of the
-2026-07 changes these endpoints use a **wallet-signature** auth model that
-retires the shared admin key: a browser frontend can create, deploy, and manage
-an app with a MetaMask signature and no server secret.
+create → validate → deploy → lifecycle surface for App Intents. **Deploy and
+lifecycle management** use a **wallet-signature** auth model (a browser frontend
+signs with MetaMask — no server secret). **Create and validate are admin-gated**
+(`X-Admin-Key`) as of the 2026-07-18 security hardening (PR #933): both compile
+and **execute the submitted App JS in the scoring sandbox**, which was the
+credential-exfil vector that leaked `RELAYER_PRIVATE_KEY`, so untrusted-JS
+execution is admin-only. Re-opening a hardened self-serve create path is a
+follow-up.
 
 This page documents the current surface. Runtime behavior notes live in the
 [Code-Verified Runtime Guide](../code-verified-runtime.md); operator env defaults
@@ -16,8 +20,8 @@ Three overlapping mechanisms, by endpoint class:
 
 | Class | How to authorize |
 |-------|------------------|
-| **Create** (`POST /v1/apps/`) | `X-Admin-Key` **or** an EIP-712 `owner_signature` (over `keccak(trimmed js + solidity)`) + `owner_deadline`. The API recovers the signer and records it as the app `deployer`; a supplied `deployer` must match the recovered signer. Non-admin create is per-IP rate-limited (`APP_CREATE_RATE_PER_MIN`, default 5/min). |
-| **Validate** (`POST /v1/apps/validate`) | Open — no auth. Stateless compile preflight, per-IP rate-limited (`APP_VALIDATE_RATE_PER_MIN`, default 5/min). |
+| **Create** (`POST /v1/apps/`) | **Admin-gated** (`X-Admin-Key`) — PR #933. Create runs a Forge/JS validation pass that **executes the submitted JS in the scoring sandbox**, so untrusted-JS execution is admin-only. An `owner_signature` self-serve branch remains in the handler but is unreachable behind the admin gate in every deployed config (dev-open only when no relayer **and** `LOCAL_TESTNET=1`). Per-IP rate-limited (`APP_CREATE_RATE_PER_MIN`, default 5/min). |
+| **Validate** (`POST /v1/apps/validate`) | **Admin-gated** (`X-Admin-Key`) — PR #933. It **executes the submitted JS** in the scoring sandbox (loads the module to check it exports `score()`) — the same credential-exfil surface as create, so it is no longer open. Per-IP rate-limited (`APP_VALIDATE_RATE_PER_MIN`, default 5/min). |
 | **Deploy** (`POST /v1/apps/{app_id}/deploy`) | ONE of: `X-Admin-Key` (free); a wallet signature (`action="deploy"`) from an allowed signer that is fee-exempt (`DEPLOY_FEE_EXEMPT_ADDRESSES`) → free; or a payment body (`payment_signature` + on-chain proof) → the public pay path. |
 | **App-management** (lifecycle / registry / registration / reads) | EIP-712 wallet-signature headers (below). Allowed signers = the app's `deployer` ∪ `APP_ADMIN_SIGNERS`. |
 
@@ -48,9 +52,11 @@ Body includes the JS + Solidity source, constructor args, `contract_version`
 
 ### `POST /v1/apps/validate` — compile preflight
 
-Open, rate-limited. Compiles the pasted source (ForgeCompiler now builds
-`DexAggregatorAppV2`; the contracts submodule was bumped and V2 imports resolve)
-and returns compile diagnostics. No state change.
+**Admin-gated** (`X-Admin-Key`), rate-limited. Compiles the pasted source
+(ForgeCompiler now builds `DexAggregatorAppV2`; the contracts submodule was
+bumped and V2 imports resolve) **and executes the JS in the scoring sandbox** to
+check it exports `score()` — the reason it is admin-only (PR #933). Returns
+compile diagnostics. No state change, nothing deployed.
 
 ### `POST /v1/apps/{app_id}/deploy` — deploy on-chain
 
@@ -95,9 +101,10 @@ All wallet-signature gated (writes need a nonce):
 |--------|------|---------|
 | `PUT` | `/v1/apps/{app_id}/solidity` | Replace stored Solidity source / ctor args / `contract_version`. Refuses mid-deploy. |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/retire` | Mark the deployment RETIRED, releasing the deploy guard so the deploy route acts as an **in-place redeploy** (upserts on `(app_id, chain_id)`, same `app_id`). |
+| `POST` | `/v1/apps/{app_id}/deregister` | **App-wide** deregister (admin key OR wallet signature `action="deregister_app"`): schedules every non-deploying deployment to RETIRING (stops new orders immediately) and, ~1 tempo later via a round-anchored fleet-uniform cutover, drops the app from the **whole benchmark corpus + pack hash** — keeping all order rows (deregister, not delete). |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/float/deposit` | Fund a V2 app-held WETH float from the relayer (optionally wrapping relayer ETH first). |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/float/withdraw` | Recover the float. |
-| `PATCH` | `/v1/apps/{app_id}/deployments/{chain_id}/config` | V2 relayer-gated setters: `setFeeBps`, `setVolumeCapBps`, `setFeeCollector`. |
+| `PATCH` | `/v1/apps/{app_id}/deployments/{chain_id}/config` | V2 relayer-gated setters: `setFeeBps`, `setVolumeCapBps`, `setFeeCollector`, `setFeeMode` (0=USER / 1=APP), `setAppOwner` (V2 float-recovery co-signer). |
 
 > V2 apps settle fees from an app-held WETH float — a production V2 app needs a
 > funded float or nonzero-fee orders revert / score zero (PR #527).

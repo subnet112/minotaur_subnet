@@ -150,11 +150,12 @@ Decide how third parties will reach you:
 
 You will fill this into `.env` in Step 8.
 
-> **Port 8080 (api service)** is also exposed by the canonical compose
-> for the champion-consensus loop's `/identity` mirror. Open it inbound
-> only if you intend to participate in champion-consensus signing once
-> the registry-consolidation work goes live; until then 9100 alone is
-> sufficient to be a useful order-consensus follower.
+> **Port 8080 (api service) is required.** Champion-consensus runs by default
+> whenever `VALIDATOR_PRIVATE_KEY` is set (there is no separate feature flag), and
+> champion-consensus proposals are delivered peer-to-peer over `:8080` — the
+> leader/peers retarget your discovered `:9100` axon to `:8080`. Open `:8080`
+> inbound so peers can reach you; the bundled `scripts/check_validator.sh` treats a
+> disabled champion-consensus as a hard failure.
 
 ## 6. Get upstream RPC keys (Alchemy / Infura / QuickNode)
 
@@ -260,10 +261,9 @@ VALIDATOR_PRIVATE_KEY=0x<your_evm_private_key>
 ETH_UPSTREAM_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/<your_key>
 BASE_UPSTREAM_RPC_URL=https://base-mainnet.g.alchemy.com/v2/<your_key>
 
-# (Optional) Watchtower auto-update poll interval. Default is 1 hour.
-# Drop to 300s (5 min) during the early-network shake-out so audit
-# fixes propagate faster across the network.
-WATCHTOWER_POLL_INTERVAL=300
+# NOTE: the Watchtower poll interval is NOT configurable via .env — it is a
+# literal on the `watchtower` service in docker-compose.yml ("3600" = 1h).
+# Setting WATCHTOWER_POLL_INTERVAL here has no effect; edit the compose service.
 ```
 
 Leave the on-chain registry addresses (`VALIDATOR_REGISTRY_8453`,
@@ -423,10 +423,12 @@ optional Watchtower container together give you hands-off updates:
    `:stable` image, recreates the `validator` and `api` containers with
    the new SHA. ~30-60 seconds of downtime during the recreate.
 
-The poll interval is controlled by `WATCHTOWER_POLL_INTERVAL` (seconds)
-in your `.env`. The canonical default is `3600` (1 hour). **During the
-early-network shake-out phase, set `WATCHTOWER_POLL_INTERVAL=300`
-(5 minutes)** so audit fixes and config changes propagate faster.
+The poll interval is set on the `watchtower` service in `docker-compose.yml`
+(`WATCHTOWER_POLL_INTERVAL: "3600"`, i.e. 1 hour). It is a literal in the
+compose file — **not** an `${...}` substitution, and the service has no
+`env_file` — so setting `WATCHTOWER_POLL_INTERVAL` in `.env` has **no effect**.
+To poll faster during the early-network shake-out phase (e.g. `300` = 5 minutes),
+edit that value on the `watchtower` service in the compose file and recreate it.
 
 Once the network is stable and `:stable` promotions are infrequent,
 bump it back up to the hourly default to save GHCR bandwidth.
@@ -465,7 +467,7 @@ of the VM.
 Install this cron — **every 6 hours**, not daily:
 
 ```
-0 */6 * * * root docker compose -f /home/<user>/minotaur/docker-compose.yml rm -fsv anvil anvil-base anvil-btevm && docker compose -f /home/<user>/minotaur/docker-compose.yml up -d anvil anvil-base anvil-btevm
+0 */6 * * * root docker compose -f /home/<user>/minotaur/docker-compose.yml rm -fsv anvil-eth anvil-base anvil-btevm && docker compose -f /home/<user>/minotaur/docker-compose.yml up -d anvil-eth anvil-base anvil-btevm
 ```
 
 (Adjust the path to where you put `docker-compose.yml` in Step 7.)
@@ -547,12 +549,15 @@ If you prefer Anvil under systemd plus the daemon as a native Python
 process, the equivalent invocations are:
 
 ```bash
+# Match the canonical compose: --chain-id + --no-storage-caching, and NO
+# --block-time. The simulator force-mines each tx (evm_mine) and re-forks to
+# head before every sim, so interval mining only burns CPU/RAM on empty blocks.
 anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" \
-  --block-time 2
+  --chain-id 1 --no-storage-caching
 anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" \
-  --chain-id 8453 --no-storage-caching --block-time 2
+  --chain-id 8453 --no-storage-caching
 anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" \
-  --chain-id 964 --no-storage-caching --block-time 2
+  --chain-id 964 --no-storage-caching
 
 python -m minotaur_subnet.validator.main \
   --port 9100 \
@@ -562,7 +567,7 @@ python -m minotaur_subnet.validator.main \
   --subtensor-url "$SUBTENSOR_URL" \
   --validator-key "$VALIDATOR_PRIVATE_KEY" \
   --tick-interval 12.0 \
-  --epoch-seconds 1200
+  --epoch-seconds 1300
 ```
 
 Wrap each in its own systemd unit with `Restart=on-failure`. The
@@ -581,7 +586,7 @@ After=network-online.target docker.service
 [Service]
 EnvironmentFile=/etc/minotaur/env
 ExecStart=/opt/minotaur/.venv/bin/python -m minotaur_subnet.validator.main \
-  --port 9100 --epoch-seconds 1200
+  --port 9100 --epoch-seconds 1300
 Restart=on-failure
 RestartSec=5
 User=minotaur
