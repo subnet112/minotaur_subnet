@@ -200,6 +200,49 @@ The local testnet auto-registers a test miner and auto-benchmarks each submissio
 
 **Caveat — local scores are a strong predictor, not the exact production score.** A live production round also runs a hidden **shadow phase** (cases not in the public benchmark pack) to discourage overfitting. So a solver that scores well locally should score similarly in production, but the final on-validator score (including shadow cases) is only known once you submit for real. Don't tune to the public cases alone.
 
+## Preview orders & find your champion's blind spots
+
+The exact set you're scored against is a per-round, seeded random sample of real orders plus [hidden shadow cases](#dry-run-score-your-solver-before-submitting-to-production) — it's deliberately not published. But you *can* pull the same population of orders to test against locally, and after a submission you get a per-order breakdown of exactly where the champion is weak.
+
+### Before you submit — pull real orders to test against
+
+All three are public, read-only endpoints on any validator/API node. Hit the production API (`https://api.minotaursubnet.com/v1`) to get the live corpus:
+
+- `GET /v1/apps/{app_id}/historical-scenarios?n_per_chain=10` — PII-stripped historical filled-order scenarios for one app: the same real orders the benchmark replays as Stage 2. Deterministic (seeded by `app_id`), so it's a **repeatable preview sample, not the set your submission is scored on**. `n_per_chain` is capped at 50.
+- `GET /v1/apps/manifests` — every app's manifest in one call (bulk discovery), including its synthetic `benchmark_scenarios`. Single-app variant: `GET /v1/apps/{app_id}/manifest`.
+- `GET /v1/orders?full=true&limit=100` — the raw order feed, newest-first, from the same store the benchmark samples. Without `full=true` you get a slim summary projection (no `plan`).
+
+Feed any of these into the local testnet or the plan dry-run below.
+
+### Debug a single plan without your own archive node
+
+Two authed endpoints score a single execution plan **you supply** (not your whole solver — that's the local testnet's job), each gated by a metagraph-registered hotkey signature or admin key:
+
+- `POST /v1/orders/{order_id}/dry-run` — fast **mock** simulation, JS score only.
+- `POST /v1/apps/{app_id}/score` — the validator's **real fork simulation** (the same `scoreIntent` path production uses): a full report with on-chain score, gas, transfers, and the decoded on-chain revert reason on failure. Rate-limited to 60 calls/hr per hotkey; pass `fork_block` to replay against historical pool state (archive-capable RPC required; clamped to ±100 blocks from head).
+
+The reference client signs the request from your local Bittensor wallet:
+
+```bash
+python scripts/miner_dry_run.py \
+  --api-url "$VALIDATOR_URL" \
+  --wallet-name <wallet> --hotkey-name <hotkey> \
+  --order-id <order_id> --plan plan.json
+```
+
+It calls `/orders/{id}/dry-run` by default; POST the same signed headers to `/apps/{app_id}/score` for the full real-sim report (see the script's header comment).
+
+### After you submit — read where the champion is blind
+
+The benchmark report and PR comment carry a per-order breakdown (`relative.per_order`), one row per order with the champion's output, yours, the ratio, and a verdict:
+
+- `blind_spot_cover` — the champion delivered **nothing** and you delivered. Pure wins that count toward dethroning — hunt for more of them.
+- `regression` — you delivered less than the champion. Optimization targets (each must stay within the 1% floor).
+- `dropped` — you produced nothing on an order the champion serves. A **hard veto** — fix these first.
+- `win` / `matched` — you beat / tied the champion within the 10 bps band.
+
+Use the `blind_spot_cover` and `regression` rows to find the champion's weak orders, then reproduce them locally with the endpoints above. Remember the shadow phase: optimize the *class* of order you're losing on, not the exact `intent_id`.
+
 ## Next steps
 
 - [Configuration](./configuration.md) for full CLI flags
