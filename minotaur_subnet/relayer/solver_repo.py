@@ -453,6 +453,14 @@ def _github_api_headers(token: str | None = None) -> dict[str, str]:
 # wrappers; they no-op without SOLVER_REPO_URL / a token, so they are inert on a
 # node that isn't the configured leader.
 
+# Transient GitHub statuses worth retrying: network/timeout (0), secondary
+# rate-limit (429), and server errors (5xx). A 4xx is a deterministic client
+# error and is never retried.
+_GITHUB_RETRY_STATUSES = frozenset({0, 429, 500, 502, 503, 504})
+_GITHUB_MAX_ATTEMPTS = 4        # 1 initial attempt + 3 retries
+_GITHUB_RETRY_BACKOFF_S = 1.0   # base seconds; backs off 1s, 2s, 4s
+
+
 def _github_api_request(
     method: str, url: str, payload: dict | None = None, *, token: str | None = None,
 ) -> tuple[int, dict | None]:
@@ -460,22 +468,39 @@ def _github_api_request(
 
     ``token`` (private path) authenticates against the miner's private repo;
     otherwise the canonical-repo environment token is used.
+
+    Transient failures (network/timeout, 429, or 5xx) are retried with bounded
+    exponential backoff. GitHub's git-object writes are content-addressed and
+    idempotent (blobs/trees by content, ref-update to a fixed SHA) and every
+    read is idempotent, so retrying the champion-publish path is safe — a
+    one-off GitHub 503 must not drop a certified dethrone (incident 2026-07-20:
+    round-e29741775 aborted merge_failed:publish_failed on a transient 503).
+    A 4xx is a deterministic client error and is returned immediately.
     """
+    import time
     import urllib.error
     import urllib.request
 
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=_github_api_headers(token), method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — fixed github host
-            body = resp.read().decode("utf-8")
-            return resp.status, (json.loads(body) if body else None)
-    except urllib.error.HTTPError as exc:
-        logger.warning("GitHub %s %s -> %s: %s", method, url, exc.code, exc.reason)
-        return exc.code, None
-    except Exception as exc:  # network / json
-        logger.warning("GitHub %s %s failed: %s", method, url, exc)
-        return 0, None
+    result: tuple[int, dict | None] = (0, None)
+    for attempt in range(_GITHUB_MAX_ATTEMPTS):
+        req = urllib.request.Request(
+            url, data=data, headers=_github_api_headers(token), method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — fixed github host
+                body = resp.read().decode("utf-8")
+                return resp.status, (json.loads(body) if body else None)
+        except urllib.error.HTTPError as exc:
+            result = (exc.code, None)
+            logger.warning("GitHub %s %s -> %s: %s", method, url, exc.code, exc.reason)
+        except Exception as exc:  # network / json
+            result = (0, None)
+            logger.warning("GitHub %s %s failed: %s", method, url, exc)
+        if result[0] not in _GITHUB_RETRY_STATUSES or attempt == _GITHUB_MAX_ATTEMPTS - 1:
+            break
+        time.sleep(_GITHUB_RETRY_BACKOFF_S * (2 ** attempt))
+    return result
 
 
 def comment_on_pr(
