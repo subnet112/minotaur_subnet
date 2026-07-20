@@ -852,9 +852,14 @@ class EpochManager:
             # ACTIVATION instead: defer + re-drive (the coordinator retries every tick)
             # while ``epoch <= effective_epoch + grace``, so a recovering RPC COMPLETES
             # the certified win; ABORT past it so a SUSTAINED outage can't pin the round
-            # open. Scoped to ``vr_read_failed`` only — every other outcome, including
-            # other ``validation``-stage refusals (quorum miss, invalid cert), aborts.
-            _TRANSIENT_DEFERRABLE = frozenset({"vr_read_failed"})
+            # open. ``publish_failed`` is the POST-attest analogue (a transient GitHub
+            # 5xx while landing the certified tree — incident 2026-07-20 round-e29741775):
+            # the cert is ALREADY on-chain, so the re-drive relies on the finalize's
+            # on-chain-cert idempotency (a landed cert counts as attested — see
+            # on_champion_adopted_pr) to COMPLETE the merge rather than re-abort; it is
+            # bounded from activation the same way. Every other outcome — including other
+            # ``validation``-stage refusals (quorum miss, invalid cert) — aborts.
+            _TRANSIENT_DEFERRABLE = frozenset({"vr_read_failed", "publish_failed"})
             _finalize_unknown = merge_stage == "client"
             _transient_read = merge_reason in _TRANSIENT_DEFERRABLE
             _defer_deadline = int(getattr(round_state, "decision_deadline_epoch", 0) or 0)
