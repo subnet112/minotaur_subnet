@@ -106,8 +106,8 @@ KNOWN_VALIDATORS: dict[str, dict[str, str | None]] = {
         "name": "Minotaur Leader",
         "url": "https://minotaursubnet.com",
     },
-    "0x19235203853dd4a8dbc7c717ec669c9391e16aa1": {
-        "hotkey": "5FdtBrmYC1WHKfqs34ZDpQeQqZgQjY5D32EcYChswhiWs112",
+    "0x38f9346ad5ef7c1ec2f4cf3c4693b558789c512b": {
+        "hotkey": "5CVNNzXQFC5iKh4Zy729LTKAKRm48tiAaAJ3JFpjmtVds112",
         "name": "Rizzo (Insured)",
         "url": None,
     },
