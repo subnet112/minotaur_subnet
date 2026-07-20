@@ -179,13 +179,59 @@ def test_render_lists_differing_orders_worse_first():
                           submission_id="sub-1")
     # No legacy scalar line.
     assert "Your score" not in md and "score_to_beat" not in md
-    # Per-order counts summary present.
-    assert "1 better · 1 worse · 1 matched" in md
+    # Per-order counts summary present. The -2% order is a legacy "worse" verdict
+    # with no catastrophic flag, so the fallback lumps it into `lost` (never
+    # UNDER-reports a loss).
+    assert "1 better · 1 matched · 1 lost" in md
     # Both differing orders rendered with signed deltas; the matched one is NOT in the table.
     assert "app:WETH_to_DAI" in md and "-2.00%" in md
     assert "app:USDC_to_WETH" in md and "+3.00%" in md
     # Worse row comes before the better row (optimize-this ordering).
     assert md.index("app:WETH_to_DAI") < md.index("app:USDC_to_WETH")
+
+
+def test_render_tolerated_regression_is_not_a_loss():
+    """A within-floor regression (catastrophic=False) must render as a neutral
+    "within tolerance" row and NOT read as a loss — no ❌, no "regressed"."""
+    rel = {
+        "better": 2, "worse": 1, "matched": 0, "new": 0, "compared": 3,
+        "tolerated": 1, "lost": 0, "catastrophic": 0, "dropped": 0, "floor_bps": 100,
+        "verdict": "dethrone", "round_id": "r",
+        "per_order": [
+            {"intent_id": "app:A", "champ": "10000", "chal": "12000", "ratio": 1.2,
+             "verdict": "win", "catastrophic": False},
+            {"intent_id": "app:B", "champ": "10000", "chal": "12000", "ratio": 1.2,
+             "verdict": "win", "catastrophic": False},
+            {"intent_id": "app:C", "champ": "10000", "chal": "9950", "ratio": 0.995,
+             "verdict": "regression", "catastrophic": False},
+        ],
+    }
+    report = build_submission_report(_sub(_CHAL_INTENT, relative=rel), reason=None)
+    # Beat on >=1 order with no hard loss — never "regressed".
+    assert report["outcome"] == "beat_champion"
+    md = render_report_md(report, submission_id="sub-1")
+    assert "Regressed" not in md
+    # Summary splits tolerated out of worse and labels the band dynamically.
+    assert "1 tolerated (within 1%)" in md
+    assert "· 1 lost" not in md
+    # The within-floor order renders neutral, not ❌.
+    assert "➖ within 1%" in md
+    assert "app:C" in md and "-0.50%" in md
+
+
+def test_render_tolerated_only_reads_as_matched_not_regressed():
+    """A submission whose ONLY divergence is a within-floor dip (no wins, no hard
+    loss) reads as "matched", not "regressed"."""
+    rel = {
+        "better": 0, "worse": 1, "matched": 2, "new": 0, "compared": 3,
+        "tolerated": 1, "lost": 0, "catastrophic": 0, "dropped": 0, "floor_bps": 100,
+        "verdict": "behind", "round_id": "r",
+        "per_order": [
+            {"intent_id": "app:C", "champ": "10000", "chal": "9950", "ratio": 0.995,
+             "verdict": "regression", "catastrophic": False},
+        ],
+    }
+    assert build_submission_report(_sub(_CHAL_INTENT, relative=rel), reason=None)["outcome"] == "matched"
 
 
 def test_render_all_matched_gives_guidance():
