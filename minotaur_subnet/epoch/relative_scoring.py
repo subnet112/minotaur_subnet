@@ -560,6 +560,13 @@ def evaluate_relative_adoption(
         bar_verdict: str | None = None
         champ_gas: int | None = None
         chal_gas: int | None = None
+        # Per-order HARD-LOSS flag (exact-integer, never the display float): a
+        # regression cut by MORE than FLOOR_BPS. Emitted so a UI can tell a
+        # TOLERATED within-floor regression (netted, not a loss) from a real loss
+        # WITHOUT re-deriving the floor client-side — when FLOOR_BPS moves this
+        # flag moves with it. False for every non-regression verdict (a
+        # ``dropped`` order is a hard loss via its own verdict, not this flag).
+        catastrophic = False
 
         if champ_has and chal_has:
             # EXACT-INTEGER verdict — cross-multiply the BPS band, no float.
@@ -572,6 +579,7 @@ def evaluate_relative_adoption(
                 # Exact-integer cross-multiply, no float — bit-exact at boundary.
                 if chal_i * _BPS < champ_i * (_BPS - FLOOR_BPS):  # type: ignore[operator]
                     n_catastrophic += 1
+                    catastrophic = True
             elif chal_i * _BPS > champ_i * (_BPS + tol_bps):  # type: ignore[operator]
                 verdict = "win"
                 n_wins += 1
@@ -651,6 +659,10 @@ def evaluate_relative_adoption(
             "chal": None if chal_i is None else str(chal_i),
             "ratio": ratio,
             "verdict": verdict,
+            # HARD-LOSS discriminator for a ``regression``: True ⇒ cut > FLOOR_BPS
+            # (a loss), False ⇒ tolerated within the floor. Always False for
+            # win / matched / blind_spot_cover / blind_spot_repeat / dropped / skip.
+            "catastrophic": catastrophic,
         }
         if bar_s is not None:
             # Blind-spot orders with a recorded adoption-time bar carry it (exact
@@ -954,6 +966,15 @@ def relative_counts(
       * ``worse``    = regressions + dropped orders (orders the challenger
                        delivers LESS on, plus champion-served orders it produced
                        nothing for). Both count as worse here.
+      * ``tolerated``= regressions WITHIN the ``floor_bps`` floor — netted against
+                       wins, never a loss. (A SUBSET of ``worse``.)
+      * ``lost``     = HARD losses: cuts OVER the floor (``catastrophic``) plus
+                       ``dropped`` orders — the subset of ``worse`` that vetoes
+                       adoption. Invariant: ``worse == tolerated + lost``.
+      * ``catastrophic`` / ``dropped`` = the two components of ``lost``.
+      * ``floor_bps``= the hard per-order regression floor in bps (``FLOOR_BPS``),
+                       so a consumer can label the tolerated band and re-tier
+                       automatically when the floor changes.
       * ``matched``  = orders inside the ±``tol_bps`` noise band (neither better nor worse).
       * ``new``      = blind-spot covers — a SUBSET of ``better``: orders the
                        champion delivered nothing on that the challenger covers.
@@ -1002,6 +1023,18 @@ def counts_from_verdict(res: dict[str, Any]) -> dict[str, Any]:
     matched = res["n_matched"] + repeats
     new = res["n_blind_spots"]
     compared = better + worse + matched
+    # HARD-LOSS split of ``worse`` (which lumps every regression with drops for
+    # back-compat). ``lost`` is the subset that actually vetoes adoption — a cut
+    # over the FLOOR_BPS floor, or a dropped order — while ``tolerated`` is the
+    # within-floor regressions that are NETTED against wins and never lose the
+    # round. Emitted so a UI shows only real losses in the loss treatment and a
+    # tolerated regression as "within tolerance"; ``floor_bps`` lets it label the
+    # band dynamically, so lowering FLOOR_BPS reshapes the display automatically.
+    # Invariant: ``worse == tolerated + lost``.
+    catastrophic = res["n_catastrophic"]
+    dropped = res["n_dropped"]
+    tolerated = res["n_regressions"] - catastrophic
+    lost = catastrophic + dropped
     verdict = (
         "dethrone"
         if res["adopt"]
@@ -1014,6 +1047,12 @@ def counts_from_verdict(res: dict[str, Any]) -> dict[str, Any]:
         "new": new,
         "repeats": repeats,
         "compared": compared,
+        # Hard-loss split of ``worse`` (additive; ``worse == tolerated + lost``).
+        "tolerated": tolerated,
+        "lost": lost,
+        "catastrophic": catastrophic,
+        "dropped": dropped,
+        "floor_bps": FLOOR_BPS,
         "verdict": verdict,
         # How an adopt was won ("performance" | "gas" | "factorization" |
         # "deadwood" | None) — lets the report explain a tie-break dethrone
