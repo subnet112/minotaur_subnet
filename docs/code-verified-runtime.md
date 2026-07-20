@@ -132,23 +132,19 @@ Other:
 
 ## Validator Service Surface (`:9100`)
 
-The standalone validator currently exposes:
+The standalone validator daemon (`validator/main.py`) registers exactly these 9 routes:
 
 - `GET /health`
-- `GET /intents/available`
-- `POST /intents/{app_id}/submit`
-- `POST /reload`
+- `GET /identity`
+- `POST /consensus/proposal`
+- `POST /internal/weights/queue`
 - `GET /weights`
 - `GET /weights/history`
 - `GET /blockloop/status`
-- `POST /orders/submit`
-- `GET /orders`
-- `GET /intents/{app_id}/details`
-- `GET /intents/{app_id}/scores`
-- `POST /apps/{app_id}/quote`
-- `POST /consensus/proposal`
 - `GET /consensus/info`
 - `GET /leader`
+
+The former `/intents/*`, `/orders/*`, `/apps/{app_id}/quote`, and `/reload` daemon routes were removed in the 2026-05-25 audit cleanup; the miner-/order-facing equivalents live on the API service (`:8080`, `/v1/…`).
 
 ## Execution Flow (Order Lifecycle)
 

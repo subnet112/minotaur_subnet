@@ -17,7 +17,7 @@ All settings can be provided as CLI arguments, environment variables, or a combi
 | `--wallet-name` | `None` | Bittensor wallet name |
 | `--hotkey-name` | `None` | Bittensor hotkey name |
 | `--validator-key` | `""` | EVM private key (hex) for EIP-712 consensus signing |
-| `--quorum-bps` | `10000` | Quorum threshold in basis points (10000 = 100%). Mostly informational — the daemon reads the canonical value from `ValidatorRegistry.quorumBps()` at startup and refreshes once per epoch. |
+| `--validator-registry-address` | `""` | Address of the on-chain `ValidatorRegistry` — the **canonical source of `quorumBps`** (and the authorized validator set). Read at startup and refreshed once per epoch. There is **no `--quorum-bps` flag**; quorum is not set on the CLI. |
 | `--leader-api-url` | `None` | Leader API base URL to sync the app catalog from (e.g. `https://api.minotaursubnet.com`). Required for follower validators that don't receive `create_app` / `deploy_app` calls directly. Falls back to `LEADER_API_URL` env. |
 | `--app-sync-interval` | `60.0` | Seconds between app catalog sync ticks. |
 
@@ -198,6 +198,6 @@ LOG_LEVEL=INFO
 
 1. CLI arguments take precedence over environment variables.
 2. For `--netuid`, the CLI value is used only if it differs from the default (112); otherwise the `NETUID` environment variable is checked.
-3. For `--quorum-bps`, the same logic applies (default 10000 defers to `QUORUM_BPS` env var).
+3. Quorum is **not** a CLI flag. The canonical `quorumBps` is read from the on-chain `ValidatorRegistry` (via `--validator-registry-address` / `VALIDATOR_REGISTRY_<chain>`); `QUORUM_BPS_OVERRIDE` is the only local escape hatch (it skips the on-chain read).
 
 See also: [Quickstart](./quickstart.md), [Troubleshooting](./troubleshooting.md).

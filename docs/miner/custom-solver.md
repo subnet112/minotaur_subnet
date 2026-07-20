@@ -256,9 +256,9 @@ composite = 0.4 * trigger_accuracy + 0.6 * plan_quality
 
 Where `trigger_accuracy` measures how well `check_trigger()` predicts when execution is warranted.
 
-## Using BaselineSwapSolver as Reference
+## Using the Reference Solver
 
-The `BaselineSwapSolver` at `minotaur_subnet/sdk/solvers/baseline_solver.py` is the default champion. Study it to understand:
+The concrete reference solvers (including the swap baseline) now live in the **canonical solver repo** [`github.com/subnet112/minotaur-solver`](https://github.com/subnet112/minotaur-solver) — its `main` branch always holds the **current champion's** `solver.py` (the code to beat), and it is the repo you fork and open your submission PR against. The in-repo `minotaur_subnet/sdk/solvers/` now ships only the abstract interfaces (`IntentSolver`, `Strategy`, `IntentProcessor`) plus a minimal `anvil_swap_solver.py` example. Study the current champion in that repo to understand:
 
 - **RPC-first architecture:** Queries Uniswap V3 pool states via RPC, falls back to snapshot.
 - **Factory-based pool discovery:** Uses the Uniswap V3 Factory contract to find pools for any token pair across all fee tiers (100, 500, 3000, 10000).
