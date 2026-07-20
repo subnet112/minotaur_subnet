@@ -62,7 +62,7 @@ Both layers must pass. Champion adoption is then **relative** and resolved by a 
 1. **Output (primary, always armed).** Adopt if net better on breadth: `(wins + blind-spot covers) − regressions ≥ 1`. Regressions are **tolerated within a 1% per-order floor** and netted against wins — this is a bounded-regression, net-better rule, not the older "any regression = reject".
 2. **Gas → Factorization → Deadwood tie-breaks** — fire only on a *fully-matched, saturated tie* (every compared order matched, zero regressions): cheaper total metered (pre-refund) gas by ≥200 bps, then smaller worst AST region (`max_region_nodes`) by ≥100, then less dead code (`unproductive_nodes`) by ≥2000. All three are **armed** on `develop` but fire "by data" — inert until both the champion and challenger records carry the metric.
 
-**Hard vetoes** (override every rung): no order cut by more than 1% and no dropped order the champion serves. The blind-spot *repeat* bar is wired but **disarmed** (`BLIND_SPOT_BAR_TTL_S = None`), so it does not yet affect adoption.
+**Hard vetoes** (override every rung): no order cut by more than 1% and no dropped order the champion serves. The blind-spot *repeat* bar is **armed** (`BLIND_SPOT_BAR_TTL_S = 24h`): a `blind_spot_cover` counts toward dethrone only if the challenger **exceeds** the incumbent's adoption-time value on that order (unless that value is older than 24h). A cover that merely re-delivers what the order already paid within 24h is a neutral `blind_spot_repeat` and can't be the +1 that dethrones (anti-treadmill; leader-only, safe at quorum==1).
 
 ### Intent OrderBook
 
