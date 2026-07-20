@@ -150,11 +150,12 @@ Decide how third parties will reach you:
 
 You will fill this into `.env` in Step 8.
 
-> **Port 8080 (api service)** is also exposed by the canonical compose
-> for the champion-consensus loop's `/identity` mirror. Open it inbound
-> only if you intend to participate in champion-consensus signing once
-> the registry-consolidation work goes live; until then 9100 alone is
-> sufficient to be a useful order-consensus follower.
+> **Port 8080 (api service) is required.** Champion-consensus runs by default
+> whenever `VALIDATOR_PRIVATE_KEY` is set (there is no separate feature flag), and
+> champion-consensus proposals are delivered peer-to-peer over `:8080` — the
+> leader/peers retarget your discovered `:9100` axon to `:8080`. Open `:8080`
+> inbound so peers can reach you; the bundled `scripts/check_validator.sh` treats a
+> disabled champion-consensus as a hard failure.
 
 ## 6. Get upstream RPC keys (Alchemy / Infura / QuickNode)
 
@@ -548,12 +549,15 @@ If you prefer Anvil under systemd plus the daemon as a native Python
 process, the equivalent invocations are:
 
 ```bash
+# Match the canonical compose: --chain-id + --no-storage-caching, and NO
+# --block-time. The simulator force-mines each tx (evm_mine) and re-forks to
+# head before every sim, so interval mining only burns CPU/RAM on empty blocks.
 anvil --host 0.0.0.0 --port 8545 --fork-url "$ETH_UPSTREAM_RPC_URL" \
-  --block-time 2
+  --chain-id 1 --no-storage-caching
 anvil --host 0.0.0.0 --port 8546 --fork-url "$BASE_UPSTREAM_RPC_URL" \
-  --chain-id 8453 --no-storage-caching --block-time 2
+  --chain-id 8453 --no-storage-caching
 anvil --host 0.0.0.0 --port 8547 --fork-url "$BITTENSOR_EVM_UPSTREAM_RPC_URL" \
-  --chain-id 964 --no-storage-caching --block-time 2
+  --chain-id 964 --no-storage-caching
 
 python -m minotaur_subnet.validator.main \
   --port 9100 \

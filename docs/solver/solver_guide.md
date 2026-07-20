@@ -166,7 +166,7 @@ class Interaction:
     target: str       # Contract address (0x-prefixed, 42 chars)
     value: str        # Wei value as decimal string ("0" for no ETH)
     call_data: str    # ABI-encoded calldata (0x-prefixed hex)
-    chain_id: int     # Target chain (default: 1)
+    chain_id: int     # Target chain (default: 0 — must be set explicitly)
 ```
 
 ### MarketSnapshot
@@ -483,7 +483,7 @@ Per-command timeouts enforced by the harness:
 | `restore_state` | 30s |
 | `metadata` | 5s |
 
-Total container lifetime: **10 minutes** maximum.
+Total container lifetime: **15 minutes** maximum.
 
 ## JSON-over-stdio Protocol
 

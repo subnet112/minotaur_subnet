@@ -48,7 +48,7 @@ When the validator runs your solver, the container is launched with strict isola
 | Memory | `--memory=4g` |
 | CPU | `--cpus=2.0` |
 
-Your solver must work entirely offline. Any data your solver needs (routing tables, model weights, pool lists) must be bundled in the Docker image.
+`--network=none` is the isolation floor (build + Stage-1/2 import checks). During Stage-3 benchmarking the harness attaches your solver to an **internal** Docker network — no internet, host, or cross-network access — and injects chain-RPC URLs into `initialize()` via `config["rpc_urls"]`, so you **can** read live on-chain pool/state during benchmarking (the reference solver is RPC-first). Anything that needs the public internet (model downloads, external routing tables, price APIs) still must be bundled into the image, since only chain RPC is reachable.
 
 ## solver.py Structure
 
