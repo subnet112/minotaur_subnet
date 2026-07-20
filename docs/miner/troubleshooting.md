@@ -84,8 +84,10 @@ reason. Common non-adoption cases:
   help (see below).
 - **`fingerprint_repeat`.** A comment-only / nonce-only resubmit of an identical
   code tree is rejected pre-build — "comments don't make code new". Change at least
-  one semantic byte. (Cross-hotkey resubmit quota is operator-gated and off by
-  default.)
+  one semantic byte. A **cross-hotkey** quota also applies by default
+  (`SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT=2`): the same normalized code fingerprint
+  can be benched at most twice **across all hotkeys**, so copy-pasting another
+  miner's solver under a fresh hotkey is rejected once the quota is spent.
 
 Use status endpoint to inspect:
 
