@@ -453,6 +453,14 @@ def _github_api_headers(token: str | None = None) -> dict[str, str]:
 # wrappers; they no-op without SOLVER_REPO_URL / a token, so they are inert on a
 # node that isn't the configured leader.
 
+# Transient GitHub statuses worth retrying: network/timeout (0), secondary
+# rate-limit (429), and server errors (5xx). A 4xx is a deterministic client
+# error and is never retried.
+_GITHUB_RETRY_STATUSES = frozenset({0, 429, 500, 502, 503, 504})
+_GITHUB_MAX_ATTEMPTS = 4        # 1 initial attempt + 3 retries
+_GITHUB_RETRY_BACKOFF_S = 1.0   # base seconds; backs off 1s, 2s, 4s
+
+
 def _github_api_request(
     method: str, url: str, payload: dict | None = None, *, token: str | None = None,
 ) -> tuple[int, dict | None]:
@@ -460,22 +468,39 @@ def _github_api_request(
 
     ``token`` (private path) authenticates against the miner's private repo;
     otherwise the canonical-repo environment token is used.
+
+    Transient failures (network/timeout, 429, or 5xx) are retried with bounded
+    exponential backoff. GitHub's git-object writes are content-addressed and
+    idempotent (blobs/trees by content, ref-update to a fixed SHA) and every
+    read is idempotent, so retrying the champion-publish path is safe — a
+    one-off GitHub 503 must not drop a certified dethrone (incident 2026-07-20:
+    round-e29741775 aborted merge_failed:publish_failed on a transient 503).
+    A 4xx is a deterministic client error and is returned immediately.
     """
+    import time
     import urllib.error
     import urllib.request
 
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=_github_api_headers(token), method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — fixed github host
-            body = resp.read().decode("utf-8")
-            return resp.status, (json.loads(body) if body else None)
-    except urllib.error.HTTPError as exc:
-        logger.warning("GitHub %s %s -> %s: %s", method, url, exc.code, exc.reason)
-        return exc.code, None
-    except Exception as exc:  # network / json
-        logger.warning("GitHub %s %s failed: %s", method, url, exc)
-        return 0, None
+    result: tuple[int, dict | None] = (0, None)
+    for attempt in range(_GITHUB_MAX_ATTEMPTS):
+        req = urllib.request.Request(
+            url, data=data, headers=_github_api_headers(token), method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — fixed github host
+                body = resp.read().decode("utf-8")
+                return resp.status, (json.loads(body) if body else None)
+        except urllib.error.HTTPError as exc:
+            result = (exc.code, None)
+            logger.warning("GitHub %s %s -> %s: %s", method, url, exc.code, exc.reason)
+        except Exception as exc:  # network / json
+            result = (0, None)
+            logger.warning("GitHub %s %s failed: %s", method, url, exc)
+        if result[0] not in _GITHUB_RETRY_STATUSES or attempt == _GITHUB_MAX_ATTEMPTS - 1:
+            break
+        time.sleep(_GITHUB_RETRY_BACKOFF_S * (2 ** attempt))
+    return result
 
 
 def comment_on_pr(
@@ -1848,6 +1873,13 @@ def on_champion_adopted_pr(
 
     # Step 1: On-chain attestation (retry up to 3 times)
     tx_hash = None
+    # Idempotent re-drive: a PRIOR finalize may have already landed the certify()
+    # on-chain and then failed downstream (e.g. a transient GitHub 503 at publish).
+    # A re-attest of the same round then reverts "Nonce not increasing" (tx_hash
+    # stays None), but the win IS certified — so a landed on-chain cert also counts
+    # as attested, letting the retry COMPLETE the merge instead of looping to a
+    # deadline abort (incident 2026-07-20 round-e29741775).
+    _attest_already_onchain = False
     if certificate is not None:
         for attempt in range(3):
             tx_hash = attest_champion_on_chain(certificate, commit_hash)
@@ -1862,18 +1894,38 @@ def on_champion_adopted_pr(
                 time.sleep(wait)
 
         if not tx_hash:
-            logger.error(
-                "On-chain attestation failed after 3 attempts for %s — "
-                "PR will be created without proof (Action will block merge)",
-                submission_id,
-            )
+            # Fall back to the authoritative on-chain read (the SAME quorum-cert
+            # check the merge gate uses) — resolving the head SHA exactly as the
+            # attest does so keccak(full_sha) matches. Fabricates nothing: a
+            # missing/unbound cert leaves this False and the attest a genuine
+            # failure, unchanged.
+            _full_head = commit_hash
+            if len(_full_head) < 40:
+                _full_head = _resolve_full_sha(commit_hash) or commit_hash
+            if _onchain_cert_binds(_full_head, round_id):
+                _attest_already_onchain = True
+                logger.info(
+                    "Champion re-drive: fresh attest reverted but an on-chain quorum "
+                    "cert already binds head %s (round %s) — treating as attested, "
+                    "proceeding to publish.",
+                    _full_head[:12], round_id,
+                )
+            else:
+                logger.error(
+                    "On-chain attestation failed after 3 attempts for %s — "
+                    "PR will be created without proof (Action will block merge)",
+                    submission_id,
+                )
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
 
-    # Root cause of a failed/absent attestation, carried into abort_reason.
+    # Root cause of a failed/absent attestation, carried into abort_reason. An
+    # already-on-chain cert (idempotent re-drive) counts as attested, so the
+    # downstream merge/publish reason (e.g. publish_failed) is reported instead of
+    # a misleading attest_failed — keeping the round deferrable while GitHub recovers.
     if certificate is None:
         _attest_reason = "no_certificate"
-    elif not tx_hash:
+    elif not tx_hash and not _attest_already_onchain:
         _attest_reason = "attest_failed"
     else:
         _attest_reason = ""
@@ -1957,7 +2009,7 @@ def on_champion_adopted_pr(
             close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("close-stale failed after champion merge: %s", exc)
-    _ok = bool(tx_hash) and bool(merged)
+    _ok = (bool(tx_hash) or _attest_already_onchain) and bool(merged)
     if _ok:
         # Record where main landed so the reconciler can later detect an orphaned merge.
         _result = MergeResult(True, main_sha=_canonical_main_head_sha())

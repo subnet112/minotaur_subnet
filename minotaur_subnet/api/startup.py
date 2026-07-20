@@ -2389,19 +2389,19 @@ async def initialize(ctx: ServerContext) -> dict:
             # rollout so a leadership change doesn't shift the schedule mid-flight.
             try:
                 solver_round_decision_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "20").strip() or "20",
+                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "45").strip() or "45",
                 )
             except ValueError:
-                solver_round_decision_epochs = 20
+                solver_round_decision_epochs = 45
             # Activate the certified champion just AFTER the decision deadline, so
             # certification has fully landed before the swap takes effect — keep
             # ACTIVATION_DELAY >= DECISION_EPOCHS.
             try:
                 solver_round_activation_delay_epochs = int(
-                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "22").strip() or "22",
+                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "47").strip() or "47",
                 )
             except ValueError:
-                solver_round_activation_delay_epochs = 22
+                solver_round_activation_delay_epochs = 47
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
@@ -2413,16 +2413,16 @@ async def initialize(ctx: ServerContext) -> dict:
             # SOLVER_ROUND_DECISION_EPOCHS). The fixed value above becomes the FLOOR.
             try:
                 solver_round_decision_base_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "10").strip() or "10",
+                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "14").strip() or "14",
                 )
             except ValueError:
-                solver_round_decision_base_epochs = 10
+                solver_round_decision_base_epochs = 14
             try:
                 solver_round_decision_per_sub_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "4").strip() or "4",
+                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "9").strip() or "9",
                 )
             except ValueError:
-                solver_round_decision_per_sub_epochs = 4
+                solver_round_decision_per_sub_epochs = 9
 
             def _round_open_elapsed(current_round) -> float:
                 return max(0.0, time.time() - float(current_round.created_at or time.time()))
