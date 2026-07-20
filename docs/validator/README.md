@@ -26,9 +26,9 @@ Validators perform six core functions:
 
 Validators operate in a leader/follower topology:
 
-- **Leader**: The validator with the highest TAO stake on subnet 112. Ties are broken by hotkey (lexicographic ascending). The leader runs the BlockLoop, processes all orders, and broadcasts proposals to followers.
+- **Leader**: During the early-network operating period, leadership is **locked** to the subnet team's hotkey via `LOCKED_LEADER_HOTKEY` (default set in `validator/metagraph_sync.py`; the matching EVM signer is pinned by `LOCKED_LEADER_EVM_ADDRESS`). `elect_leader()` returns **only** the peer whose hotkey equals `LOCKED_LEADER_HOTKEY` and **ignores stake entirely** — a third-party validator does **not** become leader while the lock is active, regardless of stake. Highest-TAO-stake election (ties broken by hotkey, lexicographic ascending) is only the fallback that applies once the lock is cleared (both env vars set empty). The leader runs the BlockLoop, processes all orders, and broadcasts proposals to followers.
 - **Followers**: All other registered validators. They receive proposals from the leader, independently re-simulate and re-score each plan, and sign EIP-712 approvals if both scores pass threshold.
-- **Leader failover**: When the leader changes (e.g., stake rebalancing), the Relayer drops all in-flight work. The new leader reprocesses everything from scratch.
+- **Leader failover**: The leader changes only when the lock is repointed or cleared (not by stake rebalancing under the default). On a leader change, the Relayer drops all in-flight work and the new leader reprocesses everything from scratch.
 
 ### BlockLoop Pipeline
 
