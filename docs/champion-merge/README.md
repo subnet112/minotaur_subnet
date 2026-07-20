@@ -2,8 +2,10 @@
 
 How a miner-submitted solver becomes the champion on `subnet112/minotaur-solver`'s
 `main` (→ `:latest` → fleet), safely, when the miner opens the PR **from their own
-fork**. Adoption is currently FROZEN (`DISABLE_CHAMPION_ADOPTION=1`); everything
-here is inert until activation.
+fork**. Adoption is **live** in production: `DISABLE_CHAMPION_ADOPTION` defaults OFF
+(unset ⇒ adoption enabled) and is set in no deployment, so the flow below runs on
+every certified round. The env gate remains available as a break-glass freeze
+(`DISABLE_CHAMPION_ADOPTION=1`).
 
 ## The problem
 
@@ -66,7 +68,7 @@ findings".)
    on `main` never earns weights. A failure **never closes a PR** — only a successful
    merge closes one — so the miner can fix the head and iterate on the same PR.
 
-## What this PR ships (inert under the freeze)
+## What this PR ships (now live)
 
 - `relayer/solver_repo.py`: ABI `getLatestChampion`/`getQuorumRequired`,
   `merge_miner_pr_when_certified`, `_onchain_cert_binds`, `_pr_touches_ci`,
@@ -136,7 +138,7 @@ Apply in `platform/production/docker-compose.production.yml` (or equivalent env)
 3. **Deploy api + relayer together** (same image): the leader only delegates when `RELAYER_URL` is set and fail-closes if the relayer lacks `/v1/finalize-champion`, so the relayer must have the endpoint before/with the leader cutover (else adoptions safely abort `merge_failed`).
 4. **Verify after deploy** on the next certified round: leader logs `Champion finalization: delegated to relayer at <url>`; relayer logs `finalize-champion accepted (… signers=N/Q) — attesting + merging` then `merge gate: PR #N squash-merged`; `ChampionRegistry.getLatestChampion()` binds the certified commit; the miner's PR shows MERGED.
 
-## Activation checklist (before flipping `DISABLE_CHAMPION_ADOPTION=0`)
+## Activation checklist (historical — adoption is now live)
 
 1. Copy `champion-merge.yml.reference` → solver repo `.github/workflows/champion-merge.yml`
    (needs a workflow-scoped token or SSH push) + add `.github/CODEOWNERS` locking

@@ -216,7 +216,7 @@ A single on-chain call within an execution plan.
 | `target` | `str` | Contract address (`0x...`, 42 characters) |
 | `value` | `str` | Wei value as decimal string (`"0"` for no ETH) |
 | `call_data` | `str` | ABI-encoded calldata (`0x...`) |
-| `chain_id` | `int` | Target chain (default: `1`) |
+| `chain_id` | `int` | Target chain (default: `0` — must be set explicitly) |
 
 ### `IntentState`
 
@@ -257,6 +257,11 @@ The full definition of an App Intent.
 | `deployer` | `str` | Deployer address |
 | `description` | `str` | What this app does |
 | `manifest` | `dict \| None` | JS manifest (intent functions, param schemas) |
+| `constructor_args` | `list[tuple[str, str]] \| None` | Extra constructor args: `[(abi_type, value), ...]` |
+| `schema_id` | `str` | Intent parameter schema identifier |
+| `policy_metadata` | `dict[str, Any]` | App policy metadata |
+| `contract_version` | `str` | Contract generation: `"v1"` (AppIntentBase) or `"v2"` (AppIntentBaseV2); empty = legacy v1 |
+| `registration_status` | `str` | AppRegistry moderation gate (permissionless-deploy / admin-gated-activation): `""` legacy=approved, `unrequested`, `requested`, `approved`, `rejected` |
 
 ### `MarketSnapshot`
 
@@ -275,7 +280,7 @@ Point-in-time market data for plan generation. Used primarily during benchmarkin
 | `dex_config` | `dict[str, Any]` | DEX router/factory addresses and config |
 | `raw_state` | `dict[str, Any]` | Additional contract storage data |
 
-**Class method:** `MarketSnapshot.empty(chain_id=1)` creates a minimal empty snapshot for use when the solver builds its own data from RPC.
+**Class method:** `MarketSnapshot.empty(chain_id=31337)` creates a minimal empty snapshot for use when the solver builds its own data from RPC.
 
 ### `SolverMetadata`
 
@@ -289,7 +294,7 @@ Solver identification and capabilities. Returned by `metadata()`.
 | `version` | `str` | Semantic version string (e.g., `"2.1.0"`) |
 | `author` | `str` | Miner hotkey or identifier |
 | `description` | `str` | Brief description of the solver's approach |
-| `supported_chains` | `list[int]` | Chain IDs this solver supports (default: `[1]`) |
+| `supported_chains` | `list[int]` | Chain IDs this solver supports (default: `[]` — declare your chains explicitly) |
 | `supported_intent_types` | `list[str]` | Intent types this solver handles (default: `["swap"]`) |
 
 ### `QuoteResult`
@@ -305,6 +310,9 @@ Result of a solver quote computation.
 | `route_summary` | `str` | Human-readable route description |
 | `gas_estimate` | `int` | Estimated gas units |
 | `metadata` | `dict[str, Any]` | Extra info (pool used, hops, protocol, etc.) |
+| `platform_fee_wei` | `str` | Platform fee in wrapped native token (WETH/WTAO) wei (default `"0"`) |
+| `platform_fee_token` | `str` | Address of the wrapped native token |
+| `platform_fee_symbol` | `str` | `"ETH"` or `"TAO"` |
 
 ---
 

@@ -91,7 +91,7 @@ Discovery requires four things to line up. Check each in order:
   ```bash
   node --version  # Should be v20.x
   ```
-- The JS engine runs app scoring code in a Node.js sandbox. Check that the app's JS code exports the required functions:
+- The JS engine runs app scoring code in an isolated V8 isolate (isolated-vm), not Node's built-in `vm`. Check that the app's JS code exports the required functions:
   ```javascript
   module.exports = { config, manifest, score };
   ```

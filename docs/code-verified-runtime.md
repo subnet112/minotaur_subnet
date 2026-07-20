@@ -83,6 +83,7 @@ App-management, lifecycle & registry (wallet-signature auth — headers `X-App-A
 - `GET /v1/apps/{app_id}/auth-nonce`
 - `PUT /v1/apps/{app_id}/solidity`
 - `POST /v1/apps/{app_id}/deployments/{chain_id}/retire`
+- `POST /v1/apps/{app_id}/deregister` (app-wide deregister-not-delete: schedules every deployment to RETIRING, then drops the app from the whole benchmark corpus + pack hash ~1 tempo later)
 - `POST /v1/apps/{app_id}/deployments/{chain_id}/float/deposit`
 - `POST /v1/apps/{app_id}/deployments/{chain_id}/float/withdraw`
 - `PATCH /v1/apps/{app_id}/deployments/{chain_id}/config`
@@ -109,6 +110,12 @@ Other:
 - `GET /v1/orders/{order_id}/bridge`
 - `GET /v1/blockloop/status`
 - `POST /v1/apps/{app_id}/prepare`
+- `POST /v1/apps/{app_id}/prepare-permit` (EIP-2612 permit digest for perpetual funding)
+- `GET /v1/orders/{order_id}/signing-payload`
+- `POST /v1/orders/{order_id}/prepare-direct`
+- `PATCH /v1/orders/{order_id}/signature`
+- `PATCH /v1/orders/{order_id}/tx-confirmed`
+- `GET /v1/quotes` (list captured quote cases — the demand corpus, paginated)
 
 ### Submissions
 
@@ -210,7 +217,7 @@ Adoption is **relative** and resolved by a fixed ladder (`epoch/relative_scoring
 From `platform/local_testnet/docker-compose.yml`:
 
 - API is exposed on host `:8080`
-- Validator runs on internal network (`:9100`), with `FORCE_LEADER=1`
+- Validator publishes `:9100` to the host (`${HOST_VALIDATOR_PORT:-9100}:9100`); it does **not** set `FORCE_LEADER` — leader election runs off the metagraph with `LOCKED_LEADER_EVM_ADDRESS` left blank
 - Relayer is exposed on `:8091`
 - There is **no Docker miner service**; miner agent is expected on host (`make miner-agent`)
 - API is configured with `USE_EVM_RELAYER=1`, and can run full order processing pipeline
