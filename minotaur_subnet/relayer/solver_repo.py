@@ -1873,6 +1873,13 @@ def on_champion_adopted_pr(
 
     # Step 1: On-chain attestation (retry up to 3 times)
     tx_hash = None
+    # Idempotent re-drive: a PRIOR finalize may have already landed the certify()
+    # on-chain and then failed downstream (e.g. a transient GitHub 503 at publish).
+    # A re-attest of the same round then reverts "Nonce not increasing" (tx_hash
+    # stays None), but the win IS certified — so a landed on-chain cert also counts
+    # as attested, letting the retry COMPLETE the merge instead of looping to a
+    # deadline abort (incident 2026-07-20 round-e29741775).
+    _attest_already_onchain = False
     if certificate is not None:
         for attempt in range(3):
             tx_hash = attest_champion_on_chain(certificate, commit_hash)
@@ -1887,18 +1894,38 @@ def on_champion_adopted_pr(
                 time.sleep(wait)
 
         if not tx_hash:
-            logger.error(
-                "On-chain attestation failed after 3 attempts for %s — "
-                "PR will be created without proof (Action will block merge)",
-                submission_id,
-            )
+            # Fall back to the authoritative on-chain read (the SAME quorum-cert
+            # check the merge gate uses) — resolving the head SHA exactly as the
+            # attest does so keccak(full_sha) matches. Fabricates nothing: a
+            # missing/unbound cert leaves this False and the attest a genuine
+            # failure, unchanged.
+            _full_head = commit_hash
+            if len(_full_head) < 40:
+                _full_head = _resolve_full_sha(commit_hash) or commit_hash
+            if _onchain_cert_binds(_full_head, round_id):
+                _attest_already_onchain = True
+                logger.info(
+                    "Champion re-drive: fresh attest reverted but an on-chain quorum "
+                    "cert already binds head %s (round %s) — treating as attested, "
+                    "proceeding to publish.",
+                    _full_head[:12], round_id,
+                )
+            else:
+                logger.error(
+                    "On-chain attestation failed after 3 attempts for %s — "
+                    "PR will be created without proof (Action will block merge)",
+                    submission_id,
+                )
     else:
         logger.warning("No certificate provided — skipping on-chain attestation")
 
-    # Root cause of a failed/absent attestation, carried into abort_reason.
+    # Root cause of a failed/absent attestation, carried into abort_reason. An
+    # already-on-chain cert (idempotent re-drive) counts as attested, so the
+    # downstream merge/publish reason (e.g. publish_failed) is reported instead of
+    # a misleading attest_failed — keeping the round deferrable while GitHub recovers.
     if certificate is None:
         _attest_reason = "no_certificate"
-    elif not tx_hash:
+    elif not tx_hash and not _attest_already_onchain:
         _attest_reason = "attest_failed"
     else:
         _attest_reason = ""
@@ -1982,7 +2009,7 @@ def on_champion_adopted_pr(
             close_stale_submission_prs(_pr_number, champion_label=f"PR #{_pr_number}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("close-stale failed after champion merge: %s", exc)
-    _ok = bool(tx_hash) and bool(merged)
+    _ok = (bool(tx_hash) or _attest_already_onchain) and bool(merged)
     if _ok:
         # Record where main landed so the reconciler can later detect an orphaned merge.
         _result = MergeResult(True, main_sha=_canonical_main_head_sha())
