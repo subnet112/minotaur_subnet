@@ -93,7 +93,7 @@ Discovery requires four things to line up. Check each in order:
   ```
   (The validator image ships Node 18 — the isolated-vm scoring addon is built
   against the Node 18 ABI; do not swap in Node 20.)
-- The JS engine runs app scoring code in a Node.js sandbox. Check that the app's JS code exports the required functions:
+- The JS engine runs app scoring code in an isolated V8 isolate (isolated-vm), not Node's built-in `vm`. Check that the app's JS code exports the required functions:
   ```javascript
   module.exports = { config, manifest, score };
   ```

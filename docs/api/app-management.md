@@ -101,9 +101,10 @@ All wallet-signature gated (writes need a nonce):
 |--------|------|---------|
 | `PUT` | `/v1/apps/{app_id}/solidity` | Replace stored Solidity source / ctor args / `contract_version`. Refuses mid-deploy. |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/retire` | Mark the deployment RETIRED, releasing the deploy guard so the deploy route acts as an **in-place redeploy** (upserts on `(app_id, chain_id)`, same `app_id`). |
+| `POST` | `/v1/apps/{app_id}/deregister` | **App-wide** deregister (admin key OR wallet signature `action="deregister_app"`): schedules every non-deploying deployment to RETIRING (stops new orders immediately) and, ~1 tempo later via a round-anchored fleet-uniform cutover, drops the app from the **whole benchmark corpus + pack hash** — keeping all order rows (deregister, not delete). |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/float/deposit` | Fund a V2 app-held WETH float from the relayer (optionally wrapping relayer ETH first). |
 | `POST` | `/v1/apps/{app_id}/deployments/{chain_id}/float/withdraw` | Recover the float. |
-| `PATCH` | `/v1/apps/{app_id}/deployments/{chain_id}/config` | V2 relayer-gated setters: `setFeeBps`, `setVolumeCapBps`, `setFeeCollector`. |
+| `PATCH` | `/v1/apps/{app_id}/deployments/{chain_id}/config` | V2 relayer-gated setters: `setFeeBps`, `setVolumeCapBps`, `setFeeCollector`, `setFeeMode` (0=USER / 1=APP), `setAppOwner` (V2 float-recovery co-signer). |
 
 > V2 apps settle fees from an app-held WETH float — a production V2 app needs a
 > funded float or nonzero-fee orders revert / score zero (PR #527).
