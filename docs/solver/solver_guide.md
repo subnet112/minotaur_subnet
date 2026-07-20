@@ -552,8 +552,8 @@ The agent loop (`minotaur_subnet.miner.agent`) runs continuously:
 
 ```bash
 python -m minotaur_subnet.miner.main agent \
-    --validator-url http://localhost:9100 \
-    --interval 300
+    --validator-url http://localhost:8080 \
+    --loop-interval 300
 ```
 
 The agent generates `Strategy` subclasses (one per app) and registers them with a `RoutingSolver`. Each strategy targets a specific `APP_ID` and set of `INTENT_FUNCTIONS`.
