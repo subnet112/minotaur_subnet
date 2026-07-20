@@ -92,12 +92,20 @@ def build_submission_report(
         outcome = "benchmark_failed"
     elif rel is not None:
         verdict = rel.get("verdict")
-        if verdict in ("dethrone", "better"):
-            outcome = "beat_champion"       # better on >=1 order (may not be finalist)
-        elif rel.get("worse", 0):
-            outcome = "regressed"           # lost ground on >=1 order
+        # Only a HARD loss — a cut over the floor or a dropped order — counts as
+        # "regressed". A within-floor TOLERATED regression is netted, not a loss,
+        # so it must never read as a refusal (miners take any drop as an auto-
+        # loss). `lost` is authoritative; fall back to the lumped `worse` for
+        # blocks persisted before the tolerated/lost split shipped.
+        lost = rel.get("lost")
+        if lost is None:
+            lost = rel.get("worse", 0)
+        if lost:
+            outcome = "regressed"           # a real hard loss (>floor cut or drop)
+        elif verdict in ("dethrone", "better") or rel.get("better", 0):
+            outcome = "beat_champion"       # beat on >=1 order, no hard loss
         else:
-            outcome = "matched"             # tied the champion, no order better
+            outcome = "matched"             # tied — incl. within-tolerance dips
     else:
         outcome = status or "scored"
 
@@ -305,6 +313,49 @@ def _pct(ratio: Any) -> str:
     return "—"
 
 
+def _is_tolerated_regression(o: Any) -> bool:
+    """True for a within-floor (TOLERATED) per-order regression — netted, NOT a
+    loss. Requires an explicit ``catastrophic is False`` from the backend, so a
+    legacy row (flag absent) stays in the loss bucket, never silently downgraded.
+    """
+    return isinstance(o, dict) and o.get("verdict") == "regression" and o.get("catastrophic") is False
+
+
+def _tiers(rel: dict[str, Any]) -> tuple[int, int, int, int, str | None]:
+    """``(better, matched, tolerated, lost, floor_pct)`` for a relative block.
+
+    ``tolerated`` = within-floor regressions (netted, not a loss); ``lost`` =
+    hard losses (>floor cuts + drops). Prefers the backend's authoritative
+    ``tolerated``/``lost``; else derives from per-order ``catastrophic`` flags;
+    else (legacy block, no tier info) keeps the lumped ``worse`` as ``lost`` so a
+    loss is never UNDER-reported. ``floor_pct`` labels the band (e.g. ``"1%"``).
+    """
+    better = int(rel.get("better", 0) or 0)
+    matched = int(rel.get("matched", 0) or 0)
+    worse = int(rel.get("worse", 0) or 0)
+    floor_bps = rel.get("floor_bps")
+    floor_pct = f"{floor_bps / 100:g}%" if isinstance(floor_bps, (int, float)) and not isinstance(floor_bps, bool) else None
+
+    tolerated = rel.get("tolerated")
+    lost = rel.get("lost")
+    if isinstance(tolerated, int) and isinstance(lost, int):
+        return better, matched, tolerated, lost, floor_pct
+
+    per_order = rel.get("per_order")
+    if isinstance(per_order, list) and any(
+        isinstance(o, dict) and o.get("catastrophic") is not None for o in per_order
+    ):
+        tol = sum(1 for o in per_order if _is_tolerated_regression(o))
+        lst = sum(
+            1 for o in per_order
+            if isinstance(o, dict)
+            and (o.get("verdict") == "dropped" or (o.get("verdict") == "regression" and not _is_tolerated_regression(o)))
+        )
+        return better, matched, tol, lst, floor_pct
+
+    return better, matched, 0, worse, floor_pct
+
+
 def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None = None) -> str:
     """Render a :func:`build_submission_report` dict into a GitHub-flavored
     markdown comment for the miner's PR: the same-pin per-order ``relative``
@@ -356,11 +407,17 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
 
     rel = report.get("relative")
     if isinstance(rel, dict):
-        seg = (
-            f"**Per-order vs champion (same-pin):** {rel.get('better', 0)} better · "
-            f"{rel.get('worse', 0)} worse · {rel.get('matched', 0)} matched · "
-            f"{rel.get('new', 0)} new"
-        )
+        # Split `worse` into TOLERATED (within-floor, netted) and LOST (hard):
+        # a within-tolerance dip must not read as a loss.
+        better, matched, tolerated, lost, floor_pct = _tiers(rel)
+        band = f"within {floor_pct}" if floor_pct else "within tolerance"
+        seg = f"**Per-order vs champion (same-pin):** {better} better · {matched} matched"
+        if tolerated:
+            seg += f" · {tolerated} tolerated ({band})"
+        if lost:
+            seg += f" · {lost} lost"
+        if rel.get("new", 0):
+            seg += f" · {rel.get('new', 0)} new"
         if rel.get("repeats"):
             # Armed blind-spot REPEAT guard: covers that only re-delivered the
             # incumbent's adoption-time value — counted in matched, called out
@@ -430,10 +487,17 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             if isinstance(per_order, list)
             else []
         )
-        diffs.sort(key=lambda o: 0 if o.get("verdict") in _worse else 1)
+        def _rank(o: dict[str, Any]) -> int:
+            # 0 hard loss (fix these) · 1 informational (tolerated / repeat) · 2 win.
+            if _is_tolerated_regression(o) or o.get("verdict") in _neutral:
+                return 1
+            return 0 if o.get("verdict") in _worse else 2
+
+        diffs.sort(key=_rank)
         if diffs:
             lines += [
-                "**Orders that differ from the champion** — optimize the ❌ rows:",
+                "**Orders that differ from the champion** — optimize the ❌ rows "
+                "(➖ = within tolerance / repeat, no action needed):",
                 "",
                 "| Order | Δ output vs champion | |",
                 "|---|---|---|",
@@ -442,6 +506,9 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
                 verdict = o.get("verdict")
                 if verdict == "dropped":
                     mark = "❌ dropped"  # no plan on a champion-served order (hard veto)
+                elif _is_tolerated_regression(o):
+                    # Within the floor: a TOLERATED regression, netted, not a loss.
+                    mark = f"➖ within {floor_pct}" if floor_pct else "➖ within tolerance"
                 elif verdict in ("new", "blind_spot_cover"):
                     mark = "✅ new"  # covered an order the champion delivers nothing on
                 elif verdict == "blind_spot_repeat":
