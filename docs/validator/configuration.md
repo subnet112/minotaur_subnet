@@ -98,23 +98,31 @@ SN112 weights are commit-reveal: the chain keeps only **one** pending commit per
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BENCHMARK_ALL_DEPLOYMENT_CHAINS` | `0` (OFF) | **Consensus flag — must be fleet-uniform.** OFF keeps byte-identical Base-only benchmarking. When ON, submissions are benchmarked per-deployment-chain with per-chain fork pins; the setting folds into `benchmark_pack_hash`, so a mixed fleet computes different scores. Arm across the whole fleet at once or not at all (PR #621). |
+| `BENCHMARK_ALL_DEPLOYMENT_CHAINS` | `1` (ON) | **Consensus flag — must be fleet-uniform.** Default ON is image-baked (PR #806): third-party validators run the canonical compose without custom env, so the default lives in code, not env. When ON, submissions are benchmarked per-deployment-chain with per-chain fork pins folded into `benchmark_pack_hash`. Set to `0`/`false`/`no`/`off` to restore byte-identical Base-only benchmarking. A mixed fleet computes different scores → `PACK_HASH_MISMATCH` (fail-loud); flip fleet-uniformly on a round boundary. Arming it requires the extra chains routed through the block-pin proxy (`SOLVER_READ_PROXY_CHAINS`), a live upstream RPC for pin derivation, and a sim fork (`ETH_SIM_RPC_URL`). |
 | `ETH_SIM_RPC_URL` | -- | Optional chain-1 (Ethereum) simulation fork URL used when deployment benchmarking spans Ethereum. |
 
-### Distributed Veto (Phase 0 — observe-only)
+### Distributed Veto (Phase 1 — enforcing by default)
 
-Phase 0 of distributed veto is **observe-only soak instrumentation**. It never gates certification and never changes round status; it only measures what a future enforcement phase would do. Leave it OFF unless you are helping the subnet team collect soak data.
+Distributed veto is **enforcing by default** (image-baked, PR #675/#925) — it is
+no longer observe-only. Followers independently re-check the leader's champion
+candidate; a **leader-confirmed** violation ABORTS certification. Blocking fires
+only on the leader's own reverify (`would_gate_confirmed`), never on a raw
+follower claim, and the gate **fails open** on deadline expiry or a slow fleet —
+so the worst case degrades to the old observe-only behavior and it never wrongly
+aborts on a laggy peer. **Consensus-relevant**; best left at the defaults unless
+the subnet team directs otherwise.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DISTRIBUTED_VETO` | `0` (OFF) | Master arm for the observe-only veto pass. Even when ON, Phase 0 cannot veto or gate anything (enforcement requires further code). When ON, `/health` surfaces the last few observe records under `distributed_veto`. |
-| `DISTRIBUTED_VETO_REVERIFY` | `0` (OFF) | Sub-flag: when on (and `DISTRIBUTED_VETO` is on), the leader fire-and-forget re-verifies dissents off the coordinator loop. Observe-only. |
+| `DISTRIBUTED_VETO` | `1` (ON) | Master participation switch — default ON so every validator joins the veto pass. Set to `0`/`false`/`no`/`off` to opt out. `/health` surfaces the last few records under `distributed_veto`. |
+| `DISTRIBUTED_VETO_ENFORCE` | `hard` (image-baked) | Enforcement mode. `hard` = a leader-confirmed veto ABORTS certification. `shadow` = run the pre-certify gate for real (same added latency) but only LOG "would block" and certify anyway. `off` = observe-only (never gates). An unrecognized value maps to `hard` — a mistyped override can't silently disarm a validator. |
+| `DISTRIBUTED_VETO_REVERIFY` | `1` (ON) | Leader re-verification sub-switch — gives the `hard` gate its teeth (blocking only ever happens on a reverify-confirmed violation). With this off, the gate is toothless and fail-opens every round. Set to `0`/`false`/`no`/`off` to disable. |
 
 ### Chain Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHAIN_ID` | `1` | Default EVM chain ID. Set to `31337` for local Anvil testnet, `1` for Ethereum mainnet. |
+| `CHAIN_ID` | `31337` | Default EVM chain ID when unset (local Anvil testnet). Set to `1` for Ethereum mainnet — the canonical production `.env` sets this explicitly. |
 
 ### Logging
 
