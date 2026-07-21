@@ -205,7 +205,10 @@ def _http_get(url: str, timeout: float = 30.0) -> dict:
         return {"error": str(exc), "url": url}
 
 
-def _http_post(url: str, payload: dict, timeout: float = 60.0) -> dict:
+def _http_post(
+    url: str, payload: dict, timeout: float = 60.0,
+    headers: dict | None = None,
+) -> dict:
     """Synchronous HTTP POST with JSON body returning JSON dict."""
     import urllib.request
     import urllib.error
@@ -214,7 +217,7 @@ def _http_post(url: str, payload: dict, timeout: float = 60.0) -> dict:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             url, data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -582,7 +585,8 @@ def _score_one_fixture(
         "metadata": plan.metadata or {},
     }
 
-    url = f"{_validator_url()}/v1/apps/{app_id}/score"
+    path = f"/v1/apps/{app_id}/score"
+    url = f"{_validator_url().rstrip('/')}{path}"
     body = {
         "plan": plan_dict,
         "params": _state_params(state),
@@ -590,7 +594,10 @@ def _score_one_fixture(
     }
     if fork_block is not None:
         body["fork_block"] = int(fork_block)
-    result = _http_post(url, body)
+    # /apps/{id}/score is gated (admin key OR a signed miner). Sign with the
+    # miner's hotkey; required=False keeps a local testnet working unsigned.
+    from minotaur_subnet.miner.signing import signed_headers
+    result = _http_post(url, body, headers=signed_headers("POST", path, required=False))
     # Prepend scenario name for per-scenario traceability.
     if isinstance(result, dict):
         result = {"scenario": scen_name, **result}

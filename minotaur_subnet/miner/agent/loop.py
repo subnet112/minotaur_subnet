@@ -322,6 +322,18 @@ async def submit_solver_via_git(
             "hotkey": hotkey,
             "signature": signature,
         }
+        # Opt-in private-repo submission (front-run protection). When the miner
+        # configured a private solver repo + a fine-grained PAT, thread them
+        # through so the validator clones the PRIVATE repo and comments on its
+        # PR instead of the canonical one — pr_number/head_sha then refer to a
+        # PR in that repo (point SOLVER_UPSTREAM_REPO at it too). Env-only here
+        # (the agent has no CLI flags); the token is transport, never signed.
+        private_repo = os.environ.get("MINER_PRIVATE_REPO", "").strip()
+        repo_token = os.environ.get("MINER_REPO_TOKEN", "").strip()
+        if private_repo and repo_token:
+            payload["private_repo"] = private_repo
+            payload["repo_token"] = repo_token
+            logger.info("Private-repo submission mode: repo=%s", private_repo)
         headers: dict[str, str] = {}
         api_key = os.environ.get("SUBMISSIONS_API_KEY", "").strip()
         if api_key:
@@ -1065,6 +1077,35 @@ class AgentLoop:
                         lines.append(f"  {reason_relative}")
                 if rank is not None:
                     lines.append(f"Benchmark rank: {rank}")
+
+                # Per-order blind-spot detail → the improve prompt. This is the
+                # actionable signal: orders where we LOST to the champion
+                # (regression, esp. catastrophic hard-losses) or where the
+                # champion is blind and we should keep covering (blind_spot_cover
+                # to defend, dropped to fix — a hard veto). Cap the list so a
+                # huge corpus doesn't blow the prompt; matched/win rows are
+                # omitted (nothing to fix there).
+                per_order = relative.get("per_order") or []
+                actionable = [
+                    r for r in per_order
+                    if r.get("verdict") in ("regression", "dropped", "blind_spot_cover")
+                ]
+                if actionable:
+                    _rank = {"dropped": 0, "regression": 1, "blind_spot_cover": 2}
+                    actionable.sort(key=lambda r: (
+                        _rank.get(r.get("verdict", ""), 9),
+                        not r.get("catastrophic", False),
+                    ))
+                    lines.append("Orders to optimize (verdict · intent · champ→chal):")
+                    for r in actionable[:20]:
+                        flag = " [HARD-LOSS]" if r.get("catastrophic") else ""
+                        lines.append(
+                            f"  {r.get('verdict', '?')}{flag}: "
+                            f"{r.get('intent_id', '?')} "
+                            f"{r.get('champ', '—')}→{r.get('chal', '—')}"
+                        )
+                    if len(actionable) > 20:
+                        lines.append(f"  … and {len(actionable) - 20} more")
 
                 feedback_msg = "\n".join(lines) or (
                     "Benchmark complete (no relative detail returned)."
