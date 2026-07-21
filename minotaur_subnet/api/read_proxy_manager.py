@@ -44,6 +44,22 @@ _PROXY_MODULE = "minotaur_subnet.harness.rpc_budget_proxy.proxy"
 PROXY_DATA_URL = f"http://{PROXY_STATIC_IP}:{PROXY_PORT}"
 PROXY_CONTROL_URL = f"http://{PROXY_CONTAINER_NAME}:{PROXY_PORT}"
 
+# LIVE champion path (opt-in; see solver_read_proxy.live_read_proxy_config). A
+# DEDICATED --internal net so the adopted champion reaches ONLY the proxy — not
+# the internet, relayer, IMDS, or docker-socket-proxy. The proxy is attached to it
+# at a static IP; the champion (on LIVE_SOLVER_NETWORK) dials that IP KEYLESSLY.
+from minotaur_subnet.harness.solver_read_proxy import LIVE_SOLVER_NETWORK_DEFAULT
+
+LIVE_SOLVER_NETWORK_NAME = (
+    os.environ.get("LIVE_SOLVER_NETWORK", LIVE_SOLVER_NETWORK_DEFAULT).strip()
+    or LIVE_SOLVER_NETWORK_DEFAULT
+)
+LIVE_SOLVER_NETWORK_SUBNET = os.environ.get(
+    "LIVE_SOLVER_NETWORK_SUBNET", "172.31.0.0/24"
+).strip()
+PROXY_LIVE_IP = os.environ.get("SOLVER_LIVE_RPC_PROXY_IP", "172.31.0.5").strip()
+PROXY_LIVE_DATA_URL = f"http://{PROXY_LIVE_IP}:{PROXY_PORT}"
+
 _FALSEY = {"0", "false", "no", "off", ""}
 
 
@@ -214,6 +230,67 @@ async def _resolve_self_image_and_net() -> tuple[str, str | None]:
     return "", None
 
 
+async def _ensure_internal_network(name: str, subnet: str) -> bool:
+    """Create ``name`` as an ``--internal`` bridge on ``subnet`` if missing.
+
+    Generic sibling of :func:`_ensure_benchmark_network` used for the dedicated
+    live-solver net. Idempotent + best-effort (an already-present net, incl. a
+    concurrent-create race, is success).
+    """
+    rc, _o, _e = await _docker("network", "inspect", name)
+    if rc == 0:
+        return True
+    rc, _c, err = await _docker(
+        "network", "create", "--driver", "bridge", "--internal", "--subnet", subnet, name,
+    )
+    if rc == 0:
+        logger.info("[read-proxy] created internal network %s (%s)", name, subnet)
+        return True
+    rc2, _, _ = await _docker("network", "inspect", name)  # lost a create race?
+    if rc2 == 0:
+        return True
+    logger.error(
+        "[read-proxy] could NOT create internal network %s (%s): %s", name, subnet, err
+    )
+    return False
+
+
+async def _attach_proxy_to_live_net() -> None:
+    """Attach the managed proxy to the dedicated live-solver ``--internal`` net and
+    export ``SOLVER_LIVE_RPC_PROXY`` so the live champion routes RPC through it.
+
+    Best-effort and FAIL-SAFE: on ANY failure (net absent, proxy container not up
+    yet, connect denied) we do NOT export the URL, so the live champion keeps its
+    existing RPC path rather than being pointed at an unreachable proxy. Only a
+    confirmed attach turns the feature on. ``setdefault`` respects an operator who
+    pinned a custom live proxy URL.
+    """
+    if not await _ensure_internal_network(LIVE_SOLVER_NETWORK_NAME, LIVE_SOLVER_NETWORK_SUBNET):
+        logger.error(
+            "[read-proxy] live-solver net %s absent — live RPC proxy stays OFF",
+            LIVE_SOLVER_NETWORK_NAME,
+        )
+        return
+    rc, _out, err = await _docker(
+        "network", "connect", "--ip", PROXY_LIVE_IP,
+        LIVE_SOLVER_NETWORK_NAME, PROXY_CONTAINER_NAME,
+    )
+    already = "already" in (err or "").lower()  # already attached == idempotent OK
+    if rc != 0 and not already:
+        logger.error(
+            "[read-proxy] could NOT attach proxy to live-solver net %s (%s) — "
+            "live RPC proxy stays OFF (champion keeps direct RPC)",
+            LIVE_SOLVER_NETWORK_NAME, err,
+        )
+        return
+    os.environ.setdefault("SOLVER_LIVE_RPC_PROXY", PROXY_LIVE_DATA_URL)
+    logger.info(
+        "[read-proxy] proxy attached to live-solver net %s(%s); live RPC proxy ON (%s)",
+        LIVE_SOLVER_NETWORK_NAME, PROXY_LIVE_IP,
+        os.environ.get("SOLVER_LIVE_RPC_PROXY"),
+    )
+
+
 async def _ensure_benchmark_network(name: str) -> bool:
     """Create the sealed benchmark network if it's missing — self-heal.
 
@@ -321,6 +398,12 @@ async def ensure_read_proxy_container() -> bool:
     ok, degraded = await _ensure_impl()
     if degraded:
         _schedule_ensure_retry()
+    # Opt-in (LIVE_SOLVER_RPC_VIA_PROXY): attach the proxy to the dedicated
+    # live-solver internal net so the adopted champion routes RPC through it
+    # (keyless + metered). Idempotent + fail-safe — see _attach_proxy_to_live_net.
+    from minotaur_subnet.harness.solver_read_proxy import live_rpc_via_proxy_enabled
+    if live_rpc_via_proxy_enabled():
+        await _attach_proxy_to_live_net()
     return ok
 
 

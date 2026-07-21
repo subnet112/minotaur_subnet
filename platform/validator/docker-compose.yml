@@ -674,6 +674,29 @@ services:
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
 
+      # ── LIVE champion RPC containment (opt-in; default OFF) ──────────────
+      # The adopted champion processes REAL user orders. By default it gets the
+      # KEYED BASE_RPC_URL and (on the leader) runs on a non-internal net — so a
+      # hostile champion could read the provider API key and exfiltrate order
+      # data. Set LIVE_SOLVER_RPC_VIA_PROXY=1 to route its RPC through the SAME
+      # keyless block-pin proxy the benchmark path uses, on a DEDICATED
+      # `live-solver` --internal net: the champion then holds NO key and reaches
+      # ONLY the proxy, which METERS its per-order RPC (LIVE_SOLVER_RPC_BUDGET).
+      # The api creates the net + attaches the proxy at 172.31.0.5 automatically.
+      # Once enabled + verified, set LIVE_SOLVER_REQUIRE_INTERNAL=1 so a champion
+      # is REFUSED on any non-internal net (fail-closed). Leave all three unset to
+      # keep today's behavior exactly.
+      LIVE_SOLVER_RPC_VIA_PROXY: "${LIVE_SOLVER_RPC_VIA_PROXY:-0}"
+      LIVE_SOLVER_REQUIRE_INTERNAL: "${LIVE_SOLVER_REQUIRE_INTERNAL:-0}"
+      LIVE_SOLVER_RPC_BUDGET: "${LIVE_SOLVER_RPC_BUDGET:-5000}"
+      # When the proxy path is on, the champion + proxy share this dedicated
+      # --internal net (auto-created). Override the name/subnet if 172.31.0.0/24
+      # collides with your host. Leave LIVE_SOLVER_NETWORK unset to use the
+      # default `live-solver`; setting it to a non-internal net (e.g. the leader's
+      # production_minotaur) is exactly what the guard warns about.
+      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"
+      LIVE_SOLVER_NETWORK_SUBNET: "${LIVE_SOLVER_NETWORK_SUBNET:-172.31.0.0/24}"
+
       # Block-pin RPC proxy — the solver's reads route through it, pinned to the
       # round fork block (deterministic, ~30ms). The api LAUNCHES + owns the proxy
       # container at startup and exports SOLVER_READ_PROXY* itself (from its own
@@ -1115,6 +1138,19 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+
+  # Dedicated sealed net for the LIVE champion when LIVE_SOLVER_RPC_VIA_PROXY=1.
+  # Declared here for visibility/parity, but (like benchmark-sandbox) the api
+  # also self-heals it imperatively at startup — a fresh host or `network prune`
+  # must not strand the champion. internal: true — the champion reaches ONLY the
+  # block-pin proxy (attached at 172.31.0.5), never the internet/relayer/IMDS.
+  live-solver:
+    name: live-solver
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
 
   # Isolated control-plane net: ONLY the api + benchmark-worker reach the
   # docker-socket-proxy here. The proxy is REMOVED from `minotaur`, so an
