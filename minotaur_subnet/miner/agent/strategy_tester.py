@@ -678,11 +678,18 @@ class StrategyTester:
         params = _state_params(state)
 
         try:
-            url = f"{validator_url.rstrip('/')}/v1/apps/{app_id}/score"
+            from minotaur_subnet.miner.signing import signed_headers
+            path = f"/v1/apps/{app_id}/score"
+            url = f"{validator_url.rstrip('/')}{path}"
             payload = {"plan": plan_dict, "params": params}
+            # /apps/{id}/score is gated (admin key OR a signed miner). Sign the
+            # call with the miner's hotkey; required=False so a local
+            # unauthenticated testnet still works when no wallet is configured,
+            # while against the real leader this authenticates instead of 401.
+            headers = signed_headers("POST", path, required=False) or None
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    url, json=payload,
+                    url, json=payload, headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
