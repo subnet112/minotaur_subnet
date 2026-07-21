@@ -177,6 +177,30 @@ _DETAILS_STRIPPABLE_STATUSES = frozenset({
     SubmissionStatus.REJECTED,
 })
 
+# Hard cap on the number of submission RECORDS kept in the store (light rows, not
+# just their details). Applied at load/hydrate ONLY — before this store serves a
+# read or a peer syncs — so we hard-DELETE the oldest terminal rows beyond the cap
+# from the DB. NEVER prunes in-flight submissions or ADOPTED champions (a
+# long-reigning champion's record can be old by created_at but must stay). Bounds
+# RAM + the DB + the shutdown JSON; copycat (`_names`, a separate index) and the
+# benchmark_details retention above are unaffected. 0 = unbounded (off, default).
+#
+# Load-time only because the cross-process pull is append-only (submission_db has
+# NO tombstones): a delete visible to an already-running peer would not propagate.
+# Every process re-hydrates the bounded DB on the coordinated restart, and pruned
+# rows are old + terminal (never re-updated), so it round-trips consistently.
+try:
+    _MAX_RECORDS = int(os.environ.get("SUBMISSIONS_MAX_RECORDS", "0") or "0")
+except ValueError:
+    _MAX_RECORDS = 0
+# Terminal end-states safe to prune when old. ADOPTED (champions) + all in-flight
+# statuses are deliberately excluded so they are always retained.
+_RETENTION_PRUNABLE_VALUES = frozenset({
+    SubmissionStatus.SCORED.value,
+    SubmissionStatus.WAITLISTED.value,
+    SubmissionStatus.REJECTED.value,
+})
+
 
 # ── Solver-name coinage (copycat labeling) ──────────────────────────────────
 # A solver's display name comes from the miner-authored ``metadata().name`` —
@@ -1843,6 +1867,41 @@ class SubmissionStore:
             stripped.append(sub.submission_id)
         return stripped
 
+    def _apply_record_retention(self, data: dict[str, dict]) -> dict[str, dict]:
+        """Cap the store at ``SUBMISSIONS_MAX_RECORDS`` by hard-deleting the OLDEST
+        terminal rows beyond the cap (see ``_MAX_RECORDS``). Called once, at load,
+        on the raw DB rows before hydration — the only place a delete is safe given
+        the append-only cross-process sync. Returns the retained map.
+
+        Keeps every in-flight submission and every ADOPTED champion regardless of
+        age; only SCORED / WAITLISTED / REJECTED rows are eligible to be pruned,
+        oldest (by ``created_at``) first. A no-op when the cap is 0/unset or the
+        store is already within it.
+        """
+        cap = _MAX_RECORDS
+        if cap <= 0 or len(data) <= cap:
+            return data
+        over = len(data) - cap
+        prunable = [
+            (sid, d) for sid, d in data.items()
+            if str(d.get("status")) in _RETENTION_PRUNABLE_VALUES
+        ]
+        if over <= 0 or not prunable:
+            return data
+        prunable.sort(key=lambda kv: kv[1].get("created_at", 0) or 0)  # oldest first
+        drop_ids = [sid for sid, _ in prunable[:over]]
+        if not drop_ids:
+            return data
+        if self._db is not None:
+            self._db.delete_records(drop_ids)
+        drop_set = set(drop_ids)
+        kept = {sid: d for sid, d in data.items() if sid not in drop_set}
+        logger.info(
+            "submission retention: pruned %d old terminal record(s) (kept %d, cap=%d)",
+            len(drop_ids), len(kept), cap,
+        )
+        return kept
+
     def _load(self, *, quiet: bool = False) -> None:
         """Hydrate the in-memory dict from the SQLite DB. ``quiet`` skips the info
         log. The per-record row-building below is byte-identical to the legacy
@@ -1857,6 +1916,7 @@ class SubmissionStore:
             # have, which _upsert_one absorbs idempotently.
             seq_before_hydrate = self._db.max_seq() if self._db is not None else 0
             data = dict(self._db.load_all()) if self._db is not None else {}
+            data = self._apply_record_retention(data)
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
             by_hotkey_epoch: dict[str, str] = {}
