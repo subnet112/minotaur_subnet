@@ -345,6 +345,7 @@ class AnvilSimulator:
         fork_block: int | None = None,
         *,
         meter_gas: bool = False,
+        pin_only: bool = False,
     ) -> SimulationResult:
         """Execute a plan against the Anvil fork and return results.
 
@@ -405,8 +406,10 @@ class AnvilSimulator:
         # On no-upstream chains (local-testnet 31337) this reverts to
         # the baseline snapshot instead, undoing any state mutation
         # from a prior simulation whose own per-sim revert failed.
+        # pin_only (QUOTE PATH) may reuse the fork in place — see
+        # _reset_fork_for_sim.
         try:
-            self._reset_fork(block_number=fork_block)
+            self._reset_fork_for_sim(fork_block, pin_only)
         except SimulatorStateError as exc:
             logger.error("Refusing to simulate; baseline revert failed: %s", exc)
             return SimulationResult(
@@ -935,6 +938,42 @@ class AnvilSimulator:
             pass
         self._reset_fork(block_number=int(block_number))
         return True
+
+    def current_fork_block(self, chain_id: int | None = None) -> int | None:
+        """The block this fork is currently anchored at (best-effort), so the
+        quote path can pin subsequent sims to a stable, cache-warm block instead
+        of chasing upstream head on every call. ``chain_id`` is accepted for a
+        uniform interface with :class:`MultiChainSimulator` and ignored here
+        (single fork). None when unknown → caller falls back to a head re-fork.
+        """
+        return getattr(self, "_fork_block_number", None)
+
+    def _reset_fork_for_sim(self, fork_block: int | None, pin_only: bool) -> None:
+        """Prepare the fork for one simulation.
+
+        Default (scoring / order-processing): a full re-fork to ``fork_block``
+        (or upstream head when None) — unchanged, deterministic behaviour.
+
+        ``pin_only`` (QUOTE PATH ONLY): the caller has already pinned this fork
+        to ``fork_block`` and only needs a fresh pool read there. Because the
+        snapshot→execute→revert bracket in :meth:`_simulate_inner` — NOT the
+        re-fork — is what isolates one sim's mutations from the next, the fork
+        can be REUSED when it is already at ``fork_block``: we skip a redundant,
+        upstream-hitting ``anvil_reset`` and keep every touched slot warm in the
+        fork-cache. A re-fork still happens on a block mismatch (e.g. an order
+        sim moved the fork) so the read is never on the wrong block. Scoring and
+        order-processing never pass ``pin_only``, so their per-sim re-fork is
+        byte-for-byte unchanged.
+
+        Raises SimulatorStateError on a baseline-revert failure (no-upstream path).
+        """
+        if pin_only and fork_block is not None:
+            try:
+                if int(self.w3.eth.block_number) == int(fork_block):
+                    return  # already pinned here — reuse the warm fork
+            except Exception:  # noqa: BLE001 - any read error → take the safe re-fork
+                pass
+        self._reset_fork(block_number=fork_block)
 
     def _reset_fork(self, block_number: int | None = None) -> None:
         """Reset the fork (see :meth:`_reset_fork_inner`) + refresh the fork
@@ -1957,6 +1996,18 @@ class MultiChainSimulator:
         if sim is None:
             return None
         return sim.get_block_timestamp(cid, block_number)
+
+    def current_fork_block(self, chain_id: int) -> int | None:
+        """The block ``chain_id``'s fork is currently anchored at (best-effort),
+        routed to the per-chain sub-simulator like :meth:`pin_read_fork`. None
+        when unresolvable — the quote path then falls back to a head re-fork.
+        """
+        try:
+            cid = int(chain_id)
+        except (TypeError, ValueError):
+            cid = self.default_chain_id
+        sim = self.simulators.get(cid) or self.simulators.get(self.default_chain_id)
+        return sim.current_fork_block(cid) if sim is not None else None
 
     async def simulate(
         self,
