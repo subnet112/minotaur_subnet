@@ -1824,7 +1824,7 @@ async def list_submissions(
     epoch: int | None = None,
     hotkey: str | None = None,
     include_details: bool = False,
-    limit: int = 0,
+    limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
     """List submissions, optionally filtered by round, epoch, and/or hotkey.
@@ -1836,11 +1836,14 @@ async def list_submissions(
     read the light fields. Pass ``include_details=true`` to keep it, or fetch a
     single submission's full report via ``GET /v1/submissions/{id}/status``.
 
-    ``limit``/``offset`` paginate the (newest-first) result; ``limit<=0`` (the
-    default) returns everything, so callers that omit it are unaffected. The full
-    corpus is now ~20k rows / ~44 MB per call and unbounded fetches drove the bulk
-    of validator egress — many clients already send ``?limit=N`` (it was
-    previously ignored). ``total`` in the response is the unpaginated count.
+    ``limit``/``offset`` paginate the (newest-first) result. **``limit`` defaults
+    to 50** — an omitted ``limit`` returns the 50 newest rows, NOT the whole
+    corpus. The full corpus is ~20k rows / ~44 MB, and unbounded no-param polls
+    (many from a handful of datacenter clients) drove the bulk of validator
+    egress. Pass ``?limit=0`` (or a negative value) to explicitly opt in to the
+    entire corpus. ``total`` in the response is always the unpaginated count —
+    use it for "how many submissions exist", NOT ``count`` (the number of rows
+    actually returned after limit/offset).
     """
     store = get_store()
 
