@@ -82,6 +82,57 @@ def _open_or_get_pr(
     return None
 
 
+def _sign_submission(message: str, miner_id: str) -> tuple[str, str]:
+    """Sign a submission message with the miner's registered bittensor hotkey.
+
+    Mirrors the CLI path (``minotaur_subnet.miner.main``): load the real
+    wallet from ``MINER_WALLET_NAME`` / ``BT_WALLET_PATH`` and sign with its
+    hotkey, so the signature verifies against the SN112 metagraph. Returns
+    ``(ss58_address, base64_signature)``.
+
+    We deliberately do NOT fall back to a freshly generated keypair (the old
+    behaviour): a random key produces a valid-looking signature for an ss58
+    the chain has never seen, so the leader cannot attribute the submission
+    and rejects it on mainnet — silently, because the request itself is
+    well-formed. If no wallet is available we return ``(miner_id, "")`` — an
+    explicitly UNSIGNED submission, which a local testnet accepts and mainnet
+    correctly refuses — and log loudly so the operator knows to configure a
+    wallet.
+    """
+    import base64
+
+    wallet_name = (
+        os.environ.get("MINER_WALLET_NAME")
+        or os.environ.get("MINER_HOTKEY")
+        or miner_id
+    ).strip()
+    hotkey_name = os.environ.get("MINER_HOTKEY_NAME", "").strip()
+    wallet_dir = (
+        os.environ.get("BT_WALLET_PATH")
+        or os.path.join(os.path.expanduser("~"), ".bittensor", "wallets")
+    )
+    try:
+        from bittensor_wallet import Wallet as BtWallet
+
+        wallet = (
+            BtWallet(name=wallet_name, hotkey=hotkey_name, path=wallet_dir)
+            if hotkey_name
+            else BtWallet(name=wallet_name, path=wallet_dir)
+        )
+        keypair = wallet.get_hotkey()
+        signature = base64.b64encode(keypair.sign(message.encode())).decode("ascii")
+        return keypair.ss58_address, signature
+    except Exception as exc:
+        logger.warning(
+            "No usable bittensor wallet (name=%s path=%s): %s — submitting "
+            "UNSIGNED as %s. Fine on a local testnet, but the leader WILL "
+            "reject this on mainnet; set MINER_WALLET_NAME / BT_WALLET_PATH "
+            "to your registered SN112 wallet.",
+            wallet_name, wallet_dir, exc, miner_id,
+        )
+        return miner_id, ""
+
+
 async def submit_solver_via_git(
     source: str,
     validator_url: str,
@@ -105,7 +156,6 @@ async def submit_solver_via_git(
         output_dir: Local workspace directory for reference copy.
     """
     import aiohttp
-    import base64
     import subprocess
 
     # Save bundled source locally for reference
@@ -254,17 +304,12 @@ async def submit_solver_via_git(
             ),
         }
 
-    # Sign the submission: {pr_number}:{head_sha}:{round_id}
-    hotkey = miner_id
-    signature = ""
-    try:
-        from bittensor_wallet import Keypair
-        keypair = Keypair.create_from_mnemonic(Keypair.generate_mnemonic())
-        message = f"{pr_number}:{head_sha}:{round_id}"
-        signature = base64.b64encode(keypair.sign(message.encode())).decode("ascii")
-        hotkey = keypair.ss58_address
-    except ImportError:
-        pass
+    # Sign the submission with the miner's REAL registered hotkey:
+    # {pr_number}:{head_sha}:{round_id}. The leader verifies this signature
+    # against the SN112 metagraph, so it must come from the miner's own
+    # wallet — see ``_sign_submission``.
+    message = f"{pr_number}:{head_sha}:{round_id}"
+    hotkey, signature = _sign_submission(message, miner_id)
 
     # Submit via the PR path
     try:
@@ -980,25 +1025,32 @@ class AgentLoop:
 
             status = data.get("status", "")
             if status in ("scored", "adopted"):
-                score = data.get("benchmark_score", 0)
-                details = data.get("benchmark_details") or {}
-                scorecard = details.get("scorecard", {})
-                per_intent = details.get("per_intent", [])
-
-                # Authoritative post-cutover signal: the per-submission RELATIVE
-                # COUNTS vs the champion ({better, worse, matched, new, compared,
-                # verdict}), served on the submission-status ``report.relative``.
-                # The 0..1 benchmark_score / app_scores are now saturated validity
-                # sentinels, so they only tell us valid vs failed — the counts tell
-                # us whether we actually beat the champion.
+                # Post-cutover, the authoritative quality signal is the
+                # per-submission RELATIVE COUNTS vs the champion, on
+                # report.relative ({better, worse, matched, new, compared,
+                # verdict}). The old benchmark_score / benchmark_details
+                # scalars were REMOVED from StatusResponse — reading them
+                # always yielded 0 / {}, which blanked the feedback message
+                # and silently pinned the gate ratchet to 0.0 on every
+                # accepted submission. Everything below drives off `report`.
                 report = data.get("report") or {}
-                relative = report.get("relative")
+                relative = report.get("relative") or {}
                 scoring_mode = report.get("scoring_mode", "")
                 reason_relative = report.get("reason_relative")
+                outcome = report.get("outcome", "")
+                rank = data.get("benchmark_rank")
 
-                # Build a feedback message. app_score is a 0/≈1 validity sentinel
-                # now, so label it valid vs failed (not a quality grade).
-                lines = [f"Docker benchmark score: {score:.4f}"]
+                # Score proxy in [0, 1]: the fraction of compared orders that
+                # beat the champion. Replaces the retired benchmark_score for
+                # the feedback label and the gate ratchet; 0.0 when nothing
+                # was comparable (e.g. all-new orders, or benchmark_failed).
+                compared = int(relative.get("compared", 0) or 0)
+                better = int(relative.get("better", 0) or 0)
+                score = (better / compared) if compared > 0 else 0.0
+
+                lines: list[str] = []
+                if outcome:
+                    lines.append(f"Outcome: {outcome}")
                 if relative:
                     lines.append(
                         "Relative vs champion: "
@@ -1011,62 +1063,40 @@ class AgentLoop:
                     )
                     if reason_relative:
                         lines.append(f"  {reason_relative}")
-                app_scores = scorecard.get("app_scores", {})
-                for app_key, app_score in app_scores.items():
-                    status_str = "VALID" if app_score > 0 else "INVALID"
-                    lines.append(f"  {app_key}: {app_score:.3f} ({status_str})")
+                if rank is not None:
+                    lines.append(f"Benchmark rank: {rank}")
 
-                # Find invalid (no-value) scenarios
-                failed = [pi for pi in per_intent if pi.get("score", 0) == 0]
-                if failed:
-                    lines.append("Invalid scenarios:")
-                    for pi in failed:
-                        lines.append(f"  {pi.get('intent_id', '?')}: score=0 error={pi.get('error', 'none')}")
-
-                feedback_msg = "\n".join(lines)
+                feedback_msg = "\n".join(lines) or (
+                    "Benchmark complete (no relative detail returned)."
+                )
                 logger.info("Docker benchmark feedback:\n%s", feedback_msg)
 
-                # Store benchmark feedback for the next improvement cycle.
-                # Iterate ALL apps in the scorecard — the original `break`
-                # after the first one dropped per-app feedback for any
-                # submission spanning multiple apps. Per-app messages are
-                # the same global feedback today, but the bug would silently
-                # bite once we ship a multi-app solver.
-                seen_app_ids: set[str] = set()
-                for app_key in app_scores:
-                    app_id = app_key.split(":")[0] if ":" in app_key else app_key
-                    if app_id in seen_app_ids:
-                        continue
-                    seen_app_ids.add(app_id)
+                # Store feedback + relative counts for every app we submitted.
+                # The old per-app scorecard (app_scores) was removed, so the
+                # submitted_apps set the caller passed in (known at submit
+                # time) is the source of truth for which apps to update.
+                confirm_apps = submitted_apps or set()
+                for app_id in confirm_apps:
                     self.score_tracker.set_last_score_feedback(
                         app_id, score, feedback_msg,
                     )
-                    # Feed the authoritative relative counts to the tracker so
-                    # priority/trend/feedback are counts-based, not score-based.
-                    # The counts are submission-wide (champion-vs-challenger over
+                    # Counts are submission-wide (champion-vs-challenger over
                     # all orders), so the same block is attached to each app.
-                    if scoring_mode or relative is not None:
+                    if scoring_mode or relative:
                         self.score_tracker.set_relative_counts(
-                            app_id, relative, scoring_mode or "relative",
+                            app_id, relative or None, scoring_mode or "relative",
                         )
 
-                # Stagnation tracking is counts-based now: record the
-                # better/compared ratio (fraction of orders beating the champion)
-                # once per benchmarked submission. A flat ratio across K
-                # submissions ⇒ Claude is churning, not improving.
-                if relative and int(relative.get("compared", 0) or 0) > 0:
-                    _ratio = int(relative.get("better", 0) or 0) / int(relative["compared"])
-                    self.cost_gate.record_pre_sim_score(_ratio)
+                # Stagnation tracking is counts-based: record the
+                # better/compared ratio (fraction of orders beating the
+                # champion) once per benchmarked submission. A flat ratio
+                # across K submissions ⇒ Claude is churning, not improving.
+                if compared > 0:
+                    self.cost_gate.record_pre_sim_score(score)
 
-                # Ratchet the gate floor on validator-confirmed score.
-                # We use the validator's benchmark_score (not pre-sim)
-                # so the floor only moves up on submissions that actually
-                # passed Stage 1+2 + scoring. Use the submitted_apps set
-                # (passed in from the caller — known at submit time) as
-                # the source of truth for which apps to confirm. The
-                # validator response's per-app scorecard may be empty
-                # even on success, so seen_app_ids alone misses cases.
-                confirm_apps = submitted_apps or seen_app_ids
+                # Ratchet the gate floor on the validator-confirmed relative
+                # score, so the floor only moves up on submissions that
+                # actually passed screening + scoring.
                 for app_id in confirm_apps:
                     self._confirm_submission(
                         app_id, validator_score=float(score), accepted=True,
@@ -1079,7 +1109,7 @@ class AgentLoop:
                 # / champion_score / scenario_scores, and Claude's improve
                 # prompt would read as if nothing happened. fetch_app_scores
                 # populates all three (avg/recent/champion/scenarios) per app.
-                for app_id in seen_app_ids:
+                for app_id in confirm_apps:
                     try:
                         scores = await self.discovery.fetch_app_scores(app_id)
                         if scores:
