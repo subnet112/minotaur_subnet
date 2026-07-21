@@ -565,6 +565,32 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
+        # WAIT FOR THE FULL BENCHED SLATE before ranking/finalizing on an adoptable
+        # finalist. _find_champion_candidates only sees SCORED submissions, so
+        # proceeding here while a slate member is still BENCHMARKING judges a PARTIAL
+        # slate — with two harms: (1) it can crown the best of a partial slate over a
+        # still-running member that would have out-ranked it; under rotation seniority
+        # (#499, LRU) that raced-out member is DE-PRIORITISED next round, so with a
+        # slate of 3 vs a large fleet it may not re-bench for a full rotation cycle
+        # (~hours) — it does NOT self-correct round-to-round; and (2) the still-running
+        # member finishes SCORED after the one-shot _persist_round_relative_counts below
+        # has already run, orphaning its same-pin relative block ("comparison report
+        # unavailable"). DEFER until the slate is terminal — the SAME guard the two
+        # no-finalist paths already use (above and below), just extended to the
+        # has-finalist path. Bounded by the same decision_deadline_epoch
+        # (_maybe_abort_expired_round terminates a round whose slate never scores), and
+        # the decision window is auto-scaled to the benched-slate size, so the full
+        # slate normally lands well inside it. NO-OP in the monolith: when the
+        # coordinator owns the slate it has already run_once()'d the whole slate to
+        # SCORED above, so nothing is in-flight here — this only closes the race on the
+        # two-process split where a separate worker benches the slate asynchronously.
+        # Consensus-neutral: the round stays REPLAYING with no broadcast; the
+        # coordinator re-evaluates next tick once the straggler scores.
+        if self._round_has_inflight_submissions(round_id):
+            result["deferred"] = True
+            result["status_after"] = round_state.status.value
+            return result
+
         # We have a finalist — re-benchmark the incumbent at the current round pin so
         # the comparison is fair (fresh same-pin bar + genesis-as-bar seeding). Without
         # this, a JS scoring update that adds harder scenarios would make the incumbent's
