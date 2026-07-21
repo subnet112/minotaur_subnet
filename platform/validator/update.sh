@@ -2,6 +2,15 @@
 #
 # One-click validator repair + health-gated update for Minotaur SN112.
 #
+# CANONICAL for ALL validators — followers AND the lead. It adapts to the node:
+#   - compose: routes through a sibling dc.sh (lead: loads .env.production +
+#     .env.keys via the production compose) when present, else plain compose.
+#   - round-drain (MINOTAUR_ROUND_DRAIN=1): waits for a safe, non-finalize round
+#     window before recreating a coordinator — a lead safety, a no-op elsewhere.
+#   - digest-parity (MINOTAUR_DIGEST_PARITY_SVCS): benchmark-worker split check.
+# platform/production/update.sh is a symlink to this file (the lead runs it from
+# there next to its dc.sh + docker-compose.production.yml).
+#
 # A SAFE replacement for Watchtower auto-update, AND a repair tool for a node
 # that's already down/flapping. Run it any time the stack is unhappy — it is
 # idempotent and safe to re-run.
@@ -53,6 +62,16 @@ SERVICE_WAIT="${MINOTAUR_UPDATE_WAIT:-240}"     # secs for api/validator to go h
 # re-drive as attest_failed, orphaning a certified win (round-e29743808, 2026-07-21).
 SERVICES="${MINOTAUR_UPDATE_SERVICES:-fork-cache validator api relayer}"  # tag-tracked (pulled) services
 ANVILS="${MINOTAUR_ANVILS:-anvil-eth anvil-base anvil-btevm}"
+# ── round-drain (coordinator safety): don't recreate a coordinator service
+# MID-ROUND. A recreate straddling a round's scoring/finalize window has orphaned
+# a champion merge (relayer race, round-e29743808 2026-07-21) and stranded
+# in-flight benchmark reports. When a new coordinator image is staged, wait for the
+# round to leave its ~2-min hot window first. Bounded so an update never blocks
+# forever; in-app defer/health-gate backstops any residual race. Default-on; a node
+# that never finalizes/benchmarks may set MINOTAUR_ROUND_DRAIN=0.
+ROUND_DRAIN="${MINOTAUR_ROUND_DRAIN:-1}"          # 1 = drain before a coordinator recreate; 0 = old behaviour
+DRAIN_MAX_WAIT="${MINOTAUR_DRAIN_MAX_WAIT:-600}"  # hard cap (secs) — proceed anyway past this
+DRAIN_POLL="${MINOTAUR_DRAIN_POLL:-20}"           # secs between round-status polls
 # Phase 2 split (LEADER ONLY): when the leader activates the benchmark-worker
 # profile it MUST keep the worker in lockstep with the api. In its .env, set:
 #   COMPOSE_PROFILES=benchmark-worker
@@ -87,16 +106,22 @@ warn() { printf '[update %s] ⚠️  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
 err()  { printf '[update %s] ‼️  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 
 # docker compose v2 (plugin) or v1 (standalone)
-if docker compose version >/dev/null 2>&1; then DC() { docker compose "$@"; }
+# Compose invocation. A LEAD deployment ships a dc.sh wrapper next to this script
+# that routes through the production compose + BOTH env files (.env.production +
+# .env.keys) — mandatory, since a bare `docker compose` bakes EMPTY signing keys and
+# breaks certification. Prefer it when present; followers have no dc.sh and use
+# plain compose.
+if [ -x "$DIR/dc.sh" ]; then DC() { "$DIR/dc.sh" "$@"; }
+elif docker compose version >/dev/null 2>&1; then DC() { docker compose "$@"; }
 elif command -v docker-compose >/dev/null 2>&1; then DC() { docker-compose "$@"; }
-else err "FATAL: neither 'docker compose' nor 'docker-compose' found"; exit 2; fi
+else err "FATAL: no dc.sh wrapper and neither 'docker compose' nor 'docker-compose' found"; exit 2; fi
 
 # ── 0. preflight: docker + compose file ───────────────────────────────────
 if ! docker info >/dev/null 2>&1; then
   err "cannot talk to the Docker daemon (is it running? are you in the docker group?)"; exit 2
 fi
-if [ ! -f "$DIR/docker-compose.yml" ] && [ ! -f "$DIR/compose.yml" ]; then
-  err "no compose file in $DIR — run from platform/validator/ or set MINOTAUR_COMPOSE_DIR"; exit 2
+if [ ! -x "$DIR/dc.sh" ] && [ ! -f "$DIR/docker-compose.yml" ] && [ ! -f "$DIR/compose.yml" ] && [ ! -f "$DIR/docker-compose.production.yml" ]; then
+  err "no compose file (or dc.sh wrapper) in $DIR — run from platform/validator/ (or the lead's platform/production/), or set MINOTAUR_COMPOSE_DIR"; exit 2
 fi
 
 # ── 1. preflight: mandatory env vars ──────────────────────────────────────
@@ -221,6 +246,69 @@ diagnose_anvils() {
   err "fork-cache proxies these upstreams; also inspect: DC logs --tail 40 fork-cache"
 }
 
+# ── round-drain helpers ─────────────────────────────────────────────────────
+# Current solver round status from the benchmark-worker's (or api's) round store.
+# Prints the lowercase status, or none|error. Never fails the run.
+round_status() {
+  local cid out
+  cid="$(DC ps -q benchmark-worker 2>/dev/null || true)"
+  [ -z "$cid" ] && cid="$(DC ps -q api 2>/dev/null || true)"
+  [ -z "$cid" ] && { echo none; return; }
+  out="$(docker exec "$cid" python3 -c 'import json
+try:
+    d = json.load(open("/data/solver_rounds.json"))
+    crid = d.get("current_round_id")
+    r = (d.get("rounds") or {}).get(crid) or {}
+    print((r.get("status") or "none").lower())
+except FileNotFoundError:
+    print("none")
+except Exception:
+    print("error")' 2>/dev/null || true)"
+  echo "${out:-error}"
+}
+
+# True (0) if a freshly-pulled image for a coordinator service differs from what
+# is running — i.e. `up` WILL recreate it, so a mid-round recreate is at stake.
+# If nothing will recreate, we skip the drain entirely (no needless waiting).
+recreate_pending() {
+  local svc cid running tag tagimg
+  for svc in $SERVICES; do
+    case "$svc" in api|relayer|benchmark-worker) ;; *) continue ;; esac
+    cid="$(DC ps -q "$svc" 2>/dev/null || true)"
+    [ -z "$cid" ] && return 0                       # not running → up will (re)create it
+    running="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
+    tag="$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
+    case "$tag" in *@sha256:*) continue ;; esac     # digest-pinned → tag compare meaningless
+    tagimg="$(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null || true)"
+    [ -n "$tagimg" ] && [ -n "$running" ] && [ "$running" != "$tagimg" ] && return 0
+  done
+  return 1
+}
+
+# Wait until the round is in a state where recreating the coordinator won't
+# orphan an in-flight benchmark or split a champion finalization. The hot window
+# is CLOSED→REPLAYING→SHADOWING→CERTIFYING→CERTIFIED (~2 min/round); OPEN
+# (collecting, ~20 min runway) and terminal/none/error are safe. DRAIN_MAX_WAIT
+# caps the wait so the hourly update never blocks forever.
+drain_for_safe_round() {
+  [ "$ROUND_DRAIN" = "1" ] || { log "round-drain disabled (MINOTAUR_ROUND_DRAIN=0) — recreating immediately"; return 0; }
+  local waited=0 st
+  while [ "$waited" -lt "$DRAIN_MAX_WAIT" ]; do
+    st="$(round_status)"
+    case "$st" in
+      closed|replaying|shadowing|certifying|certified)
+        log "round-drain: status=$st (scoring/finalizing) — waiting for a safe window (${waited}/${DRAIN_MAX_WAIT}s)"
+        sleep "$DRAIN_POLL"; waited=$((waited + DRAIN_POLL)) ;;
+      *)
+        if [ "$waited" -gt 0 ]; then log "round-drain: status=$st — safe after ${waited}s, proceeding"
+        else log "round-drain: status=$st — safe, proceeding"; fi
+        return 0 ;;
+    esac
+  done
+  warn "round-drain: still '$st' after ${DRAIN_MAX_WAIT}s cap — proceeding with recreate (in-app defer/health-gate backstops any race)"
+  return 0
+}
+
 # ── 2. snapshot the running api image for rollback ────────────────────────
 OLD_ID=""; IMAGE_REF=""
 snap_cid="$(DC ps -q "$PROBE_SVC" 2>/dev/null || true)"
@@ -273,9 +361,21 @@ if ! DC up -d --wait --wait-timeout "$ANVIL_WAIT" $ANVILS; then
 fi
 log "✅ all forks healthy"
 
+# ── 3.5 drain: don't recreate the coordinator MID-ROUND ───────────────────
+# Only matters when a new image is actually staged (otherwise `up` is a no-op).
+if recreate_pending; then
+  log "new coordinator image staged — checking the round window before recreating"
+  drain_for_safe_round
+else
+  log "no coordinator image change — nothing to recreate, skipping round-drain"
+fi
+
 # ── 4. bring up api/validator (health-gate now satisfied) ─────────────────
 log "recreating api/validator with --wait (timeout ${SERVICE_WAIT}s)…"
-if DC up -d --wait --wait-timeout "$SERVICE_WAIT"; then
+# Scope to $SERVICES so the one-shot 'seed' container (which exits) doesn't make
+# --wait fail; the anvils and other deps were already brought up healthy above.
+# shellcheck disable=SC2086 — intentional word-split of the service list.
+if DC up -d --wait --wait-timeout "$SERVICE_WAIT" $SERVICES; then
   check_digest_parity   # Phase 2 split: warn if benchmark-worker digest != api's
   log "✅ update/repair complete — stack healthy"
   exit 0
