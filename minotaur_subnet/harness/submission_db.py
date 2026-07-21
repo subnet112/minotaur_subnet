@@ -364,6 +364,33 @@ class SubmissionDB:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[submission-db] batch write failed: %s", exc)
 
+    def delete_records(self, ids: Iterable[str]) -> None:
+        """Hard-DELETE the given submission rows (and their details via the FK).
+
+        SAFE ONLY at load/retention pruning, before this store serves reads or a
+        peer syncs: the incremental pull (load_since) is append-only with NO
+        tombstones, so a delete would not propagate to an already-running peer.
+        Pruned rows are old + terminal (never re-updated), and every process
+        re-hydrates the bounded DB on the coordinated restart. Deleting low-seq
+        rows never lowers ``max_seq`` (the retained rows keep the high seqs), so
+        no reader's watermark is disturbed.
+        """
+        ids = [str(i) for i in ids]
+        if not ids:
+            return
+        try:
+            with self._immediate():
+                self._conn.executemany(
+                    "DELETE FROM submission_details WHERE submission_id=?",
+                    [(i,) for i in ids],
+                )
+                self._conn.executemany(
+                    "DELETE FROM submissions WHERE submission_id=?",
+                    [(i,) for i in ids],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[submission-db] retention delete failed: %s", exc)
+
     # ── cross-process incremental pull (Phase 2) ─────────────────────────
 
     def max_seq(self) -> int:
