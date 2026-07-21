@@ -47,7 +47,11 @@ set -euo pipefail
 # ── config (env-overridable) ──────────────────────────────────────────────
 ANVIL_WAIT="${MINOTAUR_ANVIL_WAIT:-300}"        # secs for the forks to go healthy (btevm start_period is 90s)
 SERVICE_WAIT="${MINOTAUR_UPDATE_WAIT:-240}"     # secs for api/validator to go healthy
-SERVICES="${MINOTAUR_UPDATE_SERVICES:-fork-cache validator api}"  # tag-tracked (pulled) services
+# `relayer` MUST be here: it does the on-chain champion attest, so it has to be
+# updated in lockstep with the api/validator. Omitting it let the relayer drift 3
+# days behind (pre-#977 image) and mis-report an idempotent "Already certified"
+# re-drive as attest_failed, orphaning a certified win (round-e29743808, 2026-07-21).
+SERVICES="${MINOTAUR_UPDATE_SERVICES:-fork-cache validator api relayer}"  # tag-tracked (pulled) services
 ANVILS="${MINOTAUR_ANVILS:-anvil-eth anvil-base anvil-btevm}"
 # Phase 2 split (LEADER ONLY): when the leader activates the benchmark-worker
 # profile it MUST keep the worker in lockstep with the api. In its .env, set:
