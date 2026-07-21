@@ -539,7 +539,7 @@ services:
       BENCHMARK_CONCURRENCY: "${BENCHMARK_CONCURRENCY:-1}"
       BENCHMARK_POLL_INTERVAL: "${BENCHMARK_POLL_INTERVAL:-30}"
       BENCHMARK_QUOTE_CORPUS: "${BENCHMARK_QUOTE_CORPUS:-1}"
-      CANDIDATE_IMAGE_REPO: "${CANDIDATE_IMAGE_REPO:-ghcr.io/subnet112/minotaur-solver}"
+      CANDIDATE_IMAGE_REPO: "${CANDIDATE_IMAGE_REPO:-}"   # presence-sensitive: non-empty flips leader_pushes_digests()→True (un-credentialed GHCR push on followers); leader sets repo in .env
       CHALLENGER_QUORUM_MODE: "${CHALLENGER_QUORUM_MODE:-1}"
       CHAMPION_CONSENSUS_PEERS: "${CHAMPION_CONSENSUS_PEERS:-}"
       COW_BASE_URL: "${COW_BASE_URL:-}"
@@ -549,7 +549,7 @@ services:
       DISABLE_CHAMPION_ADOPTION: "${DISABLE_CHAMPION_ADOPTION:-0}"
       DISTRIBUTED_VETO_ENFORCE: "${DISTRIBUTED_VETO_ENFORCE:-hard}"
       DISTRIBUTED_VETO_REVERIFY: "${DISTRIBUTED_VETO_REVERIFY:-1}"
-      EMISSION_TIME_WEIGHTED_OBSERVE: "${EMISSION_TIME_WEIGHTED_OBSERVE:-1}"
+      EMISSION_TIME_WEIGHTED_OBSERVE: "${EMISSION_TIME_WEIGHTED_OBSERVE:-}"   # code default OFF; leader sets 1 in .env for the observe soak
       MALLOC_ARENA_MAX: "${MALLOC_ARENA_MAX:-2}"
       RELATIVE_SCORING_ENABLED: "${RELATIVE_SCORING_ENABLED:-1}"
       ROUND_ANCHOR_SHADOW: "${ROUND_ANCHOR_SHADOW:-0}"
@@ -563,7 +563,7 @@ services:
       SOLVER_ROUND_OPEN_SECONDS: "${SOLVER_ROUND_OPEN_SECONDS:-300}"
       SOLVER_ROUND_STORE_PATH: "${SOLVER_ROUND_STORE_PATH:-/data/solver_rounds.json}"
       SUBMISSIONS_ALLOW_UNREGISTERED: "${SUBMISSIONS_ALLOW_UNREGISTERED:-0}"
-      SUBMISSIONS_MAX_RECORDS: "${SUBMISSIONS_MAX_RECORDS:-5000}"
+      SUBMISSIONS_MAX_RECORDS: "${SUBMISSIONS_MAX_RECORDS:-0}"   # code default 0=unbounded; leader arms 5000 in .env (store-bloat/egress is a leader-only concern), same pattern as OPEN_SECONDS
       SUBMISSION_SNAPSHOT_SYNC: "${SUBMISSION_SNAPSHOT_SYNC:-1}"
       SUBMISSION_STORE_PATH: "${SUBMISSION_STORE_PATH:-/data/submissions.json}"
       VALIDATOR_PEERS: "${VALIDATOR_PEERS:-}"
@@ -572,35 +572,35 @@ services:
       ARCHIVE_RPC_BTEVM: "${ARCHIVE_RPC_BTEVM:-https://lite.chain.opentensor.ai}"
       ARCHIVE_RPC_ETH: "${ARCHIVE_RPC_ETH:-}"
       BENCHMARK_HISTORICAL_SAMPLES: "${BENCHMARK_HISTORICAL_SAMPLES:-10}"
-      CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-120}"
+      CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"   # code default 30, not 120
       DEPLOY_FEE_COLLECTOR_EVM: "${DEPLOY_FEE_COLLECTOR_EVM:-}"
       DEPLOY_FEE_EXEMPT_ADDRESSES: "${DEPLOY_FEE_EXEMPT_ADDRESSES:-}"
       ENABLE_PUBLIC_DEPLOYMENT: "${ENABLE_PUBLIC_DEPLOYMENT:-0}"
       ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
       FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
       GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
-      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-production_minotaur}"
+      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"   # empty→live champion runs --network=none as today; leader sets production_minotaur in .env
       MVP_DEMO_MODE: "${MVP_DEMO_MODE:-0}"
       ORDER_CONSENSUS_PEERS: "${ORDER_CONSENSUS_PEERS}"
       ORDER_CONSENSUS_QUORUM_BPS: "${ORDER_CONSENSUS_QUORUM_BPS:-6666}"
       QUORUM_BPS: "${QUORUM_BPS:-6666}"
-      RELAYER_MIN_BALANCE_WEI: "${RELAYER_MIN_BALANCE_WEI:-1000000000000000}"
-      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:?missing - pass --env-file .env.keys (use ./dc.sh)}"
+      RELAYER_MIN_BALANCE_WEI: "${RELAYER_MIN_BALANCE_WEI:-10000000000000000}"   # code default 1e16 (embedded-relayer path, unused by api)
+      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:-}"   # was :? — followers never set it → compose interpolation fail; api uses HttpRelayer branch anyway; leader sets in .env
       RELAYER_RECEIPT_TIMEOUT: "${RELAYER_RECEIPT_TIMEOUT:-120}"
       RELAYER_WALLET: "${RELAYER_WALLET:-}"
-      REQUIRE_ASYMMETRIC_PROVENANCE: "${REQUIRE_ASYMMETRIC_PROVENANCE:-1}"
-      REQUIRE_SIGNED_PROVENANCE: "${REQUIRE_SIGNED_PROVENANCE:-1}"
+      REQUIRE_ASYMMETRIC_PROVENANCE: "${REQUIRE_ASYMMETRIC_PROVENANCE:-0}"   # startup-failure: =1 needs SUBMISSION_PROVENANCE_ALLOWED_SIGNERS or api won't boot; leader sets 1 in .env
+      REQUIRE_SIGNED_PROVENANCE: "${REQUIRE_SIGNED_PROVENANCE:-0}"   # startup-failure: same; leader sets 1 in .env
       SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
       SOLVER_REPO_TOKEN: "${SOLVER_REPO_TOKEN:-}"
       SOLVER_REPO_URL: "${SOLVER_REPO_URL:-}"
       SOLVER_ROUND_INTAKE_MAX: "${SOLVER_ROUND_INTAKE_MAX:-8}"
-      SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT: "${SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT:-0}"
+      SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT: "${SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT:-2}"   # code default 2, not 0
       SUBMISSION_ALLOWED_REPO_HOSTS: "${SUBMISSION_ALLOWED_REPO_HOSTS:-github.com}"
       SUBMISSION_GIT_CLONE_ALLOWED_HOSTS: "${SUBMISSION_GIT_CLONE_ALLOWED_HOSTS:-github.com}"
       SUBMISSION_GIT_CLONE_PASSWORD: "${SUBMISSION_GIT_CLONE_PASSWORD:-}"
-      SUBMISSION_GIT_CLONE_USERNAME: "${SUBMISSION_GIT_CLONE_USERNAME:-x-access-token}"
-      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-1}"
-      VALIDATOR_ADDRESSES: "${VALIDATOR_ADDRESSES:?missing - pass --env-file .env.keys (use ./dc.sh)}"  # added 2026-05-26 — PR #54 prefers public addresses over peer privkeys
+      SUBMISSION_GIT_CLONE_USERNAME: "${SUBMISSION_GIT_CLONE_USERNAME:-}"   # code default empty; leader sets x-access-token in .env
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-0}"   # code default 0; leader behind nginx sets 1 in .env
+      VALIDATOR_ADDRESSES: "${VALIDATOR_ADDRESSES:-}"   # was :? — followers never set it → boot fail; value-based read, empty==unset; leader sets in .env
       # ── end leader-only config ──
       # Same Bittensor identity as the validator daemon — both processes
       # use the same hotkey + EVM signing key.
@@ -1155,7 +1155,11 @@ services:
       ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
       RELAYER_WALLET: "${RELAYER_WALLET:-}"
       BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_RELAYER_RPC_URL:-https://lite.chain.opentensor.ai}"   # SCRUBBED: was a hardcoded blockmachine auth token; put the real URL in .env
-      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:?missing - pass --env-file .env.keys (use ./dc.sh)}"
+      # Leader-only (this service only starts under `profiles: [leader]`), but compose interpolates
+      # ${VAR:?} even for profiled-out services, so a `:?` here would break a follower's
+      # `docker compose up`. Kept optional; the leader supplies it via .env.keys (./dc.sh), and a
+      # dc.sh/update.sh preflight should assert it is set before starting the leader profile.
+      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:-}"
       CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964:-}"
       VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964:-}"
       CHAMPION_CONSENSUS_CHAIN_ID: "${CHAMPION_CONSENSUS_CHAIN_ID:-964}"
