@@ -697,8 +697,8 @@ services:
       # Follower role — these are LEADER-ONLY responsibilities:
       ENABLE_SOLVER_ROUND_COORDINATOR: "${ENABLE_SOLVER_ROUND_COORDINATOR:-0}"  # 1 on the leader (runs the round coordinator)
       ENABLE_BENCHMARK_WORKER: "${ENABLE_BENCHMARK_WORKER:-0}"  # leader hands the slate to the benchmark-worker profile
-      ENABLE_DEX_COMPARE: "0"               # DEX-aggregator comparison is leader-only
-      SUBMISSIONS_ACCEPTING: "0"            # Users send submissions to the leader
+      ENABLE_DEX_COMPARE: "${ENABLE_DEX_COMPARE:-0}"        # leader-only; leader sets 1 in .env
+      SUBMISSIONS_ACCEPTING: "${SUBMISSIONS_ACCEPTING:-0}"  # leader accepts user submissions (sets 1 in .env); followers default off
       # Optional DEX-compare aggregator keys (leader only; CoW + Velora are keyless):
       ONEINCH_API_KEY: "${ONEINCH_API_KEY:-}"
       ZEROX_API_KEY: "${ZEROX_API_KEY:-}"
