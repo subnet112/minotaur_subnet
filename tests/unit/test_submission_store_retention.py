@@ -87,3 +87,57 @@ def test_persist_is_bounded_on_disk_via_reload(tmp_path, monkeypatch):
     assert len(store2._submissions) == 7, "all records retained"
     with_details = [s for s in store2._submissions.values() if s.benchmark_details]
     assert len(with_details) == 2, f"retention cap not applied on disk: {len(with_details)}"
+
+
+def test_record_retention_prunes_old_terminal_keeps_champion_and_inflight(tmp_path, monkeypatch):
+    """SUBMISSIONS_MAX_RECORDS caps the record count at load: the OLDEST terminal
+    rows beyond the cap are hard-deleted from the DB, while every in-flight
+    submission and every ADOPTED champion survives regardless of age."""
+    monkeypatch.setattr(ss, "_MAX_RECORDS", 3)
+    p = tmp_path / "submissions.json"
+    store = SubmissionStore(persist_path=p)
+
+    def add(created_at, status):
+        _ctr[0] += 1
+        n = _ctr[0]
+        sub = store.create(
+            repo_url=f"https://example.com/r{n}.git", commit_hash=f"{n:040d}",
+            epoch=n, hotkey=f"hk{n}", round_id=f"round-{n}",
+            max_per_round=0, max_rounds_per_commit=0,
+        )
+        sub.created_at = float(created_at)
+        store.update_status(sub.submission_id, status)
+        return sub
+
+    champ = add(100, SubmissionStatus.ADOPTED)                               # OLD champion
+    scored = [add(200 + i, SubmissionStatus.SCORED) for i in range(5)]       # ascending age
+    active = add(999, SubmissionStatus.BENCHMARKING)                         # newest, in-flight
+
+    # Reload → load-time retention prunes to cap=3 (drops the 4 OLDEST scored).
+    store2 = SubmissionStore(persist_path=p)
+    ids = set(store2._submissions)
+    assert len(ids) == 3, sorted(ids)
+    assert champ.submission_id in ids, "ADOPTED champion pruned despite being oldest"
+    assert active.submission_id in ids, "in-flight submission pruned"
+    assert scored[-1].submission_id in ids, "newest scored pruned"
+    assert all(s.submission_id not in ids for s in scored[:4]), "old scored survived"
+
+    # The DB itself is bounded — a second fresh reload sees only the retained rows.
+    store3 = SubmissionStore(persist_path=p)
+    assert len(store3._submissions) == 3
+
+
+def test_record_retention_off_by_default(tmp_path, monkeypatch):
+    """With the cap unset/0, every record is retained (no prune)."""
+    monkeypatch.setattr(ss, "_MAX_RECORDS", 0)
+    p = tmp_path / "submissions.json"
+    store = SubmissionStore(persist_path=p)
+    for e in range(1, 11):
+        sub = store.create(
+            repo_url=f"https://example.com/z{e}.git", commit_hash=f"{e + 500:040d}",
+            epoch=e, hotkey=f"zk{e}", round_id=f"zround-{e}",
+            max_per_round=0, max_rounds_per_commit=0,
+        )
+        store.update_status(sub.submission_id, SubmissionStatus.REJECTED)
+    store2 = SubmissionStore(persist_path=p)
+    assert len(store2._submissions) == 10
