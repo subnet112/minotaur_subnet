@@ -33,6 +33,7 @@ from minotaur_subnet.shared.types import (
     AppStatus,
     DeploymentResult,
 )
+from minotaur_subnet.shared import signer_denylist
 from minotaur_subnet.store import AppIntentStore
 from minotaur_subnet.store.app_intent_store import _definition_from_dict
 
@@ -317,6 +318,16 @@ class ValidatorAppCatalogSync:
             new_def = _definition_from_dict(app_dict)
         except KeyError as exc:
             logger.warning("Malformed app payload (missing %s); skipping", exc)
+            return 0, 0
+
+        # Never re-ingest a hard-banned app or one owned by a compromised key,
+        # even if a (compromised) leader serves it. See ``shared.signer_denylist``.
+        if signer_denylist.is_app_id_banned(new_def.app_id) or \
+                signer_denylist.is_signer_denylisted(new_def.deployer):
+            logger.warning(
+                "Refusing to sync denylisted app %s (deployer=%s…) from leader",
+                new_def.app_id, (new_def.deployer or "")[:10],
+            )
             return 0, 0
 
         apps_updated = 0
