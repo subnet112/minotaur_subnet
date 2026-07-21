@@ -487,6 +487,17 @@ class AppIntentStore:
     # ── app definitions ──────────────────────────────────────────────────
 
     def save_app(self, definition: AppIntentDefinition) -> None:
+        # Backstop for every write path (create / update_scoring / follower
+        # sync): never persist a hard-banned app_id or an app whose deployer is
+        # a compromised/denylisted key. See ``shared.signer_denylist``.
+        from minotaur_subnet.shared import signer_denylist
+        if signer_denylist.is_app_id_banned(definition.app_id):
+            raise ValueError(f"refusing to persist banned app_id {definition.app_id}")
+        if signer_denylist.is_signer_denylisted(definition.deployer):
+            raise ValueError(
+                "refusing to persist app with denylisted deployer "
+                f"{(definition.deployer or '')[:10]}…"
+            )
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO apps(app_id, data) VALUES(?, ?) "

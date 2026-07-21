@@ -198,6 +198,12 @@ def create_app_intent(
             }
         deployer_addr = parse_address(signer).address  # proven owner
 
+    # Refuse to record a compromised/denylisted key as an app deployer — it
+    # would become an allowed signer able to rewrite this app's scoring JS.
+    from minotaur_subnet.shared import signer_denylist
+    if deployer_addr and signer_denylist.is_signer_denylisted(deployer_addr):
+        return {"error": f"deployer {deployer_addr[:10]}… is denylisted (compromised key)"}
+
     # ── build definition ─────────────────────────────────────────────────
     app_id = _generate_app_id()
     config = AppIntentConfig(
