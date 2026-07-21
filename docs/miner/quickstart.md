@@ -218,18 +218,25 @@ Feed either of these into the local testnet or the plan dry-run below.
 Two authed endpoints score a single execution plan **you supply** (not your whole solver — that's the local testnet's job), each gated by a metagraph-registered hotkey signature or admin key:
 
 - `POST /v1/orders/{order_id}/dry-run` — fast **mock** simulation, JS score only.
-- `POST /v1/apps/{app_id}/score` — the validator's **real fork simulation** (the same `scoreIntent` path production uses): a full report with on-chain score, gas, transfers, and the decoded on-chain revert reason on failure. Rate-limited to 60 calls/hr per hotkey; pass `fork_block` to replay against historical pool state (archive-capable RPC required; clamped to ±100 blocks from head).
+- `POST /v1/apps/{app_id}/score` — the validator's **real fork simulation** (the same `scoreIntent` path production uses): a full report with on-chain score, gas, transfers, and the decoded on-chain revert reason on failure. Rate-limited to 60 calls/hr per hotkey; pass `--fork-block` to replay against historical pool state (archive-capable RPC required; clamped to ±100 blocks from head).
 
-The reference client signs the request from your local Bittensor wallet:
+The `dry-run` subcommand signs the request with your registered hotkey and calls either endpoint:
 
 ```bash
-python scripts/miner_dry_run.py \
-  --api-url "$VALIDATOR_URL" \
-  --wallet-name <wallet> --hotkey-name <hotkey> \
-  --order-id <order_id> --plan plan.json
+# Real fork sim against an app (needs the order params):
+python -m minotaur_subnet.miner.main dry-run \
+  --validator-url "$VALIDATOR_URL" \
+  --app-id <app_id> --plan plan.json --params params.json \
+  --wallet-name <wallet> --hotkey-name <hotkey>
+
+# Fast mock sim against an existing order:
+python -m minotaur_subnet.miner.main dry-run \
+  --validator-url "$VALIDATOR_URL" \
+  --order-id <order_id> --plan plan.json \
+  --wallet-name <wallet> --hotkey-name <hotkey>
 ```
 
-It calls `/orders/{id}/dry-run` by default; POST the same signed headers to `/apps/{app_id}/score` for the full real-sim report (see the script's header comment).
+`plan.json` is `{interactions, deadline, nonce, metadata}`; `params.json` is the order params (`state.raw_params`). You can export `MINER_WALLET_NAME` / `MINER_HOTKEY_NAME` instead of passing the wallet flags. (`scripts/miner_dry_run.py` is a lower-level reference client that performs the same signing by hand.)
 
 ### After you submit — read where the champion is blind
 
@@ -239,6 +246,13 @@ The benchmark report and PR comment carry a per-order breakdown (`relative.per_o
 - `regression` — you delivered less than the champion. Optimization targets (each must stay within the 1% floor).
 - `dropped` — you produced nothing on an order the champion serves. A **hard veto** — fix these first.
 - `win` / `matched` — you beat / tied the champion within the 10 bps band.
+
+Pull that breakdown straight from the CLI — `status` renders the per-order verdicts as a table with the actionable rows first (drops and regressions before wins, hard losses flagged), or add `--json` for the raw payload:
+
+```bash
+python -m minotaur_subnet.miner.main status \
+  --submission-id <sub_id> --validator-url "$VALIDATOR_URL"
+```
 
 Use the `blind_spot_cover` and `regression` rows to find the champion's weak orders, then reproduce them locally with the endpoints above. Remember the shadow phase: optimize the *class* of order you're losing on, not the exact `intent_id`.
 
