@@ -3,8 +3,9 @@
 The endpoint historically returned the FULL submission corpus (~20k rows,
 ~44 MB) on every unfiltered call, which drove the bulk of validator egress —
 even though many clients already sent ``?limit=N`` (silently ignored). These
-tests pin the new behaviour: honour limit/offset (newest-first), default to
-unlimited (backward-compatible), and report the unpaginated ``total``.
+tests pin the behaviour: honour limit/offset (newest-first), **default to the
+50 newest rows** (subnet #990 — an omitted ``limit`` no longer dumps the whole
+corpus; pass ``limit=0`` to opt back in), and report the unpaginated ``total``.
 """
 
 from __future__ import annotations
@@ -53,13 +54,27 @@ def _store_n(n: int) -> _FakeStore:
     return _FakeStore([_FakeSub(f"sub-{i}", created_at=float(i)) for i in range(n)])
 
 
-def test_default_returns_all_backward_compatible():
-    out = _run(_store_n(5))
-    assert out["count"] == 5
-    assert out["total"] == 5
-    assert out["limit"] == 0
+def test_default_caps_at_50():
+    # Omitting ``limit`` returns the 50 NEWEST rows, not the full corpus
+    # (subnet #990 — the unbounded no-param poll drove the bulk of egress).
+    out = _run(_store_n(60))
+    assert out["count"] == 50
+    assert out["total"] == 60
+    assert out["limit"] == 50
     assert out["offset"] == 0
-    assert len(out["submissions"]) == 5
+    assert len(out["submissions"]) == 50
+    # Newest-first: the 50 returned are sub-59 .. sub-10.
+    assert out["submissions"][0]["submission_id"] == "sub-59"
+    assert out["submissions"][-1]["submission_id"] == "sub-10"
+
+
+def test_limit_zero_opts_into_full_corpus():
+    # Explicit ``limit=0`` still returns everything — the opt-in escape hatch for
+    # the rare caller that genuinely needs the whole corpus.
+    out = _run(_store_n(60), limit=0)
+    assert out["count"] == 60
+    assert out["total"] == 60
+    assert out["limit"] == 0
 
 
 def test_limit_returns_newest_n():
