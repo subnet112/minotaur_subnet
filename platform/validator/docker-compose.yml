@@ -401,6 +401,11 @@ services:
       anvil-btevm:
         condition: service_healthy
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      SUBNET_OWNER_HOTKEY: "${SUBNET_OWNER_HOTKEY:-}"
+      QUORUM_BPS: "${QUORUM_BPS:-6666}"
+      RELATIVE_SCORING_ENABLED: "${RELATIVE_SCORING_ENABLED:-1}"
+      MALLOC_ARENA_MAX: "${MALLOC_ARENA_MAX:-2}"
       # Bittensor identity
       WALLET_NAME: "${WALLET_NAME}"
       HOTKEY_NAME: "${HOTKEY_NAME}"
@@ -485,6 +490,7 @@ services:
       # (anti-free-ride). Default matches the api service name + port below.
       CHAMPION_API_URL: "${CHAMPION_API_URL:-http://api:8080}"
     volumes:
+      - store-data:/data              # shared round-state volume (matches leader; unused by followers reading champion over HTTP)
       # Bittensor wallet directory — read-only.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
     networks: [minotaur]
@@ -531,6 +537,13 @@ services:
       docker-socket-proxy:
         condition: service_started
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      APP_INTENT_BASE_1: "${APP_INTENT_BASE_1:-}"
+      APP_INTENT_BASE_964: "${APP_INTENT_BASE_964:-}"
+      STAGE3_DISABLED: "${STAGE3_DISABLED:-0}"
+      STAGE3_MAX_REGRESSION_CHECKS: "${STAGE3_MAX_REGRESSION_CHECKS:-5}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1:-}"
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1:-}"
       # ── leader-only config (subnet unified compose) — followers keep code-default behavior,
       #    the leader's .env overrides. Role is code-gated (LOCKED_LEADER / metagraph).
       ALLOW_ADMIN_SOLVER_REPO_TOKEN: "${ALLOW_ADMIN_SOLVER_REPO_TOKEN:-}"
@@ -858,6 +871,9 @@ services:
       # peer cache, which can be stale by up to 300s after a slash/removal).
       CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
     volumes:
+      # leader-only bind mounts (followers get empty placeholder dirs → unused; leader sets real host paths in .env)
+      - "${GHCR_DOCKER_CONFIG_DIR:-./.leader-mounts/docker}:/home/minotaur/.docker:ro"
+      - "${SOLVER_REPO_HOST_PATH:-./.leader-mounts/solver-repo}:/solver-repo"
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data
     networks: [minotaur, docker-control]
@@ -921,6 +937,12 @@ services:
       docker-socket-proxy:
         condition: service_started
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      SOLVER_ROUND_MAX_SUBMISSIONS: "${SOLVER_ROUND_MAX_SUBMISSIONS:-3}"
+      SUBMISSIONS_MAX_RECORDS: "${SUBMISSIONS_MAX_RECORDS:-0}"
+      VALIDATOR_HOTKEY_SS58: "${VALIDATOR_HOTKEY_SS58:-}"
+      APP_INTENTS_STORE_PATH: "${APP_INTENTS_STORE_PATH:-/data/store.json}"
+      SOLVER_READ_PROXY_CHAINS: "${SOLVER_READ_PROXY_CHAINS:-8453,1}"
       # ── identity (same hotkey/EVM key as the api) ────────────────────
       WALLET_NAME: "${WALLET_NAME}"
       HOTKEY_NAME: "${HOTKEY_NAME}"
