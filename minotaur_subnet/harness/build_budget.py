@@ -95,11 +95,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from minotaur_subnet.harness.actor import actor_last_selected, get_actor_resolver
+from minotaur_subnet.harness.actor import actor_last_selected, snapshot_resolver
 from minotaur_subnet.harness.rotation import (
     RotationLedger,
     actor_rotation_sort_key,
     rotation_ledger_path,
+    rotation_sort_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -201,14 +202,15 @@ class BuildGrant:
 class _Waiter:
     submission_id: str
     hotkey: str
-    # actor_rotation_sort_key(hotkey, round_id, actor_last, actor_of):
-    # (actor_last_selected_ts, actor-salted sha256, hotkey-salted sha256).
-    # For proven actors the timestamp orders LRU-first; for newcomers every
-    # timestamp is 0.0 so the ACTOR-salted hash is a pure per-round lottery —
-    # one ticket per actor, however many hotkeys it registers (see
-    # harness/actor.py; the identity resolver reproduces the old per-hotkey
-    # ordering exactly).
-    key: tuple[float, str, str]
+    # With actor keying: actor_rotation_sort_key = (actor_last_selected_ts,
+    # actor-salted sha256, hotkey-salted sha256) — for proven actors the
+    # timestamp orders LRU-first; for newcomers every timestamp is 0.0 so the
+    # ACTOR-salted hash is a pure per-round lottery, one ticket per actor
+    # however many hotkeys it registers. Legacy (state.actor_of None): the
+    # original per-hotkey rotation_sort_key 2-tuple, unchanged. A round uses
+    # one shape throughout (snapshotted at ensure_round), so keys always
+    # compare cleanly.
+    key: tuple[float, str, str] | tuple[float, str]
     proven: bool
     actor: str = ""
     event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -227,7 +229,9 @@ class _RoundGateState:
     ledger: dict[str, float]
     # Actor view, snapshotted with the ledger at ensure_round so one round's
     # dispatch is internally consistent even across a mid-round metagraph
-    # re-sync (next round picks up the new map).
+    # re-sync (next round picks up the new map). A FROZEN ActorResolver
+    # (harness/actor.py) — or None, which switches this round's classification,
+    # ordering and dedup to the legacy per-hotkey rules wholesale.
     actor_of: Any = None
     actor_last: dict[str, float] = field(default_factory=dict)
     charged_actors: set[str] = field(default_factory=set)
@@ -291,7 +295,7 @@ class BuildBudgetGate:
         else:
             proven_units = 0
         ledger = self._ledger_loader()
-        actor_of = get_actor_resolver()
+        actor_of = snapshot_resolver()
         state = _RoundGateState(
             round_id=round_id,
             budget=budget,
@@ -302,7 +306,10 @@ class BuildBudgetGate:
             spill_after_fraction=newcomer_spill_after_fraction(),
             ledger=ledger,
             actor_of=actor_of,
-            actor_last=actor_last_selected(ledger, actor_of),
+            actor_last=(
+                actor_last_selected(ledger, actor_of)
+                if actor_of is not None else dict(ledger)
+            ),
         )
         for sid, hotkey in prior_attempts or []:
             if sid in state.charged_ids:
@@ -385,6 +392,8 @@ class BuildBudgetGate:
         is never wasted but never multiplied by hotkey count either.
         """
         def _pool(waiters: Iterable[_Waiter]) -> list[_Waiter]:
+            if state.actor_of is None:  # legacy: pure key order, no dedup
+                return sorted(waiters, key=lambda w: w.key)
             return sorted(
                 waiters, key=lambda w: (w.actor in state.charged_actors, w.key),
             )
@@ -523,9 +532,12 @@ class BuildBudgetGate:
         waiter = _Waiter(
             submission_id=submission_id,
             hotkey=hotkey or "",
-            key=actor_rotation_sort_key(
-                hotkey or "", round_id, state.actor_last,
-                state.actor_of or (lambda hk: hk),
+            key=(
+                actor_rotation_sort_key(
+                    hotkey or "", round_id, state.actor_last, state.actor_of,
+                )
+                if state.actor_of is not None
+                else rotation_sort_key(hotkey or "", round_id, state.ledger)
             ),
             proven=self._is_proven(state, hotkey or ""),
             actor=self._actor(state, hotkey or ""),

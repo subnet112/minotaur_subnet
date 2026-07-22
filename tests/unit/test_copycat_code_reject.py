@@ -1,87 +1,111 @@
-"""Cross-actor identical-code reject (screening_pipeline.find_prior_cross_actor_copy).
+"""Cross-actor identical-code reject (screening_pipeline.evaluate_fingerprint_ownership).
 
-First submitter of a normalized fingerprint owns it; later copies from OTHER
-actors are rejected pre-build. Same-actor resubmits (the no-fault waitlist
-loop) must never match — that false positive was measured at 41.8% of
-serious-miner submissions for the naive any-prior-fingerprint rule.
+The EARLIEST submitter of a normalized fingerprint owns it; copies by other
+actors reject pre-build, and in-flight copies that raced past their own check
+are swept retroactively. Three review findings anchor this file's regression
+cases: (1) an intermediate rejected copy must NOT block the owner's resubmits
+(griefing primitive), (2) degraded coldkey attribution must stand down rather
+than reject, (3) the concurrent-copy race must close via the sweep.
 """
 
 import pytest
 
 from minotaur_subnet.api.routes.submissions.screening_pipeline import (
-    find_prior_cross_actor_copy,
+    evaluate_fingerprint_ownership,
 )
-from minotaur_subnet.harness.actor import set_coldkey_provider
+from minotaur_subnet.harness.actor import ActorResolver
 
-COLDKEYS = {"A1": "CK_A", "A2": "CK_A", "S": "CK_S"}
-
-
-@pytest.fixture(autouse=True)
-def _actor_map():
-    set_coldkey_provider(lambda: COLDKEYS)
-    yield
-    set_coldkey_provider(None)
+# O = owner (coldkey CK_O); A1/A2 = a fleet (CK_A); X = unmapped (deregistered).
+RESOLVER = ActorResolver(
+    {"O": "CK_O", "A1": "CK_A", "A2": "CK_A", "B": "CK_B"}, source="test",
+)
 
 
-class _Store:
-    def __init__(self, rows):
-        self.rows = rows  # (hotkey, created_at, submission_id)
-
-    def fingerprint_submitters(self, fingerprint, *, exclude_submission_id=None):
-        return [r for r in self.rows if r[2] != exclude_submission_id]
-
-
-def test_copy_from_other_actor_is_flagged():
-    store = _Store([("S", 100.0, "sub_orig")])
-    hit = find_prior_cross_actor_copy(
-        store, "fp1", submission_id="sub_copy", hotkey="A1", created_at=200.0,
+def _eval(entries, *, sid, hotkey, ts, resolver=RESOLVER):
+    return evaluate_fingerprint_ownership(
+        entries, submission_id=sid, hotkey=hotkey, created_at=ts,
+        resolver=resolver,
     )
-    assert hit == ("S", 100.0, "sub_orig")
 
 
-def test_first_submitter_is_never_flagged():
-    store = _Store([("A1", 200.0, "sub_late")])
-    assert find_prior_cross_actor_copy(
-        store, "fp1", submission_id="sub_first", hotkey="S", created_at=100.0,
-    ) is None
+def test_copy_from_other_actor_is_rejected():
+    entries = [("O", 100.0, "sub_orig", "waitlisted")]
+    owner, sweep = _eval(entries, sid="sub_copy", hotkey="A1", ts=200.0)
+    assert owner == ("O", 100.0, "sub_orig", "waitlisted")
+    assert sweep == []
 
 
-def test_same_actor_resubmit_passes_even_across_hotkeys():
-    # A2 resubmitting the fleet's own code (same coldkey as A1) is a resubmit,
-    # not a copy — the designed waitlist loop keeps working.
-    store = _Store([("A1", 100.0, "sub_orig")])
-    assert find_prior_cross_actor_copy(
-        store, "fp1", submission_id="sub_re", hotkey="A2", created_at=200.0,
-    ) is None
+def test_first_submitter_owns_and_sweeps_inflight_copies():
+    entries = [
+        ("A1", 200.0, "sub_copy1", "screening_stage_1"),   # sweepable
+        ("B", 300.0, "sub_copy2", "queued"),               # sweepable
+        ("A2", 400.0, "sub_copy3", "rejected"),            # terminal — leave
+        ("B", 500.0, "sub_copy4", "scored"),               # benched — leave
+    ]
+    owner, sweep = _eval(entries, sid="sub_orig", hotkey="O", ts=100.0)
+    assert owner is None
+    assert sorted(sweep) == ["sub_copy1", "sub_copy2"]
 
 
-def test_race_resolves_to_single_winner_deterministically():
-    # Two copies in flight concurrently: each sees the other in the store.
-    # (created_at, submission_id) is a total order → exactly one is flagged.
-    rows = [("S", 100.0, "sub_s"), ("A1", 100.0, "sub_a")]
-    flag_s = find_prior_cross_actor_copy(
-        _Store(rows), "fp1", submission_id="sub_s", hotkey="S", created_at=100.0,
-    )
-    flag_a = find_prior_cross_actor_copy(
-        _Store(rows), "fp1", submission_id="sub_a", hotkey="A1", created_at=100.0,
-    )
-    assert (flag_s is None) != (flag_a is None)  # one owner, one copy
-    assert flag_s is not None  # "sub_a" < "sub_s" → A1 owns the tie
+def test_owner_resubmit_passes_despite_intermediate_rejected_copy():
+    # Review finding 1 (griefing): C's rejected copy sits between the owner's
+    # original and the owner's designed waitlist resubmit — the resubmit must
+    # pass because the EARLIEST submitter is my own actor.
+    entries = [
+        ("O", 100.0, "sub_orig", "waitlisted"),
+        ("A1", 200.0, "sub_copy", "rejected"),
+    ]
+    owner, sweep = _eval(entries, sid="sub_resub", hotkey="O", ts=300.0)
+    assert owner is None
+    assert sweep == []  # the copy is already terminal — nothing to sweep
 
 
-def test_earliest_prior_copy_is_reported():
-    store = _Store([("S", 300.0, "sub_late"), ("S", 100.0, "sub_early")])
-    hit = find_prior_cross_actor_copy(
-        store, "fp1", submission_id="sub_copy", hotkey="A1", created_at=400.0,
-    )
-    assert hit == ("S", 100.0, "sub_early")
+def test_fleet_sibling_resubmit_passes_and_sweeps_foreign_copies():
+    entries = [
+        ("A1", 100.0, "sub_orig", "waitlisted"),        # my sibling coined it
+        ("B", 150.0, "sub_copy", "pending_selection"),  # foreign in-flight copy
+    ]
+    owner, sweep = _eval(entries, sid="sub_resub", hotkey="A2", ts=300.0)
+    assert owner is None
+    assert sweep == ["sub_copy"]
 
 
-def test_unknown_hotkeys_are_distinct_actors():
-    set_coldkey_provider(lambda: {})  # metagraph not synced yet
-    store = _Store([("other-hk", 100.0, "sub_orig")])
-    hit = find_prior_cross_actor_copy(
-        _Store([("other-hk", 100.0, "sub_orig")]), "fp1",
-        submission_id="sub_copy", hotkey="my-hk", created_at=200.0,
-    )
-    assert hit is not None  # per-hotkey fallback still rejects the copy
+def test_unmapped_owner_is_indeterminate_never_rejects():
+    # Review finding 2: the original hotkey deregistered (absent from the
+    # coldkey map). Attribution is indeterminate — stand down, don't reject.
+    entries = [("X", 100.0, "sub_orig", "waitlisted")]
+    owner, sweep = _eval(entries, sid="sub_mine", hotkey="A1", ts=200.0)
+    assert owner is None
+    assert sweep == []
+
+
+def test_unmapped_copier_is_never_swept():
+    entries = [("X", 200.0, "sub_maybe", "queued")]
+    owner, sweep = _eval(entries, sid="sub_orig", hotkey="O", ts=100.0)
+    assert owner is None
+    assert sweep == []
+
+
+def test_same_hotkey_is_same_actor_even_unmapped():
+    entries = [("X", 100.0, "sub_orig", "waitlisted")]
+    owner, sweep = _eval(entries, sid="sub_resub", hotkey="X", ts=200.0)
+    assert owner is None and sweep == []
+
+
+def test_race_escapee_is_swept_by_late_running_owner_check():
+    # Review finding 3: the later-created copy checked FIRST (owner's
+    # fingerprint not yet persisted) and escaped into stage 2. The owner's
+    # check runs last, sees the full picture, and sweeps it.
+    entries = [("B", 101.0, "sub_late", "screening_stage_2")]
+    owner, sweep = _eval(entries, sid="sub_early", hotkey="O", ts=100.0)
+    assert owner is None
+    assert sweep == ["sub_late"]
+
+
+def test_created_at_tie_breaks_on_submission_id():
+    rows = [("B", 100.0, "sub_a", "screening_stage_1")]
+    owner, _ = _eval(rows, sid="sub_z", hotkey="O", ts=100.0)
+    assert owner is not None  # "sub_a" < "sub_z" → B owns the tie
+    rows = [("B", 100.0, "sub_z", "screening_stage_1")]
+    owner, sweep = _eval(rows, sid="sub_a", hotkey="O", ts=100.0)
+    assert owner is None and sweep == ["sub_z"]  # I own it; escapee swept

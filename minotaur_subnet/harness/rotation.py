@@ -327,21 +327,25 @@ def apply_rotation_slate(
     """
     if slots <= 0:
         return {"applied": False, "reason": "rotation disabled (slots <= 0)"}
-    from minotaur_subnet.harness.actor import distinct_actor_count, get_actor_resolver
+    from minotaur_subnet.harness.actor import distinct_actor_count, snapshot_resolver
 
     subs = sub_store.list_by_round(round_id)
     candidates = [s for s in subs if _status_value(s) not in _TERMINAL_STATUSES]
-    actor_of = get_actor_resolver()
+    # None (kill-switch, or no coldkey data yet) => the legacy per-hotkey
+    # selection below, byte-identical to the pre-actor-keying rule.
+    actor_of = snapshot_resolver()
     selected, skipped = select_rotation_slate(
         candidates, slots, ledger.load(), round_id, actor_of=actor_of,
     )
-    n_actors = distinct_actor_count(
-        (getattr(s, "hotkey", "") or "" for s in candidates), actor_of,
-    )
-    logger.info(
-        "rotation %s: %d candidate(s) from %d actor(s) -> %d selected "
-        "(actor-keyed slate)", round_id, len(candidates), n_actors, len(selected),
-    )
+    if actor_of is not None:
+        n_actors = distinct_actor_count(
+            (getattr(s, "hotkey", "") or "" for s in candidates), actor_of,
+        )
+        logger.info(
+            "rotation %s: %d candidate(s) from %d actor(s) -> %d selected "
+            "(actor-keyed slate, map=%s)",
+            round_id, len(candidates), n_actors, len(selected), actor_of.source,
+        )
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
