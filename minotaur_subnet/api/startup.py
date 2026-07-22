@@ -2639,6 +2639,26 @@ async def initialize(ctx: ServerContext) -> dict:
                     from minotaur_subnet.api.routes import identity as identity_route
                     identity_route.set_metagraph_sync(ctx.solver_round_metagraph_sync)
 
+                    # Actor-keyed queue (harness/actor.py): rotation + build
+                    # budget collapse a coldkey's hotkeys to one scheduling
+                    # identity. Lazy provider over the sync state — empty
+                    # before the first sync (per-hotkey fallback), fresh after
+                    # every re-sync with no extra plumbing.
+                    from minotaur_subnet.harness import actor as actor_mod
+
+                    def _hotkey_coldkey_map() -> dict[str, str]:
+                        sync = ctx.solver_round_metagraph_sync
+                        state = getattr(sync, "state", None) if sync else None
+                        if state is None:
+                            return {}
+                        return {
+                            p.hotkey: p.coldkey
+                            for p in state.peers
+                            if getattr(p, "coldkey", "")
+                        }
+
+                    actor_mod.set_coldkey_provider(_hotkey_coldkey_map)
+
                     # Same metagraph_sync also powers the signed-miner gate
                     # on /orders/{id}/dry-run (PR for miner-signed access).
                     # Both setters point at the same instance — the gate

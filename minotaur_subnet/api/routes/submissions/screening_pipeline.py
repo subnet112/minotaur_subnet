@@ -32,6 +32,7 @@ MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
+    OUTCOME_COPYCAT_CODE,
     SubmissionStatus,
     offload_write,
 )
@@ -142,6 +143,56 @@ def _max_rounds_per_fingerprint() -> int:
         return int(raw)
     except ValueError:
         return 2
+
+
+def _reject_cross_actor_copies() -> bool:
+    """Cross-ACTOR identical-code reject (``SUBMISSIONS_REJECT_CROSS_ACTOR_FP``,
+    default on; 0 disables).
+
+    First submitter of a normalized fingerprint keeps it; any later submission
+    of the SAME fingerprint by a DIFFERENT actor (harness/actor.py — coldkey
+    when known) is rejected at stage 1, before it can cost a build unit or a
+    slate seat. Unlike the benched-rounds quota below this needs no benches to
+    arm, so five UIDs shipping one tree in one round lose four copies
+    immediately. Same-actor resubmits stay untouched — the waitlist resubmit
+    loop is the designed no-fault path, and rejecting it is the false-positive
+    trap the 2026-07-22 audit measured at 41.8% of serious-miner submissions.
+    Leader-local intake policy, like every cap here.
+    """
+    return os.environ.get(
+        "SUBMISSIONS_REJECT_CROSS_ACTOR_FP", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def find_prior_cross_actor_copy(
+    store: Any,
+    fingerprint: str,
+    *,
+    submission_id: str,
+    hotkey: str,
+    created_at: float,
+) -> tuple[str, float, str] | None:
+    """The earliest prior submission of ``fingerprint`` by a DIFFERENT actor,
+    or None when this submission is the fingerprint's rightful owner.
+
+    Precedence is (created_at, submission_id) — a total order, so two copies
+    racing through screening concurrently both compute the same single winner
+    regardless of which check runs first. Same-actor entries never match:
+    resubmitting your own code is the designed waitlist loop, not copying.
+    """
+    from minotaur_subnet.harness.actor import resolve_actor
+
+    my_actor = resolve_actor(hotkey or "")
+    my_order = (float(created_at or 0.0), submission_id)
+    best: tuple[str, float, str] | None = None
+    for hk, ts, sid in store.fingerprint_submitters(
+        fingerprint, exclude_submission_id=submission_id,
+    ):
+        if (ts, sid) >= my_order or resolve_actor(hk or "") == my_actor:
+            continue
+        if best is None or (ts, sid) < (best[1], best[2]):
+            best = (hk, ts, sid)
+    return best
 
 
 def _cleanup_temp_file(path: str | None) -> None:
@@ -969,6 +1020,39 @@ async def _run_screening_pipeline(submission_id: str) -> None:
 
         if not s1.passed:
             return  # set_screening_result already rejected
+
+        # Cross-ACTOR copy reject on the NORMALIZED identity: identical code
+        # belongs to whichever actor submitted it first; everyone else's copy
+        # is rejected here, pre-build. created_at (submission_id tie-break)
+        # decides precedence, so two copies racing through screening resolve
+        # deterministically to exactly one survivor.
+        if _reject_cross_actor_copies() and s1.content_fingerprint:
+            prior = find_prior_cross_actor_copy(
+                store, s1.content_fingerprint,
+                submission_id=submission_id,
+                hotkey=sub.hotkey or "",
+                created_at=float(sub.created_at or 0.0),
+            )
+            if prior is not None:
+                await offload_write(store.reject,
+                    submission_id,
+                    (
+                        f"identical code (normalized fingerprint "
+                        f"{s1.content_fingerprint[:12]}…) was first submitted by "
+                        f"another miner — a copy adds nothing to the corpus and "
+                        f"is not eligible for benchmarking. Comment, whitespace, "
+                        f"docstring and rename edits do not make code yours; "
+                        f"submit your own solver logic to participate."
+                    ),
+                    outcome_code=OUTCOME_COPYCAT_CODE,
+                )
+                logger.info(
+                    "Submission %s rejected as cross-actor copy: fp %s first "
+                    "submitted by %s (hotkey %s)",
+                    submission_id, s1.content_fingerprint[:12],
+                    prior[2], (prior[0] or "")[:12],
+                )
+                return
 
         # Cross-hotkey resubmit quota on the NORMALIZED identity. The
         # per-(hotkey, commit) cap keys on the git SHA — refreshed for free by
