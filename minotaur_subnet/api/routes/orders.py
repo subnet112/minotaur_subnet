@@ -11,6 +11,7 @@ GET  /v1/blockloop/status            → Block loop tick stats
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -151,8 +152,19 @@ def _maybe_prune_quotes(store: Any, current_opened_epoch: int) -> None:
 # (app_id, chain_id, intent_function, normalized params). The short TTL stands in
 # for the fork block — a fresh quote re-simulates once the pinned state drifts.
 _QUOTE_PLAN_CACHE_TTL = 12.0   # seconds (~1 Base block); bounds re-sim frequency
+# A degraded result (no plan / sim hiccup / sim-runner briefly unavailable) is
+# cached only briefly: long enough to absorb the retry storm a failing pair
+# would otherwise drive straight back into the (expensive, lock-serialized) sim,
+# short enough that a transient blip clears fast instead of pinning a zero quote.
+_QUOTE_PLAN_NEG_TTL = 3.0      # seconds; short TTL for degraded/zero results
 _QUOTE_PLAN_CACHE_MAX = 512    # hard cap on entries to keep memory bounded
 _QUOTE_PLAN_CACHE: dict[str, tuple[float, dict]] = {}
+# Single-flight registry: key → the in-flight asyncio.Task computing that key's
+# plan sim. Concurrent identical quotes await the SAME task instead of each
+# launching its own fork sim — the thundering herd that made N identical
+# concurrent quotes cost N sims serialized on the shared sim lock. A slot exists
+# only while a sim for that key is running (cleared by the task's done-callback).
+_QUOTE_PLAN_INFLIGHT: dict[str, "asyncio.Task"] = {}
 
 
 def _quote_plan_cache_key(
@@ -167,23 +179,85 @@ def _quote_plan_cache_key(
 
 
 def _quote_plan_cache_get(key: str) -> dict | None:
-    import time as _time
     entry = _QUOTE_PLAN_CACHE.get(key)
     if entry is None:
         return None
     ts, value = entry
-    if (_time.monotonic() - ts) > _QUOTE_PLAN_CACHE_TTL:
+    # Degraded entries (``_negative``) expire on the short TTL so a transient
+    # failure can't pin a zero quote for a full window.
+    ttl = _QUOTE_PLAN_NEG_TTL if value.get("_negative") else _QUOTE_PLAN_CACHE_TTL
+    if (time.monotonic() - ts) > ttl:
         _QUOTE_PLAN_CACHE.pop(key, None)
         return None
     return value
 
 
 def _quote_plan_cache_put(key: str, value: dict) -> None:
-    import time as _time
-    # Cheap eviction: drop everything if we blow the cap (bounded, no LRU book-keeping).
-    if len(_QUOTE_PLAN_CACHE) >= _QUOTE_PLAN_CACHE_MAX:
-        _QUOTE_PLAN_CACHE.clear()
-    _QUOTE_PLAN_CACHE[key] = (_time.monotonic(), value)
+    # Evict the OLDEST-inserted entry (dicts preserve insertion order), not the
+    # whole cache — a burst of distinct-param quotes must not wipe hot entries.
+    while len(_QUOTE_PLAN_CACHE) >= _QUOTE_PLAN_CACHE_MAX:
+        try:
+            _QUOTE_PLAN_CACHE.pop(next(iter(_QUOTE_PLAN_CACHE)))
+        except StopIteration:
+            break
+    _QUOTE_PLAN_CACHE[key] = (time.monotonic(), value)
+
+
+async def _quote_plan_get_or_compute(key: str, producer) -> dict | None:
+    """Single-flight the expensive plan sim for ``key``.
+
+    On a cache miss the FIRST caller launches ``producer`` (an async callable
+    that runs the sim, writes the result to the cache, and returns the result
+    dict WITHOUT raising); concurrent callers with the same key await that one
+    in-flight task instead of each running their own fork sim. Returns the
+    result dict, or None if the shared task failed unexpectedly.
+    """
+    cached = _quote_plan_cache_get(key)
+    if cached is not None:
+        return cached
+    task = _QUOTE_PLAN_INFLIGHT.get(key)
+    if task is None:
+        task = asyncio.ensure_future(producer())
+        _QUOTE_PLAN_INFLIGHT[key] = task
+        # Clear the registry slot when the sim finishes (success/failure/cancel)
+        # so a later quote for the same key can recompute once the TTL lapses.
+        task.add_done_callback(lambda t, k=key: _QUOTE_PLAN_INFLIGHT.pop(k, None))
+    try:
+        # shield: a waiter cancelled by its client disconnecting must not cancel
+        # the shared sim out from under the other waiters still awaiting it.
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+
+
+# Quote fork pin: chain_id → (monotonic_ts, block_number). The quote sim pins to
+# a recent block and REUSES it for a short window instead of re-forking to
+# upstream head on every call — a head re-fork busts the #498 fork-cache (which
+# only serves state keyed by explicit block) and re-downloads every touched slot
+# serially from the RPC, the bulk of a cold quote's latency. Refreshed lazily
+# once per window; the quote is indicative (valid_for_seconds=30) and the binding
+# fee is re-priced at signing, so a slightly-stale pool read is acceptable.
+# QUOTE-PATH ONLY — scoring/order-processing never pin, so their per-sim head
+# re-fork (and its determinism) is unchanged.
+_QUOTE_FORK_PIN_TTL = 20.0     # seconds a pinned quote block is reused
+_QUOTE_FORK_PIN: dict[int, tuple[float, int]] = {}
+
+
+def _quote_fork_pin_get(chain_id: int) -> int | None:
+    entry = _QUOTE_FORK_PIN.get(int(chain_id))
+    if entry is None:
+        return None
+    ts, block = entry
+    if (time.monotonic() - ts) > _QUOTE_FORK_PIN_TTL:
+        _QUOTE_FORK_PIN.pop(int(chain_id), None)
+        return None
+    return block
+
+
+def _quote_fork_pin_put(chain_id: int, block_number: int) -> None:
+    _QUOTE_FORK_PIN[int(chain_id)] = (time.monotonic(), int(block_number))
 
 
 def _quote_delivered_output(sim: Any, params: dict, deployed: str) -> int:
@@ -1506,20 +1580,23 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     # briefly keyed by (app_id, chain_id, intent_function, params). A sim failure
     # degrades to a structured zero quote (never a 500).
     _cache_key = _quote_plan_cache_key(app_id, req.chain_id, req.intent_function, req.params)
-    _cached = _quote_plan_cache_get(_cache_key)
-    try:
+    async def _produce_plan_result() -> dict:
+        """Run generate_plan + the scoreIntent sim and return the plan-result
+        dict {delivered, gas_units, route, metadata}. Writes the result to
+        _QUOTE_PLAN_CACHE (a short-TTL ``_negative`` entry when nothing could be
+        simulated) and NEVER raises. Runs at most once per cache key at a time
+        via _quote_plan_get_or_compute (single-flight)."""
         from minotaur_subnet.orderbook.orderbook import Order as _Order
-        _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
-        _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
-        _sim_runner = getattr(bl, "_simulation_runner", None)
-        _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
+        result: dict[str, Any] = {
+            "delivered": 0, "gas_units": 0, "route": "", "metadata": {},
+        }
+        negative = True  # flipped False once a real (sim / cross-chain) value lands
+        try:
+            _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
+            _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
+            _sim_runner = getattr(bl, "_simulation_runner", None)
+            _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
 
-        if _cached is not None:
-            quote_result.estimated_output = str(_cached.get("delivered", 0))
-            quote_result.route_summary = _cached.get("route", "") or ""
-            quote_result.metadata = dict(_cached.get("metadata", {}) or {})
-            _binding_gas_units = int(_cached.get("gas_units", 0) or 0)
-        else:
             _plan_state = IntentState(
                 contract_address=_deployed,
                 chain_id=req.chain_id,
@@ -1532,8 +1609,8 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
             _plan = await _plan_call if _inspect.isawaitable(_plan_call) else _plan_call
             if _plan is not None:
                 _pmeta = _plan.metadata or {}
-                quote_result.route_summary = str(_pmeta.get("route", "") or "")
-                quote_result.metadata = {
+                result["route"] = str(_pmeta.get("route", "") or "")
+                result["metadata"] = {
                     _k: _pmeta[_k]
                     for _k in ("route", "dex", "fee_tier", "pool", "data_source", "plan_type")
                     if _pmeta.get(_k) is not None
@@ -1549,7 +1626,8 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     )
                     if _xc_amt is not None:
                         try:
-                            quote_result.estimated_output = str(int(_xc_amt))
+                            result["delivered"] = int(_xc_amt)
+                            negative = False
                         except (ValueError, TypeError):
                             pass
                 elif _deployed and _has_sim:
@@ -1646,26 +1724,67 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     # bare-interaction path (0 delivered for most plans) even
                     # with a perfectly built intent_order. Mirrors
                     # order_processor.py's call shape.
+                    # Fork pin (quote-only): reuse a recent block across quotes
+                    # so the fork stays cache-warm instead of re-forking to head
+                    # on every call. A fresh pin → pin_only reuse (skips the
+                    # re-fork when the fork is already there); a cold window →
+                    # head re-fork now, then remember the block for the next
+                    # quotes in the window.
+                    _pin_block = _quote_fork_pin_get(req.chain_id)
                     _sim = await _sim_runner.simulate(
                         _plan, _prov_order,
                         _deployed if _intent_order else None,
                         _intent_order, False, _deployed,
+                        fork_block=_pin_block,
+                        pin_only=_pin_block is not None,
                     )
+                    if _pin_block is None:
+                        # Cold window: remember the block the fork just landed on
+                        # (best-effort; skip silently if the simulator can't report
+                        # it, e.g. a mock/fake runner).
+                        try:
+                            _blk = _sim_runner.simulator.current_fork_block(req.chain_id)
+                            if _blk:
+                                _quote_fork_pin_put(req.chain_id, _blk)
+                        except Exception:
+                            pass
                     _swap_gas = int(getattr(_sim, "gas_used", 0) or 0)
                     if _swap_gas > 0:
-                        _binding_gas_units = _swap_gas + fee_policy.framework_overhead_gas()
-                    _delivered = _quote_delivered_output(_sim, req.params, _deployed)
-                    quote_result.estimated_output = str(_delivered)
-                    _quote_plan_cache_put(_cache_key, {
-                        "delivered": _delivered,
-                        "gas_units": _binding_gas_units,
-                        "route": quote_result.route_summary,
-                        "metadata": quote_result.metadata,
-                    })
+                        result["gas_units"] = _swap_gas + fee_policy.framework_overhead_gas()
+                    result["delivered"] = _quote_delivered_output(_sim, req.params, _deployed)
+                    # A real sim ran — cache it at the normal TTL even when
+                    # delivered is 0 (that can be the honest "no liquidity" answer).
+                    negative = False
+        except Exception as exc:
+            # Never 500 on a sim hiccup — degrade to a structured zero quote.
+            logger.warning(
+                "Quote plan simulation failed for %s on chain %s: %s",
+                app_id, req.chain_id, exc,
+            )
+            negative = True
+        if negative:
+            # No value we can stand behind (no plan / not deployed / sim runner
+            # down / sim raised). Cache briefly so an identical retry doesn't
+            # immediately re-drive the sim, but clear fast in case it was transient.
+            result["_negative"] = True
+        _quote_plan_cache_put(_cache_key, result)
+        return result
+
+    try:
+        _cached = _quote_plan_cache_get(_cache_key)
+        if _cached is None:
+            # Single-flight: identical concurrent quotes share ONE in-flight sim
+            # instead of each running (and serializing on) their own fork sim.
+            _cached = await _quote_plan_get_or_compute(_cache_key, _produce_plan_result)
+        if _cached is not None:
+            quote_result.estimated_output = str(_cached.get("delivered", 0))
+            quote_result.route_summary = _cached.get("route", "") or ""
+            quote_result.metadata = dict(_cached.get("metadata", {}) or {})
+            _binding_gas_units = int(_cached.get("gas_units", 0) or 0)
     except Exception as exc:
-        # Never 500 on a sim hiccup — degrade to a structured zero quote.
+        # Never 500 on a resolution hiccup — degrade to a structured zero quote.
         logger.warning(
-            "Quote plan simulation failed for %s on chain %s: %s",
+            "Quote plan resolution failed for %s on chain %s: %s",
             app_id, req.chain_id, exc,
         )
         _binding_gas_units = 0
