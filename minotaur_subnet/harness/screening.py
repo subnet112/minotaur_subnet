@@ -111,6 +111,39 @@ MAX_REGION_NODES: int | None = 4200  # ARMED Stage-A backstop; None ⇒ observe-
 # deliberately not banned.
 _BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval"})
 
+# ── Banned in-tree imports (defence-in-depth PREVENT layer) ───────────────────
+#
+# A deterministic, in-bench-reproducible DEX-router solver has NO legitimate
+# in-tree use for raw network / subprocess / native-FFI / serialization-RCE
+# modules: chain RPC reaches it through the SDK's web3 (shipped in the base
+# image, NOT in-tree), and external HTTP at solve time does not reproduce at
+# bench (the exact mistake chain-killer's "putty" layer made — a nested
+# `import urllib.request` + urlopen). This is the egress-gadget class the
+# runtime containment (keyless proxy + internal net) already neutralises at
+# RUNTIME; the static ban is INSURANCE + intake-time observability, never the
+# primary barrier (it cannot see dynamic dispatch or a fund-drain built from
+# allowed libraries — those are covered by CONTAIN/VERIFY). Matched on the
+# TOP-LEVEL module so a nested `import urllib.request` is caught (ast.walk, not
+# tree.body); the full dotted name is recorded so submodule refinement
+# (urllib.request vs the benign urllib.parse) can precede arming.
+_BANNED_IMPORT_MODULES = frozenset({
+    # network / external I/O
+    "socket", "urllib", "http", "requests", "httpx", "aiohttp",
+    "smtplib", "ftplib", "telnetlib", "poplib", "imaplib",
+    # process / native / FFI escape surface
+    "subprocess", "ctypes", "cffi",
+    # deserialization RCE gadget the AST can't otherwise see
+    "marshal",
+})
+
+# Observe-only until soaked, mirroring the MAX_REGION_NODES rollout discipline:
+# while False, stage 1 LOGS what it would reject but never rejects (the PR ships
+# INERT). A follow-up flips it to True once the live fleet's import profile
+# confirms no legitimate solver trips it. A CODE constant (never env-read), so
+# the gate is fleet-uniform — the FLOOR_BPS/FLOOR_VERSION discipline.
+BANNED_IMPORTS_ARMED: bool = False
+BANNED_IMPORTS_VERSION = 1
+
 # Named scopes that START a new region: a nested def/class's *body* leaves its
 # parent region (its header still counts in the parent). Lambdas, comprehensions
 # and data literals deliberately do NOT appear here — their nodes count into the
@@ -286,6 +319,40 @@ def dynamic_code_calls(repo_path: str) -> list[str]:
     return sorted(hits)
 
 
+def banned_imports(repo_path: str) -> list[str]:
+    """Locations (``relpath:line module``) of disallowed in-tree imports.
+
+    Walks every in-tree ``*.py`` (``.git`` excluded, unparseable skipped — same
+    scope as :func:`dynamic_code_calls`) and flags any ``import``/``from`` whose
+    TOP-LEVEL module is in :data:`_BANNED_IMPORT_MODULES` (network / subprocess /
+    native-FFI / serialization). Uses ``ast.walk`` so a nested
+    ``import urllib.request`` inside a function is caught, not just module-level
+    imports — the exfil-gadget class hides exactly there. Relative imports
+    (``from . import x``) are in-tree and never flagged. The full dotted name is
+    recorded (e.g. ``urllib.request``) so the observe-only logs can drive
+    submodule refinement before the ban is armed. Sorted, deterministic.
+    """
+    root = Path(repo_path)
+    hits: list[str] = []
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            for name in names:
+                if name.split(".")[0] in _BANNED_IMPORT_MODULES:
+                    hits.append(f"{py.relative_to(root)}:{node.lineno} {name}")
+    return sorted(hits)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          STAGE 1: STATIC CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -456,6 +523,33 @@ def run_stage_1(repo_path: str) -> StageResult:
                     f"the biggest function/class/module body into named helpers"
                 ),
                 error_code="too_entangled",
+                max_region_nodes=factor_nodes,
+                **_dw_fields,
+            )
+
+    # Banned-import scan (defence-in-depth PREVENT layer; INDEPENDENT of the
+    # factor floor). Always evaluated + logged so the live fleet's import
+    # profile is observable; rejects only once BANNED_IMPORTS_ARMED flips, after
+    # a soak confirms no legitimate solver trips it. Persist-on-reject discipline:
+    # the metric/fingerprint fields ride along so a rejected sub still records them.
+    imp_hits = banned_imports(repo_path)
+    if imp_hits:
+        shown = ", ".join(imp_hits[:5]) + (", …" if len(imp_hits) > 5 else "")
+        logger.warning(
+            "[banned-imports] %d hit(s) v%d (%s): %s repo=%s",
+            len(imp_hits), BANNED_IMPORTS_VERSION,
+            "ARMED → reject" if BANNED_IMPORTS_ARMED else "observe-only, not gated",
+            shown, repo_path,
+        )
+        if BANNED_IMPORTS_ARMED:
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    "Disallowed import(s) — a deterministic solver has no in-tree "
+                    f"use for network/subprocess/native/serialization modules: {shown}"
+                ),
+                error_code="banned_import",
                 max_region_nodes=factor_nodes,
                 **_dw_fields,
             )

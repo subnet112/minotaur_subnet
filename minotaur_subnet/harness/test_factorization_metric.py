@@ -236,3 +236,80 @@ def test_floor_armed_rejects_dynamic_code_first(tmp_path, monkeypatch):
     assert res.passed is False
     assert res.error_code == "dynamic_code"
     assert "solver.py:1" in res.details
+
+
+# ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
+
+from minotaur_subnet.harness.screening import banned_imports
+
+
+def test_banned_imports_catches_nested_urllib_gadget(tmp_path):
+    # The chain-killer "putty" class: `import urllib.request` NESTED in a function
+    # (invisible to a tree.body-only scan). ast.walk must catch it.
+    (tmp_path / "a.py").write_text(
+        "import json\n"
+        "def _quote():\n"
+        "    import urllib.request as u\n"
+        "    return u\n"
+    )
+    hits = banned_imports(str(tmp_path))
+    assert hits == ["a.py:3 urllib.request"]
+
+
+def test_banned_imports_flags_from_and_socket(tmp_path):
+    (tmp_path / "b.py").write_text(
+        "import socket\n"
+        "from http.client import HTTPConnection\n"
+    )
+    mods = {h.split()[1] for h in banned_imports(str(tmp_path))}
+    assert mods == {"socket", "http.client"}
+
+
+def test_banned_imports_ignores_relative_and_legit(tmp_path):
+    # Relative imports are in-tree; web3/eth_abi/json/os are legitimate.
+    (tmp_path / "c.py").write_text(
+        "from . import helper\n"
+        "from .strategies import router\n"
+        "import json, os\n"
+        "from eth_abi import encode\n"
+        "from minotaur_subnet.sdk import intent_solver\n"
+    )
+    assert banned_imports(str(tmp_path)) == []
+
+
+def test_banned_imports_skips_unparseable(tmp_path):
+    (tmp_path / "ok.py").write_text("import socket\n")
+    (tmp_path / "broken.py").write_text("def (:\n")  # SyntaxError — skipped
+    assert banned_imports(str(tmp_path)) == ["ok.py:1 socket"]
+
+
+def test_banned_imports_observe_only_by_default(tmp_path, monkeypatch):
+    # Ships INERT: a banned import is LOGGED but does NOT reject while unarmed.
+    assert _screening.BANNED_IMPORTS_ARMED is False  # default
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)  # keep factor happy
+    repo = _valid_repo(tmp_path, "import socket\ndef f():\n    return 1\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is True  # observe-only → not gated
+
+
+def test_banned_imports_armed_rejects(tmp_path, monkeypatch):
+    monkeypatch.setattr(_screening, "BANNED_IMPORTS_ARMED", True)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
+    repo = _valid_repo(tmp_path, "import socket\ndef f():\n    return 1\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "banned_import"
+    assert "socket" in res.details
+    # persist-on-reject: metrics still ride the StageResult.
+    assert isinstance(res.max_region_nodes, int)
+
+
+def test_banned_imports_armed_passes_clean_solver(tmp_path, monkeypatch):
+    monkeypatch.setattr(_screening, "BANNED_IMPORTS_ARMED", True)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
+    repo = _valid_repo(
+        tmp_path,
+        "import json, os\nfrom eth_abi import encode\ndef f():\n    return encode\n",
+    )
+    res = run_stage_1(str(repo))
+    assert res.passed is True
