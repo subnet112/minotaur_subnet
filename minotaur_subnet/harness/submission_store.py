@@ -160,6 +160,18 @@ BENCHED_STATUSES = frozenset({
     SubmissionStatus.ADOPTED,
 })
 
+# Terminal-for-round states in which the private-repo token has ALREADY been
+# purged (reject/waitlist/adopt all purge). A late benchmark result must never
+# flip one of these back to SCORED — doing so mints a token-less finalist that
+# certifies on-chain and then dies at relayer-finalize "no token — FAIL-CLOSED"
+# (see set_benchmark_result's NO-RESURRECTION guard; live incidents 2026-07-02,
+# 2026-07-07, 2026-07-22). REJECTED alone used to be checked; rotation moving
+# overflow to WAITLISTED (#620) reopened the hole for the WAITLISTED door.
+_NO_RESURRECTION_STATUSES = frozenset({
+    SubmissionStatus.REJECTED,
+    SubmissionStatus.WAITLISTED,
+})
+
 
 # Cap how many submissions keep their (heavy — ~40-70KB each) benchmark_details
 # in the persisted store. Terminal submissions beyond the N most-recent (by
@@ -1246,18 +1258,24 @@ class SubmissionStore:
         verdict. The display rank is written via :meth:`set_benchmark_rank` in a
         separate pass, so there is no longer a "don't clobber a real score" guard.
 
-        NO RESURRECTION: a terminally REJECTED submission is never flipped back
-        to SCORED, no matter what a late benchmark result says. Rotation rejects
-        the slate overflow at round close "regardless of benchmark progress" and
-        PURGES the private-repo token (irreversibly — memory AND encrypted
-        sidecar), but an in-flight bench finishing after that, or a restart
-        re-benching an orphaned round, used to resurrect the submission here.
-        The resurrected record then ranked (and under the tie-break ladder
-        frequently WON) as finalist, certified, and died at relayer-finalize
-        "no token — FAIL-CLOSED", aborting the round (observed live 2026-07-07:
-        5 consecutive merge_failed rounds). Bench details are still recorded so
-        the miner's report shows how they scored; the terminal status and its
-        reason are immutable.
+        NO RESURRECTION: a submission that is already terminal-for-round with
+        its token purged (REJECTED or WAITLISTED — see
+        ``_NO_RESURRECTION_STATUSES``) is never flipped back to SCORED, no
+        matter what a late benchmark result says. Rotation parks the slate
+        overflow at round close "regardless of benchmark progress" — as
+        WAITLISTED since #620, REJECTED before it — and PURGES the private-repo
+        token (irreversibly, memory AND encrypted sidecar). An in-flight bench
+        finishing after that, or a restart re-benching an orphaned round, used
+        to resurrect the submission here; the resurrected record then ranked
+        (and under the tie-break ladder frequently WON) as finalist, certified
+        on-chain, and died at relayer-finalize "no token — FAIL-CLOSED",
+        refusing the adoption (live incidents 2026-07-02, 2026-07-07 with 5
+        consecutive merge_failed rounds, and 2026-07-22 sub_a91b87fdd63e: the
+        guard covered only REJECTED, so a WAITLISTED-then-re-benched sub slipped
+        through). A waitlisted sub was also NOT on this round's slate, so
+        resurrecting it to finalist-eligible SCORED is a fairness break on top
+        of the token loss. Bench details are still recorded so the miner's
+        report shows how they scored; the terminal status is immutable.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
@@ -1269,11 +1287,13 @@ class SubmissionStore:
         if details is not None:
             sub.benchmark_details = details
 
-        if sub.status == SubmissionStatus.REJECTED:
+        if sub.status in _NO_RESURRECTION_STATUSES:
             logger.info(
-                "set_benchmark_result: %s is terminally REJECTED (%s) — "
-                "recording bench details but NOT resurrecting to SCORED",
-                submission_id, (sub.rejection_reason or "?")[:80],
+                "set_benchmark_result: %s is terminal-for-round (%s, token "
+                "purged) — recording bench details but NOT resurrecting to "
+                "SCORED",
+                submission_id,
+                getattr(sub.status, "value", sub.status),
             )
             sub.updated_at = time.time()
             self._persist_records([sub])
