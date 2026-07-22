@@ -2639,6 +2639,36 @@ async def initialize(ctx: ServerContext) -> dict:
                     from minotaur_subnet.api.routes import identity as identity_route
                     identity_route.set_metagraph_sync(ctx.solver_round_metagraph_sync)
 
+                    # Actor-keyed queue (harness/actor.py): rotation + build
+                    # budget collapse a coldkey's hotkeys to one scheduling
+                    # identity. Lazy provider over the sync state — empty
+                    # before the first sync (per-hotkey fallback), fresh after
+                    # every re-sync with no extra plumbing.
+                    from minotaur_subnet.harness import actor as actor_mod
+
+                    # Rebuild the dict only when a NEW metagraph snapshot
+                    # lands (keyed on the frozen state's block/timestamp) —
+                    # resolvers snapshot per pass, but passes happen every
+                    # round and the peers list is ~256 entries.
+                    _actor_map_cache: dict[str, Any] = {"key": None, "map": {}}
+
+                    def _hotkey_coldkey_map() -> dict[str, str]:
+                        sync = ctx.solver_round_metagraph_sync
+                        state = getattr(sync, "state", None) if sync else None
+                        if state is None:
+                            return {}
+                        key = (state.block, state.timestamp)
+                        if _actor_map_cache["key"] != key:
+                            _actor_map_cache["map"] = {
+                                p.hotkey: p.coldkey
+                                for p in state.peers
+                                if getattr(p, "coldkey", "")
+                            }
+                            _actor_map_cache["key"] = key
+                        return _actor_map_cache["map"]
+
+                    actor_mod.set_coldkey_provider(_hotkey_coldkey_map)
+
                     # Same metagraph_sync also powers the signed-miner gate
                     # on /orders/{id}/dry-run (PR for miner-signed access).
                     # Both setters point at the same instance — the gate

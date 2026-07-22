@@ -255,6 +255,10 @@ class PeerInfo:
     stake: float  # TAO
     evm_address: str  # keccak256(hotkey_bytes)[-20:]
     axon_url: str = ""  # http://ip:port from axon_info
+    # Owning coldkey SS58 ("" when the metagraph didn't expose it). Feeds the
+    # actor-keyed submission queue (harness/actor.py): hotkeys sharing a
+    # coldkey are one scheduling identity.
+    coldkey: str = ""
 
 
 @dataclass(frozen=True)
@@ -455,9 +459,15 @@ class MetagraphSync:
         peers: list[PeerInfo] = []
         my_uid: int | None = None
 
+        # Coldkeys feed the actor-keyed queue (harness/actor.py). Read
+        # defensively: absent/short attribute degrades to "" (per-hotkey
+        # identity) rather than failing the whole sync.
+        coldkeys = getattr(metagraph, "coldkeys", None) or []
+
         for uid in range(metagraph.n.item()):
             hotkey = metagraph.hotkeys[uid]
             stake = float(metagraph.S[uid].item())
+            coldkey = str(coldkeys[uid]) if uid < len(coldkeys) else ""
 
             # Derive EVM address from hotkey
             evm_address = _hotkey_to_evm(hotkey)
@@ -475,6 +485,7 @@ class MetagraphSync:
                 stake=stake,
                 evm_address=evm_address,
                 axon_url=axon_url,
+                coldkey=coldkey,
             )
             peers.append(peer)
 
