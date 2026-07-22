@@ -57,36 +57,42 @@ def test_live_config_resolves_keyless_and_metered(monkeypatch):
     """Enabled + URL present => a keyless, budget-enforced config; the URLs the
     solver dials carry NO API key (they point at the proxy)."""
     monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
-    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.31.0.5:8645")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
     monkeypatch.setenv("SOLVER_READ_PROXY_CONTROL", "http://minotaur-rpc-pin-proxy:8645")
     monkeypatch.setenv("SOLVER_READ_PROXY_TOKEN", "tok")
     monkeypatch.delenv("LIVE_SOLVER_RPC_BUDGET", raising=False)
     cfg = srp.live_read_proxy_config()
     assert cfg is not None
-    assert cfg.url == "http://172.31.0.5:8645"
+    assert cfg.url == "http://172.30.1.5:8645"
     assert cfg.control_url == "http://minotaur-rpc-pin-proxy:8645"
     assert cfg.token == "tok"
     assert cfg.budget == srp.DEFAULT_LIVE_RPC_BUDGET > 0
-    url = srp.proxy_rpc_url(cfg, srp.LIVE_PROXY_SESSION_ID, 8453)
-    assert url == "http://172.31.0.5:8645/rpc/live-champion/base"
+    sid = srp.new_live_session_id()
+    assert sid.startswith(f"{srp.LIVE_PROXY_SESSION_PREFIX}-")
+    assert sid != srp.new_live_session_id()  # unique per runtime, never a fixed name
+    url = srp.proxy_rpc_url(cfg, sid, 8453)
+    assert url == f"http://172.30.1.5:8645/rpc/{sid}/base"
     assert "alchemy" not in url and "key" not in url  # keyless
 
 
 def test_live_config_budget_override(monkeypatch):
     monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
-    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.31.0.5:8645")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
     monkeypatch.setenv("LIVE_SOLVER_RPC_BUDGET", "12345")
     assert srp.live_read_proxy_config().budget == 12345
 
 
 def test_live_config_negative_budget_falls_back(monkeypatch):
     monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
-    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.31.0.5:8645")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
     monkeypatch.setenv("LIVE_SOLVER_RPC_BUDGET", "-5")
     assert srp.live_read_proxy_config().budget == srp.DEFAULT_LIVE_RPC_BUDGET
 
 
 # ── DockerRuntimeSolver: per-order metering + session lifecycle ─────────────
+
+
+_SID = "live-testsess1"  # a per-runtime id as create() would mint
 
 
 def _rt(*, live_cfg=None, session=None) -> DockerRuntimeSolver:
@@ -100,9 +106,9 @@ def _rt(*, live_cfg=None, session=None) -> DockerRuntimeSolver:
         image_ref="ghcr.io/test/solver:latest",
         metadata=SolverMetadata(name="t", version="0", author="t", description=""),
         chain_ids=[8453],
-        rpc_urls={8453: "http://172.31.0.5:8645/rpc/live-champion/base"},
+        rpc_urls={8453: f"http://172.30.1.5:8645/rpc/{_SID}/base"},
         live_proxy_cfg=live_cfg,
-        live_proxy_session_id=(srp.LIVE_PROXY_SESSION_ID if live_cfg else None),
+        live_proxy_session_id=(_SID if live_cfg else None),
     )
 
 
@@ -118,11 +124,38 @@ async def test_per_order_reset_when_proxy_on():
     cfg = MagicMock()
     rt = _rt(live_cfg=cfg)
     intent, state, snap = _intent_state_snapshot()
-    with patch.object(srp, "reset_session", new=AsyncMock()) as reset:
+    with patch.object(srp, "reset_session", new=AsyncMock(return_value=True)) as reset:
         await rt.generate_plan(intent, state, snap)
         await rt.quote(intent, state, snap)
     assert reset.await_count == 2  # one per order op
-    reset.assert_awaited_with(cfg, srp.LIVE_PROXY_SESSION_ID)
+    reset.assert_awaited_with(cfg, _SID)
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_reopens_session():
+    """A failed reset means the session may be GONE (proxy restart dropped its
+    in-memory registry → reads silently fall to the anon UNMETERED bucket). The
+    runtime must re-open the session (blocks={}, head reads) to restore
+    enforcement rather than stay degraded until the next api restart."""
+    cfg = MagicMock()
+    rt = _rt(live_cfg=cfg)
+    intent, state, snap = _intent_state_snapshot()
+    with patch.object(srp, "reset_session", new=AsyncMock(return_value=False)), \
+         patch.object(srp, "open_session", new=AsyncMock()) as reopen:
+        await rt.generate_plan(intent, state, snap)
+    reopen.assert_awaited_once_with(cfg, _SID, {})
+
+
+@pytest.mark.asyncio
+async def test_failed_reset_and_reopen_never_fail_the_order():
+    """Metering is best-effort: even reset AND re-open both failing must not
+    block the order itself."""
+    cfg = MagicMock()
+    rt = _rt(live_cfg=cfg)
+    intent, state, snap = _intent_state_snapshot()
+    with patch.object(srp, "reset_session", new=AsyncMock(return_value=False)), \
+         patch.object(srp, "open_session", new=AsyncMock(side_effect=OSError("proxy down"))):
+        assert await rt.generate_plan(intent, state, snap) == "p"
 
 
 @pytest.mark.asyncio
@@ -141,7 +174,7 @@ async def test_shutdown_closes_session_when_proxy_on():
     rt = _rt(live_cfg=cfg)
     with patch.object(srp, "close_session", new=AsyncMock()) as close:
         await rt.shutdown()
-    close.assert_awaited_once_with(cfg, srp.LIVE_PROXY_SESSION_ID)
+    close.assert_awaited_once_with(cfg, _SID)
 
 
 @pytest.mark.asyncio
@@ -160,7 +193,7 @@ async def test_create_wires_keyless_proxy(monkeypatch):
     """With the feature on, create() opens a HEAD (blocks={}) session and forwards
     KEYLESS proxy URLs to the container (rpc_overrides), never the keyed URL."""
     monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
-    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.31.0.5:8645")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
     monkeypatch.setenv("SOLVER_READ_PROXY_TOKEN", "tok")
     monkeypatch.setenv("LIVE_SOLVER_NETWORK", "live-solver")
 
@@ -186,18 +219,84 @@ async def test_create_wires_keyless_proxy(monkeypatch):
             rpc_urls={8453: "https://base-mainnet.g.alchemy.com/v2/SECRETKEY"},
         )
 
-    # HEAD session opened with an empty pin (latest reads), metered.
+    # HEAD session opened with an empty pin (latest reads), metered, on a
+    # freshly-minted per-runtime id.
     cfg, sid, blocks = captured["open"]
-    assert blocks == {} and sid == srp.LIVE_PROXY_SESSION_ID and cfg.budget > 0
+    assert blocks == {} and cfg.budget > 0
+    assert sid.startswith(f"{srp.LIVE_PROXY_SESSION_PREFIX}-")
+    assert rt._live_proxy_session_id == sid
     # start_docker got KEYLESS proxy URLs as rpc_overrides — the SECRETKEY never
     # reaches the container via env.
     kwargs = start.await_args.kwargs
-    assert kwargs["rpc_overrides"] == {8453: "http://172.31.0.5:8645/rpc/live-champion/base"}
+    assert kwargs["rpc_overrides"] == {8453: f"http://172.30.1.5:8645/rpc/{sid}/base"}
     assert "SECRETKEY" not in str(kwargs["rpc_overrides"])
     # init_cfg rpc_urls were rewritten to the keyless proxy URL too.
     init_cfg = fake_session.initialize.await_args.args[0]
-    assert init_cfg["rpc_urls"][8453] == "http://172.31.0.5:8645/rpc/live-champion/base"
+    assert init_cfg["rpc_urls"][8453] == f"http://172.30.1.5:8645/rpc/{sid}/base"
     assert rt._live_proxy_cfg is not None
+
+
+@pytest.mark.asyncio
+async def test_create_session_ids_unique_per_runtime(monkeypatch):
+    """Two runtimes never share a session id: during a hot-swap the displaced
+    champion's shutdown() close_session must not close the session its successor
+    just opened (which would silently un-meter the new champion)."""
+    monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
+
+    def _fake_session():
+        s = MagicMock()
+        s.initialize = AsyncMock()
+        s.shutdown = AsyncMock()
+        s.metadata = AsyncMock(
+            return_value=SolverMetadata(name="c", version="1", author="a", description="")
+        )
+        return s
+
+    with patch.object(orch.SolverOrchestrator, "start_docker",
+                      new=AsyncMock(side_effect=[_fake_session(), _fake_session()])), \
+         patch.object(srp, "open_session", new=AsyncMock(return_value={})), \
+         patch("minotaur_subnet.harness.runtime_solver._reap_orphan_live_solvers", lambda: None):
+        rt_old = await DockerRuntimeSolver.create(
+            image_ref="ghcr.io/test/solver:old", chain_ids=[8453], rpc_urls={8453: "https://x/KEY"},
+        )
+        rt_new = await DockerRuntimeSolver.create(
+            image_ref="ghcr.io/test/solver:new", chain_ids=[8453], rpc_urls={8453: "https://x/KEY"},
+        )
+    assert rt_old._live_proxy_session_id != rt_new._live_proxy_session_id
+
+    # The displaced runtime's shutdown closes ITS OWN session only.
+    with patch.object(srp, "close_session", new=AsyncMock()) as close:
+        await rt_old.shutdown()
+    close.assert_awaited_once_with(rt_old._live_proxy_cfg, rt_old._live_proxy_session_id)
+
+
+@pytest.mark.asyncio
+async def test_create_keeps_local_chains_off_the_proxy(monkeypatch):
+    """31337 (local Anvil) shares the 'eth' proxy slug — routing it through the
+    proxy would repoint the champion's LOCAL chain at Ethereum mainnet. Local
+    chains keep their direct RPC URL; only real chains are proxied."""
+    monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
+
+    fake_session = MagicMock()
+    fake_session.initialize = AsyncMock()
+    fake_session.metadata = AsyncMock(
+        return_value=SolverMetadata(name="c", version="1", author="a", description="")
+    )
+    start = AsyncMock(return_value=fake_session)
+    with patch.object(orch.SolverOrchestrator, "start_docker", new=start), \
+         patch.object(srp, "open_session", new=AsyncMock(return_value={})), \
+         patch("minotaur_subnet.harness.runtime_solver._reap_orphan_live_solvers", lambda: None):
+        await DockerRuntimeSolver.create(
+            image_ref="ghcr.io/test/solver:latest",
+            chain_ids=[8453, 31337],
+            rpc_urls={8453: "https://x/KEY", 31337: "http://anvil:8545"},
+        )
+    overrides = start.await_args.kwargs["rpc_overrides"]
+    assert set(overrides) == {8453}  # 31337 NOT proxied
+    init_cfg = fake_session.initialize.await_args.args[0]
+    assert init_cfg["rpc_urls"][31337] == "http://anvil:8545"  # untouched
 
 
 @pytest.mark.asyncio

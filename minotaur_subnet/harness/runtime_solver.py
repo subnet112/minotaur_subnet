@@ -21,6 +21,7 @@ import subprocess
 import time
 from typing import Any
 
+from minotaur_subnet.chains import registry
 from minotaur_subnet.harness import solver_read_proxy as _srp
 from minotaur_subnet.harness.orchestrator import (
     SolverCrashedError,
@@ -246,7 +247,10 @@ class DockerRuntimeSolver:
         live_session_id: str | None = None
         rpc_overrides: dict[int, str] | None = None
         if live_cfg is not None:
-            live_session_id = _srp.LIVE_PROXY_SESSION_ID
+            # Unique per runtime: a shared id would let the displaced champion's
+            # shutdown() close the session its successor just opened (hot-swap
+            # overlaps the two runtimes) — see new_live_session_id.
+            live_session_id = _srp.new_live_session_id()
             try:
                 # blocks={} => byte-transparent HEAD reads (a live champion needs
                 # latest state, not a pinned fork); budget>0 => enforce, giving the
@@ -256,6 +260,10 @@ class DockerRuntimeSolver:
                     cid: _srp.proxy_rpc_url(live_cfg, live_session_id, cid)
                     for cid in chain_ids
                     if cid in _srp.CHAIN_NAMES
+                    # 31337 shares the "eth" proxy slug — routing it through the
+                    # proxy would silently repoint the champion's LOCAL anvil
+                    # chain at Ethereum mainnet. Local chains keep direct RPC.
+                    and not ((_s := registry.spec(cid)) is not None and _s.is_local)
                 }
                 if proxy_rpc:
                     rpc_urls = {**rpc_urls, **proxy_rpc}  # init_cfg: keyless URLs
@@ -469,7 +477,28 @@ class DockerRuntimeSolver:
             # order's budget. Best-effort — a failed reset only makes the next cap
             # stricter (carried-over spend), never silently looser.
             if self._live_proxy_cfg is not None:
-                await _srp.reset_session(self._live_proxy_cfg, self._live_proxy_session_id)
+                ok = await _srp.reset_session(
+                    self._live_proxy_cfg, self._live_proxy_session_id
+                )
+                if not ok:
+                    # The session may be GONE, not just unreachable: a proxy
+                    # container restart drops its in-memory registry, after which
+                    # reads fall to the proxy's anon observe bucket — still
+                    # keyless, but UNMETERED. Re-open (open-or-replace, same
+                    # blocks={} head semantics) to restore enforcement.
+                    try:
+                        await _srp.open_session(
+                            self._live_proxy_cfg, self._live_proxy_session_id, {}
+                        )
+                        logger.info(
+                            "Live RPC proxy session %s re-opened after failed reset",
+                            self._live_proxy_session_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - metering is best-effort
+                        logger.warning(
+                            "Live RPC proxy session %s re-open failed: %s",
+                            self._live_proxy_session_id, exc,
+                        )
             try:
                 return await coro_factory()
             except (SolverCrashedError, SolverTimeoutError) as exc:

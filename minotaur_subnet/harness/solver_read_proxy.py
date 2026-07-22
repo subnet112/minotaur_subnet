@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import urllib.request
+import uuid
 from dataclasses import dataclass
 
 from minotaur_subnet.chains import registry
@@ -146,9 +147,18 @@ def read_proxy_config() -> ReadProxyConfig | None:
 # the benchmark constant — legit routing always fits; only a runaway loop is cut.
 DEFAULT_LIVE_RPC_BUDGET = DEFAULT_GENERATE_PLAN_BUDGET
 
-# Fixed proxy session id for the (single, long-lived) live champion. Distinct
-# from the benchmark path's per-run ids so the two never collide on one proxy.
-LIVE_PROXY_SESSION_ID = "live-champion"
+# Live proxy session ids are UNIQUE PER RUNTIME (``live-<hex>``), never a fixed
+# name: during a hot-swap the new champion's create() overlaps the displaced
+# champion's shutdown(), and with a shared id the outgoing close_session() would
+# close the session the successor just opened — silently un-metering it (the
+# proxy forwards unknown sessions via its anon observe bucket). The ``live-``
+# prefix keeps them distinct from the benchmark path's per-run ids.
+LIVE_PROXY_SESSION_PREFIX = "live"
+
+
+def new_live_session_id() -> str:
+    """A fresh proxy session id for ONE live-champion runtime instance."""
+    return f"{LIVE_PROXY_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
 
 # Name of the dedicated ``--internal`` net the live champion + proxy share when
 # the feature is on. Both read_proxy_manager (which creates it + attaches the
@@ -291,8 +301,8 @@ async def open_session(cfg: ReadProxyConfig, session_id: str, blocks: dict[str, 
     return await asyncio.to_thread(_control_post, cfg, "/control/open", body)
 
 
-async def reset_session(cfg: ReadProxyConfig, session_id: str) -> None:
-    """Reset a session's spent budget to 0 (best-effort).
+async def reset_session(cfg: ReadProxyConfig, session_id: str) -> bool:
+    """Reset a session's spent budget to 0 (best-effort); ``True`` on success.
 
     Called before each ``generate_plan`` so every scenario starts with a fresh
     budget ``B`` — making the budget a PER-SCENARIO cutoff that mirrors the
@@ -300,14 +310,18 @@ async def reset_session(cfg: ReadProxyConfig, session_id: str) -> None:
     (``/control/reset`` only zeros spent + clears exhausted when no ``blocks``
     key is sent). A failed reset is logged and swallowed: it must not crash the
     benchmark (worst case the next scenario continues with carried-over spend,
-    which only makes the cutoff stricter, never silently looser).
+    which only makes the cutoff stricter, never silently looser). The return
+    value lets the LIVE path distinguish "session gone" (e.g. the proxy
+    container restarted and dropped its in-memory registry) and re-open it.
     """
     try:
         await asyncio.to_thread(
             _control_post, cfg, "/control/reset", {"session_id": session_id}
         )
+        return True
     except Exception as exc:  # noqa: BLE001 - a failed reset must not abort the run
         logger.warning("read-proxy reset failed for session=%s: %s", session_id, exc)
+        return False
 
 
 async def close_session(cfg: ReadProxyConfig, session_id: str) -> None:
