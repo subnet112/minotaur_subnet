@@ -313,3 +313,26 @@ def test_banned_imports_armed_passes_clean_solver(tmp_path, monkeypatch):
     )
     res = run_stage_1(str(repo))
     assert res.passed is True
+
+
+# ── Stage-2 exec container hardening (import/init run untrusted code) ──────────
+
+from minotaur_subnet.harness.screening import _solver_exec_command
+
+
+def test_solver_exec_command_is_hardened():
+    """The import/init containers — the FIRST place solver code executes — must
+    carry the same containment as the benchmark/live runs (orchestrator's
+    DOCKER_SECURITY_OPTS): cap-drop, no-new-privileges, pids-limit, plus the
+    pre-existing network/fs/mem/cpu caps."""
+    cmd = _solver_exec_command("solver-img:screening", "print('x')")
+    joined = " ".join(cmd)
+    for flag in (
+        "--network=none", "--read-only",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--pids-limit=256",
+        "--memory=2g", "--cpus=1.0",
+    ):
+        assert flag in cmd, f"missing hardening flag: {flag}"
+    # runs the passed script under an explicit python entrypoint on the image
+    assert cmd[-3:] == ["solver-img:screening", "-c", "print('x')"]
+    assert "--entrypoint" in cmd and "python" in cmd
