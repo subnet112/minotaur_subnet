@@ -348,3 +348,66 @@ def test_resolve_self_uses_real_container_id(monkeypatch, tmp_path):
     image, net = asyncio.run(rpm._resolve_self_image_and_net())
     assert image == "sha256:img" and net == "production_minotaur"
     assert fake.calls[0][1] == real_id  # inspect <real id>, not gethostname()
+
+
+# ── live-solver net: derived proxy IP + retry-path attach ───────────────────
+
+
+def test_live_proxy_ip_derived_from_subnet(monkeypatch):
+    """The proxy's live-net IP is subnet base+5, so overriding ONLY the subnet
+    keeps the pair consistent; SOLVER_LIVE_RPC_PROXY_IP pins it explicitly."""
+    monkeypatch.delenv("SOLVER_LIVE_RPC_PROXY_IP", raising=False)
+    assert rpm._live_proxy_ip("172.30.1.0/24") == "172.30.1.5"
+    assert rpm._live_proxy_ip("10.99.7.0/24") == "10.99.7.5"
+    assert rpm._live_proxy_ip("not-a-subnet") == "172.30.1.5"  # fail-safe default
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY_IP", "10.0.0.9")
+    assert rpm._live_proxy_ip("172.30.1.0/24") == "10.0.0.9"
+
+
+def test_default_live_subnet_avoids_aws_default_vpc():
+    """172.31.0.0/16 is the AWS default-VPC CIDR (VPC DNS resolver at
+    172.31.0.2) — an explicitly-subnetted docker bridge overlapping it
+    blackholes host DNS / intra-VPC traffic on default-VPC EC2 hosts."""
+    import ipaddress
+    assert not ipaddress.ip_network(rpm.LIVE_SOLVER_NETWORK_SUBNET).overlaps(
+        ipaddress.ip_network("172.31.0.0/16")
+    )
+
+
+def test_maybe_attach_live_net_gated_on_flag(monkeypatch):
+    called = []
+
+    async def _fake_attach():
+        called.append(1)
+
+    monkeypatch.setattr(rpm, "_attach_proxy_to_live_net", _fake_attach)
+    monkeypatch.delenv("LIVE_SOLVER_RPC_VIA_PROXY", raising=False)
+    asyncio.run(rpm._maybe_attach_live_net())
+    assert called == []  # feature off => never touches docker
+    monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
+    asyncio.run(rpm._maybe_attach_live_net())
+    assert called == [1]
+
+
+def test_ensure_retry_recovery_attaches_live_net(monkeypatch):
+    """A degraded first ensure must not strand the live-net attach until the
+    next restart: the background retry loop attaches on recovery too."""
+    attached = []
+
+    async def _fake_ensure():
+        return True, False  # recovered on the first retry
+
+    async def _fake_attach():
+        attached.append(1)
+
+    monkeypatch.setattr(rpm, "_ENSURE_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(rpm, "_ensure_impl", _fake_ensure)
+    monkeypatch.setattr(rpm, "_maybe_attach_live_net", _fake_attach)
+
+    async def _run():
+        rpm._ensure_retry_task = None
+        rpm._schedule_ensure_retry()
+        await rpm._ensure_retry_task
+
+    asyncio.run(_run())
+    assert attached == [1]
