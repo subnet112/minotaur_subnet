@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 
+from minotaur_subnet.api import quote_node
 from minotaur_subnet.api.server_context import ServerContext
 from minotaur_subnet.epoch import SolverRoundEpochClock
 
@@ -2148,8 +2149,13 @@ async def initialize(ctx: ServerContext) -> dict:
         # this was gated by `ctx.benchmark_worker is not None`, which
         # caused peers with ENABLE_BENCHMARK_WORKER=0 to respond with
         # 503 "Champion consensus not configured" to all proposals.
-        _init_champion = ctx.benchmark_worker is not None or bool(
-            os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
+        _init_champion = (
+            ctx.benchmark_worker is not None
+            or bool(os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip())
+            # Quote node: no benchmark worker and no validator key, but it MUST
+            # init the champion machinery (epoch manager + pull-reconcile +
+            # boot-restore + hot-swap) to track the external leader's champion.
+            or quote_node.is_quote_node()
         )
         if _init_champion:
             validator_key = os.environ.get("VALIDATOR_PRIVATE_KEY", "").strip()
@@ -2714,11 +2720,26 @@ async def initialize(ctx: ServerContext) -> dict:
                 ctx.solver_round_role = "leader"
 
             def _is_solver_round_leader() -> bool:
+                # A quote node follows an EXTERNAL leader — it is never the leader
+                # itself. Check this FIRST: a quote node has no metagraph sync,
+                # which would otherwise default to leader=True below.
+                if quote_node.is_quote_node():
+                    return False
                 if solver_round_force_leader:
                     return True
                 if ctx.solver_round_metagraph_sync is None:
                     return True
                 return ctx.solver_round_metagraph_sync.is_leader
+
+            def _is_champion_follower() -> bool:
+                # Quote node ALWAYS follows its configured leader; otherwise this
+                # is the metagraph-follower gate (has sync, and isn't the leader).
+                if quote_node.is_quote_node():
+                    return True
+                return (
+                    ctx.solver_round_metagraph_sync is not None
+                    and not _is_solver_round_leader()
+                )
 
             # Only the leader mirrors the reject report onto the miner's PR —
             # evaluate_round runs on every validator, so gate the PR side effect
@@ -2733,6 +2754,11 @@ async def initialize(ctx: ServerContext) -> dict:
             # Stage-2 benchmark corpus for the diverse-subset adoption vote. No-ops
             # on the leader (the source); idempotent upsert is self-healing.
             def _resolve_leader_api_url() -> str | None:
+                # Quote node: the leader is configured directly (LEADER_API_URL),
+                # not discovered via the metagraph.
+                _override = quote_node.leader_api_url()
+                if _override is not None:
+                    return _override
                 _sync = ctx.solver_round_metagraph_sync
                 if _sync is None or _sync.state is None or _sync.state.leader is None:
                     return None
@@ -2752,10 +2778,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 _order_sync = OrderSync(
                     app_store=ctx.store,
                     leader_api_url=_resolve_leader_api_url,
-                    is_follower=(
-                        lambda: ctx.solver_round_metagraph_sync is not None
-                        and not _is_solver_round_leader()
-                    ),
+                    is_follower=_is_champion_follower,
                 )
                 ctx.order_sync_task = asyncio.create_task(_order_sync.run_loop())
                 logger.info("Order-book sync loop started (followers pull the leader's orders)")
@@ -2772,10 +2795,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 _quote_sync = QuoteSync(
                     app_store=ctx.store,
                     leader_api_url=_resolve_leader_api_url,
-                    is_follower=(
-                        lambda: ctx.solver_round_metagraph_sync is not None
-                        and not _is_solver_round_leader()
-                    ),
+                    is_follower=_is_champion_follower,
                 )
                 ctx.quote_sync_task = asyncio.create_task(_quote_sync.run_loop())
                 logger.info("Quote-case sync loop started (followers pull the leader's quotes)")
@@ -2796,10 +2816,7 @@ async def initialize(ctx: ServerContext) -> dict:
                 _app_sync = ValidatorAppCatalogSync(
                     store=ctx.store,
                     leader_url=_resolve_leader_api_url,
-                    is_follower=(
-                        lambda: ctx.solver_round_metagraph_sync is not None
-                        and not _is_solver_round_leader()
-                    ),
+                    is_follower=_is_champion_follower,
                     poll_interval=60.0,
                 )
                 ctx.app_sync_task = asyncio.create_task(_app_sync.start())
@@ -2824,10 +2841,7 @@ async def initialize(ctx: ServerContext) -> dict:
                     )
                     _reconcile = ChampionPullReconcile(
                         leader_api_url=_resolve_leader_api_url,
-                        is_follower=(
-                            lambda: ctx.solver_round_metagraph_sync is not None
-                            and not _is_solver_round_leader()
-                        ),
+                        is_follower=_is_champion_follower,
                         interval=_reconcile_interval,
                         api_key=(
                             os.environ.get("SOLVER_ROUND_INTERNAL_API_KEY", "").strip()
