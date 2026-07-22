@@ -161,22 +161,41 @@ def new_live_session_id() -> str:
     return f"{LIVE_PROXY_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
 
 # Name of the dedicated ``--internal`` net the live champion + proxy share when
-# the feature is on. Both read_proxy_manager (which creates it + attaches the
-# proxy) and runtime_solver (which puts the champion on it) default to this, so
-# enabling LIVE_SOLVER_RPC_VIA_PROXY alone lands both on the same net — no
-# separate LIVE_SOLVER_NETWORK needed. Override both via LIVE_SOLVER_NETWORK.
-LIVE_SOLVER_NETWORK_DEFAULT = "live-solver"
+# the feature is on. This is DELIBERATELY SEPARATE from ``LIVE_SOLVER_NETWORK``
+# (the legacy net the direct-RPC champion runs on — ``production_minotaur`` on
+# the leader). Overloading one var for both meanings was a footgun: enabling the
+# feature required renaming ``LIVE_SOLVER_NETWORK`` to ``live-solver``, but that
+# rename took effect even while the feature stayed off (e.g. the env var not
+# reaching the api), stranding the champion on a net nothing had created
+# (2026-07-22 incident). Now the proxy net has its OWN var and enabling the
+# feature needs ONLY ``LIVE_SOLVER_RPC_VIA_PROXY=1`` — the legacy
+# ``LIVE_SOLVER_NETWORK`` is untouched and simply ignored while the proxy is on.
+LIVE_SOLVER_PROXY_NETWORK_DEFAULT = "live-solver"
+# Back-compat alias (some call sites / tests referenced the old name).
+LIVE_SOLVER_NETWORK_DEFAULT = LIVE_SOLVER_PROXY_NETWORK_DEFAULT
 
 _TRUTHY_ENV = {"1", "true", "yes", "on"}
+
+
+def live_proxy_network() -> str:
+    """The dedicated ``--internal`` net the proxy + champion share when the
+    feature is on. From ``LIVE_SOLVER_PROXY_NETWORK`` (default ``live-solver``),
+    INDEPENDENT of the legacy ``LIVE_SOLVER_NETWORK`` — so turning the feature on
+    never requires renaming the legacy net (which would strand the champion)."""
+    return (
+        os.environ.get("LIVE_SOLVER_PROXY_NETWORK", "").strip()
+        or LIVE_SOLVER_PROXY_NETWORK_DEFAULT
+    )
 
 
 def live_rpc_via_proxy_enabled() -> bool:
     """Whether the live champion should route RPC through the keyless proxy.
 
     Opt-in (``LIVE_SOLVER_RPC_VIA_PROXY``): default off preserves today's direct
-    keyed-RPC behavior, so this ships inert. Enable it TOGETHER with a
-    ``live-solver`` ``--internal`` net (``LIVE_SOLVER_NETWORK``) so the champion
-    reaches only the proxy — see ``read_proxy_manager`` + ``runtime_solver``.
+    keyed-RPC behavior, so this ships inert. Enabling it ALONE is sufficient — the
+    api creates the dedicated ``live-solver`` ``--internal`` net, attaches the
+    proxy, and lands the champion on it (see ``read_proxy_manager`` +
+    ``runtime_solver``). Do NOT also rename ``LIVE_SOLVER_NETWORK``.
     """
     return os.environ.get("LIVE_SOLVER_RPC_VIA_PROXY", "").strip().lower() in _TRUTHY_ENV
 
