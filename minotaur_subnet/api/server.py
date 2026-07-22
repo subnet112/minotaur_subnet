@@ -52,6 +52,7 @@ from minotaur_subnet.store import AppIntentStore
 
 # Import the shared context and startup module
 from minotaur_subnet.api.server_context import ctx
+from minotaur_subnet.api import quote_node
 from minotaur_subnet.api import startup as _startup
 
 logger = logging.getLogger(__name__)
@@ -279,6 +280,24 @@ def health():
     from minotaur_subnet.harness.runtime_solver import forced_solver_image
     _forced_image = forced_solver_image()
 
+    # Champion sync — surfaces the standing champion this node tracks and whether
+    # the LOADED live solver actually matches it. ``champion.synced == false`` is
+    # the silent record-vs-live split: the champion pointer advanced but the
+    # running solver did NOT swap, so quotes price off a stale solver. This is the
+    # primary self-check for a quote node (LEADER_API_URL set) — alarm on it.
+    champion_health: dict | None = None
+    try:
+        _rs = submissions.get_round_store()
+        _active = _rs.get_active_champion() if _rs is not None else None
+        _loaded = None
+        if ctx.block_loop is not None and getattr(ctx.block_loop, "solver", None) is not None:
+            _loaded = getattr(ctx.block_loop.solver, "image_ref", None)
+        champion_health = quote_node.champion_status(_loaded, _active)
+        champion_health["quote_node"] = quote_node.is_quote_node()
+        champion_health["leader_api_url"] = quote_node.leader_api_url()
+    except Exception:
+        champion_health = None
+
     data = {
         "status": "ok",
         "service": "app-intents-api",
@@ -292,6 +311,7 @@ def health():
         "live_solver_running": live_solver_running,
         "live_solver": live_solver_diagnostics,
         "forced_solver_image": _forced_image,  # operator break-glass override, or null
+        "champion": champion_health,  # standing champion + loaded-vs-record sync check
         "provenance_policy": dict(ctx.provenance_policy_health),
         "runtime_security_policy": dict(ctx.runtime_security_policy_health),
     }

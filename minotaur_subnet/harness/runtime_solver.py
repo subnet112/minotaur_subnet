@@ -193,6 +193,14 @@ class DockerRuntimeSolver:
         self._last_respawn_at: float | None = None
         self._last_crash_error: str | None = None
 
+    @property
+    def image_ref(self) -> str:
+        """The content-addressed image this solver is running (``<repo>@sha256:D``
+        or a local id). Exposed so /health and the quote path can confirm the
+        LOADED solver matches the certified champion digest — the check that
+        catches a silently-refused hot-swap (record advanced, container didn't)."""
+        return self._image_ref
+
     @classmethod
     async def create(
         cls,
