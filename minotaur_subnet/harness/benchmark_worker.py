@@ -776,7 +776,14 @@ class BenchmarkWorker:
         if len(live) <= slots:
             return benchmarking
         last_selected = RotationLedger(rotation_ledger_path()).load()
-        slate, _ = select_rotation_slate(live, slots, last_selected, round_id)
+        # Same actor keying as close-time rotation, or the belt recomputes a
+        # DIFFERENT (per-hotkey) slate than the close would have selected. In
+        # the split-worker process the map comes from the sidecar the api
+        # persists next to this same ledger; None degrades both paths alike.
+        from minotaur_subnet.harness.actor import snapshot_resolver
+        slate, _ = select_rotation_slate(
+            live, slots, last_selected, round_id, actor_of=snapshot_resolver(),
+        )
         slate_ids = {s.submission_id for s in slate}
         kept = [s for s in benchmarking if s.submission_id in slate_ids]
         dropped = [s for s in benchmarking if s.submission_id not in slate_ids]
