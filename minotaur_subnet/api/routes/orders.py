@@ -59,6 +59,11 @@ _orderbook = None
 _block_loop = None
 _app_store = None
 _js_engine = None
+# Optional DEDICATED /quote SimulationRunner (its own anvils + _sim_lock) so quote
+# sims never queue behind order-processing on the shared runner. None => quotes use
+# bl._simulation_runner (behaviour byte-unchanged). Set at startup only when the
+# ETH_QUOTE_SIM_RPC_URL / BASE_QUOTE_SIM_RPC_URL anvils are configured.
+_quote_sim_runner = None
 
 # Quote-endpoint rate limit. Every quote now runs a real simulation to measure
 # gas (so the fee can be priced by us, not the miner), which means an
@@ -99,6 +104,14 @@ def set_orderbook(orderbook: Any) -> None:
 def set_block_loop(block_loop: Any) -> None:
     global _block_loop
     _block_loop = block_loop
+
+
+def set_quote_sim_runner(runner: Any) -> None:
+    """Register the OPTIONAL dedicated /quote SimulationRunner (see _quote_sim_runner).
+    Startup calls this only when dedicated quote anvils are configured; otherwise
+    it stays None and quotes use the shared bl._simulation_runner."""
+    global _quote_sim_runner
+    _quote_sim_runner = runner
 
 
 def set_app_store(app_store: Any) -> None:
@@ -1594,7 +1607,25 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
         try:
             _dep = s.get_deployment(app_id, chain_id=req.chain_id) if s else None
             _deployed = _dep.contract_address if (_dep and _dep.contract_address) else ""
+            # Prefer the DEDICATED quote runner, but ONLY when it has a CONNECTED
+            # per-chain anvil for THIS exact chain — so a chain with no dedicated
+            # fork (or a quote anvil that's down/unready) falls back to the shared
+            # order runner instead of emitting a zero/floor quote. Direct per-chain
+            # lookup (no default-chain fallback) so e.g. a Base-only quote sim never
+            # mis-serves a chain-1 quote.
             _sim_runner = getattr(bl, "_simulation_runner", None)
+            if _quote_sim_runner is not None:
+                try:
+                    _qsim = getattr(_quote_sim_runner, "simulator", None)
+                    _qchain = (
+                        _qsim.simulators.get(req.chain_id)
+                        if (_qsim is not None and hasattr(_qsim, "simulators"))
+                        else None
+                    )
+                    if _qchain is not None and _qchain.is_connected():
+                        _sim_runner = _quote_sim_runner
+                except Exception:  # noqa: BLE001 - any probe failure keeps the shared runner
+                    pass
             _has_sim = _sim_runner is not None and getattr(_sim_runner, "simulator", None) is not None
 
             _plan_state = IntentState(

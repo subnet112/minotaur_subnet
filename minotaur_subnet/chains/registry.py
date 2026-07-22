@@ -66,6 +66,13 @@ class ChainSpec:
     consensus_public_fallback: str | None = None
     # Simulator fork target (the api/validator sim_rpc_urls builder).
     sim_rpc_envs: tuple[str, ...] = ()
+    # OPTIONAL dedicated /quote simulator fork-target (a SEPARATE anvil from the
+    # order sim, so quote sims never queue behind order-processing on the shared
+    # _sim_lock). DELIBERATELY has NO fallback to the sim_rpc_envs above: a quote
+    # AnvilSimulator pointed at the ORDER anvil would get its OWN _sim_lock and
+    # its evm_snapshot/evm_revert would interleave with the order sim's, silently
+    # corrupting both. Empty => no dedicated fork => quotes use the shared runner.
+    quote_sim_rpc_envs: tuple[str, ...] = ()
     # Fork SOURCE the anvil forks from (upstream_rpc_urls builder + pin derivation).
     upstream_rpc_env: str | None = None
     # Benchmark-sandbox anvil (orchestrator build_rpc_url_map).
@@ -135,6 +142,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         consensus_rpc_envs=("ETH_UPSTREAM_RPC_URL",),
         consensus_public_fallback=None,
         sim_rpc_envs=("ETH_SIM_RPC_URL", "ANVIL_RPC_URL"),
+        quote_sim_rpc_envs=("ETH_QUOTE_SIM_RPC_URL",),
         upstream_rpc_env="ETH_UPSTREAM_RPC_URL",
         benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
         check_rpc_envs=("ETH_RPC_URL", "ANVIL_RPC_URL"),
@@ -163,6 +171,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         consensus_rpc_envs=("BASE_UPSTREAM_RPC_URL",),
         consensus_public_fallback=None,
         sim_rpc_envs=("BASE_SIM_RPC_URL", "BASE_RPC_URL"),
+        quote_sim_rpc_envs=("BASE_QUOTE_SIM_RPC_URL",),
         upstream_rpc_env="BASE_UPSTREAM_RPC_URL",
         benchmark_rpc_envs=(
             "BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL",
@@ -363,6 +372,14 @@ def sim_rpc(chain_id: int) -> str:
     """Simulator fork-target RPC for *chain_id* (the ``sim_rpc_urls`` value)."""
     s = spec(chain_id)
     return _first_env(s.sim_rpc_envs) if s is not None else ""
+
+
+def quote_sim_rpc(chain_id: int) -> str:
+    """DEDICATED /quote simulator fork-target for *chain_id*, or "" when none is
+    configured (the ``quote_sim_rpc_urls`` value). Empty => that chain's quotes
+    fall back to the shared order simulator."""
+    s = spec(chain_id)
+    return _first_env(s.quote_sim_rpc_envs) if s is not None else ""
 
 
 def upstream_rpc(chain_id: int) -> str:
