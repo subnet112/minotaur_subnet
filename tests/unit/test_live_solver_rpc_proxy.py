@@ -340,12 +340,118 @@ async def test_docker_network_is_internal_none_for_missing_net():
 
 @pytest.mark.asyncio
 async def test_start_docker_refuses_noninternal_live_net_when_required(monkeypatch):
-    """live=True + a DEFINITIVELY non-internal net + REQUIRE=1 => refuse to start."""
+    """live=True + an EXISTING but non-internal net + REQUIRE=1 => refuse to start."""
     monkeypatch.setenv("LIVE_SOLVER_REQUIRE_INTERNAL", "1")
     o = orch.SolverOrchestrator()
-    with patch.object(orch, "_docker_network_is_internal", new=AsyncMock(return_value=False)):
-        with pytest.raises(RuntimeError, match="refusing to start live champion"):
+    with patch.object(orch, "_docker_network_exists", new=AsyncMock(return_value=True)), \
+         patch.object(orch, "_docker_network_is_internal", new=AsyncMock(return_value=False)):
+        with pytest.raises(RuntimeError, match="not a Docker --internal net"):
             await o.start_docker("ghcr.io/test/solver:latest", live=True, network="prod-bridge")
+
+
+# ── decoupling: proxy net is independent of the legacy LIVE_SOLVER_NETWORK ───
+
+
+def test_live_proxy_network_independent_of_legacy(monkeypatch):
+    """The 2026-07-22 root cause: the proxy net must NOT be derived from the
+    legacy LIVE_SOLVER_NETWORK (which the leader sets to production_minotaur),
+    else enabling the feature collides with the direct-RPC champion's net."""
+    monkeypatch.setenv("LIVE_SOLVER_NETWORK", "production_minotaur")
+    monkeypatch.delenv("LIVE_SOLVER_PROXY_NETWORK", raising=False)
+    assert srp.live_proxy_network() == "live-solver"
+    monkeypatch.setenv("LIVE_SOLVER_PROXY_NETWORK", "custom-net")
+    assert srp.live_proxy_network() == "custom-net"
+
+
+@pytest.mark.asyncio
+async def test_create_champion_lands_on_proxy_net_despite_legacy_env(monkeypatch):
+    """Enabling the feature must land the champion on the PROXY net even when the
+    legacy LIVE_SOLVER_NETWORK is set to the leader's production_minotaur — this
+    is the exact config that stranded the champion before the decoupling."""
+    monkeypatch.setenv("LIVE_SOLVER_RPC_VIA_PROXY", "1")
+    monkeypatch.setenv("SOLVER_LIVE_RPC_PROXY", "http://172.30.1.5:8645")
+    monkeypatch.setenv("LIVE_SOLVER_NETWORK", "production_minotaur")  # legacy, must be ignored
+    fake_session = MagicMock()
+    fake_session.initialize = AsyncMock()
+    fake_session.metadata = AsyncMock(
+        return_value=SolverMetadata(name="c", version="1", author="a", description="")
+    )
+    start = AsyncMock(return_value=fake_session)
+    with patch.object(orch.SolverOrchestrator, "start_docker", new=start), \
+         patch.object(srp, "open_session", new=AsyncMock(return_value={})), \
+         patch("minotaur_subnet.harness.runtime_solver._reap_orphan_live_solvers", lambda: None):
+        await DockerRuntimeSolver.create(
+            image_ref="ghcr.io/test/solver:latest",
+            chain_ids=[8453],
+            rpc_urls={8453: "https://x/KEY"},
+        )
+    assert start.await_args.kwargs["network"] == "live-solver"  # NOT production_minotaur
+
+
+@pytest.mark.asyncio
+async def test_create_champion_uses_legacy_net_when_feature_off(monkeypatch):
+    """Feature OFF => champion stays on the legacy LIVE_SOLVER_NETWORK (today's
+    leader behavior), and the keyed RPC is used (fail-safe, orders keep flowing)."""
+    monkeypatch.delenv("LIVE_SOLVER_RPC_VIA_PROXY", raising=False)
+    monkeypatch.setenv("LIVE_SOLVER_NETWORK", "production_minotaur")
+    fake_session = MagicMock()
+    fake_session.initialize = AsyncMock()
+    fake_session.metadata = AsyncMock(
+        return_value=SolverMetadata(name="c", version="1", author="a", description="")
+    )
+    start = AsyncMock(return_value=fake_session)
+    with patch.object(orch.SolverOrchestrator, "start_docker", new=start), \
+         patch("minotaur_subnet.harness.runtime_solver._reap_orphan_live_solvers", lambda: None):
+        await DockerRuntimeSolver.create(
+            image_ref="ghcr.io/test/solver:latest", chain_ids=[8453], rpc_urls={8453: "https://x/KEY"},
+        )
+    assert start.await_args.kwargs["network"] == "production_minotaur"
+    assert start.await_args.kwargs["rpc_overrides"] is None  # keyed RPC path
+
+
+# ── existence guard: never launch a live champion onto a missing net ────────
+
+
+@pytest.mark.asyncio
+async def test_start_docker_refuses_missing_live_net(monkeypatch):
+    """live=True + a DEFINITELY-absent net => refuse (the 2026-07-22 failure mode:
+    a doomed container launched onto a net nothing had created)."""
+    o = orch.SolverOrchestrator()
+    with patch.object(orch, "_docker_network_exists", new=AsyncMock(return_value=False)):
+        with pytest.raises(RuntimeError, match="does not exist"):
+            await o.start_docker("img:latest", live=True, network="live-solver")
+
+
+@pytest.mark.asyncio
+async def test_start_docker_proceeds_when_net_existence_unknown(monkeypatch):
+    """A can't-determine (None) existence must NOT hard-fail — proceed and let
+    docker run report any real error (inspect can be denied behind socket-proxy)."""
+    monkeypatch.delenv("LIVE_SOLVER_REQUIRE_INTERNAL", raising=False)
+    o = orch.SolverOrchestrator()
+    with patch.object(orch, "_docker_network_exists", new=AsyncMock(return_value=None)), \
+         patch.object(orch, "_docker_network_is_internal", new=AsyncMock(return_value=None)), \
+         patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=RuntimeError("reached-docker-run"))):
+        with pytest.raises(RuntimeError, match="reached-docker-run"):
+            await o.start_docker("img:latest", live=True, network="live-solver")
+
+
+@pytest.mark.asyncio
+async def test_docker_network_exists_classification():
+    """_docker_network_exists: rc0 => True; 'not found' stderr => False;
+    other non-zero => None (unknown, never 'absent')."""
+    async def _mk(rc, err=b""):
+        p = MagicMock()
+        p.returncode = rc
+        p.communicate = AsyncMock(return_value=(b"live-solver", err))
+        return p
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=await _mk(0))):
+        assert await orch._docker_network_exists("live-solver") is True
+    with patch("asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=await _mk(1, b"Error: No such network: x"))):
+        assert await orch._docker_network_exists("x") is False
+    with patch("asyncio.create_subprocess_exec",
+               new=AsyncMock(return_value=await _mk(1, b"403 permission denied"))):
+        assert await orch._docker_network_exists("x") is None
 
 
 @pytest.mark.asyncio
