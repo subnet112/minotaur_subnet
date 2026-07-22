@@ -686,20 +686,26 @@ services:
       # Once enabled + verified, set LIVE_SOLVER_REQUIRE_INTERNAL=1 so a champion
       # is REFUSED on any non-internal net (fail-closed). Leave all three unset to
       # keep today's behavior exactly.
+      # Enable with ONLY this one var — the api creates the dedicated proxy net,
+      # attaches the proxy, and lands the champion on it. Do NOT also rename
+      # LIVE_SOLVER_NETWORK (the legacy direct-RPC net); the proxy net has its own
+      # var (LIVE_SOLVER_PROXY_NETWORK) precisely so enabling can't collide with it.
       LIVE_SOLVER_RPC_VIA_PROXY: "${LIVE_SOLVER_RPC_VIA_PROXY:-0}"
       LIVE_SOLVER_REQUIRE_INTERNAL: "${LIVE_SOLVER_REQUIRE_INTERNAL:-0}"
       LIVE_SOLVER_RPC_BUDGET: "${LIVE_SOLVER_RPC_BUDGET:-5000}"
-      # When the proxy path is on, the champion + proxy share this dedicated
-      # --internal net (auto-created). Override the name/subnet if 172.30.1.0/24
-      # collides with your host — the proxy's IP is derived from the subnet
-      # (base+5), or pin it via SOLVER_LIVE_RPC_PROXY_IP. Do NOT pick a subnet
-      # inside 172.31.0.0/16: that's the AWS default-VPC CIDR (its DNS resolver
-      # lives at 172.31.0.2) and an overlapping bridge blackholes host DNS/VPC
-      # traffic. Leave LIVE_SOLVER_NETWORK unset to use the default
-      # `live-solver`; setting it to a non-internal net (e.g. the leader's
-      # production_minotaur) is exactly what the guard warns about.
-      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"
+      # The dedicated --internal net the proxy + champion share when the feature is
+      # on (auto-created). SEPARATE from LIVE_SOLVER_NETWORK (the legacy net used
+      # only while the feature is OFF) so turning the feature on never requires
+      # renaming the legacy net — that overload stranded the champion on 2026-07-22.
+      # Override name/subnet only on a host collision; the proxy IP is the subnet
+      # base+5 (or pin SOLVER_LIVE_RPC_PROXY_IP). NEVER pick a subnet inside
+      # 172.31.0.0/16 (AWS default-VPC CIDR; DNS resolver at 172.31.0.2 → an
+      # overlapping bridge blackholes host DNS/VPC traffic).
+      LIVE_SOLVER_PROXY_NETWORK: "${LIVE_SOLVER_PROXY_NETWORK:-live-solver}"
       LIVE_SOLVER_NETWORK_SUBNET: "${LIVE_SOLVER_NETWORK_SUBNET:-172.30.1.0/24}"
+      # Legacy net for the direct-RPC champion (feature OFF); leader sets it to
+      # production_minotaur. Ignored while LIVE_SOLVER_RPC_VIA_PROXY=1.
+      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"
 
       # Block-pin RPC proxy — the solver's reads route through it, pinned to the
       # round fork block (deterministic, ~30ms). The api LAUNCHES + owns the proxy

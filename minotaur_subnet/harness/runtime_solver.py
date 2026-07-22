@@ -268,14 +268,19 @@ class DockerRuntimeSolver:
                 if proxy_rpc:
                     rpc_urls = {**rpc_urls, **proxy_rpc}  # init_cfg: keyless URLs
                     rpc_overrides = proxy_rpc              # -e *_RPC_URL: keyless too
-                    # Land the champion on the SAME dedicated internal net the
-                    # proxy is attached to, so it reaches the keyless proxy (and
-                    # nothing else). Explicit LIVE_SOLVER_NETWORK still wins.
-                    if not live_network:
-                        live_network = _srp.LIVE_SOLVER_NETWORK_DEFAULT
+                    # Land the champion on the dedicated proxy net (where the
+                    # keyless proxy is reachable) — this OVERRIDES the legacy
+                    # LIVE_SOLVER_NETWORK (production_minotaur on the leader), so
+                    # enabling the feature never needs the legacy net renamed. The
+                    # same net that read_proxy_manager created + attached the proxy
+                    # to, so the .5 IP resolves. (Fail-safe path: if the proxy
+                    # didn't attach, live_cfg is None and we never get here, so the
+                    # champion stays on the legacy net with direct RPC.)
+                    live_network = _srp.live_proxy_network()
                     logger.info(
-                        "Live champion RPC routed through keyless metered proxy "
-                        "(budget=%d, chains=%s)", live_cfg.budget, sorted(proxy_rpc),
+                        "Live champion RPC routed through keyless metered proxy on "
+                        "net %s (budget=%d, chains=%s)",
+                        live_network, live_cfg.budget, sorted(proxy_rpc),
                     )
                 else:  # no routable chain -> disable, keep direct RPC
                     live_cfg, live_session_id = None, None
@@ -360,9 +365,10 @@ class DockerRuntimeSolver:
         the runtime; champion image_ref hasn't changed).
         """
         live_network = os.environ.get("LIVE_SOLVER_NETWORK", "").strip()
-        # Keep a proxy-routed champion on its dedicated internal net across respawns.
-        if self._live_proxy_cfg is not None and not live_network:
-            live_network = _srp.LIVE_SOLVER_NETWORK_DEFAULT
+        # Keep a proxy-routed champion on its dedicated proxy net across respawns
+        # (overrides the legacy LIVE_SOLVER_NETWORK, mirroring create()).
+        if self._live_proxy_cfg is not None:
+            live_network = _srp.live_proxy_network()
         saved_production = os.environ.get("MINOTAUR_PRODUCTION")
         os.environ["MINOTAUR_PRODUCTION"] = "1"
         try:

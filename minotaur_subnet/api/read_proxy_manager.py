@@ -48,16 +48,16 @@ PROXY_CONTROL_URL = f"http://{PROXY_CONTAINER_NAME}:{PROXY_PORT}"
 # LIVE champion path (opt-in; see solver_read_proxy.live_read_proxy_config). A
 # DEDICATED --internal net so the adopted champion reaches ONLY the proxy — not
 # the internet, relayer, IMDS, or docker-socket-proxy. The proxy is attached to it
-# at a static IP; the champion (on LIVE_SOLVER_NETWORK) dials that IP KEYLESSLY.
+# at a static IP; the champion (on the SAME net) dials that IP KEYLESSLY. The net
+# name comes from live_proxy_network() (LIVE_SOLVER_PROXY_NETWORK), NOT the legacy
+# LIVE_SOLVER_NETWORK — so enabling the feature never collides with the direct-RPC
+# champion's net (production_minotaur on the leader). See the 2026-07-22 incident.
 from minotaur_subnet.harness.solver_read_proxy import (
-    LIVE_SOLVER_NETWORK_DEFAULT,
+    live_proxy_network,
     live_rpc_via_proxy_enabled,
 )
 
-LIVE_SOLVER_NETWORK_NAME = (
-    os.environ.get("LIVE_SOLVER_NETWORK", LIVE_SOLVER_NETWORK_DEFAULT).strip()
-    or LIVE_SOLVER_NETWORK_DEFAULT
-)
+LIVE_SOLVER_NETWORK_NAME = live_proxy_network()
 # Default subnet: adjacent to the proven benchmark-sandbox net (172.30.0.0/24).
 # NEVER default inside 172.31.0.0/16 — that's the AWS default-VPC CIDR, and its
 # Route 53 resolver sits at 172.31.0.2: an explicitly-subnetted docker bridge

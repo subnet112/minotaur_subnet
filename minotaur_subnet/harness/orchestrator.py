@@ -771,6 +771,34 @@ async def _docker_network_is_internal(name: str) -> bool | None:
         return None
 
 
+async def _docker_network_exists(name: str) -> bool | None:
+    """``True`` if the named Docker network exists, ``False`` if it DEFINITELY
+    doesn't, ``None`` if it can't be determined.
+
+    ``docker network inspect`` exits non-zero AND prints "not found" (or similar)
+    to stderr when the net is absent; any other non-zero (socket-proxy 403, CLI
+    error) is "unknown", not "absent" — callers must not treat ``None`` as
+    missing. Distinguishing these lets ``start_docker`` refuse to launch a live
+    champion onto a definitely-absent net (a doomed container) while never
+    hard-failing on an inspect it merely couldn't run.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "network", "inspect", name, "--format", "{{.Name}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            return True
+        msg = (err or b"").decode("utf-8", "replace").lower()
+        if "not found" in msg or "no such network" in msg:
+            return False
+        return None  # some other failure — can't conclude "absent"
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return None
+
+
 class SolverOrchestrator:
     """Manages solver sessions for benchmarking.
 
@@ -865,6 +893,26 @@ class SolverOrchestrator:
         # fails closed (flip it once the champion's RPC goes through the keyless
         # proxy on an internal net — see _require_internal_live_net).
         if live and bench_network:
+            # (a) EXISTENCE: never launch a live champion onto a net that
+            # DEFINITELY doesn't exist — the container would fail to start and
+            # take order processing down with it (2026-07-22 incident: the live
+            # net was renamed but nothing had created it). Fail LOUD instead of
+            # launching a doomed container; on a fresh boot this surfaces as an
+            # api start failure that update.sh health-gates + rolls back. A
+            # "can't determine" (None, e.g. socket-proxy denies inspect) is NOT
+            # treated as absent — we proceed and let docker run report any error.
+            exists = await _docker_network_exists(bench_network)
+            if exists is False:
+                raise RuntimeError(
+                    "refusing to start live champion: network %r does not exist "
+                    "(would launch a doomed container). If enabling the keyless "
+                    "RPC proxy, set only LIVE_SOLVER_RPC_VIA_PROXY=1 (the api "
+                    "creates the net); do NOT rename LIVE_SOLVER_NETWORK by hand."
+                    % bench_network
+                )
+            # (b) INTERNAL: a live net that exists but has an external gateway lets
+            # a hostile champion reach the internet/relayer/IMDS/docker-socket.
+            # WARN by default; LIVE_SOLVER_REQUIRE_INTERNAL=1 fails closed.
             internal = await _docker_network_is_internal(bench_network)
             if internal is not True:
                 msg = (
