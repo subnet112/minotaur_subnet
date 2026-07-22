@@ -87,15 +87,26 @@ class _FakeSimRunner:
     ``result`` override lets a test inject a sim carrying ``metadata.raw_output``.
     """
 
-    def __init__(self, result: SimulationResult | None = None) -> None:
-        self.simulator = object()  # truthy → _has_sim is True
+    def __init__(
+        self, result: SimulationResult | None = None, fork_block: int = 21_000_000,
+    ) -> None:
+        # ``simulator`` is truthy (→ _has_sim True) and exposes current_fork_block
+        # so the quote path's fork-pin capture works. ``fork_block`` is the block
+        # the fork reports landing on after a cold (head) re-fork.
+        self.simulator = SimpleNamespace(
+            current_fork_block=lambda chain_id=None: fork_block,
+        )
         self.calls: list[SimpleNamespace] = []
         self._result = result
 
-    async def simulate(self, plan, order, contract_address, intent_order, is_cross_chain, deployed):
+    async def simulate(
+        self, plan, order, contract_address, intent_order, is_cross_chain, deployed,
+        fork_block=None, pin_only=False,
+    ):
         self.calls.append(SimpleNamespace(
             plan=plan, order=order, contract_address=contract_address,
             intent_order=intent_order, is_cross_chain=is_cross_chain, deployed=deployed,
+            fork_block=fork_block, pin_only=pin_only,
         ))
         if self._result is not None:
             return self._result
@@ -141,6 +152,8 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = "0"
         orders_module.set_js_engine(None)
         orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
         # Preserve the real benchmark intent-order builder — some tests patch it
         # to return a sentinel (the handler lazy-imports it from orchestrator, so
         # patching the module attribute is what the import resolves at call time).
@@ -152,6 +165,8 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         orders_module.set_app_store(None)
         orchestrator_module._build_benchmark_intent_order = self._real_build_intent_order
         orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
         if self._prev_rl is None:
             os.environ.pop("QUOTE_RATE_LIMIT_PER_MINUTE", None)
         else:
@@ -329,6 +344,87 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         self.assertEqual(data["estimated_output_gross"], _raw)
         self.assertEqual(data["estimated_output"], _raw)
 
+    def test_identical_quote_hits_cache_and_skips_second_sim(self):
+        """A second identical quote within the TTL must be served from the plan
+        cache — NOT re-run the expensive fork sim. Regression guard for the
+        cache actually being consulted end-to-end."""
+        runner = _FakeSimRunner()
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        r1 = self._post_quote()
+        r2 = self._post_quote()
+        self.assertEqual(r1.status_code, 200, r1.text)
+        self.assertEqual(r2.status_code, 200, r2.text)
+        # Exactly ONE simulate() across two identical quotes — the 2nd hit cache.
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(r1.json()["estimated_output"], r2.json()["estimated_output"])
+
+    def test_different_params_miss_cache_and_resimulate(self):
+        """A quote with different params must NOT be served the prior sim's
+        result — the key includes the params, so it re-simulates."""
+        runner = _FakeSimRunner()
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        def _post(amount):
+            return self.client.post(
+                "/v1/apps/testapp/quote",
+                json={
+                    "intent_function": "swap",
+                    "chain_id": _CHAIN,
+                    "params": {
+                        "input_token": _USDC,
+                        "output_token": _DONALDPUMP,
+                        "input_amount": amount,
+                    },
+                },
+            )
+
+        self.assertEqual(_post("1000000000").status_code, 200)
+        self.assertEqual(_post("2000000000").status_code, 200)
+        self.assertEqual(len(runner.calls), 2)  # distinct params → two sims
+
+    def test_fork_pin_cold_then_warm_reuse(self):
+        """The FIRST quote in a window re-forks to head (fork_block=None,
+        pin_only=False) and records the block it landed on; a later DISTINCT
+        quote (misses the plan cache) reuses that pinned block (pin_only=True)
+        so the sim runs on a cache-warm fork instead of re-forking to head."""
+        runner = _FakeSimRunner(fork_block=21_000_123)
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=runner)
+        )
+
+        def _post(amount):
+            return self.client.post(
+                "/v1/apps/testapp/quote",
+                json={
+                    "intent_function": "swap",
+                    "chain_id": _CHAIN,
+                    "params": {
+                        "input_token": _USDC,
+                        "output_token": _DONALDPUMP,
+                        "input_amount": amount,
+                    },
+                },
+            )
+
+        # Cold: first quote re-forks to head and captures the pin.
+        self.assertEqual(_post("1000000000").status_code, 200)
+        self.assertIsNone(runner.calls[0].fork_block)
+        self.assertFalse(runner.calls[0].pin_only)
+        self.assertEqual(orders_module._quote_fork_pin_get(_CHAIN), 21_000_123)
+
+        # Warm: a DISTINCT quote (misses the plan cache) reuses the pinned block.
+        self.assertEqual(_post("2000000000").status_code, 200)
+        self.assertEqual(runner.calls[1].fork_block, 21_000_123)
+        self.assertTrue(runner.calls[1].pin_only)
+
 
 # ── Integration: the REAL _build_benchmark_intent_order address invariant ──────
 # The handler-level tests above stub the builder, so they prove get_quote pins
@@ -425,12 +521,16 @@ class TestQuoteRetirementGate(unittest.TestCase):
         os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = "0"
         orders_module.set_js_engine(None)
         orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def tearDown(self):
         orders_module.set_block_loop(None)
         orders_module.set_app_store(None)
         orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
         if self._prev_rl is None:
             os.environ.pop("QUOTE_RATE_LIMIT_PER_MINUTE", None)
         else:
@@ -524,6 +624,161 @@ class TestQuoteRetirementGate(unittest.TestCase):
             resp = self._post_quote()
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["estimated_output"], _DELIVERED)
+
+
+class TestQuotePlanCacheAndSingleFlight(unittest.TestCase):
+    """Unit tests for the plan-cache primitives: single-flight dedup, the
+    short negative TTL, and oldest-entry (not clear-all) eviction."""
+
+    def setUp(self):
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
+
+    def tearDown(self):
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
+
+    def test_single_flight_collapses_concurrent_identical_computes(self):
+        """N concurrent callers for the same key run the producer ONCE, and all
+        receive that one result — the thundering-herd fix."""
+        import asyncio
+
+        calls = {"n": 0}
+
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def producer():
+                calls["n"] += 1
+                await gate.wait()  # hold the "sim" open so all callers overlap
+                result = {"delivered": 42, "gas_units": 7, "route": "r", "metadata": {}}
+                orders_module._quote_plan_cache_put("K", result)
+                return result
+
+            waiters = [
+                asyncio.ensure_future(
+                    orders_module._quote_plan_get_or_compute("K", producer)
+                )
+                for _ in range(4)
+            ]
+            await asyncio.sleep(0)  # let all four register/await the shared task
+            gate.set()
+            return await asyncio.gather(*waiters)
+
+        results = asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1)  # producer ran exactly once for 4 callers
+        self.assertTrue(all(r["delivered"] == 42 for r in results))
+        # Registry cleaned up after completion.
+        self.assertNotIn("K", orders_module._QUOTE_PLAN_INFLIGHT)
+
+    def test_second_caller_after_completion_hits_cache_not_producer(self):
+        """Once the producer has run and cached, a later call for the same key
+        returns from cache without re-running the producer."""
+        import asyncio
+
+        calls = {"n": 0}
+
+        async def scenario():
+            async def producer():
+                calls["n"] += 1
+                result = {"delivered": 5, "gas_units": 0, "route": "", "metadata": {}}
+                orders_module._quote_plan_cache_put("K", result)
+                return result
+
+            first = await orders_module._quote_plan_get_or_compute("K", producer)
+            second = await orders_module._quote_plan_get_or_compute("K", producer)
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(first["delivered"], 5)
+        self.assertEqual(second["delivered"], 5)
+
+    def test_negative_entry_expires_on_short_ttl_while_positive_survives(self):
+        """A degraded (``_negative``) result must clear on the short NEG_TTL so a
+        transient failure can't pin a zero quote for the full window; a positive
+        result at the same age survives."""
+        o = orders_module
+        o._quote_plan_cache_put("pos", {"delivered": 1})
+        o._quote_plan_cache_put("neg", {"delivered": 0, "_negative": True})
+        # Backdate both by an age between NEG_TTL (3s) and the full TTL (12s).
+        age = (o._QUOTE_PLAN_NEG_TTL + o._QUOTE_PLAN_CACHE_TTL) / 2.0
+        for k in ("pos", "neg"):
+            ts, val = o._QUOTE_PLAN_CACHE[k]
+            o._QUOTE_PLAN_CACHE[k] = (ts - age, val)
+        self.assertIsNotNone(o._quote_plan_cache_get("pos"))  # positive still valid
+        self.assertIsNone(o._quote_plan_cache_get("neg"))     # negative expired
+
+    def test_eviction_drops_oldest_entry_not_whole_cache(self):
+        """Overflowing the cap must evict only the OLDEST-inserted entry, not
+        wipe every hot entry (the old clear-all behaviour)."""
+        o = orders_module
+        prev_max = o._QUOTE_PLAN_CACHE_MAX
+        o._QUOTE_PLAN_CACHE_MAX = 3
+        try:
+            for k in ("a", "b", "c"):
+                o._quote_plan_cache_put(k, {"delivered": 1})
+            o._quote_plan_cache_put("d", {"delivered": 1})  # over cap → evict "a"
+            self.assertEqual(set(o._QUOTE_PLAN_CACHE), {"b", "c", "d"})
+        finally:
+            o._QUOTE_PLAN_CACHE_MAX = prev_max
+
+
+class TestQuoteForkPin(unittest.TestCase):
+    """The quote fork-pin: a per-chain pin cache with a short TTL, and the
+    simulator's pin_only no-op that reuses the fork when already at the block."""
+
+    def setUp(self):
+        orders_module._QUOTE_FORK_PIN.clear()
+
+    def tearDown(self):
+        orders_module._QUOTE_FORK_PIN.clear()
+
+    def test_pin_get_put_and_ttl_expiry(self):
+        o = orders_module
+        self.assertIsNone(o._quote_fork_pin_get(1))
+        o._quote_fork_pin_put(1, 21_000_000)
+        self.assertEqual(o._quote_fork_pin_get(1), 21_000_000)
+        # Backdate past the TTL → expires.
+        ts, blk = o._QUOTE_FORK_PIN[1]
+        o._QUOTE_FORK_PIN[1] = (ts - (o._QUOTE_FORK_PIN_TTL + 1.0), blk)
+        self.assertIsNone(o._quote_fork_pin_get(1))
+        self.assertNotIn(1, o._QUOTE_FORK_PIN)  # expired entry evicted on read
+
+    def test_reset_fork_for_sim_skips_refork_when_pinned_at_block(self):
+        """pin_only + fork already at the block → NO re-fork (reuse warm fork).
+        This is the "run a quote without a re-fork" fast path; isolation is still
+        the snapshot/revert bracket, not this call."""
+        from minotaur_subnet.simulator.anvil_simulator import AnvilSimulator
+
+        sim = AnvilSimulator.__new__(AnvilSimulator)  # bypass __init__ (no anvil)
+        sim.w3 = SimpleNamespace(eth=SimpleNamespace(block_number=21_000_500))
+        reset_calls: list = []
+        sim._reset_fork = lambda block_number=None: reset_calls.append(block_number)
+
+        # Already at the pinned block → skip.
+        sim._reset_fork_for_sim(21_000_500, pin_only=True)
+        self.assertEqual(reset_calls, [])
+
+        # Block mismatch → re-fork to the pinned block (once).
+        sim._reset_fork_for_sim(21_000_999, pin_only=True)
+        self.assertEqual(reset_calls, [21_000_999])
+
+    def test_reset_fork_for_sim_always_reforks_without_pin_only(self):
+        """Scoring / order-processing path (pin_only=False) ALWAYS re-forks —
+        byte-for-byte unchanged even when the fork is already at the block."""
+        from minotaur_subnet.simulator.anvil_simulator import AnvilSimulator
+
+        sim = AnvilSimulator.__new__(AnvilSimulator)
+        sim.w3 = SimpleNamespace(eth=SimpleNamespace(block_number=21_000_500))
+        reset_calls: list = []
+        sim._reset_fork = lambda block_number=None: reset_calls.append(block_number)
+
+        sim._reset_fork_for_sim(21_000_500, pin_only=False)  # same block, no pin
+        sim._reset_fork_for_sim(None, pin_only=False)        # head re-fork
+        self.assertEqual(reset_calls, [21_000_500, None])
 
 
 if __name__ == "__main__":
