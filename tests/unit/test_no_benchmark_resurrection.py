@@ -1,13 +1,17 @@
-"""A terminally REJECTED submission must never be resurrected by a late
-benchmark result.
+"""A submission that is terminal-for-round with its token purged (REJECTED or
+WAITLISTED) must never be resurrected by a late benchmark result.
 
-Rotation rejects the slate overflow at round close "regardless of benchmark
+Rotation parks the slate overflow at round close "regardless of benchmark
 progress" and irreversibly purges the private-repo token (memory + encrypted
 sidecar). An in-flight bench finishing after that — or a restart re-benching an
-orphaned round — used to flip REJECTED -> SCORED in ``set_benchmark_result``,
-letting the resurrected record rank (and, under the tie-break ladder, WIN) as
-finalist, certify, and die at relayer-finalize "no token — FAIL-CLOSED"
-(observed live 2026-07-07: 5 consecutive merge_failed round aborts).
+orphaned round — used to flip the terminal status -> SCORED in
+``set_benchmark_result``, letting the resurrected record rank (and, under the
+tie-break ladder, WIN) as finalist, certify, and die at relayer-finalize
+"no token — FAIL-CLOSED" (observed live 2026-07-07: 5 consecutive merge_failed
+round aborts). Rotation moved overflow from ``reject()`` to ``waitlist()`` in
+#620, but the guard kept checking only REJECTED, so the WAITLISTED door
+reopened the class — 2026-07-22 sub_a91b87fdd63e certified then failed to
+merge with no token. The guard now covers both (``_NO_RESURRECTION_STATUSES``).
 
 Three guards close the class (the screening re-queue leg is already covered by
 ``_terminal_during_screening`` / test_screening_respects_rotation_reject):
@@ -85,6 +89,42 @@ def test_rejected_private_token_stays_purged():
     # No resurrection ⇒ the record can never again be selected as a finalist
     # whose merge would need the (gone) token.
     assert store.get(sub.submission_id).status == SubmissionStatus.REJECTED
+    assert store.get_repo_token(sub.submission_id) is None
+
+
+# ── 1b. WAITLISTED (rotation overflow, #620) is likewise not resurrected ──────
+
+
+def test_waitlisted_is_not_resurrected_by_valid_bench():
+    # The exact 2026-07-22 chimera: rotation waitlists the overflow (purging the
+    # token), then an in-flight/replayed bench completes valid. Must NOT flip to
+    # SCORED, or it becomes a token-less finalist that certifies then FAIL-CLOSEs.
+    store, sub = _store_with_sub()
+    store.waitlist(
+        sub.submission_id, ROTATION_REASON,
+        outcome_code="rotation_not_selected", position=14, contenders=18, slots=3,
+    )
+    store.set_benchmark_result(sub.submission_id, valid=True, details=_VALID_DETAILS)
+
+    fresh = store.get(sub.submission_id)
+    assert fresh.status == SubmissionStatus.WAITLISTED       # not resurrected
+    assert fresh.outcome_code == "rotation_not_selected"     # loser fossil intact
+    assert fresh.waitlist["position"] == 14                  # context preserved
+    assert fresh.benchmark_details == _VALID_DETAILS         # score still recorded
+
+
+def test_waitlisted_private_token_stays_purged_no_tokenless_finalist():
+    store, sub = _store_with_sub(repo_token="ghp_secret", is_private=True,
+                                 private_repo_full="m/r")
+    assert store.get_repo_token(sub.submission_id) == "ghp_secret"
+    store.waitlist(
+        sub.submission_id, ROTATION_REASON,
+        outcome_code="rotation_not_selected", position=14, contenders=18, slots=3,
+    )
+    assert store.get_repo_token(sub.submission_id) is None   # waitlist purged it
+    store.set_benchmark_result(sub.submission_id, valid=True, details=_VALID_DETAILS)
+    # No resurrection ⇒ never re-enters the finalist pool with a token it lost.
+    assert store.get(sub.submission_id).status == SubmissionStatus.WAITLISTED
     assert store.get_repo_token(sub.submission_id) is None
 
 
