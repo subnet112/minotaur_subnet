@@ -94,6 +94,15 @@ class TestSafeExtractTar:
         data = _make_tar({"big": b"x" * 1024})
         assert sp._safe_extract_tar(data, str(tmp_path)) is False
 
+    def test_member_count_cap_rejects_inode_bomb(self, tmp_path, monkeypatch):
+        # Many ZERO-byte files pass the byte cap (total size ~0) but would exhaust
+        # inodes on extract — the member-count cap must reject them.
+        monkeypatch.setattr(sp, "MAX_CLONE_TAR_MEMBERS", 10)
+        data = _make_tar({f"f{i}": b"" for i in range(25)})
+        assert sp._safe_extract_tar(data, str(tmp_path)) is False
+        # a normal small tree is unaffected
+        assert sp._safe_extract_tar(_make_tar({"solver.py": b"x"}), str(tmp_path)) is True
+
 
 class TestCloneDispatch:
     @pytest.mark.asyncio

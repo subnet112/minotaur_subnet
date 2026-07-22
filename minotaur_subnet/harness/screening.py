@@ -617,6 +617,35 @@ def _solver_build_command(image_tag: str, repo_path: str) -> list[str]:
     ]
 
 
+def _solver_exec_command(image_tag: str, script: str) -> list[str]:
+    """``docker run`` argv for EXECUTING untrusted solver code (the stage-2
+    import + init checks — the FIRST place a submission's Python actually runs).
+
+    Historically these ran with ``--network=none --read-only`` + mem/cpu caps but
+    WITHOUT ``--cap-drop``/``--no-new-privileges``/``--pids-limit`` — so the
+    least-isolated point in the whole pipeline was the one that first executes
+    untrusted module-level + ``initialize()`` code. This mirrors the hardening
+    ``orchestrator.DOCKER_SECURITY_OPTS`` already applies to the benchmark/live
+    runs of the SAME solver: since the solver tolerates these at bench, it
+    tolerates them here (import + initialize({}) needs no capability/fork/privesc).
+    ``--cap-drop=ALL`` + ``--no-new-privileges`` shrink an escape's blast radius;
+    ``--pids-limit`` bounds a fork bomb during init (legacy ``docker build`` has
+    no pids cap — see ``_solver_build_command`` — so this is where it lands).
+    """
+    return [
+        "docker", "run", "--rm",
+        "--network=none", "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--pids-limit=256",
+        "--tmpfs=/tmp:size=64m",
+        "--memory=2g", "--cpus=1.0",
+        "--entrypoint", "python",
+        image_tag,
+        "-c", script,
+    ]
+
+
 # Global bound on concurrent stage-2 runs (docker build + import/init
 # containers). Submission intake spawns one screening pipeline per submission
 # with NO concurrency cap, so a submission burst used to run N builds at once:
@@ -743,18 +772,11 @@ async def _run_stage_2_locked(
             error_code="entrypoint_overridden",
         )
 
-    # Step 2: Import check
-    # Override entrypoint since the base image sets it to the harness runner
-    import_cmd = [
-        "docker", "run", "--rm",
-        "--network=none", "--read-only",
-        "--tmpfs=/tmp:size=64m",
-        "--memory=2g", "--cpus=1.0",
-        "--entrypoint", "python",
+    # Step 2: Import check (hardened exec — the first place solver code runs)
+    import_cmd = _solver_exec_command(
         image_tag,
-        "-c",
         "from solver import SOLVER_CLASS; print(f'OK: {SOLVER_CLASS.__name__}')",
-    ]
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -796,15 +818,7 @@ async def _run_stage_2_locked(
         "print(json.dumps({'name': m.name, 'version': m.version, 'types': m.supported_intent_types}))"
     )
 
-    init_cmd = [
-        "docker", "run", "--rm",
-        "--network=none", "--read-only",
-        "--tmpfs=/tmp:size=64m",
-        "--memory=2g", "--cpus=1.0",
-        "--entrypoint", "python",
-        image_tag,
-        "-c", init_script,
-    ]
+    init_cmd = _solver_exec_command(image_tag, init_script)
 
     try:
         proc = await asyncio.create_subprocess_exec(
