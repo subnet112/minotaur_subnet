@@ -21,6 +21,8 @@ import subprocess
 import time
 from typing import Any
 
+from minotaur_subnet.chains import registry
+from minotaur_subnet.harness import solver_read_proxy as _srp
 from minotaur_subnet.harness.orchestrator import (
     SolverCrashedError,
     SolverOrchestrator,
@@ -145,12 +147,24 @@ class DockerRuntimeSolver:
         chain_ids: list[int] | None = None,
         rpc_urls: dict[int, str] | None = None,
         bridge_registry: Any = None,
+        live_proxy_cfg: Any = None,
+        live_proxy_session_id: str | None = None,
+        rpc_overrides: dict[int, str] | None = None,
     ) -> None:
         self._session = session
         self._image_ref = image_ref
         self._metadata = metadata
         self._lock = asyncio.Lock()
         self._closed = False
+        # BLIND: when the live champion routes RPC through the keyless metered
+        # proxy, hold the session handle so every order can (a) reset the proxy
+        # budget (per-order metering, BLIND-3) and (b) close it on shutdown.
+        # None => the champion uses direct RPC (feature off). rpc_overrides are the
+        # keyless proxy URLs re-applied as -e *_RPC_URL on respawn so the container
+        # never re-acquires the keyed URL after a crash.
+        self._live_proxy_cfg = live_proxy_cfg
+        self._live_proxy_session_id = live_proxy_session_id
+        self._init_rpc_overrides = dict(rpc_overrides) if rpc_overrides else None
         # Best-effort cleanup on ungraceful shutdown (sys.exit, SIGTERM
         # caught by the Python runtime). SIGKILL will bypass this — the
         # next api boot reaps orphans via _reap_orphan_live_solvers().
@@ -222,6 +236,56 @@ class DockerRuntimeSolver:
         # container as a benchmark sandbox and bake unreachable
         # BENCHMARK_ANVIL_RPC_* IPs into its environment.
         live_network = os.environ.get("LIVE_SOLVER_NETWORK", "").strip()
+
+        # BLIND (keyless + metered live RPC): route the champion's reads through
+        # the trusted proxy on the dedicated live-solver internal net, so the
+        # untrusted container holds NO provider API key and can reach nothing but
+        # the proxy. Opt-in + FAIL-SAFE: live_read_proxy_config() returns None
+        # unless the feature is enabled AND read_proxy_manager has attached the
+        # proxy to the live net — otherwise we keep the direct (keyed) RPC path.
+        live_cfg = _srp.live_read_proxy_config()
+        live_session_id: str | None = None
+        rpc_overrides: dict[int, str] | None = None
+        if live_cfg is not None:
+            # Unique per runtime: a shared id would let the displaced champion's
+            # shutdown() close the session its successor just opened (hot-swap
+            # overlaps the two runtimes) — see new_live_session_id.
+            live_session_id = _srp.new_live_session_id()
+            try:
+                # blocks={} => byte-transparent HEAD reads (a live champion needs
+                # latest state, not a pinned fork); budget>0 => enforce, giving the
+                # per-order RPC cap (reset before each order in _call_with_respawn).
+                await _srp.open_session(live_cfg, live_session_id, {})
+                proxy_rpc = {
+                    cid: _srp.proxy_rpc_url(live_cfg, live_session_id, cid)
+                    for cid in chain_ids
+                    if cid in _srp.CHAIN_NAMES
+                    # 31337 shares the "eth" proxy slug — routing it through the
+                    # proxy would silently repoint the champion's LOCAL anvil
+                    # chain at Ethereum mainnet. Local chains keep direct RPC.
+                    and not ((_s := registry.spec(cid)) is not None and _s.is_local)
+                }
+                if proxy_rpc:
+                    rpc_urls = {**rpc_urls, **proxy_rpc}  # init_cfg: keyless URLs
+                    rpc_overrides = proxy_rpc              # -e *_RPC_URL: keyless too
+                    # Land the champion on the SAME dedicated internal net the
+                    # proxy is attached to, so it reaches the keyless proxy (and
+                    # nothing else). Explicit LIVE_SOLVER_NETWORK still wins.
+                    if not live_network:
+                        live_network = _srp.LIVE_SOLVER_NETWORK_DEFAULT
+                    logger.info(
+                        "Live champion RPC routed through keyless metered proxy "
+                        "(budget=%d, chains=%s)", live_cfg.budget, sorted(proxy_rpc),
+                    )
+                else:  # no routable chain -> disable, keep direct RPC
+                    live_cfg, live_session_id = None, None
+            except Exception as exc:  # noqa: BLE001 - never block boot on the proxy
+                logger.error(
+                    "Live RPC proxy setup failed (%s) — falling back to direct RPC",
+                    exc,
+                )
+                live_cfg, live_session_id, rpc_overrides = None, None, None
+
         saved_production = os.environ.get("MINOTAUR_PRODUCTION")
         os.environ["MINOTAUR_PRODUCTION"] = "1"
         try:
@@ -229,11 +293,14 @@ class DockerRuntimeSolver:
             # live=True disables the total session timeout (600s) AND tells
             # the orchestrator to skip BENCHMARK_ANVIL_RPC_* env-var
             # overrides — the live container runs on the production
-            # network where those sandbox IPs are unreachable.
+            # network where those sandbox IPs are unreachable. rpc_overrides
+            # (when the proxy is on) forwards the KEYLESS proxy URLs as
+            # -e *_RPC_URL, so no keyed BASE_RPC_URL ever reaches the container.
             session = await orchestrator.start_docker(
                 image_ref,
                 live=True,
                 network=live_network or None,
+                rpc_overrides=rpc_overrides,
                 labels={
                     LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE,
                     LIVE_SOLVER_LAUNCHER_KEY: _live_solver_launcher_id(),
@@ -273,6 +340,9 @@ class DockerRuntimeSolver:
             chain_ids=chain_ids,
             rpc_urls=rpc_urls,
             bridge_registry=bridge_registry,
+            live_proxy_cfg=live_cfg,
+            live_proxy_session_id=live_session_id,
+            rpc_overrides=rpc_overrides,
         )
 
     async def _respawn_session(self) -> None:
@@ -290,6 +360,9 @@ class DockerRuntimeSolver:
         the runtime; champion image_ref hasn't changed).
         """
         live_network = os.environ.get("LIVE_SOLVER_NETWORK", "").strip()
+        # Keep a proxy-routed champion on its dedicated internal net across respawns.
+        if self._live_proxy_cfg is not None and not live_network:
+            live_network = _srp.LIVE_SOLVER_NETWORK_DEFAULT
         saved_production = os.environ.get("MINOTAUR_PRODUCTION")
         os.environ["MINOTAUR_PRODUCTION"] = "1"
         try:
@@ -298,6 +371,9 @@ class DockerRuntimeSolver:
                 self._image_ref,
                 live=True,
                 network=live_network or None,
+                # Re-apply the keyless proxy URLs (when the feature is on) so a
+                # respawned container never falls back to the keyed BASE_RPC_URL.
+                rpc_overrides=self._init_rpc_overrides,
                 labels={
                     LIVE_SOLVER_LABEL_KEY: LIVE_SOLVER_LABEL_VALUE,
                     LIVE_SOLVER_LAUNCHER_KEY: _live_solver_launcher_id(),
@@ -395,6 +471,34 @@ class DockerRuntimeSolver:
         """
         async with self._lock:
             await self._ensure_session_alive()
+            # Per-order RPC metering (BLIND-3): reset the proxy budget to 0 before
+            # each order so it bounds ONE order, not the champion's lifetime. Under
+            # the lock, so calls are serialized and a reset can't zero a concurrent
+            # order's budget. Best-effort — a failed reset only makes the next cap
+            # stricter (carried-over spend), never silently looser.
+            if self._live_proxy_cfg is not None:
+                ok = await _srp.reset_session(
+                    self._live_proxy_cfg, self._live_proxy_session_id
+                )
+                if not ok:
+                    # The session may be GONE, not just unreachable: a proxy
+                    # container restart drops its in-memory registry, after which
+                    # reads fall to the proxy's anon observe bucket — still
+                    # keyless, but UNMETERED. Re-open (open-or-replace, same
+                    # blocks={} head semantics) to restore enforcement.
+                    try:
+                        await _srp.open_session(
+                            self._live_proxy_cfg, self._live_proxy_session_id, {}
+                        )
+                        logger.info(
+                            "Live RPC proxy session %s re-opened after failed reset",
+                            self._live_proxy_session_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - metering is best-effort
+                        logger.warning(
+                            "Live RPC proxy session %s re-open failed: %s",
+                            self._live_proxy_session_id, exc,
+                        )
             try:
                 return await coro_factory()
             except (SolverCrashedError, SolverTimeoutError) as exc:
@@ -465,4 +569,6 @@ class DockerRuntimeSolver:
         self._closed = True
         async with self._lock:
             await self._session.shutdown()
+            if self._live_proxy_cfg is not None:
+                await _srp.close_session(self._live_proxy_cfg, self._live_proxy_session_id)
         logger.info("Champion runtime stopped (%s)", self._image_ref)
