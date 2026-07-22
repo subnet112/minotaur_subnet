@@ -30,8 +30,10 @@ DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
 # bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
 MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 
+from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
+    OUTCOME_COPYCAT_CODE,
     SubmissionStatus,
     offload_write,
 )
@@ -142,6 +144,112 @@ def _max_rounds_per_fingerprint() -> int:
         return int(raw)
     except ValueError:
         return 2
+
+
+def _reject_cross_actor_copies() -> bool:
+    """Cross-ACTOR identical-code reject (``SUBMISSIONS_REJECT_CROSS_ACTOR_FP``,
+    default on; 0 disables).
+
+    The EARLIEST submitter of a normalized fingerprint owns it; a submission
+    of the same fingerprint whose actor (harness/actor.py — on-chain coldkey)
+    determinately differs from the owner's is rejected at stage 1, before it
+    can cost a build unit or a slate seat. Unlike the benched-rounds quota
+    below this needs no benches to arm, so five UIDs shipping one tree in one
+    round lose four copies immediately. The rule only ever acts on POSITIVE
+    coldkey attribution: same-actor resubmits pass (the waitlist resubmit
+    loop is the designed no-fault path — rejecting it is the false-positive
+    trap the 2026-07-22 audit measured at 41.8% of serious-miner
+    submissions), and unmapped hotkeys / no coldkey data / the
+    SOLVER_ACTOR_KEY=hotkey kill-switch make the check stand down rather than
+    guess. Leader-local intake policy, like every cap here.
+    """
+    return _env_true("SUBMISSIONS_REJECT_CROSS_ACTOR_FP", default=True)
+
+
+# Statuses the retroactive copy sweep may reject: pre-bench only. A copy that
+# already reached the bench (BENCHMARKING/SCORED/ADOPTED) is the slate's
+# problem — rejecting it mid-bench would bust slate-width accounting — and
+# terminal states are already out of the running.
+_SWEEPABLE_STATUSES = frozenset({
+    "queued",
+    "screening_stage_1",
+    "screening_stage_2",
+    "screening_stage_3",
+    "pending_selection",
+})
+
+
+def evaluate_fingerprint_ownership(
+    entries: list[tuple[str, float, str, str]],
+    *,
+    submission_id: str,
+    hotkey: str,
+    created_at: float,
+    resolver: Any,
+) -> tuple[tuple[str, float, str, str] | None, list[str]]:
+    """Who owns this fingerprint, and which in-flight copies to sweep.
+
+    ``entries`` are ``(hotkey, created_at, submission_id, status)`` for every
+    OTHER submission carrying the fingerprint. Returns ``(owner_prior,
+    sweep_ids)``:
+
+    * ``owner_prior`` — the entry proving ANOTHER actor owns the fingerprint
+      (the globally-earliest submitter by ``(created_at, submission_id)``),
+      meaning THIS submission is a copy and must be rejected. None when this
+      submission's actor owns the fingerprint (first submitter, or a
+      same-actor sibling of it).
+    * ``sweep_ids`` — when (and only when) this submission's actor is
+      determinately the owner: ids of OTHER actors' pre-bench copies to
+      reject retroactively. This closes the concurrent-copy race: two copies
+      screening simultaneously can each miss the other's not-yet-persisted
+      fingerprint, but whichever check runs LAST sees the full picture and
+      sweeps the escapee — ordering alone cannot, because visibility (not
+      creation order) decides which check sees what.
+
+    Actor comparison is STRICT: same hotkey => same actor; otherwise both
+    hotkeys must be coldkey-MAPPED to be called different. An unmapped hotkey
+    (deregistered original, pre-sync map) is INDETERMINATE — never a reject,
+    never a sweep. Degraded attribution must degrade to allowing, not to
+    terminally rejecting the rightful owner's resubmit.
+    """
+    def _same_actor(hk_a: str, hk_b: str) -> bool | None:
+        """True/False on positive attribution, None when indeterminate."""
+        if (hk_a or "") == (hk_b or ""):
+            return True
+        ck_a, ck_b = resolver.mapped(hk_a), resolver.mapped(hk_b)
+        if ck_a is None or ck_b is None:
+            return None
+        return ck_a == ck_b
+
+    my_order = (float(created_at or 0.0), submission_id)
+    earliest: tuple[str, float, str, str] | None = None
+    for entry in entries:
+        if earliest is None or (entry[1], entry[2]) < (earliest[1], earliest[2]):
+            earliest = entry
+
+    if earliest is None or (earliest[1], earliest[2]) > my_order:
+        # I am the fingerprint's first submitter: owner. Sweep other actors'
+        # in-flight copies (all of them — an earlier-created copy that raced
+        # past its own check is still a copy).
+        sweep = [
+            sid for hk, _ts, sid, status in entries
+            if status in _SWEEPABLE_STATUSES and _same_actor(hotkey, hk) is False
+        ]
+        return None, sweep
+
+    owner_same = _same_actor(hotkey, earliest[0])
+    if owner_same is False:
+        return earliest, []
+    if owner_same is True:
+        # Sibling resubmit of my own actor's code: legitimate. Sweep copies
+        # by actors that determinately differ from MINE (== the owner's).
+        sweep = [
+            sid for hk, _ts, sid, status in entries
+            if status in _SWEEPABLE_STATUSES and _same_actor(hotkey, hk) is False
+        ]
+        return None, sweep
+    # Indeterminate owner (unmapped hotkey): stand down entirely.
+    return None, []
 
 
 def _cleanup_temp_file(path: str | None) -> None:
@@ -970,6 +1078,79 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s1.passed:
             return  # set_screening_result already rejected
 
+        # Fingerprint checks, ONE store scan for both: (a) the cross-ACTOR
+        # copy reject — the earliest submitter owns the fingerprint, copies by
+        # other actors reject pre-build, and in-flight copies that raced past
+        # their own check get swept retroactively; (b) the benched-rounds
+        # quota. Both leader-local admission control.
+        fp_cap = _max_rounds_per_fingerprint()
+        reject_copies = _reject_cross_actor_copies()
+        benched = 0
+        if s1.content_fingerprint and (fp_cap > 0 or reject_copies):
+            submitters, benched = store.fingerprint_usage(
+                s1.content_fingerprint, exclude_submission_id=submission_id,
+            )
+            resolver = snapshot_resolver() if reject_copies else None
+            if reject_copies and resolver is None:
+                logger.debug(
+                    "cross-actor copy reject standing down for %s: no coldkey "
+                    "attribution available (kill-switch or map not loaded)",
+                    submission_id,
+                )
+            if resolver is not None:
+                owner_prior, sweep_ids = evaluate_fingerprint_ownership(
+                    submitters,
+                    submission_id=submission_id,
+                    hotkey=sub.hotkey or "",
+                    created_at=float(sub.created_at or 0.0),
+                    resolver=resolver,
+                )
+                if owner_prior is not None:
+                    await offload_write(store.reject,
+                        submission_id,
+                        (
+                            f"identical code (normalized fingerprint "
+                            f"{s1.content_fingerprint[:12]}…) was first submitted "
+                            f"by another miner — a copy adds nothing to the "
+                            f"corpus and is not eligible for benchmarking. "
+                            f"Comment, whitespace, docstring and rename edits do "
+                            f"not make code yours; submit your own solver logic "
+                            f"to participate."
+                        ),
+                        outcome_code=OUTCOME_COPYCAT_CODE,
+                    )
+                    logger.info(
+                        "Submission %s rejected as cross-actor copy: fp %s first "
+                        "submitted by %s (hotkey %s, map=%s)",
+                        submission_id, s1.content_fingerprint[:12],
+                        owner_prior[2], (owner_prior[0] or "")[:12],
+                        resolver.source,
+                    )
+                    return
+                for late_sid in sweep_ids:
+                    try:
+                        await offload_write(store.reject,
+                            late_sid,
+                            (
+                                f"identical code (normalized fingerprint "
+                                f"{s1.content_fingerprint[:12]}…) was first "
+                                f"submitted by another miner — a copy adds "
+                                f"nothing to the corpus and is not eligible "
+                                f"for benchmarking."
+                            ),
+                            outcome_code=OUTCOME_COPYCAT_CODE,
+                        )
+                        logger.info(
+                            "Swept in-flight cross-actor copy %s of fp %s "
+                            "(owner submission %s)",
+                            late_sid, s1.content_fingerprint[:12], submission_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Sweeping cross-actor copy %s failed (ignored)",
+                            late_sid, exc_info=True,
+                        )
+
         # Cross-hotkey resubmit quota on the NORMALIZED identity. The
         # per-(hotkey, commit) cap keys on the git SHA — refreshed for free by
         # a nonce comment — and gives each sybil hotkey its own allowance for
@@ -979,11 +1160,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # a capped resubmit never costs a Docker build or a bench slot.
         # Operator-local admission control (leader gateway), like the other
         # submission caps — not fleet-consensus.
-        fp_cap = _max_rounds_per_fingerprint()
         if fp_cap > 0 and s1.content_fingerprint:
-            benched = store.count_benched_rounds_for_fingerprint(
-                s1.content_fingerprint, exclude_submission_id=submission_id,
-            )
             if benched >= fp_cap:
                 await offload_write(store.reject,
                     submission_id,

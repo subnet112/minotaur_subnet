@@ -131,6 +131,7 @@ class SubmissionStatus(str, Enum):
 OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
 OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
 OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
+OUTCOME_COPYCAT_CODE = "copycat_code"  # identical code first submitted by ANOTHER actor
 OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
 OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
 OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
@@ -1056,6 +1057,49 @@ class SubmissionStore:
             if sub.status in BENCHED_STATUSES and sub.round_id:
                 rounds.add(sub.round_id)
         return len(rounds)
+
+    def fingerprint_usage(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> tuple[list[tuple[str, float, str, str]], int]:
+        """One pass over the store for everything the screening fingerprint
+        checks need: ``(submitters, benched_round_count)``.
+
+        ``submitters`` is ``(hotkey, created_at, submission_id, status_value)``
+        for every submission carrying this normalized fingerprint — ANY
+        status, ANY round. Any-status scope on purpose (unlike the
+        benched-rounds quota): the cross-actor copy reject must see a copy
+        that is merely in flight, or identical code from N actors flows until
+        one of them benches. The submission_id makes first-submitter ordering
+        total even on a created_at tie.
+
+        ``benched_round_count`` mirrors
+        :meth:`count_benched_rounds_for_fingerprint` exactly (distinct rounds,
+        BENCHED statuses only) — bundled here so the screening pipeline scans
+        the store once, not twice, per submission.
+        """
+        self._maybe_reload()
+        submitters: list[tuple[str, float, str, str]] = []
+        benched_rounds: set[str] = set()
+        for sub in self._submissions.values():
+            if sub.content_fingerprint != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            status = getattr(sub.status, "value", None) or str(sub.status or "")
+            submitters.append(
+                (
+                    sub.hotkey or "",
+                    float(sub.created_at or 0.0),
+                    sub.submission_id,
+                    str(status),
+                ),
+            )
+            if sub.status in BENCHED_STATUSES and sub.round_id:
+                benched_rounds.add(sub.round_id)
+        return submitters, len(benched_rounds)
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
