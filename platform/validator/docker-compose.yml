@@ -169,6 +169,69 @@ services:
     # minotaur ONLY — see anvil-eth. Solver reaches Base state via the pin proxy.
     networks: [minotaur]
 
+  # ── Dedicated /quote forks (opt-in) ───────────────────────────────────────
+  # Byte-identical to anvil-eth / anvil-base (same image, --fork-url slug,
+  # --chain-id, --no-storage-caching) so scoreIntent state + measured gas match
+  # the order forks — but RESERVED for the /quote path so quote sims never queue
+  # behind order-processing on the shared _sim_lock, and the #1026 fork-pin stays
+  # warm (nothing else re-forks these). The api uses them ONLY when
+  # ETH_QUOTE_SIM_RPC_URL / BASE_QUOTE_SIM_RPC_URL are set on the api service
+  # (below); otherwise quotes fall back to the shared order forks. No host-port
+  # publish (would collide with anvil-eth's 127.0.0.1:8545) — reached via container
+  # DNS anvil-eth-quote:8545. Reuse the SINGLE fork-cache (warm shared immutable
+  # cache, zero extra archive CUs). minotaur net ONLY (never the sealed sandbox).
+  anvil-eth-quote:
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8545"
+      - "--fork-url=http://fork-cache:8650/eth"
+      - "--chain-id=1"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-base-quote:
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8546"
+      - "--fork-url=http://fork-cache:8650/base"
+      - "--chain-id=8453"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
   anvil-btevm:
     depends_on:
       - fork-cache
@@ -586,6 +649,14 @@ services:
       BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
       ETH_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
       BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+
+      # Dedicated /quote simulator forks (opt-in) — see the anvil-*-quote services.
+      # When set, quotes run on their OWN anvils (own _sim_lock + own fork) so quote
+      # sims never queue behind order-processing on the shared runner, and the
+      # #1026 fork-pin stays warm. Unset => quotes use the shared order forks
+      # (behaviour byte-unchanged). Order-processing/scoring never use these.
+      ETH_QUOTE_SIM_RPC_URL: http://anvil-eth-quote:8545
+      BASE_QUOTE_SIM_RPC_URL: http://anvil-base-quote:8546
 
       # Upstream RPCs for refork-time state
       ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"

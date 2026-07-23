@@ -781,5 +781,121 @@ class TestQuoteForkPin(unittest.TestCase):
         self.assertEqual(reset_calls, [21_000_500, None])
 
 
+def _dedicated_quote_runner(chain_ids, connected=True):
+    """A fake DEDICATED quote runner: a spying _FakeSimRunner whose .simulator
+    exposes a per-chain simulators map (each with is_connected()), matching the
+    real MultiChainSimulator shape the get_quote runner-pick gate probes."""
+    r = _FakeSimRunner()
+    r.simulator = SimpleNamespace(
+        current_fork_block=lambda chain_id=None: 21_000_000,
+        simulators={
+            cid: SimpleNamespace(is_connected=lambda c=connected: c) for cid in chain_ids
+        },
+    )
+    return r
+
+
+class TestDedicatedQuoteRunner(unittest.TestCase):
+    """get_quote prefers the OPT-IN dedicated quote runner ONLY when it has a
+    connected per-chain sim for the request chain, else falls back to the shared
+    (order) runner — never changing the order path's runner object."""
+
+    def setUp(self):
+        self._prev_rl = os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE")
+        os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = "0"
+        orders_module.set_js_engine(None)
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
+        orders_module.set_quote_sim_runner(None)
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self):
+        orders_module.set_block_loop(None)
+        orders_module.set_app_store(None)
+        orders_module.set_quote_sim_runner(None)
+        orders_module._QUOTE_PLAN_CACHE.clear()
+        orders_module._QUOTE_PLAN_INFLIGHT.clear()
+        orders_module._QUOTE_FORK_PIN.clear()
+        if self._prev_rl is None:
+            os.environ.pop("QUOTE_RATE_LIMIT_PER_MINUTE", None)
+        else:
+            os.environ["QUOTE_RATE_LIMIT_PER_MINUTE"] = self._prev_rl
+
+    def _wire(self, shared, dedicated):
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(
+            SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=shared)
+        )
+        orders_module.set_quote_sim_runner(dedicated)
+
+    def _post(self):
+        return self.client.post(
+            "/v1/apps/testapp/quote",
+            json={"intent_function": "swap", "chain_id": _CHAIN,
+                  "params": {"input_token": _USDC, "output_token": _DONALDPUMP,
+                             "input_amount": "1000000000"}},
+        )
+
+    def test_no_dedicated_runner_uses_shared(self):
+        shared = _FakeSimRunner()
+        self._wire(shared, None)
+        self.assertEqual(self._post().status_code, 200)
+        self.assertEqual(len(shared.calls), 1)  # opt-out: shared runner did the sim
+
+    def test_dedicated_used_for_matching_connected_chain(self):
+        shared = _FakeSimRunner()
+        dedicated = _dedicated_quote_runner([_CHAIN], connected=True)  # _CHAIN == 8453
+        self._wire(shared, dedicated)
+        self.assertEqual(self._post().status_code, 200)
+        self.assertEqual(len(dedicated.calls), 1)   # dedicated ran the quote sim
+        self.assertEqual(len(shared.calls), 0)      # order runner untouched
+
+    def test_dedicated_missing_chain_falls_back(self):
+        shared = _FakeSimRunner()
+        dedicated = _dedicated_quote_runner([1], connected=True)  # only chain 1; quote is 8453
+        self._wire(shared, dedicated)
+        self.assertEqual(self._post().status_code, 200)
+        self.assertEqual(len(shared.calls), 1)      # fell back (direct per-chain lookup)
+        self.assertEqual(len(dedicated.calls), 0)
+
+    def test_dedicated_disconnected_falls_back(self):
+        shared = _FakeSimRunner()
+        dedicated = _dedicated_quote_runner([_CHAIN], connected=False)  # right chain, down
+        self._wire(shared, dedicated)
+        self.assertEqual(self._post().status_code, 200)
+        self.assertEqual(len(shared.calls), 1)      # is_connected() False → shared
+        self.assertEqual(len(dedicated.calls), 0)
+
+    def test_order_runner_object_identity_unchanged(self):
+        shared = _FakeSimRunner()
+        dedicated = _dedicated_quote_runner([_CHAIN], connected=True)
+        bl = SimpleNamespace(solver=_FakeSolver(quote_zero=False), _simulation_runner=shared)
+        orders_module.set_app_store(_FakeStore())
+        orders_module.set_block_loop(bl)
+        orders_module.set_quote_sim_runner(dedicated)
+        self.assertEqual(self._post().status_code, 200)
+        self.assertIs(bl._simulation_runner, shared)  # order path never rebound
+
+
+class TestQuoteSimRegistry(unittest.TestCase):
+    """The quote_sim_rpc resolver is the opt-in gate: empty env → no dedicated fork."""
+
+    def test_quote_sim_rpc_resolver(self):
+        from minotaur_subnet.chains import registry
+        prev = os.environ.pop("BASE_QUOTE_SIM_RPC_URL", None)
+        try:
+            self.assertEqual(registry.quote_sim_rpc(8453), "")  # unset → no dedicated fork
+            os.environ["BASE_QUOTE_SIM_RPC_URL"] = "http://anvil-base-quote:8546"
+            self.assertEqual(registry.quote_sim_rpc(8453), "http://anvil-base-quote:8546")
+            # NO fallback to the shared order anvil envs (the aliasing footgun).
+            self.assertEqual(registry.quote_sim_rpc(31337), "")
+        finally:
+            if prev is None:
+                os.environ.pop("BASE_QUOTE_SIM_RPC_URL", None)
+            else:
+                os.environ["BASE_QUOTE_SIM_RPC_URL"] = prev
+
+
 if __name__ == "__main__":
     unittest.main()
