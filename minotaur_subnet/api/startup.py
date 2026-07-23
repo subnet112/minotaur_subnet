@@ -527,6 +527,50 @@ def _build_simulator():
         return None
 
 
+def _build_quote_simulator():
+    """Build a DEDICATED MultiChainSimulator for the /quote path over the
+    ``*_QUOTE_SIM_RPC_URL`` anvils, or None when none is configured (then quotes
+    use the shared order simulator — behaviour byte-unchanged).
+
+    Same shape as :func:`_build_simulator` but pointed at the quote anvils, and it
+    FAIL-CLOSES if a quote fork is aliased to a SHARED order anvil: two
+    AnvilSimulator instances over one anvil process each hold their OWN _sim_lock,
+    so their evm_snapshot/evm_revert interleave and silently corrupt each other's
+    scoreIntent. The dedicated fork MUST be a distinct anvil-*-quote container.
+    """
+    from minotaur_subnet.chains import wiring as chain_wiring
+    quote_rpc_urls: dict[int, str] = chain_wiring.quote_sim_rpc_urls()
+    if not quote_rpc_urls:
+        return None
+    from urllib.parse import urlsplit
+    for cid, url in quote_rpc_urls.items():
+        try:
+            host = urlsplit(url).hostname or ""
+        except (ValueError, TypeError):
+            host = ""
+        if host in _SHARED_API_FORK_HOSTS:
+            logger.error(
+                "Dedicated quote fork for chain %s points at a SHARED order anvil "
+                "(%s) — refusing to build it (would corrupt both sims via "
+                "interleaved snapshot/revert). Point *_QUOTE_SIM_RPC_URL at a "
+                "DISTINCT anvil-*-quote container.",
+                cid, url,
+            )
+            return None
+    upstream_rpc_urls: dict[int, str] = chain_wiring.upstream_rpc_urls()
+    try:
+        from minotaur_subnet.simulator.anvil_simulator import MultiChainSimulator
+        qsim = MultiChainSimulator(quote_rpc_urls, upstream_rpc_urls=upstream_rpc_urls)
+        logger.info(
+            "Dedicated quote MultiChainSimulator initialized (chains=%s)",
+            list(quote_rpc_urls.keys()),
+        )
+        return qsim
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Dedicated quote simulator unavailable: %s", exc)
+        return None
+
+
 # Compose service names of the api's SHARED simulator forks. The split benchmark
 # worker (BENCHMARK_WORKER_ONLY) MUST fork on its OWN dedicated anvils (…-bench):
 # sharing a fork means both processes evm_snapshot / evm_revert + re-fork the same
@@ -2140,6 +2184,26 @@ async def initialize(ctx: ServerContext) -> dict:
         if order_peer_network is not None:
             ctx.block_loop.set_peer_network(order_peer_network)
         orders.set_block_loop(ctx.block_loop)
+
+        # Dedicated /quote simulator (opt-in): when *_QUOTE_SIM_RPC_URL anvils are
+        # configured, quotes run on their OWN SimulationRunner (own _sim_lock +
+        # own fork) so they never queue behind order-processing on the shared
+        # runner, and the #1026 fork-pin stays warm (nothing else re-forks it).
+        # None => quotes keep using bl._simulation_runner (unchanged). The order
+        # path (ctx.block_loop above) and scoring are never given this runner.
+        try:
+            _quote_simulator = _build_quote_simulator()
+            if _quote_simulator is not None:
+                from minotaur_subnet.blockloop.simulation import SimulationRunner
+                orders.set_quote_sim_runner(
+                    SimulationRunner(
+                        simulator=_quote_simulator,
+                        bridge_registry=bridge_registry,
+                    )
+                )
+                logger.info("Dedicated /quote SimulationRunner wired")
+        except Exception:
+            logger.warning("Dedicated quote runner not wired; quotes use the shared runner", exc_info=True)
 
         # ── solver round coordinator ─────────────────────────────────────
         # Champion consensus init is DECOUPLED from the benchmark worker.
