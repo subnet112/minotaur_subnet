@@ -19,7 +19,9 @@ on SIM_BLOCK_TIMESTAMP_OFFSET).
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 import time
 
 import pytest
@@ -30,10 +32,12 @@ from minotaur_subnet.harness.orchestrator import (
     _build_benchmark_intent_order,
 )
 from minotaur_subnet.shared.types import ExecutionPlan, IntentState
+from minotaur_subnet.shared.types import SimulationResult
 from minotaur_subnet.simulator.anvil_simulator import (
     SIM_BLOCK_TIMESTAMP_OFFSET,
     AnvilSimulator,
     MultiChainSimulator,
+    _sim_offload_enabled,
 )
 
 _APP = "0x0CDe9A7Eb2313662f3E9d64Ab4A6bb0Cf5A4A000"
@@ -192,6 +196,11 @@ def _bare_sim(fork_number=None, fork_ts=None, ts_cache=None) -> AnvilSimulator:
     sim._fork_block_number = fork_number
     sim._fork_block_timestamp = fork_ts
     sim._block_ts_cache = dict(ts_cache or {})
+    # Pre-init the threading locks exactly as __init__ does — the lazy-init in
+    # the accessors is only safe single-threaded (some concurrency tests below
+    # spawn a writer thread), and it mirrors the real object.
+    sim._fork_mutation_lock = threading.Lock()
+    sim._anchor_lock = threading.Lock()
     return sim
 
 
@@ -282,3 +291,179 @@ class TestSimulatorForkAnchor:
         mcs.simulators = {}
         mcs.default_chain_id = 8453
         assert mcs.get_block_timestamp(8453, _FORK_BLOCK) is None
+
+
+# ── SIM_OFFLOAD_TO_THREAD: event-loop offload + fork-mutation exclusion ──────
+#
+# A scoreIntent sim is a multi-second block of synchronous web3 RPCs. Run
+# inline on the API's single event loop it freezes every other route; the fix
+# offloads it to a worker thread (default on, SIM_OFFLOAD_TO_THREAD=0 reverts).
+# The offloaded body now runs CONCURRENTLY with loop-side fork access, so these
+# tests pin the two invariants that keep that safe + deterministic:
+#   * the sim runs off the loop thread but still under _fork_mutation_lock, and
+#     offloading does not change the result it returns;
+#   * the synchronous fork-mutators (pin_read_fork / simulate_with_trace) take
+#     that same lock, and the hot anchor-cache readers never tear against a
+#     concurrent _refresh_fork_anchor write.
+
+
+class TestSimOffloadKillSwitch:
+    @pytest.mark.parametrize("val,expected", [
+        (None, False),         # unset → default OFF (lands dark; see the gate)
+        ("", False),           # empty → default OFF
+        ("0", False), (" 0 ", False), ("false", False),
+        ("FALSE", False), ("no", False), ("off", False), ("garbage", False),
+        ("1", True), (" 1 ", True), ("true", True), ("YES", True), ("on", True),
+    ])
+    def test_env_parsing(self, monkeypatch, val, expected):
+        if val is None:
+            monkeypatch.delenv("SIM_OFFLOAD_TO_THREAD", raising=False)
+        else:
+            monkeypatch.setenv("SIM_OFFLOAD_TO_THREAD", val)
+        assert _sim_offload_enabled() is expected
+
+    def test_inner_is_synchronous(self):
+        # to_thread can only run a plain (non-coroutine) function; the whole
+        # offload hinges on _simulate_inner having no awaits.
+        assert not asyncio.iscoroutinefunction(AnvilSimulator._simulate_inner)
+        assert not asyncio.iscoroutinefunction(AnvilSimulator._simulate_inner_locked)
+
+
+class TestSimOffloadBehavior:
+    @staticmethod
+    def _sim_with_stub_inner():
+        sim = _bare_sim(fork_number=_FORK_BLOCK, fork_ts=_FORK_TS)
+        calls: list[dict] = []
+
+        def _stub_inner(*args, **kwargs):
+            # instance-attr shadow → called WITHOUT self
+            calls.append({
+                "thread": threading.get_ident(),
+                "fork_lock_held": sim._fork_mutation_lock.locked(),
+                "args": args,
+                "kwargs": kwargs,
+            })
+            return SimulationResult(success=True, gas_used=123456)
+
+        sim._simulate_inner = _stub_inner
+        return sim, calls
+
+    def test_offload_runs_off_loop_thread_under_fork_lock(self, monkeypatch):
+        monkeypatch.setenv("SIM_OFFLOAD_TO_THREAD", "1")
+        sim, calls = self._sim_with_stub_inner()
+
+        async def _run():
+            return threading.get_ident(), await sim.simulate("PLAN", fork_block=7)
+
+        loop_thread, res = asyncio.run(_run())
+        assert res.gas_used == 123456
+        assert len(calls) == 1
+        assert calls[0]["thread"] != loop_thread          # ran OFF the loop
+        assert calls[0]["fork_lock_held"] is True          # ...but serialized
+        assert calls[0]["args"] == ("PLAN",)               # args forwarded 1:1
+        assert calls[0]["kwargs"] == {"fork_block": 7}
+
+    def test_inline_runs_on_loop_thread_under_fork_lock(self, monkeypatch):
+        monkeypatch.setenv("SIM_OFFLOAD_TO_THREAD", "0")
+        sim, calls = self._sim_with_stub_inner()
+
+        async def _run():
+            return threading.get_ident(), await sim.simulate("PLAN")
+
+        loop_thread, res = asyncio.run(_run())
+        assert res.gas_used == 123456
+        assert calls[0]["thread"] == loop_thread           # inline → same thread
+        assert calls[0]["fork_lock_held"] is True
+
+    def test_offload_result_is_identical_to_inline(self, monkeypatch):
+        # The core determinism guarantee: routing the (identical) sync body
+        # through a thread must not change what simulate() returns.
+        def _once(offload):
+            monkeypatch.setenv("SIM_OFFLOAD_TO_THREAD", "1" if offload else "0")
+            sim = _bare_sim(fork_number=_FORK_BLOCK, fork_ts=_FORK_TS)
+            sim._simulate_inner = lambda *a, **k: SimulationResult(
+                success=True, gas_used=99, error=None)
+            return asyncio.run(sim.simulate("PLAN", fork_block=7))
+
+        a, b = _once(True), _once(False)
+        assert (a.success, a.gas_used, a.error) == (b.success, b.gas_used, b.error)
+
+
+class TestForkMutatorsHoldLock:
+    def test_pin_read_fork_holds_fork_mutation_lock(self):
+        sim = _bare_sim(fork_number=_FORK_BLOCK, fork_ts=_FORK_TS)
+        held: dict[str, bool] = {}
+
+        def _stub_reset(block_number=None):
+            held["reset"] = sim._fork_mutation_lock.locked()
+
+        sim._reset_fork = _stub_reset
+
+        class _Eth:
+            block_number = _FORK_BLOCK + 5     # != target → forces a re-fork
+
+        class _W3:
+            eth = _Eth()
+
+        sim.w3 = _W3()
+        assert sim.pin_read_fork(1, _FORK_BLOCK) is True
+        assert held.get("reset") is True
+
+    def test_simulate_with_trace_holds_fork_mutation_lock(self):
+        sim = _bare_sim()
+        held: dict[str, bool] = {}
+
+        def _stub_inner(plan, token_balances=None, focus_tokens=None):
+            held["trace"] = sim._fork_mutation_lock.locked()
+            return {"summary": "ok"}
+
+        sim._simulate_with_trace_inner = _stub_inner
+        assert sim.simulate_with_trace(object())["summary"] == "ok"
+        assert held.get("trace") is True
+
+
+class TestAnchorCacheConcurrency:
+    def test_reads_never_tear_under_concurrent_refresh(self):
+        # _refresh_fork_anchor (writer; runs in the offloaded sim thread) clears
+        # + repopulates _block_ts_cache while get_block_timestamp (reader; on the
+        # loop) does an `in`-then-lookup. Without _anchor_lock that races into a
+        # KeyError / torn read. Hammer both sides and assert neither raises.
+        sim = _bare_sim(fork_number=_FORK_BLOCK, fork_ts=_FORK_TS,
+                        ts_cache={_FORK_BLOCK: _FORK_TS})
+        counter = {"n": _FORK_BLOCK}
+
+        class _Eth:
+            def get_block(self, which):
+                if which == "latest":          # advance the anchor each refresh
+                    counter["n"] += 1
+                    return {"number": counter["n"],
+                            "timestamp": _FORK_TS + counter["n"]}
+                return {"timestamp": _FORK_TS + int(which)}
+
+        class _W3:
+            eth = _Eth()
+
+        sim.w3 = _W3()
+        errors: list[tuple[str, Exception]] = []
+        stop = threading.Event()
+
+        def _writer():
+            while not stop.is_set():
+                try:
+                    sim._refresh_fork_anchor()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(("writer", exc))
+
+        t = threading.Thread(target=_writer, daemon=True)
+        t.start()
+        try:
+            for _ in range(20_000):
+                try:
+                    sim.get_block_timestamp(1, _FORK_BLOCK)
+                    sim.current_fork_block(1)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(("reader", exc))
+        finally:
+            stop.set()
+            t.join(timeout=5)
+        assert not errors, errors[:3]

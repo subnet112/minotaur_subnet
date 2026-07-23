@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -222,6 +223,36 @@ def parse_gas_measured(logs: Any, relayer_address: str) -> int | None:
     return found
 
 
+def _sim_offload_enabled() -> bool:
+    """Kill-switch for running the synchronous scoreIntent simulation in a
+    worker thread instead of inline on the asyncio event loop.
+
+    A single scoreIntent sim is a multi-second, purely-synchronous block of
+    web3 RPCs (``eth_call`` / ``evm_snapshot`` / ``evm_revert`` / mining). Run
+    inline it freezes the API's single event loop for that whole window —
+    starving ``/health``, quotes, and every other route (the 504s we saw under
+    concurrent benchmark + frontend load). Offloading it to a thread keeps the
+    loop responsive; the per-fork locks (see :meth:`AnvilSimulator.simulate`)
+    preserve the exact same serialization and therefore byte-for-byte
+    determinism WITHIN one simulation.
+
+    DEFAULT OFF. This lands dark behind one remaining gate: ``SimulationRunner``
+    (blockloop/simulation.py) seeds the fork (``_deal_erc20`` / allowances /
+    platform fee) on the loop BEFORE calling ``simulate()``. Inline that seed is
+    atomic with the sim it precedes (the loop never yields between them);
+    offloaded, a concurrent flow's ``_reset_fork`` could wipe it mid-flight if
+    both drive the same simulator instance. Before flipping this on in
+    production, move that seeding inside the sim's locked window (pass the seed
+    ops into ``simulate`` so ``_simulate_inner`` applies them AFTER its re-fork)
+    — or prove no two flows ever share a simulator concurrently — and
+    re-validate benchmark determinism against a live anvil. Set
+    ``SIM_OFFLOAD_TO_THREAD=1`` to enable once that gate is cleared.
+    """
+    return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 class AnvilSimulator:
     """Simulates execution plans on a running Anvil fork.
 
@@ -289,6 +320,22 @@ class AnvilSimulator:
         # revert failed" / fork-poison false positives. One lock per fork makes
         # the snapshot→execute→revert window atomic.
         self._sim_lock = asyncio.Lock()
+        # With SIM_OFFLOAD_TO_THREAD (default on) the sim body runs in a worker
+        # thread, so it can now execute CONCURRENTLY with loop-side code that
+        # also touches this fork. Two threading locks bridge that boundary
+        # (an asyncio.Lock can't be held across a thread):
+        #   * _fork_mutation_lock — held by the offloaded sim body AND by the
+        #     synchronous fork-mutators (pin_read_fork / simulate_with_trace) so
+        #     their evm_snapshot/reset/revert can't interleave a sim's and
+        #     corrupt its snapshot chain (the same hazard _sim_lock guards on
+        #     the loop, extended across the thread boundary).
+        #   * _anchor_lock — a micro-lock over the fork-anchor cache so the
+        #     hot loop-side readers (get_block_timestamp / current_fork_block)
+        #     never observe a torn write from _refresh_fork_anchor, which now
+        #     runs inside the sim thread. Held only for in-memory reads/writes,
+        #     never across an RPC, so it never stalls the loop.
+        self._fork_mutation_lock = threading.Lock()
+        self._anchor_lock = threading.Lock()
         self._baseline_snapshot_id: str | None = None
 
         # Per-process counter for the periodic baseline-alive probe.
@@ -336,22 +383,71 @@ class AnvilSimulator:
                     exc,
                 )
 
-    async def simulate(self, *args: Any, **kwargs: Any) -> SimulationResult:
-        """Serialized entrypoint — see :meth:`_simulate_inner`.
-
-        Holds the per-fork lock for the whole snapshot→execute→revert window
-        so concurrent callers can't corrupt each other's snapshot state.
+    def _get_sim_lock(self) -> asyncio.Lock:
+        """The per-fork asyncio lock, lazy-initialised so objects built via
+        ``__new__`` (some tests / partial-construction paths that skip
+        ``__init__``) still serialize. Safe under asyncio: no await between the
+        check and the assignment.
         """
-        # Lazy-init keeps objects built via __new__ (some tests / partial
-        # construction paths) working — they never ran __init__. Safe under
-        # asyncio: there's no await between the check and the assignment.
         lock = getattr(self, "_sim_lock", None)
         if lock is None:
             lock = self._sim_lock = asyncio.Lock()
-        async with lock:
-            return await self._simulate_inner(*args, **kwargs)
+        return lock
 
-    async def _simulate_inner(
+    def _get_fork_mutation_lock(self) -> threading.Lock:
+        """Threading lock excluding synchronous fork-mutators from an offloaded
+        sim body (see ``_fork_mutation_lock`` in ``__init__``). Lazy-init mirrors
+        :meth:`_get_sim_lock`; the assignment is atomic under the GIL and these
+        objects are single-threaded until a sim is offloaded.
+        """
+        lock = getattr(self, "_fork_mutation_lock", None)
+        if lock is None:
+            lock = self._fork_mutation_lock = threading.Lock()
+        return lock
+
+    def _get_anchor_lock(self) -> threading.Lock:
+        """Micro-lock over the fork-anchor cache (see ``_anchor_lock`` in
+        ``__init__``). Lazy-init mirrors :meth:`_get_fork_mutation_lock`.
+        """
+        lock = getattr(self, "_anchor_lock", None)
+        if lock is None:
+            lock = self._anchor_lock = threading.Lock()
+        return lock
+
+    async def simulate(self, *args: Any, **kwargs: Any) -> SimulationResult:
+        """Serialized entrypoint — see :meth:`_simulate_inner`.
+
+        Holds the per-fork asyncio lock for the whole snapshot→execute→revert
+        window so concurrent callers can't corrupt each other's snapshot state.
+        Under ``SIM_OFFLOAD_TO_THREAD`` (default OFF — see
+        :func:`_sim_offload_enabled` for the enabling gate) the synchronous body
+        runs in a worker thread so it can't freeze the event loop; the asyncio
+        lock is only ever acquired/released ON the loop (never inside the
+        thread), and the thread additionally holds ``_fork_mutation_lock`` so no
+        loop-side fork-mutator can interleave. Serialization — and therefore
+        byte-for-byte determinism — is identical to the inline path.
+        """
+        async with self._get_sim_lock():
+            if _sim_offload_enabled():
+                return await asyncio.to_thread(
+                    self._simulate_inner_locked, *args, **kwargs,
+                )
+            return self._simulate_inner_locked(*args, **kwargs)
+
+    def _simulate_inner_locked(self, *args: Any, **kwargs: Any) -> SimulationResult:
+        """Run the sim body under ``_fork_mutation_lock``.
+
+        The outer :meth:`simulate` already holds ``_sim_lock`` (so two sims
+        never reach here at once); this inner lock additionally excludes the
+        synchronous loop-side fork-mutators (:meth:`pin_read_fork`,
+        :meth:`simulate_with_trace`), which can now run concurrently with this
+        thread. Lock order is always _sim_lock → _fork_mutation_lock and the
+        mutators take only _fork_mutation_lock, so there is no cycle.
+        """
+        with self._get_fork_mutation_lock():
+            return self._simulate_inner(*args, **kwargs)
+
+    def _simulate_inner(
         self,
         plan: ExecutionPlan,
         contract_address: str | None = None,
@@ -945,14 +1041,24 @@ class AnvilSimulator:
         avoid a redundant, expensive re-fork). ``chain_id`` is accepted for a
         uniform interface with :class:`MultiChainSimulator` and ignored here
         (this is a single fork). Returns True iff a re-fork happened.
+
+        Kept synchronous, but it re-forks (an evm mutation), so it takes
+        ``_fork_mutation_lock`` to exclude a concurrently-offloaded sim body —
+        otherwise the ``anvil_reset`` here could interleave that sim's
+        snapshot/revert bracket and corrupt its result. This is dormant today
+        (the caller is gated behind PIN_SOLVER_READ_BLOCK, off), so the lock is
+        uncontended; NOTE for whoever flips that flag with SIM_OFFLOAD_TO_THREAD
+        on: this acquire is synchronous, so a collision with an in-flight sim
+        would briefly block the loop — make this path async first.
         """
-        try:
-            if int(self.w3.eth.block_number) == int(block_number):
-                return False
-        except Exception:  # noqa: BLE001 - fall through to a reset on any read error
-            pass
-        self._reset_fork(block_number=int(block_number))
-        return True
+        with self._get_fork_mutation_lock():
+            try:
+                if int(self.w3.eth.block_number) == int(block_number):
+                    return False
+            except Exception:  # noqa: BLE001 - fall through to a reset on any read error
+                pass
+            self._reset_fork(block_number=int(block_number))
+            return True
 
     def current_fork_block(self, chain_id: int | None = None) -> int | None:
         """The block this fork is currently anchored at (best-effort), so the
@@ -960,8 +1066,12 @@ class AnvilSimulator:
         of chasing upstream head on every call. ``chain_id`` is accepted for a
         uniform interface with :class:`MultiChainSimulator` and ignored here
         (single fork). None when unknown → caller falls back to a head re-fork.
+
+        Guarded by ``_anchor_lock`` so it never reads ``_fork_block_number``
+        mid-write from an offloaded sim's :meth:`_refresh_fork_anchor`.
         """
-        return getattr(self, "_fork_block_number", None)
+        with self._get_anchor_lock():
+            return getattr(self, "_fork_block_number", None)
 
     def _reset_fork_for_sim(self, fork_block: int | None, pin_only: bool) -> None:
         """Prepare the fork for one simulation.
@@ -1010,21 +1120,30 @@ class AnvilSimulator:
         behavior, exactly the pre-pin world) rather than pinning to a stale
         anchor.
         """
-        # Lazy-init keeps objects built via __new__ (some tests / partial
-        # construction paths) working — mirrors the _sim_lock discipline.
-        if not isinstance(getattr(self, "_block_ts_cache", None), dict):
-            self._block_ts_cache = {}
+        # The eth_getBlockByNumber RPC is done OUTSIDE _anchor_lock so the lock
+        # only ever wraps the in-memory writes below (microseconds) — it must
+        # never be held across an RPC or it would stall the loop-side readers
+        # (get_block_timestamp / current_fork_block).
         try:
             block = self.w3.eth.get_block("latest")
-            self._fork_block_number = int(block["number"])
-            self._fork_block_timestamp = int(block["timestamp"])
-            if len(self._block_ts_cache) > 256:
-                self._block_ts_cache.clear()
-            self._block_ts_cache[self._fork_block_number] = self._fork_block_timestamp
+            num: int | None = int(block["number"])
+            ts: int | None = int(block["timestamp"])
         except Exception as exc:  # noqa: BLE001 - cache is best-effort by design
             logger.warning("fork anchor refresh failed (%s): %s", self.rpc_url, exc)
-            self._fork_block_number = None
-            self._fork_block_timestamp = None
+            num = None
+            ts = None
+        # Publish the new anchor atomically w.r.t. the loop-side readers. Lazy-
+        # init keeps objects built via __new__ (some tests / partial
+        # construction paths) working — mirrors the _sim_lock discipline.
+        with self._get_anchor_lock():
+            if not isinstance(getattr(self, "_block_ts_cache", None), dict):
+                self._block_ts_cache = {}
+            self._fork_block_number = num
+            self._fork_block_timestamp = ts
+            if num is not None:
+                if len(self._block_ts_cache) > 256:
+                    self._block_ts_cache.clear()
+                self._block_ts_cache[num] = ts
 
     def get_block_timestamp(
         self, chain_id: int | None = None, block_number: int | None = None,
@@ -1037,9 +1156,15 @@ class AnvilSimulator:
         uniformity with :class:`MultiChainSimulator` and ignored here (single
         fork) — mirrors :meth:`pin_read_fork`.
         """
-        cache: dict[int, int] = getattr(self, "_block_ts_cache", None) or {}
+        # Snapshot the anchor + cache under _anchor_lock (a shallow copy of a
+        # small int->int dict) so a concurrent _refresh_fork_anchor .clear()
+        # from an offloaded sim can't turn our `in`-then-lookup into a KeyError
+        # or a torn read. The upstream RPC below runs OUTSIDE the lock.
+        with self._get_anchor_lock():
+            anchor_ts = getattr(self, "_fork_block_timestamp", None)
+            cache: dict[int, int] = dict(getattr(self, "_block_ts_cache", None) or {})
         if block_number is None:
-            return getattr(self, "_fork_block_timestamp", None)
+            return anchor_ts
         block_number = int(block_number)
         if block_number in cache:
             return cache[block_number]
@@ -1051,10 +1176,11 @@ class AnvilSimulator:
                 block_number, self.rpc_url, exc,
             )
             return None
-        if isinstance(getattr(self, "_block_ts_cache", None), dict):
-            if len(self._block_ts_cache) > 256:
-                self._block_ts_cache.clear()
-            self._block_ts_cache[block_number] = ts
+        with self._get_anchor_lock():
+            if isinstance(getattr(self, "_block_ts_cache", None), dict):
+                if len(self._block_ts_cache) > 256:
+                    self._block_ts_cache.clear()
+                self._block_ts_cache[block_number] = ts
         return ts
 
     def _pin_next_block_timestamp(self) -> None:
@@ -1554,6 +1680,26 @@ class AnvilSimulator:
         return snap
 
     def simulate_with_trace(
+        self,
+        plan: Any,
+        token_balances: dict[str, int] | None = None,
+        focus_tokens: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Fork-mutation-locked wrapper over :meth:`_simulate_with_trace_inner`.
+
+        The trace body runs its own snapshot→execute→revert bracket, so with
+        SIM_OFFLOAD_TO_THREAD on it must be excluded from a concurrently
+        offloaded sim (which would consume/invalidate each other's snapshots).
+        Kept synchronous (this is a debug/replay path that already blocked the
+        loop pre-offload); the lock is uncontended unless it collides with an
+        in-flight sim, in which case it briefly blocks — acceptable here.
+        """
+        with self._get_fork_mutation_lock():
+            return self._simulate_with_trace_inner(
+                plan, token_balances=token_balances, focus_tokens=focus_tokens,
+            )
+
+    def _simulate_with_trace_inner(
         self,
         plan: Any,
         token_balances: dict[str, int] | None = None,
