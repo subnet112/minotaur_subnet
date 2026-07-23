@@ -16,7 +16,7 @@ from minotaur_subnet.api.routes.submissions.screening_pipeline import (
 from minotaur_subnet.harness.actor import ActorResolver
 
 # O = owner (coldkey CK_O); A1/A2 = a fleet (CK_A); X = unmapped (deregistered).
-RESOLVER = ActorResolver(
+RESOLVER = ActorResolver.from_maps(
     {"O": "CK_O", "A1": "CK_A", "A2": "CK_A", "B": "CK_B"}, source="test",
 )
 
