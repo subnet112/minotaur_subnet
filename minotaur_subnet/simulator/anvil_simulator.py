@@ -260,7 +260,22 @@ class AnvilSimulator:
         # not forked from anything) leave this unset and skip the
         # head-fetch path entirely.
         self.upstream_rpc_url = (upstream_rpc_url or "").strip() or None
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        # SOCKET TIMEOUT (load-bearing): without request_kwargs the HTTPProvider
+        # inherits requests' default timeout of None = INFINITE socket wait. Every
+        # sim RPC below (eth_call / get_balance / make_request('anvil_reset'|
+        # 'evm_*') / block_number) runs SYNCHRONOUSLY inside _simulate_inner while
+        # holding _sim_lock, so a single wedged RPC freezes the whole event loop —
+        # which starves BOTH the TOTAL_BENCHMARK_TIMEOUT check AND the round's
+        # certification-deadline abort coroutine (they can't run on a blocked loop).
+        # That is the confirmed cause of the 159-min round-e29746399 stall (aborted
+        # +75 epochs past its own deadline) and the current-era "stale incumbent bar
+        # (re-benchmark failed)" aborts. A bounded socket timeout converts an
+        # unbounded freeze into a per-call exception the existing except-handlers
+        # turn into a deterministic best-effort/zero result, so the round advances
+        # on time. sim_timeout defaults 30s (generous: normal anvil calls are
+        # sub-second, upstream anvil_reset a few seconds — only a genuine wedge
+        # hits it), which is why this is behaviour-preserving in normal operation.
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": sim_timeout}))
 
         # Baseline snapshot taken immediately after the first connect.
         # Used by _reset_fork on no-upstream paths (local-testnet chain
