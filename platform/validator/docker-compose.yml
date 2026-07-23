@@ -401,6 +401,11 @@ services:
       anvil-btevm:
         condition: service_healthy
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      SUBNET_OWNER_HOTKEY: "${SUBNET_OWNER_HOTKEY:-}"
+      QUORUM_BPS: "${QUORUM_BPS:-6666}"
+      RELATIVE_SCORING_ENABLED: "${RELATIVE_SCORING_ENABLED:-1}"
+      MALLOC_ARENA_MAX: "${MALLOC_ARENA_MAX:-2}"
       # Bittensor identity
       WALLET_NAME: "${WALLET_NAME}"
       HOTKEY_NAME: "${HOTKEY_NAME}"
@@ -485,6 +490,7 @@ services:
       # (anti-free-ride). Default matches the api service name + port below.
       CHAMPION_API_URL: "${CHAMPION_API_URL:-http://api:8080}"
     volumes:
+      - store-data:/data              # shared round-state volume (matches leader; unused by followers reading champion over HTTP)
       # Bittensor wallet directory — read-only.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
     networks: [minotaur]
@@ -531,6 +537,84 @@ services:
       docker-socket-proxy:
         condition: service_started
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      APP_INTENT_BASE_1: "${APP_INTENT_BASE_1:-}"
+      APP_INTENT_BASE_964: "${APP_INTENT_BASE_964:-}"
+      STAGE3_DISABLED: "${STAGE3_DISABLED:-0}"
+      STAGE3_MAX_REGRESSION_CHECKS: "${STAGE3_MAX_REGRESSION_CHECKS:-5}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1:-}"
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1:-}"
+      # ── leader-only config (subnet unified compose) — followers keep code-default behavior,
+      #    the leader's .env overrides. Role is code-gated (LOCKED_LEADER / metagraph).
+      ALLOW_ADMIN_SOLVER_REPO_TOKEN: "${ALLOW_ADMIN_SOLVER_REPO_TOKEN:-}"
+      API_URL: "${API_URL:-}"
+      BENCHMARK_ALL_DEPLOYMENT_CHAINS: "${BENCHMARK_ALL_DEPLOYMENT_CHAINS:-1}"
+      BENCHMARK_CONCURRENCY: "${BENCHMARK_CONCURRENCY:-1}"
+      BENCHMARK_POLL_INTERVAL: "${BENCHMARK_POLL_INTERVAL:-30}"
+      BENCHMARK_QUOTE_CORPUS: "${BENCHMARK_QUOTE_CORPUS:-1}"
+      CANDIDATE_IMAGE_REPO: "${CANDIDATE_IMAGE_REPO:-}"   # presence-sensitive: non-empty flips leader_pushes_digests()→True (un-credentialed GHCR push on followers); leader sets repo in .env
+      CHALLENGER_QUORUM_MODE: "${CHALLENGER_QUORUM_MODE:-1}"
+      CHAMPION_CONSENSUS_PEERS: "${CHAMPION_CONSENSUS_PEERS:-}"
+      COW_BASE_URL: "${COW_BASE_URL:-}"
+      DEX_COMPARE_CHAINS: "${DEX_COMPARE_CHAINS:-}"
+      DEX_COMPARE_COW_APP_ID: "${DEX_COMPARE_COW_APP_ID:-}"
+      DEX_COMPARE_SOURCE: "${DEX_COMPARE_SOURCE:-}"
+      DISABLE_CHAMPION_ADOPTION: "${DISABLE_CHAMPION_ADOPTION:-0}"
+      DISTRIBUTED_VETO_ENFORCE: "${DISTRIBUTED_VETO_ENFORCE:-hard}"
+      DISTRIBUTED_VETO_REVERIFY: "${DISTRIBUTED_VETO_REVERIFY:-1}"
+      EMISSION_TIME_WEIGHTED_OBSERVE: "${EMISSION_TIME_WEIGHTED_OBSERVE:-}"   # code default OFF; leader sets 1 in .env for the observe soak
+      MALLOC_ARENA_MAX: "${MALLOC_ARENA_MAX:-2}"
+      RELATIVE_SCORING_ENABLED: "${RELATIVE_SCORING_ENABLED:-1}"
+      ROUND_ANCHOR_SHADOW: "${ROUND_ANCHOR_SHADOW:-0}"
+      RPC_PROXY_PIN_CACHE_MAX_BLOCKS: "${RPC_PROXY_PIN_CACHE_MAX_BLOCKS:-4}"
+      RPC_PROXY_PIN_CACHE_PERSIST_PATH: "${RPC_PROXY_PIN_CACHE_PERSIST_PATH:-}"
+      SOLVER_REPO_PATH: "${SOLVER_REPO_PATH:-}"
+      SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS: "${SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS:-47}"
+      SOLVER_ROUND_DECISION_BASE_EPOCHS: "${SOLVER_ROUND_DECISION_BASE_EPOCHS:-14}"
+      SOLVER_ROUND_DECISION_EPOCHS: "${SOLVER_ROUND_DECISION_EPOCHS:-45}"
+      SOLVER_ROUND_DECISION_PER_SUB_EPOCHS: "${SOLVER_ROUND_DECISION_PER_SUB_EPOCHS:-9}"
+      SOLVER_ROUND_OPEN_SECONDS: "${SOLVER_ROUND_OPEN_SECONDS:-300}"
+      SOLVER_ROUND_STORE_PATH: "${SOLVER_ROUND_STORE_PATH:-/data/solver_rounds.json}"
+      SUBMISSIONS_ALLOW_UNREGISTERED: "${SUBMISSIONS_ALLOW_UNREGISTERED:-0}"
+      SUBMISSIONS_MAX_RECORDS: "${SUBMISSIONS_MAX_RECORDS:-0}"   # code default 0=unbounded; leader arms 5000 in .env (store-bloat/egress is a leader-only concern), same pattern as OPEN_SECONDS
+      SUBMISSION_SNAPSHOT_SYNC: "${SUBMISSION_SNAPSHOT_SYNC:-1}"
+      SUBMISSION_STORE_PATH: "${SUBMISSION_STORE_PATH:-/data/submissions.json}"
+      VALIDATOR_PEERS: "${VALIDATOR_PEERS:-}"
+      APP_ADMIN_SIGNERS: "${APP_ADMIN_SIGNERS:-}"
+      ARCHIVE_RPC_BASE: "${ARCHIVE_RPC_BASE:-}"
+      ARCHIVE_RPC_BTEVM: "${ARCHIVE_RPC_BTEVM:-https://lite.chain.opentensor.ai}"
+      ARCHIVE_RPC_ETH: "${ARCHIVE_RPC_ETH:-}"
+      BENCHMARK_HISTORICAL_SAMPLES: "${BENCHMARK_HISTORICAL_SAMPLES:-10}"
+      CHAMPION_CONSENSUS_TIMEOUT_SECONDS: "${CHAMPION_CONSENSUS_TIMEOUT_SECONDS:-30}"   # code default 30, not 120
+      DEPLOY_FEE_COLLECTOR_EVM: "${DEPLOY_FEE_COLLECTOR_EVM:-}"
+      DEPLOY_FEE_EXEMPT_ADDRESSES: "${DEPLOY_FEE_EXEMPT_ADDRESSES:-}"
+      ENABLE_PUBLIC_DEPLOYMENT: "${ENABLE_PUBLIC_DEPLOYMENT:-0}"
+      ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
+      FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
+      GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
+      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"   # empty→live champion runs --network=none as today; leader sets production_minotaur in .env
+      MVP_DEMO_MODE: "${MVP_DEMO_MODE:-0}"
+      ORDER_CONSENSUS_PEERS: "${ORDER_CONSENSUS_PEERS}"
+      ORDER_CONSENSUS_QUORUM_BPS: "${ORDER_CONSENSUS_QUORUM_BPS:-6666}"
+      QUORUM_BPS: "${QUORUM_BPS:-6666}"
+      RELAYER_MIN_BALANCE_WEI: "${RELAYER_MIN_BALANCE_WEI:-10000000000000000}"   # code default 1e16 (embedded-relayer path, unused by api)
+      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:-}"   # was :? — followers never set it → compose interpolation fail; api uses HttpRelayer branch anyway; leader sets in .env
+      RELAYER_RECEIPT_TIMEOUT: "${RELAYER_RECEIPT_TIMEOUT:-120}"
+      RELAYER_WALLET: "${RELAYER_WALLET:-}"
+      REQUIRE_ASYMMETRIC_PROVENANCE: "${REQUIRE_ASYMMETRIC_PROVENANCE:-0}"   # startup-failure: =1 needs SUBMISSION_PROVENANCE_ALLOWED_SIGNERS or api won't boot; leader sets 1 in .env
+      REQUIRE_SIGNED_PROVENANCE: "${REQUIRE_SIGNED_PROVENANCE:-0}"   # startup-failure: same; leader sets 1 in .env
+      SCORE_THRESHOLD: "${SCORE_THRESHOLD:-5000}"
+      SOLVER_REPO_TOKEN: "${SOLVER_REPO_TOKEN:-}"
+      SOLVER_REPO_URL: "${SOLVER_REPO_URL:-}"
+      SOLVER_ROUND_INTAKE_MAX: "${SOLVER_ROUND_INTAKE_MAX:-8}"
+      SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT: "${SUBMISSIONS_MAX_ROUNDS_PER_FINGERPRINT:-2}"   # code default 2, not 0
+      SUBMISSION_ALLOWED_REPO_HOSTS: "${SUBMISSION_ALLOWED_REPO_HOSTS:-github.com}"
+      SUBMISSION_GIT_CLONE_ALLOWED_HOSTS: "${SUBMISSION_GIT_CLONE_ALLOWED_HOSTS:-github.com}"
+      SUBMISSION_GIT_CLONE_PASSWORD: "${SUBMISSION_GIT_CLONE_PASSWORD:-}"
+      SUBMISSION_GIT_CLONE_USERNAME: "${SUBMISSION_GIT_CLONE_USERNAME:-}"   # code default empty; leader sets x-access-token in .env
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-0}"   # code default 0; leader behind nginx sets 1 in .env
+      VALIDATOR_ADDRESSES: "${VALIDATOR_ADDRESSES:-}"   # was :? — followers never set it → boot fail; value-based read, empty==unset; leader sets in .env
+      # ── end leader-only config ──
       # Same Bittensor identity as the validator daemon — both processes
       # use the same hotkey + EVM signing key.
       WALLET_NAME: "${WALLET_NAME}"
@@ -624,10 +708,10 @@ services:
       CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
 
       # Follower role — these are LEADER-ONLY responsibilities:
-      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # Leader manages round lifecycle
-      ENABLE_BENCHMARK_WORKER: "0"          # Proactive bench is leader-only
-      ENABLE_DEX_COMPARE: "0"               # DEX-aggregator comparison is leader-only
-      SUBMISSIONS_ACCEPTING: "0"            # Users send submissions to the leader
+      ENABLE_SOLVER_ROUND_COORDINATOR: "${ENABLE_SOLVER_ROUND_COORDINATOR:-0}"  # 1 on the leader (runs the round coordinator)
+      ENABLE_BENCHMARK_WORKER: "${ENABLE_BENCHMARK_WORKER:-0}"  # leader hands the slate to the benchmark-worker profile
+      ENABLE_DEX_COMPARE: "${ENABLE_DEX_COMPARE:-0}"        # leader-only; leader sets 1 in .env
+      SUBMISSIONS_ACCEPTING: "${SUBMISSIONS_ACCEPTING:-0}"  # leader accepts user submissions (sets 1 in .env); followers default off
       # Optional DEX-compare aggregator keys (leader only; CoW + Velora are keyless):
       ONEINCH_API_KEY: "${ONEINCH_API_KEY:-}"
       ZEROX_API_KEY: "${ZEROX_API_KEY:-}"
@@ -820,6 +904,9 @@ services:
       # peer cache, which can be stale by up to 300s after a slash/removal).
       CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
     volumes:
+      # leader-only bind mounts (followers get empty placeholder dirs → unused; leader sets real host paths in .env)
+      - "${GHCR_DOCKER_CONFIG_DIR:-./.leader-mounts/docker}:/home/minotaur/.docker:ro"
+      - "${SOLVER_REPO_HOST_PATH:-./.leader-mounts/solver-repo}:/solver-repo"
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data
     networks: [minotaur, docker-control]
@@ -883,6 +970,12 @@ services:
       docker-socket-proxy:
         condition: service_started
     environment:
+      # ── leader-parity: box-only env (followers keep code defaults; leader sets via .env) ──
+      SOLVER_ROUND_MAX_SUBMISSIONS: "${SOLVER_ROUND_MAX_SUBMISSIONS:-3}"
+      SUBMISSIONS_MAX_RECORDS: "${SUBMISSIONS_MAX_RECORDS:-0}"
+      VALIDATOR_HOTKEY_SS58: "${VALIDATOR_HOTKEY_SS58:-}"
+      APP_INTENTS_STORE_PATH: "${APP_INTENTS_STORE_PATH:-/data/store.json}"
+      SOLVER_READ_PROXY_CHAINS: "${SOLVER_READ_PROXY_CHAINS:-8453,1}"
       # ── identity (same hotkey/EVM key as the api) ────────────────────
       WALLET_NAME: "${WALLET_NAME}"
       HOTKEY_NAME: "${HOTKEY_NAME}"
@@ -894,7 +987,7 @@ services:
       BENCHMARK_WORKER_ONLY: "1"          # activates every worker-mode code gate
       ENABLE_BENCHMARK_WORKER: "1"        # THIS process runs the slate run_loop
       DISABLE_BLOCK_LOOP: "1"             # no block loop / EpochManager here
-      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # the api owns the round lifecycle
+      ENABLE_SOLVER_ROUND_COORDINATOR: "0"   # worker never runs the round coordinator (api-only)
       SUBMISSIONS_ACCEPTING: "0"          # users submit to the leader api, not here
       DISABLE_READ_PROXY: "1"             # the api LAUNCHES + owns the pin proxy;
                                           # the worker must not launch a second one
@@ -1091,6 +1184,94 @@ services:
     # Not exposed to host — and NOT on `minotaur`, so an untrusted solver
     # (live-solver or reactive-bench) cannot reach the Docker-control endpoint.
     # Only the api + benchmark-worker (also on docker-control) can reach it.
+
+
+  # ── leader-only services (activate with COMPOSE_PROFILES=...,leader) ──
+  relayer:
+    profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    image: ghcr.io/subnet112/minotaur-validator:latest
+    ports:
+      - "127.0.0.1:8091:8091"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["exec python -m minotaur_subnet.relayer.main --port 8091"]
+    environment:
+      # Cap glibc malloc arenas to reduce per-process RSS (~50-100 MB/container savings)
+      MALLOC_ARENA_MAX: "2"
+      ANVIL_RPC_URL: http://anvil-base:8546
+      CHAIN_ID: "8453"
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1:-}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1:-}"
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453:-}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964:-}"
+      BASE_RPC_URL: "${BASE_RPC_URL}"
+      ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
+      RELAYER_WALLET: "${RELAYER_WALLET:-}"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_RELAYER_RPC_URL:-https://lite.chain.opentensor.ai}"   # SCRUBBED: was a hardcoded blockmachine auth token; put the real URL in .env
+      # Leader-only (this service only starts under `profiles: [leader]`), but compose interpolates
+      # ${VAR:?} even for profiled-out services, so a `:?` here would break a follower's
+      # `docker compose up`. Kept optional; the leader supplies it via .env.keys (./dc.sh), and a
+      # dc.sh/update.sh preflight should assert it is set before starting the leader profile.
+      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:-}"
+      CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964:-}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964:-}"
+      CHAMPION_CONSENSUS_CHAIN_ID: "${CHAMPION_CONSENSUS_CHAIN_ID:-964}"
+      SOLVER_REPO_URL: "${SOLVER_REPO_URL:-}"
+      SOLVER_REPO_TOKEN: "${SOLVER_REPO_TOKEN:-}"
+    networks: [minotaur]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8091/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Seed (one-time app registration) ─────────────────────────────────────
+
+
+  seed:
+    profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
+    image: ghcr.io/subnet112/minotaur-validator:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["exec python /app/platform/local_testnet/seed.py"]
+    environment:
+      MINOTAUR_API_URL: http://api:8080
+    networks: [minotaur]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── docker-socket-proxy — limit api's Docker access ──────────────────────
+  # Mounts /var/run/docker.sock read-only and exposes a filtered subset
+  # of the Docker API on tcp://docker-socket-proxy:2375. The api service
+  # reaches it via DOCKER_HOST in its environment. Without this proxy the
+  # api would need a direct bind-mount of the host socket, but the
+  # Dockerfile runs as USER minotaur (uid 1000) which has no read
+  # permission on /var/run/docker.sock (root:988) — so a direct mount
+  # fails with "permission denied" and the genesis solver crashes
+  # silently on Command.INITIALIZE, leaving the leader with no solver
+  # and /v1/chains/{id}/tokens returning 503. Mirrors the third-party
+  # validator stack at platform/validator/.
+  #
+  # Allowed: containers (read+create+start+wait+logs+rm), networks (for
+  # attaching solver containers to benchmark-sandbox), images (for
+  # pulling solver images). NOT allowed: exec, host control, build,
+  # services, swarm — anything that would let a compromised api take
+  # over the host.
+  #
+  # NOTE: watchtower below keeps a direct socket mount — its
+  # stop+recreate workflow needs broader Docker access than this proxy
+  # exposes.
 
 volumes:
   store-data:
