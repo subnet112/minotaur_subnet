@@ -672,6 +672,26 @@ def _max_submissions_per_owner_per_round() -> int:
         return 1
 
 
+def _max_submissions_per_actor_per_round() -> int:
+    """Per-OPERATOR round cap — the sybil cap that supersedes the per-account one.
+
+    An operator is the actor from harness/actor.py: the union of a coldkey's
+    hotkeys and the github accounts it submits under. This caps how many times
+    one operator may submit in a round no matter how many hotkeys, coldkeys or
+    accounts it splits across — closing the coldkey-split evasion that the
+    account-only cap can't (SF-1 spread 15 coldkeys over 5 accounts, ~5
+    submissions/round). Configurable via ``SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND``
+    (default 1); a value <= 0 falls back to the per-account cap. Leader-local
+    admission control; degrades to the account cap before the first metagraph
+    sync (no coldkey map yet).
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND", "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+
 def _max_rounds_per_commit() -> int:
     """Per-(hotkey, commit) lifetime BENCHMARK participation cap — anti-resubmit-spam.
 
@@ -1016,17 +1036,31 @@ async def create_submission(
     # mergeability GitHub call. The store re-checks atomically inside create() as
     # the TOCTOU backstop.
     from minotaur_subnet.api.routes.submissions.github_pr import github_owner_from_url
+    from minotaur_subnet.harness.actor import snapshot_resolver
     _github_owner = github_owner_from_url(pr["clone_url"])
-    max_per_owner = _max_submissions_per_owner_per_round()
-    if _github_owner and max_per_owner > 0:
-        owner_already = store.count_by_owner_round(_github_owner, current_round.round_id)
-        if owner_already >= max_per_owner:
+    # Per-OPERATOR round cap: one operator (coldkey ∪ github owner) gets N slots
+    # per round, however many hotkeys / coldkeys / accounts it splits into. The
+    # resolver folds those identities; None (pre-metagraph) degrades to the old
+    # per-account behaviour. Supersedes the account-only cap.
+    _actor_of = snapshot_resolver()
+    max_per_actor = _max_submissions_per_actor_per_round()
+    _operator_cap = max_per_actor or _max_submissions_per_owner_per_round()
+    _operator_id = (_github_owner or "").strip() or (
+        _actor_of(body.hotkey) if _actor_of is not None else ""
+    )
+    if _operator_cap > 0 and _operator_id and _operator_id != body.hotkey:
+        op_already = store.count_by_operator_round(
+            body.hotkey, _github_owner, current_round.round_id, actor_of=_actor_of,
+        )
+        if op_already >= _operator_cap:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"GitHub account '{_github_owner}' has already submitted "
-                    f"{owner_already} time(s) for round {current_round.round_id} "
-                    f"(max {max_per_owner} per round per account); try again next round."
+                    f"Operator '{_operator_id}' has already submitted "
+                    f"{op_already} time(s) for round {current_round.round_id} "
+                    f"(max {_operator_cap} per round — the hotkeys, coldkeys and "
+                    f"github accounts of one operator share the cap); try again "
+                    f"next round."
                 ),
             )
 
@@ -1100,7 +1134,9 @@ async def create_submission(
             private_repo_full=(body.private_repo if _private else None),
             repo_token=(body.repo_token if _private else None),
             github_owner=_github_owner,
-            max_per_owner_per_round=max_per_owner,
+            max_per_owner_per_round=_max_submissions_per_owner_per_round(),
+            max_per_actor_per_round=max_per_actor,
+            actor_of=_actor_of,
             max_rounds_per_commit=max_commit_rounds,
         )
     except ValueError as exc:

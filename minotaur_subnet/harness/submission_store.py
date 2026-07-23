@@ -215,6 +215,26 @@ _RETENTION_PRUNABLE_VALUES = frozenset({
 })
 
 
+def _same_operator(hk_a, own_a, hk_b, own_b, actor_of=None) -> bool:
+    """Do two submissions belong to the same OPERATOR?
+
+    True when they share the hotkey, the github account (case-insensitive,
+    both non-empty), or — when ``actor_of`` is given — the resolved actor
+    (coldkey ∪ owner). This is the single definition the per-operator round
+    cap uses; with ``actor_of=None`` it is exactly hotkey ∪ owner.
+    """
+    if hk_a and hk_a == hk_b:
+        return True
+    oa, ob = (own_a or "").strip().lower(), (own_b or "").strip().lower()
+    if oa and oa == ob:
+        return True
+    if actor_of is not None:
+        aa = actor_of(hk_a or "")
+        if aa and aa == actor_of(hk_b or ""):
+            return True
+    return False
+
+
 # ── Solver-name coinage (copycat labeling) ──────────────────────────────────
 # A solver's display name comes from the miner-authored ``metadata().name`` —
 # unvalidated free text — so multiple hotkeys can submit the same name (usually
@@ -599,9 +619,17 @@ class SubmissionStore:
         repo_token: str | None = None,
         github_owner: str | None = None,
         max_per_owner_per_round: int = 0,
+        max_per_actor_per_round: int = 0,
+        actor_of: Any = None,
         max_rounds_per_commit: int = 0,
     ) -> Submission:
         """Create a new submission. Raises ValueError when a per-round cap is hit.
+
+        ``max_per_actor_per_round`` (with ``actor_of``, a hotkey→actor resolver)
+        is the sybil cap: it counts submissions by the same OPERATOR (coldkey ∪
+        github owner) for the round and supersedes ``max_per_owner_per_round``
+        (the old per-account cap, kept as the fallback value when the actor cap
+        is 0). See :func:`_same_operator`.
 
         ``max_per_round`` caps how many submissions a single hotkey may make for
         one round — anti-spam protection for the validator's screening +
@@ -650,23 +678,37 @@ class SubmissionStore:
                     f"time(s) for round {resolved_round_id} "
                     f"(max {max_per_round} per round)"
                 )
-        # Per-(github-account, round) cap — the anti-sybil backstop. Counts ALL of
-        # this GitHub account's submissions for the round REGARDLESS of hotkey, so a
-        # miner spreading one account across N hotkeys still collapses to the cap.
-        # Case-insensitive (GitHub logins are). Skipped when the owner is unknown
-        # (inline-source) or the cap is disabled.
-        owner_key = (github_owner or "").lower()
-        if owner_key and max_per_owner_per_round > 0:
-            owner_count = sum(
+        # Per-OPERATOR round cap — the anti-sybil backstop, generalizing the old
+        # per-github-account cap. An operator is the actor (coldkey ∪ github
+        # owner, harness/actor.py); ``max_per_actor_per_round`` wins, else the
+        # legacy ``max_per_owner_per_round`` value is used as the same cap. One
+        # coldkey spread over N hotkeys AND N github accounts collapses here, so
+        # the split-into-many-identities evasion buys no extra round slots.
+        # Degrades to hotkey ∪ owner when ``actor_of`` is None (pre-metagraph),
+        # i.e. exactly the old per-account behaviour. Inline-source with no
+        # coldkey and no owner is only ever its own hotkey, so it is never
+        # merged with anyone else.
+        operator_cap = max_per_actor_per_round or max_per_owner_per_round
+        # Only bites when the operator shares SOME cross-hotkey signal (a github
+        # account or a resolved coldkey) — an inline-source, coldkey-unknown
+        # submission is only ever its own hotkey, which the per-hotkey cap above
+        # already governs, so it stays exempt exactly like the old owner cap.
+        operator_id = (github_owner or "").strip() or (
+            actor_of(hotkey or "") if actor_of is not None else ""
+        )
+        shares_identity = bool(operator_id) and operator_id != hotkey
+        if operator_cap > 0 and shares_identity:
+            op_count = sum(
                 1 for s in self._submissions.values()
-                if (s.github_owner or "").lower() == owner_key
-                and s.round_id == resolved_round_id
+                if s.round_id == resolved_round_id
+                and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
             )
-            if owner_count >= max_per_owner_per_round:
+            if op_count >= operator_cap:
                 raise ValueError(
-                    f"GitHub account {owner_key!r} already submitted {owner_count} "
-                    f"time(s) for round {resolved_round_id} "
-                    f"(max {max_per_owner_per_round} per round per account)"
+                    f"operator {operator_id!r} already submitted {op_count} "
+                    f"time(s) for round {resolved_round_id} (max {operator_cap} "
+                    f"per round per operator — the hotkeys, coldkeys and github "
+                    f"accounts of one operator share the cap); resubmit next round"
                 )
         if max_total_per_round > 0:
             round_total = sum(
@@ -886,6 +928,33 @@ class SubmissionStore:
         return sum(
             1 for s in self._submissions.values()
             if (s.github_owner or "").lower() == owner and s.round_id == round_id
+        )
+
+    def count_by_operator_round(
+        self,
+        hotkey: str,
+        github_owner: str | None,
+        round_id: str,
+        actor_of: Any = None,
+    ) -> int:
+        """Number of submissions for ``round_id`` by the same OPERATOR as
+        ``(hotkey, github_owner)`` — the sybil-cap generalization of
+        :meth:`count_by_owner_round`.
+
+        Two submissions are the same operator when they share ANY of: the
+        hotkey, the github account (case-insensitive), or — when ``actor_of``
+        (a hotkey→actor resolver, harness/actor.py) is supplied — the resolved
+        actor (coldkey ∪ owner union). So one coldkey spread over many hotkeys
+        AND many github accounts still collapses to one operator. With
+        ``actor_of=None`` (no metagraph yet) it degrades to exactly the
+        hotkey ∪ owner behaviour, i.e. the old per-account cap. The submission
+        gate reads this BEFORE any expensive work.
+        """
+        self._maybe_reload()
+        return sum(
+            1 for s in self._submissions.values()
+            if s.round_id == round_id
+            and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
         )
 
     def count_benched_rounds_by_commit(self, hotkey: str, commit_hash: str) -> int:
