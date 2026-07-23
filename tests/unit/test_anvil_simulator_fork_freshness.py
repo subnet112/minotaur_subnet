@@ -66,6 +66,34 @@ def sim_with_upstream():
         return sim
 
 
+def test_httpprovider_gets_socket_timeout():
+    """The sim's HTTPProvider MUST be built with a finite socket timeout.
+
+    Without request_kwargs the provider inherits requests' default timeout=None
+    (infinite wait), so a wedged RPC freezes the event loop and starves the
+    benchmark timeout + the round's cert-deadline abort (the 159-min stall +
+    'stale incumbent bar' aborts). Regression guard: the provider must carry a
+    positive timeout == sim_timeout.
+    """
+    with patch("minotaur_subnet.simulator.anvil_simulator.Web3") as MockWeb3:
+        MockWeb3.HTTPProvider.return_value = MagicMock()
+        MockWeb3.to_checksum_address = lambda x: x
+        inst = MagicMock()
+        inst.is_connected.return_value = True
+        inst.eth.block_number = 100
+        MockWeb3.return_value = inst
+        AnvilSimulator(
+            rpc_url="http://anvil:8545",
+            default_executor="0x" + "00" * 20,
+            sim_timeout=17.0,
+        )
+        _, kwargs = MockWeb3.HTTPProvider.call_args
+        rk = kwargs.get("request_kwargs") or {}
+        assert rk.get("timeout") == 17.0, (
+            f"HTTPProvider built without a finite socket timeout: {kwargs!r}"
+        )
+
+
 def test_reset_fork_none_no_upstream_reverts_to_baseline(sim_no_upstream):
     """Without upstream URL, _reset_fork(None) reverts to baseline snapshot.
 
