@@ -2733,6 +2733,35 @@ async def initialize(ctx: ServerContext) -> dict:
 
                     actor_mod.set_coldkey_provider(_hotkey_coldkey_map)
 
+                    # Owner-union links (harness/actor.py): coldkeys an operator
+                    # spreads across shared github owners collapse into one
+                    # actor. Cached against the store's write-sequence + size so
+                    # a screening burst doesn't rescan the store each submission;
+                    # a new/updated submission refreshes it.
+                    from minotaur_subnet.api.routes.submissions.state import (
+                        get_store as _get_submission_store,
+                    )
+                    _owner_cache: dict[str, Any] = {"key": None, "map": {}}
+
+                    def _hotkey_owner_links() -> dict[str, list[str]]:
+                        try:
+                            store = _get_submission_store()
+                        except Exception:
+                            return _owner_cache["map"]
+                        key = (
+                            getattr(store, "_last_seen_seq", None),
+                            len(getattr(store, "_submissions", {}) or {}),
+                        )
+                        if _owner_cache["key"] != key:
+                            try:
+                                _owner_cache["map"] = store.actor_owner_edges()
+                                _owner_cache["key"] = key
+                            except Exception:
+                                logger.warning("owner-links build failed", exc_info=True)
+                        return _owner_cache["map"]
+
+                    actor_mod.set_owner_links_provider(_hotkey_owner_links)
+
                     # Same metagraph_sync also powers the signed-miner gate
                     # on /orders/{id}/dry-run (PR for miner-signed access).
                     # Both setters point at the same instance — the gate

@@ -30,7 +30,7 @@ from minotaur_subnet.harness.rotation import (
 
 # Fleet: hotkeys A1/A2/A3 share coldkey CK_A; S and T are solo miners.
 COLDKEYS = {"A1": "CK_A", "A2": "CK_A", "A3": "CK_A", "S": "CK_S", "T": "CK_T"}
-FLEET_RESOLVER = ActorResolver(COLDKEYS, source="test")
+FLEET_RESOLVER = ActorResolver.from_maps(COLDKEYS, source="test")
 
 
 @pytest.fixture(autouse=True)
@@ -157,7 +157,7 @@ def test_none_resolver_is_the_untouched_legacy_path():
 def test_actor_sort_key_identity_matches_legacy_prefix():
     ledger = {"X": 42.0}
     legacy = rotation_sort_key("X", "r1", ledger)
-    actored = actor_rotation_sort_key("X", "r1", ledger, ActorResolver({}, source="t"))
+    actored = actor_rotation_sort_key("X", "r1", ledger, ActorResolver.from_maps({}, source="t"))
     assert actored[:2] == legacy
 
 
@@ -271,3 +271,63 @@ def test_legacy_dispatch_has_no_per_hotkey_dedup(monkeypatch):
         gate.flush_round("r1")
         await asyncio.sleep(0)
     asyncio.run(run())
+
+
+# ── owner union: coldkeys sharing a github owner collapse to one actor ─────────
+
+from minotaur_subnet.harness.actor import _build_actor_map, owner_union_enabled
+
+
+def test_owner_union_merges_coldkeys_sharing_an_owner():
+    # Operator SF: 3 coldkeys, linked by reusing github owner "sf" across them,
+    # each hotkey a different owner alias but all bridged through the shared one.
+    coldkeys = {"h1": "CK1", "h2": "CK2", "h3": "CK3", "solo": "CKS"}
+    owners = {
+        "h1": ["sf", "aliasA"],   # CK1 <-> sf, aliasA
+        "h2": ["sf"],             # CK2 <-> sf   => CK1,CK2 merge
+        "h3": ["aliasA"],         # CK3 <-> aliasA => CK3 merges via aliasA<->CK1
+        "solo": ["honest"],       # unrelated
+    }
+    amap, backed = _build_actor_map(coldkeys, owners)
+    assert amap["h1"] == amap["h2"] == amap["h3"]      # one super-actor
+    assert amap["solo"] != amap["h1"]                  # honest solo stays separate
+    assert amap["h1"] == "CK1"                          # smallest coldkey label
+    assert backed == {"h1", "h2", "h3", "solo"}
+
+
+def test_owner_union_off_is_coldkey_only(monkeypatch):
+    monkeypatch.setenv("SOLVER_ACTOR_OWNER_UNION", "0")
+    assert owner_union_enabled() is False
+    coldkeys = {"h1": "CK1", "h2": "CK2"}
+    owners = {"h1": ["sf"], "h2": ["sf"]}               # shared owner ignored
+    amap, _ = _build_actor_map(coldkeys, owners)
+    assert amap["h1"] == "CK1" and amap["h2"] == "CK2"  # NOT merged
+    assert amap["h1"] != amap["h2"]
+
+
+def test_lone_coldkey_label_is_byte_identical_to_1030():
+    # No owner links => actor id is exactly the coldkey string (no prefix).
+    amap, _ = _build_actor_map({"h1": "CK1"}, {})
+    assert amap["h1"] == "CK1"
+
+
+def test_unmapped_hotkey_with_owner_gets_owner_actor_but_stays_unmapped():
+    # An unmapped hotkey (no coldkey) that submitted under an owner resolves to
+    # that owner for rotation, but mapped() still returns None (copy reject
+    # stands down — preserves the #1030 degraded-reject fix).
+    r = ActorResolver.from_maps({"h1": "CK1"}, {"h1": ["sf"], "u": ["sf"]})
+    # u shares owner sf with CK1 => same actor for rotation
+    assert r("u") == r("h1")
+    assert r("h1") == "CK1"
+    # but u has no coldkey => indeterminate for the copy reject
+    assert r.mapped("u") is None
+    assert r.mapped("h1") == "CK1"
+
+
+def test_owner_linked_coldkeys_are_same_actor_for_copy_reject():
+    # Two DIFFERENT coldkeys sharing an owner read as the same actor in
+    # mapped(), so a same-code resubmit across them is NOT a cross-actor copy.
+    r = ActorResolver.from_maps(
+        {"a": "CKA", "b": "CKB"}, {"a": ["op"], "b": ["op"]},
+    )
+    assert r.mapped("a") == r.mapped("b")   # merged => copy reject won't fire

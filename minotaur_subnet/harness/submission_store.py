@@ -936,6 +936,28 @@ class SubmissionStore:
         ]
         return sorted(subs, key=lambda s: s.created_at)
 
+    def actor_owner_edges(self) -> dict[str, list[str]]:
+        """``{hotkey: [github_owner, ...]}`` — every github owner each hotkey
+        has ever submitted under.
+
+        Feeds the actor-key owner union (harness/actor.py): coldkeys an
+        operator links by reusing a github owner across them collapse into one
+        scheduling identity, closing the coldkey-split evasion. In-RAM scan
+        (no DB hit); owners are deduped, order-stable. github_owner is derived
+        from the PR clone_url at ingest, so it can't be charged to a victim.
+        """
+        self._maybe_reload()
+        out: dict[str, list[str]] = {}
+        for s in self._submissions.values():
+            owner = (s.github_owner or "").strip()
+            hk = s.hotkey or ""
+            if not owner or not hk:
+                continue
+            owners = out.setdefault(hk, [])
+            if owner not in owners:
+                owners.append(owner)
+        return out
+
     def list_queued(self) -> list[Submission]:
         """List all submissions in QUEUED status."""
         return self.list_by_status(SubmissionStatus.QUEUED)
