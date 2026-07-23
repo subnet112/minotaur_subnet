@@ -236,17 +236,28 @@ def _sim_offload_enabled() -> bool:
     preserve the exact same serialization and therefore byte-for-byte
     determinism WITHIN one simulation.
 
-    DEFAULT OFF. This lands dark behind one remaining gate: ``SimulationRunner``
-    (blockloop/simulation.py) seeds the fork (``_deal_erc20`` / allowances /
-    platform fee) on the loop BEFORE calling ``simulate()``. Inline that seed is
-    atomic with the sim it precedes (the loop never yields between them);
-    offloaded, a concurrent flow's ``_reset_fork`` could wipe it mid-flight if
-    both drive the same simulator instance. Before flipping this on in
-    production, move that seeding inside the sim's locked window (pass the seed
-    ops into ``simulate`` so ``_simulate_inner`` applies them AFTER its re-fork)
-    — or prove no two flows ever share a simulator concurrently — and
-    re-validate benchmark determinism against a live anvil. Set
-    ``SIM_OFFLOAD_TO_THREAD=1`` to enable once that gate is cleared.
+    DEFAULT OFF — VALIDATED GATE, do not flip on until closed. ``SimulationRunner``
+    (blockloop/simulation.py:96-126) seeds the fork by calling ``_deal_erc20`` (an
+    ``anvil_setStorageAt``) and ``_set_erc20_allowance`` (which MINES A BLOCK via
+    ``send_transaction`` and pins the next block's timestamp) ON THE EVENT LOOP,
+    BEFORE ``await simulate()`` and OUTSIDE both ``_sim_lock`` and
+    ``_fork_mutation_lock``. Inline that is harmless (the loop can't run another
+    flow mid-sim). Offloaded it is NOT: startup.py wires ONE MultiChainSimulator
+    into BOTH the block loop (order/quote processing) AND the benchmark worker
+    (:1915 / :1926 / :2171), which run as concurrent asyncio tasks in one process.
+    While a benchmark sim is offloaded — this frees the loop (``_sim_lock`` is held
+    across ``await asyncio.to_thread``) — the block loop's seed can mine a block /
+    mutate storage on the SAME shared fork underneath that in-flight sim,
+    perturbing its gas_used / on_chain_score → cross-validator CONSENSUS DIVERGENCE.
+    (The reverse "a concurrent re-fork wipes our seed" is moot: the order rail
+    re-forks and wipes its own external seed single-threaded anyway.) Only the
+    isolated BENCHMARK_WORKER_ONLY (+ DISABLE_BLOCK_LOOP) process is immune as-is.
+    TO CLOSE: relocate those seeds into the locked, post-re-fork window — pass the
+    deposit-model + platform-fee amounts into ``simulate`` so
+    ``_simulate_via_score_intent`` applies them AFTER the re-fork (mirroring how
+    ``token_balances`` are already re-dealt there under the lock), delete the
+    pre-``await simulate()`` seeds — then re-run the benchmark determinism soak.
+    Set ``SIM_OFFLOAD_TO_THREAD=1`` only once that gate is cleared.
     """
     return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
         "1", "true", "yes", "on",
@@ -320,9 +331,10 @@ class AnvilSimulator:
         # revert failed" / fork-poison false positives. One lock per fork makes
         # the snapshot→execute→revert window atomic.
         self._sim_lock = asyncio.Lock()
-        # With SIM_OFFLOAD_TO_THREAD (default on) the sim body runs in a worker
-        # thread, so it can now execute CONCURRENTLY with loop-side code that
-        # also touches this fork. Two threading locks bridge that boundary
+        # With SIM_OFFLOAD_TO_THREAD (default OFF; see _sim_offload_enabled) the
+        # sim body runs in a worker thread, so it can now execute CONCURRENTLY
+        # with loop-side code that also touches this fork. Two threading locks
+        # bridge that boundary
         # (an asyncio.Lock can't be held across a thread):
         #   * _fork_mutation_lock — held by the offloaded sim body AND by the
         #     synchronous fork-mutators (pin_read_fork / simulate_with_trace) so
