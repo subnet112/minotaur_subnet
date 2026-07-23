@@ -26,6 +26,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+import asyncio
 import os
 
 # Configure logging before anything else so all modules get handlers.
@@ -177,6 +178,25 @@ def _solver_round_epoch_health() -> dict[str, object]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start/stop background workers with the server."""
+    # Enlarge the loop's DEFAULT thread pool. Many hot read paths hop to a thread
+    # via ``asyncio.to_thread`` / ``run_in_executor(None, …)`` — DB/store reads for
+    # /v1/solver/rounds (paginated), /v1/apps, /v1/dex-compare/stats, order-proc
+    # RPC reads, the read-proxy control POSTs. Python's default executor is only
+    # ``min(32, cpu+4)`` (12 on an 8-core box), so a burst of concurrent frontend
+    # polling saturates it and EVERY to_thread endpoint queues → upstream timeouts
+    # (looks like dex-compare "CORS did not succeed" in the browser). This pool is
+    # for blocking I/O, not CPU, so oversubscription is fine. Tune via
+    # API_THREAD_POOL_SIZE (default 64).
+    try:
+        import concurrent.futures
+        _pool = int(os.environ.get("API_THREAD_POOL_SIZE", "64") or "64")
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(16, _pool), thread_name_prefix="api-io",
+            )
+        )
+    except Exception:  # noqa: BLE001 - never block boot on the pool tweak
+        pass
     locals_bag = await _startup.initialize(ctx)
     yield
     await _startup.shutdown(ctx, locals_bag)
