@@ -28,7 +28,7 @@ PROVEN_LEDGER = {"hk-old": 100.0, "hk-mid": 200.0, "hk-new": 300.0}
 
 
 def _gate(ledger=None, seen=None, now=1000.0, budget=None,
-          concurrency=None, monkeypatch=None, opened_at=0.0, open_seconds=0.0):
+          concurrency=None, monkeypatch=None):
     """Build a gate + round with explicit env, injectable clock/ledger/seen."""
     assert monkeypatch is not None
     if budget is None:
@@ -46,7 +46,7 @@ def _gate(ledger=None, seen=None, now=1000.0, budget=None,
         now=lambda: clock["t"],
     )
     gate._clock = clock
-    gate.ensure_round(ROUND, opened_at=opened_at, open_seconds=open_seconds)
+    gate.ensure_round(ROUND)
     return gate
 
 
@@ -260,7 +260,7 @@ def test_prior_attempts_rebuild_charges_exactly_once(monkeypatch):
             ledger_loader=lambda: dict(PROVEN_LEDGER), seen_loader=lambda: {},
         )
         gate.ensure_round(
-            ROUND, opened_at=0.0, open_seconds=0.0,
+            ROUND,
             prior_attempts=[("s-a", "hk-old"), ("s-b", "sybil-1"),
                             ("s-a", "hk-old"), ("s-c", "sybil-2")],
         )

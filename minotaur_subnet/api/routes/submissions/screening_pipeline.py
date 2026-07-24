@@ -884,16 +884,6 @@ def _has_prior_build_attempt(sub: Any) -> bool:
     return stage2.get("passed") is not None
 
 
-def _round_open_window_seconds() -> float:
-    """The round OPEN window length — same env + default as the round
-    coordinator's close check (api/startup.py). Read here only to time the
-    build budget's newcomer→proven spill delay."""
-    try:
-        return float(os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "300").strip() or "300")
-    except ValueError:
-        return 300.0
-
-
 def _ensure_budget_round(store: Any, round_id: str) -> None:
     """Bootstrap the build-budget gate's state for a round (idempotent).
 
@@ -908,32 +898,16 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
     """
     from minotaur_subnet.harness.build_budget import get_build_budget_gate
 
-    from .state import get_round_store
-
     gate = get_build_budget_gate()
     if not round_id or not gate.needs_round(round_id):
         return
     try:
-        opened_at = 0.0
-        try:
-            round_state = get_round_store().get_round(round_id)
-            opened_at = float(getattr(round_state, "created_at", 0.0) or 0.0)
-        except Exception:
-            logger.warning(
-                "[build-budget] no round state for %s (newcomer-spill delay "
-                "disabled for the round)", round_id, exc_info=True,
-            )
         prior = [
             (s.submission_id, s.hotkey or "")
             for s in store.list_by_round(round_id)
             if _has_prior_build_attempt(s)
         ]
-        gate.ensure_round(
-            round_id,
-            opened_at=opened_at,
-            open_seconds=_round_open_window_seconds(),
-            prior_attempts=prior,
-        )
+        gate.ensure_round(round_id, prior_attempts=prior)
     except Exception:
         logger.warning(
             "[build-budget] bootstrap for %s failed (gate will bootstrap "
@@ -944,12 +918,13 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
 async def _acquire_build_grant(store: Any, sub: Any):
     """Wire the pipeline into the per-round build-budget gate (may WAIT).
 
-    Gathers the leader-local context the gate needs — the round's open window
-    (for the newcomer-spill delay), a liveness probe (so a waiter never
-    outlives a round closed without a rotation flush), and the restart-rebuild
-    input (prior build attempts, charged exactly once) — then asks for a
-    unit. See harness/build_budget.py for the allocation rules and the
-    2026-07-16 build-flood rationale.
+    Gathers the leader-local context the gate needs — a liveness probe (so a
+    waiter never outlives a round closed without a rotation flush) and the
+    restart-rebuild input (prior build attempts, charged exactly once) — then
+    asks for a unit. Units are dispensed from one wait-time seniority queue
+    (last bench, or first-seen for the never-benched). See
+    harness/build_budget.py for the allocation rules and the 2026-07-16
+    build-flood rationale.
     """
     from minotaur_subnet.harness.build_budget import get_build_budget_gate
 
@@ -1191,8 +1166,9 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # Stage 2 gate: the docker build is the resource the 2026-07-16 flood
         # weaponized (63 builds/hour from sybil intake), so builds are dispensed
         # from a per-round budget (SOLVER_ROUND_INTAKE_MAX, default 8, 0 =
-        # unlimited) by ROTATION SENIORITY — proven miners LRU-first with a
-        # reserved newcomer lottery share — instead of arrival order. This
+        # unlimited) by WAIT-TIME SENIORITY — one queue ordered by last bench
+        # (or first-seen for the never-benched; a fresh mint sorts junior),
+        # with soft per-operator dedup — instead of arrival order. This
         # acquire may WAIT (until a unit frees, or the close-time flush parks
         # us); budget-winners proceed immediately, so their near-immediate
         # feedback is preserved. See harness/build_budget.py.
