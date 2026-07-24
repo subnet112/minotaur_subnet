@@ -40,7 +40,7 @@ def test_champion_miner_weight_fraction_is_pinned():
     # it, and never let the change sit on develop unpromoted (the leader holds the
     # supermajority of validator stake, so it alone moves consensus and every
     # third-party validator still on the old value gets its vtrust clipped).
-    assert CHAMPION_MINER_WEIGHT_FRACTION == 0.75
+    assert CHAMPION_MINER_WEIGHT_FRACTION == 0.10
 
 
 def test_build_weights_ramps_champion_with_owner_burn():
