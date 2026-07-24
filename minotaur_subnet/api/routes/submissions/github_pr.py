@@ -95,12 +95,18 @@ def _fetch_pr(
     except urllib.error.HTTPError as exc:
         if token is not None or exc.code != 401 or "Authorization" not in headers:
             raise
+        exc.close()
 
     # A revoked validator token makes GitHub reject even public resources. The
     # host and canonical repository are fixed by the caller, so retrying this
     # public lookup without the bad bearer restores availability without
-    # weakening the explicit-token private submission path.
-    logger.warning("GitHub rejected the public PR token; retrying unauthenticated")
+    # weakening the explicit-token private submission path. Unauthenticated
+    # requests share a 60/hr per-IP rate limit, so this is a degraded mode,
+    # not a steady state — hence error, not warning.
+    logger.error(
+        "GitHub rejected the public PR token (401); retrying unauthenticated. "
+        "Rotate SOLVER_REPO_PR_TOKEN/SOLVER_REPO_TOKEN."
+    )
     public_headers = dict(headers)
     public_headers.pop("Authorization", None)
     retry = urllib.request.Request(url, headers=public_headers)
