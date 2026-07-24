@@ -905,6 +905,119 @@ class TestEpochManager:
         assert "outranked" in rejected[0][1]
         assert "sub_top" in rejected[0][1]
 
+    # ── transient incumbent re-bench: defer-not-abort (round-e29746984) ─────────
+    @staticmethod
+    def _stale_bar_fixture(rebench_behavior):
+        """Closed round + adopted champion + ONE adoptable challenger, with
+        ``_refresh_incumbent_score`` patched to ``rebench_behavior(mgr, champ)`` —
+        an async fn that sets ``_incumbent_refresh_failed`` /
+        ``_incumbent_refresh_retryable`` to simulate a transient or permanent
+        re-bench failure (or success). The challenger's stored bar strictly beats
+        the champion's, so a SUCCESSFUL re-bench yields an adopted finalist.
+        Returns ``(mgr, current_round)``."""
+        round_store = RoundStore()
+        current_round = round_store.ensure_open_round(opened_epoch=4)
+        round_store.close_current_round(
+            close_epoch=4, benchmark_pack_hash="pack-4",
+            committee_hash="committee-4", quorum_required=1,
+        )
+        champ = _make_submission(submission_id="sub_champ", epoch=1)
+        champ.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "1000000"},
+        ]}
+        challenger = _make_submission(
+            submission_id="sub_chal", epoch=4, round_id=current_round.round_id,
+        )
+        challenger.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "2000000"},  # strictly wins vs the bar
+        ]}
+        store = _make_store_with_subs(champ, challenger)
+        mgr = EpochManager(
+            benchmark_worker=_make_mock_benchmark_worker(),
+            submission_store=store,
+            round_store=round_store,
+            on_champion_rejected=lambda *a: None,
+        )
+        mgr._champion = ChampionInfo(submission_id="sub_champ")
+
+        async def _patched():
+            await rebench_behavior(mgr, champ)
+        mgr._refresh_incumbent_score = _patched
+        return mgr, current_round
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_defers_on_transient_stale_bar_then_recovers(self):
+        """A TRANSIENT incumbent re-bench failure must DEFER (not abort) so the next
+        coordinator tick retries — a single flaky re-bench no longer kills a round a
+        challenger legitimately won (the live 'stale incumbent bar (re-benchmark
+        failed)' aborts, round-e29746984). Once the re-bench succeeds, the finalist
+        is selected."""
+        calls = {"n": 0}
+
+        async def flaky(mgr, champ):
+            calls["n"] += 1
+            if calls["n"] <= 2:  # fail transiently the first two ticks
+                mgr._incumbent_refresh_failed = True
+                mgr._incumbent_refresh_retryable = True
+            else:  # then recover
+                mgr._incumbent_refresh_failed = False
+                mgr._incumbent_refresh_retryable = False
+
+        mgr, rnd = self._stale_bar_fixture(flaky)
+
+        r1 = await mgr.evaluate_round(rnd.round_id, epoch=4)
+        assert r1.get("deferred") is True
+        assert r1.get("abort_reason") is None
+        assert mgr._round_store.get_round(rnd.round_id).status != RoundStatus.ABORTED
+
+        r2 = await mgr.evaluate_round(rnd.round_id, epoch=4)
+        assert r2.get("deferred") is True
+
+        r3 = await mgr.evaluate_round(rnd.round_id, epoch=4)
+        assert r3.get("deferred") is not True
+        assert r3["finalist_submission_id"] == "sub_chal"
+        assert r3["status_after"] == RoundStatus.CERTIFYING.value
+        # The per-round defer counter is evicted once the round leaves REPLAYING
+        # (no unbounded growth on the long-lived leader).
+        assert rnd.round_id not in mgr._incumbent_refresh_attempts
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_aborts_transient_stale_bar_after_attempt_cap(self):
+        """A PERSISTENTLY-failing (still 'transient') re-bench must not hog the
+        decision window forever: after ``INCUMBENT_REFRESH_MAX_ATTEMPTS`` defers it
+        gives up and aborts on the stale bar (the decision deadline is the outer
+        bound; this cap prevents repeated expensive re-benches in the meantime)."""
+        async def always_transient(mgr, champ):
+            mgr._incumbent_refresh_failed = True
+            mgr._incumbent_refresh_retryable = True
+
+        mgr, rnd = self._stale_bar_fixture(always_transient)
+
+        results = [await mgr.evaluate_round(rnd.round_id, epoch=4) for _ in range(3)]
+        assert results[0].get("deferred") is True   # attempt 1/3
+        assert results[1].get("deferred") is True   # attempt 2/3
+        # 3rd hits the cap -> abort on the stale bar rather than defer again.
+        assert results[2].get("deferred") is not True
+        assert results[2]["status_after"] == RoundStatus.ABORTED.value
+        assert "stale incumbent bar" in (results[2]["abort_reason"] or "")
+        # Counter evicted on the abort path too (via _complete_round).
+        assert rnd.round_id not in mgr._incumbent_refresh_attempts
+
+    @pytest.mark.asyncio
+    async def test_evaluate_round_aborts_permanent_stale_bar_immediately(self):
+        """A PERMANENT stale bar (missing incumbent record / unresolvable image;
+        retryable=False) still aborts FAST — no pointless retries to the deadline."""
+        async def permanent(mgr, champ):
+            mgr._incumbent_refresh_failed = True
+            mgr._incumbent_refresh_retryable = False
+
+        mgr, rnd = self._stale_bar_fixture(permanent)
+
+        r = await mgr.evaluate_round(rnd.round_id, epoch=4)
+        assert r.get("deferred") is not True
+        assert r["status_after"] == RoundStatus.ABORTED.value
+        assert "stale incumbent bar" in (r["abort_reason"] or "")
+
     @pytest.mark.asyncio
     async def test_evaluate_round_defers_with_adoptable_finalist_and_inflight_slate(self):
         """Wait for the FULL slate even when a scored candidate is already adoptable.
