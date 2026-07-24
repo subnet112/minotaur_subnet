@@ -439,6 +439,7 @@ async def _clone_repo_sandboxed(
     if basic_auth:
         run_env["GIT_BASIC_AUTH"] = basic_auth
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -451,19 +452,25 @@ async def _clone_repo_sandboxed(
         )
     except asyncio.TimeoutError:
         logger.warning("Clone sandbox timed out for %s", repo_url)
-        # The cancelled communicate() leaves nobody draining the CLI's stdout,
-        # so it blocks forever mid-tar and its pipes + pidfd stay open in this
-        # process — enough timed-out clones EMFILE the whole api (2026-07-23
-        # leader incident: 95 hung CLIs, fd table at 924/1024). Kill and reap
-        # it, then remove the container the orphaned CLI leaves behind.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
-        await _force_remove_container(container_name)
         return False
     except FileNotFoundError:
         logger.error("docker CLI not found; cannot run clone sandbox")
         return False
+    finally:
+        # ANY exit while the CLI is still running — timeout above, task
+        # cancellation (mid-round restarts orphan screening tasks), or an
+        # unexpected error mid-communicate() — must kill and reap it here.
+        # An abandoned communicate() leaves nobody draining the CLI's stdout,
+        # so it blocks forever mid-tar and its pipes + pidfd stay open in this
+        # process — enough orphaned clones EMFILE the whole api (2026-07-23
+        # leader incident: 95 hung CLIs, fd table at 924/1024). Also remove
+        # the daemon-side container the orphaned CLI leaves behind. A
+        # CancelledError still propagates to the caller after this cleanup.
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()  # prompt: the CLI was just SIGKILLed
+            await _force_remove_container(container_name)
 
     if proc.returncode != 0:
         logger.warning(
