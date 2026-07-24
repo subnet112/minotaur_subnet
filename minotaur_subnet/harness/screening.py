@@ -141,6 +141,13 @@ _BANNED_IMPORT_MODULES = frozenset({
 # INERT). A follow-up flips it to True once the live fleet's import profile
 # confirms no legitimate solver trips it. A CODE constant (never env-read), so
 # the gate is fleet-uniform — the FLOOR_BPS/FLOOR_VERSION discipline.
+#
+# ARMING PRECONDITION: the scan matches TOP-LEVEL modules, so today it flags
+# legitimate code — `from urllib.parse import urlparse` (used by this codebase
+# itself) and `from http import HTTPStatus` hit the `urllib`/`http` bans just
+# like the exfil gadgets do. Flipping this flag alone is NOT sufficient: arming
+# first requires a submodule allowlist (at minimum urllib.parse), shaped by the
+# dotted names the observe-only soak logs record.
 BANNED_IMPORTS_ARMED: bool = False
 BANNED_IMPORTS_VERSION = 1
 

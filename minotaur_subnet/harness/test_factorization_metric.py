@@ -15,7 +15,12 @@ from __future__ import annotations
 import ast
 import textwrap
 
-from minotaur_subnet.harness.screening import _module_max_region, max_region_nodes
+from minotaur_subnet.harness.screening import (
+    _module_max_region,
+    _solver_exec_command,
+    banned_imports,
+    max_region_nodes,
+)
 
 
 def _mrn(src: str) -> int:
@@ -240,8 +245,6 @@ def test_floor_armed_rejects_dynamic_code_first(tmp_path, monkeypatch):
 
 # ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
 
-from minotaur_subnet.harness.screening import banned_imports
-
 
 def test_banned_imports_catches_nested_urllib_gadget(tmp_path):
     # The chain-killer "putty" class: `import urllib.request` NESTED in a function
@@ -316,8 +319,6 @@ def test_banned_imports_armed_passes_clean_solver(tmp_path, monkeypatch):
 
 
 # ── Stage-2 exec container hardening (import/init run untrusted code) ──────────
-
-from minotaur_subnet.harness.screening import _solver_exec_command
 
 
 def test_solver_exec_command_is_hardened():
