@@ -169,6 +169,69 @@ services:
     # minotaur ONLY — see anvil-eth. Solver reaches Base state via the pin proxy.
     networks: [minotaur]
 
+  # ── Dedicated /quote forks (opt-in) ───────────────────────────────────────
+  # Byte-identical to anvil-eth / anvil-base (same image, --fork-url slug,
+  # --chain-id, --no-storage-caching) so scoreIntent state + measured gas match
+  # the order forks — but RESERVED for the /quote path so quote sims never queue
+  # behind order-processing on the shared _sim_lock, and the #1026 fork-pin stays
+  # warm (nothing else re-forks these). The api uses them ONLY when
+  # ETH_QUOTE_SIM_RPC_URL / BASE_QUOTE_SIM_RPC_URL are set on the api service
+  # (below); otherwise quotes fall back to the shared order forks. No host-port
+  # publish (would collide with anvil-eth's 127.0.0.1:8545) — reached via container
+  # DNS anvil-eth-quote:8545. Reuse the SINGLE fork-cache (warm shared immutable
+  # cache, zero extra archive CUs). minotaur net ONLY (never the sealed sandbox).
+  anvil-eth-quote:
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8545"
+      - "--fork-url=http://fork-cache:8650/eth"
+      - "--chain-id=1"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
+  anvil-base-quote:
+    depends_on:
+      - fork-cache
+    image: ghcr.io/foundry-rs/foundry@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8546"
+      - "--fork-url=http://fork-cache:8650/base"
+      - "--chain-id=8453"
+      - "--no-storage-caching"
+      - "--fork-retry-backoff=5000"
+      - "--retries=10"
+      - "--timeout=60000"
+    tmpfs:
+      - /root:size=2g
+      - /tmp:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8546 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks: [minotaur]
+
   anvil-btevm:
     depends_on:
       - fork-cache
@@ -592,7 +655,6 @@ services:
       ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
       FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
       GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
-      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"   # empty→live champion runs --network=none as today; leader sets production_minotaur in .env
       MVP_DEMO_MODE: "${MVP_DEMO_MODE:-0}"
       ORDER_CONSENSUS_PEERS: "${ORDER_CONSENSUS_PEERS}"
       ORDER_CONSENSUS_QUORUM_BPS: "${ORDER_CONSENSUS_QUORUM_BPS:-6666}"
@@ -670,6 +732,14 @@ services:
       BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
       ETH_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
       BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_UPSTREAM_RPC_URL:-https://lite.chain.opentensor.ai}"
+
+      # Dedicated /quote simulator forks (opt-in) — see the anvil-*-quote services.
+      # When set, quotes run on their OWN anvils (own _sim_lock + own fork) so quote
+      # sims never queue behind order-processing on the shared runner, and the
+      # #1026 fork-pin stays warm. Unset => quotes use the shared order forks
+      # (behaviour byte-unchanged). Order-processing/scoring never use these.
+      ETH_QUOTE_SIM_RPC_URL: http://anvil-eth-quote:8545
+      BASE_QUOTE_SIM_RPC_URL: http://anvil-base-quote:8546
 
       # Upstream RPCs for refork-time state
       ETH_UPSTREAM_RPC_URL: "${ETH_UPSTREAM_RPC_URL}"
@@ -757,6 +827,39 @@ services:
       BENCHMARK_ANVIL_RPC_ETH: "http://172.30.0.2:8545"
       BENCHMARK_ANVIL_RPC_BASE: "http://172.30.0.3:8546"
       BENCHMARK_ANVIL_RPC_BTEVM: "http://172.30.0.4:8547"
+
+      # ── LIVE champion RPC containment (opt-in; default OFF) ──────────────
+      # The adopted champion processes REAL user orders. By default it gets the
+      # KEYED BASE_RPC_URL and (on the leader) runs on a non-internal net — so a
+      # hostile champion could read the provider API key and exfiltrate order
+      # data. Set LIVE_SOLVER_RPC_VIA_PROXY=1 to route its RPC through the SAME
+      # keyless block-pin proxy the benchmark path uses, on a DEDICATED
+      # `live-solver` --internal net: the champion then holds NO key and reaches
+      # ONLY the proxy, which METERS its per-order RPC (LIVE_SOLVER_RPC_BUDGET).
+      # The api creates the net + attaches the proxy at 172.30.1.5 automatically.
+      # Once enabled + verified, set LIVE_SOLVER_REQUIRE_INTERNAL=1 so a champion
+      # is REFUSED on any non-internal net (fail-closed). Leave all three unset to
+      # keep today's behavior exactly.
+      # Enable with ONLY this one var — the api creates the dedicated proxy net,
+      # attaches the proxy, and lands the champion on it. Do NOT also rename
+      # LIVE_SOLVER_NETWORK (the legacy direct-RPC net); the proxy net has its own
+      # var (LIVE_SOLVER_PROXY_NETWORK) precisely so enabling can't collide with it.
+      LIVE_SOLVER_RPC_VIA_PROXY: "${LIVE_SOLVER_RPC_VIA_PROXY:-0}"
+      LIVE_SOLVER_REQUIRE_INTERNAL: "${LIVE_SOLVER_REQUIRE_INTERNAL:-0}"
+      LIVE_SOLVER_RPC_BUDGET: "${LIVE_SOLVER_RPC_BUDGET:-5000}"
+      # The dedicated --internal net the proxy + champion share when the feature is
+      # on (auto-created). SEPARATE from LIVE_SOLVER_NETWORK (the legacy net used
+      # only while the feature is OFF) so turning the feature on never requires
+      # renaming the legacy net — that overload stranded the champion on 2026-07-22.
+      # Override name/subnet only on a host collision; the proxy IP is the subnet
+      # base+5 (or pin SOLVER_LIVE_RPC_PROXY_IP). NEVER pick a subnet inside
+      # 172.31.0.0/16 (AWS default-VPC CIDR; DNS resolver at 172.31.0.2 → an
+      # overlapping bridge blackholes host DNS/VPC traffic).
+      LIVE_SOLVER_PROXY_NETWORK: "${LIVE_SOLVER_PROXY_NETWORK:-live-solver}"
+      LIVE_SOLVER_NETWORK_SUBNET: "${LIVE_SOLVER_NETWORK_SUBNET:-172.30.1.0/24}"
+      # Legacy net for the direct-RPC champion (feature OFF); leader sets it to
+      # production_minotaur. Ignored while LIVE_SOLVER_RPC_VIA_PROXY=1.
+      LIVE_SOLVER_NETWORK: "${LIVE_SOLVER_NETWORK:-}"
 
       # Block-pin RPC proxy — the solver's reads route through it, pinned to the
       # round fork block (deterministic, ~30ms). The api LAUNCHES + owns the proxy
@@ -1296,6 +1399,21 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+
+  # Dedicated sealed net for the LIVE champion when LIVE_SOLVER_RPC_VIA_PROXY=1.
+  # Declared here for visibility/parity, but (like benchmark-sandbox) the api
+  # also self-heals it imperatively at startup — a fresh host or `network prune`
+  # must not strand the champion. internal: true — the champion reaches ONLY the
+  # block-pin proxy (attached at subnet base+5, default 172.30.1.5), never the
+  # internet/relayer/IMDS. Subnet deliberately OUTSIDE 172.31.0.0/16 (the AWS
+  # default-VPC CIDR — overlapping it blackholes the VPC DNS resolver).
+  live-solver:
+    name: live-solver
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: "${LIVE_SOLVER_NETWORK_SUBNET:-172.30.1.0/24}"
 
   # Isolated control-plane net: ONLY the api + benchmark-worker reach the
   # docker-socket-proxy here. The proxy is REMOVED from `minotaur`, so an

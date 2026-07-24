@@ -39,11 +39,19 @@ class SimulationRunner:
         intent_order_dict: dict | None,
         is_cross_chain: bool,
         deployed_contract: str,
+        fork_block: int | None = None,
+        pin_only: bool = False,
     ) -> SimulationResult:
         """Simulate an execution plan.
 
         Handles token seeding, deposit-model apps, cross-chain simulation,
         and falls back to mock simulation on failure.
+
+        ``fork_block`` / ``pin_only`` are the QUOTE path's fork-pin controls:
+        pin the single-chain sim to a stable, cache-warm block instead of
+        re-forking to upstream head on every call (see AnvilSimulator._simulate_inner).
+        They are ignored on the cross-chain branch and default to the prior
+        head-refork behaviour, so scoring / order-processing are unchanged.
         """
         if self.simulator is not None:
             # Seed the simulator with input tokens from order params.
@@ -134,6 +142,8 @@ class SimulationRunner:
                         contract_address=contract_address,
                         intent_order=intent_order_dict,
                         token_balances=sim_token_balances,
+                        fork_block=fork_block,
+                        pin_only=pin_only,
                     )
                     logger.info("[LOOP] simulation result: success=%s error=%s transfers=%s", simulation.success, simulation.error, len(simulation.token_transfers or []))
                 return simulation

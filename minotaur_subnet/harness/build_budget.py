@@ -91,12 +91,14 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from minotaur_subnet.harness.actor import actor_last_selected, snapshot_resolver
 from minotaur_subnet.harness.rotation import (
     RotationLedger,
+    actor_rotation_sort_key,
     rotation_ledger_path,
     rotation_sort_key,
 )
@@ -200,11 +202,17 @@ class BuildGrant:
 class _Waiter:
     submission_id: str
     hotkey: str
-    # rotation_sort_key(hotkey, round_id, ledger): (last_selected_ts, salted
-    # sha256). For proven miners the timestamp orders LRU-first; for newcomers
-    # every timestamp is 0.0 so the salted hash is a pure per-round lottery.
-    key: tuple[float, str]
+    # With actor keying: actor_rotation_sort_key = (actor_last_selected_ts,
+    # actor-salted sha256, hotkey-salted sha256) — for proven actors the
+    # timestamp orders LRU-first; for newcomers every timestamp is 0.0 so the
+    # ACTOR-salted hash is a pure per-round lottery, one ticket per actor
+    # however many hotkeys it registers. Legacy (state.actor_of None): the
+    # original per-hotkey rotation_sort_key 2-tuple, unchanged. A round uses
+    # one shape throughout (snapshotted at ensure_round), so keys always
+    # compare cleanly.
+    key: tuple[float, str, str] | tuple[float, str]
     proven: bool
+    actor: str = ""
     event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: BuildGrant | None = None
 
@@ -219,6 +227,14 @@ class _RoundGateState:
     open_seconds: float
     spill_after_fraction: float
     ledger: dict[str, float]
+    # Actor view, snapshotted with the ledger at ensure_round so one round's
+    # dispatch is internally consistent even across a mid-round metagraph
+    # re-sync (next round picks up the new map). A FROZEN ActorResolver
+    # (harness/actor.py) — or None, which switches this round's classification,
+    # ordering and dedup to the legacy per-hotkey rules wholesale.
+    actor_of: Any = None
+    actor_last: dict[str, float] = field(default_factory=dict)
+    charged_actors: set[str] = field(default_factory=set)
     charged_ids: set[str] = field(default_factory=set)
     proven_charged: int = 0
     newcomer_charged: int = 0
@@ -278,6 +294,8 @@ class BuildBudgetGate:
             proven_units = min(budget, max(0, round(budget * share)))
         else:
             proven_units = 0
+        ledger = self._ledger_loader()
+        actor_of = snapshot_resolver()
         state = _RoundGateState(
             round_id=round_id,
             budget=budget,
@@ -286,16 +304,17 @@ class BuildBudgetGate:
             opened_at=float(opened_at or 0.0),
             open_seconds=float(open_seconds or 0.0),
             spill_after_fraction=newcomer_spill_after_fraction(),
-            ledger=self._ledger_loader(),
+            ledger=ledger,
+            actor_of=actor_of,
+            actor_last=(
+                actor_last_selected(ledger, actor_of)
+                if actor_of is not None else dict(ledger)
+            ),
         )
         for sid, hotkey in prior_attempts or []:
             if sid in state.charged_ids:
                 continue
-            state.charged_ids.add(sid)
-            if self._is_proven(state, hotkey):
-                state.proven_charged += 1
-            else:
-                state.newcomer_charged += 1
+            self._charge_unit(state, sid, hotkey)
         self._rounds[round_id] = state
         if prior_attempts:
             logger.info(
@@ -319,11 +338,33 @@ class BuildBudgetGate:
     # ── classification / ordering ────────────────────────────────────────
 
     @staticmethod
+    def _actor(state: _RoundGateState, hotkey: str) -> str:
+        hotkey = hotkey or ""
+        if state.actor_of is None:
+            return hotkey
+        return state.actor_of(hotkey) or hotkey
+
+    @staticmethod
     def _is_proven(state: _RoundGateState, hotkey: str) -> bool:
         # A ledger entry means "completed at least one past bench" — the
         # rotation ledger only advances for SELECTED slate members
-        # (rotation.apply_rotation_slate → mark_selected).
-        return float(state.ledger.get(hotkey or "", 0.0)) > 0.0
+        # (rotation.apply_rotation_slate → mark_selected). Actor-keyed: ANY of
+        # the actor's hotkeys having benched makes the whole actor proven, so
+        # a fleet's freshly-minted sibling hotkey can no longer re-enter the
+        # newcomer lottery its coldkey already graduated from.
+        actor = BuildBudgetGate._actor(state, hotkey)
+        return float(state.actor_last.get(actor, 0.0)) > 0.0
+
+    @staticmethod
+    def _charge_unit(state: _RoundGateState, submission_id: str, hotkey: str) -> None:
+        """Record one spent budget unit for ``submission_id`` (idempotence is
+        the caller's job via ``charged_ids``)."""
+        state.charged_ids.add(submission_id)
+        state.charged_actors.add(BuildBudgetGate._actor(state, hotkey))
+        if BuildBudgetGate._is_proven(state, hotkey):
+            state.proven_charged += 1
+        else:
+            state.newcomer_charged += 1
 
     def _spill_to_proven_open(self, state: _RoundGateState) -> bool:
         """May a newcomer consume an idle proven unit yet? (Amendment: only
@@ -344,10 +385,21 @@ class BuildBudgetGate:
 
         Largest-remainder interleave between the pools (with 6/2 units the
         grant pattern is P P P N P P P N), each pool internally ordered by
-        rotation_sort_key; asymmetric spillover per the module docstring.
+        the actor-keyed rotation sort; asymmetric spillover per the module
+        docstring. Soft per-actor dedup: waiters whose ACTOR already spent a
+        unit this round sort behind every fresh actor in their pool — a fleet
+        only collects a second unit when no other actor is waiting, so budget
+        is never wasted but never multiplied by hotkey count either.
         """
-        proven_w = sorted((w for w in state.waiters if w.proven), key=lambda w: w.key)
-        newcomer_w = sorted((w for w in state.waiters if not w.proven), key=lambda w: w.key)
+        def _pool(waiters: Iterable[_Waiter]) -> list[_Waiter]:
+            if state.actor_of is None:  # legacy: pure key order, no dedup
+                return sorted(waiters, key=lambda w: w.key)
+            return sorted(
+                waiters, key=lambda w: (w.actor in state.charged_actors, w.key),
+            )
+
+        proven_w = _pool(w for w in state.waiters if w.proven)
+        newcomer_w = _pool(w for w in state.waiters if not w.proven)
         proven_left = state.proven_units - state.proven_charged
         newcomer_left = state.newcomer_units - state.newcomer_charged
 
@@ -382,6 +434,7 @@ class BuildBudgetGate:
     def _grant(self, state: _RoundGateState, waiter: _Waiter, pool: str) -> None:
         state.waiters.remove(waiter)
         state.charged_ids.add(waiter.submission_id)
+        state.charged_actors.add(waiter.actor)
         if pool == "proven":
             state.proven_charged += 1
         else:
@@ -448,11 +501,7 @@ class BuildBudgetGate:
         # (or earlier in this one) — pass free, and count exactly once.
         if prior_attempt or submission_id in state.charged_ids:
             if submission_id not in state.charged_ids:
-                state.charged_ids.add(submission_id)
-                if self._is_proven(state, hotkey):
-                    state.proven_charged += 1
-                else:
-                    state.newcomer_charged += 1
+                self._charge_unit(state, submission_id, hotkey)
             state.in_flight.add(submission_id)
             return BuildGrant(
                 granted=True, charged=False,
@@ -466,11 +515,7 @@ class BuildBudgetGate:
             # exactly the pre-gate semantics for slow screeners, still bounded
             # by the round's budget — otherwise deny (caller parks no-fault).
             if state.total_charged < state.budget:
-                state.charged_ids.add(submission_id)
-                if self._is_proven(state, hotkey):
-                    state.proven_charged += 1
-                else:
-                    state.newcomer_charged += 1
+                self._charge_unit(state, submission_id, hotkey)
                 state.in_flight.add(submission_id)
                 return BuildGrant(
                     granted=True, charged=True,
@@ -487,8 +532,15 @@ class BuildBudgetGate:
         waiter = _Waiter(
             submission_id=submission_id,
             hotkey=hotkey or "",
-            key=rotation_sort_key(hotkey or "", round_id, state.ledger),
+            key=(
+                actor_rotation_sort_key(
+                    hotkey or "", round_id, state.actor_last, state.actor_of,
+                )
+                if state.actor_of is not None
+                else rotation_sort_key(hotkey or "", round_id, state.ledger)
+            ),
             proven=self._is_proven(state, hotkey or ""),
+            actor=self._actor(state, hotkey or ""),
         )
         state.waiters.append(waiter)
         self._dispatch(state)

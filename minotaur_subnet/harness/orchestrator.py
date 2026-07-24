@@ -734,6 +734,70 @@ _SENSITIVE_ENV_PREFIXES = (
     "PASSWORD", "TOKEN", "AUTH", "CREDENTIAL",
 )
 
+_TRUTHY_ENV = {"1", "true", "yes", "on"}
+
+
+def _require_internal_live_net() -> bool:
+    """Whether to HARD-FAIL a live champion whose network is not ``--internal``.
+
+    Opt-in for a safe rollout: default is WARN-only (surfaces a mis-scoped live
+    net without breaking a node mid-flight). Set ``LIVE_SOLVER_REQUIRE_INTERNAL=1``
+    to fail closed — do this once the live champion has a keyless RPC path (the
+    read proxy on the live-solver internal net) so enforcement doesn't sever the
+    champion's only RPC route.
+    """
+    return os.environ.get("LIVE_SOLVER_REQUIRE_INTERNAL", "").strip().lower() in _TRUTHY_ENV
+
+
+async def _docker_network_is_internal(name: str) -> bool | None:
+    """``True``/``False`` if the named Docker network is ``--internal``.
+
+    ``None`` when it can't be determined (docker error, socket-proxy denies
+    inspect, or the net is absent) — callers treat ``None`` as "unknown", not
+    "safe", but must not hard-fail on it (inspect can be denied on a healthy
+    node behind the socket-proxy).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "network", "inspect", name, "--format", "{{.Internal}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            return None
+        return out.decode("utf-8", "replace").strip() == "true"
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return None
+
+
+async def _docker_network_exists(name: str) -> bool | None:
+    """``True`` if the named Docker network exists, ``False`` if it DEFINITELY
+    doesn't, ``None`` if it can't be determined.
+
+    ``docker network inspect`` exits non-zero AND prints "not found" (or similar)
+    to stderr when the net is absent; any other non-zero (socket-proxy 403, CLI
+    error) is "unknown", not "absent" — callers must not treat ``None`` as
+    missing. Distinguishing these lets ``start_docker`` refuse to launch a live
+    champion onto a definitely-absent net (a doomed container) while never
+    hard-failing on an inspect it merely couldn't run.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "network", "inspect", name, "--format", "{{.Name}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0:
+            return True
+        msg = (err or b"").decode("utf-8", "replace").lower()
+        if "not found" in msg or "no such network" in msg:
+            return False
+        return None  # some other failure — can't conclude "absent"
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return None
+
 
 class SolverOrchestrator:
     """Manages solver sessions for benchmarking.
@@ -818,6 +882,50 @@ class SolverOrchestrator:
         bench_network = (network or "").strip() or os.environ.get(
             "BENCHMARK_DOCKER_NETWORK", "",
         ).strip()
+
+        # LIVE champions process REAL user orders (wallet addrs, balances, trade
+        # params) and — unlike benchmark/screening on the sealed sandbox —
+        # historically attach to a non-internal net (LIVE_SOLVER_NETWORK), giving
+        # an adopted-but-hostile champion a route to the internet, the relayer,
+        # IMDS, and the docker-socket-proxy. Require the live net to be a Docker
+        # `--internal` bridge (no external gateway). WARN-only by default so this
+        # merges without breaking a running node; LIVE_SOLVER_REQUIRE_INTERNAL=1
+        # fails closed (flip it once the champion's RPC goes through the keyless
+        # proxy on an internal net — see _require_internal_live_net).
+        if live and bench_network:
+            # (a) EXISTENCE: never launch a live champion onto a net that
+            # DEFINITELY doesn't exist — the container would fail to start and
+            # take order processing down with it (2026-07-22 incident: the live
+            # net was renamed but nothing had created it). Fail LOUD instead of
+            # launching a doomed container; on a fresh boot this surfaces as an
+            # api start failure that update.sh health-gates + rolls back. A
+            # "can't determine" (None, e.g. socket-proxy denies inspect) is NOT
+            # treated as absent — we proceed and let docker run report any error.
+            exists = await _docker_network_exists(bench_network)
+            if exists is False:
+                raise RuntimeError(
+                    "refusing to start live champion: network %r does not exist "
+                    "(would launch a doomed container). If enabling the keyless "
+                    "RPC proxy, set only LIVE_SOLVER_RPC_VIA_PROXY=1 (the api "
+                    "creates the net); do NOT rename LIVE_SOLVER_NETWORK by hand."
+                    % bench_network
+                )
+            # (b) INTERNAL: a live net that exists but has an external gateway lets
+            # a hostile champion reach the internet/relayer/IMDS/docker-socket.
+            # WARN by default; LIVE_SOLVER_REQUIRE_INTERNAL=1 fails closed.
+            internal = await _docker_network_is_internal(bench_network)
+            if internal is not True:
+                msg = (
+                    "LIVE champion network %r is not a Docker --internal net "
+                    "(Internal=%s) — a hostile champion could reach the internet, "
+                    "relayer, IMDS, or docker-socket-proxy. Move it to an "
+                    "--internal net with a keyless RPC broker."
+                    % (bench_network, internal)
+                )
+                if internal is False and _require_internal_live_net():
+                    raise RuntimeError("refusing to start live champion: " + msg)
+                logger.warning(msg)
+
         security_opts = list(DOCKER_SECURITY_OPTS)
         if bench_network:
             # Use the dedicated benchmark network. In production this MUST be

@@ -906,6 +906,58 @@ class TestEpochManager:
         assert "sub_top" in rejected[0][1]
 
     @pytest.mark.asyncio
+    async def test_evaluate_round_defers_with_adoptable_finalist_and_inflight_slate(self):
+        """Wait for the FULL slate even when a scored candidate is already adoptable.
+
+        The two-process split (a separate worker benches the slate asynchronously)
+        let the coordinator finalize the moment a dethroning candidate scored, while a
+        later slate member was still BENCHMARKING — crowning the best of a PARTIAL
+        slate and orphaning the straggler's same-pin relative block ("comparison report
+        unavailable"). Under rotation seniority the raced-out member is de-prioritised,
+        so it does NOT re-compete next round. evaluate_round must DEFER until the slate
+        is terminal, exactly like the no-finalist defer, rather than finalize early."""
+        # `top` strictly wins the fresh bar -> adoptable finalist RIGHT NOW.
+        top = _make_submission(
+            submission_id="sub_top", epoch=4, image_id="sha256:" + "a" * 64,
+        )
+        top.pr_number = 41
+        top.benchmark_details = {"per_intent": [
+            {"intent_id": "o1", "raw_output": "3000000"},  # wins stored AND fresh bar
+            {"intent_id": "o2", "raw_output": "1000000"},
+        ]}
+        # A later slate member still BENCHMARKING in the SAME round — no score yet.
+        straggler = _make_submission(
+            submission_id="sub_straggler", epoch=4,
+            image_id="sha256:" + "c" * 64, status=SubmissionStatus.BENCHMARKING,
+        )
+        straggler.benchmark_details = None
+        # Fresh bar: o1=2000000 -> top still strictly wins -> would be adopted.
+        mgr, current_round, rejected = self._fallthrough_fixture(
+            [{"intent_id": "o1", "raw_output": "2000000"},
+             {"intent_id": "o2", "raw_output": "1000000"}],
+            top, straggler,
+        )
+
+        result = await mgr.evaluate_round(current_round.round_id, epoch=4)
+
+        # DEFERRED, not finalized — the round waits for the straggler to score so the
+        # FULL slate is judged (and every member gets its relative block).
+        assert result.get("deferred") is True
+        assert result.get("finalist_submission_id") is None
+        assert result["status_after"] != RoundStatus.ABORTED.value
+        assert (
+            mgr._round_store.get_round(current_round.round_id).status
+            != RoundStatus.ABORTED
+        )
+        # No premature finalist recorded, no outranked/reject feedback fired yet, and
+        # the straggler is left BENCHMARKING to finish (not reaped/waitlisted).
+        assert mgr._round_store.get_round(
+            current_round.round_id
+        ).finalist_submission_id is None
+        assert rejected == []
+        assert mgr._sub_store.get("sub_straggler").status == SubmissionStatus.BENCHMARKING
+
+    @pytest.mark.asyncio
     async def test_evaluate_round_defers_when_a_candidate_still_benchmarking(self):
         """Restart-survival: when every SCORED candidate rejects but a benched
         candidate is still BENCHMARKING (e.g. a mid-round update.sh restart re-scored

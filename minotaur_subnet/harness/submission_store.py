@@ -131,6 +131,7 @@ class SubmissionStatus(str, Enum):
 OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
 OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
 OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
+OUTCOME_COPYCAT_CODE = "copycat_code"  # identical code first submitted by ANOTHER actor
 OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
 OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
 OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
@@ -157,6 +158,18 @@ BENCHED_STATUSES = frozenset({
     SubmissionStatus.BENCHMARKING,
     SubmissionStatus.SCORED,
     SubmissionStatus.ADOPTED,
+})
+
+# Terminal-for-round states in which the private-repo token has ALREADY been
+# purged (reject/waitlist/adopt all purge). A late benchmark result must never
+# flip one of these back to SCORED — doing so mints a token-less finalist that
+# certifies on-chain and then dies at relayer-finalize "no token — FAIL-CLOSED"
+# (see set_benchmark_result's NO-RESURRECTION guard; live incidents 2026-07-02,
+# 2026-07-07, 2026-07-22). REJECTED alone used to be checked; rotation moving
+# overflow to WAITLISTED (#620) reopened the hole for the WAITLISTED door.
+_NO_RESURRECTION_STATUSES = frozenset({
+    SubmissionStatus.REJECTED,
+    SubmissionStatus.WAITLISTED,
 })
 
 
@@ -923,6 +936,28 @@ class SubmissionStore:
         ]
         return sorted(subs, key=lambda s: s.created_at)
 
+    def actor_owner_edges(self) -> dict[str, list[str]]:
+        """``{hotkey: [github_owner, ...]}`` — every github owner each hotkey
+        has ever submitted under.
+
+        Feeds the actor-key owner union (harness/actor.py): coldkeys an
+        operator links by reusing a github owner across them collapse into one
+        scheduling identity, closing the coldkey-split evasion. In-RAM scan
+        (no DB hit); owners are deduped, order-stable. github_owner is derived
+        from the PR clone_url at ingest, so it can't be charged to a victim.
+        """
+        self._maybe_reload()
+        out: dict[str, list[str]] = {}
+        for s in self._submissions.values():
+            owner = (s.github_owner or "").strip()
+            hk = s.hotkey or ""
+            if not owner or not hk:
+                continue
+            owners = out.setdefault(hk, [])
+            if owner not in owners:
+                owners.append(owner)
+        return out
+
     def list_queued(self) -> list[Submission]:
         """List all submissions in QUEUED status."""
         return self.list_by_status(SubmissionStatus.QUEUED)
@@ -1056,6 +1091,49 @@ class SubmissionStore:
             if sub.status in BENCHED_STATUSES and sub.round_id:
                 rounds.add(sub.round_id)
         return len(rounds)
+
+    def fingerprint_usage(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> tuple[list[tuple[str, float, str, str]], int]:
+        """One pass over the store for everything the screening fingerprint
+        checks need: ``(submitters, benched_round_count)``.
+
+        ``submitters`` is ``(hotkey, created_at, submission_id, status_value)``
+        for every submission carrying this normalized fingerprint — ANY
+        status, ANY round. Any-status scope on purpose (unlike the
+        benched-rounds quota): the cross-actor copy reject must see a copy
+        that is merely in flight, or identical code from N actors flows until
+        one of them benches. The submission_id makes first-submitter ordering
+        total even on a created_at tie.
+
+        ``benched_round_count`` mirrors
+        :meth:`count_benched_rounds_for_fingerprint` exactly (distinct rounds,
+        BENCHED statuses only) — bundled here so the screening pipeline scans
+        the store once, not twice, per submission.
+        """
+        self._maybe_reload()
+        submitters: list[tuple[str, float, str, str]] = []
+        benched_rounds: set[str] = set()
+        for sub in self._submissions.values():
+            if sub.content_fingerprint != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            status = getattr(sub.status, "value", None) or str(sub.status or "")
+            submitters.append(
+                (
+                    sub.hotkey or "",
+                    float(sub.created_at or 0.0),
+                    sub.submission_id,
+                    str(status),
+                ),
+            )
+            if sub.status in BENCHED_STATUSES and sub.round_id:
+                benched_rounds.add(sub.round_id)
+        return submitters, len(benched_rounds)
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
@@ -1202,18 +1280,24 @@ class SubmissionStore:
         verdict. The display rank is written via :meth:`set_benchmark_rank` in a
         separate pass, so there is no longer a "don't clobber a real score" guard.
 
-        NO RESURRECTION: a terminally REJECTED submission is never flipped back
-        to SCORED, no matter what a late benchmark result says. Rotation rejects
-        the slate overflow at round close "regardless of benchmark progress" and
-        PURGES the private-repo token (irreversibly — memory AND encrypted
-        sidecar), but an in-flight bench finishing after that, or a restart
-        re-benching an orphaned round, used to resurrect the submission here.
-        The resurrected record then ranked (and under the tie-break ladder
-        frequently WON) as finalist, certified, and died at relayer-finalize
-        "no token — FAIL-CLOSED", aborting the round (observed live 2026-07-07:
-        5 consecutive merge_failed rounds). Bench details are still recorded so
-        the miner's report shows how they scored; the terminal status and its
-        reason are immutable.
+        NO RESURRECTION: a submission that is already terminal-for-round with
+        its token purged (REJECTED or WAITLISTED — see
+        ``_NO_RESURRECTION_STATUSES``) is never flipped back to SCORED, no
+        matter what a late benchmark result says. Rotation parks the slate
+        overflow at round close "regardless of benchmark progress" — as
+        WAITLISTED since #620, REJECTED before it — and PURGES the private-repo
+        token (irreversibly, memory AND encrypted sidecar). An in-flight bench
+        finishing after that, or a restart re-benching an orphaned round, used
+        to resurrect the submission here; the resurrected record then ranked
+        (and under the tie-break ladder frequently WON) as finalist, certified
+        on-chain, and died at relayer-finalize "no token — FAIL-CLOSED",
+        refusing the adoption (live incidents 2026-07-02, 2026-07-07 with 5
+        consecutive merge_failed rounds, and 2026-07-22 sub_a91b87fdd63e: the
+        guard covered only REJECTED, so a WAITLISTED-then-re-benched sub slipped
+        through). A waitlisted sub was also NOT on this round's slate, so
+        resurrecting it to finalist-eligible SCORED is a fairness break on top
+        of the token loss. Bench details are still recorded so the miner's
+        report shows how they scored; the terminal status is immutable.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
@@ -1225,11 +1309,13 @@ class SubmissionStore:
         if details is not None:
             sub.benchmark_details = details
 
-        if sub.status == SubmissionStatus.REJECTED:
+        if sub.status in _NO_RESURRECTION_STATUSES:
             logger.info(
-                "set_benchmark_result: %s is terminally REJECTED (%s) — "
-                "recording bench details but NOT resurrecting to SCORED",
-                submission_id, (sub.rejection_reason or "?")[:80],
+                "set_benchmark_result: %s is terminal-for-round (%s, token "
+                "purged) — recording bench details but NOT resurrecting to "
+                "SCORED",
+                submission_id,
+                getattr(sub.status, "value", sub.status),
             )
             sub.updated_at = time.time()
             self._persist_records([sub])
