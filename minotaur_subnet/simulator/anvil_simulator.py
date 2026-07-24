@@ -469,6 +469,8 @@ class AnvilSimulator:
         *,
         meter_gas: bool = False,
         pin_only: bool = False,
+        deposit_contract_seeds: dict[str, int] | None = None,
+        fee_seeds: dict[str, int] | None = None,
     ) -> SimulationResult:
         """Execute a plan against the Anvil fork and return results.
 
@@ -561,6 +563,8 @@ class AnvilSimulator:
                 result = self._simulate_via_score_intent(
                     contract_address, intent_order, plan, token_balances,
                     meter_gas=meter_gas,
+                    deposit_contract_seeds=deposit_contract_seeds,
+                    fee_seeds=fee_seeds,
                 )
                 if result is not None:
                     print(f"[SIM] scoreIntent result: success={result.success} gas={result.gas_used} transfers={len(result.token_transfers or [])} on_chain_score={result.on_chain_score}", flush=True)
@@ -675,6 +679,48 @@ class AnvilSimulator:
                 self._baseline_snapshot_id = None
             self._stop_impersonating(executor)
 
+    def _apply_relocated_seeds(
+        self,
+        target: str,
+        intent_order: dict | None,
+        deposit_contract_seeds: dict[str, int] | None,
+        fee_seeds: dict[str, int] | None,
+        relayer_addr: str,
+    ) -> None:
+        """Apply the fork seeds relocated out of ``SimulationRunner``'s former
+        loop-side pre-seed into this locked, post-re-fork window.
+
+        Why here: those seeds (``anvil_setStorageAt`` deals + an ``approve``
+        transaction that MINES A BLOCK) used to run on the event loop before
+        ``await simulate()``, outside ``_sim_lock`` / ``_fork_mutation_lock`` —
+        racing an offloaded sim on the shared fork (see
+        :func:`_sim_offload_enabled`) — and were then wiped by this sim's own
+        re-fork before scoreIntent ran, making them silent no-ops on the order
+        rail. Applying them HERE (after the re-fork, under the lock) both closes
+        that race and makes deposit-model / user-fee funding actually effective.
+
+        - ``deposit_contract_seeds`` (deposit/DCA apps): ``scoreIntent`` pulls
+          the input token from the APP CONTRACT via ``_fundFromContract``, so
+          fund the contract (== ``target``) directly; the executor gets nothing.
+        - ``fee_seeds`` (user-paid platform fee): fund the user's WETH + approve
+          the app so ``scoreIntent``'s fee settlement can
+          ``safeTransferFrom(user -> feeCollector)``. Re-impersonates the relayer
+          afterwards (``_set_erc20_allowance`` stops impersonating the owner).
+
+        Executor input-token balance + allowance for STANDARD apps are NOT here:
+        they are already re-dealt from ``token_balances`` just above, unchanged.
+        """
+        if deposit_contract_seeds:
+            for tok, amt in deposit_contract_seeds.items():
+                self._deal_erc20(tok, target, int(amt))
+        if fee_seeds:
+            submitted_by = intent_order.get("submitted_by", "") if intent_order else ""
+            if submitted_by:
+                for tok, amt in fee_seeds.items():
+                    self._deal_erc20(tok, submitted_by, int(amt))
+                    self._set_erc20_allowance(tok, submitted_by, target, 2**256 - 1)
+                self._impersonate(relayer_addr)
+
     def _simulate_via_score_intent(
         self,
         contract_address: str,
@@ -683,6 +729,8 @@ class AnvilSimulator:
         token_balances: dict[str, int] | None = None,
         *,
         meter_gas: bool = False,
+        deposit_contract_seeds: dict[str, int] | None = None,
+        fee_seeds: dict[str, int] | None = None,
     ) -> SimulationResult | None:
         """Call scoreIntent as a real transaction to simulate the full flow.
 
@@ -738,6 +786,15 @@ class AnvilSimulator:
                     # Re-impersonate relayer — _set_erc20_allowance may have
                     # stopped impersonating if submitted_by == relayer
                     self._impersonate(relayer_addr)
+
+            # Deposit-model contract funding + user platform-fee funding,
+            # relocated here (post-re-fork, under the sim lock) from
+            # SimulationRunner's former loop-side pre-seed — see
+            # :func:`_sim_offload_enabled` and :meth:`_apply_relocated_seeds`.
+            self._apply_relocated_seeds(
+                target, intent_order, deposit_contract_seeds, fee_seeds,
+                relayer_addr,
+            )
 
             # Fund the app's fee paymaster so APP-mode protocol-fee settlement
             # can pull WETH (see _fund_app_paymaster). No-op for non-fee apps.
