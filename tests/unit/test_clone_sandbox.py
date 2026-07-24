@@ -313,3 +313,56 @@ class TestCloneSandboxTimeout:
             "https://github.com/x/y", "a" * 40, str(tmp_path)
         )
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_reaps_and_reraises(self, monkeypatch, tmp_path):
+        """Cancelling the awaiting task (mid-round restarts orphan screening
+        tasks) must clean up exactly like a timeout — kill + reap the CLI and
+        remove the container — and then re-raise, never swallow, the
+        CancelledError."""
+        events = []
+        in_communicate = asyncio.Event()
+
+        class HungCloneProc:
+            returncode = None
+
+            async def communicate(self):
+                in_communicate.set()
+                await asyncio.sleep(3600)
+
+            def kill(self):
+                events.append("kill")
+                self.returncode = -9
+
+            async def wait(self):
+                events.append("wait")
+                return self.returncode
+
+        class QuickRmProc:
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        rm_argv = []
+
+        async def fake_exec(*argv, **kwargs):
+            if argv[:2] == ("docker", "rm"):
+                rm_argv.append(argv)
+                return QuickRmProc()
+            return HungCloneProc()
+
+        monkeypatch.setattr(sp.asyncio, "create_subprocess_exec", fake_exec)
+
+        task = asyncio.ensure_future(
+            sp._clone_repo_sandboxed("https://github.com/x/y", "a" * 40, str(tmp_path))
+        )
+        await in_communicate.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert events == ["kill", "wait"]  # reaped, and only after the kill
+        assert len(rm_argv) == 1           # daemon-side container removed
+        assert rm_argv[0][:3] == ("docker", "rm", "-f")
+        assert rm_argv[0][3].startswith("minotaur-clone-")
