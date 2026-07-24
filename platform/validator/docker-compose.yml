@@ -656,7 +656,7 @@ services:
       FOLLOWER_PROPOSAL_RESIMULATE: "${FOLLOWER_PROPOSAL_RESIMULATE:-1}"
       GENESIS_SOLVER_IMAGE: "${GENESIS_SOLVER_IMAGE:-}"
       MVP_DEMO_MODE: "${MVP_DEMO_MODE:-0}"
-      ORDER_CONSENSUS_PEERS: "${ORDER_CONSENSUS_PEERS}"
+      ORDER_CONSENSUS_PEERS: "${ORDER_CONSENSUS_PEERS:-}"
       ORDER_CONSENSUS_QUORUM_BPS: "${ORDER_CONSENSUS_QUORUM_BPS:-6666}"
       QUORUM_BPS: "${QUORUM_BPS:-6666}"
       RELAYER_MIN_BALANCE_WEI: "${RELAYER_MIN_BALANCE_WEI:-10000000000000000}"   # code default 1e16 (embedded-relayer path, unused by api)
@@ -1259,9 +1259,11 @@ services:
   # ── leader-only services (activate with COMPOSE_PROFILES=...,leader) ──
   relayer:
     profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-    image: ghcr.io/subnet112/minotaur-validator:latest
+    # NO watchtower label here ON PURPOSE: update.sh owns relayer updates (it
+    # round-drains before recreating a coordinator). Watchtower recreating the
+    # relayer mid-round outside that drain has orphaned a certified champion
+    # merge before (round-e29743808, 2026-07-21).
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
     ports:
       - "127.0.0.1:8091:8091"
     entrypoint: ["/bin/sh", "-c"]
@@ -1271,12 +1273,12 @@ services:
       MALLOC_ARENA_MAX: "2"
       ANVIL_RPC_URL: http://anvil-base:8546
       CHAIN_ID: "8453"
-      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453}"
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453:-}"
       VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1:-}"
       APP_REGISTRY_1: "${APP_REGISTRY_1:-}"
       APP_REGISTRY_8453: "${APP_REGISTRY_8453:-}"
       APP_REGISTRY_964: "${APP_REGISTRY_964:-}"
-      BASE_RPC_URL: "${BASE_RPC_URL}"
+      BASE_RPC_URL: "${BASE_RPC_URL:-}"
       ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
       RELAYER_WALLET: "${RELAYER_WALLET:-}"
       BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_RELAYER_RPC_URL:-https://lite.chain.opentensor.ai}"   # SCRUBBED: was a hardcoded blockmachine auth token; put the real URL in .env
@@ -1311,7 +1313,7 @@ services:
 
   seed:
     profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
-    image: ghcr.io/subnet112/minotaur-validator:latest
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
     entrypoint: ["/bin/sh", "-c"]
     command: ["exec python /app/platform/local_testnet/seed.py"]
     environment:
@@ -1320,28 +1322,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-
-  # ── docker-socket-proxy — limit api's Docker access ──────────────────────
-  # Mounts /var/run/docker.sock read-only and exposes a filtered subset
-  # of the Docker API on tcp://docker-socket-proxy:2375. The api service
-  # reaches it via DOCKER_HOST in its environment. Without this proxy the
-  # api would need a direct bind-mount of the host socket, but the
-  # Dockerfile runs as USER minotaur (uid 1000) which has no read
-  # permission on /var/run/docker.sock (root:988) — so a direct mount
-  # fails with "permission denied" and the genesis solver crashes
-  # silently on Command.INITIALIZE, leaving the leader with no solver
-  # and /v1/chains/{id}/tokens returning 503. Mirrors the third-party
-  # validator stack at platform/validator/.
-  #
-  # Allowed: containers (read+create+start+wait+logs+rm), networks (for
-  # attaching solver containers to benchmark-sandbox), images (for
-  # pulling solver images). NOT allowed: exec, host control, build,
-  # services, swarm — anything that would let a compromised api take
-  # over the host.
-  #
-  # NOTE: watchtower below keeps a direct socket mount — its
-  # stop+recreate workflow needs broader Docker access than this proxy
-  # exposes.
 
 volumes:
   store-data:
