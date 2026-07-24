@@ -957,6 +957,30 @@ class SubmissionStore:
             and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
         )
 
+    def earliest_created_at_by_hotkey(self) -> dict[str, float]:
+        """``{hotkey: earliest created_at}`` across ALL retained submissions.
+
+        The rotation ledger anchors a never-benched identity's wait clock to
+        this (see rotation.apply_rotation_slate): first-seen = the hotkey's
+        earliest server-assigned ``created_at``, so seniority reflects when the
+        miner truly first appeared — independent of build-race luck within a
+        round, and reconstructible after a ledger upgrade/loss from submission
+        history alone. Records without a created_at (0/None legacy rows) are
+        skipped rather than granting instant max seniority. Bounded by the
+        store's retention pruning; best-effort by design.
+        """
+        self._maybe_reload()
+        out: dict[str, float] = {}
+        for s in self._submissions.values():
+            hk = s.hotkey or ""
+            try:
+                ts = float(s.created_at or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if hk and ts and (hk not in out or ts < out[hk]):
+                out[hk] = ts
+        return out
+
     def count_benched_rounds_by_commit(self, hotkey: str, commit_hash: str) -> int:
         """DISTINCT rounds where this miner's exact commit occupied a benchmark
         slate slot (status in ``BENCHED_STATUSES``).
