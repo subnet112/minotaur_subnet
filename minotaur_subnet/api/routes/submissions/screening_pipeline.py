@@ -35,6 +35,12 @@ MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
 # shrink it without waiting out the production value).
 CLONE_SANDBOX_TIMEOUT_SECONDS = 240.0
 
+# Hard cap on the NUMBER of tar members. The byte cap alone doesn't stop a repo
+# of e.g. 500k zero-byte files (total uncompressed size stays ~0) from exhausting
+# host INODES on extract. A legit solver repo has hundreds–low-thousands of
+# files; 50k is far above any real tree yet blocks the inode-bomb.
+MAX_CLONE_TAR_MEMBERS = 50_000
+
 from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
@@ -310,6 +316,12 @@ def _safe_extract_tar(data: bytes, dest: str) -> bool:
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
             members = tf.getmembers()
+            if len(members) > MAX_CLONE_TAR_MEMBERS:
+                logger.warning(
+                    "Clone archive member count %d exceeds cap %d (inode-bomb guard)",
+                    len(members), MAX_CLONE_TAR_MEMBERS,
+                )
+                return False
             for m in members:
                 target = os.path.realpath(os.path.join(dest_real, m.name))
                 if target != dest_real and not target.startswith(prefix):
