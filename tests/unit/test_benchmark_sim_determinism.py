@@ -467,3 +467,54 @@ class TestAnchorCacheConcurrency:
             stop.set()
             t.join(timeout=5)
         assert not errors, errors[:3]
+
+
+class TestRelocatedSeeds:
+    """`_apply_relocated_seeds` — the deposit-model + user-fee seeds moved out of
+    SimulationRunner's loop-side pre-seed into the locked, post-re-fork window."""
+
+    @staticmethod
+    def _rec_sim():
+        sim = _bare_sim()
+        calls: list[tuple] = []
+        sim._deal_erc20 = lambda tok, to, amt: (calls.append(("deal", tok, to, amt)), True)[1]
+        sim._set_erc20_allowance = lambda tok, owner, spender, amt: calls.append(
+            ("approve", tok, owner, spender, amt))
+        sim._impersonate = lambda addr: calls.append(("impersonate", addr))
+        return sim, calls
+
+    def test_deposit_seeds_fund_the_contract(self):
+        sim, calls = self._rec_sim()
+        sim._apply_relocated_seeds(
+            "0xCONTRACT", {"submitted_by": "0xUSER"}, {"0xTOK": 1000}, None, "0xRELAYER")
+        # deposit → fund the CONTRACT (== target), not the user; no allowance.
+        assert calls == [("deal", "0xTOK", "0xCONTRACT", 1000)]
+
+    def test_fee_seeds_fund_user_then_approve_then_reimpersonate(self):
+        sim, calls = self._rec_sim()
+        sim._apply_relocated_seeds(
+            "0xCONTRACT", {"submitted_by": "0xUSER"}, None, {"0xWETH": 500}, "0xRELAYER")
+        assert calls == [
+            ("deal", "0xWETH", "0xUSER", 500),
+            ("approve", "0xWETH", "0xUSER", "0xCONTRACT", 2**256 - 1),
+            ("impersonate", "0xRELAYER"),   # relayer restored after the approve
+        ]
+
+    def test_both_seeds_applied(self):
+        sim, calls = self._rec_sim()
+        sim._apply_relocated_seeds(
+            "0xC", {"submitted_by": "0xU"}, {"0xT": 1}, {"0xW": 2}, "0xR")
+        assert ("deal", "0xT", "0xC", 1) in calls
+        assert ("deal", "0xW", "0xU", 2) in calls
+        assert ("approve", "0xW", "0xU", "0xC", 2**256 - 1) in calls
+        assert calls[-1] == ("impersonate", "0xR")
+
+    def test_no_seeds_is_noop(self):
+        sim, calls = self._rec_sim()
+        sim._apply_relocated_seeds("0xC", {"submitted_by": "0xU"}, None, None, "0xR")
+        assert calls == []
+
+    def test_fee_without_submitted_by_is_noop(self):
+        sim, calls = self._rec_sim()
+        sim._apply_relocated_seeds("0xC", {}, None, {"0xW": 2}, "0xR")
+        assert calls == []
