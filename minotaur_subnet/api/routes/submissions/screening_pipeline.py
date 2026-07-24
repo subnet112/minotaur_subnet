@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import logging
 import os
@@ -18,6 +19,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import uuid
 from urllib.parse import urlparse
 
 # Ephemeral sandbox used to fetch untrusted miner repos. The clone runs in a
@@ -29,6 +31,9 @@ DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
 # Hard cap on the clone tarball (compressed stream + uncompressed total) to
 # bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
 MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
+# Wall-clock cap on one sandboxed clone attempt (module-level so tests can
+# shrink it without waiting out the production value).
+CLONE_SANDBOX_TIMEOUT_SECONDS = 240.0
 
 from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
@@ -346,6 +351,30 @@ def _token_basic_auth(repo_url: str, token: str) -> str | None:
     return base64.b64encode(f"x-access-token:{token}".encode()).decode()
 
 
+async def _force_remove_container(name: str) -> None:
+    """Best-effort ``docker rm -f`` of a clone container whose CLI was killed.
+
+    Killing the ``docker run`` client does not stop the container, so a clone
+    that is genuinely hung (e.g. a stalled git server) would otherwise keep
+    running daemon-side. Never raises: on the EMFILE path this spawn itself
+    can fail, and cleanup must not mask the clone-timeout result.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+
+
 async def _clone_repo_sandboxed(
     repo_url: str, commit_hash: str, dest: str, *, token: str | None = None,
 ) -> bool:
@@ -378,8 +407,12 @@ async def _clone_repo_sandboxed(
         'git -C /clone checkout "$COMMIT" >&2; '
         "tar -C /clone -cf - ."
     )
+    # Named so a timed-out attempt can be removed daemon-side: killing the
+    # `docker run` client below does not stop the container itself.
+    container_name = f"minotaur-clone-{uuid.uuid4().hex[:12]}"
     cmd = [
         "docker", "run", "--rm",
+        "--name", container_name,
         # The alpine/git image's ENTRYPOINT is `git`; override to a shell so the
         # clone+fetch+checkout+tar script runs (and stays image-agnostic).
         "--entrypoint", "sh",
@@ -406,6 +439,7 @@ async def _clone_repo_sandboxed(
     if basic_auth:
         run_env["GIT_BASIC_AUTH"] = basic_auth
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -413,13 +447,30 @@ async def _clone_repo_sandboxed(
             stderr=asyncio.subprocess.PIPE,
             env=run_env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=CLONE_SANDBOX_TIMEOUT_SECONDS
+        )
     except asyncio.TimeoutError:
         logger.warning("Clone sandbox timed out for %s", repo_url)
         return False
     except FileNotFoundError:
         logger.error("docker CLI not found; cannot run clone sandbox")
         return False
+    finally:
+        # ANY exit while the CLI is still running — timeout above, task
+        # cancellation (mid-round restarts orphan screening tasks), or an
+        # unexpected error mid-communicate() — must kill and reap it here.
+        # An abandoned communicate() leaves nobody draining the CLI's stdout,
+        # so it blocks forever mid-tar and its pipes + pidfd stay open in this
+        # process — enough orphaned clones EMFILE the whole api (2026-07-23
+        # leader incident: 95 hung CLIs, fd table at 924/1024). Also remove
+        # the daemon-side container the orphaned CLI leaves behind. A
+        # CancelledError still propagates to the caller after this cleanup.
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()  # prompt: the CLI was just SIGKILLed
+            await _force_remove_container(container_name)
 
     if proc.returncode != 0:
         logger.warning(
