@@ -236,27 +236,24 @@ def _sim_offload_enabled() -> bool:
     preserve the exact same serialization and therefore byte-for-byte
     determinism WITHIN one simulation.
 
-    DEFAULT OFF — VALIDATED GATE, do not flip on until closed. ``SimulationRunner``
-    (blockloop/simulation.py:96-126) seeds the fork by calling ``_deal_erc20`` (an
-    ``anvil_setStorageAt``) and ``_set_erc20_allowance`` (which MINES A BLOCK via
-    ``send_transaction`` and pins the next block's timestamp) ON THE EVENT LOOP,
-    BEFORE ``await simulate()`` and OUTSIDE both ``_sim_lock`` and
-    ``_fork_mutation_lock``. Inline that is harmless (the loop can't run another
-    flow mid-sim). Offloaded it is NOT: startup.py wires ONE MultiChainSimulator
-    into BOTH the block loop (order/quote processing) AND the benchmark worker
-    (:1915 / :1926 / :2171), which run as concurrent asyncio tasks in one process.
-    While a benchmark sim is offloaded — this frees the loop (``_sim_lock`` is held
-    across ``await asyncio.to_thread``) — the block loop's seed can mine a block /
-    mutate storage on the SAME shared fork underneath that in-flight sim,
-    perturbing its gas_used / on_chain_score → cross-validator CONSENSUS DIVERGENCE.
-    (The reverse "a concurrent re-fork wipes our seed" is moot: the order rail
-    re-forks and wipes its own external seed single-threaded anyway.) Only the
-    isolated BENCHMARK_WORKER_ONLY (+ DISABLE_BLOCK_LOOP) process is immune as-is.
-    TO CLOSE: relocate those seeds into the locked, post-re-fork window — pass the
-    deposit-model + platform-fee amounts into ``simulate`` so
-    ``_simulate_via_score_intent`` applies them AFTER the re-fork (mirroring how
-    ``token_balances`` are already re-dealt there under the lock), delete the
-    pre-``await simulate()`` seeds — then re-run the benchmark determinism soak.
+    DEFAULT OFF — VALIDATED GATE, do not flip on until closed. The original
+    blocker — ``SimulationRunner`` seeding the fork (deposit-contract deals +
+    user fee deal/approve; the approve MINES A BLOCK) ON THE EVENT LOOP, before
+    ``await simulate()`` and OUTSIDE both ``_sim_lock`` and
+    ``_fork_mutation_lock``, so an offloaded sim could have a block mined /
+    storage mutated underneath it on the SAME shared fork (startup.py wires ONE
+    MultiChainSimulator into both the block loop and the benchmark worker) →
+    cross-validator CONSENSUS DIVERGENCE — is CLOSED: seed relocation is DONE.
+    Those seeds now travel into ``simulate()`` as ``deposit_contract_seeds`` /
+    ``fee_seeds`` and are applied by ``_simulate_via_score_intent`` INSIDE the
+    sim's snapshot bracket, under both locks, after the per-sim re-fork
+    (mirroring how ``token_balances`` are re-dealt there), and are reverted
+    with the snapshot like every other sim mutation — see
+    :meth:`AnvilSimulator._apply_relocated_seeds`. No loop-side fork mutation
+    remains on that path.
+    REMAINING GATES before flipping on: (a) re-run the benchmark determinism
+    soak WITH the flag on (byte-for-byte gas_used / on_chain_score across
+    validators); (b) the two loop-stall caveats below.
 
     LOOP-STALL CAVEATS — two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY
     on the event loop, so with offload on, a collision with an in-flight
@@ -271,7 +268,7 @@ def _sim_offload_enabled() -> bool:
         calls it synchronously on the event loop. Before enabling, either
         offload the trace capture too or set ``BENCHMARK_REVERT_TRACE_MAX=0``.
 
-    Set ``SIM_OFFLOAD_TO_THREAD=1`` only once that gate is cleared.
+    Set ``SIM_OFFLOAD_TO_THREAD=1`` only once those gates are cleared.
     """
     return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
         "1", "true", "yes", "on",
@@ -728,6 +725,10 @@ class AnvilSimulator:
             for tok, amt in deposit_contract_seeds.items():
                 self._deal_erc20(tok, target, int(amt))
         if fee_seeds:
+            # Intentional silent no-op when intent_order lacks submitted_by:
+            # fee seeds are only meaningful for scoreIntent-path orders, which
+            # always carry submitted_by (there is no user to fund otherwise);
+            # manual-path callers pre-deal via token_balances instead.
             submitted_by = intent_order.get("submitted_by", "") if intent_order else ""
             if submitted_by:
                 for tok, amt in fee_seeds.items():
