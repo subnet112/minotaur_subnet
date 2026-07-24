@@ -1,5 +1,8 @@
 """Unit tests for the PR-based submission resolver (github_pr)."""
 
+import json
+import urllib.error
+
 import pytest
 
 from minotaur_subnet.api.routes.submissions import github_pr as gp
@@ -86,6 +89,55 @@ def test_resolve_wraps_fetch_errors():
 
     with pytest.raises(gp.PRResolutionError, match="could not fetch"):
         gp.resolve_pr(7, fetch=boom)
+
+
+class _Response:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+
+def test_public_fetch_retries_without_revoked_validator_token(monkeypatch):
+    monkeypatch.setenv("SOLVER_REPO_PR_TOKEN", "revoked")
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append((request, timeout))
+        if len(requests) == 1:
+            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+        return _Response(_pr())
+
+    monkeypatch.setattr(gp.urllib.request, "urlopen", urlopen)
+
+    out = gp._fetch_pr(OWNER, REPO, 7)
+
+    assert out["head"]["sha"] == HEAD
+    assert requests[0][0].get_header("Authorization") == "Bearer revoked"
+    assert requests[1][0].get_header("Authorization") is None
+
+
+def test_private_fetch_never_downgrades_explicit_token(monkeypatch):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append((request, timeout))
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(gp.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(urllib.error.HTTPError):
+        gp._fetch_pr(OWNER, REPO, 7, token="private-token")
+
+    assert len(requests) == 1
+    assert requests[0][0].get_header("Authorization") == "Bearer private-token"
 
 
 # ── assess_pr_mergeability (fail-fast submit gate) ───────────────────────────
