@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import urllib.request
+import uuid
 from dataclasses import dataclass
 
 from minotaur_subnet.chains import registry
@@ -130,6 +131,117 @@ def read_proxy_config() -> ReadProxyConfig | None:
     )
 
 
+# ── LIVE champion path (BLIND: keyless + metered, head reads) ────────────────
+#
+# The benchmark path above pins reads to a fork block for determinism. The LIVE
+# champion instead needs LATEST-block reads, but it must STILL be (a) keyless —
+# the Alchemy/blockmachine API key stays in the proxy, never in the untrusted
+# container — and (b) metered, so a hostile or runaway champion can't run up the
+# provider bill (BLIND-3). It reaches the proxy on the dedicated ``live-solver``
+# internal net (a DIFFERENT IP than the benchmark-sandbox data plane), whose URL
+# ``read_proxy_manager`` exports as ``SOLVER_LIVE_RPC_PROXY`` once it has attached
+# the proxy to that net.
+
+# Default per-ORDER live RPC-cost budget (reset before each generate_plan/quote,
+# so it bounds a single order, not the champion's whole lifetime). Generous like
+# the benchmark constant — legit routing always fits; only a runaway loop is cut.
+DEFAULT_LIVE_RPC_BUDGET = DEFAULT_GENERATE_PLAN_BUDGET
+
+# Live proxy session ids are UNIQUE PER RUNTIME (``live-<hex>``), never a fixed
+# name: during a hot-swap the new champion's create() overlaps the displaced
+# champion's shutdown(), and with a shared id the outgoing close_session() would
+# close the session the successor just opened — silently un-metering it (the
+# proxy forwards unknown sessions via its anon observe bucket). The ``live-``
+# prefix keeps them distinct from the benchmark path's per-run ids.
+LIVE_PROXY_SESSION_PREFIX = "live"
+
+
+def new_live_session_id() -> str:
+    """A fresh proxy session id for ONE live-champion runtime instance."""
+    return f"{LIVE_PROXY_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
+
+# Name of the dedicated ``--internal`` net the live champion + proxy share when
+# the feature is on. This is DELIBERATELY SEPARATE from ``LIVE_SOLVER_NETWORK``
+# (the legacy net the direct-RPC champion runs on — ``production_minotaur`` on
+# the leader). Overloading one var for both meanings was a footgun: enabling the
+# feature required renaming ``LIVE_SOLVER_NETWORK`` to ``live-solver``, but that
+# rename took effect even while the feature stayed off (e.g. the env var not
+# reaching the api), stranding the champion on a net nothing had created
+# (2026-07-22 incident). Now the proxy net has its OWN var and enabling the
+# feature needs ONLY ``LIVE_SOLVER_RPC_VIA_PROXY=1`` — the legacy
+# ``LIVE_SOLVER_NETWORK`` is untouched and simply ignored while the proxy is on.
+LIVE_SOLVER_PROXY_NETWORK_DEFAULT = "live-solver"
+# Back-compat alias (some call sites / tests referenced the old name).
+LIVE_SOLVER_NETWORK_DEFAULT = LIVE_SOLVER_PROXY_NETWORK_DEFAULT
+
+_TRUTHY_ENV = {"1", "true", "yes", "on"}
+
+
+def live_proxy_network() -> str:
+    """The dedicated ``--internal`` net the proxy + champion share when the
+    feature is on. From ``LIVE_SOLVER_PROXY_NETWORK`` (default ``live-solver``),
+    INDEPENDENT of the legacy ``LIVE_SOLVER_NETWORK`` — so turning the feature on
+    never requires renaming the legacy net (which would strand the champion)."""
+    return (
+        os.environ.get("LIVE_SOLVER_PROXY_NETWORK", "").strip()
+        or LIVE_SOLVER_PROXY_NETWORK_DEFAULT
+    )
+
+
+def live_rpc_via_proxy_enabled() -> bool:
+    """Whether the live champion should route RPC through the keyless proxy.
+
+    Opt-in (``LIVE_SOLVER_RPC_VIA_PROXY``): default off preserves today's direct
+    keyed-RPC behavior, so this ships inert. Enabling it ALONE is sufficient — the
+    api creates the dedicated ``live-solver`` ``--internal`` net, attaches the
+    proxy, and lands the champion on it (see ``read_proxy_manager`` +
+    ``runtime_solver``). Do NOT also rename ``LIVE_SOLVER_NETWORK``.
+    """
+    return os.environ.get("LIVE_SOLVER_RPC_VIA_PROXY", "").strip().lower() in _TRUTHY_ENV
+
+
+def live_read_proxy_config() -> ReadProxyConfig | None:
+    """Config for routing the LIVE champion's reads through the keyless metered
+    proxy, or ``None`` if the feature is disabled / not yet wired.
+
+    Differs from :func:`read_proxy_config` (benchmark) in two ways: the data URL
+    is ``SOLVER_LIVE_RPC_PROXY`` (the proxy's live-solver-net IP, since the live
+    champion is on a different internal net than benchmark solvers), and the
+    session pins NO block (``blocks={}`` at open → byte-transparent head reads).
+    The budget still enforces (BLIND-3). Returns ``None`` unless the feature is
+    enabled AND ``read_proxy_manager`` has exported the live data URL — so a
+    failed proxy attach fails SAFE (champion keeps its direct RPC) rather than
+    pointing the champion at an unreachable proxy.
+    """
+    if not live_rpc_via_proxy_enabled():
+        return None
+    data = os.environ.get("SOLVER_LIVE_RPC_PROXY", "").strip()
+    if not data:
+        return None
+    control = os.environ.get("SOLVER_READ_PROXY_CONTROL", "").strip() or data
+    token = os.environ.get("SOLVER_READ_PROXY_TOKEN", "").strip()
+    raw_budget = os.environ.get("LIVE_SOLVER_RPC_BUDGET", "").strip()
+    budget = DEFAULT_LIVE_RPC_BUDGET
+    if raw_budget:
+        try:
+            budget = int(raw_budget)
+        except ValueError:
+            logger.error(
+                "LIVE_SOLVER_RPC_BUDGET not an int: %r; using default %d",
+                raw_budget, DEFAULT_LIVE_RPC_BUDGET,
+            )
+            budget = DEFAULT_LIVE_RPC_BUDGET
+    if budget < 0:
+        budget = DEFAULT_LIVE_RPC_BUDGET
+    return ReadProxyConfig(
+        url=data.rstrip("/"),
+        control_url=control.rstrip("/"),
+        token=token,
+        chain_ids=tuple(CHAIN_NAMES),
+        budget=budget,
+    )
+
+
 def budget_enforced() -> bool:
     """``True`` iff the proxy is configured AND a positive budget is set.
 
@@ -208,8 +320,8 @@ async def open_session(cfg: ReadProxyConfig, session_id: str, blocks: dict[str, 
     return await asyncio.to_thread(_control_post, cfg, "/control/open", body)
 
 
-async def reset_session(cfg: ReadProxyConfig, session_id: str) -> None:
-    """Reset a session's spent budget to 0 (best-effort).
+async def reset_session(cfg: ReadProxyConfig, session_id: str) -> bool:
+    """Reset a session's spent budget to 0 (best-effort); ``True`` on success.
 
     Called before each ``generate_plan`` so every scenario starts with a fresh
     budget ``B`` — making the budget a PER-SCENARIO cutoff that mirrors the
@@ -217,14 +329,18 @@ async def reset_session(cfg: ReadProxyConfig, session_id: str) -> None:
     (``/control/reset`` only zeros spent + clears exhausted when no ``blocks``
     key is sent). A failed reset is logged and swallowed: it must not crash the
     benchmark (worst case the next scenario continues with carried-over spend,
-    which only makes the cutoff stricter, never silently looser).
+    which only makes the cutoff stricter, never silently looser). The return
+    value lets the LIVE path distinguish "session gone" (e.g. the proxy
+    container restarted and dropped its in-memory registry) and re-open it.
     """
     try:
         await asyncio.to_thread(
             _control_post, cfg, "/control/reset", {"session_id": session_id}
         )
+        return True
     except Exception as exc:  # noqa: BLE001 - a failed reset must not abort the run
         logger.warning("read-proxy reset failed for session=%s: %s", session_id, exc)
+        return False
 
 
 async def close_session(cfg: ReadProxyConfig, session_id: str) -> None:

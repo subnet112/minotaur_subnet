@@ -109,21 +109,82 @@ def rotation_sort_key(
     )
 
 
+def actor_rotation_sort_key(
+    hotkey: str,
+    round_id: str,
+    actor_last: dict[str, float],
+    actor_of: Any,
+) -> tuple[float, str, str]:
+    """Actor-keyed variant of :func:`rotation_sort_key` (see harness/actor.py).
+
+    Seniority is the ACTOR's (max over its hotkeys' ledger timestamps,
+    pre-aggregated by ``actor_last_selected``), and the primary tie-break salts
+    the actor — so a fleet's hotkeys share one seniority and one per-round
+    shuffle position instead of one each. The hotkey-salted third element only
+    orders submissions WITHIN one actor, deterministically. With the identity
+    resolver this ranks exactly like :func:`rotation_sort_key` (the extra
+    element never reorders distinct hotkeys — the actor salt already differs).
+    """
+    actor = actor_of(hotkey or "") or (hotkey or "")
+    return (
+        float(actor_last.get(actor, 0.0)),
+        hashlib.sha256(f"{actor}:{round_id}".encode()).hexdigest(),
+        hashlib.sha256(f"{hotkey}:{round_id}".encode()).hexdigest(),
+    )
+
+
 def select_rotation_slate(
     candidates: list[Any],
     slots: int,
     last_selected: dict[str, float],
     round_id: str,
+    actor_of: Any = None,
 ) -> tuple[list[Any], list[Any]]:
-    """PURE: split candidates into (selected, skipped) by rotation order."""
+    """PURE: split candidates into (selected, skipped) by rotation order.
+
+    With ``actor_of`` (hotkey → actor, see harness/actor.py) the sort key is
+    actor-aggregated and selection soft-dedups per actor: the first pass seats
+    at most ONE submission per actor — a fleet rotating N hotkeys holds one
+    seat, not N — and only when fewer distinct actors than slots contend do
+    an actor's further submissions fill the leftover seats (throughput is
+    never sacrificed to fairness in an uncontested round). ``skipped`` stays
+    in seniority order, so waitlist positions remain meaningful.
+    """
     slots = max(0, int(slots))
+    if actor_of is None:
+        ordered = sorted(
+            candidates,
+            key=lambda s: rotation_sort_key(
+                getattr(s, "hotkey", "") or "", round_id, last_selected,
+            ),
+        )
+        return ordered[:slots], ordered[slots:]
+
+    from minotaur_subnet.harness.actor import actor_last_selected
+
+    actor_last = actor_last_selected(last_selected, actor_of)
     ordered = sorted(
         candidates,
-        key=lambda s: rotation_sort_key(
-            getattr(s, "hotkey", "") or "", round_id, last_selected,
+        key=lambda s: actor_rotation_sort_key(
+            getattr(s, "hotkey", "") or "", round_id, actor_last, actor_of,
         ),
     )
-    return ordered[:slots], ordered[slots:]
+    selected: list[Any] = []
+    overflow: list[Any] = []
+    seated_actors: set[str] = set()
+    for sub in ordered:
+        hk = getattr(sub, "hotkey", "") or ""
+        actor = actor_of(hk) or hk
+        if len(selected) < slots and actor not in seated_actors:
+            selected.append(sub)
+            seated_actors.add(actor)
+        else:
+            overflow.append(sub)
+    # Fewer distinct actors than slots: fill from the overflow in seniority
+    # order (repeat actors) rather than waste bench capacity.
+    while len(selected) < slots and overflow:
+        selected.append(overflow.pop(0))
+    return selected, overflow
 
 
 class RotationLedger:
@@ -266,11 +327,25 @@ def apply_rotation_slate(
     """
     if slots <= 0:
         return {"applied": False, "reason": "rotation disabled (slots <= 0)"}
+    from minotaur_subnet.harness.actor import distinct_actor_count, snapshot_resolver
+
     subs = sub_store.list_by_round(round_id)
     candidates = [s for s in subs if _status_value(s) not in _TERMINAL_STATUSES]
+    # None (kill-switch, or no coldkey data yet) => the legacy per-hotkey
+    # selection below, byte-identical to the pre-actor-keying rule.
+    actor_of = snapshot_resolver()
     selected, skipped = select_rotation_slate(
-        candidates, slots, ledger.load(), round_id,
+        candidates, slots, ledger.load(), round_id, actor_of=actor_of,
     )
+    if actor_of is not None:
+        n_actors = distinct_actor_count(
+            (getattr(s, "hotkey", "") or "" for s in candidates), actor_of,
+        )
+        logger.info(
+            "rotation %s: %d candidate(s) from %d actor(s) -> %d selected "
+            "(actor-keyed slate, map=%s)",
+            round_id, len(candidates), n_actors, len(selected), actor_of.source,
+        )
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
