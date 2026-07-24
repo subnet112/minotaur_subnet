@@ -257,6 +257,20 @@ def _sim_offload_enabled() -> bool:
     ``_simulate_via_score_intent`` applies them AFTER the re-fork (mirroring how
     ``token_balances`` are already re-dealt there under the lock), delete the
     pre-``await simulate()`` seeds — then re-run the benchmark determinism soak.
+
+    LOOP-STALL CAVEATS — two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY
+    on the event loop, so with offload on, a collision with an in-flight
+    offloaded sim stalls the ENTIRE loop for the remainder of that sim — the
+    exact freeze this flag exists to eliminate:
+      * :meth:`AnvilSimulator.pin_read_fork` — dormant today (its caller is
+        gated behind PIN_SOLVER_READ_BLOCK, off); make it async before flipping
+        both flags together.
+      * :meth:`AnvilSimulator.simulate_with_trace` — LIVE in the monolith
+        deployment: ``_capture_revert_trace`` (harness/orchestrator.py,
+        benchmark revert-trace capture, default ``BENCHMARK_REVERT_TRACE_MAX=10``)
+        calls it synchronously on the event loop. Before enabling, either
+        offload the trace capture too or set ``BENCHMARK_REVERT_TRACE_MAX=0``.
+
     Set ``SIM_OFFLOAD_TO_THREAD=1`` only once that gate is cleared.
     """
     return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
