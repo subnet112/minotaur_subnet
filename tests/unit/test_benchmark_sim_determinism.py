@@ -297,7 +297,7 @@ class TestSimulatorForkAnchor:
 #
 # A scoreIntent sim is a multi-second block of synchronous web3 RPCs. Run
 # inline on the API's single event loop it freezes every other route; the fix
-# offloads it to a worker thread (default on, SIM_OFFLOAD_TO_THREAD=0 reverts).
+# offloads it to a worker thread (default OFF, SIM_OFFLOAD_TO_THREAD=1 enables).
 # The offloaded body now runs CONCURRENTLY with loop-side fork access, so these
 # tests pin the two invariants that keep that safe + deterministic:
 #   * the sim runs off the loop thread but still under _fork_mutation_lock, and
