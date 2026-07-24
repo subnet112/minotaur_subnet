@@ -168,8 +168,6 @@ class _Waiter:
 class _RoundGateState:
     round_id: str
     budget: int
-    opened_at: float
-    open_seconds: float
     ledger: dict[str, float]
     # Actor view + seniority maps, snapshotted with the ledger at ensure_round.
     # actor_of is a FROZEN ActorResolver (harness/actor.py) or None (legacy
@@ -222,8 +220,6 @@ class BuildBudgetGate:
         self,
         round_id: str,
         *,
-        opened_at: float,
-        open_seconds: float,
         prior_attempts: list[tuple[str, str]] | None = None,
     ) -> None:
         """Create (idempotently) the gate state for a round.
@@ -249,8 +245,6 @@ class BuildBudgetGate:
         state = _RoundGateState(
             round_id=round_id,
             budget=budget,
-            opened_at=float(opened_at or 0.0),
-            open_seconds=float(open_seconds or 0.0),
             ledger=ledger,
             actor_of=actor_of,
             actor_last=actor_last,
@@ -373,7 +367,7 @@ class BuildBudgetGate:
         if state is None:
             # Defensive: callers ensure_round() first; a bare acquire must
             # still never crash a pipeline. Bootstrap with no history.
-            self.ensure_round(round_id, opened_at=0.0, open_seconds=0.0)
+            self.ensure_round(round_id)
             state = self._rounds[round_id]
 
         # 0 = unlimited: transparent pass-through, today's behaviour exactly
