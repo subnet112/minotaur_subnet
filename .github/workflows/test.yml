@@ -13,6 +13,25 @@ on:
     branches: [main, develop]
 
 jobs:
+  compose-lint:
+    # Guard: the tracked validator compose must PARSE and render for both the
+    # follower (no profiles) and leader profile sets. Catches e.g. a clean git
+    # merge producing a duplicate mapping key (parse-fatal for compose) that
+    # plain YAML tooling silently accepts.
+    runs-on: ubuntu-latest
+    env:
+      # Stub the three ':?'-required secrets: compose interpolates them even
+      # for `config`, and the YAML parse this guard exists for happens first.
+      VALIDATOR_PRIVATE_KEY: ci-stub
+      ADMIN_API_KEY: ci-stub
+      SOLVER_ROUND_INTERNAL_API_KEY: ci-stub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate follower render (no profiles)
+        run: docker compose -f platform/validator/docker-compose.yml config -q
+      - name: Validate leader render (leader + benchmark-worker profiles)
+        run: COMPOSE_PROFILES=leader,benchmark-worker docker compose -f platform/validator/docker-compose.yml config -q
+
   unit-tests:
     runs-on: ubuntu-latest
     steps:
