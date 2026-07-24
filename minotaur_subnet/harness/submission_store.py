@@ -627,9 +627,12 @@ class SubmissionStore:
 
         ``max_per_actor_per_round`` (with ``actor_of``, a hotkey→actor resolver)
         is the sybil cap: it counts submissions by the same OPERATOR (coldkey ∪
-        github owner) for the round and supersedes ``max_per_owner_per_round``
-        (the old per-account cap, kept as the fallback value when the actor cap
-        is 0). See :func:`_same_operator`.
+        github owner, :func:`_same_operator`) for the round. When > 0 it
+        SUPERSEDES ``max_per_owner_per_round`` (the operator definition already
+        subsumes the account match). When <= 0 (kill-switch) the operator
+        keying is fully disabled and ``max_per_owner_per_round`` is enforced
+        on its own, owner-keyed, exactly as before the operator cap existed —
+        the legacy account cap never silently turns off with it.
 
         ``max_per_round`` caps how many submissions a single hotkey may make for
         one round — anti-spam protection for the validator's screening +
@@ -680,36 +683,56 @@ class SubmissionStore:
                 )
         # Per-OPERATOR round cap — the anti-sybil backstop, generalizing the old
         # per-github-account cap. An operator is the actor (coldkey ∪ github
-        # owner, harness/actor.py); ``max_per_actor_per_round`` wins, else the
-        # legacy ``max_per_owner_per_round`` value is used as the same cap. One
-        # coldkey spread over N hotkeys AND N github accounts collapses here, so
-        # the split-into-many-identities evasion buys no extra round slots.
-        # Degrades to hotkey ∪ owner when ``actor_of`` is None (pre-metagraph),
-        # i.e. exactly the old per-account behaviour. Inline-source with no
-        # coldkey and no owner is only ever its own hotkey, so it is never
-        # merged with anyone else.
-        operator_cap = max_per_actor_per_round or max_per_owner_per_round
-        # Only bites when the operator shares SOME cross-hotkey signal (a github
-        # account or a resolved coldkey) — an inline-source, coldkey-unknown
-        # submission is only ever its own hotkey, which the per-hotkey cap above
-        # already governs, so it stays exempt exactly like the old owner cap.
-        operator_id = (github_owner or "").strip() or (
-            actor_of(hotkey or "") if actor_of is not None else ""
-        )
-        shares_identity = bool(operator_id) and operator_id != hotkey
-        if operator_cap > 0 and shares_identity:
-            op_count = sum(
-                1 for s in self._submissions.values()
-                if s.round_id == resolved_round_id
-                and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
+        # owner, harness/actor.py): one coldkey spread over N hotkeys AND N
+        # github accounts collapses here, so the split-into-many-identities
+        # evasion buys no extra round slots. Degrades to hotkey ∪ owner when
+        # ``actor_of`` is None (pre-metagraph), i.e. exactly the old
+        # per-account behaviour. <= 0 is the kill-switch: operator keying fully
+        # off, and the legacy owner-keyed account cap below takes over — the
+        # two caps are never BOTH silently off. Must mirror the route's
+        # pre-check (routes.py) — this is its atomic TOCTOU backstop.
+        if max_per_actor_per_round > 0:
+            # Only bites when the operator shares SOME cross-hotkey signal (a
+            # github account or a resolved coldkey) — an inline-source,
+            # coldkey-unknown submission is only ever its own hotkey, which the
+            # per-hotkey cap above already governs, so it stays exempt exactly
+            # like the old owner cap.
+            operator_id = (github_owner or "").strip() or (
+                actor_of(hotkey or "") if actor_of is not None else ""
             )
-            if op_count >= operator_cap:
-                raise ValueError(
-                    f"operator {operator_id!r} already submitted {op_count} "
-                    f"time(s) for round {resolved_round_id} (max {operator_cap} "
-                    f"per round per operator — the hotkeys, coldkeys and github "
-                    f"accounts of one operator share the cap); resubmit next round"
+            if operator_id and operator_id != hotkey:
+                op_count = sum(
+                    1 for s in self._submissions.values()
+                    if s.round_id == resolved_round_id
+                    and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
                 )
+                if op_count >= max_per_actor_per_round:
+                    raise ValueError(
+                        f"operator {operator_id!r} already submitted {op_count} "
+                        f"time(s) for round {resolved_round_id} "
+                        f"(max {max_per_actor_per_round} per round per operator "
+                        f"— the hotkeys, coldkeys and github accounts of one "
+                        f"operator share the cap); resubmit next round"
+                    )
+        else:
+            # Kill-switch path: the pre-operator-cap per-(github-account, round)
+            # cap, keyed by owner alone. Counts ALL of this GitHub account's
+            # submissions for the round regardless of hotkey; case-insensitive
+            # (GitHub logins are). Skipped when the owner is unknown
+            # (inline-source) or this cap too is disabled.
+            owner_key = (github_owner or "").strip().lower()
+            if owner_key and max_per_owner_per_round > 0:
+                owner_count = sum(
+                    1 for s in self._submissions.values()
+                    if (s.github_owner or "").lower() == owner_key
+                    and s.round_id == resolved_round_id
+                )
+                if owner_count >= max_per_owner_per_round:
+                    raise ValueError(
+                        f"GitHub account {owner_key!r} already submitted "
+                        f"{owner_count} time(s) for round {resolved_round_id} "
+                        f"(max {max_per_owner_per_round} per round per account)"
+                    )
         if max_total_per_round > 0:
             round_total = sum(
                 1 for s in self._submissions.values()

@@ -12,10 +12,6 @@ from minotaur_subnet.harness.submission_store import (
 )
 
 
-def _store(tmp_path):
-    return SubmissionStore(persist_path=tmp_path / "s.json")
-
-
 def _mk(store, hotkey, rid="rr", **kw):
     return store.create("r", "h", epoch=1, hotkey=hotkey, round_id=rid, **kw)
 
@@ -40,7 +36,7 @@ def test_same_operator_by_hotkey_owner_actor():
 # ── the operator cap: coldkey split across hotkeys AND accounts ───────────────
 
 def test_actor_cap_collapses_coldkey_split_across_accounts():
-    store = _store(None) if False else SubmissionStore(persist_path=None)
+    store = SubmissionStore(persist_path=None)
     # One coldkey CK_A, three hotkeys, three DIFFERENT github accounts — the
     # exact SF-1 shape the account-only cap misses.
     _mk(store, "hkA1", github_owner="acct1", max_per_actor_per_round=1, actor_of=actor_of)
@@ -94,3 +90,43 @@ def test_actor_cap_zero_disables():
         _mk(store, hk, github_owner="a", max_per_actor_per_round=0,
             max_per_owner_per_round=0, actor_of=actor_of)
     assert store.count_by_round("rr") == 3
+
+
+# ── kill-switch (<= 0): operator keying OFF, legacy owner-keyed cap ON ────────
+
+@pytest.mark.parametrize("actor_cap_off", [0, -1])
+def test_actor_cap_off_enforces_legacy_owner_keyed_cap(actor_cap_off):
+    # env<=0 must fall back to the pre-operator behaviour: the account cap
+    # counts by GITHUB OWNER alone (count_by_owner_round semantics), and a
+    # negative value behaves exactly like 0 — the caps are never BOTH silently
+    # disabled (the `-1 or owner_cap` truthiness bug).
+    store = SubmissionStore(persist_path=None)
+    _mk(store, "hkA1", github_owner="alice",
+        max_per_actor_per_round=actor_cap_off, max_per_owner_per_round=1,
+        actor_of=actor_of)
+    # Same owner, different hotkey/coldkey → legacy owner cap fires.
+    with pytest.raises(ValueError, match="per round per account"):
+        _mk(store, "solo", github_owner="ALICE",
+            max_per_actor_per_round=actor_cap_off, max_per_owner_per_round=1,
+            actor_of=actor_of)
+    # Same COLDKEY but a different owner → allowed: operator keying is OFF,
+    # only the owner-keyed cap applies (exactly pre-operator-cap behaviour).
+    _mk(store, "hkA2", github_owner="bob",
+        max_per_actor_per_round=actor_cap_off, max_per_owner_per_round=1,
+        actor_of=actor_of)
+    assert store.count_by_round("rr") == 2
+
+
+def test_actor_cap_negative_env_parses_and_means_disabled(monkeypatch):
+    # The route helper passes negative env values through; the <= 0 branch (not
+    # truthiness) must decide, in both routes.py and the store's atomic check.
+    from minotaur_subnet.api.routes.submissions.routes import (
+        _max_submissions_per_actor_per_round,
+    )
+
+    monkeypatch.setenv("SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND", "-1")
+    assert _max_submissions_per_actor_per_round() == -1
+    monkeypatch.setenv("SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND", "0")
+    assert _max_submissions_per_actor_per_round() == 0
+    monkeypatch.delenv("SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND", raising=False)
+    assert _max_submissions_per_actor_per_round() == 1  # default: operator cap on
