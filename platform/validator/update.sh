@@ -185,6 +185,68 @@ preflight_env() {
   log "✅ env preflight passed (all mandatory vars set)"
 }
 
+# ── 1.5 scope SERVICES to the services ACTIVE under the current profile set ──
+# `docker compose up <svc>` AUTO-ACTIVATES a profiled service when it is named
+# explicitly on the CLI — so a follower (no `leader` profile) running the default
+# SERVICES list would silently START a keyless leader relayer. Intersect
+# $SERVICES with what `config --services` reports for the CURRENT profile set:
+# a service that is profiled out (or doesn't exist in this compose file at all —
+# which used to hard-fail `up` and break the ROLLBACK path) is skipped with a
+# log line instead. Fail-open: if the active set can't be enumerated, keep
+# SERVICES unchanged rather than updating nothing.
+ACTIVE_SERVICES=""
+filter_services_to_active() {
+  ACTIVE_SERVICES="$(DC config --services 2>/dev/null || true)"
+  if [ -z "$ACTIVE_SERVICES" ]; then
+    warn "could not enumerate active services (DC config --services failed) — leaving SERVICES unfiltered: $SERVICES"
+    return 0
+  fi
+  local svc kept=""
+  for svc in $SERVICES; do
+    if printf '%s\n' "$ACTIVE_SERVICES" | grep -qx "$svc"; then
+      kept="$kept $svc"
+    else
+      log "service '$svc' is not active for the current profile set (COMPOSE_PROFILES=${COMPOSE_PROFILES:-<unset>}) — skipping it (naming it on the CLI would force-activate its profile)"
+    fi
+  done
+  SERVICES="${kept# }"
+  if [ -z "$SERVICES" ]; then
+    err "none of the requested services are active in this compose project — check MINOTAUR_UPDATE_SERVICES / COMPOSE_PROFILES"; exit 2
+  fi
+  log "services in scope for this update: $SERVICES"
+}
+
+# ── 1.6 leader profile ⇒ the relayer MUST have its signing key ─────────────
+# The unified compose keeps RELAYER_PRIVATE_KEY optional (`:-` not `:?`) because
+# compose interpolates `:?` even for profiled-OUT services, which would break
+# every follower. That removed the fail-fast — so re-add it HERE: when the
+# `leader` profile is active (the relayer is in the active service set), refuse
+# to start a KEYLESS relayer — it would boot, go healthy, and then fail every
+# on-chain champion attest (merge_failed) instead of failing loudly up front.
+preflight_leader_relayer_key() {
+  # Only meaningful when the relayer is actually active under the current
+  # profile set (leader). ACTIVE_SERVICES was computed by filter_services_to_active.
+  printf '%s\n' "$ACTIVE_SERVICES" | grep -qx "relayer" || return 0
+  local rk
+  rk="$(env_val RELAYER_PRIVATE_KEY)"
+  # The lead's dc.sh sources secrets from a sibling .env.keys — check it too.
+  if [ -z "$rk" ] && [ -f "$DIR/.env.keys" ]; then
+    rk="$(grep -E '^[[:space:]]*RELAYER_PRIVATE_KEY=' "$DIR/.env.keys" 2>/dev/null | tail -n1 \
+          | sed -E "s/^[[:space:]]*RELAYER_PRIVATE_KEY=//; s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")" || rk=""
+  fi
+  if is_unset_or_placeholder "$rk"; then
+    if [ "$SKIP_ENV_CHECK" = "1" ]; then
+      warn "leader profile is active but RELAYER_PRIVATE_KEY is unset — continuing ONLY because --skip-env-check; the relayer will fail every champion attest"
+      return 0
+    fi
+    err "leader profile is active (the relayer is in the service set) but RELAYER_PRIVATE_KEY is unset or a placeholder."
+    err "A keyless relayer boots healthy and then FAILS every on-chain champion attest (merge_failed)."
+    err "Set RELAYER_PRIVATE_KEY in $ENV_FILE (or the lead's .env.keys), or drop 'leader' from COMPOSE_PROFILES."
+    exit 2
+  fi
+  log "✅ leader relayer key present"
+}
+
 # ── health helpers ─────────────────────────────────────────────────────────
 # One of: missing | starting | healthy | unhealthy | nohealthcheck | <state>
 svc_health() {
@@ -322,6 +384,8 @@ fi
 
 # ── run ────────────────────────────────────────────────────────────────────
 preflight_env
+filter_services_to_active
+preflight_leader_relayer_key
 
 if [ -n "$OLD_ID" ] && [ -n "$IMAGE_REF" ]; then
   log "current $PROBE_SVC image: $IMAGE_REF ($OLD_ID) — rollback armed"
