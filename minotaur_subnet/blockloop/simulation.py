@@ -90,42 +90,47 @@ class SimulationRunner:
             seed_contract = deployed_contract if (is_deposit_model and deployed_contract) else None
 
             try:
-                # For deposit-model apps, seed the contract with input tokens
-                # so scoreIntent -> _fundFromContract can transfer to the proxy.
+                # Fork seeds are applied INSIDE simulate() now — after the
+                # per-sim re-fork and under the sim locks — via the
+                # deposit_contract_seeds / fee_seeds params below. They used to
+                # be dealt HERE on the event loop before `await simulate()`,
+                # which (a) mutated the shared fork outside _sim_lock /
+                # _fork_mutation_lock and raced offloaded sims (see
+                # anvil_simulator._sim_offload_enabled), and (b) was silently
+                # WIPED by this sim's own re-fork before scoreIntent ran on the
+                # order rail. The standard-app executor balance + allowance are
+                # already re-dealt inside _simulate_via_score_intent from
+                # token_balances, so only the deposit-contract fund and the
+                # user platform-fee fund are forwarded explicitly.
                 sim_token_balances = token_balances
-                if seed_contract and token_balances and hasattr(self.simulator, '_deal_erc20'):
-                    for tok, amt in token_balances.items():
-                        self.simulator._deal_erc20(tok, seed_contract, amt)
-                    sim_token_balances = None  # Already dealt to contract
+                deposit_contract_seeds: dict[str, int] | None = None
+                fee_seeds: dict[str, int] | None = None
 
-                # For standard apps, scoreIntent calls _fundAndExecute which does
-                # safeTransferFrom(user, proxy, amount). The user needs both
-                # token balance AND allowance for the app contract.
+                # Deposit-model apps: scoreIntent -> _fundFromContract pulls the
+                # input token from the APP CONTRACT, so fund the contract (not
+                # the executor) inside the sim.
+                if seed_contract and token_balances:
+                    deposit_contract_seeds = dict(token_balances)
+                    sim_token_balances = None  # not dealt to the executor
+
+                # Standard apps: a user-paid platform fee (when set) is pulled
+                # from the USER in WETH — fund it + approve the app inside the sim.
                 if not seed_contract and token_balances and deployed_contract:
-                    # Get the AnvilSimulator for this chain
-                    sim = self.simulator
-                    if hasattr(sim, 'simulators'):
-                        sim = sim.simulators.get(
-                            order.chain_id,
-                            sim.simulators.get(31337),
-                        )
-                    if sim and hasattr(sim, '_deal_erc20'):
-                        for tok, amt in token_balances.items():
-                            sim._deal_erc20(tok, order.submitted_by, amt)
-                            sim._set_erc20_allowance(
-                                tok, order.submitted_by, deployed_contract, 2**256 - 1,
-                            )
+                    platform_fee = int(order.params.get("platform_fee_wei", 0))
+                    if platform_fee > 0:
+                        from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
+                        weth = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
+                        if weth:
+                            fee_seeds = {weth: platform_fee}
 
-                        # Seed WETH/WTAO for platform fee so scoreIntent can collect it
-                        platform_fee = int(order.params.get("platform_fee_wei", 0))
-                        if platform_fee > 0:
-                            from minotaur_subnet.blockchain.tokens import WRAPPED_NATIVE_TOKEN
-                            weth = WRAPPED_NATIVE_TOKEN.get(order.chain_id)
-                            if weth:
-                                sim._deal_erc20(weth, order.submitted_by, platform_fee)
-                                sim._set_erc20_allowance(
-                                    weth, order.submitted_by, deployed_contract, 2**256 - 1,
-                                )
+                # Only forward the seed kwargs when set: keeps standard swaps /
+                # quotes byte-identical, and never passes them to a simulator
+                # whose simulate() signature doesn't accept them.
+                _seed_kwargs: dict[str, Any] = {}
+                if deposit_contract_seeds:
+                    _seed_kwargs["deposit_contract_seeds"] = deposit_contract_seeds
+                if fee_seeds:
+                    _seed_kwargs["fee_seeds"] = fee_seeds
 
                 if is_cross_chain and hasattr(self.simulator, "simulate_cross_chain"):
                     simulation = await self.simulator.simulate_cross_chain(
@@ -134,6 +139,7 @@ class SimulationRunner:
                         contract_address=contract_address,
                         intent_order=intent_order_dict,
                         token_balances=sim_token_balances,
+                        **_seed_kwargs,
                     )
                 else:
                     logger.info("[LOOP] simulate: contract=%s intent_order=%s tokens=%s", contract_address, "yes" if intent_order_dict else "no", sim_token_balances)
@@ -144,6 +150,7 @@ class SimulationRunner:
                         token_balances=sim_token_balances,
                         fork_block=fork_block,
                         pin_only=pin_only,
+                        **_seed_kwargs,
                     )
                     logger.info("[LOOP] simulation result: success=%s error=%s transfers=%s", simulation.success, simulation.error, len(simulation.token_transfers or []))
                 return simulation
