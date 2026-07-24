@@ -349,9 +349,17 @@ class AnvilSimulator:
         if lock is None:
             lock = self._sim_lock = asyncio.Lock()
         async with lock:
-            return await self._simulate_inner(*args, **kwargs)
+            # OFFLOAD: _simulate_inner is fully synchronous blocking web3 I/O
+            # (no awaits in its body). Running it directly on the event loop
+            # froze the entire API whenever a quote's scoreIntent stalled on a
+            # slow single-threaded anvil fetch (--no-storage-caching → hundreds
+            # of sequential upstream reads per quote). Offload to a worker thread
+            # so a stalled sim blocks only that thread; the _sim_lock is still
+            # held across the await, so per-fork snapshot/execute/revert stays
+            # serialized exactly as before.
+            return await asyncio.to_thread(self._simulate_inner, *args, **kwargs)
 
-    async def _simulate_inner(
+    def _simulate_inner(
         self,
         plan: ExecutionPlan,
         contract_address: str | None = None,
