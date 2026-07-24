@@ -383,6 +383,26 @@ def actor_last_selected(
     return out
 
 
+def actor_first_seen(
+    first_seen: dict[str, float],
+    actor_of: Callable[[str], str],
+) -> dict[str, float]:
+    """Aggregate a ``{hotkey: first_seen_ts}`` map to ``{actor: MIN ts}``.
+
+    MIN is the point: an actor is as senior as its EARLIEST-appearing hotkey,
+    so an operator can't reset its wait clock by rotating to a fresh sibling
+    hotkey/coldkey — the fleet's oldest identity sets the actor's age. Pairs
+    with :func:`actor_last_selected` (MAX benched) in :func:`rotation.wait_ts`.
+    """
+    out: dict[str, float] = {}
+    for hk, ts in first_seen.items():
+        actor = actor_of(hk) or hk
+        cur = out.get(actor)
+        if cur is None or ts < cur:
+            out[actor] = ts
+    return out
+
+
 def distinct_actor_count(hotkeys: Iterable[Any], actor_of: Callable[[str], str]) -> int:
     """Observability helper: how many actors a set of hotkeys collapses to."""
     return len({actor_of(str(hk) or "") for hk in hotkeys})

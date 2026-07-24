@@ -43,12 +43,28 @@ class _FakeStore:
 
 # ── pure selection ────────────────────────────────────────────────────────────
 
-def test_never_benched_outrank_benched():
+def test_long_waiting_never_benched_outrank_benched():
+    # Never-benched B, C who FIRST APPEARED long ago (seen 10, 20) outrank a
+    # miner benched more recently (A at 100): you earn priority by waiting.
     subs = [_sub("A"), _sub("B"), _sub("C")]
-    last = {"A": 100.0}  # A benched before; B, C never
-    selected, skipped = select_rotation_slate(subs, 2, last, "r1")
+    benched = {"A": 100.0}
+    seen = {"B": 10.0, "C": 20.0}
+    selected, skipped = select_rotation_slate(
+        subs, 2, benched, "r1", seen=seen, now=1000.0,
+    )
     assert {s.hotkey for s in selected} == {"B", "C"}
     assert [s.hotkey for s in skipped] == ["A"]
+
+
+def test_fresh_mint_is_junior_not_most_senior():
+    # A brand-new identity (no bench, no first-seen) sorts JUNIOR (wait_ts=now),
+    # so a miner benched long ago beats it — minting buys the back of the queue.
+    subs = [_sub("A"), _sub("fresh")]
+    selected, skipped = select_rotation_slate(
+        subs, 1, {"A": 100.0}, "r1", seen={}, now=1000.0,
+    )
+    assert [s.hotkey for s in selected] == ["A"]
+    assert [s.hotkey for s in skipped] == ["fresh"]
 
 
 def test_lru_order_among_benched():
@@ -98,7 +114,8 @@ def test_ledger_corrupt_file_degrades_to_empty(tmp_path):
 def test_apply_rejects_overflow_and_advances_ledger(tmp_path):
     store = _FakeStore([_sub("A"), _sub("B"), _sub("C")])
     ledger = RotationLedger(str(tmp_path / "rot.json"))
-    ledger.mark_selected(["B"], 100.0)  # B benched before → lowest priority
+    ledger.mark_seen(["A", "C"], 10.0)  # A, C long-waiting never-benched → senior
+    ledger.mark_selected(["B"], 100.0)  # B benched recently → junior
     res = apply_rotation_slate(store, "r1", 2, ledger, now=200.0)
     assert res["applied"] and res["candidates"] == 3 and res["slots"] == 2
     assert set(res["selected"]) == {"sub_A", "sub_C"}
