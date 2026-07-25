@@ -1104,6 +1104,7 @@ def relative_reason(
     *,
     candidate_id: str | None = None,
     adopted: bool = False,
+    finalized: bool = False,
 ) -> str | None:
     """Phrase a round reason in relative vocabulary from a counts dict — PURE.
 
@@ -1140,7 +1141,19 @@ def relative_reason(
         # Only an ACTUAL adoption is stated as final; a mere per-order win is
         # explicitly marked pending so a non-finalist can never read it as a merge.
         verb = f"adopted{who}" if adopted else f"beat the champion{who}"
-        tail = "" if adopted else " (pending round outcome — not yet adopted)"
+        # ``adopted`` -> stated as final (past-tense verb, no tail). Otherwise the
+        # tail turns on whether the ROUND has finalized: while it is still being
+        # scored the outcome is genuinely pending (this may yet be the finalist);
+        # once the round has decided WITHOUT this being the finalist it is settled,
+        # so say "not this round's finalist" rather than "pending" — a non-finalist
+        # (or a former champion since dethroned, whose live status has reverted off
+        # ``adopted``) must never read a decided result as still in flight.
+        if adopted:
+            tail = ""
+        elif finalized:
+            tail = " — not this round's finalist"
+        else:
+            tail = " (pending round outcome — not yet adopted)"
         if counts.get("adopt_via") == "gas":
             # A gas-tie dethrone has 0 better / 0 worse by definition — the
             # performance phrasing would read as nonsense. Name the real reason.
