@@ -677,11 +677,17 @@ def _render_report_body(
     dethrone_margin: float | None = None,  # (report is now per-order only)
     *,
     won: bool = False,
+    round_finalized: bool = True,
 ) -> str:
     """PR-comment body for a champion-consensus outcome: the same-pin per-order
     ``relative`` report when the submission was benchmarked, else the concise
     reason. ``won=True`` renders it as a win (header + fallback), otherwise as a
     rejection. Never raises.
+
+    ``round_finalized`` defaults True because these comments are posted on a
+    TERMINAL round event (finalist selected, or a competitor not selected) — so a
+    non-finalist that beat the champion reads "beat the champion … — not this
+    round's finalist" instead of a stale "(pending — not yet adopted)".
 
     ``champion_score`` / ``dethrone_margin`` are accepted for call-site
     compatibility but no longer used — the report dropped the aggregate scalars
@@ -696,7 +702,9 @@ def _render_report_body(
             render_report_md,
         )
 
-        report = build_submission_report(submission, reason=reason, won=won)
+        report = build_submission_report(
+            submission, reason=reason, won=won, round_finalized=round_finalized,
+        )
         # Only enrich when there's real per-order detail to show; a screening or
         # otherwise-empty (no stored ``relative`` block) report falls back to the
         # concise reason message.
