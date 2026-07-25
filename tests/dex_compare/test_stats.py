@@ -350,7 +350,8 @@ def test_worst_losses_pair_with_bad_median_listed():
     wl = compute_chain_stats(rows, 8453)["worst_losses"]
     assert wl["basis"] == "raw_vs_best_aggregator"
     assert wl["pairs"] == [{
-        "input": "A", "output": "B", "comparisons": 2, "severe_count": 2,
+        "input": "A", "output": "B", "input_symbol": "A", "output_symbol": "B",
+        "comparisons": 2, "severe_count": 2,
         "median_relative": 0.5, "worst_relative": 0.5, "last_severe_at": 2000.0,
     }]
 
@@ -404,6 +405,39 @@ def test_worst_losses_excludes_minotaur_failures():
     assert compute_chain_stats(rows, 8453)["worst_losses"]["pairs"] == []
 
 
+def test_worst_losses_emits_address_and_enriched_symbol():
+    # The severe rows carry only addresses; a LATER row (newest-first order)
+    # resolves TOKA's symbol — the pair view must emit the address (for explorer
+    # links) plus the cross-row-enriched symbol.
+    severe = [_row({"minotaur": _r(out=50), "cow": _r(out=100)},
+                   input_token="0xToken000A", output_token="0xToken000B")] * 2
+    labelled = _row({"minotaur": _r(out=100), "cow": _r(out=100)},
+                    input_token="0xtoken000a", input_symbol="TOKA")
+    pairs = compute_chain_stats([labelled] + severe, 8453)["worst_losses"]["pairs"]
+    assert pairs[0]["input"] == "0xToken000A" and pairs[0]["output"] == "0xToken000B"
+    assert pairs[0]["input_symbol"] == "TOKA"     # enriched, case-insensitive
+    assert pairs[0]["output_symbol"] is None      # never resolved anywhere
+
+
+def test_top_unservable_emits_address_and_symbol():
+    rows = [
+        _row({"minotaur": _r(status="failed")}, trade_source="cow_onchain",
+             input_token="0xAAA", output_token="0xBBB", output_symbol="BBB"),
+    ]
+    top = compute_chain_stats(rows, 8453)["coverage"]["top_unservable_pairs"]
+    assert top[0]["input"] == "0xAAA" and top[0]["input_symbol"] is None
+    assert top[0]["output"] == "0xBBB" and top[0]["output_symbol"] == "BBB"
+
+
+def test_symbol_map_newest_row_wins():
+    from minotaur_subnet.dex_compare.stats import build_symbol_map
+    rows = [  # fetch_since order: newest first
+        _row({}, input_token="0xAAA", input_symbol="NEW"),
+        _row({}, input_token="0xaaa", input_symbol="OLD"),
+    ]
+    assert build_symbol_map(rows) == {"0xaaa": "NEW"}
+
+
 def test_finalize_exposes_tail_percentiles():
     # 10 comparisons: eight at parity, one at 50%, one at 10% -> the median hides
     # the tail; p10 (sorted[int(10*0.10)] = 2nd-worst) and worst expose it.
@@ -431,5 +465,8 @@ def test_top_unservable_pairs_ranked():
              input_symbol="E", output_symbol="F"),
     ]
     top = compute_chain_stats(rows, 8453)["coverage"]["top_unservable_pairs"]
-    assert top[0] == {"input": "A", "output": "B", "count": 2, "last_error": None}
+    assert top[0] == {
+        "input": "A", "output": "B", "input_symbol": "A", "output_symbol": "B",
+        "count": 2, "last_error": None,
+    }
     assert {t["input"] for t in top} == {"A", "C"}  # E (error) excluded

@@ -28,7 +28,7 @@ from typing import Any
 
 from minotaur_subnet.blockchain.chains import get_chain_name
 
-from .stats import _int
+from .stats import _int, build_symbol_map
 
 # Classification thresholds. Kept deliberately lenient on sample count because
 # per-pair sampling is sparse; the counts are returned so a consumer can judge
@@ -69,6 +69,10 @@ def compute_chain_blindspots(
 
     ``split_ts`` is the boundary between the *earlier* and *recent* sub-windows.
     """
+    # Cross-pair symbol enrichment: a token resolved on ANY row (any pair, any
+    # source) labels every pair it appears in — per-pair rows alone often predate
+    # symbol resolution.
+    symbols = build_symbol_map(rows)
     agg: dict[tuple, dict[str, Any]] = {}
     for row in rows:
         if row.get("trade_source") != "cow_onchain":
@@ -118,7 +122,8 @@ def compute_chain_blindspots(
         r_ok = pair["r_ok"] / r_total if r_total else None
         base = {
             "input": pair["input"], "output": pair["output"],
-            "input_symbol": pair["input_symbol"], "output_symbol": pair["output_symbol"],
+            "input_symbol": pair["input_symbol"] or symbols.get(str(pair["input"]).lower()),
+            "output_symbol": pair["output_symbol"] or symbols.get(str(pair["output"]).lower()),
         }
 
         # OPEN: currently failing at a high rate.
