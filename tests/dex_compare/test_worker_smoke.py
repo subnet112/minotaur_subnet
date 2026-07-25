@@ -139,7 +139,7 @@ def test_draws_one_per_chain(tmp_path):
         [_VALID_ORDER, _ETH_ORDER, _CROSS_ORDER], tmp_path, chains=(1, 8453),
     )
 
-    async def _resolve(order, _cache):
+    async def _resolve(order, _cache, _symbols=None):
         return make_trade(chain_id=int(order["chain_id"]))
 
     with patch(

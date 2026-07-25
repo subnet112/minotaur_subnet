@@ -105,3 +105,16 @@ def test_response_groups_by_chain_and_shapes():
     assert resp["window_days"] == 14 and resp["recent_days"] == 7
     assert [c["chain_id"] for c in resp["chains"]] == [1, 8453]
     assert all(c["open_count"] == 1 for c in resp["chains"])
+
+
+def test_open_pair_symbol_enriched_from_other_rows():
+    # The failing pair's own rows never resolved a symbol, but 0xAAA appears
+    # labelled on a DIFFERENT pair's row — cross-pair enrichment fills it in.
+    rows = (
+        [_row("failed", NOW - i * 3600, err="no route") for i in range(3)]
+        + [_row("ok", NOW - 3600, pair=("0xaaa", "0xCCC"), in_sym="TOKA")]
+    )
+    res = _bs(rows)
+    open_pair = next(p for p in res["open"] if p["output"] == "0xBBB")
+    assert open_pair["input_symbol"] == "TOKA"   # enriched, case-insensitive
+    assert open_pair["output_symbol"] is None    # 0xBBB never labelled anywhere
