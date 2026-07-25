@@ -110,13 +110,27 @@ async def test_refresh_loop_updates_in_place():
     )
 
     # Sequence: first refresh sees 6666 (no change), second sees 8000 (change).
+    # Patch ALL registry reads, not just the quorum one: unpatched reads do a
+    # REAL http attempt against the unreachable test rpc_url, and on CI its
+    # DNS-failure retries cost ~1s+ per refresh iteration — enough for the
+    # outcome poll to expire after a single iteration (needs two). Flaked on
+    # the #1006 CI run; deterministic-fast with everything patched.
     values = iter([6666, 8000, 8000])
     with patch(
         "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
         side_effect=lambda *_a, **_kw: next(values),
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_validator_count",
+        return_value=3,
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_validators",
+        return_value=[],
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_block_number",
+        return_value=8_000_000,
     ):
         task = asyncio.create_task(cfg.refresh_loop())
-        await _pump_until(lambda: cfg.quorum_bps == 8000)
+        await _pump_until(lambda: cfg.quorum_bps == 8000, timeout=10.0)
         task.cancel()
         try:
             await task
