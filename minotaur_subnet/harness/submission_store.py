@@ -160,6 +160,27 @@ BENCHED_STATUSES = frozenset({
     SubmissionStatus.ADOPTED,
 })
 
+
+def _counts_as_benched(sub: "Submission", current_round_id: str | None) -> bool:
+    """Does this row burn per-commit / per-fingerprint bench quota?
+
+    SCORED/ADOPTED always do — the code demonstrably completed a bench.
+    BENCHMARKING is IN-FLIGHT, not evidence of a completed bench: it is set at
+    screening pass (pre-slate), and a round that dies through the route-path
+    abort (deadline elapsed) skips the reaper and strands rows in BENCHMARKING
+    forever. Counting those burned quota for code that never benched once —
+    observed live 2026-07-26: 3 fingerprints at the cap purely from stranded
+    rows. So BENCHMARKING counts only from the CALLER'S OWN round (in-flight
+    peers racing this submission), never from a bygone round.
+    """
+    if sub.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED):
+        return True
+    return (
+        sub.status is SubmissionStatus.BENCHMARKING
+        and current_round_id is not None
+        and sub.round_id == current_round_id
+    )
+
 # Terminal-for-round states in which the private-repo token has ALREADY been
 # purged (reject/waitlist/adopt all purge). A late benchmark result must never
 # flip one of these back to SCORED — doing so mints a token-less finalist that
@@ -745,7 +766,9 @@ class SubmissionStore:
                     f"try again next round"
                 )
         if max_rounds_per_commit > 0:
-            benched_rounds = self.count_benched_rounds_by_commit(hotkey, commit_hash)
+            benched_rounds = self.count_benched_rounds_by_commit(
+                hotkey, commit_hash, current_round_id=resolved_round_id,
+            )
             if benched_rounds >= max_rounds_per_commit:
                 raise ValueError(
                     f"Commit {commit_hash[:12]} has already been benchmarked in "
@@ -1004,14 +1027,18 @@ class SubmissionStore:
                 out[hk] = ts
         return out
 
-    def count_benched_rounds_by_commit(self, hotkey: str, commit_hash: str) -> int:
+    def count_benched_rounds_by_commit(
+        self, hotkey: str, commit_hash: str, *, current_round_id: str | None = None,
+    ) -> int:
         """DISTINCT rounds where this miner's exact commit occupied a benchmark
-        slate slot (status in ``BENCHED_STATUSES``).
+        slate slot (see :func:`_counts_as_benched`).
 
         The submission gate reads this to enforce the per-commit participation
         cap BEFORE any expensive work. Scoped to the (hotkey, commit) pair —
         another miner submitting the same commit can't burn this miner's quota.
         Case-insensitive on the hash (git SHAs are hex). Empty commit returns 0.
+        ``current_round_id`` is the caller's round: an in-flight BENCHMARKING
+        row counts only from THAT round — never from a bygone one.
         """
         self._maybe_reload()
         commit = (commit_hash or "").strip().lower()
@@ -1021,7 +1048,7 @@ class SubmissionStore:
             s.round_id for s in self._submissions.values()
             if s.hotkey == hotkey
             and (s.commit_hash or "").strip().lower() == commit
-            and s.status in BENCHED_STATUSES
+            and _counts_as_benched(s, current_round_id)
         })
 
     def count_by_round(self, round_id: str) -> int:
@@ -1187,6 +1214,7 @@ class SubmissionStore:
         fingerprint: str,
         *,
         exclude_submission_id: str | None = None,
+        current_round_id: str | None = None,
     ) -> int:
         """DISTINCT rounds in which this normalized fingerprint occupied a
         benchmark slot — ACROSS ALL HOTKEYS.
@@ -1194,8 +1222,10 @@ class SubmissionStore:
         The cross-hotkey scope is the point: the per-(hotkey, commit) cap gives
         every sybil hotkey its own quota for the same bytes; this counter gives
         the CODE one quota, however many hotkeys ship it. Mirrors the commit
-        cap's accounting: only BENCHED statuses count, so rotation-not-selected
-        and screening rejections don't burn quota.
+        cap's accounting (:func:`_counts_as_benched`): completed benches always
+        count; in-flight BENCHMARKING only from ``current_round_id`` — so
+        rotation-not-selected, screening rejections and rows stranded by an
+        aborted round don't burn quota.
         """
         self._maybe_reload()
         rounds: set[str] = set()
@@ -1204,7 +1234,7 @@ class SubmissionStore:
                 continue
             if exclude_submission_id and sub.submission_id == exclude_submission_id:
                 continue
-            if sub.status in BENCHED_STATUSES and sub.round_id:
+            if _counts_as_benched(sub, current_round_id) and sub.round_id:
                 rounds.add(sub.round_id)
         return len(rounds)
 
@@ -1213,6 +1243,7 @@ class SubmissionStore:
         fingerprint: str,
         *,
         exclude_submission_id: str | None = None,
+        current_round_id: str | None = None,
     ) -> tuple[list[tuple[str, float, str, str]], int]:
         """One pass over the store for everything the screening fingerprint
         checks need: ``(submitters, benched_round_count)``.
@@ -1247,7 +1278,7 @@ class SubmissionStore:
                     str(status),
                 ),
             )
-            if sub.status in BENCHED_STATUSES and sub.round_id:
+            if _counts_as_benched(sub, current_round_id) and sub.round_id:
                 benched_rounds.add(sub.round_id)
         return submitters, len(benched_rounds)
 

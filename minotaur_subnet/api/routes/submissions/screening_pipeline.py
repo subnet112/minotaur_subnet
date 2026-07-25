@@ -917,6 +917,66 @@ async def resume_stranded_screenings() -> int:
     return resumed
 
 
+async def reap_orphaned_benchmarking() -> int:
+    """Boot-time healer: no-fault-waitlist BENCHMARKING rows whose round is over.
+
+    BENCHMARKING is set at screening pass; the round-completion reaper (#227)
+    normally settles every row at round end. Rounds that died through the
+    route-path abort (deadline elapsed) skipped that reaper, stranding rows in
+    BENCHMARKING forever — 62 across ~20 rounds observed live 2026-07-26.
+    Stranded rows are pure debt: rendered as live benchmarks, immune to
+    retention (non-terminal), and historically counted as benched rounds by
+    the per-commit / per-fingerprint quota, locking miners out for code that
+    never benched once. The abort path now reaps inline
+    (``_reap_benchmarking_for_terminal_round``); this sweep settles the
+    backlog and backstops any future path that skips both reapers.
+
+    Only rows whose round is MISSING or terminal (aborted / certified /
+    activated) are touched — the current round's in-flight rows are the
+    benchmark worker's business. Waitlist (not reject): the miner did nothing
+    wrong and keeps wait-clock seniority (anchored on created_at, so this
+    transition cannot reset it). Call once at api startup, after
+    :func:`resume_stranded_screenings`. Returns the number healed.
+    """
+    from .state import get_round_store
+
+    store = get_store()
+    try:
+        round_store = get_round_store()
+    except Exception as exc:  # noqa: BLE001 — healer must never break startup
+        logger.warning("[screening] orphan-bench sweep skipped (no round store): %s", exc)
+        return 0
+    _TERMINAL_ROUND = {"aborted", "certified", "activated"}
+    healed = 0
+    for sub in store.list_by_status(SubmissionStatus.BENCHMARKING):
+        round_id = getattr(sub, "round_id", "") or ""
+        state = round_store.get_round(round_id) if round_id else None
+        status = getattr(getattr(state, "status", None), "value", None) if state else None
+        if state is not None and status not in _TERMINAL_ROUND:
+            continue  # live round — not ours to touch
+        reason = (
+            f"round {round_id or 'unknown'} ended before your benchmark ran — "
+            "no quota burned; resubmit to a fresh open round"
+        )
+        try:
+            await offload_write(
+                store.waitlist, sub.submission_id, reason,
+                outcome_code="round_ended_unbenched",
+            )
+            healed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[screening] orphan-bench sweep: failed to waitlist %s: %s",
+                sub.submission_id, exc,
+            )
+    if healed:
+        logger.info(
+            "[screening] orphan-bench sweep: waitlisted %d stranded BENCHMARKING "
+            "submission(s) from ended rounds", healed,
+        )
+    return healed
+
+
 # Statuses proving a stage-2 BUILD already started for this submission (in
 # this or a previous process life). Used to rebuild the build-budget gate's
 # charged set after a restart and to re-dispatch resumed pipelines without
@@ -1127,6 +1187,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if s1.content_fingerprint and (fp_cap > 0 or reject_copies):
             submitters, benched = store.fingerprint_usage(
                 s1.content_fingerprint, exclude_submission_id=submission_id,
+                current_round_id=getattr(s1, "round_id", None),
             )
             resolver = snapshot_resolver() if reject_copies else None
             if reject_copies and resolver is None:

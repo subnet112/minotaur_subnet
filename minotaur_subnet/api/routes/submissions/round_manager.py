@@ -669,6 +669,46 @@ def _abort_round_sync_payload(state: RoundState) -> dict[str, Any]:
     }
 
 
+def _reap_benchmarking_for_terminal_round(round_id: str) -> int:
+    """No-fault-waitlist submissions stranded in BENCHMARKING by a route-path
+    abort.
+
+    ``EpochManager._complete_round`` reaps these (#227) — but the deadline
+    abort (``_maybe_abort_expired_round`` → this module) never passes through
+    it, so its screening-passers stayed BENCHMARKING forever: invisible to
+    retention (non-terminal), rendered as live benchmarks, and — worst —
+    counted as benched rounds by the per-commit/per-fingerprint quota, locking
+    miners out for code that never benched once (3 fingerprints observed live
+    2026-07-26). Mirrors the manager reaper's no-fault semantics; best-effort —
+    a failed reap only delays cleanup to the boot sweep, never blocks an abort.
+    """
+    reaped = 0
+    try:
+        store = get_store()
+        subs = store.list_by_round(round_id)
+    except Exception as exc:  # noqa: BLE001 — reap must never break an abort
+        logger.warning("abort-reap: list_by_round(%s) failed: %s", round_id, exc)
+        return 0
+    for sub in subs:
+        if getattr(sub.status, "value", str(sub.status)) != "benchmarking":
+            continue
+        reason = (
+            f"round {round_id} was aborted before your benchmark ran — "
+            "no quota burned; resubmit to a fresh open round"
+        )
+        try:
+            store.waitlist(sub.submission_id, reason, outcome_code="round_aborted_unbenched")
+            reaped += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("abort-reap: failed to waitlist %s: %s", sub.submission_id, exc)
+    if reaped:
+        logger.info(
+            "abort-reap: waitlisted %d BENCHMARKING submission(s) of aborted round %s",
+            reaped, round_id,
+        )
+    return reaped
+
+
 def _abort_solver_round_state(body: AbortRoundRequest) -> RoundState:
     """Abort a round locally without HTTP context."""
     round_store = get_round_store()
@@ -688,8 +728,11 @@ def _abort_solver_round_state(body: AbortRoundRequest) -> RoundState:
     if round_state.status == RoundStatus.ABORTED:
         if body.reason and round_state.abort_reason != body.reason:
             round_state = round_store.abort_round(body.round_id, body.reason)
+        _reap_benchmarking_for_terminal_round(body.round_id)
         return round_state
-    return round_store.abort_round(body.round_id, body.reason)
+    aborted = round_store.abort_round(body.round_id, body.reason)
+    _reap_benchmarking_for_terminal_round(body.round_id)
+    return aborted
 
 
 def _sync_abort_solver_round_state(body: AbortRoundRequest) -> RoundState:
