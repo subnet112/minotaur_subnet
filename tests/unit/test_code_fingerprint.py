@@ -149,3 +149,47 @@ def test_fingerprint_survives_store_reload(tmp_path):
     sid = _seed(store, 1, "hk_A", "r1", SubmissionStatus.SCORED, "a" * 64)
     reloaded = SubmissionStore(persist_path=path)
     assert reloaded.get(sid).content_fingerprint == "a" * 64
+
+
+def test_stranded_benchmarking_does_not_burn_fingerprint_quota(tmp_path):
+    """The live 2026-07-26 leak: rounds that died through the route-path abort
+    stranded rows in BENCHMARKING forever, and those counted as benched rounds
+    — 3 fingerprints hit the cap without a single completed bench. BENCHMARKING
+    must count only from the caller's OWN (current) round."""
+    store = SubmissionStore(persist_path=tmp_path / "subs.json")
+    fp = "e" * 64
+    # Two bygone rounds stranded in BENCHMARKING (the orphan shape).
+    _seed(store, 1, "hk_A", "r_dead1", SubmissionStatus.BENCHMARKING, fp)
+    _seed(store, 2, "hk_A", "r_dead2", SubmissionStatus.BENCHMARKING, fp)
+    # Orphans burn nothing, whatever the caller's round.
+    assert store.count_benched_rounds_for_fingerprint(fp, current_round_id="r_now") == 0
+    assert store.count_benched_rounds_for_fingerprint(fp) == 0
+    _, benched = store.fingerprint_usage(fp, current_round_id="r_now")
+    assert benched == 0
+
+    # An in-flight peer in the CALLER'S round does count (racing submissions).
+    _seed(store, 3, "hk_B", "r_now", SubmissionStatus.BENCHMARKING, fp)
+    assert store.count_benched_rounds_for_fingerprint(fp, current_round_id="r_now") == 1
+
+    # Completed benches always count, current round or not.
+    _seed(store, 4, "hk_C", "r_old", SubmissionStatus.SCORED, fp)
+    assert store.count_benched_rounds_for_fingerprint(fp, current_round_id="r_now") == 2
+
+
+def test_stranded_benchmarking_does_not_burn_commit_quota(tmp_path):
+    """Same rule for the per-(hotkey, commit) cap — including create()'s
+    TOCTOU re-check, which passes the round being submitted into."""
+    store = SubmissionStore(persist_path=tmp_path / "subs.json")
+    sub = store.create(
+        repo_url="https://example.com/r.git", commit_hash="deadbeef" * 5,
+        epoch=1, hotkey="hk_A", round_id="r_dead",
+    )
+    store.update_status(sub.submission_id, SubmissionStatus.BENCHMARKING)
+    assert store.count_benched_rounds_by_commit(
+        "hk_A", "deadbeef" * 5, current_round_id="r_now",
+    ) == 0
+    # Scored → counts regardless of round.
+    store.update_status(sub.submission_id, SubmissionStatus.SCORED)
+    assert store.count_benched_rounds_by_commit(
+        "hk_A", "deadbeef" * 5, current_round_id="r_now",
+    ) == 1
