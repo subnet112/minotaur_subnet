@@ -15,6 +15,19 @@ _REGISTRY = "0x" + "11" * 20
 _RPC = "http://anvil:8545"
 
 
+async def _pump_until(cond, timeout: float = 2.0) -> bool:
+    """Drive the loop until ``cond()`` holds (or timeout). The refresh loop
+    hops through ``asyncio.to_thread`` for its registry reads, so bare
+    ``sleep(0)`` yields can no longer step it deterministically — poll the
+    observable outcome instead."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if cond():
+            return True
+        await asyncio.sleep(0.01)
+    return cond()
+
+
 @pytest.fixture(autouse=True)
 def _clear_override():
     """Make sure no test leaks the override env var to the next one."""
@@ -103,9 +116,7 @@ async def test_refresh_loop_updates_in_place():
         side_effect=lambda *_a, **_kw: next(values),
     ):
         task = asyncio.create_task(cfg.refresh_loop())
-        # Yield a few times so the task can run two iterations.
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await _pump_until(lambda: cfg.quorum_bps == 8000)
         task.cancel()
         try:
             await task
@@ -230,8 +241,7 @@ async def test_refresh_stamps_freshness_on_success():
          patch(f"{_PC}._read_validators", return_value=list(_VSET)), \
          patch(f"{_PC}._read_block_number", return_value=8_111_111):
         task = asyncio.create_task(cfg.refresh_loop())
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await _pump_until(lambda: cfg.last_successful_refresh_at is not None)
         task.cancel()
         try:
             await task
@@ -257,8 +267,7 @@ async def test_refresh_records_error_and_freezes_cache_on_failure():
     with patch(f"{_PC}._read_quorum_bps", return_value=6666), \
          patch(f"{_PC}._read_validator_count", side_effect=RuntimeError("rpc down")):
         task = asyncio.create_task(cfg.refresh_loop())
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await _pump_until(lambda: cfg.last_refresh_error is not None)
         task.cancel()
         try:
             await task
@@ -269,3 +278,59 @@ async def test_refresh_records_error_and_freezes_cache_on_failure():
     assert cfg.last_refresh_error is not None
     assert "getValidatorCount" in cfg.last_refresh_error
     assert cfg.last_successful_refresh_at is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_quorum_does_not_block_the_event_loop():
+    """Regression guard for the 2026-07-25 stalls: the ``_read_*`` registry
+    reads are synchronous web3-over-HTTPS round-trips, and two refresh loops
+    tick every 60s — run ON the loop, a slow upstream froze the whole API for
+    the round-trip (py-spy caught MainThread in ``ssl.read`` under
+    ``_refresh_quorum``, up to ~18s). ``_refresh_quorum`` must run them via
+    ``asyncio.to_thread``: with a read blocked in ``time.sleep``, a 10ms
+    heartbeat coroutine must keep ticking."""
+    import time as _time
+
+    cfg = ProtocolConfig(
+        quorum_bps=6666, rpc_url=_RPC, registry_address=_REGISTRY,
+        refresh_interval_seconds=0,
+    )
+
+    BLOCK_SECONDS = 0.3
+
+    def blocking_read(*_a, **_kw):
+        _time.sleep(BLOCK_SECONDS)  # the synchronous HTTPS round-trip
+        return 6666
+
+    ticks = {"n": 0}
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            ticks["n"] += 1
+
+    with patch(
+        "minotaur_subnet.consensus.protocol_config._read_quorum_bps",
+        side_effect=blocking_read,
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_validator_count",
+        return_value=3,
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_validators",
+        return_value=[],
+    ), patch(
+        "minotaur_subnet.consensus.protocol_config._read_block_number",
+        return_value=8_000_000,
+    ):
+        hb = asyncio.create_task(heartbeat())
+        try:
+            await cfg._refresh_quorum()
+        finally:
+            hb.cancel()
+
+    # A responsive loop ticks ~30x during the 0.3s blocked read; frozen it
+    # stays at ~0. Require a healthy margin for slow CI.
+    assert ticks["n"] >= 5, (
+        f"event loop only advanced {ticks['n']}x while a registry read "
+        "blocked — _refresh_quorum is not offloading its sync web3 reads"
+    )
