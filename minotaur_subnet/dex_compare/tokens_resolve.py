@@ -17,6 +17,7 @@ from web3 import Web3
 from minotaur_subnet.blockchain.tokens import (
     WRAPPED_NATIVE_TOKEN,
     get_erc20_decimals,
+    get_erc20_symbol,
     get_token_symbol,
     resolve_token,
 )
@@ -50,6 +51,51 @@ class DecimalsCache:
         return decimals
 
 
+# Symbols are display-only; anything longer is either non-standard or an attempt
+# to smuggle a sentence into the UI — truncate rather than reject.
+_SYMBOL_MAX_LEN = 24
+
+
+def _sanitize_symbol(raw: Any) -> str | None:
+    """Printable, trimmed, length-capped symbol — or None when unusable.
+
+    ERC-20 ``symbol()`` is untrusted contract output: bytes32 pseudo-strings
+    (MKR-era tokens) arrive NUL-padded, and nothing stops a token from returning
+    control characters or a paragraph."""
+    if not isinstance(raw, (str, bytes)):
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    cleaned = "".join(ch for ch in raw.replace("\x00", "") if ch.isprintable()).strip()
+    return cleaned[:_SYMBOL_MAX_LEN] or None
+
+
+class SymbolCache:
+    """Process-lifetime cache of ``(chain_id, address) -> symbol | None``.
+
+    Registry first (free), then on-chain ``symbol()``. Failures are cached as
+    ``None`` — non-standard tokens would otherwise be re-queried every cycle,
+    and a missing symbol is a cosmetic, not a correctness, outcome."""
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[int, str], str | None] = {}
+
+    async def get(self, address: str, chain_id: int) -> str | None:
+        known = get_token_symbol(address, chain_id)
+        if known:
+            return known
+        key = (chain_id, address.lower())
+        if key in self._cache:
+            return self._cache[key]
+        try:
+            symbol = _sanitize_symbol(await get_erc20_symbol(address, chain_id))
+        except Exception as exc:  # noqa: BLE001 — bytes32/reverting/RPC failure -> no symbol
+            logger.debug("symbol resolve failed for %s on %d: %s", address, chain_id, exc)
+            symbol = None
+        self._cache[key] = symbol
+        return symbol
+
+
 def _resolve_address(token: str, chain_id: int) -> tuple[str, bool]:
     """Return ``(checksummed_address, is_wrapped_native)`` for a token identifier.
 
@@ -72,7 +118,9 @@ def _resolve_address(token: str, chain_id: int) -> tuple[str, bool]:
 
 
 async def resolve_trade_tokens(
-    order: dict[str, Any], decimals_cache: DecimalsCache,
+    order: dict[str, Any],
+    decimals_cache: DecimalsCache,
+    symbol_cache: SymbolCache | None = None,
 ) -> TradeDescriptor | None:
     """Build a :class:`TradeDescriptor` from an order, or ``None`` if unresolvable.
 
@@ -113,6 +161,15 @@ async def resolve_trade_tokens(
     if in_dec is None or out_dec is None:
         return None
 
+    # Symbols: on-chain via the cache when provided, else registry-only. Purely
+    # cosmetic — a None symbol never skips the order.
+    if symbol_cache is not None:
+        in_sym = await symbol_cache.get(in_addr, chain_id)
+        out_sym = await symbol_cache.get(out_addr, chain_id)
+    else:
+        in_sym = get_token_symbol(in_addr, chain_id)
+        out_sym = get_token_symbol(out_addr, chain_id)
+
     return TradeDescriptor(
         order_id=str(order.get("order_id") or ""),
         app_id=str(order.get("app_id") or ""),
@@ -123,8 +180,8 @@ async def resolve_trade_tokens(
         input_amount=str(amount),
         input_decimals=in_dec,
         output_decimals=out_dec,
-        input_symbol=get_token_symbol(in_addr, chain_id),
-        output_symbol=get_token_symbol(out_addr, chain_id),
+        input_symbol=in_sym,
+        output_symbol=out_sym,
         input_is_native=in_native,
         output_is_native=out_native,
     )

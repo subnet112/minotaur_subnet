@@ -159,11 +159,14 @@ WRAPPED_NATIVE_SYMBOL: dict[int, str] = {
     31337: "ETH",
 }
 
-# Reverse lookup: address (lower) -> (chain_id, symbol)
-_ADDRESS_TO_SYMBOL: dict[str, tuple[int, str]] = {}
+# Reverse lookup: (chain_id, address lower) -> symbol. Keyed per-chain — the
+# same address exists on several chains (Base and Optimism both deploy WETH at
+# 0x4200…0006), and an address-only key let one chain's entry clobber another's,
+# so chain-scoped lookups for the clobbered chain came back None.
+_ADDRESS_TO_SYMBOL: dict[tuple[int, str], str] = {}
 for _cid, _toks in TOKENS.items():
     for _sym, _addr in _toks.items():
-        _ADDRESS_TO_SYMBOL[_addr.lower()] = (_cid, _sym)
+        _ADDRESS_TO_SYMBOL[(_cid, _addr.lower())] = _sym
 
 
 # ---------------------------------------------------------------------------
@@ -311,13 +314,12 @@ def get_token_symbol(address: str, chain_id: int | None = None) -> str | None:
     Returns ``None`` when the address is not in the registry.
     """
     key = address.lower()
-    entry = _ADDRESS_TO_SYMBOL.get(key)
-    if entry is None:
-        return None
-    cid, sym = entry
-    if chain_id is not None and cid != chain_id:
-        return None
-    return sym
+    if chain_id is not None:
+        return _ADDRESS_TO_SYMBOL.get((chain_id, key))
+    for (_cid, addr), sym in _ADDRESS_TO_SYMBOL.items():
+        if addr == key:
+            return sym
+    return None
 
 
 # ---------------------------------------------------------------------------
