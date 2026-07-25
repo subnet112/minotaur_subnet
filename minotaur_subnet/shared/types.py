@@ -134,6 +134,8 @@ class Interaction:
 # Kept for backward compatibility with legacy cross-chain path.
 _BRIDGE_CALL_SELECTORS = {
     "81b4e8b4",  # Hyperlane transferRemote(uint32,bytes32,uint256)
+    "7b939232",  # Across depositV3(address,address,address,address,uint256,
+                 #   uint256,uint256,address,uint32,uint32,uint32,bytes)
 }
 _MOCK_BRIDGE_TARGET = "0x" + "BB" * 20
 
@@ -431,25 +433,41 @@ class CrossChainPlan:
     The platform's CrossChainCompiler converts this into an executable
     MultiLegPlan with bridge calldata, escrow, rollback, and simulation
     mocks — none of which the solver controls.
+
+    revert_legs (OPTIONAL, additive): solver-authored recovery legs, one per
+    failure point. Each is a ChainLeg whose ``metadata["revert_for_leg"]``
+    names the (0-based) solver leg whose failure it recovers from — e.g. a
+    destination-chain swap back to the bridged asset when leg 1 can't meet
+    its min-out. The compiler validates them like forward legs (bridge
+    selectors banned) and appends the platform's reverse-bridge after them,
+    so an absent/failed solver revert still falls back to the reverse-bridge
+    rollback. Solvers that don't emit revert_legs are unaffected: the field
+    is omitted from serialization when empty, keeping the wire shape
+    byte-identical to pre-revert_legs plans.
     """
     legs: list[ChainLeg]
     bridge_requests: list[BridgeRequest]
+    revert_legs: list[ChainLeg] = field(default_factory=list)
 
     @property
     def is_cross_chain(self) -> bool:
         return len(self.bridge_requests) > 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "legs": [leg.to_dict() for leg in self.legs],
             "bridge_requests": [br.to_dict() for br in self.bridge_requests],
         }
+        if self.revert_legs:
+            d["revert_legs"] = [leg.to_dict() for leg in self.revert_legs]
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CrossChainPlan":
         return cls(
             legs=[ChainLeg.from_dict(l) for l in d.get("legs", [])],
             bridge_requests=[BridgeRequest.from_dict(br) for br in d.get("bridge_requests", [])],
+            revert_legs=[ChainLeg.from_dict(l) for l in d.get("revert_legs", [])],
         )
 
 
