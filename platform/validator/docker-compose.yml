@@ -463,6 +463,15 @@ services:
         condition: service_healthy
       anvil-btevm:
         condition: service_healthy
+    # Leader-only values (see .env.leader.example) flow in via this OPTIONAL
+    # env file — absent on followers (no-op), present on a leader. Keys listed
+    # in `environment:` above win over the file; everything else (leader round
+    # windows, SIM_OFFLOAD_TO_THREAD, rate limits, ...) reaches the container
+    # from the file WITHOUT being duplicated here, so compose never grows a
+    # second copy of an app default that can drift.
+    env_file:
+      - path: .env.leader
+        required: false
     environment:
       # Bittensor identity
       WALLET_NAME: "${WALLET_NAME}"
@@ -548,6 +557,7 @@ services:
       # (anti-free-ride). Default matches the api service name + port below.
       CHAMPION_API_URL: "${CHAMPION_API_URL:-http://api:8080}"
     volumes:
+      - store-data:/data              # shared round-state volume (matches leader; unused by followers reading champion over HTTP)
       # Bittensor wallet directory — read-only.
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
     networks: [minotaur]
@@ -593,7 +603,17 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+    # Leader-only values (see .env.leader.example) flow in via this OPTIONAL
+    # env file — absent on followers (no-op), present on a leader. Keys listed
+    # in `environment:` above win over the file; everything else (leader round
+    # windows, SIM_OFFLOAD_TO_THREAD, rate limits, ...) reaches the container
+    # from the file WITHOUT being duplicated here, so compose never grows a
+    # second copy of an app default that can drift.
+    env_file:
+      - path: .env.leader
+        required: false
     environment:
+      # ── end leader-only config ──
       # Same Bittensor identity as the validator daemon — both processes
       # use the same hotkey + EVM signing key.
       WALLET_NAME: "${WALLET_NAME}"
@@ -695,10 +715,10 @@ services:
       CONSENSUS_REQUIRE_SIGNED_PROPOSALS: "1"
 
       # Follower role — these are LEADER-ONLY responsibilities:
-      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # Leader manages round lifecycle
-      ENABLE_BENCHMARK_WORKER: "0"          # Proactive bench is leader-only
-      ENABLE_DEX_COMPARE: "0"               # DEX-aggregator comparison is leader-only
-      SUBMISSIONS_ACCEPTING: "0"            # Users send submissions to the leader
+      ENABLE_SOLVER_ROUND_COORDINATOR: "${ENABLE_SOLVER_ROUND_COORDINATOR:-0}"  # 1 on the leader (runs the round coordinator)
+      ENABLE_BENCHMARK_WORKER: "${ENABLE_BENCHMARK_WORKER:-0}"  # leader hands the slate to the benchmark-worker profile
+      ENABLE_DEX_COMPARE: "${ENABLE_DEX_COMPARE:-0}"        # leader-only; leader sets 1 in .env
+      SUBMISSIONS_ACCEPTING: "${SUBMISSIONS_ACCEPTING:-0}"  # leader accepts user submissions (sets 1 in .env); followers default off
       # Optional DEX-compare aggregator keys (leader only; CoW + Velora are keyless):
       ONEINCH_API_KEY: "${ONEINCH_API_KEY:-}"
       ZEROX_API_KEY: "${ZEROX_API_KEY:-}"
@@ -891,6 +911,9 @@ services:
       # peer cache, which can be stale by up to 300s after a slash/removal).
       CONSENSUS_ENFORCE_ONCHAIN_REGISTRY: "${CONSENSUS_ENFORCE_ONCHAIN_REGISTRY:-1}"
     volumes:
+      # leader-only bind mounts (followers get empty placeholder dirs → unused; leader sets real host paths in .env)
+      - "${GHCR_DOCKER_CONFIG_DIR:-./.leader-mounts/docker}:/home/minotaur/.docker:ro"
+      - "${SOLVER_REPO_HOST_PATH:-./.leader-mounts/solver-repo}:/solver-repo"
       - "${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/home/minotaur/.bittensor/wallets:ro"
       - store-data:/data
     networks: [minotaur, docker-control]
@@ -953,6 +976,15 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+    # Leader-only values (see .env.leader.example) flow in via this OPTIONAL
+    # env file — absent on followers (no-op), present on a leader. Keys listed
+    # in `environment:` above win over the file; everything else (leader round
+    # windows, SIM_OFFLOAD_TO_THREAD, rate limits, ...) reaches the container
+    # from the file WITHOUT being duplicated here, so compose never grows a
+    # second copy of an app default that can drift.
+    env_file:
+      - path: .env.leader
+        required: false
     environment:
       # ── identity (same hotkey/EVM key as the api) ────────────────────
       WALLET_NAME: "${WALLET_NAME}"
@@ -965,7 +997,7 @@ services:
       BENCHMARK_WORKER_ONLY: "1"          # activates every worker-mode code gate
       ENABLE_BENCHMARK_WORKER: "1"        # THIS process runs the slate run_loop
       DISABLE_BLOCK_LOOP: "1"             # no block loop / EpochManager here
-      ENABLE_SOLVER_ROUND_COORDINATOR: "0"  # the api owns the round lifecycle
+      ENABLE_SOLVER_ROUND_COORDINATOR: "0"   # worker never runs the round coordinator (api-only)
       SUBMISSIONS_ACCEPTING: "0"          # users submit to the leader api, not here
       DISABLE_READ_PROXY: "1"             # the api LAUNCHES + owns the pin proxy;
                                           # the worker must not launch a second one
@@ -1162,6 +1194,92 @@ services:
     # Not exposed to host — and NOT on `minotaur`, so an untrusted solver
     # (live-solver or reactive-bench) cannot reach the Docker-control endpoint.
     # Only the api + benchmark-worker (also on docker-control) can reach it.
+
+
+  # ── leader-only services (activate with COMPOSE_PROFILES=...,leader) ──
+  relayer:
+    profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
+    # NO watchtower label here ON PURPOSE: update.sh owns relayer updates (it
+    # round-drains before recreating a coordinator). Watchtower recreating the
+    # relayer mid-round outside that drain has orphaned a certified champion
+    # merge before (round-e29743808, 2026-07-21).
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    ports:
+      - "127.0.0.1:8091:8091"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["exec python -m minotaur_subnet.relayer.main --port 8091"]
+    # Leader-only values (see .env.leader.example) flow in via this OPTIONAL
+    # env file — absent on followers (no-op), present on a leader. Keys listed
+    # in `environment:` above win over the file; everything else (leader round
+    # windows, SIM_OFFLOAD_TO_THREAD, rate limits, ...) reaches the container
+    # from the file WITHOUT being duplicated here, so compose never grows a
+    # second copy of an app default that can drift.
+    env_file:
+      - path: .env.leader
+        required: false
+    environment:
+      # Cap glibc malloc arenas to reduce per-process RSS (~50-100 MB/container savings)
+      MALLOC_ARENA_MAX: "2"
+      ANVIL_RPC_URL: http://anvil-base:8546
+      CHAIN_ID: "8453"
+      VALIDATOR_REGISTRY_8453: "${VALIDATOR_REGISTRY_8453:-}"
+      VALIDATOR_REGISTRY_1: "${VALIDATOR_REGISTRY_1:-}"
+      APP_REGISTRY_1: "${APP_REGISTRY_1:-}"
+      APP_REGISTRY_8453: "${APP_REGISTRY_8453:-}"
+      APP_REGISTRY_964: "${APP_REGISTRY_964:-}"
+      BASE_RPC_URL: "${BASE_RPC_URL:-}"
+      ETHEREUM_RPC_URL: "${ETHEREUM_RPC_URL:-}"
+      RELAYER_WALLET: "${RELAYER_WALLET:-}"
+      BITTENSOR_EVM_RPC_URL: "${BITTENSOR_EVM_RELAYER_RPC_URL:-https://lite.chain.opentensor.ai}"   # SCRUBBED: was a hardcoded blockmachine auth token; put the real URL in .env
+      # Leader-only (this service only starts under `profiles: [leader]`), but compose interpolates
+      # ${VAR:?} even for profiled-out services, so a `:?` here would break a follower's
+      # `docker compose up`. Kept optional; the leader supplies it via .env.keys (./dc.sh), and a
+      # dc.sh/update.sh preflight should assert it is set before starting the leader profile.
+      RELAYER_PRIVATE_KEY: "${RELAYER_PRIVATE_KEY:-}"
+      CHAMPION_REGISTRY_964: "${CHAMPION_REGISTRY_964:-}"
+      VALIDATOR_REGISTRY_964: "${VALIDATOR_REGISTRY_964:-}"
+      CHAMPION_CONSENSUS_CHAIN_ID: "${CHAMPION_CONSENSUS_CHAIN_ID:-964}"
+      SOLVER_REPO_URL: "${SOLVER_REPO_URL:-}"
+      SOLVER_REPO_TOKEN: "${SOLVER_REPO_TOKEN:-}"
+    networks: [minotaur]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8091/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Seed (one-time app registration) ─────────────────────────────────────
+
+
+  seed:
+    profiles: [leader]   # leader-only singleton (relayer pays gas / seed bootstraps the app)
+    image: ghcr.io/subnet112/minotaur-validator:${MINOTAUR_IMAGE_TAG:-stable}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["exec python /app/platform/local_testnet/seed.py"]
+    # Leader-only values (see .env.leader.example) flow in via this OPTIONAL
+    # env file — absent on followers (no-op), present on a leader. Keys listed
+    # in `environment:` above win over the file; everything else (leader round
+    # windows, SIM_OFFLOAD_TO_THREAD, rate limits, ...) reaches the container
+    # from the file WITHOUT being duplicated here, so compose never grows a
+    # second copy of an app default that can drift.
+    env_file:
+      - path: .env.leader
+        required: false
+    environment:
+      MINOTAUR_API_URL: http://api:8080
+    networks: [minotaur]
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   store-data:
