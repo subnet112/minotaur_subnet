@@ -135,7 +135,10 @@ async def test_refresh_loop_survives_rpc_error():
         refresh_interval_seconds=0,
     )
 
+    calls = {"n": 0}
+
     def fake(_rpc, _reg):
+        calls["n"] += 1
         raise RuntimeError("transient blip")
 
     with patch(
@@ -143,8 +146,11 @@ async def test_refresh_loop_survives_rpc_error():
         side_effect=fake,
     ):
         task = asyncio.create_task(cfg.refresh_loop())
-        for _ in range(5):
-            await asyncio.sleep(0)
+        # The read MUST have been attempted (and raised) at least twice —
+        # proving the loop both hit the error and survived it — before we
+        # check the cache. A bare yield-count pump could pass vacuously
+        # with zero iterations now that the read hops through to_thread.
+        assert await _pump_until(lambda: calls["n"] >= 2)
         task.cancel()
         try:
             await task
