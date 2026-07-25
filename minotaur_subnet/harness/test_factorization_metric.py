@@ -184,15 +184,54 @@ def test_dynamic_code_calls_flags_bare_exec_eval(tmp_path):
         "y = eval('2 + 2')\n"
     )
     hits = dynamic_code_calls(str(tmp_path))
-    assert hits == ["a.py:1", "a.py:2"]
+    assert hits == ["a.py:1 exec", "a.py:2 eval"]
 
 
-def test_dynamic_code_calls_ignores_attribute_calls_and_compile(tmp_path):
+def test_dynamic_code_calls_flags_compile_and_dunder_import(tmp_path):
+    # compile() / __import__() were previously ALLOWED — the analyzability gate
+    # bans them: both build/resolve code the AST can't otherwise follow.
+    (tmp_path / "c.py").write_text(
+        "code = compile('1', '<s>', 'eval')\n"
+        "m = __import__('king_base')\n"
+    )
+    assert dynamic_code_calls(str(tmp_path)) == [
+        "c.py:1 compile", "c.py:2 __import__",
+    ]
+
+
+def test_dynamic_code_calls_flags_dynamic_import_and_code_construction(tmp_path):
+    # Attribute form, matched on the trailing name so an ALIASED importlib/types
+    # is still caught: importlib.import_module(<var>) + types.FunctionType/CodeType.
+    (tmp_path / "d.py").write_text(
+        "import importlib as il, types\n"
+        "base = il.import_module(_m)\n"       # d.py:2 import_module
+        "fn = types.FunctionType(c, {})\n"    # d.py:3 FunctionType
+        "co = types.CodeType()\n"             # d.py:4 CodeType
+    )
+    assert dynamic_code_calls(str(tmp_path)) == [
+        "d.py:2 import_module", "d.py:3 FunctionType", "d.py:4 CodeType",
+    ]
+
+
+def test_dynamic_code_calls_flags_shim_import_indirection(tmp_path):
+    # Regression on the LIVE obfuscator: james_base.py resolves its real base
+    # module through `__import__(_m)` with a VARIABLE name — invisible to a
+    # static import scan, the exact AST-blinding this gate closes.
+    (tmp_path / "james_base.py").write_text(
+        'import kb_a122b33 as base_module\n'
+        'for _m in ("king_solver", "king_base"):\n'
+        '    v = getattr(__import__(_m), "SOLVER_VERSION", "")\n'
+    )
+    assert dynamic_code_calls(str(tmp_path)) == ["james_base.py:3 __import__"]
+
+
+def test_dynamic_code_calls_ignores_benign_attribute_calls(tmp_path):
+    # Attribute calls whose trailing name is NOT in the ban stay clean: re.compile
+    # (the builtin `compile` is bare-name only) and a miner method named `eval`.
     (tmp_path / "b.py").write_text(
         "import re\n"
-        "pat = re.compile('x')\n"       # attribute call — not flagged
-        "tree.eval(ctx)\n"              # attribute call — not flagged
-        "code = compile('1', '<s>', 'eval')\n"  # compile not banned
+        "pat = re.compile('x')\n"       # attribute `.compile` — not the builtin
+        "tree.eval(ctx)\n"              # attribute `.eval` — a miner method
     )
     assert dynamic_code_calls(str(tmp_path)) == []
 
@@ -233,14 +272,42 @@ def test_floor_armed_passes_clean_code(tmp_path, monkeypatch):
     assert res.passed is True
 
 
-def test_floor_armed_rejects_dynamic_code_first(tmp_path, monkeypatch):
-    # exec/eval is checked before the cap: even TINY code with exec rejects.
+def test_dynamic_code_rejected_before_too_entangled(tmp_path, monkeypatch):
+    # Analyzability takes precedence over the cap: even TINY code with exec
+    # rejects as dynamic_code, never reaching the (huge) entanglement cap.
     repo = _valid_repo(tmp_path, "exec('x = 1')\n")
     monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
     res = run_stage_1(str(repo))
     assert res.passed is False
     assert res.error_code == "dynamic_code"
-    assert "solver.py:1" in res.details
+    assert "solver.py:1 exec" in res.details
+
+
+def test_dynamic_code_rejects_even_when_floor_unarmed(tmp_path, monkeypatch):
+    # DECOUPLED: the analyzability ban does NOT depend on MAX_REGION_NODES.
+    # With the factor floor disarmed (None), __import__ indirection still rejects.
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)
+    repo = _valid_repo(tmp_path, "m = __import__('king_base')\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "dynamic_code"
+    assert "__import__" in res.details
+
+
+def test_dynamic_code_ban_can_be_disarmed(tmp_path, monkeypatch):
+    # Escape hatch: DYNAMIC_CODE_ARMED=False → observe-only (logs, never rejects),
+    # even with the factor floor also disarmed. Proves the arming is what gates.
+    monkeypatch.setattr(_screening, "DYNAMIC_CODE_ARMED", False)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)
+    repo = _valid_repo(tmp_path, "code = compile('1', '<s>', 'eval')\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+def test_dynamic_code_armed_by_default():
+    # Ships ENFORCING (unlike the observe-only import ban), version-stamped.
+    assert _screening.DYNAMIC_CODE_ARMED is True
+    assert _screening.DYNAMIC_CODE_VERSION == 1
 
 
 # ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
