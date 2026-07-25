@@ -1864,15 +1864,33 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         # verdict (the follower-slice check). veto_observe attaches to the report
         # only when this submission was the finalist the followers checked.
         _veto_observe = None
+        _won = False
+        _round_finalized = False
         if sub.round_id:
             rs = get_round_store().get_round(sub.round_id)
             if rs is not None:
                 if not reason and getattr(rs, "abort_reason", None):
                     reason = rs.abort_reason
                 _veto_observe = getattr(rs, "veto_observe", None)
+                # Reflect the round's ACTUAL finalization in this submission's
+                # report so a settled outcome never reads as still-pending — the
+                # /submissions/{id}/status card a miner polls previously derived the
+                # verdict from the LIVE submission status only, so a finalist whose
+                # champion reign later ended (status reverts 'adopted'->'scored')
+                # fell back to "beat the champion … (pending — not yet adopted)"
+                # despite having won its round.
+                #   * _won        -> this submission is the round's chosen finalist
+                #                    (persists past a later dethrone).
+                #   * _finalized  -> the round has decided (a finalist was picked,
+                #                    or it aborted), so a non-finalist reads
+                #                    "not this round's finalist", not "pending".
+                _fin = getattr(rs, "finalist_submission_id", None)
+                _won = _fin is not None and _fin == getattr(sub, "submission_id", None)
+                _round_finalized = _fin is not None or rs.status == RoundStatus.ABORTED
 
         d["report"] = build_submission_report(
-            sub, reason=reason, veto_observe=_veto_observe,
+            sub, reason=reason, won=_won, round_finalized=_round_finalized,
+            veto_observe=_veto_observe,
         )
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)
