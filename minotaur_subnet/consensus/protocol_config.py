@@ -449,8 +449,15 @@ class ProtocolConfig:
                     )
 
     async def _refresh_quorum(self) -> None:
+        # The ``_read_*`` helpers are synchronous web3-over-HTTPS round-trips
+        # (fresh provider + chain_id preflight + retry middleware each), so
+        # they MUST run off the event loop: two of these loops tick every 60s,
+        # and a slow upstream turned each tick into a whole-API freeze of up
+        # to ~18s (2026-07-25, same class as the #1056 quote-sim freeze).
         quorum_source = self.quorum_address or self.registry_address
-        new_value = _read_quorum_bps(self.rpc_url, quorum_source)
+        new_value = await asyncio.to_thread(
+            _read_quorum_bps, self.rpc_url, quorum_source,
+        )
         if new_value != self.quorum_bps:
             logger.warning(
                 "ProtocolConfig: quorum_bps changed %d -> %d on %s — "
@@ -464,7 +471,9 @@ class ProtocolConfig:
         # can correlate quorum_required shifts with on-chain
         # ``updateValidators`` calls without grepping events.
         try:
-            new_count = _read_validator_count(self.rpc_url, self.registry_address)
+            new_count = await asyncio.to_thread(
+                _read_validator_count, self.rpc_url, self.registry_address,
+            )
         except Exception as exc:
             logger.warning(
                 "ProtocolConfig: getValidatorCount() refresh failed on %s "
@@ -486,7 +495,9 @@ class ProtocolConfig:
         # ``ProtocolConfig.on_chain_validators``. Lowercased for case-
         # insensitive lookups in the auth check.
         try:
-            new_addrs = _read_validators(self.rpc_url, self.registry_address)
+            new_addrs = await asyncio.to_thread(
+                _read_validators, self.rpc_url, self.registry_address,
+            )
         except Exception as exc:
             logger.warning(
                 "ProtocolConfig: getValidators() refresh failed on %s "
@@ -512,7 +523,9 @@ class ProtocolConfig:
         # successful refresh); the timestamp + cleared error are the signal
         # the health workflow keys off to tell a live view from a frozen one.
         try:
-            self.last_refresh_block = _read_block_number(self.rpc_url)
+            self.last_refresh_block = await asyncio.to_thread(
+                _read_block_number, self.rpc_url,
+            )
         except Exception as exc:
             logger.debug("ProtocolConfig: eth_blockNumber read failed: %s", exc)
         self.last_successful_refresh_at = time.time()
