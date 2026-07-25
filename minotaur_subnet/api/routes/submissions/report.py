@@ -49,6 +49,7 @@ def build_submission_report(
     *,
     reason: str | None,
     won: bool = False,
+    round_finalized: bool = False,
     veto_observe: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Assemble the per-order feedback report, or None if nothing to report yet.
@@ -260,6 +261,7 @@ def build_submission_report(
             rel_reason = relative_reason(
                 rel, candidate_id=getattr(sub, "submission_id", None),
                 adopted=(status == "adopted" or won),
+                finalized=round_finalized,
             )
             if rel_reason:
                 report["reason_relative"] = rel_reason
