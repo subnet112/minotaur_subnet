@@ -104,12 +104,49 @@ BINARY_EXTENSIONS = {
 FLOOR_VERSION = 1
 MAX_REGION_NODES: int | None = 4200  # ARMED Stage-A backstop; None ⇒ observe-only
 
-# Bare builtin calls that defeat static analysis: code built in strings is
-# invisible to max_region_nodes, so once the floor is armed these are rejected
-# (error_code="dynamic_code"). Precise AST bare-Name check — attribute calls
-# like `re.compile(...)` or `tree.eval(...)` are NOT flagged, and `compile` is
-# deliberately not banned.
-_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval"})
+# ── Static-analyzability ban (PREVENT layer, always-on) ──────────────────────
+# Calls that DEFEAT static (AST) inspection by building code from strings,
+# constructing code objects, or resolving modules through a runtime value: a
+# solver that `exec`s a string, `compile`s source, or does `__import__(name)`
+# hides its real logic from max_region_nodes, the deadwood metric AND the
+# content fingerprint alike. A deterministic DEX-router solver has ZERO
+# legitimate in-tree use for any of them (verified: none appear in the
+# reference/example solvers or any live champion fork), so — unlike the import
+# ban, whose urllib.parse/http false positives keep it observe-only — this bans
+# on sight. INDEPENDENT of the factorization floor (MAX_REGION_NODES):
+# analyzability is a precondition for every other static check, so it must hold
+# even when the entanglement cap is disarmed. CODE constants (never env-read) so
+# the gate is fleet-uniform — the FLOOR_VERSION discipline. `DYNAMIC_CODE_VERSION`
+# stamps the semantics; only NEW submissions gate (the standing champion is never
+# re-screened).
+#
+# BARE-NAME builtins (ast.Name callee) — an attribute call like `re.compile(...)`
+# or `obj.eval(...)` deliberately does NOT match (a method named `eval` on a
+# miner's own object is not the builtin). `compile`/`__import__` ARE banned here
+# (they were previously allowed): both are code-construction / dynamic-import
+# primitives with no deterministic-solver use.
+_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
+
+# ATTRIBUTE-form calls (ast.Attribute callee), matched on the TRAILING attribute
+# name so an alias (`import importlib as il; il.import_module(...)`) is still
+# caught. These resolve modules dynamically or fabricate functions/code objects —
+# the indirection an obfuscator uses to spread a copied engine across a
+# runtime-resolved module graph (the live `james_base.py` shim's `__import__(_m)`
+# is the bare-name twin of this). The names are distinctive enough that a bare
+# attribute match has no false positives in solver code; `marshal`/`pickle`
+# deserialization is covered separately by the import ban.
+_BANNED_DYNAMIC_ATTR_CALLS = frozenset({
+    "import_module",   # importlib.import_module(<name>)
+    "FunctionType",    # types.FunctionType(<code>, globals, ...)
+    "CodeType",        # types.CodeType(...)
+})
+
+# Always-on (armed): the primitives above have no legitimate solver use, so —
+# unlike BANNED_IMPORTS_ARMED — this ships ENFORCING. Kept as an explicit CODE
+# constant for the same fleet-uniform, version-stamped discipline (and an escape
+# hatch if an unforeseen false positive ever surfaces during rollout).
+DYNAMIC_CODE_ARMED: bool = True
+DYNAMIC_CODE_VERSION = 1
 
 # ── Banned in-tree imports (defence-in-depth PREVENT layer) ───────────────────
 #
@@ -297,15 +334,24 @@ def max_region_nodes(repo_path: str) -> int:
 
 
 def dynamic_code_calls(repo_path: str) -> list[str]:
-    """Locations (``relpath:line``) of bare ``exec(...)``/``eval(...)`` calls.
+    """Locations (``relpath:line name``) of calls that defeat static analysis.
 
-    These build code in strings the AST can't see, so they would let a solver
-    smuggle an entangled god-region past :func:`max_region_nodes`. Flagged only
-    when the callee is the BARE builtin name (``ast.Name``) — attribute calls
-    (``re.compile``, ``obj.eval``) never match, and ``compile`` is not banned.
-    Same scan scope as the metric (in-tree ``*.py``, ``.git`` excluded,
-    unparseable files skipped — stage 2's import check backstops those).
-    Sorted for deterministic reject messages.
+    Two forms are flagged (see :data:`_BANNED_DYNAMIC_CALLS` /
+    :data:`_BANNED_DYNAMIC_ATTR_CALLS`):
+
+      * BARE builtin calls — ``exec``/``eval``/``compile``/``__import__`` where
+        the callee is an ``ast.Name`` (a method named ``eval`` on a miner's own
+        object is NOT flagged).
+      * ATTRIBUTE calls — ``….import_module`` / ``….FunctionType`` /
+        ``….CodeType``, matched on the trailing attribute so an aliased
+        ``importlib`` / ``types`` is still caught.
+
+    These build code from strings, construct code objects, or resolve modules
+    dynamically — hiding logic from :func:`max_region_nodes`, the deadwood
+    metric and the content fingerprint. Same scan scope as the metric (in-tree
+    ``*.py``, ``.git`` excluded, unparseable files skipped — stage 2's import
+    check backstops those). Each hit records the matched name; sorted for
+    deterministic reject messages.
     """
     root = Path(repo_path)
     hits: list[str] = []
@@ -317,12 +363,19 @@ def dynamic_code_calls(repo_path: str) -> list[str]:
         except (SyntaxError, ValueError, OSError):
             continue
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id in _BANNED_DYNAMIC_CALLS
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name: str | None = None
+            if isinstance(func, ast.Name) and func.id in _BANNED_DYNAMIC_CALLS:
+                name = func.id
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr in _BANNED_DYNAMIC_ATTR_CALLS
             ):
-                hits.append(f"{py.relative_to(root)}:{node.lineno}")
+                name = func.attr
+            if name is not None:
+                hits.append(f"{py.relative_to(root)}:{node.lineno} {name}")
     return sorted(hits)
 
 
@@ -504,22 +557,38 @@ def run_stage_1(repo_path: str) -> StageResult:
         )
         _dw_fields["content_fingerprint"] = fingerprint
 
-    if floor_armed:
-        # Bare exec()/eval() first: code built in strings is invisible to the
-        # metric, so an armed floor without this ban would be trivially dodged.
-        banned = dynamic_code_calls(repo_path)
-        if banned:
-            shown = ", ".join(banned[:5]) + (", …" if len(banned) > 5 else "")
+    # Static-analyzability ban (always-on PREVENT layer; INDEPENDENT of the
+    # factor floor — code built from strings / dynamically imported is invisible
+    # to the metric, the deadwood scan AND the fingerprint, so it must be
+    # rejected even when the entanglement cap is disarmed). Evaluated + logged
+    # for every submission; rejects when DYNAMIC_CODE_ARMED (default True — these
+    # primitives have no legitimate solver use). Checked BEFORE the factor cap so
+    # an unanalyzable submission is rejected as such rather than measured, and
+    # takes precedence over too_entangled exactly as the coupled check did.
+    dyn_hits = dynamic_code_calls(repo_path)
+    if dyn_hits:
+        shown = ", ".join(dyn_hits[:5]) + (", …" if len(dyn_hits) > 5 else "")
+        logger.warning(
+            "[dynamic-code] %d hit(s) v%d (%s): %s repo=%s",
+            len(dyn_hits), DYNAMIC_CODE_VERSION,
+            "ARMED → reject" if DYNAMIC_CODE_ARMED else "observe-only, not gated",
+            shown, repo_path,
+        )
+        if DYNAMIC_CODE_ARMED:
             return StageResult(
                 stage=1, passed=False,
                 duration_ms=_elapsed(start),
                 details=(
-                    f"Dynamic code execution (bare exec/eval) is not allowed: {shown}"
+                    "Code that defeats static analysis is not allowed — a "
+                    "deterministic solver has no use for exec / eval / compile / "
+                    f"__import__ or dynamic import / code construction: {shown}"
                 ),
                 error_code="dynamic_code",
                 max_region_nodes=factor_nodes,
                 **_dw_fields,
             )
+
+    if floor_armed:
         if factor_nodes > MAX_REGION_NODES:
             return StageResult(
                 stage=1, passed=False,
