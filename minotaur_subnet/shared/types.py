@@ -136,6 +136,8 @@ _BRIDGE_CALL_SELECTORS = {
     "81b4e8b4",  # Hyperlane transferRemote(uint32,bytes32,uint256)
     "7b939232",  # Across depositV3(address,address,address,address,uint256,
                  #   uint256,uint256,address,uint32,uint32,uint32,bytes)
+    "8e0250ee",  # CCTP v2 depositForBurn(uint256,uint32,bytes32,address,
+                 #   bytes32,uint256,uint32)
 }
 _MOCK_BRIDGE_TARGET = "0x" + "BB" * 20
 

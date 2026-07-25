@@ -319,8 +319,12 @@ class AppIntentsValidator:
             bridge_registry.register(MockBridgeAdapter())
             bridge_registry.register(HyperlaneAdapter())
             bridge_registry.register(AcrossAdapter())
+            from minotaur_subnet.bridge.cctp import CCTPAdapter, cctp_enabled
+            if cctp_enabled():
+                bridge_registry.register(CCTPAdapter())
             logger.info(
-                "BridgeRegistry initialized (mock + hyperlane + across adapters)"
+                "BridgeRegistry initialized (%s adapters)",
+                " + ".join(bridge_registry.protocols),
             )
         except Exception as exc:
             logger.warning("BridgeRegistry unavailable: %s", exc)

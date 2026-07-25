@@ -1867,6 +1867,11 @@ async def initialize(ctx: ServerContext) -> dict:
             bridge_registry.register(TensorplexAdapter())
             bridge_registry.register(HyperlaneAdapter())
             bridge_registry.register(AcrossAdapter())
+            # CCTP needs platform self-relay of the destination mint —
+            # registers only when explicitly enabled (see bridge/cctp.py).
+            from minotaur_subnet.bridge.cctp import CCTPAdapter, cctp_enabled
+            if cctp_enabled():
+                bridge_registry.register(CCTPAdapter())
             logger.info("BridgeRegistry initialized (mock + tensorplex + hyperlane adapters)")
         except Exception as exc:
             logger.warning("BridgeRegistry unavailable: %s", exc)
