@@ -120,12 +120,26 @@ def test_fleet_holds_one_seat_not_three():
 
 
 def test_benching_one_fleet_hotkey_ages_the_whole_fleet():
-    # A2 benched recently; fresh sibling A1 must NOT count as never-benched.
+    # A2 benched (500); its sibling A1 inherits the fleet's bench time, so a
+    # long-waiting solo (first-seen 10) outranks the whole fleet.
     subs = [_sub("A1"), _sub("S")]
     selected, _ = select_rotation_slate(
         subs, 1, {"A2": 500.0}, "r1", actor_of=FLEET_RESOLVER,
+        seen={"S": 10.0}, now=1000.0,
     )
-    assert [s.hotkey for s in selected] == ["S"]  # solo (never benched) wins
+    assert [s.hotkey for s in selected] == ["S"]  # long-waiting solo beats aged fleet
+
+
+def test_fresh_fleet_sibling_is_junior_via_actor_bench():
+    # The wait-time equivalent of "the fleet ages together": a benched coldkey's
+    # freshly-minted sibling A1 sorts by the fleet's bench time (500), NOT as a
+    # fresh newcomer — so a long-waiting solo (seen 10) still beats it.
+    subs = [_sub("A1"), _sub("S")]
+    sel, _ = select_rotation_slate(
+        subs, 1, {"A2": 500.0}, "r1", actor_of=FLEET_RESOLVER,
+        seen={"S": 10.0}, now=1000.0,
+    )
+    assert [s.hotkey for s in sel] == ["S"]
 
 
 def test_leftover_slots_fill_rather_than_waste():
@@ -167,21 +181,21 @@ def _gate(ledger, now=1000.0):
     return BuildBudgetGate(ledger_loader=lambda: dict(ledger), now=lambda: now)
 
 
-def test_fleet_hotkey_of_benched_coldkey_is_proven_not_newcomer():
+def test_fleet_sibling_inherits_fleet_bench_time_in_gate():
     _with_map()
     gate = _gate({"A2": 500.0})
-    gate.ensure_round("r1", opened_at=0.0, open_seconds=1200.0)
+    gate.ensure_round("r1")
     state = gate._rounds["r1"]
-    # Fresh sibling A1 inherits the fleet's proven status (no newcomer lottery
-    # re-entry) — and an unknown hotkey stays a newcomer.
-    assert gate._is_proven(state, "A1") is True
-    assert gate._is_proven(state, "fresh") is False
+    # The gate aggregates the fleet's bench time onto every sibling: A1's actor
+    # (CK_A) carries A2's bench (500), so A1 is NOT treated as a fresh newcomer.
+    assert state.actor_last.get("CK_A") == 500.0
+    assert gate._actor(state, "A1") == "CK_A" == gate._actor(state, "A2")
 
 
 def test_fleet_gets_one_lottery_ticket():
     _with_map()
     gate = _gate({})
-    gate.ensure_round("r1", opened_at=0.0, open_seconds=1200.0)
+    gate.ensure_round("r1")
     state = gate._rounds["r1"]
     keys = {
         hk: actor_rotation_sort_key(hk, "r1", state.actor_last, state.actor_of)
@@ -199,7 +213,7 @@ def test_soft_per_actor_dedup_prefers_fresh_actors(monkeypatch):
 
     async def run():
         gate = _gate({"A1": 100.0, "A2": 200.0, "S": 300.0, "T": 400.0})
-        gate.ensure_round("r1", opened_at=0.0, open_seconds=1200.0)
+        gate.ensure_round("r1")
         # Fleet floods first with its two most-LRU hotkeys; solos arrive after.
         t_a1 = asyncio.ensure_future(gate.acquire(submission_id="a1", hotkey="A1", round_id="r1"))
         t_a2 = asyncio.ensure_future(gate.acquire(submission_id="a2", hotkey="A2", round_id="r1"))
@@ -232,10 +246,10 @@ def test_repeat_actor_still_served_when_alone(monkeypatch):
     monkeypatch.setenv("SCREENING_BUILD_CONCURRENCY", "2")
 
     async def run():
-        # now=1000 with the round open since 100: past the 0.5×1200 spill
-        # threshold, so the lone actor may consume idle proven units too.
+        # One actor, budget for all: the soft per-actor dedup must not starve a
+        # lone actor's further submissions when nobody else is waiting.
         gate = _gate({}, now=1000.0)
-        gate.ensure_round("r1", opened_at=100.0, open_seconds=1200.0)
+        gate.ensure_round("r1")
         t1 = asyncio.ensure_future(gate.acquire(submission_id="a1", hotkey="A1", round_id="r1"))
         t2 = asyncio.ensure_future(gate.acquire(submission_id="a2", hotkey="A2", round_id="r1"))
         await asyncio.sleep(0)
@@ -254,7 +268,7 @@ def test_legacy_dispatch_has_no_per_hotkey_dedup(monkeypatch):
 
     async def run():
         gate = _gate({"H": 100.0, "K": 200.0})
-        gate.ensure_round("r1", opened_at=0.0, open_seconds=1200.0)
+        gate.ensure_round("r1")
         assert gate._rounds["r1"].actor_of is None
         t_h1 = asyncio.ensure_future(gate.acquire(submission_id="h1", hotkey="H", round_id="r1"))
         await asyncio.sleep(0)
