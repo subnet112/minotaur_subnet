@@ -548,6 +548,23 @@ def test_reason_dethrone_not_adopted_says_beat_not_merged():
     assert not msg.startswith("adopted")
 
 
+def test_reason_finalized_non_finalist_is_decided_not_pending():
+    # Once the ROUND has finalized without this being the finalist, the outcome is
+    # SETTLED — the string must say "not this round's finalist", never "pending"
+    # (a non-finalist, or a former champion since dethroned, must not read a
+    # decided result as still in flight). See report.py round_finalized threading.
+    counts = relative_counts([_r("o1", "100")], [_r("o1", "200")])
+    msg = relative_reason(counts, candidate_id="sub-7", finalized=True)
+    assert msg == (
+        "beat the champion sub-7: net better — 1 better / 0 worse "
+        "(regressions within 1% floor) — not this round's finalist"
+    )
+    assert "pending" not in msg
+    # adopted wins over finalized: the actual finalist stays past-tense, no tail.
+    won_msg = relative_reason(counts, candidate_id="sub-7", adopted=True, finalized=True)
+    assert won_msg == "adopted sub-7: net better — 1 better / 0 worse (regressions within 1% floor)"
+
+
 def test_reason_not_adopted_verb_applies_to_tie_break_wins():
     # The verb swap also covers the saturated-tie phrasings (factor here): a
     # non-adopted factor-tie win must not read as "adopted" either.
