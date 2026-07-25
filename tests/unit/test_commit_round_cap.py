@@ -51,11 +51,17 @@ class TestCountBenchedRoundsByCommit:
         _bench_one(store, 2, status=SubmissionStatus.QUEUED)
         _bench_one(store, 3, status=SubmissionStatus.SCREENING_STAGE_2)
         assert store.count_benched_rounds_by_commit(HOTKEY, COMMIT) == 0
-        # benchmarking / scored / adopted all count
+        # scored / adopted always count; BENCHMARKING is in-flight, not a
+        # completed bench — it counts ONLY from the caller's own round (rounds
+        # that die through the route-path abort strand rows in BENCHMARKING,
+        # and those must never burn quota — live leak 2026-07-26).
         _bench_one(store, 4, status=SubmissionStatus.BENCHMARKING)
         _bench_one(store, 5, status=SubmissionStatus.SCORED)
         _bench_one(store, 6, status=SubmissionStatus.ADOPTED)
-        assert store.count_benched_rounds_by_commit(HOTKEY, COMMIT) == 3
+        assert store.count_benched_rounds_by_commit(HOTKEY, COMMIT) == 2
+        assert store.count_benched_rounds_by_commit(
+            HOTKEY, COMMIT, current_round_id="round-4",
+        ) == 3
 
     def test_scoped_per_hotkey(self):
         # Another miner submitting the same commit must NOT burn this miner's

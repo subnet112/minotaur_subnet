@@ -1409,9 +1409,14 @@ async def initialize(ctx: ServerContext) -> dict:
     if os.environ.get("BENCHMARK_WORKER_ONLY", "").lower() not in ("1", "true", "yes"):
         try:
             from minotaur_subnet.api.routes.submissions.screening_pipeline import (
+                reap_orphaned_benchmarking,
                 resume_stranded_screenings,
             )
             await resume_stranded_screenings()
+            # Settle rows stranded in BENCHMARKING by rounds that ended through
+            # the route-path abort (they'd otherwise burn fingerprint/commit
+            # bench quota forever and render as live benchmarks).
+            await reap_orphaned_benchmarking()
         except Exception as exc:
             logger.error("[screening] boot resume failed (continuing startup): %s", exc)
 

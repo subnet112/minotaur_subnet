@@ -1097,7 +1097,7 @@ async def create_submission(
     max_commit_rounds = _max_rounds_per_commit()
     if max_commit_rounds > 0:
         benched_rounds = store.count_benched_rounds_by_commit(
-            body.hotkey, pr["head_sha"]
+            body.hotkey, pr["head_sha"], current_round_id=current_round.round_id,
         )
         if benched_rounds >= max_commit_rounds:
             raise HTTPException(
