@@ -711,7 +711,12 @@ class EpochManager:
             ):
                 attempts = self._incumbent_refresh_attempts.get(round_id, 0) + 1
                 if attempts < self.INCUMBENT_REFRESH_MAX_ATTEMPTS:
-                    self._incumbent_refresh_attempts[round_id] = attempts
+                    # Replace (not update) the map: only ONE round is ever under
+                    # evaluation, and a round aborted by the deadline path
+                    # (_maybe_abort_expired_round → the API-route abort) never
+                    # passes through _complete_round's eviction — its counter
+                    # entry would otherwise leak for the process lifetime.
+                    self._incumbent_refresh_attempts = {round_id: attempts}
                     result["deferred"] = True
                     result["status_after"] = round_state.status.value
                     logger.info(

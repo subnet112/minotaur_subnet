@@ -964,11 +964,16 @@ class TestEpochManager:
                 mgr._incumbent_refresh_retryable = False
 
         mgr, rnd = self._stale_bar_fixture(flaky)
+        # A bygone round's counter entry (e.g. left behind by a deadline abort,
+        # which routes around _complete_round's eviction) must be swept when the
+        # CURRENT round records a defer — the map only ever tracks one round.
+        mgr._incumbent_refresh_attempts["round-bygone-deadline-abort"] = 2
 
         r1 = await mgr.evaluate_round(rnd.round_id, epoch=4)
         assert r1.get("deferred") is True
         assert r1.get("abort_reason") is None
         assert mgr._round_store.get_round(rnd.round_id).status != RoundStatus.ABORTED
+        assert "round-bygone-deadline-abort" not in mgr._incumbent_refresh_attempts
 
         r2 = await mgr.evaluate_round(rnd.round_id, epoch=4)
         assert r2.get("deferred") is True
