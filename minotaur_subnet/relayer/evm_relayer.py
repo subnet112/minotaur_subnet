@@ -480,9 +480,35 @@ class EvmRelayer(RelayerBase):
                     if is_multi_leg:
                         if leg_index is None:
                             leg_index = _meta.get("cross_chain_leg_index", 0)
-                        call_fn = contract.functions.executeLeg(
-                            order_tuple, plan_tuple, leg_index, user_sig, validator_sigs,
-                        )
+                        # Plan-set signed path: when the orchestrator threaded
+                        # the user's PlanSetApproval (thread_plan_set_params),
+                        # submit via executeLegSigned so the contract proves
+                        # this plan is a member of the user-signed set. Falls
+                        # back to legacy executeLeg (quorum-only) otherwise —
+                        # accepted until planSetSignatureRequired is armed.
+                        _ps_hashes = order.params.get("_plan_set_hashes")
+                        _ps_position = order.params.get("_plan_set_position")
+                        _ps_sig_hex = order.params.get("_plan_set_signature", "")
+                        if _ps_hashes and _ps_sig_hex and _ps_position is not None:
+                            _ps_sig = canonicalize_user_signature(
+                                bytes.fromhex(_ps_sig_hex.replace("0x", "")),
+                            )
+                            call_fn = contract.functions.executeLegSigned(
+                                order_tuple,
+                                plan_tuple,
+                                leg_index,
+                                [
+                                    bytes.fromhex(h.replace("0x", ""))
+                                    for h in _ps_hashes
+                                ],
+                                int(_ps_position),
+                                _ps_sig,
+                                validator_sigs,
+                            )
+                        else:
+                            call_fn = contract.functions.executeLeg(
+                                order_tuple, plan_tuple, leg_index, user_sig, validator_sigs,
+                            )
                     else:
                         call_fn = contract.functions.executeIntent(
                             order_tuple, plan_tuple, user_sig, validator_sigs,

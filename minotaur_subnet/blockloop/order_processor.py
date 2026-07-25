@@ -358,6 +358,19 @@ class OrderProcessor:
                 plan.metadata["escrow_params"] = compiled.escrow_params
                 plan.metadata["simulation_mocks"] = compiled.simulation_mocks
                 plan.metadata["_platform_compiled"] = True
+                # Plan set: expose the signable digest on the ORDER so the
+                # user's wallet can sign PlanSetApproval (POST
+                # /orders/{id}/plan-set-signature attaches the result); ride
+                # the plan metadata so orchestrators thread it to the relayer.
+                if compiled.plan_set is not None:
+                    from minotaur_subnet.consensus.plan_set import plan_set_digest
+                    _ps = compiled.plan_set.to_dict()
+                    _ps["digest"] = "0x" + plan_set_digest(
+                        order.order_id, compiled.plan_set.plan_set_hash,
+                    ).hex()
+                    plan.metadata["plan_set"] = _ps
+                    order.params["plan_set"] = _ps
+                    self.order_persistence.sync(order.order_id)
                 # Remove solver's raw plan (prevent bypass)
                 plan.metadata.pop("cross_chain_plan", None)
                 logger.info(

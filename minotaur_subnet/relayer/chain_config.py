@@ -222,6 +222,54 @@ EXECUTE_INTENT_ABI = [
         "stateMutability": "payable",
         "type": "function",
     },
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "orderId", "type": "bytes32"},
+                    {"name": "app", "type": "address"},
+                    {"name": "intentSelector", "type": "bytes4"},
+                    {"name": "intentParams", "type": "bytes"},
+                    {"name": "submittedBy", "type": "address"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "perpetual", "type": "bool"},
+                    {"name": "maxExecutions", "type": "uint256"},
+                    {"name": "cooldown", "type": "uint256"},
+                ],
+                "name": "order",
+                "type": "tuple",
+            },
+            {
+                "components": [
+                    {
+                        "components": [
+                            {"name": "target", "type": "address"},
+                            {"name": "value", "type": "uint256"},
+                            {"name": "callData", "type": "bytes"},
+                        ],
+                        "name": "calls",
+                        "type": "tuple[]",
+                    },
+                    {"name": "deadline", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "metadata", "type": "bytes"},
+                ],
+                "name": "plan",
+                "type": "tuple",
+            },
+            {"name": "legIndex", "type": "uint256"},
+            {"name": "planSetHashes", "type": "bytes32[]"},
+            {"name": "setPosition", "type": "uint256"},
+            {"name": "userSignature", "type": "bytes"},
+            {"name": "validatorSignatures", "type": "bytes[]"},
+        ],
+        "name": "executeLegSigned",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
 ]
 
 
