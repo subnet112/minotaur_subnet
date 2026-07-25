@@ -337,3 +337,69 @@ def test_solver_exec_command_is_hardened():
     # runs the passed script under an explicit python entrypoint on the image
     assert cmd[-3:] == ["solver-img:screening", "-c", "print('x')"]
     assert "--entrypoint" in cmd and "python" in cmd
+
+
+# ── Deadwood floor (PREVENT layer) ────────────────────────────────────────────
+
+from minotaur_subnet.harness import deadwood as _deadwood
+
+
+def _dead_lineage_repo(tmp_path):
+    """A repo whose solver.py is clean but which carries an UNREACHABLE
+    dead-lineage module — the shim/superseded-generation obfuscation shape that
+    deadwood Tier A counts (imported from nowhere ⇒ whole-file dead mass)."""
+    repo = _valid_repo(tmp_path, "SOLVER_CLASS = object\n")
+    (tmp_path / "kb_dead_lineage.py").write_text(
+        "".join(
+            f"def _f{i}():\n    x = {i}\n    y = x + 1\n    return y\n"
+            for i in range(60)
+        )
+    )
+    return repo
+
+
+def test_deadwood_floor_pinned_to_gap_cut():
+    # Pinned to the 2026-07 soak valley (clean lineages ≤3871, obfuscated ≥5560).
+    assert _deadwood.UNPRODUCTIVE_NODES_MAX == 4600
+
+
+def test_deadwood_floor_rejects_dead_lineage_over_cap(tmp_path, monkeypatch):
+    repo = _dead_lineage_repo(tmp_path)
+    measured = _deadwood.unproductive_nodes(str(repo)).unproductive_nodes
+    assert isinstance(measured, int) and measured > 0
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", measured - 1)
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "too_much_deadwood"
+    # The rejected value + offenders still ride on the StageResult (persisted so
+    # the miner sees exactly which dead files to delete).
+    assert res.unproductive_nodes == measured
+    assert res.unproductive_top_offenders
+
+
+def test_deadwood_floor_passes_under_cap(tmp_path, monkeypatch):
+    repo = _dead_lineage_repo(tmp_path)
+    measured = _deadwood.unproductive_nodes(str(repo)).unproductive_nodes
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", measured + 1)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+def test_deadwood_floor_disarmed_observes_only(tmp_path, monkeypatch):
+    # None ⇒ the dead mass is measured + persisted but never gates.
+    repo = _dead_lineage_repo(tmp_path)
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", None)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+    assert isinstance(res.unproductive_nodes, int) and res.unproductive_nodes > 0
+
+
+def test_deadwood_floor_skips_none_value(tmp_path, monkeypatch):
+    # An unparseable non-exempt file ⇒ unproductive_nodes=None; the armed floor
+    # must NOT reject on None (stage 2's import check backstops unparseable code).
+    repo = _valid_repo(tmp_path, "SOLVER_CLASS = object\n")
+    (tmp_path / "broken.py").write_text("def (:\n")  # SyntaxError
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", 0)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+    assert res.unproductive_nodes is None
