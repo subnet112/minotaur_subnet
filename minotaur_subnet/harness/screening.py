@@ -520,20 +520,23 @@ def run_stage_1(repo_path: str) -> StageResult:
         repo_path,
     )
 
-    # Deadwood metric — computed in the same pass, observe-only until its own
-    # floor arms (deadwood.UNPRODUCTIVE_NODES_MAX, a later separately-reviewed
-    # PR). Computed BEFORE the factor floor gates so a floor-rejected
-    # submission still records its deadwood values (persist-on-reject). An
-    # unparseable non-exempt file yields unproductive_nodes=None (logged inside
-    # the analyzer) — persisted as None, every consumer skips it; stage 2's
-    # import check remains the backstop for code that cannot even be parsed.
+    # Deadwood metric — computed in the same pass. Computed BEFORE the gates
+    # below so a rejected submission still records its deadwood values
+    # (persist-on-reject). An unparseable non-exempt file yields
+    # unproductive_nodes=None (logged inside the analyzer) — persisted as None,
+    # every consumer skips it, and the floor below never rejects on None; stage
+    # 2's import check remains the backstop for code that cannot even be parsed.
     from minotaur_subnet.harness import deadwood
 
     dw = deadwood.unproductive_nodes(repo_path)
+    dw_armed = deadwood.UNPRODUCTIVE_NODES_MAX is not None
     if not dw.unparseable:
         logger.info(
-            "[deadwood] unproductive_nodes=%d version=%d (observe-only) repo=%s",
-            dw.unproductive_nodes, dw.version, repo_path,
+            "[deadwood] unproductive_nodes=%d version=%d (%s) repo=%s",
+            dw.unproductive_nodes, dw.version,
+            f"floor armed, cap={deadwood.UNPRODUCTIVE_NODES_MAX}"
+            if dw_armed else "observe-only, not gated",
+            repo_path,
         )
     _dw_fields: dict[str, Any] = dict(
         unproductive_nodes=dw.unproductive_nodes,
@@ -602,6 +605,35 @@ def run_stage_1(repo_path: str) -> StageResult:
                 max_region_nodes=factor_nodes,
                 **_dw_fields,
             )
+
+    # Deadwood floor (PREVENT layer; INDEPENDENT of the factor floor). Rejects a
+    # submission carrying too much provably-dead AST mass — superseded-generation
+    # modules kept as never-taken import fallbacks, dead-lineage files, unreferenced
+    # defs — the un-forkable bloat that stops the NEXT miner reading the published
+    # champion. Gated on its OWN cap (deadwood.UNPRODUCTIVE_NODES_MAX); skips a None
+    # value (an unparseable non-exempt file — stage 2 backstops that). The top
+    # offenders ride in the reject so the miner sees exactly what to delete.
+    if (
+        dw_armed
+        and dw.unproductive_nodes is not None
+        and dw.unproductive_nodes > deadwood.UNPRODUCTIVE_NODES_MAX
+    ):
+        worst = ", ".join(
+            f"{p}{'::' + q if q else ''} ({n})" for p, q, n in dw.top_offenders[:5]
+        )
+        return StageResult(
+            stage=1, passed=False,
+            duration_ms=_elapsed(start),
+            details=(
+                f"Submission carries {dw.unproductive_nodes} dead AST nodes, over "
+                f"the cap of {deadwood.UNPRODUCTIVE_NODES_MAX} "
+                f"(deadwood v{dw.version}) — delete unreachable / superseded code "
+                f"so the published champion stays forkable. Biggest: {worst}"
+            ),
+            error_code="too_much_deadwood",
+            max_region_nodes=factor_nodes,
+            **_dw_fields,
+        )
 
     # Banned-import scan (defence-in-depth PREVENT layer; INDEPENDENT of the
     # factor floor). Always evaluated + logged so the live fleet's import

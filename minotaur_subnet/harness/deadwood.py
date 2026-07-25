@@ -95,10 +95,31 @@ HARNESS_SURFACE = (
     "rpc_for",
 )
 
-# Future Phase-1 floor (reject when unproductive_nodes exceeds it). None ⇒
-# disarmed. Phase 0 NEVER reads this for gating — it exists so the report can
-# truthfully say observe_only and so arming is a one-line, code-reviewed diff.
-UNPRODUCTIVE_NODES_MAX: int | None = None
+# Phase-1 floor: stage 1 REJECTS a NEW submission whose unproductive_nodes
+# exceeds this. None ⇒ disarmed (observe-only). A CODE constant, never env-read
+# (the FLOOR_BPS/FLOOR_VERSION discipline) so the gate is fleet-uniform; only
+# NEW submissions gate (the standing champion is never re-screened, and
+# UNPRODUCTIVE_METRIC_VERSION guards against a vN champion being retro-evicted
+# by vN+1 semantics).
+#
+# CALIBRATED = 4600 (GAP CUT) from the 2026-07 soak (304 live measurements). The
+# distribution is BIMODAL with an empty valley between 3871 and 5560:
+#   • clean / refactored lineages ≤ 3871 — a refactored lineage at ~1795 (×35)
+#     and ~1875 (×44), and the reference-derived cluster at 3839/3871 (×10).
+#   • an obfuscated champion-fork lineage ≥ 5560 — DOMINANT mode 7355 (×90, the
+#     same tree resubmitted = the re-fork treadmill), plus 6727 (×15), 7514
+#     (×19), up to 8733. Its dead mass is superseded-generation modules kept as
+#     never-taken import fallbacks (Tier A) — the very thing that makes the
+#     published champion un-forkable by the NEXT miner.
+# Unlike max_region_nodes (where champion and clone were indistinguishable at
+# ~4109, forcing a backstop-above-worst), deadwood SEPARATES them because the
+# obfuscation ADDS dead mass. 4600 sits in the valley: it passes every clean
+# lineage and rejects the entire obfuscated mode (~54% of submitted VOLUME, but
+# a re-fork monoculture — the clean ~1795/3839 lineages carry the challenger
+# pipeline). Once the fleet re-forks clean under this, a Stage-B ratchet toward
+# ~2500 under UNPRODUCTIVE_METRIC_VERSION=2 is painless (the fleet is already
+# below it). The saturated-tie "prefer-cleaner" margin is a separate PR.
+UNPRODUCTIVE_NODES_MAX: int | None = 4600
 
 # Cap on the persisted offender list (what miners see they should delete).
 MAX_TOP_OFFENDERS = 20
