@@ -29,7 +29,7 @@ from .minotaur_client import fetch_minotaur_quote
 from .models import STATUS_WARMING_UP, ComparisonRow, TradeDescriptor
 from .sources import build_source, is_candidate
 from .store import DexCompareStore
-from .tokens_resolve import DecimalsCache, resolve_trade_tokens
+from .tokens_resolve import DecimalsCache, SymbolCache, resolve_trade_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ class DexCompareWorker:
         self._cfg = config
         self._running = False
         self._decimals = DecimalsCache()
+        self._symbols = SymbolCache()
         self._aggregators = build_aggregators(config)
         self._velora = next((a for a in self._aggregators if a.name == "velora"), None)
         # Non-deterministic on purpose — unlike the consensus-seeded corpus in
@@ -140,7 +141,7 @@ class DexCompareWorker:
         Returns True if a row was written; False when the order can't be resolved
         or the solver is warming up (503).
         """
-        trade = await resolve_trade_tokens(order, self._decimals)
+        trade = await resolve_trade_tokens(order, self._decimals, self._symbols)
         if trade is None:
             return False
         trade.trade_source = self._source.name
