@@ -21,11 +21,12 @@ from minotaur_subnet.harness.rotation import (
 )
 
 
-def _sub(hotkey, sid=None, status="queued"):
+def _sub(hotkey, sid=None, status="queued", created_at=0.0):
     return SimpleNamespace(
         submission_id=sid or f"sub_{hotkey}",
         hotkey=hotkey,
         status=SimpleNamespace(value=status),
+        created_at=created_at,
     )
 
 
@@ -43,12 +44,28 @@ class _FakeStore:
 
 # ── pure selection ────────────────────────────────────────────────────────────
 
-def test_never_benched_outrank_benched():
+def test_long_waiting_never_benched_outrank_benched():
+    # Never-benched B, C who FIRST APPEARED long ago (seen 10, 20) outrank a
+    # miner benched more recently (A at 100): you earn priority by waiting.
     subs = [_sub("A"), _sub("B"), _sub("C")]
-    last = {"A": 100.0}  # A benched before; B, C never
-    selected, skipped = select_rotation_slate(subs, 2, last, "r1")
+    benched = {"A": 100.0}
+    seen = {"B": 10.0, "C": 20.0}
+    selected, skipped = select_rotation_slate(
+        subs, 2, benched, "r1", seen=seen, now=1000.0,
+    )
     assert {s.hotkey for s in selected} == {"B", "C"}
     assert [s.hotkey for s in skipped] == ["A"]
+
+
+def test_fresh_mint_is_junior_not_most_senior():
+    # A brand-new identity (no bench, no first-seen) sorts JUNIOR (wait_ts=now),
+    # so a miner benched long ago beats it — minting buys the back of the queue.
+    subs = [_sub("A"), _sub("fresh")]
+    selected, skipped = select_rotation_slate(
+        subs, 1, {"A": 100.0}, "r1", seen={}, now=1000.0,
+    )
+    assert [s.hotkey for s in selected] == ["A"]
+    assert [s.hotkey for s in skipped] == ["fresh"]
 
 
 def test_lru_order_among_benched():
@@ -98,7 +115,8 @@ def test_ledger_corrupt_file_degrades_to_empty(tmp_path):
 def test_apply_rejects_overflow_and_advances_ledger(tmp_path):
     store = _FakeStore([_sub("A"), _sub("B"), _sub("C")])
     ledger = RotationLedger(str(tmp_path / "rot.json"))
-    ledger.mark_selected(["B"], 100.0)  # B benched before → lowest priority
+    ledger.mark_seen({"A": 10.0, "C": 10.0})  # long-waiting never-benched → senior
+    ledger.mark_selected(["B"], 100.0)  # B benched recently → junior
     res = apply_rotation_slate(store, "r1", 2, ledger, now=200.0)
     assert res["applied"] and res["candidates"] == 3 and res["slots"] == 2
     assert set(res["selected"]) == {"sub_A", "sub_C"}
@@ -137,6 +155,107 @@ def test_apply_disabled_when_slots_nonpositive(tmp_path):
         store, "r1", 0, RotationLedger(str(tmp_path / "rot.json")),
     )
     assert res["applied"] is False and store.rejected == {}
+
+
+# ── wait-clock anchoring: created_at, not build-race luck ─────────────────────
+
+def test_flush_parked_waiter_wait_clock_anchors_at_created_at(tmp_path):
+    """A submission parked WAITLISTED pre-close (build-budget flush) is
+    terminal — excluded from slate candidacy — but its hotkey must STILL be
+    marked seen, anchored at the submission's created_at. Otherwise an honest
+    newcomer that keeps losing the build race has its wait clock restarted
+    every round and starves forever."""
+    ledger = RotationLedger(str(tmp_path / "rot.json"))
+    # Round 1: W lost the build race and was flush-parked before close.
+    store = _FakeStore([
+        _sub("W", status="waitlisted", created_at=50.0),
+        _sub("A", created_at=90.0),
+    ])
+    res = apply_rotation_slate(store, "r1", 1, ledger, now=100.0)
+    assert res["candidates"] == 1                    # W stays out of the slate
+    assert ledger.load_seen()["W"] == 50.0           # but its clock is anchored
+    # Round 2: W resubmits; a fresher actor F (first appeared later) contends.
+    store2 = _FakeStore([
+        _sub("W", sid="sub_W_r2", created_at=200.0),
+        _sub("F", sid="sub_F_r2", created_at=150.0),
+    ])
+    res2 = apply_rotation_slate(store2, "r2", 1, ledger, now=210.0)
+    assert res2["selected"] == ["sub_W_r2"]          # W reached the front
+    # min-write: the round-2 resubmission could not move W's clock later.
+    assert ledger.load_seen()["W"] == 50.0
+
+
+def test_flush_parked_every_round_still_converges_to_front(tmp_path):
+    """Sustained contention: W is flush-parked (WAITLISTED) round after round
+    while others win. Its anchored clock keeps aging it toward the front, so
+    once it survives to candidacy it outranks every later arrival."""
+    ledger = RotationLedger(str(tmp_path / "rot.json"))
+    for rnd, now in (("r1", 100.0), ("r2", 200.0)):
+        store = _FakeStore([
+            _sub("W", sid=f"sub_W_{rnd}", status="waitlisted", created_at=10.0),
+            _sub("B", sid=f"sub_B_{rnd}", created_at=20.0),
+        ])
+        res = apply_rotation_slate(store, rnd, 1, ledger, now=now)
+        assert res["selected"] == [f"sub_B_{rnd}"]
+    # Round 3: W finally gets built; it must beat B (benched twice already)
+    # AND a fresh competitor — its seniority accrued from created_at=10.
+    store = _FakeStore([
+        _sub("W", sid="sub_W_r3", created_at=290.0),
+        _sub("B", sid="sub_B_r3", created_at=290.0),
+        _sub("N", sid="sub_N_r3", created_at=290.0),
+    ])
+    res = apply_rotation_slate(store, "r3", 1, ledger, now=300.0)
+    assert res["selected"] == ["sub_W_r3"]
+
+
+def test_legacy_flat_ledger_migration_restores_never_benched_seniority(tmp_path):
+    """Upgrade from the v1 flat ledger ({hotkey: benched_ts}): a never-benched
+    miner has NO ledger entry, but its wait clock must be reconstructed from
+    submission-store history (earliest created_at) — not reset to 'now', which
+    would drop a days-long waiter behind every benched actor."""
+    import json as _json
+    p = tmp_path / "rot.json"
+    p.write_text(_json.dumps({"B": 100.0}))          # legacy flat: benched only
+    ledger = RotationLedger(str(p))
+
+    class _HistoryStore(_FakeStore):
+        def earliest_created_at_by_hotkey(self):
+            # O first submitted long ago (ts 10) — never benched.
+            return {"O": 10.0, "B": 5.0}
+
+    store = _HistoryStore([
+        _sub("O", created_at=990.0),                 # genuine long waiter
+        _sub("F", created_at=995.0),                 # fresh submitter
+        _sub("B", created_at=990.0),                 # benched at 100
+    ])
+    res = apply_rotation_slate(store, "r1", 1, ledger, now=1000.0)
+    assert res["selected"] == ["sub_O"]              # waiter ahead of everyone
+    # Benched B (wait_ts=100, its last bench — NOT its created_at history)
+    # still outranks the fresh submitter F (first seen 995).
+    assert res["skipped"] == ["sub_B", "sub_F"]
+
+
+def test_store_earliest_created_at_by_hotkey_min_and_skips_legacy_zero():
+    from minotaur_subnet.harness.submission_store import SubmissionStore
+
+    store = SubmissionStore(persist_path=None)
+    a1 = store.create("r", "h", epoch=1, hotkey="A", round_id="r1")
+    a2 = store.create("r", "h", epoch=2, hotkey="A", round_id="r2")
+    b = store.create("r", "h", epoch=1, hotkey="B", round_id="r1")
+    a1.created_at, a2.created_at = 10.0, 500.0
+    b.created_at = 0.0                               # legacy row: no timestamp
+    m = store.earliest_created_at_by_hotkey()
+    assert m["A"] == 10.0                            # MIN across all rounds
+    assert "B" not in m                              # 0 ≠ instant max seniority
+
+
+def test_history_backfill_never_moves_a_clock_later(tmp_path):
+    ledger = RotationLedger(str(tmp_path / "rot.json"))
+    ledger.mark_seen({"X": 30.0})
+    ledger.mark_seen({"X": 500.0})                   # later stamp: ignored
+    assert ledger.load_seen()["X"] == 30.0
+    ledger.mark_seen({"X": 20.0})                    # earlier truth: restored
+    assert ledger.load_seen()["X"] == 20.0
 
 
 # ── truncation-proofing (2026-07-07: 12 of 19 rejects landed, 10 scored on 3
