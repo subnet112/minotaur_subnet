@@ -164,3 +164,13 @@ class TestDedupModeGate:
         from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
         monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "yes")  # typo → fail safe
         assert structural_dedup_mode() == "off"
+
+
+class TestStageResultAcceptsFingerprint:
+    """Regression: _dw_fields (incl. structural_fingerprint) is spread into
+    StageResult during screening — StageResult MUST accept it, or every
+    submission is rejected with 'Screening error: StageResult.__init__()'."""
+    def test_stageresult_takes_structural_fingerprint(self):
+        from minotaur_subnet.harness.screening import StageResult
+        sr = StageResult(stage=1, passed=True, structural_fingerprint="fp")
+        assert sr.structural_fingerprint == "fp"

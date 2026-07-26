@@ -254,6 +254,11 @@ class StageResult:
     # Set by stage 1 only; same compute-once-read-forever discipline as
     # max_region_nodes. Feeds the cross-hotkey resubmit quota.
     content_fingerprint: str | None = None
+    # Structural fingerprint (harness/structural_fingerprint) — salt-invariant
+    # identity for the observe-only structural dedup. In the same _dw_fields
+    # bundle as content_fingerprint, so StageResult MUST accept it or the
+    # **_dw_fields spread below raises TypeError and rejects every submission.
+    structural_fingerprint: str | None = None
 
 
 @dataclass
