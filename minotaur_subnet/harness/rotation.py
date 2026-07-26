@@ -532,28 +532,34 @@ def apply_rotation_slate(
             round_id, len(candidates), n_actors, len(selected), actor_of.source,
         )
 
-    # Structural-dedup OBSERVE (Phase 0): flag cross-actor slates where
+    # Structural-dedup (env-gated, default OFF): flag cross-actor slates where
     # DISTINCT coldkeys run structurally-identical code (salted constants) —
-    # the sybil that actor-keying alone can't collapse. Logs only; does NOT
-    # change selection. Arming (collapse to one slot) is gated + must promote
-    # fleet-uniform (it changes the benched slate → the pack hash).
-    try:
-        clusters = structural_dedup_clusters(selected, actor_of)
-        for c in clusters:
-            fp = getattr(c[0], "structural_fingerprint", "") or ""
-            logger.warning(
-                "[structural-dedup OBSERVE] %s: %d slate submissions share "
-                "structural fingerprint %s across distinct actors — likely one "
-                "sybil (would collapse to 1 slot when armed): %s",
-                round_id, len(c), fp[:16],
-                ", ".join(
-                    f"{getattr(s, 'submission_id', '?')}"
-                    f"(hk={(getattr(s, 'hotkey', '') or '')[:10]})"
-                    for s in c
-                ),
-            )
-    except Exception:
-        logger.debug("structural-dedup observe failed for %s", round_id, exc_info=True)
+    # the sybil that actor-keying alone can't collapse. Only acts when
+    # STRUCTURAL_DEDUP_MODE is set (observe|enforce); logs only for now, does
+    # NOT change selection. Enforce (collapse to one slot) is reserved and
+    # must promote fleet-uniform (it changes the benched slate → the pack hash).
+    from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+    _dedup_mode = structural_dedup_mode()
+    if _dedup_mode != "off":
+        try:
+            clusters = structural_dedup_clusters(selected, actor_of)
+            for c in clusters:
+                fp = getattr(c[0], "structural_fingerprint", "") or ""
+                logger.warning(
+                    "[structural-dedup %s] %s: %d slate submissions share "
+                    "structural fingerprint %s across distinct actors — likely "
+                    "one sybil%s: %s",
+                    _dedup_mode.upper(), round_id, len(c), fp[:16],
+                    " (enforce not yet wired — observing only)"
+                    if _dedup_mode == "enforce" else " (would collapse to 1 slot when armed)",
+                    ", ".join(
+                        f"{getattr(s, 'submission_id', '?')}"
+                        f"(hk={(getattr(s, 'hotkey', '') or '')[:10]})"
+                        for s in c
+                    ),
+                )
+        except Exception:
+            logger.debug("structural-dedup observe failed for %s", round_id, exc_info=True)
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "

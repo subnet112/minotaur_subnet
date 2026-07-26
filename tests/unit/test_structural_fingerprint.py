@@ -142,3 +142,25 @@ class TestStructuralDedupClusters:
         subs = [_sub("a", "hk1", "FP"), _sub("b", "hk2", "FP")]
         clusters = structural_dedup_clusters(subs, None)
         assert len(clusters) == 1
+
+
+class TestDedupModeGate:
+    def test_default_off(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.delenv("STRUCTURAL_DEDUP_MODE", raising=False)
+        assert structural_dedup_mode() == "off"
+
+    def test_observe(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "observe")
+        assert structural_dedup_mode() == "observe"
+
+    def test_enforce(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "ENFORCE")
+        assert structural_dedup_mode() == "enforce"
+
+    def test_unknown_falls_back_to_off(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "yes")  # typo → fail safe
+        assert structural_dedup_mode() == "off"
