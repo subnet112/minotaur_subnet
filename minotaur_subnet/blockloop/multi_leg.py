@@ -130,6 +130,7 @@ class MultiLegOrchestrator:
                                 "rollback_legs": [l.to_dict() for l in multi_leg_plan.rollback_legs],
                                 "completed_leg_indices": [l.leg_index for l in completed_legs],
                                 "plan_set": (plan_metadata or {}).get("plan_set"),
+                                "escrow_params": (plan_metadata or {}).get("escrow_params"),
                             },
                         )
 
@@ -300,7 +301,11 @@ class MultiLegOrchestrator:
 
                 if consensus_result and not consensus_result.reached:
                     logger.warning("[MULTI-LEG] %s: %s consensus failed, rolling back", order.order_id, leg_label)
-                    await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
+                    await self._fail_leg(
+                        order, completed_legs, multi_leg_plan.rollback_legs,
+                        contract_address, plan_metadata, leg.leg_index,
+                        f"Leg {leg.leg_index} consensus failed",
+                    )
                     return False
 
             # Submit this leg via relayer — use per-leg params so the
@@ -331,7 +336,11 @@ class MultiLegOrchestrator:
                 logger.info("[MULTI-LEG] %s: %s relayer result: success=%s tx=%s err=%s", order.order_id, leg_label, submit_result.success, submit_result.tx_hash, submit_result.error)
             except Exception as exc:
                 logger.error("[MULTI-LEG] %s: %s relayer EXCEPTION: %s", order.order_id, leg_label, exc, exc_info=True)
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
+                await self._fail_leg(
+                    order, completed_legs, multi_leg_plan.rollback_legs,
+                    contract_address, plan_metadata, leg.leg_index,
+                    f"Leg {leg.leg_index} relayer exception: {exc}",
+                )
                 return False
 
             if not submit_result.success:
@@ -339,7 +348,11 @@ class MultiLegOrchestrator:
                     "Multi-leg %s: %s submission failed: %s",
                     order.order_id, leg_label, submit_result.error,
                 )
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
+                await self._fail_leg(
+                    order, completed_legs, multi_leg_plan.rollback_legs,
+                    contract_address, plan_metadata, leg.leg_index,
+                    f"Leg {leg.leg_index} submission failed: {submit_result.error}",
+                )
                 return False
 
             logger.info("Multi-leg %s: %s completed (tx=%s)", order.order_id, leg_label, submit_result.tx_hash)
@@ -360,6 +373,180 @@ class MultiLegOrchestrator:
             order.app_id, best_leg_oc if best_leg_oc is not None else 0, success=True,
         )
         return True
+
+    async def _fail_leg(
+        self,
+        order: Order,
+        completed_legs: list,
+        rollback_legs: list,
+        contract_address: str,
+        plan_metadata: dict | None,
+        failed_leg_index: int,
+        reason: str,
+    ) -> None:
+        """Route a leg failure: park for the user's revert-or-refresh
+        decision when the feature is on, else the legacy auto-rollback."""
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+        if cross_chain_user_decision_enabled():
+            await self.park_for_user_decision(
+                order, completed_legs, rollback_legs, contract_address,
+                plan_metadata, failed_leg_index, reason,
+            )
+        else:
+            await self._execute_rollback(
+                order, completed_legs, rollback_legs, contract_address,
+                plan_metadata,
+            )
+
+    async def park_for_user_decision(
+        self,
+        order: Order,
+        completed_legs: list,
+        rollback_legs: list,
+        contract_address: str,
+        plan_metadata: dict | None,
+        failed_leg_index: int,
+        reason: str,
+    ) -> None:
+        """Park a failed multi-leg order in AWAITING_USER_DECISION.
+
+        The user's funds are in a safe state at every parkable failure point
+        (origin refund received, or asset held in on-chain escrow with a
+        permissionless timelocked refund), so waiting is safe. The user
+        chooses via POST /orders/{id}/decision:
+          - revert  → execute the pre-agreed revert plan (the same rollback
+                      legs the plan-set signature covers)
+          - refresh → this order's orchestration ends (REFRESHING); the
+                      failed leg re-quotes as a NEW single-chain order over
+                      the escrowed asset
+        No decision by the deadline → auto-revert (never leave funds waiting
+        on an absent user past the escrow window). If this process restarts
+        mid-window the watcher dies: the decision endpoint still resolves,
+        and the on-chain escrowRefund timelock remains the unconditional
+        backstop.
+        """
+        import time as _time
+
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_decision_window_s,
+        )
+
+        deadline = int(_time.time()) + cross_chain_decision_window_s()
+        # Everything the resolver needs must survive in order.params — the
+        # in-memory leg objects don't outlive a restart.
+        order.params["recovery"] = {
+            "failed_leg_index": failed_leg_index,
+            "reason": reason,
+            "options": ["revert", "refresh"],
+            "decision_deadline": deadline,
+            "completed_legs": [l.to_dict() for l in completed_legs],
+            "rollback_legs": [l.to_dict() for l in rollback_legs],
+            "contract_address": contract_address,
+            "plan_set": (plan_metadata or {}).get("plan_set"),
+            "escrow_params": (plan_metadata or {}).get("escrow_params"),
+            "resolved": None,
+        }
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.AWAITING_USER_DECISION,
+            params=order.params,
+            error=reason,
+        )
+        self._sync(order.order_id)
+        logger.info(
+            "Multi-leg %s: parked for user decision (leg %d, deadline %d): %s",
+            order.order_id, failed_leg_index, deadline, reason,
+        )
+        asyncio.create_task(self._decision_timeout_watch(order.order_id, deadline))
+
+    async def _decision_timeout_watch(self, order_id: str, deadline: int) -> None:
+        """Auto-revert when the decision window expires undecided."""
+        import time as _time
+
+        while True:
+            await asyncio.sleep(10)
+            order = self.orderbook.get(order_id)
+            if order is None:
+                return
+            recovery = order.params.get("recovery") or {}
+            if recovery.get("resolved"):
+                return  # endpoint already resolved it
+            if order.status != OrderStatus.AWAITING_USER_DECISION:
+                return
+            if _time.time() >= deadline:
+                logger.info(
+                    "Multi-leg %s: decision window expired — auto-revert",
+                    order_id,
+                )
+                try:
+                    await self.resolve_user_decision(order_id, "revert")
+                except Exception as exc:
+                    logger.error(
+                        "Multi-leg %s: timeout auto-revert failed: %s",
+                        order_id, exc,
+                    )
+                return
+
+    async def resolve_user_decision(self, order_id: str, action: str) -> dict:
+        """Execute the user's (or the timeout's) revert-or-refresh choice.
+
+        Returns a result dict for the API. Raises ValueError on bad
+        action/state — the caller maps it to an HTTP error.
+        """
+        from minotaur_subnet.shared.types import LegPlan
+
+        if action not in ("revert", "refresh"):
+            raise ValueError(f"Unknown recovery action: {action}")
+        order = self.orderbook.get(order_id)
+        if order is None:
+            raise ValueError(f"Order not found: {order_id}")
+        if order.status != OrderStatus.AWAITING_USER_DECISION:
+            raise ValueError(
+                f"Order {order_id} is not awaiting a decision "
+                f"(status={getattr(order.status, 'value', order.status)})"
+            )
+        recovery = order.params.get("recovery") or {}
+        if recovery.get("resolved"):
+            raise ValueError(f"Order {order_id} decision already resolved")
+
+        recovery["resolved"] = action
+        order.params["recovery"] = recovery
+        self.orderbook.update_order(order_id, params=order.params)
+        self._sync(order_id)
+
+        if action == "refresh":
+            # This order's orchestration ends here. The client submits a NEW
+            # single-chain order over the escrowed asset (an ordinary atomic
+            # intent — no solver-side concept of "refresh" needed). Escrow
+            # stays claimable via the timelocked escrowRefund if the refresh
+            # never completes.
+            self.orderbook.update_order(order_id, status=OrderStatus.REFRESHING)
+            self._sync(order_id)
+            return {
+                "action": "refresh",
+                "escrow_params": recovery.get("escrow_params"),
+                "note": (
+                    "Submit a new single-chain order over the escrowed asset "
+                    "to re-quote the failed leg; escrowRefund remains "
+                    "available after the escrow deadline."
+                ),
+            }
+
+        # revert: run the pre-agreed rollback legs (plan-set-covered)
+        completed = [LegPlan.from_dict(d) for d in recovery.get("completed_legs", [])]
+        rollbacks = [LegPlan.from_dict(d) for d in recovery.get("rollback_legs", [])]
+        await self._execute_rollback(
+            order, completed, rollbacks,
+            recovery.get("contract_address", ""),
+            {"plan_set": recovery.get("plan_set")},
+        )
+        final = self.orderbook.get(order_id)
+        return {
+            "action": "revert",
+            "status": getattr(final.status, "value", str(final.status)) if final else "unknown",
+        }
 
     async def _execute_rollback(
         self,

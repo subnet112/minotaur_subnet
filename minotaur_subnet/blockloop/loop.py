@@ -154,6 +154,10 @@ class BlockLoop:
             app_store=app_store,
         )
         self._multi_leg_orchestrator.bridge_tracker = bridge_tracker
+        # Reverse ref: destination-leg failures park for the user's
+        # revert-or-refresh decision via the orchestrator (flag-gated).
+        if bridge_tracker is not None:
+            bridge_tracker.multi_leg_orchestrator = self._multi_leg_orchestrator
         self._order_processor = self._build_order_processor()
 
     def _build_order_processor(self) -> OrderProcessor:

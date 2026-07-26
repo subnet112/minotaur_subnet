@@ -31,6 +31,34 @@ def cross_chain_enabled() -> bool:
     return _env_bool("CROSS_CHAIN_ENABLED", default=False)
 
 
+def cross_chain_user_decision_enabled() -> bool:
+    """Revert-or-refresh recovery: park failed multi-leg orders in
+    AWAITING_USER_DECISION so the user chooses between the pre-agreed
+    revert plan and a fresh per-leg quote, instead of the platform
+    auto-rolling-back immediately.
+
+    OFF (default): current behavior — automatic rollback on any leg
+    failure. Only meaningful when CROSS_CHAIN_ENABLED is also on.
+
+    Safety note: the decision window is bounded
+    (CROSS_CHAIN_DECISION_WINDOW_S, default 1800s) and expires into the
+    pre-agreed auto-revert; the on-chain escrowRefund timelock remains the
+    unconditional backstop if this process dies mid-window (the watcher
+    task does not survive restarts — the decision endpoint still works,
+    but the timeout auto-revert re-arms only for new failures).
+    """
+    return _env_bool("CROSS_CHAIN_USER_DECISION", default=False)
+
+
+def cross_chain_decision_window_s() -> int:
+    """Seconds the user has to pick revert vs refresh before auto-revert."""
+    import os as _os
+    try:
+        return int(_os.environ.get("CROSS_CHAIN_DECISION_WINDOW_S", "1800"))
+    except ValueError:
+        return 1800
+
+
 CROSS_CHAIN_DISABLED_MESSAGE = (
     "Cross-chain / multi-leg orders are not enabled in this environment. "
     "Beta scope is single-chain Base (chain 8453). "

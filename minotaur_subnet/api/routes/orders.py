@@ -2371,6 +2371,138 @@ async def attach_plan_set_signature(order_id: str, request: Request) -> dict:
     return {"order_id": order_id, "plan_set_signature_attached": True}
 
 
+@router.get("/orders/{order_id}/recovery")
+def get_order_recovery(order_id: str) -> dict:
+    """Recovery context for a multi-leg order awaiting a user decision.
+
+    Available when a leg failed with funds in a safe state (origin refund
+    received, or asset held in on-chain escrow with a permissionless
+    timelocked refund). The user chooses via POST /orders/{id}/decision:
+    execute the pre-agreed revert plan, or refresh the failed leg with a
+    new quote. No decision by ``decision_deadline`` → automatic revert.
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    recovery = order.params.get("recovery")
+    if not recovery:
+        raise HTTPException(
+            status_code=409,
+            detail="Order has no pending recovery decision",
+        )
+    return {
+        "order_id": order_id,
+        "status": getattr(order.status, "value", str(order.status)),
+        "failed_leg_index": recovery.get("failed_leg_index"),
+        "reason": recovery.get("reason"),
+        "options": recovery.get("options", ["revert", "refresh"]),
+        "decision_deadline": recovery.get("decision_deadline"),
+        "escrow_params": recovery.get("escrow_params"),
+        "resolved": recovery.get("resolved"),
+        "revert_legs": len(recovery.get("rollback_legs", [])),
+        "note": (
+            "POST /orders/{id}/decision with {action: 'revert'|'refresh', "
+            "owner_signature} — an EIP-191 signature over "
+            "'order-decision:{order_id}:{action}' by the order's "
+            "submitted_by. Undecided orders auto-revert at "
+            "decision_deadline; the on-chain escrowRefund remains available "
+            "after the escrow deadline regardless."
+        ),
+    }
+
+
+@router.post("/orders/{order_id}/decision")
+async def post_order_decision(order_id: str, request: Request) -> dict:
+    """Resolve a parked multi-leg order: revert or refresh.
+
+    - ``revert``: execute the pre-agreed revert plan (the rollback legs
+      covered by the user's plan-set signature).
+    - ``refresh``: end this order's orchestration (REFRESHING) — the failed
+      leg re-quotes as a NEW single-chain order over the escrowed asset,
+      which current solvers handle natively.
+
+    Auth: EIP-191 ``owner_signature`` over ``order-decision:{order_id}:{action}``
+    must recover to ``order.submitted_by`` (same challenge pattern as the
+    order reader-sig).
+
+    Body shape: ``{"action": "revert"|"refresh", "owner_signature": "0x..."}``
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    body = await request.json()
+    action = (body.get("action") or "").strip().lower()
+    if action not in ("revert", "refresh"):
+        raise HTTPException(
+            status_code=400, detail="action must be 'revert' or 'refresh'",
+        )
+
+    sig = body.get("owner_signature", "")
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+    if not _verify_decision_sig(owner, order_id, action, sig):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "owner_signature does not recover to order.submitted_by for "
+                f"'order-decision:{order_id}:{action}'"
+            ),
+        )
+
+    bl = _block_loop
+    orchestrator = getattr(bl, "_multi_leg_orchestrator", None) if bl else None
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Multi-leg orchestrator unavailable on this node",
+        )
+    try:
+        result = await orchestrator.resolve_user_decision(order_id, action)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if _app_store is not None:
+        try:
+            _app_store.save_order(ob.get(order_id).to_dict())
+        except Exception:
+            pass
+    return {"order_id": order_id, **result}
+
+
+def _verify_decision_sig(
+    submitted_by: str, order_id: str, action: str, sig_hex: str,
+) -> bool:
+    """Verify an EIP-191 sig over ``order-decision:{order_id}:{action}``.
+
+    A decision changes execution state, so unlike the reader-sig this gates
+    a state change — but both options only move funds along paths the user
+    already authorized (the signed revert plan, or nothing until a new
+    signed order), so deadline-binding is unnecessary: replaying a stale
+    'revert' decision is at worst the same auto-revert the timeout runs.
+    """
+    if not submitted_by or not sig_hex or not order_id:
+        return False
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except Exception:
+        return False
+    try:
+        msg = encode_defunct(text=f"order-decision:{order_id}:{action}")
+        sig = sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
+        recovered = Account.recover_message(msg, signature=sig)
+    except Exception:
+        return False
+    return recovered.lower() == submitted_by.lower()
+
+
 @router.get("/orders/{order_id}/bridge")
 def get_bridge_status(order_id: str) -> dict:
     """Get bridge transfer status for a cross-chain order.

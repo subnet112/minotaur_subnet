@@ -65,6 +65,10 @@ class BridgeTracker:
 
         self._tracked: dict[str, TrackedBridge] = {}
         self._running = False
+        # Back-ref to the MultiLegOrchestrator (wired in blockloop/loop.py)
+        # so destination-leg failures can park for the user's
+        # revert-or-refresh decision instead of dead-ending in BRIDGE_FAILED.
+        self.multi_leg_orchestrator: Any = None
 
     def track(
         self,
@@ -289,7 +293,10 @@ class BridgeTracker:
                     )
                     if sim and not sim.success:
                         logger.warning("Dest leg simulation failed for %s %s", tracked.order_id, leg_label)
-                        self._mark_bridge_failed(tracked.order_id, f"Dest leg {leg.leg_index} simulation failed")
+                        await self._fail_dest_leg(
+                            tracked, order, leg.leg_index,
+                            f"Dest leg {leg.leg_index} simulation failed",
+                        )
                         return
                     print(f"[BRIDGE] {tracked.order_id}: {leg_label} simulation passed", flush=True)
                 except Exception as exc:
@@ -412,12 +419,14 @@ class BridgeTracker:
                 print(f"[BRIDGE] {tracked.order_id}: {leg_label} submit success={submit_result.success} tx={submit_result.tx_hash} err={submit_result.error}", flush=True)
             except Exception as exc:
                 logger.error("Bridge dest leg submit failed: %s", exc)
-                self._mark_bridge_failed(tracked.order_id, f"Dest leg failed: {exc}")
+                await self._fail_dest_leg(
+                    tracked, order, leg.leg_index, f"Dest leg failed: {exc}",
+                )
                 return
 
             if not submit_result.success:
-                self._mark_bridge_failed(
-                    tracked.order_id,
+                await self._fail_dest_leg(
+                    tracked, order, leg.leg_index,
                     f"Dest leg {leg.leg_index} failed: {submit_result.error}",
                 )
                 return
@@ -560,6 +569,58 @@ class BridgeTracker:
             error=error,
         )
         logger.warning("Cross-chain order %s → BRIDGE_FAILED: %s", order_id, error)
+
+    async def _fail_dest_leg(
+        self,
+        tracked: TrackedBridge,
+        order: Any,
+        failed_leg_index: int,
+        error: str,
+    ) -> None:
+        """Destination-leg failure: park for revert-or-refresh when enabled.
+
+        This is the design's core decision point — bridged funds sit in
+        on-chain escrow (deposit done, release gated), so waiting for the
+        user is safe. Falls back to the legacy BRIDGE_FAILED dead-end when
+        the feature is off or the orchestrator isn't wired.
+        """
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+
+        orchestrator = self.multi_leg_orchestrator
+        if not cross_chain_user_decision_enabled() or orchestrator is None:
+            self._mark_bridge_failed(tracked.order_id, error)
+            return
+
+        from minotaur_subnet.shared.types import LegPlan
+
+        meta = tracked.plan.metadata or {}
+        all_legs = {
+            l["leg_index"]: LegPlan.from_dict(l)
+            for l in (meta.get("multi_leg_plan") or {}).get("forward_legs", [])
+        }
+        completed = [
+            all_legs[i] for i in meta.get("completed_leg_indices", [])
+            if i in all_legs
+        ]
+        rollbacks = [
+            LegPlan.from_dict(d) for d in meta.get("rollback_legs", [])
+        ]
+        try:
+            await orchestrator.park_for_user_decision(
+                order, completed, rollbacks,
+                meta.get("contract_address", ""),
+                {"plan_set": meta.get("plan_set"),
+                 "escrow_params": meta.get("escrow_params")},
+                failed_leg_index, error,
+            )
+        except Exception as exc:
+            logger.error(
+                "Park-for-decision failed for %s (%s) — falling back to "
+                "BRIDGE_FAILED", tracked.order_id, exc,
+            )
+            self._mark_bridge_failed(tracked.order_id, error)
 
     async def run_loop(self) -> None:
         """Background polling loop. Runs until stop() is called."""
