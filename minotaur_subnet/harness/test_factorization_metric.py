@@ -225,6 +225,20 @@ def test_dynamic_code_calls_flags_shim_import_indirection(tmp_path):
     assert dynamic_code_calls(str(tmp_path)) == ["james_base.py:3 __import__"]
 
 
+def test_dynamic_code_calls_flags_spec_loader_exec_module(tmp_path):
+    # v2: the spec-loader spelling of dynamic import — building the spec/module
+    # is inert until `spec.loader.exec_module(mod)` RUNS it, so the executor is
+    # the one name that kills the pattern (the champion `_apex_champ.py`
+    # strategies-loader shape).
+    (tmp_path / "loader.py").write_text(
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('strat', path)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+    )
+    assert dynamic_code_calls(str(tmp_path)) == ["loader.py:4 exec_module"]
+
+
 def test_dynamic_code_calls_ignores_benign_attribute_calls(tmp_path):
     # Attribute calls whose trailing name is NOT in the ban stay clean: re.compile
     # (the builtin `compile` is bare-name only) and a miner method named `eval`.
@@ -305,9 +319,9 @@ def test_dynamic_code_ban_can_be_disarmed(tmp_path, monkeypatch):
 
 
 def test_dynamic_code_armed_by_default():
-    # Ships ENFORCING (unlike the observe-only import ban), version-stamped.
+    # Ships ENFORCING (like the now-armed import ban), version-stamped.
     assert _screening.DYNAMIC_CODE_ARMED is True
-    assert _screening.DYNAMIC_CODE_VERSION == 1
+    assert _screening.DYNAMIC_CODE_VERSION == 2  # v2 adds exec_module
 
 
 # ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
@@ -353,13 +367,38 @@ def test_banned_imports_skips_unparseable(tmp_path):
     assert banned_imports(str(tmp_path)) == ["ok.py:1 socket"]
 
 
-def test_banned_imports_observe_only_by_default(tmp_path, monkeypatch):
-    # Ships INERT: a banned import is LOGGED but does NOT reject while unarmed.
-    assert _screening.BANNED_IMPORTS_ARMED is False  # default
-    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)  # keep factor happy
+def test_banned_imports_armed_by_default(tmp_path):
+    # ARMED v2 after the observe-only soak (257/257 hits = urllib.request, zero
+    # benign dotted names): a banned import now rejects out of the box.
+    assert _screening.BANNED_IMPORTS_ARMED is True
+    assert _screening.BANNED_IMPORTS_VERSION == 2
     repo = _valid_repo(tmp_path, "import socket\ndef f():\n    return 1\n")
     res = run_stage_1(str(repo))
-    assert res.passed is True  # observe-only → not gated
+    assert res.passed is False
+    assert res.error_code == "banned_import"
+
+
+def test_banned_imports_allowlists_urllib_parse_spellings(tmp_path):
+    # Every spelling that binds ONLY the benign submodule passes…
+    (tmp_path / "a.py").write_text(
+        "import urllib.parse\n"
+        "import urllib.parse as up\n"
+        "from urllib.parse import urlparse\n"
+        "from urllib import parse\n"
+    )
+    assert banned_imports(str(tmp_path)) == []
+
+
+def test_banned_imports_allowlist_does_not_leak_to_request(tmp_path):
+    # …while the gadget spellings — including the mixed from-import — still flag.
+    (tmp_path / "b.py").write_text(
+        "import urllib\n"
+        "import urllib.request\n"
+        "from urllib import parse, request\n"
+        "from urllib.request import urlopen\n"
+    )
+    mods = {h.split()[1] for h in banned_imports(str(tmp_path))}
+    assert mods == {"urllib", "urllib.request"}
 
 
 def test_banned_imports_armed_rejects(tmp_path, monkeypatch):
