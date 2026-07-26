@@ -74,3 +74,62 @@ class OrderPersistence:
         if loaded > 0:
             logger.info("Reloaded %d OPEN orders from store", loaded)
         return loaded
+
+    # Multi-leg orders parked waiting on the user. Unlike OPEN orders these
+    # keep their exact status, params (the recovery/plan-set context) and
+    # compiled plan — the whole point is to resume from where they stopped.
+    PARKED_STATUSES = (
+        OrderStatus.AWAITING_PLAN_SET_SIGNATURE,
+        OrderStatus.AWAITING_USER_DECISION,
+    )
+
+    def load_parked_orders(self, orderbook: IntentOrderBook) -> list[Order]:
+        """Reload multi-leg orders parked awaiting user action.
+
+        ``load_open_orders`` only covers status="open", so without this a
+        restart leaves a parked order absent from the in-memory OrderBook
+        entirely — every endpoint keyed on ``orderbook.get`` then 404s and
+        the order is unreachable, not merely un-resumed. Returns the orders
+        it reloaded so the caller can re-arm their timers.
+        """
+        reloaded: list[Order] = []
+        for status in self.PARKED_STATUSES:
+            try:
+                stored = self.app_store.list_orders(status=status.value)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to list %s orders from store: %s", status.value, exc,
+                )
+                continue
+            for order_dict in stored:
+                order_id = order_dict.get("order_id", "")
+                if not order_id or orderbook.get(order_id) is not None:
+                    continue
+                try:
+                    order = Order(
+                        order_id=order_id,
+                        app_id=order_dict.get("app_id", ""),
+                        intent_function=order_dict.get("intent_function", "execute"),
+                        params=order_dict.get("params", {}),
+                        submitted_by=order_dict.get("submitted_by", ""),
+                        chain_id=order_dict.get("chain_id", 1),
+                        status=status,
+                        perpetual=order_dict.get("perpetual", False),
+                        max_executions=order_dict.get("max_executions", 1),
+                        cooldown=order_dict.get("cooldown", 0.0),
+                        deadline=order_dict.get("deadline", 0.0),
+                        last_filled_at=order_dict.get("last_filled_at", 0.0),
+                        execution_count=order_dict.get("execution_count", 0),
+                        plan=order_dict.get("plan"),
+                        tx_hash=order_dict.get("tx_hash"),
+                        error=order_dict.get("error"),
+                    )
+                    orderbook._orders[order_id] = order
+                    reloaded.append(order)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reload parked order %s: %s", order_id, exc,
+                    )
+        if reloaded:
+            logger.info("Reloaded %d parked multi-leg orders from store", len(reloaded))
+        return reloaded

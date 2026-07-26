@@ -39,10 +39,21 @@ class TrackedBridge:
     # platform self-relays receiveMessage on the destination. Set once that
     # mint tx has been submitted, so we don't double-mint on re-poll.
     cctp_minted: bool = False
+    # One-shot ops escalation for a committed-rail transfer that blew past
+    # max_polls (see _fail_bridge): the funds aren't lost, delivery is just
+    # late, so we keep polling instead of dead-ending — but somebody should
+    # know. Bounded by COMMITTED_MAX_POLL_FACTOR.
+    stall_escalated: bool = False
 
 
 class BridgeTracker:
     """Polls bridge adapters and completes cross-chain orders.
+
+    COMMITTED_MAX_POLL_FACTOR bounds how far past ``max_polls`` a
+    committed-rail transfer keeps being polled before we stop: the funds are
+    already gone from the source and only the delivery is outstanding, so
+    giving up at the normal timeout would abandon a mint that still needs
+    relaying. 10x ≈ 20h at the default 60s interval.
 
     Args:
         bridge_registry: Registry of bridge adapters.
@@ -50,6 +61,8 @@ class BridgeTracker:
         relayer: Relayer for submitting destination legs.
         poll_interval: Seconds between polling cycles.
     """
+
+    COMMITTED_MAX_POLL_FACTOR = 10
 
     def __init__(
         self,
@@ -132,8 +145,26 @@ class BridgeTracker:
         for order_id, tracked in list(self._tracked.items()):
             tracked.poll_count += 1
 
-            # Max polls exceeded → mark as failed
+            # Max polls exceeded. On a refundable rail that's the end of the
+            # attempt. On a COMMITTED rail (CCTP burn) the funds are already
+            # gone from the source and the mint is merely late — dropping the
+            # entry here would abandon the self-relay that still has to fire,
+            # so keep polling to a hard ceiling and escalate to ops instead.
             if tracked.poll_count > tracked.max_polls:
+                if not self._refunds_on_origin(tracked) and (
+                    tracked.poll_count
+                    <= tracked.max_polls * self.COMMITTED_MAX_POLL_FACTOR
+                ):
+                    if not tracked.stall_escalated:
+                        tracked.stall_escalated = True
+                        logger.error(
+                            "Bridge %s STALLED for order %s after %d polls — "
+                            "funds are committed on the source chain and the "
+                            "delivery is still pending; continuing to poll "
+                            "(ops escalation)",
+                            tracked.bridge_protocol, order_id, tracked.poll_count,
+                        )
+                    continue
                 logger.warning(
                     "Bridge timeout for order %s after %d polls",
                     order_id, tracked.poll_count,
@@ -633,24 +664,60 @@ class BridgeTracker:
         )
         logger.warning("Cross-chain order %s → BRIDGE_FAILED: %s", order_id, error)
 
+    def _refunds_on_origin(self, tracked: TrackedBridge) -> bool:
+        """Does this rail return the funds to the user if it never delivers?
+
+        Read off the adapter (``REFUNDS_ON_ORIGIN``). Unknown protocol →
+        False: never tell a user a refund is coming unless the rail actually
+        provides one.
+        """
+        registry = getattr(self, "bridge_registry", None)
+        adapter = registry.get(tracked.bridge_protocol) if registry else None
+        return bool(getattr(adapter, "REFUNDS_ON_ORIGIN", False))
+
     async def _fail_bridge(self, tracked: TrackedBridge, error: str) -> None:
         """The bridge HOP itself failed — expired unfilled, or polled out.
 
         Distinct from a destination-leg failure: nothing arrived on the
         destination, so there is no escrow and no executable revert (the
         rollback legs are reverse-bridges that would run on the destination
-        chain, where the funds never landed). What the user actually has is
-        the origin-chain refund — Across returns the deposit to the
-        depositor, which the compiler pins to the user's own wallet — so the
-        only meaningful choice is to re-quote.
+        chain, where the funds never landed).
 
-        Parks with ``refresh`` as the sole option when the recovery feature
-        is on; otherwise the legacy BRIDGE_FAILED terminal state. Either way
-        the refund is already on its way without anyone acting.
+        What comes next depends on the RAIL, not on the failure:
+
+        - **Refundable** (Across): the deposit returns to the depositor —
+          the user's own wallet — on the origin chain. Nothing to revert,
+          and the one decision left is whether to re-quote, so park with
+          ``refresh`` as the sole option.
+        - **Committed** (CCTP burn, Hyperlane lock): the source funds are
+          gone and the delivery is late, not lost. There is no refund to
+          announce and no re-quote to make — offering either would be false.
+          Record the accurate terminal state and escalate; the mint/message
+          can still be completed manually and remains permissionless.
+
+        Falls back to the legacy BRIDGE_FAILED state when the recovery
+        feature is off or the orchestrator isn't wired.
         """
         from minotaur_subnet.shared.feature_flags import (
             cross_chain_user_decision_enabled,
         )
+
+        if not self._refunds_on_origin(tracked):
+            logger.error(
+                "Committed-rail bridge %s did not deliver for order %s (%s) — "
+                "source funds are irreversibly committed; the delivery is "
+                "still pending and can be completed permissionlessly. Manual "
+                "escalation required; no refund or re-quote applies.",
+                tracked.bridge_protocol, tracked.order_id, error,
+            )
+            self._mark_bridge_failed(
+                tracked.order_id,
+                f"{error} — {tracked.bridge_protocol} funds are committed on "
+                f"the source chain and delivery is still pending (no origin "
+                f"refund exists for this rail); escalated for manual "
+                f"completion",
+            )
+            return
 
         orchestrator = self.multi_leg_orchestrator
         order = self.orderbook.get(tracked.order_id) if self.orderbook else None

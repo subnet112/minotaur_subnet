@@ -42,10 +42,12 @@ def cross_chain_user_decision_enabled() -> bool:
 
     Safety note: the decision window is bounded
     (CROSS_CHAIN_DECISION_WINDOW_S, default 1800s) and expires into the
-    pre-agreed auto-revert; the on-chain escrowRefund timelock remains the
-    unconditional backstop if this process dies mid-window (the watcher
-    task does not survive restarts — the decision endpoint still works,
-    but the timeout auto-revert re-arms only for new failures).
+    pre-agreed auto-revert. A restart mid-window kills the in-process
+    watcher, but the block loop's boot sweep
+    (MultiLegOrchestrator.recover_parked_orders) reloads parked orders and
+    re-arms the watcher on its ORIGINAL deadline, so an expired window
+    still fires. The on-chain escrowRefund timelock remains the
+    unconditional backstop underneath both.
     """
     return _env_bool("CROSS_CHAIN_USER_DECISION", default=False)
 

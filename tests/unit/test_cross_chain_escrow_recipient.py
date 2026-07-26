@@ -389,9 +389,10 @@ class TestBridgeHopFailure:
 
 class TestBridgeTrackerRoutesHopFailure:
     """Bridge expiry / poll timeout used to bypass the recovery flow
-    entirely and dead-end in BRIDGE_FAILED."""
+    entirely and dead-end in BRIDGE_FAILED — and the recovery it now offers
+    has to match what the RAIL actually does with undelivered funds."""
 
-    def _tracker(self, decision_on: bool, monkeypatch):
+    def _tracker(self, decision_on: bool, monkeypatch, protocol: str = "across"):
         from minotaur_subnet.relayer.bridge_tracker import BridgeTracker, TrackedBridge
         from minotaur_subnet.shared.types import ExecutionPlan
 
@@ -403,8 +404,14 @@ class TestBridgeTrackerRoutesHopFailure:
             app_id="app-1", intent_function="swap", params={},
             submitted_by=USER, deadline=time.time() + 3600,
         )
+        registry = BridgeRegistry()
+        registry.register(AcrossAdapter())
+        from minotaur_subnet.bridge.cctp import CCTPAdapter
+        registry.register(CCTPAdapter())
+
         tracker = BridgeTracker.__new__(BridgeTracker)
         tracker.orderbook = ob
+        tracker.bridge_registry = registry
         tracker.multi_leg_orchestrator = None
         if decision_on:
             from minotaur_subnet.blockloop.multi_leg import MultiLegOrchestrator
@@ -413,7 +420,7 @@ class TestBridgeTrackerRoutesHopFailure:
             )
         tracked = TrackedBridge(
             order_id=order.order_id, src_tx_hash="0xdead",
-            src_chain_id=1, dst_chain_id=8453, bridge_protocol="across",
+            src_chain_id=1, dst_chain_id=8453, bridge_protocol=protocol,
             plan=ExecutionPlan(
                 intent_id="app-1", interactions=[], deadline=0, nonce=0,
                 metadata={"contract_address": APP_ETH, "bridge_leg_index": 1},
@@ -431,4 +438,181 @@ class TestBridgeTrackerRoutesHopFailure:
     def test_legacy_dead_end_when_disabled(self, monkeypatch):
         ob, tracker, tracked, order = self._tracker(False, monkeypatch)
         _run(tracker._fail_bridge(tracked, "Bridge polling timeout"))
+        assert ob.get(order.order_id).status == OrderStatus.BRIDGE_FAILED
+
+    def test_cctp_is_never_offered_a_refund_or_requote(self, monkeypatch):
+        # A CCTP burn is irreversible and always mints — there is no origin
+        # refund to announce and nothing to re-quote, so parking the user
+        # with "refresh" (and refund wording) would be a lie.
+        ob, tracker, tracked, order = self._tracker(
+            True, monkeypatch, protocol="cctp",
+        )
+        _run(tracker._fail_bridge(tracked, "Bridge polling timeout"))
+        final = ob.get(order.order_id)
+        assert final.status == OrderStatus.BRIDGE_FAILED
+        assert "recovery" not in final.params
+        assert "committed on the source chain" in (final.error or "")
+        assert "refund" not in (final.error or "").replace(
+            "no origin refund exists", "",
+        )
+
+    def test_refund_semantics_read_from_the_adapter(self, monkeypatch):
+        ob, tracker, tracked, _ = self._tracker(True, monkeypatch)
+        assert tracker._refunds_on_origin(tracked) is True
+        tracked.bridge_protocol = "cctp"
+        assert tracker._refunds_on_origin(tracked) is False
+        # Unknown rail → assume no refund rather than promise one.
+        tracked.bridge_protocol = "not-a-real-bridge"
+        assert tracker._refunds_on_origin(tracked) is False
+
+
+class TestBootRecovery:
+    """Both parked states depend on an in-process task that a restart kills,
+    and parked orders aren't in the OPEN set load_open_orders restores — so
+    before the sweep a restart made them unreachable, not just un-resumed."""
+
+    def _env(self, stored: list[dict]):
+        from minotaur_subnet.blockloop.multi_leg import MultiLegOrchestrator
+        from minotaur_subnet.blockloop.persistence import OrderPersistence
+
+        class FakeStore:
+            def __init__(self): self.saved = []
+            def list_orders(self, status=None, app_id=None):
+                return [d for d in stored if d.get("status") == status]
+            def save_order(self, d): self.saved.append(d)
+
+        ob = IntentOrderBook()
+        persistence = OrderPersistence(app_store=FakeStore(), orderbook=ob)
+        orch = MultiLegOrchestrator(
+            orderbook=ob, relayer=FakeRelayer(), app_store=FakeAppStore(),
+            plan_scorer=FakeScorer(), order_persistence=persistence,
+        )
+        return ob, orch
+
+    def _parked_dict(self, order_id, status, params, plan=None):
+        return {
+            "order_id": order_id, "app_id": "app-1",
+            "intent_function": "swap", "params": params,
+            "submitted_by": USER, "chain_id": 1, "status": status,
+            "deadline": time.time() + 3600, "plan": plan,
+        }
+
+    def test_reloads_parked_orders_into_the_orderbook(self):
+        ob, orch = self._env([
+            self._parked_dict("o-sig", "awaiting_plan_set_signature", {}),
+            self._parked_dict(
+                "o-dec", "awaiting_user_decision",
+                {"recovery": {"decision_deadline": time.time() + 600,
+                              "options": ["revert", "refresh"],
+                              "resolved": None}},
+            ),
+        ])
+        assert ob.get("o-sig") is None  # gone after the "restart"
+        counts = _run(orch.recover_parked_orders())
+        assert counts["reloaded"] == 2
+        # Reachable again — every endpoint keys on orderbook.get.
+        assert ob.get("o-sig").status == OrderStatus.AWAITING_PLAN_SET_SIGNATURE
+        assert ob.get("o-dec").status == OrderStatus.AWAITING_USER_DECISION
+
+    def test_resumes_a_signed_order(self):
+        ob, orch = self._env([
+            self._parked_dict(
+                "o-sig", "awaiting_plan_set_signature",
+                {"plan_set_signature": "0x" + "ab" * 65},
+                plan={"metadata": {
+                    "multi_leg_plan": _multi_leg_plan().to_dict(),
+                    "contract_address": APP_ETH,
+                    "plan_set": PLAN_SET,
+                }},
+            ),
+        ])
+        counts = _run(orch.recover_parked_orders())
+        assert counts["resumed"] == 1
+
+    def test_unsigned_order_stays_parked(self):
+        # The user never signed; nothing executed. Waiting is correct.
+        ob, orch = self._env([
+            self._parked_dict("o-sig", "awaiting_plan_set_signature", {}),
+        ])
+        counts = _run(orch.recover_parked_orders())
+        assert counts["resumed"] == 0
+        assert ob.get("o-sig").status == OrderStatus.AWAITING_PLAN_SET_SIGNATURE
+
+    def test_rearms_decision_watcher_on_its_original_deadline(self):
+        ob, orch = self._env([
+            self._parked_dict(
+                "o-dec", "awaiting_user_decision",
+                {"recovery": {"decision_deadline": time.time() + 600,
+                              "options": ["revert", "refresh"],
+                              "resolved": None}},
+            ),
+        ])
+        counts = _run(orch.recover_parked_orders())
+        assert counts["watchers_rearmed"] == 1
+
+    def test_resolved_decision_is_not_rearmed(self):
+        ob, orch = self._env([
+            self._parked_dict(
+                "o-dec", "awaiting_user_decision",
+                {"recovery": {"decision_deadline": 1, "resolved": "revert"}},
+            ),
+        ])
+        counts = _run(orch.recover_parked_orders())
+        assert counts["watchers_rearmed"] == 0
+
+    def test_never_raises_without_persistence(self):
+        from minotaur_subnet.blockloop.multi_leg import MultiLegOrchestrator
+        orch = MultiLegOrchestrator(orderbook=IntentOrderBook())
+        assert _run(orch.recover_parked_orders()) == {
+            "reloaded": 0, "resumed": 0, "watchers_rearmed": 0,
+        }
+
+
+class TestCommittedRailKeepsPolling:
+    """A committed-rail transfer past max_polls is late, not lost: dropping
+    it would abandon the mint self-relay that still has to fire."""
+
+    def _tracker(self, protocol: str, poll_count: int):
+        from minotaur_subnet.relayer.bridge_tracker import BridgeTracker, TrackedBridge
+        from minotaur_subnet.shared.types import ExecutionPlan
+        from minotaur_subnet.bridge.cctp import CCTPAdapter
+
+        ob = IntentOrderBook()
+        order = ob.submit(
+            app_id="app-1", intent_function="swap", params={},
+            submitted_by=USER, deadline=time.time() + 3600,
+        )
+        registry = BridgeRegistry()
+        registry.register(AcrossAdapter())
+        registry.register(CCTPAdapter())
+
+        tracker = BridgeTracker.__new__(BridgeTracker)
+        tracker.orderbook = ob
+        tracker.bridge_registry = registry
+        tracker.multi_leg_orchestrator = None
+        tracker._tracked = {}
+        tracked = TrackedBridge(
+            order_id=order.order_id, src_tx_hash="0xdead",
+            src_chain_id=1, dst_chain_id=8453, bridge_protocol=protocol,
+            plan=ExecutionPlan(
+                intent_id="app-1", interactions=[], deadline=0, nonce=0,
+                metadata={"contract_address": APP_ETH},
+            ),
+            poll_count=poll_count,
+        )
+        tracker._tracked[order.order_id] = tracked
+        return ob, tracker, tracked, order
+
+    def test_cctp_stays_tracked_past_max_polls(self):
+        ob, tracker, tracked, order = self._tracker("cctp", poll_count=121)
+        # check_status must never be reached — we short-circuit before it.
+        _run(tracker.poll_once())
+        assert order.order_id in tracker._tracked      # still being polled
+        assert tracked.stall_escalated is True         # ops notified once
+        assert ob.get(order.order_id).status != OrderStatus.BRIDGE_FAILED
+
+    def test_cctp_gives_up_at_the_hard_ceiling(self):
+        ob, tracker, tracked, order = self._tracker("cctp", poll_count=1_300)
+        _run(tracker.poll_once())
+        assert order.order_id not in tracker._tracked
         assert ob.get(order.order_id).status == OrderStatus.BRIDGE_FAILED

@@ -115,6 +115,11 @@ class AcrossAdapter(BridgeAdapter):
 
     PROTOCOL = "across"
 
+    # An unfilled deposit is refunded to the depositor on the ORIGIN chain at
+    # fillDeadline — the one rail here where "didn't deliver" means the user
+    # gets their funds back where they started.
+    REFUNDS_ON_ORIGIN = True
+
     def _resolve_pair(
         self, token_in: str, src_chain_id: int, dst_chain_id: int,
     ) -> tuple[str, str, str] | None:

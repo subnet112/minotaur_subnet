@@ -139,6 +139,28 @@ plan never carried `multi_leg_plan` / `cross_chain` / `plan_set`, which is why
 contract's `planSetSignatureRequired`. Reversed, the contract rejects every
 leg the pipeline submits, because none carry a signature.
 
+### 3a. Both parked states now survive a restart
+
+Neither parked state could outlive the process. The plan-set resume runs as a
+background task; the decision-window auto-revert runs as a watcher task. A
+restart killed both — and worse, `load_open_orders` only restores
+`status="open"`, so a parked order wasn't even reloaded into the in-memory
+OrderBook. Since every order endpoint keys on `orderbook.get`, a restart made
+parked orders **unreachable**, not merely un-resumed: re-POSTing the signature
+would have 404'd.
+
+`MultiLegOrchestrator.recover_parked_orders()`, called from `BlockLoop.run_loop`
+at boot, reloads both parked statuses with their params and compiled plan, then:
+
+- `AWAITING_PLAN_SET_SIGNATURE` **with** a signature → resume orchestration
+  (the signature landed, the process died before the legs ran);
+- **without** one → stay parked; the user hasn't signed and nothing executed;
+- `AWAITING_USER_DECISION` unresolved → re-arm the watcher on its **original**
+  deadline, so an expired window fires promptly instead of never.
+
+The `escrowRefund` timelock stays the unconditional backstop underneath all of
+it. Docstrings that claimed the watcher "does not survive restarts" are updated.
+
 ---
 
 ## 4. Fixed — a failed bridge hop bypassed the recovery flow
@@ -149,15 +171,31 @@ the poll timeout — still called `_mark_bridge_failed` directly. That is row 2
 of the design's own failure matrix, the single most likely cross-chain
 failure, dead-ending in a terminal state.
 
-**Fix.** Both paths now go through `_fail_bridge`, which parks the order with
-**`refresh` as the only option**. This is deliberate: nothing reached the
-destination chain, so the revert legs (reverse-bridges that execute *there*)
-have no funds to move, and offering "revert" would be a lie. What the user
-actually has is the origin-chain refund, already on its way to their wallet
-without anyone acting. `resolve_user_decision` now rejects an action that
-wasn't offered, and a decision window that expires with no revert option
-settles into `BRIDGE_FAILED` instead of attempting an auto-revert that would
-fail.
+**Fix.** Both paths now go through `_fail_bridge`, and what it offers depends
+on what the **rail** does with undelivered funds — declared on the adapter as
+`REFUNDS_ON_ORIGIN`, defaulting to `False` so we never promise a refund we
+can't verify:
+
+- **Refundable (Across, `True`).** The deposit returns to the depositor — the
+  user's own wallet — on the origin chain. Nothing to revert (the reverse-bridge
+  legs execute on the destination, where funds never landed), so the order
+  parks with **`refresh` as the only option**. `resolve_user_decision` rejects
+  an action that wasn't offered, and a window that expires with no revert
+  option settles into `BRIDGE_FAILED` rather than attempting a revert that
+  would fail.
+- **Committed (CCTP, Hyperlane, `False`).** A CCTP burn is irreversible and
+  *always* mints; there is no origin refund and nothing to re-quote. Parking
+  such an order with "refresh" and refund wording would be actively false. It
+  records an accurate terminal state and raises an ops escalation instead —
+  the mint stays permissionlessly completable.
+
+For a committed rail the poll timeout also no longer **drops** the transfer:
+the source funds are already gone and only delivery is outstanding, so
+abandoning the entry would abandon the mint self-relay that still has to fire.
+It keeps polling to a hard ceiling (`COMMITTED_MAX_POLL_FACTOR = 10`, ≈20h at
+the 60s interval) behind a one-shot `logger.error` escalation, and only then
+gives up. A rare edge in practice — Iris attests in minutes against a 2h
+`max_polls` — but the semantics are now per-rail rather than Across-shaped.
 
 ---
 

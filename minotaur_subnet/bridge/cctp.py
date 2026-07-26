@@ -122,6 +122,13 @@ class CCTPAdapter(BridgeAdapter):
 
     PROTOCOL = "cctp"
 
+    # Burn-and-mint: the source USDC is destroyed at deposit time and there
+    # is no origin-chain refund path at all. A slow transfer is a pending
+    # mint (the attestation stays valid and anyone may submit it), never a
+    # lost or returnable one — so the recovery flow must not offer a re-quote
+    # or promise a refund here.
+    REFUNDS_ON_ORIGIN = False
+
     def supported_routes(self) -> list[tuple[int, int]]:
         return [(1, 8453), (8453, 1)]
 

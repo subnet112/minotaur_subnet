@@ -64,6 +64,23 @@ class BridgeAdapter(ABC):
 
     PROTOCOL: str = ""
 
+    #: What happens to the user's funds when a transfer does NOT deliver.
+    #:
+    #: True  — the ORIGIN chain refunds the depositor (Across returns an
+    #:         unfilled deposit at ``fillDeadline``). The funds come home by
+    #:         themselves, so the only decision left for the user is whether
+    #:         to re-quote.
+    #: False — the source funds are irreversibly committed and delivery is a
+    #:         question of *when*, not *whether*: burn-and-mint (CCTP — the
+    #:         burn cannot be undone and the attestation stays valid forever)
+    #:         and lock-and-mint (Hyperlane) rails. There is nothing to
+    #:         refund and nothing to re-quote; a stalled transfer is an ops
+    #:         escalation, not a user choice.
+    #:
+    #: Defaults False so we never promise a refund we can't verify — the
+    #: recovery flow's wording and options branch on this.
+    REFUNDS_ON_ORIGIN: bool = False
+
     @abstractmethod
     async def quote(
         self,
