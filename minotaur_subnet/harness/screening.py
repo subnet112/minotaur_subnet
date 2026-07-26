@@ -560,6 +560,25 @@ def run_stage_1(repo_path: str) -> StageResult:
         )
         _dw_fields["content_fingerprint"] = fingerprint
 
+    # Structural fingerprint — same pass, same persist-on-reject discipline.
+    # Salt-invariant identity (docstring-stripped, constant-erased AST) so a
+    # fleet of coldkeys shipping structurally-identical code shows as one
+    # identity even when each salts a constant to mint a distinct
+    # content_fingerprint. Consumed observe-only by rotation's structural
+    # dedup (see harness/structural_fingerprint.py).
+    from minotaur_subnet.harness.structural_fingerprint import (
+        STRUCTURAL_FINGERPRINT_VERSION,
+        repo_structural_fingerprint,
+    )
+
+    struct_fp = repo_structural_fingerprint(repo_path)
+    if struct_fp:
+        logger.info(
+            "[fingerprint] structural_fingerprint=%s version=%d repo=%s",
+            struct_fp[:16], STRUCTURAL_FINGERPRINT_VERSION, repo_path,
+        )
+        _dw_fields["structural_fingerprint"] = struct_fp
+
     # Static-analyzability ban (always-on PREVENT layer; INDEPENDENT of the
     # factor floor — code built from strings / dynamically imported is invisible
     # to the metric, the deadwood scan AND the fingerprint, so it must be

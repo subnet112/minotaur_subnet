@@ -221,6 +221,46 @@ def select_rotation_slate(
     return selected, overflow
 
 
+def structural_dedup_clusters(
+    subs: list[Any],
+    actor_of: Any = None,
+) -> list[list[Any]]:
+    """Group submissions that share a structural fingerprint ACROSS DISTINCT
+    actors — the sybil signature (one codebase, N coldkeys, salted constants).
+
+    Returns one list per offending fingerprint, each holding the ≥2
+    submissions that share it AND belong to ≥2 distinct actors, sorted so the
+    caller can keep a stable representative. Submissions with no structural
+    fingerprint (unparseable / pre-metric) are ignored — never grouped, so a
+    missing value can't manufacture a false cluster.
+
+    PURE + observe-safe: does not mutate or select. ``select_rotation_slate``
+    already soft-dedups per actor; this is the orthogonal cut that a fleet of
+    DISTINCT coldkeys running identical code slips through. Phase 0 only
+    reports these; arming (collapsing them to one slot) is gated and MUST be
+    promoted fleet-uniform because it changes the benched slate → the pack
+    hash.
+    """
+    by_fp: dict[str, list[Any]] = {}
+    for s in subs:
+        fp = getattr(s, "structural_fingerprint", None)
+        if fp:
+            by_fp.setdefault(fp, []).append(s)
+
+    clusters: list[list[Any]] = []
+    for fp, group in by_fp.items():
+        if len(group) < 2:
+            continue
+        actors = {
+            (actor_of(getattr(g, "hotkey", "") or "") if actor_of else None)
+            or (getattr(g, "hotkey", "") or "")
+            for g in group
+        }
+        if len(actors) >= 2:
+            clusters.append(list(group))
+    return clusters
+
+
 class RotationLedger:
     """Per-hotkey seniority timestamps with atomic JSON persistence.
 
@@ -491,6 +531,29 @@ def apply_rotation_slate(
             "(actor-keyed slate, map=%s)",
             round_id, len(candidates), n_actors, len(selected), actor_of.source,
         )
+
+    # Structural-dedup OBSERVE (Phase 0): flag cross-actor slates where
+    # DISTINCT coldkeys run structurally-identical code (salted constants) —
+    # the sybil that actor-keying alone can't collapse. Logs only; does NOT
+    # change selection. Arming (collapse to one slot) is gated + must promote
+    # fleet-uniform (it changes the benched slate → the pack hash).
+    try:
+        clusters = structural_dedup_clusters(selected, actor_of)
+        for c in clusters:
+            fp = getattr(c[0], "structural_fingerprint", "") or ""
+            logger.warning(
+                "[structural-dedup OBSERVE] %s: %d slate submissions share "
+                "structural fingerprint %s across distinct actors — likely one "
+                "sybil (would collapse to 1 slot when armed): %s",
+                round_id, len(c), fp[:16],
+                ", ".join(
+                    f"{getattr(s, 'submission_id', '?')}"
+                    f"(hk={(getattr(s, 'hotkey', '') or '')[:10]})"
+                    for s in c
+                ),
+            )
+    except Exception:
+        logger.debug("structural-dedup observe failed for %s", round_id, exc_info=True)
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
