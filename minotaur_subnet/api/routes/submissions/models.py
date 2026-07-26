@@ -187,6 +187,10 @@ class SolverRoundResponse(BaseModel):
     close_epoch: int | None = None
     incumbent_submission_id: str | None = None
     incumbent_image_id: str | None = None
+    # The incumbent champion's hotkey (RoundState.incumbent_hotkey) — lets a
+    # reader attribute the round's defending champion to a miner without a
+    # second lookup through the submission store.
+    incumbent_hotkey: str | None = None
     benchmark_pack_hash: str | None = None
     committee_block: int | None = None
     committee_hash: str | None = None
@@ -206,6 +210,12 @@ class SolverRoundResponse(BaseModel):
     certificate_candidate_image_id: str | None = None
     certificate_quorum_required: int | None = None
     certificate_approvals: int = 0
+    # The submission_ids the close-time LRU rotation seated on this round's
+    # benched slate (RoundState.benched_slate — the single source of truth for
+    # "who got benched", recorded at close). None on rounds closed before the
+    # field existed or when rotation was disabled. Read-only exposure for
+    # per-miner seat history; nothing consensus-bearing.
+    benched_slate: list[str] | None = None
 
 
 class SolverChampionResponse(BaseModel):
@@ -242,6 +252,11 @@ class SolverRoundSummary(BaseModel):
     # Unix seconds for effective_epoch (see SolverRoundResponse.effective_at).
     effective_at: float | None = None
     abort_reason: str | None = None
+    # Defending champion's hotkey + the rotation-seated slate (see the same
+    # fields on SolverRoundResponse) — history rows carry them so per-miner
+    # seat/reign history is one paginated read, not a per-round fan-out.
+    incumbent_hotkey: str | None = None
+    benched_slate: list[str] | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -252,6 +267,45 @@ class SolverRoundsResponse(BaseModel):
     limit: int = 0
     offset: int = 0
     rounds: list[SolverRoundSummary] = []
+
+
+class SolverQueueEntry(BaseModel):
+    """One hotkey's rotation-queue standing (GET /v1/solver/queue)."""
+    hotkey: str
+    # Current-metagraph UID (same read-time resolution + null semantics as
+    # StatusResponse.miner_uid — deregistered/unsynced resolves to null).
+    miner_uid: int | None = None
+    # The actor identity the slate selection charges this hotkey to (a coldkey
+    # SS58, or the fleet's canonical label under the github-owner union — see
+    # harness/actor.py). null when actor keying is off (legacy per-hotkey LRU).
+    actor: str | None = None
+    # This HOTKEY's ledger timestamps (unix seconds): when it first appeared
+    # and when it last held a bench seat. last_benched_at is null for a
+    # never-benched hotkey — note a sibling hotkey of the same actor may still
+    # have benched (that is what waiting_since aggregates).
+    first_seen_at: float | None = None
+    last_benched_at: float | None = None
+    # The seniority clock the next slate selection will sort by — the ACTOR's
+    # wait_ts (max last-bench over its hotkeys, else min first-seen): LOWER =
+    # waiting longer = seated sooner. See harness/rotation.wait_ts.
+    waiting_since: float = 0.0
+    # 1-based dense rank over distinct actors in seniority order (an actor's
+    # hotkeys share one rank — the slate soft-dedups per actor). Indicative
+    # only: the real slate depends on who submits that round, and equal
+    # seniority reshuffles every round via a public salted hash.
+    rank: int = 0
+
+
+class SolverQueueResponse(BaseModel):
+    """Rotation-queue snapshot: who has been waiting how long for a bench seat."""
+    generated_at: float = 0.0
+    # True when the actor resolver was active (coldkey/owner aggregation);
+    # False = legacy per-hotkey seniority (kill-switch or no coldkey map yet).
+    actor_keyed: bool = False
+    # total = full queue size; count = entries returned (after ?hotkey= filter).
+    total: int = 0
+    count: int = 0
+    queue: list[SolverQueueEntry] = []
 
 
 class CloseRoundRequest(BaseModel):
