@@ -207,6 +207,34 @@ class CrossChainCompiler:
 
                 leg_index += 1
 
+        # Solver-authored revert legs (optional, additive). Each recovers
+        # from the failure of one solver leg — e.g. swap back to the bridged
+        # asset on the destination chain — and runs BEFORE the platform's
+        # reverse-bridge for that failure point (the orchestrator executes
+        # rollback legs in reverse forward-leg order, and the solver leg's
+        # forward index is always higher than the preceding bridge leg's).
+        # The reverse-bridge legs above stay as the unconditional fallback:
+        # a stale solver revert that misses its own min-out fails its leg
+        # and the escrow-refund backstop still applies.
+        for revert_leg in solver_plan.revert_legs:
+            solver_leg_idx = int(revert_leg.metadata["revert_for_leg"])
+            # Forward legs alternate solver/bridge, so solver leg j sits at
+            # forward index 2*j.
+            forward_idx = 2 * solver_leg_idx
+            rollback_legs.append(LegPlan(
+                leg_index=200 + len(rollback_legs),
+                chain_id=revert_leg.chain_id,
+                intent_selector=revert_leg.intent_selector,
+                intent_params_hex=revert_leg.intent_params_hex,
+                interactions=list(revert_leg.interactions),
+                rollback_for=forward_idx,
+                metadata={
+                    **revert_leg.metadata,
+                    "type": "rollback_solver",
+                    "_platform_compiled": True,
+                },
+            ))
+
         multi_leg = MultiLegPlan(
             forward_legs=forward_legs,
             rollback_legs=rollback_legs,
@@ -253,8 +281,13 @@ class CrossChainCompiler:
                         f"{plan.legs[i + 1].chain_id}"
                     )
 
-        # Verify no bridge protocol selectors in solver interactions
-        for i, leg in enumerate(plan.legs):
+        # Verify no bridge protocol selectors in solver interactions —
+        # forward AND revert legs (the revert path is solver code too).
+        labeled_legs = [(f"leg[{i}]", leg) for i, leg in enumerate(plan.legs)]
+        labeled_legs += [
+            (f"revert_leg[{i}]", leg) for i, leg in enumerate(plan.revert_legs)
+        ]
+        for label, leg in labeled_legs:
             for ix in leg.interactions:
                 raw_cd = (ix.call_data or "")
                 if raw_cd.startswith("0x"):
@@ -262,9 +295,31 @@ class CrossChainCompiler:
                 selector = raw_cd[:8] if len(raw_cd) >= 8 else ""
                 if selector in _BRIDGE_CALL_SELECTORS:
                     errors.append(
-                        f"leg[{i}] contains bridge selector {selector} — "
+                        f"{label} contains bridge selector {selector} — "
                         f"solvers must not include bridge calldata"
                     )
+
+        # Solver revert legs: each must name the solver leg it recovers from,
+        # and execute on that leg's chain (where the stranded funds sit).
+        for i, leg in enumerate(plan.revert_legs):
+            target = leg.metadata.get("revert_for_leg")
+            if not isinstance(target, int) or isinstance(target, bool):
+                errors.append(
+                    f"revert_leg[{i}]: metadata.revert_for_leg must be an "
+                    f"integer solver-leg index"
+                )
+                continue
+            if not (1 <= target < len(plan.legs)):
+                errors.append(
+                    f"revert_leg[{i}]: revert_for_leg {target} out of range "
+                    f"(must name a post-bridge leg, 1..{len(plan.legs) - 1})"
+                )
+                continue
+            if leg.chain_id != plan.legs[target].chain_id:
+                errors.append(
+                    f"revert_leg[{i}]: chain {leg.chain_id} != chain "
+                    f"{plan.legs[target].chain_id} of the leg it reverts"
+                )
 
         return errors
 

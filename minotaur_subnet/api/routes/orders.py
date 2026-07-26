@@ -1647,20 +1647,38 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     if _pmeta.get(_k) is not None
                 }
                 if _pmeta.get("cross_chain"):
-                    # Cross-chain plans can't be single-fork-simulated here. Derive
-                    # a best-effort estimate from plan metadata rather than 0 so
-                    # cross-chain quotes don't regress; gas stays at floor.
-                    _xc_amt = (
-                        _pmeta.get("dst_amount")
-                        or _pmeta.get("expected_output")
-                        or _pmeta.get("bridge_amount")
+                    # Unified cross-chain quote: dry-compile the solver's
+                    # CrossChainPlan through the platform compiler to get LIVE
+                    # bridge quotes (fee/ETA/min output) + the revert plan per
+                    # failure point, instead of trusting the solver's estimate.
+                    # Falls back to the legacy metadata copy when the compiler
+                    # isn't wired or the plan doesn't compile; gas stays at floor
+                    # either way (no per-leg sim on this path yet).
+                    from minotaur_subnet.api.services.cross_chain_quote import (
+                        build_cross_chain_quote,
                     )
-                    if _xc_amt is not None:
-                        try:
-                            result["delivered"] = int(_xc_amt)
-                            negative = False
-                        except (ValueError, TypeError):
-                            pass
+                    _xc_quote = await build_cross_chain_quote(
+                        _pmeta, getattr(bl, "cross_chain_compiler", None),
+                    )
+                    if _xc_quote and _xc_quote.get("estimated_output"):
+                        result["delivered"] = int(_xc_quote["estimated_output"])
+                        result["metadata"]["cross_chain_quote"] = _xc_quote
+                        negative = False
+                    else:
+                        # Legacy fallback: best-effort estimate from plan
+                        # metadata rather than 0 so cross-chain quotes don't
+                        # regress.
+                        _xc_amt = (
+                            _pmeta.get("dst_amount")
+                            or _pmeta.get("expected_output")
+                            or _pmeta.get("bridge_amount")
+                        )
+                        if _xc_amt is not None:
+                            try:
+                                result["delivered"] = int(_xc_amt)
+                                negative = False
+                            except (ValueError, TypeError):
+                                pass
                 elif _deployed and _has_sim:
                     # Run the SAME scoreIntent path the benchmark scores (proxy
                     # deploy, token funding, plan execution, transfer capture) so
