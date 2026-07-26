@@ -80,6 +80,14 @@ def _simulation_to_dict(sim: SimulationResult) -> dict[str, Any]:
         "gas_used": sim.gas_used,
         "gasUsed": sim.gas_used,  # Also provide camelCase for JS convention
     }
+    # The App contract's OWN verdict on this plan (scoreIntent BPS, 0..10000).
+    # Exposed so a scorer can build its quality metric from the contract rather
+    # than re-deriving it in JS — the platform never reads scoreIntent for
+    # adoption itself, the app's JS decides (see shared/quality_metric). None
+    # when the bare interaction path ran (no scoreIntent call) or on a mock.
+    if getattr(sim, "on_chain_score", None) is not None:
+        result["on_chain_score"] = sim.on_chain_score
+        result["onChainScore"] = sim.on_chain_score
     if sim.error is not None:
         result["error"] = sim.error
     if sim.token_transfers:
