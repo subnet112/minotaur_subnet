@@ -56,9 +56,35 @@ from __future__ import annotations
 import ast
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def structural_dedup_mode() -> str:
+    """How the structural dedup ACTS on a slate — an explicit env lever so
+    this stays a KNOWN, discoverable feature rather than silent always-on
+    behaviour.
+
+    ``STRUCTURAL_DEDUP_MODE``:
+      * ``off`` (DEFAULT) — do nothing. The structural fingerprint is still
+        computed + persisted at screening (a passive metric, like
+        max_region_nodes), but rotation neither logs nor collapses. Set this
+        explicitly in the leader env so the lever is visible.
+      * ``observe`` — Phase 0: LOG cross-actor structural clusters at slate
+        selection; selection unchanged.
+      * ``enforce`` — RESERVED (not yet wired): collapse a cross-actor
+        structural cluster to one slate slot. Changes the benched slate → the
+        pack hash, so arming it MUST be fleet-uniform. Until the collapse is
+        implemented, ``enforce`` behaves as ``observe`` and logs that it is
+        not yet enforcing.
+
+    Unknown values fall back to ``off`` (fail safe — an env typo must not
+    silently enable a slate-changing feature).
+    """
+    v = os.environ.get("STRUCTURAL_DEDUP_MODE", "").strip().lower()
+    return v if v in ("off", "observe", "enforce") else "off"
 
 # Bump on ANY change to the normalization below (see module docstring).
 STRUCTURAL_FINGERPRINT_VERSION = 1
