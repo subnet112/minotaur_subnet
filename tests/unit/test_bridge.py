@@ -388,3 +388,114 @@ class TestPlanHelpers:
         result = extract_leg_plan(plan, 99)
         # Should return original plan when no legs metadata
         assert result is plan
+
+
+# ── CCTP mint self-relay (BridgeTracker) ─────────────────────────────────────
+
+
+class _ReadyToMintAdapter(BridgeAdapter):
+    """Fake CCTP adapter: check_status always says the burn is attested."""
+    PROTOCOL = "cctp"
+
+    async def quote(self, token_in, amount, src_chain_id, dst_chain_id):
+        raise NotImplementedError
+
+    def build_bridge_interactions(self, quote, sender):
+        return []
+
+    def supported_routes(self):
+        return [(1, 8453), (8453, 1)]
+
+    async def check_status(self, src_tx_hash, src_chain_id, dst_chain_id=0):
+        return BridgeStatus(
+            status=BridgeStatusEnum.IN_TRANSIT,
+            src_tx_hash=src_tx_hash,
+            metadata={
+                "ready_to_mint": True,
+                "message": "0xdeadbeef",
+                "attestation": "0xc0ffee",
+            },
+        )
+
+
+class _RecordingRelayer:
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    async def call_contract_function(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("receiveMessage reverted")
+        return "0x" + "ab" * 32
+
+
+class TestCctpMintSelfRelay:
+    def _tracker(self, relayer):
+        from minotaur_subnet.relayer.bridge_tracker import BridgeTracker
+        from minotaur_subnet.orderbook.orderbook import IntentOrderBook
+        reg = BridgeRegistry()
+        reg.register(_ReadyToMintAdapter())
+        return BridgeTracker(bridge_registry=reg, orderbook=IntentOrderBook(),
+                             relayer=relayer, poll_interval=1.0)
+
+    def _track(self, tracker, order_id="o-cctp"):
+        from minotaur_subnet.relayer.bridge_tracker import TrackedBridge
+        from minotaur_subnet.shared.types import ExecutionPlan
+        plan = ExecutionPlan(intent_id="x", interactions=[], deadline=0, nonce=0,
+                             metadata={"dst_chain_id": 8453})
+        tracker._tracked[order_id] = TrackedBridge(
+            order_id=order_id, src_tx_hash="0x" + "11" * 32, plan=plan,
+            src_chain_id=1, dst_chain_id=8453, bridge_protocol="cctp")
+        return order_id
+
+    def test_poll_submits_mint_on_ready(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        from minotaur_subnet.bridge.cctp import MESSAGE_TRANSMITTER_V2
+        relayer = _RecordingRelayer()
+        tracker = self._tracker(relayer)
+        oid = self._track(tracker)
+        # isolate the mint: stub the dest-leg completion
+        tracker._on_bridge_complete = AsyncMock()
+
+        completed = asyncio.run(tracker.poll_once())
+        assert completed == 1
+        assert len(relayer.calls) == 1
+        call = relayer.calls[0]
+        assert call["contract_address"] == MESSAGE_TRANSMITTER_V2
+        assert call["chain_id"] == 8453
+        assert call["signature"] == "receiveMessage(bytes,bytes)"
+        assert call["values"] == [bytes.fromhex("deadbeef"), bytes.fromhex("c0ffee")]
+        # completed → dest legs run and the order is removed from tracking
+        assert oid not in tracker._tracked
+        tracker._on_bridge_complete.assert_awaited_once()
+
+    def test_no_double_mint(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        relayer = _RecordingRelayer()
+        tracker = self._tracker(relayer)
+        oid = self._track(tracker)
+        tracker._on_bridge_complete = AsyncMock()
+        # first poll mints + completes + removes from tracking
+        asyncio.run(tracker.poll_once())
+        assert len(relayer.calls) == 1
+        # re-track with cctp_minted already set → must NOT mint again
+        oid2 = self._track(tracker, "o-cctp2")
+        tracker._tracked[oid2].cctp_minted = True
+        # keep it IN_TRANSIT (adapter ready_to_mint) — guard should skip
+        tracker._on_bridge_complete = AsyncMock()
+        asyncio.run(tracker.poll_once())
+        assert len(relayer.calls) == 1  # unchanged
+
+    def test_mint_failure_retries(self):
+        from unittest.mock import AsyncMock
+        from minotaur_subnet.orderbook.orderbook import OrderStatus
+        relayer = _RecordingRelayer(fail=True)
+        tracker = self._tracker(relayer)
+        oid = self._track(tracker)
+        tracker._on_bridge_complete = AsyncMock()
+        completed = asyncio.run(tracker.poll_once())
+        assert completed == 0                       # not completed
+        assert oid in tracker._tracked              # still tracked (retry)
+        assert tracker._tracked[oid].cctp_minted is False
+        tracker._on_bridge_complete.assert_not_awaited()

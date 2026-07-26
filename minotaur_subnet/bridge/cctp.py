@@ -13,15 +13,14 @@ current fast fee, CCTP silently downgrades to a Standard transfer
 (~13–19 min hard finality) — the quote fetches the live fee and adds
 headroom so a downgrade only happens if fees move sharply after quoting.
 
-SELF-RELAY REQUIRED: unlike Across/Hyperlane there is no permissionless
-relayer network delivering the mint — an integrator must submit
+SELF-RELAY: unlike Across/Hyperlane there is no permissionless relayer
+network delivering the mint — the platform submits
 ``receiveMessage(message, attestation)`` on the destination chain once
 Iris attests. ``check_status`` surfaces the attested message in
-``BridgeStatus.metadata`` and ``build_mint_interactions`` builds the
-destination call; wiring the BridgeTracker to submit it is the follow-up
-tracked in the design doc (§10 step 7). Until then this adapter must not
-be the selected rail in production (it registers behind
-``CCTP_ENABLED``, default OFF).
+``BridgeStatus.metadata`` (``ready_to_mint``); ``BridgeTracker`` polls for
+it and self-relays the mint via ``_submit_cctp_mint`` (relayer wallet →
+destination MessageTransmitterV2), then runs the destination leg. Still
+gated behind ``CCTP_ENABLED`` (default OFF) as a kill switch.
 
 Contract addresses are the CCTP v2 deployments (same address across EVM
 chains), env-overridable — verify against developers.circle.com before
@@ -272,13 +271,19 @@ class CCTPAdapter(BridgeAdapter):
         src_chain_id: int,
         dst_chain_id: int = 0,
     ) -> BridgeStatus:
-        """Poll Iris for the burn message's attestation/mint status.
+        """Poll Iris for the burn message's attestation status.
+
+        CCTP has no permissionless relayer: Iris only produces the
+        attestation; the PLATFORM must submit ``receiveMessage`` on the
+        destination to actually mint (BridgeTracker._submit_cctp_mint). So
+        this NEVER returns COMPLETED — Iris ``complete`` means the
+        attestation is ready, not that the mint happened. The tracker marks
+        completion after its mint tx confirms.
 
         Verdicts:
-          complete           → COMPLETED (mint executed on destination)
-          attestation ready  → IN_TRANSIT with metadata {message, attestation,
-                               ready_to_mint: True} — the relayer must submit
-                               receiveMessage on the destination
+          attestation ready (Iris ``complete`` / attestation present)
+                             → IN_TRANSIT + metadata {ready_to_mint: True,
+                               message, attestation} — tracker mints
           pending            → IN_TRANSIT / PENDING
         API trouble degrades to PENDING (keep polling). A burn cannot be
         stranded: the attestation eventually arrives and anyone can mint.
@@ -314,13 +319,14 @@ class CCTPAdapter(BridgeAdapter):
         msg = messages[0]
         status = str(msg.get("status", "")).lower()
         attestation = msg.get("attestation") or ""
+        attestation_ready = (
+            status == "complete"
+            or (bool(attestation) and attestation.lower() not in ("", "pending"))
+        )
 
-        if status == "complete":
-            return BridgeStatus(
-                status=BridgeStatusEnum.COMPLETED,
-                src_tx_hash=tx_hash,
-            )
-        if attestation and attestation.lower() not in ("", "pending"):
+        if attestation_ready and attestation and attestation.lower() != "pending":
+            # Attestation available → the platform can now mint. NOT COMPLETED:
+            # the mint only happens once BridgeTracker submits receiveMessage.
             return BridgeStatus(
                 status=BridgeStatusEnum.IN_TRANSIT,
                 src_tx_hash=tx_hash,
