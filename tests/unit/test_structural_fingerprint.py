@@ -174,3 +174,25 @@ class TestStageResultAcceptsFingerprint:
         from minotaur_subnet.harness.screening import StageResult
         sr = StageResult(stage=1, passed=True, structural_fingerprint="fp")
         assert sr.structural_fingerprint == "fp"
+
+
+class TestStructuralFingerprintPersistence:
+    """Regression: the value computed in screening must actually REACH the
+    record. screening_pipeline persists it via store.set_structural_fingerprint
+    (mirroring set_content_fingerprint) — without that call every submission
+    reads structural_fingerprint=None and the dedup can never fire."""
+
+    def test_set_and_survives_reload(self, tmp_path):
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+        p = tmp_path / "subs.json"
+        store = SubmissionStore(persist_path=p)
+        sub = store.create(
+            repo_url="https://example.com/r.git", commit_hash="c1",
+            epoch=1, hotkey="hk", round_id="r1",
+        )
+        store.set_structural_fingerprint(sub.submission_id, "s" * 64)
+        # in-memory
+        assert store.get(sub.submission_id).structural_fingerprint == "s" * 64
+        # survives to_dict/from_dict round-trip (fresh store from same file)
+        store2 = SubmissionStore(persist_path=p)
+        assert store2.get(sub.submission_id).structural_fingerprint == "s" * 64
