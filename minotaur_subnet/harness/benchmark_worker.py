@@ -2572,6 +2572,17 @@ class BenchmarkWorker:
                 # deployed on more than one chain. None on legacy rows / single
                 # -chain apps (transition falls back to the primary deployment).
                 "chain_id": getattr(r, "chain_id", None),
+                # PHASE 0, OBSERVE-ONLY: destination-chain delivery for a
+                # cross-chain plan (exact decimal wei string) and where the
+                # bridged amount came from ("simulated" = observed leaving the
+                # source fork, "declared" = the plan's own number). None on
+                # every single-chain row. Recorded so the leader/follower
+                # determinism check has something to compare BEFORE any
+                # scoring rule is allowed to consume it — never feeds `score`.
+                "destination_delivered": getattr(r, "destination_delivered", None),
+                "destination_amount_source": getattr(
+                    r, "destination_amount_source", None,
+                ),
             }
             # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
             # tag — ADDITIVE keys, present ONLY when the probe measured this

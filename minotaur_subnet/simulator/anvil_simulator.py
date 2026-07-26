@@ -2278,27 +2278,49 @@ class MultiChainSimulator:
         self,
         plan: ExecutionPlan,
         bridge_registry: Any = None,
+        deterministic_bridge: bool = False,
         **kwargs: Any,
     ) -> SimulationResult:
         """Simulate a cross-chain plan by running each leg independently.
 
         Source and destination legs are simulated on their respective chain
-        forks.  Bridge legs are not simulated — a quote estimate is used
-        instead.  Falls back to single-chain ``simulate()`` when the plan
-        has no ``metadata["legs"]``.
+        forks.  Bridge legs are not simulated — an estimate is used instead.
+        Accepts the legacy ``metadata["legs"]`` convention directly and
+        projects the modern ``multi_leg_plan`` / ``cross_chain_plan`` shapes
+        onto it; falls back to single-chain ``simulate()`` when the plan is
+        not multi-leg at all.
 
         Args:
-            plan: Execution plan (may contain ``metadata["legs"]``).
-            bridge_registry: Optional ``BridgeRegistry`` for bridge quotes.
+            plan: Execution plan (legacy ``metadata["legs"]`` or a modern
+                cross-chain shape).
+            bridge_registry: Optional ``BridgeRegistry`` for LIVE bridge
+                quotes. Correct for the live rail; must NOT be passed from
+                the benchmark — see ``deterministic_bridge``.
+            deterministic_bridge: Use the fixed-fee benchmark bridge model
+                (simulator/cross_chain_bench) applied to the amount the
+                source leg was OBSERVED to move, instead of a live quote.
+                Required for any scored path: a live quote makes two
+                validators seed the destination fork differently, and the
+                solver's own declared output is self-reported. Ignores
+                ``bridge_registry`` when set.
             **kwargs: Forwarded to per-chain ``AnvilSimulator.simulate()``.
 
         Returns:
             Combined ``SimulationResult`` with ``leg_results`` and
             ``bridge_estimate`` populated.
         """
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            benchmark_bridge_estimate,
+            normalize_to_legs,
+            observed_bridged_amount,
+        )
+
+        if not plan.metadata.get("legs"):
+            normalized = normalize_to_legs(plan)
+            if normalized is None:
+                return await self.simulate(plan, **kwargs)
+            plan = normalized
         legs = plan.metadata.get("legs")
-        if not legs:
-            return await self.simulate(plan, **kwargs)
 
         leg_results: dict[int, Any] = {}
         bridge_estimate: dict[str, Any] | None = None
@@ -2342,7 +2364,27 @@ class MultiChainSimulator:
                 continue
 
             if leg.get("type") == "bridge":
-                # Don't simulate bridge — use quote estimate
+                # Don't simulate the bridge itself — estimate what arrives.
+                if deterministic_bridge:
+                    # Scored path. EXECUTE the deposit with its calldata
+                    # mocked to an ERC-20 transfer, rather than assuming it
+                    # succeeds: the proxy only holds what the source leg
+                    # actually produced, so a plan declaring a bridge amount
+                    # it never earned reverts here instead of being credited
+                    # for delivery on the far side. The amount is then read
+                    # back off the simulation — not off the plan.
+                    moved, amount_source = await self._simulate_mocked_bridge(
+                        plan, leg, kwargs,
+                    )
+                    bridge_estimate = benchmark_bridge_estimate(
+                        moved, leg.get("token_out", ""), amount_source,
+                    )
+                    leg_results[leg_id] = {
+                        "success": moved > 0,
+                        "type": "bridge",
+                        "bridge_estimate": bridge_estimate,
+                    }
+                    continue
                 if bridge_registry is not None:
                     try:
                         token_in = plan.metadata.get("bridge_token", "")
@@ -2434,6 +2476,64 @@ class MultiChainSimulator:
             leg_results=leg_results,
             bridge_estimate=bridge_estimate,
         )
+
+    async def _simulate_mocked_bridge(
+        self,
+        plan: ExecutionPlan,
+        leg: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[int, str]:
+        """Run a bridge leg with its calldata mocked; report what moved.
+
+        Returns ``(amount, source)`` where source is:
+          "simulated" — the deposit executed and this is the amount observed
+              leaving for the bridge. Trustworthy: an amount the plan didn't
+              actually earn cannot transfer.
+          "declared"  — the leg carries no bridge calldata to execute (the
+              solver's own plan shape, where the compiler hasn't injected it
+              yet), so the plan's declared amount is all there is. Weaker,
+              and labelled as such.
+          "unfilled"  — the deposit reverted, or moved nothing. No credit.
+        """
+        from minotaur_subnet.shared.types import mock_bridge_interactions
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            observed_bridged_amount,
+        )
+
+        try:
+            declared = int(leg.get("bridge_amount") or 0)
+        except (ValueError, TypeError):
+            declared = 0
+
+        leg_plan = extract_leg_plan(plan, leg["leg_id"])
+        if not leg_plan.interactions:
+            return max(0, declared), "declared"
+
+        sim = self.simulators.get(leg.get("chain_id", self.default_chain_id))
+        if sim is None:
+            return max(0, declared), "declared"
+
+        mocked = ExecutionPlan(
+            intent_id=leg_plan.intent_id,
+            interactions=mock_bridge_interactions(
+                leg_plan.interactions,
+                token_address=leg.get("token_in", "") or "",
+                amount=declared,
+            ),
+            deadline=leg_plan.deadline,
+            nonce=leg_plan.nonce,
+            metadata=leg_plan.metadata,
+        )
+        try:
+            result = await sim.simulate(mocked, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Mocked bridge leg simulation failed: %s", exc)
+            return 0, "unfilled"
+        if not result.success:
+            return 0, "unfilled"
+
+        moved = observed_bridged_amount(result.token_transfers)
+        return (moved, "simulated") if moved > 0 else (0, "unfilled")
 
     def is_connected(self) -> bool:
         """True if at least one chain simulator is connected."""
