@@ -573,12 +573,17 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
 def build_stats_response(rows: list[dict[str, Any]], window_days: int) -> dict[str, Any]:
     by_chain: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
+        # Reprobe rows are synthetic re-asks of known open blindspots (minotaur-
+        # only, no aggregators) — they feed blindspot classification, never the
+        # stats: counting them would re-count served/unserved demand.
+        if row.get("trade_source") == "reprobe":
+            continue
         by_chain[int(row["chain_id"])].append(row)
     chains = [compute_chain_stats(rws, cid) for cid, rws in sorted(by_chain.items())]
     return {
         "generated_at": time.time(),
         "window_days": window_days,
-        "total_comparisons": len(rows),
+        "total_comparisons": sum(len(rws) for rws in by_chain.values()),
         "sources": list(SOURCES),
         "note": CAVEATS_NOTE,
         "chains": chains,

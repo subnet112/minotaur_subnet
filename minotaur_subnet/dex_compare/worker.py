@@ -27,6 +27,7 @@ from .aggregators import build_aggregators
 from .config import DexCompareConfig
 from .minotaur_client import fetch_minotaur_quote
 from .models import STATUS_WARMING_UP, ComparisonRow, TradeDescriptor
+from .reprobe import BlindspotReprober
 from .sources import build_source, is_candidate
 from .store import DexCompareStore
 from .tokens_resolve import DecimalsCache, SymbolCache, resolve_trade_tokens
@@ -68,6 +69,8 @@ class DexCompareWorker:
         self._price_cache: dict[tuple[int, str], tuple[float, float]] = {}
         # chain -> (native_usd, monotonic_ts) — ETH/native price for gas/fee conversion.
         self._native_cache: dict[int, tuple[float, float]] = {}
+        # Active blindspot re-probe (drip + on-adoption sweep); shares the caches.
+        self._reprober = BlindspotReprober(store, config, self._decimals, self._symbols)
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def run_loop(self, interval: float | None = None) -> None:
@@ -113,17 +116,24 @@ class DexCompareWorker:
         random draw), so every enabled chain advances each cycle regardless of
         corpus share. Returns the number of rows written this cycle.
         """
+        # No early-out on an empty sample — the reprobe tick below must still run
+        # (a quiet corpus is exactly when open blindspots would otherwise starve).
         orders = await self._source.sample(self._cfg.supported_chain_ids)
-        if not orders:
-            return 0
 
         written = 0
-        for order in orders:
+        for order in orders or []:
             try:
                 if await self._run_one_comparison(order):
                     written += 1
             except Exception as exc:  # noqa: BLE001 — one trade must not kill the rest
                 logger.exception("dex-compare comparison error: %s", exc)
+
+        # Active blindspot re-probe (drip + adoption sweep) after the normal
+        # comparisons — never lets a reprobe failure kill the main loop.
+        try:
+            written += await self._reprober.tick(self._session)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("dex-compare reprobe tick error: %s", exc)
 
         # Occasional prune (~1/50 cycles) — keeps growth bounded off the hot path.
         if written and self._rng.random() < 0.02:
