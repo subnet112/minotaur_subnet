@@ -46,6 +46,10 @@ class BridgeStatus:
     dst_tx_hash: str | None = None
     amount_received: int | None = None
     error: str | None = None
+    # Adapter-specific payload for the tracker (additive). CCTP uses it to
+    # surface the attested message the platform must self-relay on the
+    # destination ({ready_to_mint, message, attestation}).
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BridgeAdapter(ABC):
