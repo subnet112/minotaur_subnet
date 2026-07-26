@@ -39,6 +39,15 @@ class OrderStatus(str, Enum):
     ROLLING_BACK = "rolling_back"    # Multi-leg: forward failed, executing rollback
     ROLLED_BACK = "rolled_back"      # Multi-leg: rollback completed
     PARTIAL_ROLLBACK = "partial_rollback"  # Multi-leg: rollback partially completed
+    AWAITING_USER_DECISION = "awaiting_user_decision"  # Multi-leg: leg failed with
+    #                              funds in a safe state (escrow / refundable);
+    #                              user picks revert (pre-agreed plan) or refresh
+    #                              (new quote for the failed leg). Expires into
+    #                              auto-revert (CROSS_CHAIN_DECISION_WINDOW_S).
+    REFRESHING = "refreshing"        # Multi-leg: user chose refresh — the failed
+    #                              leg re-quotes as a NEW single-chain order over
+    #                              the escrowed asset; this order's orchestration
+    #                              is done (escrowRefund stays the backstop).
 
 
 @dataclass
