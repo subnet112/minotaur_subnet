@@ -27,6 +27,21 @@ submits two minutes after a bot flood loses only the builds that PHYSICALLY
 started before it arrived (~1 per 1-3 min), and outranks every queued bot for
 the next unit. Budget-winners keep today's near-immediate build feedback.
 
+HOLDBACK (late-senior protection). Pacing orders waiters who are PRESENT, but
+when builds finish in seconds (warm docker caches on unchanged re-submissions)
+the whole budget can be spent on arrival order minutes after open — before a
+slower-submitting senior miner's pipeline has even pushed (observed 2026-07-26:
+the most senior waiter, ~40h since last bench, arrived 8 min after open and
+found 8/8 units gone to a 48-second bot flood, twice in a row). So the last
+``SOLVER_BUILD_HOLDBACK_UNITS`` units (default 3; 0 disables) are not
+dispensable until ``SOLVER_BUILD_HOLDBACK_SECONDS`` (default 600) after the
+round's gate state is created (~= the first submission's stage-2 entry): the
+flood spends the immediate units, and anyone arriving within the window gets
+ranked by seniority for the held-back remainder. A quiet round loses nothing —
+the units dispense the moment the window lapses (waiters re-dispatch on their
+poll tick, so no grant/release event is needed) and post-close stragglers keep
+the full budget exactly as before.
+
 ONE WAIT-TIME QUEUE (no pools). Units are handed to waiters by
 ``rotation.wait_ts`` seniority — "waiting since when": a hotkey's (actor's) last
 bench, or, if it never benched, its FIRST-SEEN time. A freshly-minted identity's
@@ -116,6 +131,33 @@ def round_build_budget() -> int:
         return 8
 
 
+def holdback_units() -> int:
+    """How many budget units are reserved for the holdback window —
+    ``SOLVER_BUILD_HOLDBACK_UNITS``, default 3 in code, 0 = no holdback
+    (kill-switch: exact pre-holdback dispatch). Values above the round budget
+    simply hold the whole budget until the window lapses.
+    """
+    raw = os.environ.get("SOLVER_BUILD_HOLDBACK_UNITS", "3").strip() or "3"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
+def holdback_seconds() -> float:
+    """How long after gate creation the held-back units stay reserved —
+    ``SOLVER_BUILD_HOLDBACK_SECONDS``, default 600. Anchored at ensure_round
+    (the first stage-2 entry of the round, seconds after open under a flood);
+    in a quiet round the anchor drifts later, which is harmless — a quiet
+    round has budget to spare either way.
+    """
+    raw = os.environ.get("SOLVER_BUILD_HOLDBACK_SECONDS", "600").strip() or "600"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 600.0
+
+
 def _dispatch_concurrency() -> int:
     """Grant pacing width — mirrors screening's stage-2 build semaphore
     (``SCREENING_BUILD_CONCURRENCY``, default 1) so granted builds never queue
@@ -183,6 +225,7 @@ class _RoundGateState:
     in_flight: set[str] = field(default_factory=set)
     waiters: list[_Waiter] = field(default_factory=list)
     flushed: bool = False
+    holdback_lapse_logged: bool = False
 
     @property
     def total_charged(self) -> int:
@@ -332,6 +375,29 @@ class BuildBudgetGate:
             len(state.in_flight), len(state.waiters),
         )
 
+    def _dispensable_budget(self, state: _RoundGateState) -> int:
+        """The budget _dispatch may spend RIGHT NOW: the full budget once the
+        holdback window has lapsed (or with holdback disabled), else the
+        budget minus the held-back units. Only pre-flush dispatch is bounded
+        by this — the post-close straggler grant in acquire() keeps the full
+        budget on purpose (the window is long past by any real close).
+        """
+        held = holdback_units()
+        if held <= 0:
+            return state.budget
+        if self._now() - state.now_at < holdback_seconds():
+            return max(0, state.budget - held)
+        if not state.holdback_lapse_logged:
+            state.holdback_lapse_logged = True
+            if state.charged >= state.budget - held:
+                logger.info(
+                    "[build-budget] %s: holdback window lapsed — %d held "
+                    "unit(s) now dispensable (%d/%d spent, %d waiting)",
+                    state.round_id, min(held, state.budget),
+                    state.charged, state.budget, len(state.waiters),
+                )
+        return state.budget
+
     def _dispatch(self, state: _RoundGateState) -> None:
         if state.flushed:
             return
@@ -339,7 +405,7 @@ class BuildBudgetGate:
         while (
             state.waiters
             and len(state.in_flight) < concurrency
-            and state.charged < state.budget
+            and state.charged < self._dispensable_budget(state)
         ):
             pick = self._pick_next(state)
             if pick is None:
@@ -429,6 +495,13 @@ class BuildBudgetGate:
             try:
                 await asyncio.wait_for(waiter.event.wait(), timeout=_WAIT_POLL_SECONDS)
             except asyncio.TimeoutError:
+                # Held-back units dispense on a clock, not an event: with no
+                # grant/release traffic after the holdback window lapses,
+                # somebody has to run dispatch — the poll tick is that
+                # somebody (worst case one poll interval of extra latency).
+                self._dispatch(state)
+                if waiter.outcome is not None:
+                    return waiter.outcome
                 # Round closed without a rotation flush (manual close / abort)
                 # — self-evict so the coroutine never waits forever. The
                 # caller parks the submission no-fault.
@@ -535,6 +608,7 @@ class BuildBudgetGate:
             return None
         return {
             "budget": state.budget,
+            "dispensable_budget": self._dispensable_budget(state),
             "charged_count": state.charged,
             "charged": sorted(state.charged_ids),
             "charged_actors": sorted(state.charged_actors),
