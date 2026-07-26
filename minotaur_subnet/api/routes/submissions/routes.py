@@ -42,6 +42,8 @@ from .models import (
     CloseRoundRequest,
     DiagnosticScoreRequest,
     SolverChampionResponse,
+    SolverQueueEntry,
+    SolverQueueResponse,
     SolverRoundResponse,
     SolverRoundSummary,
     SolverRoundsResponse,
@@ -1775,6 +1777,10 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
         effective_epoch=d.get("effective_epoch"),
         effective_at=epoch_start_ts(d.get("effective_epoch")),
         abort_reason=d.get("abort_reason"),
+        incumbent_hotkey=d.get("incumbent_hotkey"),
+        benched_slate=(
+            list(d["benched_slate"]) if isinstance(d.get("benched_slate"), list) else None
+        ),
         created_at=float(d.get("created_at") or 0.0),
         updated_at=float(d.get("updated_at") or 0.0),
     )
@@ -1803,6 +1809,85 @@ async def list_solver_rounds(
         limit=limit,
         offset=offset,
         rounds=[_round_summary_from_dict(d) for d in rows],
+    )
+
+
+@router.get("/solver/queue", response_model=SolverQueueResponse)
+async def get_solver_queue(
+    hotkey: str | None = Query(None),
+) -> SolverQueueResponse:
+    """Rotation-queue standing per hotkey: last benched, first seen, seniority.
+
+    A read-only join of the rotation ledger (harness/rotation.py) with the
+    actor resolver (harness/actor.py) — the SAME inputs the close-time slate
+    selection sorts by, so a miner can see exactly where they stand instead of
+    inferring it from waitlist prose: ``last_benched_at`` answers "when was I
+    last benchmarked", ``waiting_since`` is the seniority clock the next slate
+    sorts by (lower = seated sooner), and ``rank`` is the indicative position
+    among distinct actors. Powers the dashboard's per-miner stats page.
+
+    Leader-local by nature: the ledger is the leader's admission-control state,
+    so on followers / split benchmark workers the file is absent and the queue
+    is empty — same category as the waitlist context on submission status.
+    Public read: the ledger holds only hotkeys + timestamps, all reconstructible
+    from public submission history and on-chain coldkeys (the rotation docstring
+    explicitly promises the ordering is recomputable from public data).
+
+    ``?hotkey=`` filters to one entry AFTER ranking, so a single-miner query
+    still reports the global rank/total.
+    """
+    from minotaur_subnet.harness.actor import (
+        actor_first_seen,
+        actor_last_selected,
+        snapshot_resolver,
+    )
+    from minotaur_subnet.harness.rotation import (
+        RotationLedger,
+        rotation_ledger_path,
+        wait_ts,
+    )
+
+    ledger = RotationLedger(rotation_ledger_path())
+    benched = ledger.load()
+    seen = ledger.load_seen()
+    resolver = snapshot_resolver()
+    now = time.time()
+    actor_benched = (
+        actor_last_selected(benched, resolver) if resolver is not None else {}
+    )
+    actor_seen = actor_first_seen(seen, resolver) if resolver is not None else {}
+    uid_by_hotkey = _hotkey_to_uid_map()
+
+    entries: list[SolverQueueEntry] = []
+    for hk in set(benched) | set(seen):
+        actor = resolver(hk) if resolver is not None else None
+        entries.append(SolverQueueEntry(
+            hotkey=hk,
+            miner_uid=uid_by_hotkey.get(hk),
+            actor=actor,
+            first_seen_at=seen.get(hk),
+            last_benched_at=benched.get(hk),
+            waiting_since=(
+                wait_ts(actor, actor_benched, actor_seen, now)
+                if actor is not None
+                else wait_ts(hk, benched, seen, now)
+            ),
+        ))
+    # Seniority order. The hotkey tie-break is only for a stable listing — the
+    # real per-round tie-break is the salted per-round shuffle (rotation_sort_key).
+    entries.sort(key=lambda e: (e.waiting_since, e.hotkey))
+    ranks: dict[str, int] = {}
+    for e in entries:
+        e.rank = ranks.setdefault(e.actor or e.hotkey, len(ranks) + 1)
+    total = len(entries)
+    if hotkey:
+        entries = [e for e in entries if e.hotkey == hotkey]
+    return SolverQueueResponse(
+        generated_at=now,
+        actor_keyed=resolver is not None,
+        total=total,
+        count=len(entries),
+        queue=entries,
     )
 
 
