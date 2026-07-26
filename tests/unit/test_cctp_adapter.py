@@ -20,7 +20,7 @@ from minotaur_subnet.bridge.cctp import (
     CCTPAdapter,
     DEPOSIT_FOR_BURN_SELECTOR,
     FAST_FINALITY_THRESHOLD,
-    MAX_FEE_HEADROOM_BPS,
+    MAX_FEE_HEADROOM_PCT,
     MESSAGE_TRANSMITTER_V2,
     RECEIVE_MESSAGE_SELECTOR,
     TOKEN_MESSENGER_V2,
@@ -62,7 +62,7 @@ class TestQuote:
         assert q.metadata["dst_domain"] == CCTP_DOMAINS[8453]
         assert q.metadata["min_finality_threshold"] == FAST_FINALITY_THRESHOLD
         # maxFee carries headroom over the quoted fee
-        assert q.metadata["max_fee"] == AMOUNT * FAST_FEE_BPS * MAX_FEE_HEADROOM_BPS // (10_000 * 100)
+        assert q.metadata["max_fee"] == AMOUNT * FAST_FEE_BPS * MAX_FEE_HEADROOM_PCT // (10_000 * 100)
         assert q.metadata["max_fee"] > fee
 
     def test_non_usdc_rejected(self):

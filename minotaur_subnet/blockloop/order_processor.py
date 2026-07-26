@@ -340,17 +340,22 @@ class OrderProcessor:
 
         # Cross-chain plan compilation: solver provides CrossChainPlan,
         # platform compiles it into MultiLegPlan with bridge calldata + escrow.
+        # See _resolve_app_addresses for the fail-closed destination policy.
         cross_chain_plan_dict = plan.metadata.get("cross_chain_plan")
         if cross_chain_plan_dict and self.cross_chain_compiler is not None:
             try:
                 from minotaur_subnet.shared.types import CrossChainPlan
                 solver_plan = CrossChainPlan.from_dict(cross_chain_plan_dict)
+                app_addresses = self._resolve_app_addresses(
+                    order.app_id, solver_plan, deployed_contract, order.chain_id,
+                )
                 compiled = await self.cross_chain_compiler.compile(
                     solver_plan,
                     order_id=order.order_id,
                     user_address=order.submitted_by,
                     contract_address=deployed_contract or "",
                     deadline=int(order.deadline),
+                    app_addresses=app_addresses,
                 )
                 # Replace plan metadata with platform-compiled version
                 plan.metadata["multi_leg_plan"] = compiled.multi_leg_plan.to_dict()
@@ -373,6 +378,20 @@ class OrderProcessor:
                     self.order_persistence.sync(order.order_id)
                 # Remove solver's raw plan (prevent bypass)
                 plan.metadata.pop("cross_chain_plan", None)
+                # The App address per chain has to outlive this call: the
+                # plan-set resume path and /orders/{id}/bridge both read it
+                # back from the stored plan.
+                plan.metadata["contract_address"] = deployed_contract or ""
+                # Persist the COMPILED plan on the order. The earlier
+                # update_order(plan=...) above ran BEFORE compilation, so
+                # without this the stored plan never carries multi_leg_plan /
+                # cross_chain / plan_set — which is why GET
+                # /orders/{id}/bridge always answered "not a cross-chain
+                # order", and what the resume path below reads.
+                self.orderbook.update_order(
+                    order.order_id, plan=_plan_to_dict(plan),
+                )
+                self.order_persistence.sync(order.order_id)
                 logger.info(
                     "Cross-chain compiled for %s: %d legs, %d bridges",
                     order.order_id,
@@ -397,6 +416,30 @@ class OrderProcessor:
                     "Multi-leg order %s: %d forward legs, %d rollback legs",
                     order.order_id, len(multi_leg.forward_legs), len(multi_leg.rollback_legs),
                 )
+                # Plan-set gate: hold before the FIRST leg until the user has
+                # signed the compiled set. Nothing has executed yet, so
+                # waiting here costs only latency; executing here instead
+                # would spend the user's funds under quorum alone.
+                from minotaur_subnet.shared.feature_flags import (
+                    cross_chain_require_plan_set_signature,
+                )
+                if (
+                    cross_chain_require_plan_set_signature()
+                    and plan.metadata.get("plan_set")
+                    and not order.params.get("plan_set_signature")
+                ):
+                    self.orderbook.update_order(
+                        order.order_id,
+                        status=OrderStatus.AWAITING_PLAN_SET_SIGNATURE,
+                        error=None,
+                    )
+                    self.order_persistence.sync(order.order_id)
+                    logger.info(
+                        "Multi-leg order %s: awaiting plan-set signature "
+                        "(GET /orders/%s/plan-set to sign)",
+                        order.order_id, order.order_id,
+                    )
+                    return True
                 return await self.multi_leg_orchestrator.process(
                     order, multi_leg, deployed_contract,
                     plan_metadata=plan.metadata,
@@ -815,6 +858,55 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    def _resolve_app_addresses(
+        self,
+        app_id: str,
+        solver_plan: Any,
+        deployed_contract: str,
+        source_chain_id: int,
+    ) -> dict[int, str]:
+        """Map chain id → this App's contract address, for every chain the
+        plan touches.
+
+        The compiler pins each bridge's destination recipient to the App on
+        the receiving chain, because that is the only address
+        ``escrowDeposit`` can gate (it checks
+        ``IERC20(token).balanceOf(address(this))``) and therefore the only
+        one the user can reclaim from via the ``escrowRefund`` timelock.
+
+        FAIL CLOSED: if a bridge lands on a chain with no order-ready
+        deployment, the destination leg could never execute — the hop would
+        deliver into the user's wallet and the intent would dead-end with no
+        escrow behind it. Raising here rejects the order at compile time
+        instead of moving the user's funds to a place the plan can't
+        continue from.
+        """
+        from minotaur_subnet.bridge.compiler import CrossChainCompileError
+
+        addresses: dict[int, str] = {}
+        if deployed_contract:
+            addresses[int(source_chain_id)] = deployed_contract
+
+        for br in getattr(solver_plan, "bridge_requests", []) or []:
+            dst = int(br.dst_chain_id)
+            if dst in addresses:
+                continue
+            dep = self.app_store.get_deployment(app_id, chain_id=dst)
+            if dep is None or not dep.contract_address:
+                raise CrossChainCompileError(
+                    f"App {app_id} has no deployment on destination chain "
+                    f"{dst} — a bridge there would strand the intent (no "
+                    f"escrow, no executable destination leg)"
+                )
+            if not dep.status.is_order_ready():
+                raise CrossChainCompileError(
+                    f"App {app_id} deployment on destination chain {dst} is "
+                    f"not order-ready (status: {dep.status.value})"
+                )
+            addresses[dst] = dep.contract_address
+
+        return addresses
 
     async def _perpetual_funds_check(self, order: Any, spender: str) -> bool:
         """Live balance+allowance gate for a perpetual's NEXT fill (#1/#3).

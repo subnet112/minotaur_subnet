@@ -18,15 +18,19 @@ test-app:
 
 # Dev-track cross-chain lane — keeps bridge/ + multi-leg code compiling even
 # while CROSS_CHAIN_ENABLED=0 in prod. Always run in CI on every PR.
-# Runs unit + emulation cross-chain tests only; the E2E escrow test
-# (tests/e2e/test_cross_chain_escrow.py) runs under the e2e lane when Anvil
-# is available.
+# Selection is by MARKER, not by filename: test-unit excludes everything
+# marked cross_chain, so any file this list forgot would run in NO lane at
+# all (which is what happened to the Across/CCTP/plan-set/recovery suites —
+# 91 tests silently unexercised in CI). The E2E escrow test
+# (tests/e2e/test_cross_chain_escrow.py) still runs under the e2e lane when
+# Anvil is available.
 test-cross-chain:
 	CROSS_CHAIN_ENABLED=1 ./.venv/bin/pytest \
-		tests/unit/test_cross_chain_solver.py \
-		tests/unit/test_cross_chain_primitive.py \
-		tests/emulation/test_cross_chain.py \
-		-v --tb=short -m cross_chain
+		tests/unit/ tests/emulation/test_cross_chain.py \
+		-v --tb=short -m cross_chain \
+		--ignore=tests/unit/test_v3_foundations.py \
+		--ignore=tests/unit/test_vault_dip_solver.py \
+		--ignore=tests/unit/test_agent_loop.py
 
 # Emulation tests (requires Docker for local subtensor)
 test-emulation:

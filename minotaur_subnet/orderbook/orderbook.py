@@ -39,6 +39,12 @@ class OrderStatus(str, Enum):
     ROLLING_BACK = "rolling_back"    # Multi-leg: forward failed, executing rollback
     ROLLED_BACK = "rolled_back"      # Multi-leg: rollback completed
     PARTIAL_ROLLBACK = "partial_rollback"  # Multi-leg: rollback partially completed
+    AWAITING_PLAN_SET_SIGNATURE = "awaiting_plan_set_signature"  # Multi-leg:
+    #                              compiled and waiting for the user to sign the
+    #                              plan set (every forward + revert leg hash).
+    #                              Nothing has executed; POST
+    #                              /orders/{id}/plan-set-signature resumes it.
+    #                              Gated by CROSS_CHAIN_REQUIRE_PLAN_SET_SIG.
     AWAITING_USER_DECISION = "awaiting_user_decision"  # Multi-leg: leg failed with
     #                              funds in a safe state (escrow / refundable);
     #                              user picks revert (pre-agreed plan) or refresh

@@ -190,13 +190,16 @@ class HyperlaneAdapter(BridgeAdapter):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build approve + transferRemote interactions for the Warp Route.
 
         Args:
             quote: Quote from this adapter's quote() method.
-            sender: Address initiating the bridge (token holder / proxy).
+            recipient: Address credited on the destination chain (bytes32).
+            refund_recipient: Unused — a Hyperlane warp transfer has no
+                origin-refund path (accepted for interface symmetry).
 
         Returns:
             Two interactions:
@@ -209,7 +212,7 @@ class HyperlaneAdapter(BridgeAdapter):
 
         # Encode recipient as bytes32 (left-padded address)
         recipient_bytes32 = b"\x00" * 12 + bytes.fromhex(
-            sender.replace("0x", "")
+            recipient.replace("0x", "")
         )
 
         # 1. Approve underlying token to collateral contract
