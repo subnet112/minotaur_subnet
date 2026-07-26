@@ -300,6 +300,7 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         close_epoch=state.close_epoch,
         incumbent_submission_id=state.incumbent_submission_id,
         incumbent_image_id=state.incumbent_image_id,
+        incumbent_hotkey=state.incumbent_hotkey,
         benchmark_pack_hash=state.benchmark_pack_hash,
         committee_block=state.committee_block,
         committee_hash=state.committee_hash,
@@ -320,6 +321,9 @@ def _round_state_to_response(state: RoundState) -> SolverRoundResponse:
         ),
         certificate_quorum_required=certificate.quorum_required if certificate else None,
         certificate_approvals=len(certificate.approvals) if certificate else 0,
+        benched_slate=(
+            list(state.benched_slate) if state.benched_slate is not None else None
+        ),
         # Additive relative fields (always emitted — relative is the sole rule).
         **_round_relative_extra(state),
     )
