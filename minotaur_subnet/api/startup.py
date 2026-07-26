@@ -2448,39 +2448,43 @@ async def initialize(ctx: ServerContext) -> dict:
                 solver_round_poll_interval = 5.0
             try:
                 solver_round_open_seconds = float(
-                    os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "300").strip() or "300",
+                    os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "1200").strip() or "1200",
                 )
             except ValueError:
-                solver_round_open_seconds = 300.0
-            # Two-phase round defaults: a ~5-min OPEN phase (collect submissions +
-            # build/distribute images; SOLVER_ROUND_OPEN_SECONDS=300) followed by a
-            # CLOSED phase to benchmark the champion + the round's submissions and
+                solver_round_open_seconds = 1200.0
+            # Two-phase round defaults: a 20-min OPEN phase (collect submissions +
+            # build/distribute images; SOLVER_ROUND_OPEN_SECONDS=1200 — the sole
+            # cadence lever, production-soaked since 2026-07) followed by a CLOSED
+            # phase to benchmark the champion + the round's submissions and
             # certify. Benchmarking only starts at close (the round-anchored fork pin
             # seals on close_epoch), so the closed window must fit the post-close
             # batch — which routinely runs well over 5 min with several submissions
             # and/or a slow champion reference (each scenario re-quotes the champion).
-            # DECISION_EPOCHS=20 (20 epochs x EPOCH_SECONDS, ~20 min) gives that
-            # margin: too small a value silently aborts contested rounds
-            # (certification_deadline_elapsed) the instant after the leader decides to
-            # adopt, instead of adopting. Leader-driven + broadcast (followers adopt
-            # the leader's decision_deadline_epoch / effective_epoch), so it is the
-            # LEADER's value that governs a round; keep it fleet-uniform across the
-            # rollout so a leadership change doesn't shift the schedule mid-flight.
+            # The decision-window defaults below are the values production re-widened
+            # to on 2026-07-25 after the prior 45/14/9/47 set aborted ~40% of
+            # finalists (close→finalist ran 61 min > the 59-min window under a
+            # sybil-flood slate + the 100-scenario quote corpus): too small a value
+            # silently aborts contested rounds (certification_deadline_elapsed) the
+            # instant after the leader decides to adopt, instead of adopting.
+            # Leader-driven + broadcast (followers adopt the leader's
+            # decision_deadline_epoch / effective_epoch), so it is the LEADER's value
+            # that governs a round; keep it fleet-uniform across the rollout so a
+            # leadership change doesn't shift the schedule mid-flight.
             try:
                 solver_round_decision_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "45").strip() or "45",
+                    os.environ.get("SOLVER_ROUND_DECISION_EPOCHS", "70").strip() or "70",
                 )
             except ValueError:
-                solver_round_decision_epochs = 45
+                solver_round_decision_epochs = 70
             # Activate the certified champion just AFTER the decision deadline, so
             # certification has fully landed before the swap takes effect — keep
             # ACTIVATION_DELAY >= DECISION_EPOCHS.
             try:
                 solver_round_activation_delay_epochs = int(
-                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "47").strip() or "47",
+                    os.environ.get("SOLVER_ROUND_ACTIVATION_DELAY_EPOCHS", "72").strip() or "72",
                 )
             except ValueError:
-                solver_round_activation_delay_epochs = 47
+                solver_round_activation_delay_epochs = 72
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
@@ -2492,16 +2496,16 @@ async def initialize(ctx: ServerContext) -> dict:
             # SOLVER_ROUND_DECISION_EPOCHS). The fixed value above becomes the FLOOR.
             try:
                 solver_round_decision_base_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "14").strip() or "14",
+                    os.environ.get("SOLVER_ROUND_DECISION_BASE_EPOCHS", "24").strip() or "24",
                 )
             except ValueError:
-                solver_round_decision_base_epochs = 14
+                solver_round_decision_base_epochs = 24
             try:
                 solver_round_decision_per_sub_epochs = int(
-                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "9").strip() or "9",
+                    os.environ.get("SOLVER_ROUND_DECISION_PER_SUB_EPOCHS", "15").strip() or "15",
                 )
             except ValueError:
-                solver_round_decision_per_sub_epochs = 9
+                solver_round_decision_per_sub_epochs = 15
 
             def _round_open_elapsed(current_round) -> float:
                 return max(0.0, time.time() - float(current_round.created_at or time.time()))

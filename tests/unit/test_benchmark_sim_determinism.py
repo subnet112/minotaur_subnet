@@ -297,7 +297,8 @@ class TestSimulatorForkAnchor:
 #
 # A scoreIntent sim is a multi-second block of synchronous web3 RPCs. Run
 # inline on the API's single event loop it freezes every other route; the fix
-# offloads it to a worker thread (default OFF, SIM_OFFLOAD_TO_THREAD=1 enables).
+# offloads it to a worker thread (default ON, SIM_OFFLOAD_TO_THREAD=0 is the
+# kill-switch back to the inline path).
 # The offloaded body now runs CONCURRENTLY with loop-side fork access, so these
 # tests pin the two invariants that keep that safe + deterministic:
 #   * the sim runs off the loop thread but still under _fork_mutation_lock, and
@@ -309,8 +310,8 @@ class TestSimulatorForkAnchor:
 
 class TestSimOffloadKillSwitch:
     @pytest.mark.parametrize("val,expected", [
-        (None, False),         # unset → default OFF (lands dark; see the gate)
-        ("", False),           # empty → default OFF
+        (None, True),          # unset → default ON (production-soaked config)
+        ("", False),           # empty string → explicit off (matches "" or-default)
         ("0", False), (" 0 ", False), ("false", False),
         ("FALSE", False), ("no", False), ("off", False), ("garbage", False),
         ("1", True), (" 1 ", True), ("true", True), ("YES", True), ("on", True),

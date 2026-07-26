@@ -15,7 +15,7 @@ The socket timeout guard (#1052, see test_httpprovider_gets_socket_timeout) was
 necessary but insufficient: even a bounded 30s stall freezes the loop for 30s if
 it runs ON the loop. The fix offloads ``_simulate_inner`` to a worker thread via
 ``asyncio.to_thread`` under the existing ``_sim_lock`` (which still serializes
-per-fork snapshot state) — gated by ``SIM_OFFLOAD_TO_THREAD`` (default OFF; see
+per-fork snapshot state) — gated by ``SIM_OFFLOAD_TO_THREAD`` (default ON; see
 ``_sim_offload_enabled`` for the enabling gates). These tests pin the
 flag-ENABLED behavior; the flag-off inline path is pinned by
 test_benchmark_sim_determinism.py.
