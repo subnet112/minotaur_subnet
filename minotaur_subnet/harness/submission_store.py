@@ -365,6 +365,12 @@ class Submission:
     # — the "same code, same quota" identity that comment/whitespace/nonce
     # rotation cannot refresh. None on records that predate the metric.
     content_fingerprint: str | None = None
+    # Structural fingerprint (harness/structural_fingerprint, screening stage 1)
+    # — salt-invariant identity (constant values erased) that collapses a
+    # coldkey fleet shipping structurally-identical code even when each salts a
+    # constant to mint a distinct content_fingerprint. Consumed OBSERVE-ONLY by
+    # rotation's structural dedup; None on records that predate the metric.
+    structural_fingerprint: str | None = None
 
     # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
     # tree that provably does no work at runtime (unreachable files + dead
@@ -440,6 +446,7 @@ class Submission:
             "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
+            "structural_fingerprint": self.structural_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "unproductive_metric_version": self.unproductive_metric_version,
             "unproductive_top_offenders": self.unproductive_top_offenders,
@@ -469,6 +476,7 @@ class Submission:
             "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
+            "structural_fingerprint": self.structural_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
@@ -866,6 +874,7 @@ class SubmissionStore:
             coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
             content_fingerprint=record.get("content_fingerprint"),
+            structural_fingerprint=record.get("structural_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
             unproductive_metric_version=record.get("unproductive_metric_version"),
             unproductive_top_offenders=record.get("unproductive_top_offenders"),
@@ -2181,6 +2190,7 @@ class SubmissionStore:
                     coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
                     content_fingerprint=d.get("content_fingerprint"),
+                    structural_fingerprint=d.get("structural_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
                     unproductive_metric_version=d.get("unproductive_metric_version"),
                     unproductive_top_offenders=d.get("unproductive_top_offenders"),
