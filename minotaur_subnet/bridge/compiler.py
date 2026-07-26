@@ -56,15 +56,28 @@ class CrossChainCompiler:
         user_address: str,
         contract_address: str,
         deadline: int,
+        app_addresses: dict[int, str] | None = None,
     ) -> "CompiledCrossChainPlan":
         """Compile a solver's cross-chain plan into executable form.
 
         Args:
             solver_plan: The solver's CrossChainPlan (untrusted).
             order_id: The intent order ID.
-            user_address: The user's address (bridge recipient override).
+            user_address: The user's address — origin-refund target, escrow
+                beneficiary, and the fallback bridge recipient.
             contract_address: The App contract address on the source chain.
             deadline: Order deadline timestamp.
+            app_addresses: The App's contract address per chain id. The
+                bridge recipient on a chain with a following leg MUST be the
+                App there: ``escrowDeposit`` gates on
+                ``balanceOf(address(this))``, so a hop that delivers anywhere
+                else leaves the destination leg with nothing to spend and no
+                escrow to refund (see
+                docs/architecture/cross-chain-review-2026-07-26.md §2).
+                Omitted/unknown → falls back to ``user_address``, which keeps
+                funds safe in the user's wallet but ends the multi-leg flow
+                there; callers that need the flow to complete should resolve
+                this map and fail closed (``OrderProcessor`` does).
 
         Returns:
             CompiledCrossChainPlan with executable MultiLegPlan, escrow params,
@@ -109,8 +122,20 @@ class CrossChainCompiler:
             if i < len(solver_plan.bridge_requests):
                 br = solver_plan.bridge_requests[i]
 
-                # Override recipient with user address (solver can't control this)
-                safe_recipient = user_address
+                # Recipient/refund split — both platform-chosen, never
+                # solver-controlled. The destination fill goes to the App on
+                # the destination chain so escrowDeposit can gate it and the
+                # user can reclaim via the escrowRefund timelock; the ORIGIN
+                # refund (bridge never fills) goes straight to the user,
+                # whose wallet is already a terminal safe state.
+                safe_recipient = (app_addresses or {}).get(br.dst_chain_id) or user_address
+                if safe_recipient == user_address:
+                    logger.warning(
+                        "No App address for destination chain %d — bridging to "
+                        "the user's wallet; the destination leg cannot execute "
+                        "against it and no escrow will be recorded",
+                        br.dst_chain_id,
+                    )
 
                 # Get bridge quote
                 quote = await self.bridge_registry.best_quote(
@@ -139,7 +164,7 @@ class CrossChainCompiler:
                         f"Bridge adapter '{quote.protocol}' not found"
                     )
                 bridge_interactions = adapter.build_bridge_interactions(
-                    quote, safe_recipient,
+                    quote, safe_recipient, refund_recipient=user_address,
                 )
 
                 # Get simulation mock config from adapter
@@ -156,6 +181,8 @@ class CrossChainCompiler:
                     "bridge_estimated_output": quote.estimated_output,
                     "bridge_fee": quote.fee,
                     "bridge_recipient": safe_recipient,
+                    "bridge_refund_recipient": user_address,
+                    "bridge_recipient_is_app": safe_recipient != user_address,
                     "_platform_compiled": True,
                 }
                 forward_legs.append(LegPlan(
@@ -186,8 +213,13 @@ class CrossChainCompiler:
                         br.dst_chain_id, br.src_chain_id,
                     )
                     if reverse_quote and adapter:
+                        # Reverse bridge is the terminal step of a revert: the
+                        # user's own wallet on the source chain is the goal, and
+                        # an expiry refund on the destination chain should reach
+                        # them too. Both addresses are the user by design.
                         reverse_ixs = adapter.build_bridge_interactions(
                             reverse_quote, user_address,
+                            refund_recipient=user_address,
                         )
                         rollback_legs.append(LegPlan(
                             leg_index=100 + len(rollback_legs),

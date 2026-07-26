@@ -2368,7 +2368,53 @@ async def attach_plan_set_signature(order_id: str, request: Request) -> dict:
         except Exception:
             pass
 
-    return {"order_id": order_id, "plan_set_signature_attached": True}
+    result: dict[str, Any] = {
+        "order_id": order_id, "plan_set_signature_attached": True,
+    }
+
+    # Resume an order parked by the plan-set gate. Orchestration runs in the
+    # background: leg execution takes minutes (simulate → quorum → relay, per
+    # leg), far longer than an HTTP request should hold. The client polls
+    # GET /orders/{id} from here.
+    from minotaur_subnet.orderbook.orderbook import OrderStatus as _OS
+    if order.status == _OS.AWAITING_PLAN_SET_SIGNATURE:
+        bl = _block_loop
+        orchestrator = getattr(bl, "_multi_leg_orchestrator", None) if bl else None
+        if orchestrator is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Order is awaiting a plan-set signature but no multi-leg "
+                    "orchestrator is available on this node; the signature was "
+                    "attached and can be resumed from the leader"
+                ),
+            )
+        import asyncio as _asyncio
+        task = _asyncio.create_task(
+            _resume_plan_set_order(orchestrator, order_id),
+        )
+        # Keep a strong reference: the event loop only holds a weak one, so an
+        # unreferenced task can be garbage-collected mid-flight.
+        _RESUME_TASKS.add(task)
+        task.add_done_callback(_RESUME_TASKS.discard)
+        result["resuming"] = True
+
+    return result
+
+
+# Strong references to in-flight plan-set resume tasks (see above).
+_RESUME_TASKS: set = set()
+
+
+async def _resume_plan_set_order(orchestrator: Any, order_id: str) -> None:
+    """Background resume for a plan-set-gated order (errors are logged only —
+    a failed resume leaves the order parked, with nothing executed)."""
+    try:
+        await orchestrator.resume_after_plan_set_signature(order_id)
+    except Exception as exc:
+        logger.error(
+            "Plan-set resume failed for %s: %s", order_id, exc, exc_info=True,
+        )
 
 
 @router.get("/orders/{order_id}/recovery")

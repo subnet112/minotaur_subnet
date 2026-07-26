@@ -124,6 +124,9 @@ class MultiLegOrchestrator:
                                 "src_chain_id": src_chain_id,
                                 "dst_chain_id": dst_chain_id,
                                 "bridge_protocol": bridge_protocol,
+                                # Which leg the hop belongs to — reported as
+                                # failed_leg_index if the bridge never delivers.
+                                "bridge_leg_index": dep.leg_index,
                                 "contract_address": contract_address,
                                 "multi_leg_plan": multi_leg_plan.to_dict(),
                                 "remaining_legs": [l.to_dict() for l in remaining_legs],
@@ -374,6 +377,124 @@ class MultiLegOrchestrator:
         )
         return True
 
+    async def resume_after_plan_set_signature(self, order_id: str) -> dict:
+        """Start orchestration for an order parked awaiting its plan-set sig.
+
+        Called by POST /orders/{id}/plan-set-signature once the signature has
+        been verified and attached. The compiled plan is read back from the
+        stored order (order_processor persists it before parking), so this
+        survives a restart between compile and signature — the user's wallet
+        prompt can take as long as it takes. If the restart lands between the
+        signature and the resume, recover_parked_orders re-fires this at boot.
+
+        Raises ValueError on bad state; the caller maps it to an HTTP error.
+        """
+        from minotaur_subnet.shared.types import MultiLegPlan
+
+        order = self.orderbook.get(order_id)
+        if order is None:
+            raise ValueError(f"Order not found: {order_id}")
+        if order.status != OrderStatus.AWAITING_PLAN_SET_SIGNATURE:
+            raise ValueError(
+                f"Order {order_id} is not awaiting a plan-set signature "
+                f"(status={getattr(order.status, 'value', order.status)})"
+            )
+        if not order.params.get("plan_set_signature"):
+            raise ValueError(f"Order {order_id} has no plan-set signature attached")
+
+        plan = order.plan or {}
+        metadata = plan.get("metadata", {}) if isinstance(plan, dict) else {}
+        multi_leg_dict = metadata.get("multi_leg_plan")
+        if not multi_leg_dict:
+            raise ValueError(
+                f"Order {order_id} has no compiled multi-leg plan to resume"
+            )
+        multi_leg = MultiLegPlan.from_dict(multi_leg_dict)
+
+        logger.info("Multi-leg %s: resuming after plan-set signature", order_id)
+        ok = await self.process(
+            order, multi_leg, metadata.get("contract_address", ""),
+            plan_metadata=metadata,
+        )
+        final = self.orderbook.get(order_id)
+        return {
+            "resumed": True,
+            "success": bool(ok),
+            "status": getattr(final.status, "value", str(final.status)) if final else "unknown",
+        }
+
+    async def recover_parked_orders(self) -> dict[str, int]:
+        """Boot sweep: re-arm every multi-leg order parked on user action.
+
+        Both parked states depend on a live in-process task — the plan-set
+        resume fired from the attach endpoint, and the decision-window
+        watcher — and neither survives a restart. Worse, parked orders
+        aren't in the OPEN set that ``load_open_orders`` restores, so before
+        this sweep a restart made them unreachable to the API entirely.
+
+        Reloads them into the OrderBook, then:
+          - AWAITING_PLAN_SET_SIGNATURE **with** a signature → resume
+            orchestration (the signature landed, the process died before the
+            legs ran);
+          - AWAITING_PLAN_SET_SIGNATURE **without** one → leave parked; the
+            user hasn't signed, and nothing has executed;
+          - AWAITING_USER_DECISION unresolved → re-arm the timeout watcher
+            on its ORIGINAL deadline, so an expired window fires promptly
+            instead of silently never firing.
+
+        Never raises: a failed recovery must not stop the block loop.
+        """
+        counts = {"reloaded": 0, "resumed": 0, "watchers_rearmed": 0}
+        if self.order_persistence is None or self.orderbook is None:
+            return counts
+
+        try:
+            parked = self.order_persistence.load_parked_orders(self.orderbook)
+        except Exception as exc:
+            logger.error("Parked-order reload failed: %s", exc, exc_info=True)
+            return counts
+        counts["reloaded"] = len(parked)
+
+        for order in parked:
+            try:
+                if order.status == OrderStatus.AWAITING_PLAN_SET_SIGNATURE:
+                    if not order.params.get("plan_set_signature"):
+                        continue
+                    logger.info(
+                        "Boot recovery: resuming %s (plan-set signature was "
+                        "attached before restart)", order.order_id,
+                    )
+                    asyncio.create_task(
+                        self._recover_resume(order.order_id),
+                    )
+                    counts["resumed"] += 1
+                elif order.status == OrderStatus.AWAITING_USER_DECISION:
+                    recovery = order.params.get("recovery") or {}
+                    if recovery.get("resolved"):
+                        continue
+                    deadline = int(recovery.get("decision_deadline") or 0)
+                    logger.info(
+                        "Boot recovery: re-arming decision watcher for %s "
+                        "(deadline %d)", order.order_id, deadline,
+                    )
+                    asyncio.create_task(
+                        self._decision_timeout_watch(order.order_id, deadline),
+                    )
+                    counts["watchers_rearmed"] += 1
+            except Exception as exc:
+                logger.error(
+                    "Boot recovery failed for %s: %s", order.order_id, exc,
+                )
+        return counts
+
+    async def _recover_resume(self, order_id: str) -> None:
+        """Background plan-set resume for the boot sweep (logs, never raises —
+        a failure leaves the order parked, with nothing executed)."""
+        try:
+            await self.resume_after_plan_set_signature(order_id)
+        except Exception as exc:
+            logger.error("Boot resume failed for %s: %s", order_id, exc)
+
     async def _fail_leg(
         self,
         order: Order,
@@ -409,6 +530,8 @@ class MultiLegOrchestrator:
         plan_metadata: dict | None,
         failed_leg_index: int,
         reason: str,
+        options: list[str] | None = None,
+        expiry_status: Any = None,
     ) -> None:
         """Park a failed multi-leg order in AWAITING_USER_DECISION.
 
@@ -422,10 +545,17 @@ class MultiLegOrchestrator:
                       failed leg re-quotes as a NEW single-chain order over
                       the escrowed asset
         No decision by the deadline → auto-revert (never leave funds waiting
-        on an absent user past the escrow window). If this process restarts
-        mid-window the watcher dies: the decision endpoint still resolves,
-        and the on-chain escrowRefund timelock remains the unconditional
-        backstop.
+        on an absent user past the escrow window). A restart mid-window kills
+        the watcher task, but recover_parked_orders re-arms it at boot on the
+        same deadline; the on-chain escrowRefund timelock remains the
+        unconditional backstop underneath both.
+
+        ``options`` narrows the offer when a choice isn't actually available.
+        A failed bridge HOP passes ["refresh"]: nothing reached the
+        destination, so the revert legs (reverse-bridges that run there)
+        have no funds to move and offering "revert" would be a lie. With no
+        revert available, expiry falls through to ``expiry_status`` (a
+        terminal state) instead of auto-reverting.
         """
         import time as _time
 
@@ -433,13 +563,18 @@ class MultiLegOrchestrator:
             cross_chain_decision_window_s,
         )
 
+        options = list(options) if options else ["revert", "refresh"]
         deadline = int(_time.time()) + cross_chain_decision_window_s()
         # Everything the resolver needs must survive in order.params — the
         # in-memory leg objects don't outlive a restart.
         order.params["recovery"] = {
             "failed_leg_index": failed_leg_index,
             "reason": reason,
-            "options": ["revert", "refresh"],
+            "options": options,
+            "expiry_status": (
+                getattr(expiry_status, "value", expiry_status)
+                if expiry_status is not None else None
+            ),
             "decision_deadline": deadline,
             "completed_legs": [l.to_dict() for l in completed_legs],
             "rollback_legs": [l.to_dict() for l in rollback_legs],
@@ -476,6 +611,19 @@ class MultiLegOrchestrator:
             if order.status != OrderStatus.AWAITING_USER_DECISION:
                 return
             if _time.time() >= deadline:
+                options = recovery.get("options") or ["revert", "refresh"]
+                if "revert" not in options:
+                    # Nothing to revert (failed bridge hop — the origin
+                    # refund is already the resolution). Settle into the
+                    # terminal state rather than pretending a revert ran.
+                    expiry = recovery.get("expiry_status") or OrderStatus.BRIDGE_FAILED
+                    logger.info(
+                        "Multi-leg %s: decision window expired with no revert "
+                        "option — settling as %s", order_id, expiry,
+                    )
+                    self.orderbook.update_order(order_id, status=expiry)
+                    self._sync(order_id)
+                    return
                 logger.info(
                     "Multi-leg %s: decision window expired — auto-revert",
                     order_id,
@@ -510,6 +658,12 @@ class MultiLegOrchestrator:
         recovery = order.params.get("recovery") or {}
         if recovery.get("resolved"):
             raise ValueError(f"Order {order_id} decision already resolved")
+        offered = recovery.get("options") or ["revert", "refresh"]
+        if action not in offered:
+            raise ValueError(
+                f"Action '{action}' is not available for order {order_id} "
+                f"(offered: {', '.join(offered)})"
+            )
 
         recovery["resolved"] = action
         order.params["recovery"] = recovery

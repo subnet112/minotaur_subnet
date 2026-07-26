@@ -115,6 +115,11 @@ class AcrossAdapter(BridgeAdapter):
 
     PROTOCOL = "across"
 
+    # An unfilled deposit is refunded to the depositor on the ORIGIN chain at
+    # fillDeadline — the one rail here where "didn't deliver" means the user
+    # gets their funds back where they started.
+    REFUNDS_ON_ORIGIN = True
+
     def _resolve_pair(
         self, token_in: str, src_chain_id: int, dst_chain_id: int,
     ) -> tuple[str, str, str] | None:
@@ -238,16 +243,25 @@ class AcrossAdapter(BridgeAdapter):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build approve + depositV3 interactions for the origin SpokePool.
 
-        ``sender`` (the compiler's safe_recipient — always the user/escrow,
-        never solver-controlled) is pinned as BOTH depositor and recipient:
-        the depositor receives the origin-chain refund if the deposit
-        expires, and the recipient receives the destination fill. Fills must
-        match these params exactly, so nobody downstream can redirect them.
+        Both addresses come from the compiler (never solver-controlled) and
+        are pinned into the deposit — fills must match the deposit params
+        exactly, so nobody downstream can redirect either one:
+
+        - ``recipient`` receives the destination fill. For a multi-leg
+          intent that is the destination App contract, so the bridged funds
+          land where ``escrowDeposit`` can gate them and ``escrowRefund``
+          can return them to the user after the timelock.
+        - ``refund_recipient`` becomes the ``depositor``, who is refunded on
+          the ORIGIN chain if no relayer fills by ``fillDeadline`` (and who
+          may call Across's speed-up). This stays the user: an origin refund
+          into the destination app would be stranded on the wrong chain.
         """
+        depositor = refund_recipient or recipient
         spoke_pool = quote.metadata["spoke_pool"]
         quote_timestamp = quote.metadata["quote_timestamp"]
         fill_deadline = quote.metadata["fill_deadline"]
@@ -264,8 +278,8 @@ class AcrossAdapter(BridgeAdapter):
                 "uint32", "uint32", "uint32", "bytes",
             ],
             [
-                sender,                    # depositor (refund target on expiry)
-                sender,                    # recipient (destination fill target)
+                depositor,                 # depositor (refund target on expiry)
+                recipient,                 # recipient (destination fill target)
                 quote.token_in,
                 quote.token_out,
                 quote.amount_in,

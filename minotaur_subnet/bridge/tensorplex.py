@@ -112,7 +112,8 @@ class TensorplexAdapter(BridgeAdapter):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build EVM interactions for Ethereum → Bittensor bridge direction.
 
