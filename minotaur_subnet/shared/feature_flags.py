@@ -50,6 +50,34 @@ def cross_chain_user_decision_enabled() -> bool:
     return _env_bool("CROSS_CHAIN_USER_DECISION", default=False)
 
 
+def cross_chain_require_plan_set_signature() -> bool:
+    """Hold a compiled multi-leg order until the user has signed its plan set.
+
+    The plan set only exists AFTER platform compilation (it hashes the
+    compiled legs, including live bridge calldata), and compilation is
+    immediately followed by execution — so without this gate there is no
+    moment at which a wallet can sign, ``order.params["plan_set_signature"]``
+    is always absent, and every leg falls back to the legacy quorum-only
+    ``executeLeg``. That is the "destination leg executes with an empty user
+    signature" hole (docs/architecture/cross-chain-intents.md §5).
+
+    ON: a compiled multi-leg order parks in ``AWAITING_PLAN_SET_SIGNATURE``.
+    The client fetches GET /orders/{id}/plan-set, signs
+    PlanSetApproval(orderId, planSetHash), and POSTs it back; the attach
+    endpoint resumes orchestration. Nothing has executed and no funds have
+    moved while it waits, so an order the user never signs simply expires at
+    its own deadline.
+
+    OFF (default): today's behaviour — compile straight into execution under
+    validator quorum alone.
+
+    ARMING ORDER: turn this ON (and soak) BEFORE arming the contract-side
+    ``planSetSignatureRequired``. Reversed, the contract rejects every leg the
+    pipeline submits, because none of them carry a signature.
+    """
+    return _env_bool("CROSS_CHAIN_REQUIRE_PLAN_SET_SIG", default=False)
+
+
 def cross_chain_decision_window_s() -> int:
     """Seconds the user has to pick revert vs refresh before auto-revert."""
     import os as _os

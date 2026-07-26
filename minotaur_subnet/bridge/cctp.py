@@ -90,15 +90,28 @@ IRIS_API = os.environ.get("CCTP_IRIS_API", "https://iris-api.circle.com")
 
 # Headroom multiplier on the live fast fee so a fee tick between quote and
 # execution doesn't silently downgrade the transfer to Standard finality.
-MAX_FEE_HEADROOM_BPS = int(os.environ.get("CCTP_MAX_FEE_HEADROOM_BPS", "150"))
+# PERCENT, not bps: 150 means maxFee = 1.5x the quoted fast fee. (The old
+# CCTP_MAX_FEE_HEADROOM_BPS name is still read for compatibility — it always
+# carried a percent, the name was simply wrong.)
+MAX_FEE_HEADROOM_PCT = int(
+    os.environ.get("CCTP_MAX_FEE_HEADROOM_PCT")
+    or os.environ.get("CCTP_MAX_FEE_HEADROOM_BPS")
+    or "150"
+)
 
 ESTIMATED_DURATION_S = 30  # Fast Transfer target
 
 
 def cctp_enabled() -> bool:
-    """CCTP registers only when explicitly enabled: the destination mint
-    needs platform self-relay (BridgeTracker follow-up) before this rail
-    can carry live value."""
+    """CCTP registers only when explicitly enabled.
+
+    The destination mint is self-relayed by BridgeTracker (see the module
+    docstring), so this is no longer a "not implemented" gate — it is the
+    kill switch for a rail whose delivery depends on OUR relayer rather than
+    a permissionless network. Note that ``BridgeRegistry.best_quote`` ranks
+    purely on output, and CCTP's ~1.0 bps beats Across on every USDC route,
+    so enabling this makes CCTP the default USDC rail.
+    """
     return os.environ.get("CCTP_ENABLED", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
@@ -149,7 +162,7 @@ class CCTPAdapter(BridgeAdapter):
         fee = amount * fast_fee_bps // 10_000
         # maxFee with headroom — burned amount minus actual fee mints; the
         # headroom only bounds the worst case, it isn't always charged.
-        max_fee = amount * fast_fee_bps * MAX_FEE_HEADROOM_BPS // (10_000 * 100)
+        max_fee = amount * fast_fee_bps * MAX_FEE_HEADROOM_PCT // (10_000 * 100)
         if max_fee >= amount:
             raise ValueError(f"CCTP: fee bound {max_fee} consumes amount {amount}")
 
@@ -196,17 +209,22 @@ class CCTPAdapter(BridgeAdapter):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build approve + depositForBurn for the TokenMessenger.
 
-        ``sender`` (the compiler's safe_recipient — user/escrow, never
-        solver-controlled) becomes the bytes32 ``mintRecipient`` baked into
-        the burn message: the mint cannot be redirected by anyone.
-        ``destinationCaller`` stays open (zero) so any party can submit the
-        mint if the platform relayer stalls.
+        ``recipient`` (from the compiler, never solver-controlled) becomes
+        the bytes32 ``mintRecipient`` baked into the burn message: the mint
+        cannot be redirected by anyone, including the party that self-relays
+        it. ``destinationCaller`` stays open (zero) so any party can submit
+        the mint if the platform relayer stalls.
+
+        ``refund_recipient`` is accepted for interface symmetry and unused:
+        CCTP has no origin-refund path — a burn always mints eventually, so
+        there is nothing to refund on the source chain.
         """
-        mint_recipient = b"\x00" * 12 + bytes.fromhex(sender.replace("0x", ""))
+        mint_recipient = b"\x00" * 12 + bytes.fromhex(recipient.replace("0x", ""))
 
         approve_data = APPROVE_SELECTOR + abi_encode(
             ["address", "uint256"],

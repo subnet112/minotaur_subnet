@@ -88,13 +88,28 @@ class BridgeAdapter(ABC):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build the on-chain interactions to initiate a bridge transfer.
 
+        The two addresses are deliberately SEPARATE — they land in different
+        chains' states and want different owners:
+
         Args:
             quote: A quote from this adapter's ``quote()`` method.
-            sender: The address initiating the bridge (token holder).
+            recipient: Who receives the funds on the DESTINATION chain. For a
+                multi-leg intent this is the destination App contract, whose
+                ``escrowDeposit`` gate + user-callable ``escrowRefund``
+                timelock are what make the hop safe (see
+                docs/architecture/cross-chain-intents.md §1, state 3/4).
+                Pinned into the deposit at source-commitment time, so no
+                downstream party can redirect it.
+            refund_recipient: Who receives an ORIGIN-chain refund if the
+                bridge never delivers (Across: the depositor, refunded at
+                ``fillDeadline``). This must stay the USER — a refund into
+                the app would need a second recovery path to get home.
+                Defaults to ``recipient`` for rails with no refund concept.
 
         Returns:
             List of Interactions (e.g., approve + bridge deposit).

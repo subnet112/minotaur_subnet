@@ -8,8 +8,10 @@ min-guaranteed output instead of the solver's self-reported estimate, plus
 the revert plan that will apply at each failure point.
 
 Simulation note: per-leg Anvil simulation of the compiled plan is NOT run
-here yet — the destination leg's swap output is taken from the solver's
-declared estimate, floored by the bridge's estimated output. Wiring
+here yet. Bridge fees/ETAs/outputs are live and platform-verified, but the
+destination leg's swap output is still the SOLVER's declared estimate — it
+is neither simulated nor bounded here, so the response labels it
+``estimated_output_source: "solver_declared"``. Wiring
 ``MultiChainSimulator.simulate_cross_chain`` into this path is the follow-up
 tracked in docs/architecture/cross-chain-intents.md §10 step 2.
 """
@@ -100,12 +102,14 @@ async def build_cross_chain_quote(
         for leg in compiled.multi_leg_plan.rollback_legs
     ]
 
-    # Delivered estimate: the solver's declared destination output, floored
-    # by the LAST bridge's live estimated output (a solver can't quote more
-    # than what actually arrives on the destination chain unless a
-    # destination-leg swap adds value — which per-leg simulation will price
-    # in when it lands; until then the bridge floor is the honest number
-    # when the solver's claim exceeds sanity or is absent).
+    # Delivered estimate. The bridge numbers above are LIVE and verified;
+    # the destination-leg output is not — it is still the solver's own
+    # declaration, because per-leg simulation isn't wired here yet. Say so
+    # in the payload rather than letting a self-reported number pass as a
+    # platform estimate: ``estimated_output_source`` is "solver_declared"
+    # whenever the number came from the solver, and ``bridge_floor`` is the
+    # amount the last bridge actually delivers (a destination-leg swap can
+    # legitimately exceed it, so this is context, not a cap).
     bridge_floor = bridges[-1]["estimated_output"] if bridges else 0
     declared = plan_metadata.get("dst_amount") or plan_metadata.get("expected_output")
     try:
@@ -116,6 +120,9 @@ async def build_cross_chain_quote(
 
     return {
         "estimated_output": estimated_output,
+        "estimated_output_source": (
+            "solver_declared" if declared_int > 0 else "bridge_quote"
+        ),
         "bridge_floor": bridge_floor,
         "bridges": bridges,
         "legs": legs,

@@ -138,7 +138,7 @@ class BridgeTracker:
                     "Bridge timeout for order %s after %d polls",
                     order_id, tracked.poll_count,
                 )
-                self._mark_bridge_failed(order_id, "Bridge polling timeout")
+                await self._fail_bridge(tracked, "Bridge polling timeout")
                 to_remove.append(order_id)
                 continue
 
@@ -162,7 +162,7 @@ class BridgeTracker:
                     completed += 1
                 elif status.status == BridgeStatusEnum.FAILED:
                     error = status.error or "Bridge transfer failed"
-                    self._mark_bridge_failed(order_id, error)
+                    await self._fail_bridge(tracked, error)
                     to_remove.append(order_id)
                 elif (
                     tracked.bridge_protocol == "cctp"
@@ -632,6 +632,54 @@ class BridgeTracker:
             error=error,
         )
         logger.warning("Cross-chain order %s → BRIDGE_FAILED: %s", order_id, error)
+
+    async def _fail_bridge(self, tracked: TrackedBridge, error: str) -> None:
+        """The bridge HOP itself failed — expired unfilled, or polled out.
+
+        Distinct from a destination-leg failure: nothing arrived on the
+        destination, so there is no escrow and no executable revert (the
+        rollback legs are reverse-bridges that would run on the destination
+        chain, where the funds never landed). What the user actually has is
+        the origin-chain refund — Across returns the deposit to the
+        depositor, which the compiler pins to the user's own wallet — so the
+        only meaningful choice is to re-quote.
+
+        Parks with ``refresh`` as the sole option when the recovery feature
+        is on; otherwise the legacy BRIDGE_FAILED terminal state. Either way
+        the refund is already on its way without anyone acting.
+        """
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+
+        orchestrator = self.multi_leg_orchestrator
+        order = self.orderbook.get(tracked.order_id) if self.orderbook else None
+        if (
+            not cross_chain_user_decision_enabled()
+            or orchestrator is None
+            or order is None
+        ):
+            self._mark_bridge_failed(tracked.order_id, error)
+            return
+
+        meta = tracked.plan.metadata or {}
+        try:
+            await orchestrator.park_for_user_decision(
+                order, [], [],
+                meta.get("contract_address", ""),
+                {"plan_set": meta.get("plan_set"),
+                 "escrow_params": meta.get("escrow_params")},
+                tracked.plan.metadata.get("bridge_leg_index", -1),
+                f"{error} (origin-chain refund to your wallet)",
+                options=["refresh"],
+                expiry_status=OrderStatus.BRIDGE_FAILED,
+            )
+        except Exception as exc:
+            logger.error(
+                "Park-for-decision failed for %s (%s) — falling back to "
+                "BRIDGE_FAILED", tracked.order_id, exc,
+            )
+            self._mark_bridge_failed(tracked.order_id, error)
 
     async def _fail_dest_leg(
         self,
