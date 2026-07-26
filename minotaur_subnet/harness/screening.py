@@ -139,6 +139,16 @@ _BANNED_DYNAMIC_ATTR_CALLS = frozenset({
     "import_module",   # importlib.import_module(<name>)
     "FunctionType",    # types.FunctionType(<code>, globals, ...)
     "CodeType",        # types.CodeType(...)
+    # v2: the spec-loader spelling of dynamic import — importlib.util.
+    # spec_from_file_location(...) + module_from_spec(...) does nothing until
+    # spec.loader.exec_module(mod) runs it, so banning the one call that
+    # EXECUTES the loaded module kills the whole pattern without needing to
+    # chase the builder names. The current champion's `_apex_champ.py`
+    # strategies-loader uses exactly this (in-tree files, so v1 tolerated it as
+    # analyzable) — prospective-only like every gate: the standing champion is
+    # never re-screened, but forks must replace the loader with static imports
+    # of `strategies/<app_id>/strategy.py` to pass intake.
+    "exec_module",     # spec.loader.exec_module(<module>)
 })
 
 # Always-on (armed): the primitives above have no legitimate solver use, so —
@@ -146,7 +156,7 @@ _BANNED_DYNAMIC_ATTR_CALLS = frozenset({
 # constant for the same fleet-uniform, version-stamped discipline (and an escape
 # hatch if an unforeseen false positive ever surfaces during rollout).
 DYNAMIC_CODE_ARMED: bool = True
-DYNAMIC_CODE_VERSION = 1
+DYNAMIC_CODE_VERSION = 2  # v2 adds exec_module to the attribute ban
 
 # ── Banned in-tree imports (defence-in-depth PREVENT layer) ───────────────────
 #
@@ -354,7 +364,7 @@ def dynamic_code_calls(repo_path: str) -> list[str]:
         the callee is an ``ast.Name`` (a method named ``eval`` on a miner's own
         object is NOT flagged).
       * ATTRIBUTE calls — ``….import_module`` / ``….FunctionType`` /
-        ``….CodeType``, matched on the trailing attribute so an aliased
+        ``….CodeType`` / ``….exec_module``, matched on the trailing attribute so an aliased
         ``importlib`` / ``types`` is still caught.
 
     These build code from strings, construct code objects, or resolve modules

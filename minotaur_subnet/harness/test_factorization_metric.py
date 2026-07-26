@@ -225,6 +225,20 @@ def test_dynamic_code_calls_flags_shim_import_indirection(tmp_path):
     assert dynamic_code_calls(str(tmp_path)) == ["james_base.py:3 __import__"]
 
 
+def test_dynamic_code_calls_flags_spec_loader_exec_module(tmp_path):
+    # v2: the spec-loader spelling of dynamic import — building the spec/module
+    # is inert until `spec.loader.exec_module(mod)` RUNS it, so the executor is
+    # the one name that kills the pattern (the champion `_apex_champ.py`
+    # strategies-loader shape).
+    (tmp_path / "loader.py").write_text(
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('strat', path)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+    )
+    assert dynamic_code_calls(str(tmp_path)) == ["loader.py:4 exec_module"]
+
+
 def test_dynamic_code_calls_ignores_benign_attribute_calls(tmp_path):
     # Attribute calls whose trailing name is NOT in the ban stay clean: re.compile
     # (the builtin `compile` is bare-name only) and a miner method named `eval`.
@@ -305,9 +319,9 @@ def test_dynamic_code_ban_can_be_disarmed(tmp_path, monkeypatch):
 
 
 def test_dynamic_code_armed_by_default():
-    # Ships ENFORCING (unlike the observe-only import ban), version-stamped.
+    # Ships ENFORCING (like the now-armed import ban), version-stamped.
     assert _screening.DYNAMIC_CODE_ARMED is True
-    assert _screening.DYNAMIC_CODE_VERSION == 1
+    assert _screening.DYNAMIC_CODE_VERSION == 2  # v2 adds exec_module
 
 
 # ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
