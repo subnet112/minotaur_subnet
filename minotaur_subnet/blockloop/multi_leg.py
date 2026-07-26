@@ -91,17 +91,13 @@ class MultiLegOrchestrator:
             )
             self._sync(order.order_id)
 
-            # Build an ExecutionPlan from this leg
-            leg_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=leg.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **leg.metadata,
-                    "leg_index": leg.leg_index,
-                    "chain_id": leg.chain_id,
-                },
+            # Build an ExecutionPlan from this leg — through the canonical
+            # builder: the plan-set signature hashes legs via the SAME
+            # constructor, and any metadata drift breaks on-chain set
+            # membership (consensus/plan_set.py invariant).
+            from minotaur_subnet.consensus.plan_set import build_leg_execution_plan
+            leg_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), leg,
             )
 
             # Check if this leg depends on a bridge (wait for bridge completion)
@@ -133,6 +129,7 @@ class MultiLegOrchestrator:
                                 "remaining_legs": [l.to_dict() for l in remaining_legs],
                                 "rollback_legs": [l.to_dict() for l in multi_leg_plan.rollback_legs],
                                 "completed_leg_indices": [l.leg_index for l in completed_legs],
+                                "plan_set": (plan_metadata or {}).get("plan_set"),
                             },
                         )
 
@@ -303,7 +300,7 @@ class MultiLegOrchestrator:
 
                 if consensus_result and not consensus_result.reached:
                     logger.warning("[MULTI-LEG] %s: %s consensus failed, rolling back", order.order_id, leg_label)
-                    await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                    await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
                     return False
 
             # Submit this leg via relayer — use per-leg params so the
@@ -314,6 +311,15 @@ class MultiLegOrchestrator:
             submit_params["intent_selector"] = leg.intent_selector
             if leg.intent_params_hex:
                 submit_params["intent_params_hex"] = leg.intent_params_hex
+            # Plan-set signed path: when the user signed the plan set, the
+            # relayer submits via executeLegSigned (membership-proved).
+            from minotaur_subnet.consensus.plan_set import thread_plan_set_params
+            thread_plan_set_params(
+                submit_params,
+                (plan_metadata or {}).get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                leg.leg_index,
+            )
             submit_order.params = submit_params
 
             logger.info("[MULTI-LEG] %s: submitting %s to relayer (selector=%s)", order.order_id, leg_label, leg.intent_selector)
@@ -325,7 +331,7 @@ class MultiLegOrchestrator:
                 logger.info("[MULTI-LEG] %s: %s relayer result: success=%s tx=%s err=%s", order.order_id, leg_label, submit_result.success, submit_result.tx_hash, submit_result.error)
             except Exception as exc:
                 logger.error("[MULTI-LEG] %s: %s relayer EXCEPTION: %s", order.order_id, leg_label, exc, exc_info=True)
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
                 return False
 
             if not submit_result.success:
@@ -333,7 +339,7 @@ class MultiLegOrchestrator:
                     "Multi-leg %s: %s submission failed: %s",
                     order.order_id, leg_label, submit_result.error,
                 )
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address, plan_metadata)
                 return False
 
             logger.info("Multi-leg %s: %s completed (tx=%s)", order.order_id, leg_label, submit_result.tx_hash)
@@ -361,6 +367,7 @@ class MultiLegOrchestrator:
         completed_legs: list,
         rollback_legs: list,
         contract_address: str,
+        plan_metadata: dict | None = None,
     ) -> None:
         """Execute rollback legs in reverse order for completed forward legs.
 
@@ -385,22 +392,30 @@ class MultiLegOrchestrator:
                 logger.warning("No rollback leg for forward leg %d", completed_leg.leg_index)
                 continue
 
-            rollback_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=rollback.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **rollback.metadata,
-                    "leg_index": rollback.leg_index,
-                    "chain_id": rollback.chain_id,
-                    "is_rollback": True,
-                },
+            from minotaur_subnet.consensus.plan_set import (
+                build_leg_execution_plan,
+                thread_plan_set_params,
             )
+            rollback_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), rollback, is_rollback=True,
+            )
+
+            # Rollback legs are members of the user-signed plan set too —
+            # the agreed revert plan executes under the same signature.
+            from copy import copy as _copy
+            submit_order = _copy(order)
+            submit_params = dict(order.params)
+            thread_plan_set_params(
+                submit_params,
+                (plan_metadata or {}).get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                rollback.leg_index,
+            )
+            submit_order.params = submit_params
 
             try:
                 result = await self.relayer.submit_plan(
-                    order, rollback_plan, 0.5, None,
+                    submit_order, rollback_plan, 0.5, None,
                     contract_address=contract_address,
                 )
                 if result.success:
