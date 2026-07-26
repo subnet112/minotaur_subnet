@@ -279,6 +279,16 @@ class SolverQueueEntry(BaseModel):
     # SS58, or the fleet's canonical label under the github-owner union — see
     # harness/actor.py). null when actor keying is off (legacy per-hotkey LRU).
     actor: str | None = None
+    # Is this hotkey in the CURRENT metagraph? Intake fail-closes on metagraph
+    # membership, so registered=False means the hotkey CANNOT submit — it is a
+    # ledger relic, not a competitor (its clock is kept so a returning identity
+    # resumes its seniority). null = metagraph unavailable (indeterminate).
+    registered: bool | None = None
+    # Does this hotkey have a live (non-terminal) submission in the current
+    # round? Rotation only seats miners who submit, so the next slate is drawn
+    # from the contending subset — everyone else is idle, merely accruing
+    # seniority for when they return.
+    contending: bool = False
     # This HOTKEY's ledger timestamps (unix seconds): when it first appeared
     # and when it last held a bench seat. last_benched_at is null for a
     # never-benched hotkey — note a sibling hotkey of the same actor may still
@@ -290,10 +300,13 @@ class SolverQueueEntry(BaseModel):
     # waiting longer = seated sooner. See harness/rotation.wait_ts.
     waiting_since: float = 0.0
     # 1-based dense rank over distinct actors in seniority order (an actor's
-    # hotkeys share one rank — the slate soft-dedups per actor). Indicative
-    # only: the real slate depends on who submits that round, and equal
-    # seniority reshuffles every round via a public salted hash.
-    rank: int = 0
+    # hotkeys share one rank — the slate soft-dedups per actor). Ranked over
+    # actors with >= 1 REGISTERED hotkey only, so deregistered relics don't
+    # hold places in line — their entries carry rank=null (when the metagraph
+    # is unavailable everyone is ranked, legacy behavior). Indicative only:
+    # the real slate depends on who submits that round, and equal seniority
+    # reshuffles every round via a public salted hash.
+    rank: int | None = None
 
 
 class SolverQueueResponse(BaseModel):
@@ -302,9 +315,17 @@ class SolverQueueResponse(BaseModel):
     # True when the actor resolver was active (coldkey/owner aggregation);
     # False = legacy per-hotkey seniority (kill-switch or no coldkey map yet).
     actor_keyed: bool = False
+    # The open round whose submissions define `contending` (null when no round
+    # is open / the round store is unavailable).
+    round_id: str | None = None
     # total = full queue size; count = entries returned (after ?hotkey= filter).
     total: int = 0
     count: int = 0
+    # Full-queue rollups (independent of the ?hotkey= filter): hotkeys in the
+    # current metagraph (null = indeterminate) and hotkeys with a live
+    # submission this round.
+    registered_count: int | None = None
+    contending_count: int = 0
     queue: list[SolverQueueEntry] = []
 
 
