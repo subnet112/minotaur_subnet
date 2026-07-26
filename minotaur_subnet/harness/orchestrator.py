@@ -232,6 +232,11 @@ def _capture_revert_trace(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# Anvil's first funded account — the benchmark's stand-in receiver when a
+# scenario declares none.
+_ANVIL_DEFAULT_ACCOUNT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+
+
 @dataclass
 class BenchmarkResult:
     """Result of benchmarking a single intent."""
@@ -261,6 +266,18 @@ class BenchmarkResult:
     # sims, probe failures). MEASUREMENT ONLY — never feeds ``score`` or any
     # verdict; the gas clause is a separate, stacked change.
     gas_metered: int | None = None
+    # PHASE 0, OBSERVE-ONLY: what a cross-chain plan actually delivered on the
+    # DESTINATION chain, as an exact decimal wei string (same precision
+    # discipline as raw_output). None for every single-chain row and whenever
+    # the destination leg could not be measured. MEASUREMENT ONLY — never
+    # feeds ``score`` or any verdict, exactly like gas_metered; the scoring
+    # rule that consumes it is a separate, later change, gated on this number
+    # first proving identical across leader and follower on the same pins.
+    destination_delivered: str | None = None
+    # "simulated" (amount observed leaving the source fork — trustworthy) or
+    # "declared" (the plan's own number — solver-reported, weaker). Phase-0
+    # analysis must be able to separate the two before either moves a score.
+    destination_amount_source: str | None = None
     revert_reason: str | None = None  # decoded on-chain revert reason when the real sim reverted
     # Per-step interaction trace ({interactions, total_gas, summary}) captured on
     # a real-sim revert — pure diagnostics for the miner; never feeds the score.
@@ -1812,6 +1829,17 @@ async def _process_scenario(
                         _gm if (not used_mock and sim.success and _gm > 0)
                         else None
                     )
+                    # PHASE 0 (observe-only): measure what the plan delivers
+                    # on the DESTINATION chain. Runs alongside the scored sim
+                    # above — which is untouched — so it cannot move a score.
+                    # No-op for every single-chain plan.
+                    if not used_mock:
+                        (
+                            br.destination_delivered,
+                            br.destination_amount_source,
+                        ) = await _measure_destination_delivery(
+                            simulator, plan, state, token_balances, fork_block,
+                        )
                     score_result = await score_fn(
                         intent.app_id, plan, sim, state,
                     )
@@ -2115,7 +2143,6 @@ def _build_benchmark_intent_order(
     control = state.control_view() if hasattr(state, "control_view") else {}
 
     # Use Anvil default account instead of dummy address(1)
-    _ANVIL_DEFAULT_ACCOUNT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
     submitted_by = params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
     if submitted_by == "0x0000000000000000000000000000000000000001":
         submitted_by = _ANVIL_DEFAULT_ACCOUNT
@@ -2308,6 +2335,82 @@ def _mock_bridge_for_benchmark(
         nonce=plan.nonce,
         metadata=plan.metadata,
     )
+
+
+async def _measure_destination_delivery(
+    simulator: Any,
+    plan: ExecutionPlan,
+    state: IntentState | None,
+    token_balances: dict[str, int] | None,
+    fork_block: Any,
+) -> tuple[str | None, str | None]:
+    """PHASE 0 (observe-only): run the destination leg and report delivery.
+
+    The scored simulation stays exactly what it was — single-chain, with
+    bridge calls mocked — so this cannot move a score. It runs ALONGSIDE it
+    purely to answer the question the scoring rule will eventually need:
+    *how much did this plan actually deliver on the far chain?* Today nothing
+    answers it, which is why a correct cross-chain plan and a useless one
+    score the same.
+
+    Determinism is the whole point of the exercise, so the bridged amount
+    comes from the fixed-fee benchmark model applied to what the source leg
+    was observed to move — never a live bridge quote (differs between
+    validators) and never the solver's declared output (self-reported).
+
+    Returns ``(delivered_wei_str | None, amount_source | None)``. Never
+    raises: an observation failing must not fail a benchmark row.
+    """
+    from minotaur_subnet.simulator.cross_chain_bench import is_cross_chain_plan
+
+    if not is_cross_chain_plan(plan):
+        return None, None
+    if simulator is None or not hasattr(simulator, "simulate_cross_chain"):
+        return None, None
+
+    try:
+        result = await simulator.simulate_cross_chain(
+            plan,
+            deterministic_bridge=True,
+            contract_address=state.contract_address if state else None,
+            token_balances=token_balances,
+            fork_block=fork_block,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info("[benchmark] destination-leg observation failed: %s", exc)
+        return None, None
+
+    estimate = getattr(result, "bridge_estimate", None) or {}
+    amount_source = estimate.get("amount_source")
+
+    legs_meta = (plan.metadata or {}).get("legs") or []
+    leg_results = getattr(result, "leg_results", None) or {}
+    dest_ids = [
+        leg["leg_id"] for leg in legs_meta if leg.get("type") == "destination"
+    ]
+    if not dest_ids:
+        return None, amount_source
+
+    params = (
+        state.raw_params_view()
+        if state is not None and hasattr(state, "raw_params_view")
+        else {}
+    )
+    receiver = str(
+        params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
+    ).lower()
+
+    delivered = 0
+    for leg_id in dest_ids:
+        for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
+            if str(t.get("to", "")).lower() != receiver:
+                continue
+            try:
+                delivered += int(t.get("amount") or 0)
+            except (ValueError, TypeError):
+                continue
+
+    return str(delivered), amount_source
 
 
 def _build_benchmark_simulation(
