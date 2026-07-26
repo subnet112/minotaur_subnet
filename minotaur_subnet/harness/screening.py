@@ -104,12 +104,89 @@ BINARY_EXTENSIONS = {
 FLOOR_VERSION = 1
 MAX_REGION_NODES: int | None = 4200  # ARMED Stage-A backstop; None ⇒ observe-only
 
-# Bare builtin calls that defeat static analysis: code built in strings is
-# invisible to max_region_nodes, so once the floor is armed these are rejected
-# (error_code="dynamic_code"). Precise AST bare-Name check — attribute calls
-# like `re.compile(...)` or `tree.eval(...)` are NOT flagged, and `compile` is
-# deliberately not banned.
-_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval"})
+# ── Static-analyzability ban (PREVENT layer, always-on) ──────────────────────
+# Calls that DEFEAT static (AST) inspection by building code from strings,
+# constructing code objects, or resolving modules through a runtime value: a
+# solver that `exec`s a string, `compile`s source, or does `__import__(name)`
+# hides its real logic from max_region_nodes, the deadwood metric AND the
+# content fingerprint alike. A deterministic DEX-router solver has ZERO
+# legitimate in-tree use for any of them (verified: none appear in the
+# reference/example solvers or any live champion fork), so — unlike the import
+# ban, whose urllib.parse/http false positives keep it observe-only — this bans
+# on sight. INDEPENDENT of the factorization floor (MAX_REGION_NODES):
+# analyzability is a precondition for every other static check, so it must hold
+# even when the entanglement cap is disarmed. CODE constants (never env-read) so
+# the gate is fleet-uniform — the FLOOR_VERSION discipline. `DYNAMIC_CODE_VERSION`
+# stamps the semantics; only NEW submissions gate (the standing champion is never
+# re-screened).
+#
+# BARE-NAME builtins (ast.Name callee) — an attribute call like `re.compile(...)`
+# or `obj.eval(...)` deliberately does NOT match (a method named `eval` on a
+# miner's own object is not the builtin). `compile`/`__import__` ARE banned here
+# (they were previously allowed): both are code-construction / dynamic-import
+# primitives with no deterministic-solver use.
+_BANNED_DYNAMIC_CALLS = frozenset({"exec", "eval", "compile", "__import__"})
+
+# ATTRIBUTE-form calls (ast.Attribute callee), matched on the TRAILING attribute
+# name so an alias (`import importlib as il; il.import_module(...)`) is still
+# caught. These resolve modules dynamically or fabricate functions/code objects —
+# the indirection an obfuscator uses to spread a copied engine across a
+# runtime-resolved module graph (the live `james_base.py` shim's `__import__(_m)`
+# is the bare-name twin of this). The names are distinctive enough that a bare
+# attribute match has no false positives in solver code; `marshal`/`pickle`
+# deserialization is covered separately by the import ban.
+_BANNED_DYNAMIC_ATTR_CALLS = frozenset({
+    "import_module",   # importlib.import_module(<name>)
+    "FunctionType",    # types.FunctionType(<code>, globals, ...)
+    "CodeType",        # types.CodeType(...)
+})
+
+# Always-on (armed): the primitives above have no legitimate solver use, so —
+# unlike BANNED_IMPORTS_ARMED — this ships ENFORCING. Kept as an explicit CODE
+# constant for the same fleet-uniform, version-stamped discipline (and an escape
+# hatch if an unforeseen false positive ever surfaces during rollout).
+DYNAMIC_CODE_ARMED: bool = True
+DYNAMIC_CODE_VERSION = 1
+
+# ── Banned in-tree imports (defence-in-depth PREVENT layer) ───────────────────
+#
+# A deterministic, in-bench-reproducible DEX-router solver has NO legitimate
+# in-tree use for raw network / subprocess / native-FFI / serialization-RCE
+# modules: chain RPC reaches it through the SDK's web3 (shipped in the base
+# image, NOT in-tree), and external HTTP at solve time does not reproduce at
+# bench (the exact mistake chain-killer's "putty" layer made — a nested
+# `import urllib.request` + urlopen). This is the egress-gadget class the
+# runtime containment (keyless proxy + internal net) already neutralises at
+# RUNTIME; the static ban is INSURANCE + intake-time observability, never the
+# primary barrier (it cannot see dynamic dispatch or a fund-drain built from
+# allowed libraries — those are covered by CONTAIN/VERIFY). Matched on the
+# TOP-LEVEL module so a nested `import urllib.request` is caught (ast.walk, not
+# tree.body); the full dotted name is recorded so submodule refinement
+# (urllib.request vs the benign urllib.parse) can precede arming.
+_BANNED_IMPORT_MODULES = frozenset({
+    # network / external I/O
+    "socket", "urllib", "http", "requests", "httpx", "aiohttp",
+    "smtplib", "ftplib", "telnetlib", "poplib", "imaplib",
+    # process / native / FFI escape surface
+    "subprocess", "ctypes", "cffi",
+    # deserialization RCE gadget the AST can't otherwise see
+    "marshal",
+})
+
+# Observe-only until soaked, mirroring the MAX_REGION_NODES rollout discipline:
+# while False, stage 1 LOGS what it would reject but never rejects (the PR ships
+# INERT). A follow-up flips it to True once the live fleet's import profile
+# confirms no legitimate solver trips it. A CODE constant (never env-read), so
+# the gate is fleet-uniform — the FLOOR_BPS/FLOOR_VERSION discipline.
+#
+# ARMING PRECONDITION: the scan matches TOP-LEVEL modules, so today it flags
+# legitimate code — `from urllib.parse import urlparse` (used by this codebase
+# itself) and `from http import HTTPStatus` hit the `urllib`/`http` bans just
+# like the exfil gadgets do. Flipping this flag alone is NOT sufficient: arming
+# first requires a submodule allowlist (at minimum urllib.parse), shaped by the
+# dotted names the observe-only soak logs record.
+BANNED_IMPORTS_ARMED: bool = False
+BANNED_IMPORTS_VERSION = 1
 
 # Named scopes that START a new region: a nested def/class's *body* leaves its
 # parent region (its header still counts in the parent). Lambdas, comprehensions
@@ -257,15 +334,24 @@ def max_region_nodes(repo_path: str) -> int:
 
 
 def dynamic_code_calls(repo_path: str) -> list[str]:
-    """Locations (``relpath:line``) of bare ``exec(...)``/``eval(...)`` calls.
+    """Locations (``relpath:line name``) of calls that defeat static analysis.
 
-    These build code in strings the AST can't see, so they would let a solver
-    smuggle an entangled god-region past :func:`max_region_nodes`. Flagged only
-    when the callee is the BARE builtin name (``ast.Name``) — attribute calls
-    (``re.compile``, ``obj.eval``) never match, and ``compile`` is not banned.
-    Same scan scope as the metric (in-tree ``*.py``, ``.git`` excluded,
-    unparseable files skipped — stage 2's import check backstops those).
-    Sorted for deterministic reject messages.
+    Two forms are flagged (see :data:`_BANNED_DYNAMIC_CALLS` /
+    :data:`_BANNED_DYNAMIC_ATTR_CALLS`):
+
+      * BARE builtin calls — ``exec``/``eval``/``compile``/``__import__`` where
+        the callee is an ``ast.Name`` (a method named ``eval`` on a miner's own
+        object is NOT flagged).
+      * ATTRIBUTE calls — ``….import_module`` / ``….FunctionType`` /
+        ``….CodeType``, matched on the trailing attribute so an aliased
+        ``importlib`` / ``types`` is still caught.
+
+    These build code from strings, construct code objects, or resolve modules
+    dynamically — hiding logic from :func:`max_region_nodes`, the deadwood
+    metric and the content fingerprint. Same scan scope as the metric (in-tree
+    ``*.py``, ``.git`` excluded, unparseable files skipped — stage 2's import
+    check backstops those). Each hit records the matched name; sorted for
+    deterministic reject messages.
     """
     root = Path(repo_path)
     hits: list[str] = []
@@ -277,12 +363,53 @@ def dynamic_code_calls(repo_path: str) -> list[str]:
         except (SyntaxError, ValueError, OSError):
             continue
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id in _BANNED_DYNAMIC_CALLS
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name: str | None = None
+            if isinstance(func, ast.Name) and func.id in _BANNED_DYNAMIC_CALLS:
+                name = func.id
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr in _BANNED_DYNAMIC_ATTR_CALLS
             ):
-                hits.append(f"{py.relative_to(root)}:{node.lineno}")
+                name = func.attr
+            if name is not None:
+                hits.append(f"{py.relative_to(root)}:{node.lineno} {name}")
+    return sorted(hits)
+
+
+def banned_imports(repo_path: str) -> list[str]:
+    """Locations (``relpath:line module``) of disallowed in-tree imports.
+
+    Walks every in-tree ``*.py`` (``.git`` excluded, unparseable skipped — same
+    scope as :func:`dynamic_code_calls`) and flags any ``import``/``from`` whose
+    TOP-LEVEL module is in :data:`_BANNED_IMPORT_MODULES` (network / subprocess /
+    native-FFI / serialization). Uses ``ast.walk`` so a nested
+    ``import urllib.request`` inside a function is caught, not just module-level
+    imports — the exfil-gadget class hides exactly there. Relative imports
+    (``from . import x``) are in-tree and never flagged. The full dotted name is
+    recorded (e.g. ``urllib.request``) so the observe-only logs can drive
+    submodule refinement before the ban is armed. Sorted, deterministic.
+    """
+    root = Path(repo_path)
+    hits: list[str] = []
+    for py in root.rglob("*.py"):
+        if _METRIC_EXCLUDE_DIRS.intersection(py.parts):
+            continue
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            for name in names:
+                if name.split(".")[0] in _BANNED_IMPORT_MODULES:
+                    hits.append(f"{py.relative_to(root)}:{node.lineno} {name}")
     return sorted(hits)
 
 
@@ -393,20 +520,23 @@ def run_stage_1(repo_path: str) -> StageResult:
         repo_path,
     )
 
-    # Deadwood metric — computed in the same pass, observe-only until its own
-    # floor arms (deadwood.UNPRODUCTIVE_NODES_MAX, a later separately-reviewed
-    # PR). Computed BEFORE the factor floor gates so a floor-rejected
-    # submission still records its deadwood values (persist-on-reject). An
-    # unparseable non-exempt file yields unproductive_nodes=None (logged inside
-    # the analyzer) — persisted as None, every consumer skips it; stage 2's
-    # import check remains the backstop for code that cannot even be parsed.
+    # Deadwood metric — computed in the same pass. Computed BEFORE the gates
+    # below so a rejected submission still records its deadwood values
+    # (persist-on-reject). An unparseable non-exempt file yields
+    # unproductive_nodes=None (logged inside the analyzer) — persisted as None,
+    # every consumer skips it, and the floor below never rejects on None; stage
+    # 2's import check remains the backstop for code that cannot even be parsed.
     from minotaur_subnet.harness import deadwood
 
     dw = deadwood.unproductive_nodes(repo_path)
+    dw_armed = deadwood.UNPRODUCTIVE_NODES_MAX is not None
     if not dw.unparseable:
         logger.info(
-            "[deadwood] unproductive_nodes=%d version=%d (observe-only) repo=%s",
-            dw.unproductive_nodes, dw.version, repo_path,
+            "[deadwood] unproductive_nodes=%d version=%d (%s) repo=%s",
+            dw.unproductive_nodes, dw.version,
+            f"floor armed, cap={deadwood.UNPRODUCTIVE_NODES_MAX}"
+            if dw_armed else "observe-only, not gated",
+            repo_path,
         )
     _dw_fields: dict[str, Any] = dict(
         unproductive_nodes=dw.unproductive_nodes,
@@ -430,22 +560,38 @@ def run_stage_1(repo_path: str) -> StageResult:
         )
         _dw_fields["content_fingerprint"] = fingerprint
 
-    if floor_armed:
-        # Bare exec()/eval() first: code built in strings is invisible to the
-        # metric, so an armed floor without this ban would be trivially dodged.
-        banned = dynamic_code_calls(repo_path)
-        if banned:
-            shown = ", ".join(banned[:5]) + (", …" if len(banned) > 5 else "")
+    # Static-analyzability ban (always-on PREVENT layer; INDEPENDENT of the
+    # factor floor — code built from strings / dynamically imported is invisible
+    # to the metric, the deadwood scan AND the fingerprint, so it must be
+    # rejected even when the entanglement cap is disarmed). Evaluated + logged
+    # for every submission; rejects when DYNAMIC_CODE_ARMED (default True — these
+    # primitives have no legitimate solver use). Checked BEFORE the factor cap so
+    # an unanalyzable submission is rejected as such rather than measured, and
+    # takes precedence over too_entangled exactly as the coupled check did.
+    dyn_hits = dynamic_code_calls(repo_path)
+    if dyn_hits:
+        shown = ", ".join(dyn_hits[:5]) + (", …" if len(dyn_hits) > 5 else "")
+        logger.warning(
+            "[dynamic-code] %d hit(s) v%d (%s): %s repo=%s",
+            len(dyn_hits), DYNAMIC_CODE_VERSION,
+            "ARMED → reject" if DYNAMIC_CODE_ARMED else "observe-only, not gated",
+            shown, repo_path,
+        )
+        if DYNAMIC_CODE_ARMED:
             return StageResult(
                 stage=1, passed=False,
                 duration_ms=_elapsed(start),
                 details=(
-                    f"Dynamic code execution (bare exec/eval) is not allowed: {shown}"
+                    "Code that defeats static analysis is not allowed — a "
+                    "deterministic solver has no use for exec / eval / compile / "
+                    f"__import__ or dynamic import / code construction: {shown}"
                 ),
                 error_code="dynamic_code",
                 max_region_nodes=factor_nodes,
                 **_dw_fields,
             )
+
+    if floor_armed:
         if factor_nodes > MAX_REGION_NODES:
             return StageResult(
                 stage=1, passed=False,
@@ -456,6 +602,62 @@ def run_stage_1(repo_path: str) -> StageResult:
                     f"the biggest function/class/module body into named helpers"
                 ),
                 error_code="too_entangled",
+                max_region_nodes=factor_nodes,
+                **_dw_fields,
+            )
+
+    # Deadwood floor (PREVENT layer; INDEPENDENT of the factor floor). Rejects a
+    # submission carrying too much provably-dead AST mass — superseded-generation
+    # modules kept as never-taken import fallbacks, dead-lineage files, unreferenced
+    # defs — the un-forkable bloat that stops the NEXT miner reading the published
+    # champion. Gated on its OWN cap (deadwood.UNPRODUCTIVE_NODES_MAX); skips a None
+    # value (an unparseable non-exempt file — stage 2 backstops that). The top
+    # offenders ride in the reject so the miner sees exactly what to delete.
+    if (
+        dw_armed
+        and dw.unproductive_nodes is not None
+        and dw.unproductive_nodes > deadwood.UNPRODUCTIVE_NODES_MAX
+    ):
+        worst = ", ".join(
+            f"{p}{'::' + q if q else ''} ({n})" for p, q, n in dw.top_offenders[:5]
+        )
+        return StageResult(
+            stage=1, passed=False,
+            duration_ms=_elapsed(start),
+            details=(
+                f"Submission carries {dw.unproductive_nodes} dead AST nodes, over "
+                f"the cap of {deadwood.UNPRODUCTIVE_NODES_MAX} "
+                f"(deadwood v{dw.version}) — delete unreachable / superseded code "
+                f"so the published champion stays forkable. Biggest: {worst}"
+            ),
+            error_code="too_much_deadwood",
+            max_region_nodes=factor_nodes,
+            **_dw_fields,
+        )
+
+    # Banned-import scan (defence-in-depth PREVENT layer; INDEPENDENT of the
+    # factor floor). Always evaluated + logged so the live fleet's import
+    # profile is observable; rejects only once BANNED_IMPORTS_ARMED flips, after
+    # a soak confirms no legitimate solver trips it. Persist-on-reject discipline:
+    # the metric/fingerprint fields ride along so a rejected sub still records them.
+    imp_hits = banned_imports(repo_path)
+    if imp_hits:
+        shown = ", ".join(imp_hits[:5]) + (", …" if len(imp_hits) > 5 else "")
+        logger.warning(
+            "[banned-imports] %d hit(s) v%d (%s): %s repo=%s",
+            len(imp_hits), BANNED_IMPORTS_VERSION,
+            "ARMED → reject" if BANNED_IMPORTS_ARMED else "observe-only, not gated",
+            shown, repo_path,
+        )
+        if BANNED_IMPORTS_ARMED:
+            return StageResult(
+                stage=1, passed=False,
+                duration_ms=_elapsed(start),
+                details=(
+                    "Disallowed import(s) — a deterministic solver has no in-tree "
+                    f"use for network/subprocess/native/serialization modules: {shown}"
+                ),
+                error_code="banned_import",
                 max_region_nodes=factor_nodes,
                 **_dw_fields,
             )
@@ -520,6 +722,35 @@ def _solver_build_command(image_tag: str, repo_path: str) -> list[str]:
         "--ulimit", f"nofile={nofile}:{nofile}",
         "-t", image_tag,
         repo_path,
+    ]
+
+
+def _solver_exec_command(image_tag: str, script: str) -> list[str]:
+    """``docker run`` argv for EXECUTING untrusted solver code (the stage-2
+    import + init checks — the FIRST place a submission's Python actually runs).
+
+    Historically these ran with ``--network=none --read-only`` + mem/cpu caps but
+    WITHOUT ``--cap-drop``/``--no-new-privileges``/``--pids-limit`` — so the
+    least-isolated point in the whole pipeline was the one that first executes
+    untrusted module-level + ``initialize()`` code. This mirrors the hardening
+    ``orchestrator.DOCKER_SECURITY_OPTS`` already applies to the benchmark/live
+    runs of the SAME solver: since the solver tolerates these at bench, it
+    tolerates them here (import + initialize({}) needs no capability/fork/privesc).
+    ``--cap-drop=ALL`` + ``--no-new-privileges`` shrink an escape's blast radius;
+    ``--pids-limit`` bounds a fork bomb during init (legacy ``docker build`` has
+    no pids cap — see ``_solver_build_command`` — so this is where it lands).
+    """
+    return [
+        "docker", "run", "--rm",
+        "--network=none", "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true",
+        "--pids-limit=256",
+        "--tmpfs=/tmp:size=64m",
+        "--memory=2g", "--cpus=1.0",
+        "--entrypoint", "python",
+        image_tag,
+        "-c", script,
     ]
 
 
@@ -649,18 +880,11 @@ async def _run_stage_2_locked(
             error_code="entrypoint_overridden",
         )
 
-    # Step 2: Import check
-    # Override entrypoint since the base image sets it to the harness runner
-    import_cmd = [
-        "docker", "run", "--rm",
-        "--network=none", "--read-only",
-        "--tmpfs=/tmp:size=64m",
-        "--memory=2g", "--cpus=1.0",
-        "--entrypoint", "python",
+    # Step 2: Import check (hardened exec — the first place solver code runs)
+    import_cmd = _solver_exec_command(
         image_tag,
-        "-c",
         "from solver import SOLVER_CLASS; print(f'OK: {SOLVER_CLASS.__name__}')",
-    ]
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -702,15 +926,7 @@ async def _run_stage_2_locked(
         "print(json.dumps({'name': m.name, 'version': m.version, 'types': m.supported_intent_types}))"
     )
 
-    init_cmd = [
-        "docker", "run", "--rm",
-        "--network=none", "--read-only",
-        "--tmpfs=/tmp:size=64m",
-        "--memory=2g", "--cpus=1.0",
-        "--entrypoint", "python",
-        image_tag,
-        "-c", init_script,
-    ]
+    init_cmd = _solver_exec_command(image_tag, init_script)
 
     try:
         proc = await asyncio.create_subprocess_exec(

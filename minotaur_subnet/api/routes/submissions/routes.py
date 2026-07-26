@@ -672,6 +672,30 @@ def _max_submissions_per_owner_per_round() -> int:
         return 1
 
 
+def _max_submissions_per_actor_per_round() -> int:
+    """Per-OPERATOR round cap — the sybil cap that supersedes the per-account one.
+
+    An operator is the actor from harness/actor.py: the union of a coldkey's
+    hotkeys and the github accounts it submits under. This caps how many times
+    one operator may submit in a round no matter how many hotkeys, coldkeys or
+    accounts it splits across — closing the coldkey-split evasion that the
+    account-only cap can't (SF-1 spread 15 coldkeys over 5 accounts, ~5
+    submissions/round). Configurable via ``SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND``
+    (default 1). A value <= 0 is the kill-switch: the operator-keyed cap is
+    fully disabled and the legacy per-github-account cap
+    (``SUBMISSIONS_MAX_PER_OWNER_PER_ROUND``, owner-keyed via
+    ``count_by_owner_round``) is enforced instead, exactly as before this cap
+    existed — disabling the operator cap never turns the account cap off with
+    it. Leader-local admission control; degrades to the account cap before the
+    first metagraph sync (no coldkey map yet).
+    """
+    raw = os.environ.get("SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND", "1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+
 def _max_rounds_per_commit() -> int:
     """Per-(hotkey, commit) lifetime BENCHMARK participation cap — anti-resubmit-spam.
 
@@ -1016,19 +1040,55 @@ async def create_submission(
     # mergeability GitHub call. The store re-checks atomically inside create() as
     # the TOCTOU backstop.
     from minotaur_subnet.api.routes.submissions.github_pr import github_owner_from_url
+    from minotaur_subnet.harness.actor import snapshot_resolver
     _github_owner = github_owner_from_url(pr["clone_url"])
-    max_per_owner = _max_submissions_per_owner_per_round()
-    if _github_owner and max_per_owner > 0:
-        owner_already = store.count_by_owner_round(_github_owner, current_round.round_id)
-        if owner_already >= max_per_owner:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"GitHub account '{_github_owner}' has already submitted "
-                    f"{owner_already} time(s) for round {current_round.round_id} "
-                    f"(max {max_per_owner} per round per account); try again next round."
-                ),
+    # Per-OPERATOR round cap: one operator (coldkey ∪ github owner) gets N slots
+    # per round, however many hotkeys / coldkeys / accounts it splits into. The
+    # resolver folds those identities; None (pre-metagraph) degrades to the old
+    # per-account behaviour. When > 0 it supersedes the account-only cap; <= 0
+    # is the kill-switch — operator keying fully off, legacy owner-keyed
+    # account cap enforced instead (never both silently off). The store's
+    # create() re-checks the same rule atomically as the TOCTOU backstop.
+    _actor_of = snapshot_resolver()
+    max_per_actor = _max_submissions_per_actor_per_round()
+    if max_per_actor > 0:
+        _operator_id = (_github_owner or "").strip() or (
+            _actor_of(body.hotkey) if _actor_of is not None else ""
+        )
+        if _operator_id and _operator_id != body.hotkey:
+            op_already = store.count_by_operator_round(
+                body.hotkey, _github_owner, current_round.round_id,
+                actor_of=_actor_of,
             )
+            if op_already >= max_per_actor:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Operator '{_operator_id}' has already submitted "
+                        f"{op_already} time(s) for round {current_round.round_id} "
+                        f"(max {max_per_actor} per round — the hotkeys, coldkeys "
+                        f"and github accounts of one operator share the cap); "
+                        f"try again next round."
+                    ),
+                )
+    else:
+        # Kill-switch path: the pre-operator-cap per-(github-account, round)
+        # check, owner-keyed exactly as it shipped before the operator cap.
+        max_per_owner = _max_submissions_per_owner_per_round()
+        if _github_owner and max_per_owner > 0:
+            owner_already = store.count_by_owner_round(
+                _github_owner, current_round.round_id,
+            )
+            if owner_already >= max_per_owner:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"GitHub account '{_github_owner}' has already submitted "
+                        f"{owner_already} time(s) for round {current_round.round_id} "
+                        f"(max {max_per_owner} per round per account); try again "
+                        f"next round."
+                    ),
+                )
 
     # Per-(hotkey, commit) participation cap — anti-resubmit-spam. Uses the
     # RESOLVED head SHA (not the client-claimed one, though they matched above).
@@ -1037,7 +1097,7 @@ async def create_submission(
     max_commit_rounds = _max_rounds_per_commit()
     if max_commit_rounds > 0:
         benched_rounds = store.count_benched_rounds_by_commit(
-            body.hotkey, pr["head_sha"]
+            body.hotkey, pr["head_sha"], current_round_id=current_round.round_id,
         )
         if benched_rounds >= max_commit_rounds:
             raise HTTPException(
@@ -1100,7 +1160,9 @@ async def create_submission(
             private_repo_full=(body.private_repo if _private else None),
             repo_token=(body.repo_token if _private else None),
             github_owner=_github_owner,
-            max_per_owner_per_round=max_per_owner,
+            max_per_owner_per_round=_max_submissions_per_owner_per_round(),
+            max_per_actor_per_round=max_per_actor,
+            actor_of=_actor_of,
             max_rounds_per_commit=max_commit_rounds,
         )
     except ValueError as exc:
@@ -1802,15 +1864,33 @@ async def get_submission_status(submission_id: str) -> StatusResponse:
         # verdict (the follower-slice check). veto_observe attaches to the report
         # only when this submission was the finalist the followers checked.
         _veto_observe = None
+        _won = False
+        _round_finalized = False
         if sub.round_id:
             rs = get_round_store().get_round(sub.round_id)
             if rs is not None:
                 if not reason and getattr(rs, "abort_reason", None):
                     reason = rs.abort_reason
                 _veto_observe = getattr(rs, "veto_observe", None)
+                # Reflect the round's ACTUAL finalization in this submission's
+                # report so a settled outcome never reads as still-pending — the
+                # /submissions/{id}/status card a miner polls previously derived the
+                # verdict from the LIVE submission status only, so a finalist whose
+                # champion reign later ended (status reverts 'adopted'->'scored')
+                # fell back to "beat the champion … (pending — not yet adopted)"
+                # despite having won its round.
+                #   * _won        -> this submission is the round's chosen finalist
+                #                    (persists past a later dethrone).
+                #   * _finalized  -> the round has decided (a finalist was picked,
+                #                    or it aborted), so a non-finalist reads
+                #                    "not this round's finalist", not "pending".
+                _fin = getattr(rs, "finalist_submission_id", None)
+                _won = _fin is not None and _fin == getattr(sub, "submission_id", None)
+                _round_finalized = _fin is not None or rs.status == RoundStatus.ABORTED
 
         d["report"] = build_submission_report(
-            sub, reason=reason, veto_observe=_veto_observe,
+            sub, reason=reason, won=_won, round_finalized=_round_finalized,
+            veto_observe=_veto_observe,
         )
     except Exception as exc:
         logger.warning("submission report build failed for %s: %s", submission_id, exc)
@@ -1824,7 +1904,7 @@ async def list_submissions(
     epoch: int | None = None,
     hotkey: str | None = None,
     include_details: bool = False,
-    limit: int = 0,
+    limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
     """List submissions, optionally filtered by round, epoch, and/or hotkey.
@@ -1836,11 +1916,14 @@ async def list_submissions(
     read the light fields. Pass ``include_details=true`` to keep it, or fetch a
     single submission's full report via ``GET /v1/submissions/{id}/status``.
 
-    ``limit``/``offset`` paginate the (newest-first) result; ``limit<=0`` (the
-    default) returns everything, so callers that omit it are unaffected. The full
-    corpus is now ~20k rows / ~44 MB per call and unbounded fetches drove the bulk
-    of validator egress — many clients already send ``?limit=N`` (it was
-    previously ignored). ``total`` in the response is the unpaginated count.
+    ``limit``/``offset`` paginate the (newest-first) result. **``limit`` defaults
+    to 50** — an omitted ``limit`` returns the 50 newest rows, NOT the whole
+    corpus. The full corpus is ~20k rows / ~44 MB, and unbounded no-param polls
+    (many from a handful of datacenter clients) drove the bulk of validator
+    egress. Pass ``?limit=0`` (or a negative value) to explicitly opt in to the
+    entire corpus. ``total`` in the response is always the unpaginated count —
+    use it for "how many submissions exist", NOT ``count`` (the number of rows
+    actually returned after limit/offset).
     """
     store = get_store()
 

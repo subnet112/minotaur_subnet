@@ -13,8 +13,13 @@ Subcommands:
         --pr-number 123 \\
         --head-sha <40-char-sha> --hotkey my-wallet
 
-    # Check submission status
+    # Check submission status (rendered per-order verdicts; --json for raw)
     python -m minotaur_subnet.miner.main status --submission-id sub_xxx
+
+    # Dry-run a plan without submitting (gated, signed with your hotkey)
+    python -m minotaur_subnet.miner.main dry-run \\
+        --app-id app_123 --plan plan.json --params params.json \\
+        --wallet-name my-wallet --hotkey-name my-hotkey
 """
 
 from __future__ import annotations
@@ -248,6 +253,159 @@ async def poll_submission_status(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#                            DRY-RUN (score a plan without submitting)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def run_dry_run(
+    *,
+    validator_url: str,
+    plan: dict[str, Any],
+    wallet_name: str,
+    hotkey_name: str | None,
+    wallet_path: str | None,
+    app_id: str | None = None,
+    order_id: str | None = None,
+    params: dict[str, Any] | None = None,
+    chain_id: int = 0,
+    intent_function: str = "execute",
+    fork_block: int | None = None,
+) -> dict[str, Any]:
+    """Score a single execution plan against the validator without submitting.
+
+    Two gated endpoints, chosen by which id is given:
+
+    * ``--app-id`` → ``POST /v1/apps/{app_id}/score`` — the validator's REAL
+      fork simulation (on-chain score, gas, transfers, decoded revert reason).
+      Needs ``params`` (the order params → ``state.raw_params``).
+    * ``--order-id`` → ``POST /v1/orders/{order_id}/dry-run`` — fast MOCK
+      simulation, JS score only. Params come from the stored order; the body
+      is just the plan's interactions/deadline/nonce/metadata.
+
+    Both are authenticated with ``X-Bittensor-*`` headers signed by the
+    miner's registered hotkey (see ``minotaur_subnet.miner.signing``).
+    """
+    from minotaur_subnet.miner.signing import signed_headers
+
+    base = validator_url.rstrip("/")
+    if app_id:
+        path = f"/v1/apps/{app_id}/score"
+        body: dict[str, Any] = {
+            "plan": plan,
+            "params": params or {},
+            "chain_id": chain_id,
+            "intent_function": intent_function,
+        }
+        if fork_block is not None:
+            body["fork_block"] = fork_block
+    else:
+        path = f"/v1/orders/{order_id}/dry-run"
+        # /dry-run takes the plan's fields directly (DryRunRequest).
+        body = {
+            "interactions": plan.get("interactions", []),
+            "deadline": plan.get("deadline", 0),
+            "nonce": plan.get("nonce", 0),
+            "metadata": plan.get("metadata", {}) or {},
+        }
+
+    # required=True: a miner who invoked `dry-run` wants a signed call — fail
+    # loudly if the wallet can't be loaded rather than silently 401.
+    headers = signed_headers(
+        "POST", path,
+        wallet_name=wallet_name, hotkey_name=hotkey_name, wallet_path=wallet_path,
+        required=True,
+    )
+    headers["Content-Type"] = "application/json"
+
+    url = base + path
+    logger.info("Dry-run: POST %s (hotkey=%s)", url, headers["X-Bittensor-Hotkey"][:16])
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, json=body, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                logger.error("Dry-run failed (HTTP %d): %s", resp.status, text[:400])
+                return {"error": text, "status_code": resp.status}
+            return json.loads(text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                            STATUS RENDERING (per-order blind spots)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def render_status(data: dict[str, Any]) -> str:
+    """Human-readable submission status incl. the per-order blind-spot table.
+
+    Surfaces ``report.relative.per_order`` — the row-per-order verdicts
+    (``win`` / ``regression`` / ``matched`` / ``blind_spot_cover`` /
+    ``dropped``) that tell a miner exactly where the champion is weak
+    (``blind_spot_cover``) and where they must not regress (``dropped`` is a
+    hard veto). Falls back to a compact summary when no report is attached.
+    """
+    lines: list[str] = []
+    sid = data.get("submission_id", "?")
+    status = data.get("status", "?")
+    lines.append(f"Submission {sid}: {status}")
+
+    report = data.get("report") or {}
+    outcome = report.get("outcome")
+    if outcome:
+        lines.append(f"Outcome: {outcome}")
+    if data.get("benchmark_rank") is not None:
+        lines.append(f"Benchmark rank: {data['benchmark_rank']}")
+    if data.get("rejection_reason"):
+        lines.append(f"Rejection: {data['rejection_reason']}")
+
+    relative = report.get("relative") or {}
+    if relative:
+        lines.append(
+            "Relative vs champion: "
+            f"better={relative.get('better', 0)} "
+            f"worse={relative.get('worse', 0)} "
+            f"matched={relative.get('matched', 0)} "
+            f"new={relative.get('new', 0)} "
+            f"compared={relative.get('compared', 0)} "
+            f"verdict={relative.get('verdict', '?')}"
+        )
+        if report.get("reason_relative"):
+            lines.append(f"  {report['reason_relative']}")
+
+    per_order = relative.get("per_order") or []
+    if per_order:
+        # Lead with the actionable rows: blind spots to keep, regressions to
+        # fix, drops (hard vetoes) first.
+        priority = {
+            "dropped": 0, "regression": 1, "blind_spot_cover": 2,
+            "win": 3, "matched": 4, "skip": 5,
+        }
+        rows = sorted(per_order, key=lambda r: priority.get(r.get("verdict", ""), 9))
+        lines.append("")
+        lines.append(f"Per-order verdicts ({len(rows)}):")
+        lines.append(f"  {'verdict':<18} {'intent_id':<24} {'champ':>14} {'chal':>14}  ratio")
+        for r in rows:
+            iid = str(r.get("intent_id", "?"))
+            iid_disp = iid if len(iid) <= 24 else iid[:21] + "…"
+            ratio = r.get("ratio")
+            ratio_s = f"{ratio:.4f}" if isinstance(ratio, (int, float)) else "—"
+            flag = " ⚠ HARD-LOSS" if r.get("catastrophic") else ""
+            lines.append(
+                f"  {str(r.get('verdict', '?')):<18} {iid_disp:<24} "
+                f"{str(r.get('champ', '—')):>14} {str(r.get('chal', '—')):>14}  {ratio_s}{flag}"
+            )
+        lines.append("")
+        lines.append(
+            "Legend: blind_spot_cover = champion delivered nothing, you did "
+            "(pure win) · regression = you delivered less (stay within the 1% "
+            "floor) · dropped = you produced nothing the champion serves (HARD "
+            "VETO — fix first)."
+        )
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                            ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -360,6 +518,61 @@ def main() -> None:
         "--validator-url", default="http://localhost:9100",
         help="Validator base URL",
     )
+    status_parser.add_argument(
+        "--json", action="store_true",
+        help="Print the raw status JSON instead of the rendered per-order view",
+    )
+
+    # dry-run (score a plan without submitting)
+    dryrun_parser = subparsers.add_parser(
+        "dry-run",
+        help="Score a plan against the validator without submitting (gated, signed)",
+    )
+    dryrun_parser.add_argument(
+        "--validator-url", default="http://localhost:8080",
+        help="Validator base URL",
+    )
+    dryrun_parser.add_argument(
+        "--plan", required=True, type=Path,
+        help="Path to plan.json ({interactions, deadline, nonce, metadata})",
+    )
+    dryrun_target = dryrun_parser.add_mutually_exclusive_group(required=True)
+    dryrun_target.add_argument(
+        "--app-id",
+        help="Score via the REAL fork sim: POST /v1/apps/{app_id}/score "
+             "(needs --params)",
+    )
+    dryrun_target.add_argument(
+        "--order-id",
+        help="Score via the fast MOCK sim: POST /v1/orders/{order_id}/dry-run",
+    )
+    dryrun_parser.add_argument(
+        "--params", type=Path, default=None,
+        help="Path to params.json (order params → state.raw_params). "
+             "Required with --app-id.",
+    )
+    dryrun_parser.add_argument(
+        "--chain-id", type=int, default=0,
+        help="Chain ID (0 = auto-detect from deployment)",
+    )
+    dryrun_parser.add_argument(
+        "--intent-function", default="execute", help="Intent function name",
+    )
+    dryrun_parser.add_argument(
+        "--fork-block", type=int, default=None,
+        help="Historical block to rewind the fork to (archive RPC; ±100 of head)",
+    )
+    dryrun_parser.add_argument(
+        "--wallet-name", default=None,
+        help="Bittensor wallet name (or MINER_WALLET_NAME)",
+    )
+    dryrun_parser.add_argument(
+        "--hotkey-name", default=None,
+        help="Bittensor hotkey name (or MINER_HOTKEY_NAME)",
+    )
+    dryrun_parser.add_argument(
+        "--wallet-path", default=None, help="Path to bittensor wallets directory",
+    )
 
     args = parser.parse_args()
 
@@ -436,8 +649,53 @@ def main() -> None:
         result = asyncio.run(poll_submission_status(
             args.submission_id, args.validator_url, timeout=30.0,
         ))
-        print(json.dumps(result, indent=2))
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(render_status(result))
         sys.exit(0)
+
+    elif args.command == "dry-run":
+        if args.app_id and args.params is None:
+            parser.error("--params is required with --app-id (POST /apps/{id}/score)")
+        wallet_name = (
+            args.wallet_name
+            or os.environ.get("MINER_WALLET_NAME")
+            or os.environ.get("MINER_HOTKEY")
+        )
+        if not wallet_name:
+            parser.error("--wallet-name (or MINER_WALLET_NAME) is required to sign")
+        if not args.plan.is_file():
+            parser.error(f"plan file not found: {args.plan}")
+        plan = json.loads(args.plan.read_text())
+        params = (
+            json.loads(args.params.read_text())
+            if args.params and args.params.is_file()
+            else None
+        )
+        try:
+            result = asyncio.run(run_dry_run(
+                validator_url=args.validator_url,
+                plan=plan,
+                params=params,
+                app_id=args.app_id,
+                order_id=args.order_id,
+                chain_id=args.chain_id,
+                intent_function=args.intent_function,
+                fork_block=args.fork_block,
+                wallet_name=wallet_name,
+                hotkey_name=args.hotkey_name,
+                wallet_path=args.wallet_path,
+            ))
+        except Exception as exc:
+            logger.error(
+                "dry-run could not sign the request (wallet=%s): %s. "
+                "Check --wallet-name / --hotkey-name / --wallet-path.",
+                wallet_name, exc,
+            )
+            sys.exit(1)
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if "error" not in result else 1)
 
     else:
         parser.print_help()

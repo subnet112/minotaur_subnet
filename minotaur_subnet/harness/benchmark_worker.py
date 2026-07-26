@@ -775,8 +775,18 @@ class BenchmarkWorker:
         live = [s for s in round_subs if _occupies_slot(s)]
         if len(live) <= slots:
             return benchmarking
-        last_selected = RotationLedger(rotation_ledger_path()).load()
-        slate, _ = select_rotation_slate(live, slots, last_selected, round_id)
+        _ledger = RotationLedger(rotation_ledger_path())
+        last_selected = _ledger.load()
+        # Same actor keying AND wait-time seniority (benched + first-seen) as
+        # close-time rotation, or the belt recomputes a DIFFERENT slate than the
+        # close would have selected. In the split-worker process the coldkey map
+        # comes from the sidecar the api persists next to this same ledger; None
+        # degrades both paths alike.
+        from minotaur_subnet.harness.actor import snapshot_resolver
+        slate, _ = select_rotation_slate(
+            live, slots, last_selected, round_id, actor_of=snapshot_resolver(),
+            seen=_ledger.load_seen(), now=time.time(),
+        )
         slate_ids = {s.submission_id for s in slate}
         kept = [s for s in benchmarking if s.submission_id in slate_ids]
         dropped = [s for s in benchmarking if s.submission_id not in slate_ids]

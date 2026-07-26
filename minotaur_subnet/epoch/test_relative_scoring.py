@@ -15,6 +15,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from minotaur_subnet.epoch.relative_scoring import (
+    FLOOR_BPS,
     MIN_VALID_OUTPUT,
     RELATIVE_TOL,
     RELATIVE_TOL_BPS,
@@ -429,6 +430,62 @@ def test_counts_blind_spot_is_better_and_new():
     assert c["verdict"] == "dethrone"
 
 
+# ── hard-loss tier split (worse == tolerated + lost) ─────────────────────────
+
+
+def test_counts_floor_bps_exposed():
+    # The floor is surfaced so a consumer re-tiers automatically when it moves.
+    c = relative_counts([_r("o1", "100")], [_r("o1", "100")])
+    assert c["floor_bps"] == FLOOR_BPS == 100
+
+
+def test_counts_tolerated_regression_is_worse_but_not_lost():
+    # A -0.5% cut is a regression (worse) but WITHIN the 1% floor: tolerated,
+    # netted, NOT a loss. Two wins net past the one tolerated regression, so a
+    # tolerated regression never blocks a dethrone.
+    champ = [_r("o1", "10000"), _r("o2", "10000"), _r("o3", "10000")]
+    chal = [_r("o1", "12000"), _r("o2", "12000"), _r("o3", "9950")]  # win, win, -0.5%
+    c = relative_counts(champ, chal)
+    assert (c["better"], c["worse"], c["matched"]) == (2, 1, 0)
+    assert c["tolerated"] == 1
+    assert c["lost"] == 0
+    assert c["catastrophic"] == 0
+    assert c["dropped"] == 0
+    assert c["worse"] == c["tolerated"] + c["lost"]  # invariant
+    assert c["verdict"] == "dethrone"  # net +1, no hard loss
+    # The tolerated order is flagged NOT catastrophic per-order.
+    per = {o["intent_id"]: o for o in c["per_order"]}
+    assert per["o3"]["verdict"] == "regression"
+    assert per["o3"]["catastrophic"] is False
+
+
+def test_counts_catastrophic_and_dropped_are_lost():
+    # A >1% cut and a true drop are BOTH hard losses -> `lost`, not tolerated.
+    champ = [_r("o1", "10000"), _r("o2", "10000"), _r("o3", "10000")]
+    chal = [_r("o1", "9950"), _r("o2", "9800"), _r("o3", None)]
+    #        o1 -0.5% tolerated   o2 -2% catastrophic   o3 dropped
+    c = relative_counts(champ, chal)
+    assert c["worse"] == 3
+    assert c["tolerated"] == 1          # o1 only
+    assert c["lost"] == 2               # o2 (catastrophic) + o3 (dropped)
+    assert c["catastrophic"] == 1       # o2
+    assert c["dropped"] == 1            # o3
+    assert c["worse"] == c["tolerated"] + c["lost"]  # invariant
+    assert c["verdict"] == "behind"
+    per = {o["intent_id"]: o for o in c["per_order"]}
+    assert per["o2"]["catastrophic"] is True   # >floor regression
+    assert per["o3"]["catastrophic"] is False  # a drop is a loss via its verdict
+
+
+def test_per_order_catastrophic_false_for_non_losses():
+    # win / matched / blind_spot_cover / skip never carry the hard-loss flag.
+    champ = [_r("o1", "100"), _r("o2", "100"), _r("o3", None), _r("o4", None)]
+    chal = [_r("o1", "200"), _r("o2", "100"), _r("o3", "500"), _r("o4", None)]
+    #        win               matched          blind_spot_cover   skip
+    c = relative_counts(champ, chal)
+    assert all(o["catastrophic"] is False for o in c["per_order"])
+
+
 def test_counts_compared_excludes_skips():
     # o2 has no value on either side -> skip, excluded from `compared`.
     champ = [_r("o1", "100"), _r("o2", None)]
@@ -489,6 +546,23 @@ def test_reason_dethrone_not_adopted_says_beat_not_merged():
         "(regressions within 1% floor) (pending round outcome — not yet adopted)"
     )
     assert not msg.startswith("adopted")
+
+
+def test_reason_finalized_non_finalist_is_decided_not_pending():
+    # Once the ROUND has finalized without this being the finalist, the outcome is
+    # SETTLED — the string must say "not this round's finalist", never "pending"
+    # (a non-finalist, or a former champion since dethroned, must not read a
+    # decided result as still in flight). See report.py round_finalized threading.
+    counts = relative_counts([_r("o1", "100")], [_r("o1", "200")])
+    msg = relative_reason(counts, candidate_id="sub-7", finalized=True)
+    assert msg == (
+        "beat the champion sub-7: net better — 1 better / 0 worse "
+        "(regressions within 1% floor) — not this round's finalist"
+    )
+    assert "pending" not in msg
+    # adopted wins over finalized: the actual finalist stays past-tense, no tail.
+    won_msg = relative_reason(counts, candidate_id="sub-7", adopted=True, finalized=True)
+    assert won_msg == "adopted sub-7: net better — 1 better / 0 worse (regressions within 1% floor)"
 
 
 def test_reason_not_adopted_verb_applies_to_tie_break_wins():

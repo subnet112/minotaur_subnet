@@ -27,44 +27,20 @@ submits two minutes after a bot flood loses only the builds that PHYSICALLY
 started before it arrived (~1 per 1-3 min), and outranks every queued bot for
 the next unit. Budget-winners keep today's near-immediate build feedback.
 
-THE SYBIL TRAP, and the two-pool answer. Rotation seniority treats
-never-benched identities as MOST senior (rotation_sort_key: missing ledger
-entry = timestamp 0.0) — correct for the bench slate's starvation-freedom, but
-a build budget allocated purely by that rule hands all 8 builds to fresh
-sybils every round: minting a new hotkey out-seniors every proven miner. So
-the budget is split into two pools by ``SOLVER_BUILD_PROVEN_SHARE`` (default
-0.75 — 6 of 8 units):
-
-  PROVEN   — hotkeys with a rotation-ledger entry (at least one completed past
-             bench), ordered LRU (benched longest ago first), salted-hash
-             tie-break: the rotation rule, applied to the identities it was
-             designed for.
-  NEWCOMER — never-benched hotkeys, ordered purely by the salted
-             ``sha256(hotkey:round_id)`` hash — a deterministic, publicly
-             recomputable per-round lottery with no arrival/alphabetical bias.
-
-Trade-off, stated honestly: under a flood of S never-benched sybils an honest
-newcomer's per-round build probability is ~2/S — degraded to probabilistic,
-never zero (fresh lottery every round, so no permanent starvation), with
-expected entry in ~S/2 rounds. Sybils can no longer starve proven miners; the
-residual attack (buying lottery tickets by minting identities) is priced in
-registration cost, which is min_burn's job, not the scheduler's. A sybil that
-wins and gets BENCHED does become "proven", but that promotion is bounded by
-the newcomer share per round and still costs registration + the per-owner and
-fingerprint caps upstream. Losing the ledger degrades exactly as rotation
-documents: everyone ties at "never benched" and the per-round lottery decides
-until history rebuilds.
-
-SPILLOVER. A pool with no waiters donates its units so quiet rounds waste no
-capacity — but asymmetrically:
-  * proven → newcomer units: IMMEDIATE (a proven miner consuming an idle
-    newcomer unit costs newcomers nothing they were contending for).
-  * newcomer → proven units: only after ``SOLVER_BUILD_NEWCOMER_SPILL_AFTER``
-    (default 0.5) of the round's open window has elapsed. Without this delay
-    the live flood pattern — bots submitting the instant the round opens,
-    before any proven miner has arrived — would drain the proven pool through
-    the "no proven waiter exists" rule and partially reintroduce the
-    arrival-order advantage this gate exists to remove.
+ONE WAIT-TIME QUEUE (no pools). Units are handed to waiters by
+``rotation.wait_ts`` seniority — "waiting since when": a hotkey's (actor's) last
+bench, or, if it never benched, its FIRST-SEEN time. A freshly-minted identity's
+clock starts NOW, so it sorts junior and cannot out-senior a miner who has
+genuinely been waiting. That single change retires the old two-pool /
+newcomer-lottery / spillover apparatus: those existed only because the previous
+rule treated never-benched as MOST senior (ts 0.0), which handed fresh sybils
+the front of the queue and forced a reserved "proven" share to defend against
+it. With first-seen aging there is nothing to defend — minting buys the back of
+the line — so the gate is just: order all waiters by (fresh-actor-first,
+wait-time), grant while budget and pacing allow. Soft per-actor dedup keeps a
+fleet from taking a second unit while any other actor waits; leftover budget in
+a quiet round still fills. Starvation-free: an honest newcomer ages toward the
+front as others bench and reset, benching in its fair turn.
 
 RESTART SAFETY (single-charge). The gate is in-process state; a restart wipes
 it while ``resume_stranded_screenings`` re-kicks pipelines from scratch. On
@@ -91,12 +67,18 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from minotaur_subnet.harness.actor import (
+    actor_first_seen,
+    actor_last_selected,
+    snapshot_resolver,
+)
 from minotaur_subnet.harness.rotation import (
     RotationLedger,
+    actor_rotation_sort_key,
     rotation_ledger_path,
     rotation_sort_key,
 )
@@ -132,35 +114,6 @@ def round_build_budget() -> int:
         return int(raw)
     except ValueError:
         return 8
-
-
-def proven_share() -> float:
-    """Fraction of the build budget reserved for PROVEN miners (ledger entry =
-    at least one completed past bench). Default 0.75 → 6 of 8 units proven,
-    2 newcomer. Clamped to [0, 1]. See the module docstring for why a share of
-    the budget must be held back from the never-benched-is-most-senior rule.
-    """
-    raw = os.environ.get("SOLVER_BUILD_PROVEN_SHARE", "0.75").strip()
-    try:
-        val = float(raw)
-    except ValueError:
-        val = 0.75
-    return min(1.0, max(0.0, val))
-
-
-def newcomer_spill_after_fraction() -> float:
-    """Fraction of the round's OPEN window that must elapse before a NEWCOMER
-    waiter may consume an idle PROVEN unit (default 0.5). The delay closes the
-    open-instant hole: bots submitting at round open, before any proven miner
-    arrives, must not drain the proven pool via the no-proven-waiter spill
-    rule. Proven → newcomer spill is immediate (see module docstring).
-    <= 0 disables the delay; >= 1 disables newcomer→proven spill entirely.
-    """
-    raw = os.environ.get("SOLVER_BUILD_NEWCOMER_SPILL_AFTER", "0.5").strip()
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.5
 
 
 def _dispatch_concurrency() -> int:
@@ -200,11 +153,13 @@ class BuildGrant:
 class _Waiter:
     submission_id: str
     hotkey: str
-    # rotation_sort_key(hotkey, round_id, ledger): (last_selected_ts, salted
-    # sha256). For proven miners the timestamp orders LRU-first; for newcomers
-    # every timestamp is 0.0 so the salted hash is a pure per-round lottery.
-    key: tuple[float, str]
-    proven: bool
+    # The wait-time sort key (rotation.wait_ts): (seniority, actor-salt,
+    # hotkey-salt) actor-keyed, or (seniority, hotkey-salt) legacy. Seniority is
+    # last-benched, or first-seen for a never-benched identity — so a fresh
+    # mint sorts junior, not senior. Snapshotted at ensure_round so a round's
+    # ordering is stable across a mid-round metagraph re-sync.
+    key: tuple[float, str, str] | tuple[float, str]
+    actor: str = ""
     event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: BuildGrant | None = None
 
@@ -213,22 +168,25 @@ class _Waiter:
 class _RoundGateState:
     round_id: str
     budget: int
-    proven_units: int
-    newcomer_units: int
-    opened_at: float
-    open_seconds: float
-    spill_after_fraction: float
     ledger: dict[str, float]
+    # Actor view + seniority maps, snapshotted with the ledger at ensure_round.
+    # actor_of is a FROZEN ActorResolver (harness/actor.py) or None (legacy
+    # per-hotkey). actor_last/actor_seen are the benched/first-seen timestamps
+    # aggregated per actor for wait_ts; now_at anchors a brand-new actor's clock.
+    actor_of: Any = None
+    actor_last: dict[str, float] = field(default_factory=dict)
+    actor_seen: dict[str, float] = field(default_factory=dict)
+    now_at: float = 0.0
+    charged_actors: set[str] = field(default_factory=set)
     charged_ids: set[str] = field(default_factory=set)
-    proven_charged: int = 0
-    newcomer_charged: int = 0
+    charged: int = 0
     in_flight: set[str] = field(default_factory=set)
     waiters: list[_Waiter] = field(default_factory=list)
     flushed: bool = False
 
     @property
     def total_charged(self) -> int:
-        return self.proven_charged + self.newcomer_charged
+        return self.charged
 
 
 class BuildBudgetGate:
@@ -241,12 +199,16 @@ class BuildBudgetGate:
         self,
         *,
         ledger_loader: Callable[[], dict[str, float]] | None = None,
+        seen_loader: Callable[[], dict[str, float]] | None = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._rounds: dict[str, _RoundGateState] = {}
         self._now = now
         self._ledger_loader = ledger_loader or (
             lambda: RotationLedger(rotation_ledger_path()).load()
+        )
+        self._seen_loader = seen_loader or (
+            lambda: RotationLedger(rotation_ledger_path()).load_seen()
         )
 
     # ── round lifecycle ──────────────────────────────────────────────────
@@ -258,8 +220,6 @@ class BuildBudgetGate:
         self,
         round_id: str,
         *,
-        opened_at: float,
-        open_seconds: float,
         prior_attempts: list[tuple[str, str]] | None = None,
     ) -> None:
         """Create (idempotently) the gate state for a round.
@@ -273,29 +233,28 @@ class BuildBudgetGate:
         if round_id in self._rounds:
             return
         budget = round_build_budget()
-        share = proven_share()
-        if budget > 0:
-            proven_units = min(budget, max(0, round(budget * share)))
-        else:
-            proven_units = 0
+        ledger = self._ledger_loader()
+        seen = self._seen_loader()
+        actor_of = snapshot_resolver()
+        if actor_of is not None:
+            actor_last = actor_last_selected(ledger, actor_of)
+            actor_seen = actor_first_seen(seen, actor_of)
+        else:  # legacy per-hotkey: identity aggregation
+            actor_last = dict(ledger)
+            actor_seen = dict(seen)
         state = _RoundGateState(
             round_id=round_id,
             budget=budget,
-            proven_units=proven_units,
-            newcomer_units=max(0, budget - proven_units),
-            opened_at=float(opened_at or 0.0),
-            open_seconds=float(open_seconds or 0.0),
-            spill_after_fraction=newcomer_spill_after_fraction(),
-            ledger=self._ledger_loader(),
+            ledger=ledger,
+            actor_of=actor_of,
+            actor_last=actor_last,
+            actor_seen=actor_seen,
+            now_at=self._now(),
         )
         for sid, hotkey in prior_attempts or []:
             if sid in state.charged_ids:
                 continue
-            state.charged_ids.add(sid)
-            if self._is_proven(state, hotkey):
-                state.proven_charged += 1
-            else:
-                state.newcomer_charged += 1
+            self._charge_unit(state, sid, hotkey)
         self._rounds[round_id] = state
         if prior_attempts:
             logger.info(
@@ -319,85 +278,57 @@ class BuildBudgetGate:
     # ── classification / ordering ────────────────────────────────────────
 
     @staticmethod
-    def _is_proven(state: _RoundGateState, hotkey: str) -> bool:
-        # A ledger entry means "completed at least one past bench" — the
-        # rotation ledger only advances for SELECTED slate members
-        # (rotation.apply_rotation_slate → mark_selected).
-        return float(state.ledger.get(hotkey or "", 0.0)) > 0.0
+    def _actor(state: _RoundGateState, hotkey: str) -> str:
+        hotkey = hotkey or ""
+        if state.actor_of is None:
+            return hotkey
+        return state.actor_of(hotkey) or hotkey
 
-    def _spill_to_proven_open(self, state: _RoundGateState) -> bool:
-        """May a newcomer consume an idle proven unit yet? (Amendment: only
-        after a configured fraction of the open window, so open-instant bots
-        can't drain the proven pool before proven miners arrive.)"""
-        frac = state.spill_after_fraction
-        if frac <= 0:
-            return True
-        if state.open_seconds <= 0 or state.opened_at <= 0:
-            # No window information — fail toward fairness for newcomers
-            # (spill allowed) only when the delay is disabled; otherwise hold
-            # the proven reserve for the whole round.
-            return False
-        return (self._now() - state.opened_at) >= frac * state.open_seconds
+    @staticmethod
+    def _charge_unit(state: _RoundGateState, submission_id: str, hotkey: str) -> None:
+        """Record one spent budget unit for ``submission_id`` (idempotence is
+        the caller's job via ``charged_ids``)."""
+        state.charged_ids.add(submission_id)
+        state.charged_actors.add(BuildBudgetGate._actor(state, hotkey))
+        state.charged += 1
 
-    def _pick_next(self, state: _RoundGateState) -> tuple[_Waiter, str] | None:
-        """Choose the next waiter to grant and the POOL whose unit it spends.
+    def _pick_next(self, state: _RoundGateState) -> _Waiter | None:
+        """The next waiter to grant — one wait-time queue, no pools.
 
-        Largest-remainder interleave between the pools (with 6/2 units the
-        grant pattern is P P P N P P P N), each pool internally ordered by
-        rotation_sort_key; asymmetric spillover per the module docstring.
+        Order: fresh-actor first (an actor that has NOT yet spent a unit this
+        round sorts ahead of one that has — soft per-actor dedup, so a fleet
+        never multiplies its build share by hotkey count), then by wait-time
+        seniority (``_Waiter.key``: last-benched, or first-seen for a
+        never-benched identity — a fresh mint is junior). Budget never wasted:
+        once every fresh actor is served, repeat actors fill the remainder.
         """
-        proven_w = sorted((w for w in state.waiters if w.proven), key=lambda w: w.key)
-        newcomer_w = sorted((w for w in state.waiters if not w.proven), key=lambda w: w.key)
-        proven_left = state.proven_units - state.proven_charged
-        newcomer_left = state.newcomer_units - state.newcomer_charged
-
-        # Pool preference: serve the pool at-or-below its proportional pace
-        # (cross-multiplied to avoid division; ties prefer proven).
-        prefer_proven = (
-            state.proven_charged * state.newcomer_units
-            <= state.newcomer_charged * state.proven_units
+        if not state.waiters:
+            return None
+        if state.actor_of is None:  # legacy: pure wait-time order
+            return min(state.waiters, key=lambda w: w.key)
+        return min(
+            state.waiters,
+            key=lambda w: (w.actor in state.charged_actors, w.key),
         )
-        order = ("proven", "newcomer") if prefer_proven else ("newcomer", "proven")
-        for pool in order:
-            if pool == "proven" and proven_w and proven_left > 0:
-                return proven_w[0], "proven"
-            if pool == "newcomer" and newcomer_w and newcomer_left > 0:
-                return newcomer_w[0], "newcomer"
-        # Spillover — only when the unit's own constituency has NO waiter:
-        # proven → newcomer units immediately…
-        if proven_w and not newcomer_w and newcomer_left > 0:
-            return proven_w[0], "newcomer"
-        # …newcomer → proven units only after the open-window delay.
-        if (
-            newcomer_w
-            and not proven_w
-            and proven_left > 0
-            and self._spill_to_proven_open(state)
-        ):
-            return newcomer_w[0], "proven"
-        return None
 
     # ── dispatch machinery ───────────────────────────────────────────────
 
-    def _grant(self, state: _RoundGateState, waiter: _Waiter, pool: str) -> None:
+    def _grant(self, state: _RoundGateState, waiter: _Waiter) -> None:
         state.waiters.remove(waiter)
         state.charged_ids.add(waiter.submission_id)
-        if pool == "proven":
-            state.proven_charged += 1
-        else:
-            state.newcomer_charged += 1
+        state.charged_actors.add(waiter.actor)
+        state.charged += 1
         state.in_flight.add(waiter.submission_id)
         waiter.outcome = BuildGrant(
             granted=True, charged=True,
-            reason=f"unit {state.total_charged}/{state.budget} ({pool} pool)",
+            reason=f"unit {state.charged}/{state.budget}",
         )
         waiter.event.set()
         logger.info(
-            "[build-budget] %s: granted build to %s (hotkey=%s pool=%s "
-            "proven=%d/%d newcomer=%d/%d in_flight=%d waiting=%d)",
-            state.round_id, waiter.submission_id, waiter.hotkey[:12], pool,
-            state.proven_charged, state.proven_units,
-            state.newcomer_charged, state.newcomer_units,
+            "[build-budget] %s: granted build to %s (hotkey=%s actor=%s "
+            "spent=%d/%d in_flight=%d waiting=%d)",
+            state.round_id, waiter.submission_id, waiter.hotkey[:12],
+            waiter.actor[:12], state.charged, state.budget,
             len(state.in_flight), len(state.waiters),
         )
 
@@ -408,12 +339,12 @@ class BuildBudgetGate:
         while (
             state.waiters
             and len(state.in_flight) < concurrency
-            and state.total_charged < state.budget
+            and state.charged < state.budget
         ):
             pick = self._pick_next(state)
             if pick is None:
                 return
-            self._grant(state, *pick)
+            self._grant(state, pick)
 
     # ── public API ───────────────────────────────────────────────────────
 
@@ -436,7 +367,7 @@ class BuildBudgetGate:
         if state is None:
             # Defensive: callers ensure_round() first; a bare acquire must
             # still never crash a pipeline. Bootstrap with no history.
-            self.ensure_round(round_id, opened_at=0.0, open_seconds=0.0)
+            self.ensure_round(round_id)
             state = self._rounds[round_id]
 
         # 0 = unlimited: transparent pass-through, today's behaviour exactly
@@ -448,11 +379,7 @@ class BuildBudgetGate:
         # (or earlier in this one) — pass free, and count exactly once.
         if prior_attempt or submission_id in state.charged_ids:
             if submission_id not in state.charged_ids:
-                state.charged_ids.add(submission_id)
-                if self._is_proven(state, hotkey):
-                    state.proven_charged += 1
-                else:
-                    state.newcomer_charged += 1
+                self._charge_unit(state, submission_id, hotkey)
             state.in_flight.add(submission_id)
             return BuildGrant(
                 granted=True, charged=False,
@@ -466,11 +393,7 @@ class BuildBudgetGate:
             # exactly the pre-gate semantics for slow screeners, still bounded
             # by the round's budget — otherwise deny (caller parks no-fault).
             if state.total_charged < state.budget:
-                state.charged_ids.add(submission_id)
-                if self._is_proven(state, hotkey):
-                    state.proven_charged += 1
-                else:
-                    state.newcomer_charged += 1
+                self._charge_unit(state, submission_id, hotkey)
                 state.in_flight.add(submission_id)
                 return BuildGrant(
                     granted=True, charged=True,
@@ -487,8 +410,18 @@ class BuildBudgetGate:
         waiter = _Waiter(
             submission_id=submission_id,
             hotkey=hotkey or "",
-            key=rotation_sort_key(hotkey or "", round_id, state.ledger),
-            proven=self._is_proven(state, hotkey or ""),
+            key=(
+                actor_rotation_sort_key(
+                    hotkey or "", round_id, state.actor_last, state.actor_of,
+                    state.actor_seen, state.now_at,
+                )
+                if state.actor_of is not None
+                else rotation_sort_key(
+                    hotkey or "", round_id, state.ledger, state.actor_seen,
+                    state.now_at,
+                )
+            ),
+            actor=self._actor(state, hotkey or ""),
         )
         state.waiters.append(waiter)
         self._dispatch(state)
@@ -561,7 +494,7 @@ class BuildBudgetGate:
                 "[build-budget] %s: flush re-entered with %d waiter(s)",
                 round_id, len(state.waiters),
             )
-        ordered = sorted(state.waiters, key=lambda w: (not w.proven, w.key))
+        ordered = sorted(state.waiters, key=lambda w: w.key)
         contenders = len(ordered)
         parked: list[str] = []
         for idx, waiter in enumerate(ordered):
@@ -581,8 +514,8 @@ class BuildBudgetGate:
                 granted=False, parked=parked_ok,
                 reason=(
                     f"build budget for {round_id} exhausted "
-                    f"({state.total_charged}/{state.budget} builds dispatched "
-                    f"by seniority) — waitlisted, seniority retained"
+                    f"({state.charged}/{state.budget} builds dispatched by "
+                    f"seniority) — waitlisted, seniority retained"
                 ),
             )
             waiter.event.set()
@@ -590,10 +523,8 @@ class BuildBudgetGate:
         state.waiters.clear()
         logger.info(
             "[build-budget] %s: flush parked %d waiter(s) at close "
-            "(proven=%d/%d newcomer=%d/%d units spent)",
-            round_id, len(parked),
-            state.proven_charged, state.proven_units,
-            state.newcomer_charged, state.newcomer_units,
+            "(%d/%d units spent)",
+            round_id, len(parked), state.charged, state.budget,
         )
         return parked
 
@@ -604,11 +535,9 @@ class BuildBudgetGate:
             return None
         return {
             "budget": state.budget,
-            "proven_units": state.proven_units,
-            "newcomer_units": state.newcomer_units,
-            "proven_charged": state.proven_charged,
-            "newcomer_charged": state.newcomer_charged,
+            "charged_count": state.charged,
             "charged": sorted(state.charged_ids),
+            "charged_actors": sorted(state.charged_actors),
             "in_flight": sorted(state.in_flight),
             "waiting": [w.submission_id for w in state.waiters],
             "flushed": state.flushed,

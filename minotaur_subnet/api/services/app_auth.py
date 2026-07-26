@@ -32,6 +32,7 @@ from typing import Any
 from eth_hash.auto import keccak
 
 from minotaur_subnet.api.services import developer_auth
+from minotaur_subnet.shared import signer_denylist
 
 
 @dataclass
@@ -64,13 +65,15 @@ def allowed_signers(store: Any, app_id: str, *, admin_only: bool = False) -> lis
     registration approval gate): only ``APP_ADMIN_SIGNERS`` qualify, never the
     app's deployer."""
     out = list(admin_signers())
-    if admin_only:
-        return out
-    definition = store.get_app(app_id)
-    dep = (getattr(definition, "deployer", "") or "").strip().lower()
-    if dep and dep not in out:
-        out.append(dep)
-    return out
+    if not admin_only:
+        definition = store.get_app(app_id)
+        dep = (getattr(definition, "deployer", "") or "").strip().lower()
+        if dep and dep not in out:
+            out.append(dep)
+    # Compromised keys (e.g. the 2026-07-18 breach EOAs) are never allowed
+    # signers, even if still recorded as an app's on-chain-mirrored deployer or
+    # mistakenly present in APP_ADMIN_SIGNERS. See ``signer_denylist``.
+    return [a for a in out if not signer_denylist.is_signer_denylisted(a)]
 
 
 # ── parameter binding ────────────────────────────────────────────────────
@@ -163,6 +166,8 @@ def authorize(
             signer = (getattr(definition, "deployer", "") or "").strip().lower()
         if not signer:
             return False, "no signer given and app has no deployer", ""
+        if signer_denylist.is_signer_denylisted(signer):
+            return False, f"signer {signer[:10]}… is denylisted (compromised key)", ""
         if signer not in allowed:
             return False, f"signer {signer[:10]}… is not an allowed signer for this app", ""
 

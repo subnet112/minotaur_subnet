@@ -1358,6 +1358,38 @@ class TestSubmissionAPI(unittest.TestCase):
             data["submissions"][0]["benchmark_details"], sub.benchmark_details
         )
 
+    def test_list_submissions_default_limit_caps_at_50(self):
+        """Omitting ``limit`` returns the 50 newest rows, NOT the full corpus —
+        the unbounded no-param poll drove the bulk of validator egress. ``total``
+        still reports the true count, and ``?limit=0`` opts back in to everything.
+        """
+        for i in range(60):
+            self.store.create(
+                repo_url="https://github.com/a/s",
+                commit_hash=f"c{i:07d}",
+                epoch=42,
+                hotkey=f"miner_{i:04d}",
+                round_id="round-e42-n1",
+            )
+
+        # Default: capped at 50 rows, but `total` is the true unpaginated count.
+        data = self.client.get("/v1/submissions").json()
+        self.assertEqual(data["count"], 50)
+        self.assertEqual(len(data["submissions"]), 50)
+        self.assertEqual(data["total"], 60)
+        self.assertEqual(data["limit"], 50)
+
+        # Explicit small page.
+        data = self.client.get("/v1/submissions?limit=10").json()
+        self.assertEqual(data["count"], 10)
+        self.assertEqual(data["total"], 60)
+
+        # Explicit opt-in to the full corpus via limit=0.
+        data = self.client.get("/v1/submissions?limit=0").json()
+        self.assertEqual(data["count"], 60)
+        self.assertEqual(data["total"], 60)
+        self.assertEqual(data["limit"], 0)
+
     def test_list_submissions_by_epoch(self):
         self.store.create(
             repo_url="https://github.com/a/s", commit_hash="aaaa123",

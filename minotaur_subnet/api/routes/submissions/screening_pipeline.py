@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import logging
 import os
@@ -18,6 +19,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import uuid
 from urllib.parse import urlparse
 
 # Ephemeral sandbox used to fetch untrusted miner repos. The clone runs in a
@@ -29,9 +31,20 @@ DEFAULT_CLONE_IMAGE = "alpine/git:2.45.2"
 # Hard cap on the clone tarball (compressed stream + uncompressed total) to
 # bound memory/disk against a hostile repo. 256 MiB is generous for a solver.
 MAX_CLONE_TAR_BYTES = 256 * 1024 * 1024
+# Wall-clock cap on one sandboxed clone attempt (module-level so tests can
+# shrink it without waiting out the production value).
+CLONE_SANDBOX_TIMEOUT_SECONDS = 240.0
 
+# Hard cap on the NUMBER of tar members. The byte cap alone doesn't stop a repo
+# of e.g. 500k zero-byte files (total uncompressed size stays ~0) from exhausting
+# host INODES on extract. A legit solver repo has hundreds–low-thousands of
+# files; 50k is far above any real tree yet blocks the inode-bomb.
+MAX_CLONE_TAR_MEMBERS = 50_000
+
+from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
+    OUTCOME_COPYCAT_CODE,
     SubmissionStatus,
     offload_write,
 )
@@ -144,6 +157,112 @@ def _max_rounds_per_fingerprint() -> int:
         return 2
 
 
+def _reject_cross_actor_copies() -> bool:
+    """Cross-ACTOR identical-code reject (``SUBMISSIONS_REJECT_CROSS_ACTOR_FP``,
+    default on; 0 disables).
+
+    The EARLIEST submitter of a normalized fingerprint owns it; a submission
+    of the same fingerprint whose actor (harness/actor.py — on-chain coldkey)
+    determinately differs from the owner's is rejected at stage 1, before it
+    can cost a build unit or a slate seat. Unlike the benched-rounds quota
+    below this needs no benches to arm, so five UIDs shipping one tree in one
+    round lose four copies immediately. The rule only ever acts on POSITIVE
+    coldkey attribution: same-actor resubmits pass (the waitlist resubmit
+    loop is the designed no-fault path — rejecting it is the false-positive
+    trap the 2026-07-22 audit measured at 41.8% of serious-miner
+    submissions), and unmapped hotkeys / no coldkey data / the
+    SOLVER_ACTOR_KEY=hotkey kill-switch make the check stand down rather than
+    guess. Leader-local intake policy, like every cap here.
+    """
+    return _env_true("SUBMISSIONS_REJECT_CROSS_ACTOR_FP", default=True)
+
+
+# Statuses the retroactive copy sweep may reject: pre-bench only. A copy that
+# already reached the bench (BENCHMARKING/SCORED/ADOPTED) is the slate's
+# problem — rejecting it mid-bench would bust slate-width accounting — and
+# terminal states are already out of the running.
+_SWEEPABLE_STATUSES = frozenset({
+    "queued",
+    "screening_stage_1",
+    "screening_stage_2",
+    "screening_stage_3",
+    "pending_selection",
+})
+
+
+def evaluate_fingerprint_ownership(
+    entries: list[tuple[str, float, str, str]],
+    *,
+    submission_id: str,
+    hotkey: str,
+    created_at: float,
+    resolver: Any,
+) -> tuple[tuple[str, float, str, str] | None, list[str]]:
+    """Who owns this fingerprint, and which in-flight copies to sweep.
+
+    ``entries`` are ``(hotkey, created_at, submission_id, status)`` for every
+    OTHER submission carrying the fingerprint. Returns ``(owner_prior,
+    sweep_ids)``:
+
+    * ``owner_prior`` — the entry proving ANOTHER actor owns the fingerprint
+      (the globally-earliest submitter by ``(created_at, submission_id)``),
+      meaning THIS submission is a copy and must be rejected. None when this
+      submission's actor owns the fingerprint (first submitter, or a
+      same-actor sibling of it).
+    * ``sweep_ids`` — when (and only when) this submission's actor is
+      determinately the owner: ids of OTHER actors' pre-bench copies to
+      reject retroactively. This closes the concurrent-copy race: two copies
+      screening simultaneously can each miss the other's not-yet-persisted
+      fingerprint, but whichever check runs LAST sees the full picture and
+      sweeps the escapee — ordering alone cannot, because visibility (not
+      creation order) decides which check sees what.
+
+    Actor comparison is STRICT: same hotkey => same actor; otherwise both
+    hotkeys must be coldkey-MAPPED to be called different. An unmapped hotkey
+    (deregistered original, pre-sync map) is INDETERMINATE — never a reject,
+    never a sweep. Degraded attribution must degrade to allowing, not to
+    terminally rejecting the rightful owner's resubmit.
+    """
+    def _same_actor(hk_a: str, hk_b: str) -> bool | None:
+        """True/False on positive attribution, None when indeterminate."""
+        if (hk_a or "") == (hk_b or ""):
+            return True
+        ck_a, ck_b = resolver.mapped(hk_a), resolver.mapped(hk_b)
+        if ck_a is None or ck_b is None:
+            return None
+        return ck_a == ck_b
+
+    my_order = (float(created_at or 0.0), submission_id)
+    earliest: tuple[str, float, str, str] | None = None
+    for entry in entries:
+        if earliest is None or (entry[1], entry[2]) < (earliest[1], earliest[2]):
+            earliest = entry
+
+    if earliest is None or (earliest[1], earliest[2]) > my_order:
+        # I am the fingerprint's first submitter: owner. Sweep other actors'
+        # in-flight copies (all of them — an earlier-created copy that raced
+        # past its own check is still a copy).
+        sweep = [
+            sid for hk, _ts, sid, status in entries
+            if status in _SWEEPABLE_STATUSES and _same_actor(hotkey, hk) is False
+        ]
+        return None, sweep
+
+    owner_same = _same_actor(hotkey, earliest[0])
+    if owner_same is False:
+        return earliest, []
+    if owner_same is True:
+        # Sibling resubmit of my own actor's code: legitimate. Sweep copies
+        # by actors that determinately differ from MINE (== the owner's).
+        sweep = [
+            sid for hk, _ts, sid, status in entries
+            if status in _SWEEPABLE_STATUSES and _same_actor(hotkey, hk) is False
+        ]
+        return None, sweep
+    # Indeterminate owner (unmapped hotkey): stand down entirely.
+    return None, []
+
+
 def _cleanup_temp_file(path: str | None) -> None:
     """Best-effort cleanup for temporary helper files."""
     if not path:
@@ -197,6 +316,12 @@ def _safe_extract_tar(data: bytes, dest: str) -> bool:
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
             members = tf.getmembers()
+            if len(members) > MAX_CLONE_TAR_MEMBERS:
+                logger.warning(
+                    "Clone archive member count %d exceeds cap %d (inode-bomb guard)",
+                    len(members), MAX_CLONE_TAR_MEMBERS,
+                )
+                return False
             for m in members:
                 target = os.path.realpath(os.path.join(dest_real, m.name))
                 if target != dest_real and not target.startswith(prefix):
@@ -238,6 +363,30 @@ def _token_basic_auth(repo_url: str, token: str) -> str | None:
     return base64.b64encode(f"x-access-token:{token}".encode()).decode()
 
 
+async def _force_remove_container(name: str) -> None:
+    """Best-effort ``docker rm -f`` of a clone container whose CLI was killed.
+
+    Killing the ``docker run`` client does not stop the container, so a clone
+    that is genuinely hung (e.g. a stalled git server) would otherwise keep
+    running daemon-side. Never raises: on the EMFILE path this spawn itself
+    can fail, and cleanup must not mask the clone-timeout result.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+
+
 async def _clone_repo_sandboxed(
     repo_url: str, commit_hash: str, dest: str, *, token: str | None = None,
 ) -> bool:
@@ -270,8 +419,12 @@ async def _clone_repo_sandboxed(
         'git -C /clone checkout "$COMMIT" >&2; '
         "tar -C /clone -cf - ."
     )
+    # Named so a timed-out attempt can be removed daemon-side: killing the
+    # `docker run` client below does not stop the container itself.
+    container_name = f"minotaur-clone-{uuid.uuid4().hex[:12]}"
     cmd = [
         "docker", "run", "--rm",
+        "--name", container_name,
         # The alpine/git image's ENTRYPOINT is `git`; override to a shell so the
         # clone+fetch+checkout+tar script runs (and stays image-agnostic).
         "--entrypoint", "sh",
@@ -298,6 +451,7 @@ async def _clone_repo_sandboxed(
     if basic_auth:
         run_env["GIT_BASIC_AUTH"] = basic_auth
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -305,13 +459,30 @@ async def _clone_repo_sandboxed(
             stderr=asyncio.subprocess.PIPE,
             env=run_env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=CLONE_SANDBOX_TIMEOUT_SECONDS
+        )
     except asyncio.TimeoutError:
         logger.warning("Clone sandbox timed out for %s", repo_url)
         return False
     except FileNotFoundError:
         logger.error("docker CLI not found; cannot run clone sandbox")
         return False
+    finally:
+        # ANY exit while the CLI is still running — timeout above, task
+        # cancellation (mid-round restarts orphan screening tasks), or an
+        # unexpected error mid-communicate() — must kill and reap it here.
+        # An abandoned communicate() leaves nobody draining the CLI's stdout,
+        # so it blocks forever mid-tar and its pipes + pidfd stay open in this
+        # process — enough orphaned clones EMFILE the whole api (2026-07-23
+        # leader incident: 95 hung CLIs, fd table at 924/1024). Also remove
+        # the daemon-side container the orphaned CLI leaves behind. A
+        # CancelledError still propagates to the caller after this cleanup.
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()  # prompt: the CLI was just SIGKILLed
+            await _force_remove_container(container_name)
 
     if proc.returncode != 0:
         logger.warning(
@@ -746,6 +917,66 @@ async def resume_stranded_screenings() -> int:
     return resumed
 
 
+async def reap_orphaned_benchmarking() -> int:
+    """Boot-time healer: no-fault-waitlist BENCHMARKING rows whose round is over.
+
+    BENCHMARKING is set at screening pass; the round-completion reaper (#227)
+    normally settles every row at round end. Rounds that died through the
+    route-path abort (deadline elapsed) skipped that reaper, stranding rows in
+    BENCHMARKING forever — 62 across ~20 rounds observed live 2026-07-26.
+    Stranded rows are pure debt: rendered as live benchmarks, immune to
+    retention (non-terminal), and historically counted as benched rounds by
+    the per-commit / per-fingerprint quota, locking miners out for code that
+    never benched once. The abort path now reaps inline
+    (``_reap_benchmarking_for_terminal_round``); this sweep settles the
+    backlog and backstops any future path that skips both reapers.
+
+    Only rows whose round is MISSING or terminal (aborted / certified /
+    activated) are touched — the current round's in-flight rows are the
+    benchmark worker's business. Waitlist (not reject): the miner did nothing
+    wrong and keeps wait-clock seniority (anchored on created_at, so this
+    transition cannot reset it). Call once at api startup, after
+    :func:`resume_stranded_screenings`. Returns the number healed.
+    """
+    from .state import get_round_store
+
+    store = get_store()
+    try:
+        round_store = get_round_store()
+    except Exception as exc:  # noqa: BLE001 — healer must never break startup
+        logger.warning("[screening] orphan-bench sweep skipped (no round store): %s", exc)
+        return 0
+    _TERMINAL_ROUND = {"aborted", "certified", "activated"}
+    healed = 0
+    for sub in store.list_by_status(SubmissionStatus.BENCHMARKING):
+        round_id = getattr(sub, "round_id", "") or ""
+        state = round_store.get_round(round_id) if round_id else None
+        status = getattr(getattr(state, "status", None), "value", None) if state else None
+        if state is not None and status not in _TERMINAL_ROUND:
+            continue  # live round — not ours to touch
+        reason = (
+            f"round {round_id or 'unknown'} ended before your benchmark ran — "
+            "no quota burned; resubmit to a fresh open round"
+        )
+        try:
+            await offload_write(
+                store.waitlist, sub.submission_id, reason,
+                outcome_code="round_ended_unbenched",
+            )
+            healed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[screening] orphan-bench sweep: failed to waitlist %s: %s",
+                sub.submission_id, exc,
+            )
+    if healed:
+        logger.info(
+            "[screening] orphan-bench sweep: waitlisted %d stranded BENCHMARKING "
+            "submission(s) from ended rounds", healed,
+        )
+    return healed
+
+
 # Statuses proving a stage-2 BUILD already started for this submission (in
 # this or a previous process life). Used to rebuild the build-budget gate's
 # charged set after a restart and to re-dispatch resumed pipelines without
@@ -776,16 +1007,6 @@ def _has_prior_build_attempt(sub: Any) -> bool:
     return stage2.get("passed") is not None
 
 
-def _round_open_window_seconds() -> float:
-    """The round OPEN window length — same env + default as the round
-    coordinator's close check (api/startup.py). Read here only to time the
-    build budget's newcomer→proven spill delay."""
-    try:
-        return float(os.environ.get("SOLVER_ROUND_OPEN_SECONDS", "300").strip() or "300")
-    except ValueError:
-        return 300.0
-
-
 def _ensure_budget_round(store: Any, round_id: str) -> None:
     """Bootstrap the build-budget gate's state for a round (idempotent).
 
@@ -800,32 +1021,16 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
     """
     from minotaur_subnet.harness.build_budget import get_build_budget_gate
 
-    from .state import get_round_store
-
     gate = get_build_budget_gate()
     if not round_id or not gate.needs_round(round_id):
         return
     try:
-        opened_at = 0.0
-        try:
-            round_state = get_round_store().get_round(round_id)
-            opened_at = float(getattr(round_state, "created_at", 0.0) or 0.0)
-        except Exception:
-            logger.warning(
-                "[build-budget] no round state for %s (newcomer-spill delay "
-                "disabled for the round)", round_id, exc_info=True,
-            )
         prior = [
             (s.submission_id, s.hotkey or "")
             for s in store.list_by_round(round_id)
             if _has_prior_build_attempt(s)
         ]
-        gate.ensure_round(
-            round_id,
-            opened_at=opened_at,
-            open_seconds=_round_open_window_seconds(),
-            prior_attempts=prior,
-        )
+        gate.ensure_round(round_id, prior_attempts=prior)
     except Exception:
         logger.warning(
             "[build-budget] bootstrap for %s failed (gate will bootstrap "
@@ -836,12 +1041,13 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
 async def _acquire_build_grant(store: Any, sub: Any):
     """Wire the pipeline into the per-round build-budget gate (may WAIT).
 
-    Gathers the leader-local context the gate needs — the round's open window
-    (for the newcomer-spill delay), a liveness probe (so a waiter never
-    outlives a round closed without a rotation flush), and the restart-rebuild
-    input (prior build attempts, charged exactly once) — then asks for a
-    unit. See harness/build_budget.py for the allocation rules and the
-    2026-07-16 build-flood rationale.
+    Gathers the leader-local context the gate needs — a liveness probe (so a
+    waiter never outlives a round closed without a rotation flush) and the
+    restart-rebuild input (prior build attempts, charged exactly once) — then
+    asks for a unit. Units are dispensed from one wait-time seniority queue
+    (last bench, or first-seen for the never-benched). See
+    harness/build_budget.py for the allocation rules and the 2026-07-16
+    build-flood rationale.
     """
     from minotaur_subnet.harness.build_budget import get_build_budget_gate
 
@@ -970,6 +1176,80 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if not s1.passed:
             return  # set_screening_result already rejected
 
+        # Fingerprint checks, ONE store scan for both: (a) the cross-ACTOR
+        # copy reject — the earliest submitter owns the fingerprint, copies by
+        # other actors reject pre-build, and in-flight copies that raced past
+        # their own check get swept retroactively; (b) the benched-rounds
+        # quota. Both leader-local admission control.
+        fp_cap = _max_rounds_per_fingerprint()
+        reject_copies = _reject_cross_actor_copies()
+        benched = 0
+        if s1.content_fingerprint and (fp_cap > 0 or reject_copies):
+            submitters, benched = store.fingerprint_usage(
+                s1.content_fingerprint, exclude_submission_id=submission_id,
+                current_round_id=getattr(s1, "round_id", None),
+            )
+            resolver = snapshot_resolver() if reject_copies else None
+            if reject_copies and resolver is None:
+                logger.debug(
+                    "cross-actor copy reject standing down for %s: no coldkey "
+                    "attribution available (kill-switch or map not loaded)",
+                    submission_id,
+                )
+            if resolver is not None:
+                owner_prior, sweep_ids = evaluate_fingerprint_ownership(
+                    submitters,
+                    submission_id=submission_id,
+                    hotkey=sub.hotkey or "",
+                    created_at=float(sub.created_at or 0.0),
+                    resolver=resolver,
+                )
+                if owner_prior is not None:
+                    await offload_write(store.reject,
+                        submission_id,
+                        (
+                            f"identical code (normalized fingerprint "
+                            f"{s1.content_fingerprint[:12]}…) was first submitted "
+                            f"by another miner — a copy adds nothing to the "
+                            f"corpus and is not eligible for benchmarking. "
+                            f"Comment, whitespace, docstring and rename edits do "
+                            f"not make code yours; submit your own solver logic "
+                            f"to participate."
+                        ),
+                        outcome_code=OUTCOME_COPYCAT_CODE,
+                    )
+                    logger.info(
+                        "Submission %s rejected as cross-actor copy: fp %s first "
+                        "submitted by %s (hotkey %s, map=%s)",
+                        submission_id, s1.content_fingerprint[:12],
+                        owner_prior[2], (owner_prior[0] or "")[:12],
+                        resolver.source,
+                    )
+                    return
+                for late_sid in sweep_ids:
+                    try:
+                        await offload_write(store.reject,
+                            late_sid,
+                            (
+                                f"identical code (normalized fingerprint "
+                                f"{s1.content_fingerprint[:12]}…) was first "
+                                f"submitted by another miner — a copy adds "
+                                f"nothing to the corpus and is not eligible "
+                                f"for benchmarking."
+                            ),
+                            outcome_code=OUTCOME_COPYCAT_CODE,
+                        )
+                        logger.info(
+                            "Swept in-flight cross-actor copy %s of fp %s "
+                            "(owner submission %s)",
+                            late_sid, s1.content_fingerprint[:12], submission_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Sweeping cross-actor copy %s failed (ignored)",
+                            late_sid, exc_info=True,
+                        )
+
         # Cross-hotkey resubmit quota on the NORMALIZED identity. The
         # per-(hotkey, commit) cap keys on the git SHA — refreshed for free by
         # a nonce comment — and gives each sybil hotkey its own allowance for
@@ -979,11 +1259,7 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # a capped resubmit never costs a Docker build or a bench slot.
         # Operator-local admission control (leader gateway), like the other
         # submission caps — not fleet-consensus.
-        fp_cap = _max_rounds_per_fingerprint()
         if fp_cap > 0 and s1.content_fingerprint:
-            benched = store.count_benched_rounds_for_fingerprint(
-                s1.content_fingerprint, exclude_submission_id=submission_id,
-            )
             if benched >= fp_cap:
                 await offload_write(store.reject,
                     submission_id,
@@ -1014,8 +1290,9 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # Stage 2 gate: the docker build is the resource the 2026-07-16 flood
         # weaponized (63 builds/hour from sybil intake), so builds are dispensed
         # from a per-round budget (SOLVER_ROUND_INTAKE_MAX, default 8, 0 =
-        # unlimited) by ROTATION SENIORITY — proven miners LRU-first with a
-        # reserved newcomer lottery share — instead of arrival order. This
+        # unlimited) by WAIT-TIME SENIORITY — one queue ordered by last bench
+        # (or first-seen for the never-benched; a fresh mint sorts junior),
+        # with soft per-operator dedup — instead of arrival order. This
         # acquire may WAIT (until a unit frees, or the close-time flush parks
         # us); budget-winners proceed immediately, so their near-immediate
         # feedback is preserved. See harness/build_budget.py.

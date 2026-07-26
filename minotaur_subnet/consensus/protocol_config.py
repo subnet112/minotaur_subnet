@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, NamedTuple, Sequence
 
 import aiohttp
 from web3 import Web3
@@ -449,30 +449,47 @@ class ProtocolConfig:
                     )
 
     async def _refresh_quorum(self) -> None:
+        # The ``_read_*`` helpers are synchronous web3-over-HTTPS round-trips
+        # (fresh provider + chain_id preflight + retry middleware each), so
+        # they MUST run off the event loop: two of these loops tick every 60s,
+        # and a slow upstream turned each tick into a whole-API freeze of up
+        # to ~18s (2026-07-25, same class as the #1056 quote-sim freeze).
+        #
+        # ONE thread hop for ALL reads, then publish in a single sync block:
+        # per-read awaits would let other coroutines observe a half-updated
+        # config (new quorum_bps with a stale validator count mid-refresh),
+        # which ``quorum_required`` combines into a value no chain state ever
+        # implied. Reading in one hop and mutating with no await in between
+        # keeps the pre-offload guarantee that a refresh publishes atomically
+        # with respect to the event loop.
         quorum_source = self.quorum_address or self.registry_address
-        new_value = _read_quorum_bps(self.rpc_url, quorum_source)
-        if new_value != self.quorum_bps:
+        reads = await asyncio.to_thread(
+            _read_registry_snapshot,
+            self.rpc_url, quorum_source, self.registry_address,
+        )
+
+        if reads.quorum_bps != self.quorum_bps:
             logger.warning(
                 "ProtocolConfig: quorum_bps changed %d -> %d on %s — "
                 "consumers pick up the new value on their next tick",
-                self.quorum_bps, new_value, quorum_source,
+                self.quorum_bps, reads.quorum_bps, quorum_source,
             )
-            self.quorum_bps = new_value
+            self.quorum_bps = reads.quorum_bps
 
         # Also refresh the on-chain validator count. Same source as
         # construction; logged as a warning when it changes so operators
         # can correlate quorum_required shifts with on-chain
         # ``updateValidators`` calls without grepping events.
-        try:
-            new_count = _read_validator_count(self.rpc_url, self.registry_address)
-        except Exception as exc:
+        if reads.validator_count is None:
             logger.warning(
                 "ProtocolConfig: getValidatorCount() refresh failed on %s "
                 "(%s); keeping cached count=%d",
-                self.registry_address, exc, self.on_chain_validator_count,
+                self.registry_address, reads.failure,
+                self.on_chain_validator_count,
             )
-            self.last_refresh_error = f"getValidatorCount: {exc}"
+            self.last_refresh_error = f"getValidatorCount: {reads.failure}"
             return
+        new_count = reads.validator_count
         if new_count != self.on_chain_validator_count:
             logger.warning(
                 "ProtocolConfig: validator_count changed %d -> %d on %s — "
@@ -485,16 +502,16 @@ class ProtocolConfig:
         # Used by ConsensusManager.authorize_approver — see
         # ``ProtocolConfig.on_chain_validators``. Lowercased for case-
         # insensitive lookups in the auth check.
-        try:
-            new_addrs = _read_validators(self.rpc_url, self.registry_address)
-        except Exception as exc:
+        if reads.validators is None:
             logger.warning(
                 "ProtocolConfig: getValidators() refresh failed on %s "
                 "(%s); keeping cached %d addresses",
-                self.registry_address, exc, len(self.on_chain_validators),
+                self.registry_address, reads.failure,
+                len(self.on_chain_validators),
             )
-            self.last_refresh_error = f"getValidators: {exc}"
+            self.last_refresh_error = f"getValidators: {reads.failure}"
             return
+        new_addrs = reads.validators
         # Detect set change for operator visibility (correlated with on-chain
         # ``updateValidators`` events).
         before = {a.lower() for a in self.on_chain_validators}
@@ -511,10 +528,8 @@ class ProtocolConfig:
         # block height is best-effort (its failure mustn't void an otherwise
         # successful refresh); the timestamp + cleared error are the signal
         # the health workflow keys off to tell a live view from a frozen one.
-        try:
-            self.last_refresh_block = _read_block_number(self.rpc_url)
-        except Exception as exc:
-            logger.debug("ProtocolConfig: eth_blockNumber read failed: %s", exc)
+        if reads.block_number is not None:
+            self.last_refresh_block = reads.block_number
         self.last_successful_refresh_at = time.time()
         self.last_refresh_error = None
 
@@ -530,7 +545,12 @@ class ProtocolConfig:
             )
             return
 
-        authorized = _read_validators(self.rpc_url, self.registry_address)
+        # Same off-loop rule as ``_refresh_quorum``: this is the fifth
+        # synchronous registry read of a tick, and left inline it kept the
+        # whole-API freeze alive after the other four were offloaded.
+        authorized = await asyncio.to_thread(
+            _read_validators, self.rpc_url, self.registry_address,
+        )
 
         new_peers = await discover_peers(
             metagraph_peers=metagraph_peers,
@@ -613,8 +633,69 @@ def _read_override() -> int | None:
         return None
 
 
+# Bounded per-request timeout for the refresh-loop registry reads. Off-loop
+# (asyncio.to_thread) a hung upstream no longer freezes the API — but without
+# a bound it would silently pin a worker thread and wedge the refresh at
+# web3's 30s default per attempt. Same rationale as _NONCE_READ_TIMEOUT_SECONDS;
+# a hung read degrades to a caught error, cached values, and a retry next tick.
+_REGISTRY_READ_TIMEOUT_SECONDS = 10.0
+
+
+def _registry_read_web3(rpc_url: str) -> Web3:
+    return build_retrying_web3(
+        rpc_url, request_kwargs={"timeout": _REGISTRY_READ_TIMEOUT_SECONDS},
+    )
+
+
+class _RegistryReads(NamedTuple):
+    """Result of one worker-thread pass over the registry reads.
+
+    ``validator_count``/``validators`` are ``None`` when their read failed
+    (``failure`` then carries the stringified exception) — mirroring the
+    keep-cached-and-record-error semantics ``_refresh_quorum`` has always had.
+    A ``quorum_bps`` failure raises instead, failing the whole tick, exactly
+    as the inline read did.
+    """
+
+    quorum_bps: int
+    validator_count: int | None
+    validators: list[str] | None
+    block_number: int | None
+    failure: str | None
+
+
+def _read_registry_snapshot(
+    rpc_url: str, quorum_source: str, registry_address: str,
+) -> _RegistryReads:
+    """All refresh-tick registry reads in ONE worker-thread call.
+
+    Batched so ``_refresh_quorum`` has exactly one await: reading everything
+    first and publishing afterwards keeps the config's fields mutually
+    consistent as seen from the event loop (``quorum_required`` combines
+    ``quorum_bps`` × ``on_chain_validator_count`` and must never see a pair
+    from two different refreshes).
+    """
+    quorum_bps = _read_quorum_bps(rpc_url, quorum_source)
+    try:
+        validator_count = _read_validator_count(rpc_url, registry_address)
+    except Exception as exc:
+        return _RegistryReads(quorum_bps, None, None, None, str(exc))
+    try:
+        validators = _read_validators(rpc_url, registry_address)
+    except Exception as exc:
+        return _RegistryReads(quorum_bps, validator_count, None, None, str(exc))
+    block_number: int | None
+    try:
+        block_number = _read_block_number(rpc_url)
+    except Exception as exc:
+        # Best-effort observability read — never fails the refresh.
+        logger.debug("ProtocolConfig: eth_blockNumber read failed: %s", exc)
+        block_number = None
+    return _RegistryReads(quorum_bps, validator_count, validators, block_number, None)
+
+
 def _read_quorum_bps(rpc_url: str, registry_address: str) -> int:
-    w3 = build_retrying_web3(rpc_url)
+    w3 = _registry_read_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -632,7 +713,7 @@ def _read_validator_count(rpc_url: str, registry_address: str) -> int:
     verifying a quorum bundle, so off-chain and on-chain agree byte-
     for-byte on how many signatures are required.
     """
-    w3 = build_retrying_web3(rpc_url)
+    w3 = _registry_read_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -641,7 +722,7 @@ def _read_validator_count(rpc_url: str, registry_address: str) -> int:
 
 
 def _read_validators(rpc_url: str, registry_address: str) -> list[str]:
-    w3 = build_retrying_web3(rpc_url)
+    w3 = _registry_read_web3(rpc_url)
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address),
         abi=_VALIDATOR_REGISTRY_ABI,
@@ -687,7 +768,7 @@ def _read_block_number(rpc_url: str) -> int:
     signature of an out-of-sync RPC node, which can serve stale contract
     reads (and thus a stale validator count/set) while still answering.
     """
-    w3 = build_retrying_web3(rpc_url)
+    w3 = _registry_read_web3(rpc_url)
     return int(w3.eth.block_number)
 
 

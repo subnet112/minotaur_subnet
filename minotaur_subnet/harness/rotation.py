@@ -29,7 +29,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -93,18 +93,69 @@ def rotation_ledger_path() -> str:
     return os.path.join(base or ".", "solver_rotation.json")
 
 
-def rotation_sort_key(
-    hotkey: str, round_id: str, last_selected: dict[str, float],
-) -> tuple[float, str]:
-    """(seniority, salted tie-break) — lower sorts first, i.e. gets a slot.
+def wait_ts(
+    key: str,
+    benched: dict[str, float],
+    seen: dict[str, float],
+    now: float,
+) -> float:
+    """The seniority timestamp for a hotkey OR actor: LOWER sorts first (gets a
+    slot), so this is "waiting since when".
 
-    Seniority is the hotkey's last-selected timestamp (0.0 = never benched, so
-    newcomers outrank everyone). The tie-break salts the hotkey with the round
-    id so equal-seniority order is deterministic + publicly recomputable but
-    reshuffles every round.
+      * benched before  -> its last-benched ts (recently benched = junior).
+      * never benched    -> its first-seen ts (long-waiting newcomer = senior;
+                            fresh mint's first-seen ~= now = junior).
+      * never seen yet   -> ``now`` (brand-new this round = most junior).
+
+    This is the whole anti-mint idea: a fresh identity can't out-senior a miner
+    who has genuinely been waiting, because a fresh identity's clock starts now.
+    """
+    if key in benched:
+        return benched[key]
+    if key in seen:
+        return seen[key]
+    return now
+
+
+def rotation_sort_key(
+    hotkey: str,
+    round_id: str,
+    benched: dict[str, float],
+    seen: dict[str, float] | None = None,
+    now: float | None = None,
+) -> tuple[float, str]:
+    """(wait_ts, salted tie-break) — lower sorts first. See :func:`wait_ts`.
+
+    ``seen``/``now`` default to empty/0.0 for the legacy call shape; with them
+    a never-benched hotkey ranks by first-seen age instead of jumping the queue.
     """
     return (
-        float(last_selected.get(hotkey, 0.0)),
+        wait_ts(hotkey, benched, seen or {}, now if now is not None else 0.0),
+        hashlib.sha256(f"{hotkey}:{round_id}".encode()).hexdigest(),
+    )
+
+
+def actor_rotation_sort_key(
+    hotkey: str,
+    round_id: str,
+    actor_benched: dict[str, float],
+    actor_of: Any,
+    actor_seen: dict[str, float] | None = None,
+    now: float | None = None,
+) -> tuple[float, str, str]:
+    """Actor-keyed variant of :func:`rotation_sort_key` (see harness/actor.py).
+
+    Seniority is the ACTOR's :func:`wait_ts` — its last bench (max over its
+    hotkeys, ``actor_benched``) or, if it never benched, its first-seen (min
+    over its hotkeys, ``actor_seen``); a brand-new actor defaults to ``now``.
+    So a fleet's hotkeys share one seniority and one per-round shuffle position,
+    and a freshly-minted coldkey/owner can't out-senior a genuine waiter. The
+    hotkey-salted third element only orders submissions WITHIN one actor.
+    """
+    actor = actor_of(hotkey or "") or (hotkey or "")
+    return (
+        wait_ts(actor, actor_benched, actor_seen or {}, now if now is not None else 0.0),
+        hashlib.sha256(f"{actor}:{round_id}".encode()).hexdigest(),
         hashlib.sha256(f"{hotkey}:{round_id}".encode()).hexdigest(),
     )
 
@@ -114,62 +165,150 @@ def select_rotation_slate(
     slots: int,
     last_selected: dict[str, float],
     round_id: str,
+    actor_of: Any = None,
+    seen: dict[str, float] | None = None,
+    now: float | None = None,
 ) -> tuple[list[Any], list[Any]]:
-    """PURE: split candidates into (selected, skipped) by rotation order."""
+    """PURE: split candidates into (selected, skipped) by wait-time order.
+
+    Seniority is :func:`wait_ts` — last-benched, or first-seen for a
+    never-benched identity (``seen``/``now``), so a fresh mint sits at the back
+    instead of jumping the queue. With ``actor_of`` (hotkey → actor, see
+    harness/actor.py) the key is actor-aggregated and selection soft-dedups per
+    actor: the first pass seats at most ONE submission per actor — a fleet
+    rotating N hotkeys holds one seat, not N — and only when fewer distinct
+    actors than slots contend do an actor's further submissions fill the
+    leftover seats. ``skipped`` stays in seniority order.
+    """
     slots = max(0, int(slots))
+    seen = seen or {}
+    now = now if now is not None else time.time()
+    if actor_of is None:
+        ordered = sorted(
+            candidates,
+            key=lambda s: rotation_sort_key(
+                getattr(s, "hotkey", "") or "", round_id, last_selected, seen, now,
+            ),
+        )
+        return ordered[:slots], ordered[slots:]
+
+    from minotaur_subnet.harness.actor import actor_first_seen, actor_last_selected
+
+    actor_last = actor_last_selected(last_selected, actor_of)
+    actor_seen = actor_first_seen(seen, actor_of)
     ordered = sorted(
         candidates,
-        key=lambda s: rotation_sort_key(
-            getattr(s, "hotkey", "") or "", round_id, last_selected,
+        key=lambda s: actor_rotation_sort_key(
+            getattr(s, "hotkey", "") or "", round_id, actor_last, actor_of,
+            actor_seen, now,
         ),
     )
-    return ordered[:slots], ordered[slots:]
+    selected: list[Any] = []
+    overflow: list[Any] = []
+    seated_actors: set[str] = set()
+    for sub in ordered:
+        hk = getattr(sub, "hotkey", "") or ""
+        actor = actor_of(hk) or hk
+        if len(selected) < slots and actor not in seated_actors:
+            selected.append(sub)
+            seated_actors.add(actor)
+        else:
+            overflow.append(sub)
+    # Fewer distinct actors than slots: fill from the overflow in seniority
+    # order (repeat actors) rather than waste bench capacity.
+    while len(selected) < slots and overflow:
+        selected.append(overflow.pop(0))
+    return selected, overflow
 
 
 class RotationLedger:
-    """``{hotkey: last_selected_unix_ts}`` with atomic JSON persistence.
+    """Per-hotkey seniority timestamps with atomic JSON persistence.
 
-    Single-writer (the leader's round coordinator); best-effort by design — a
-    lost write only delays fairness by one round, never corrupts a round.
+    Two maps, both ``{hotkey: unix_ts}``:
+
+      * ``benched`` — when the hotkey last occupied a bench slot (``mark_selected``).
+      * ``seen``    — when the hotkey FIRST appeared (``mark_seen``): anchored
+                      at its earliest submission ``created_at``, min-write.
+
+    Seniority (see :func:`wait_ts`) is "how long since you last benched, or —
+    if you never have — since you first appeared." A never-benched hotkey is
+    therefore ranked by its first-seen age, NOT handed instant most-senior
+    status, so minting a fresh identity buys the back of the queue, not the
+    front. This replaced the never-benched=0.0 rule + the build-budget's
+    newcomer pool: one wait-time LRU, no reserved newcomer share to farm.
+
+    ``seen`` is anchored to submission ``created_at`` (server-assigned at
+    intake), NOT to "the time a submission survived a rotation pass": a
+    submission parked terminal pre-close (e.g. by the build-budget flush) still
+    anchors its hotkey's clock, so losing the build race can never restart an
+    honest waiter's seniority (the round-N starvation bug). Min-write: a later
+    stamp can only move an entry EARLIER (toward the true first appearance,
+    e.g. store-history backfill at ledger-v2 migration), never later — so
+    re-submitting can neither refresh nor game the clock.
+
+    On-disk format is ``{"benched": {...}, "seen": {...}}``; a legacy flat
+    ``{hotkey: ts}`` file loads as ``benched`` (its hotkeys also seed ``seen``
+    at their benched ts, so pre-existing miners aren't treated as brand-new).
+    Never-benched miners have no flat-file entry at all — their first-seen is
+    reconstructed from submission-store history (earliest ``created_at``) by
+    the first post-upgrade rotation pass, so days of pre-upgrade waiting keep
+    their place in the queue. Single-writer (the leader's round coordinator);
+    best-effort — a lost write only delays fairness by one round, never
+    corrupts one.
     """
 
     def __init__(self, path: str) -> None:
         self._path = str(path)
 
-    def load(self) -> dict[str, float]:
+    def _load_raw(self) -> tuple[dict[str, float], dict[str, float]]:
         try:
             with open(self._path) as f:
                 raw = json.load(f)
         except FileNotFoundError:
-            return {}
+            return {}, {}
         except Exception:
             logger.warning(
                 "rotation ledger unreadable (%s) — treating all miners as never-benched",
                 self._path, exc_info=True,
             )
-            return {}
+            return {}, {}
         if not isinstance(raw, dict):
-            return {}
-        out: dict[str, float] = {}
-        for k, v in raw.items():
-            try:
-                out[str(k)] = float(v)
-            except (TypeError, ValueError):
-                continue
-        return out
+            return {}, {}
 
-    def mark_selected(self, hotkeys: list[str], ts: float) -> None:
-        data = self.load()
-        for hk in hotkeys:
-            if hk:
-                data[hk] = float(ts)
+        def _floats(d: Any) -> dict[str, float]:
+            out: dict[str, float] = {}
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    try:
+                        out[str(k)] = float(v)
+                    except (TypeError, ValueError):
+                        continue
+            return out
+
+        if isinstance(raw.get("benched"), dict) or isinstance(raw.get("seen"), dict):
+            return _floats(raw.get("benched")), _floats(raw.get("seen"))
+        # Legacy flat file: {hotkey: last_benched_ts}. Seed `seen` from it so
+        # miners with history aren't demoted to brand-new on the first v2 write.
+        benched = _floats(raw)
+        return benched, dict(benched)
+
+    def load(self) -> dict[str, float]:
+        """The benched map ``{hotkey: last_selected_ts}`` (name kept for the
+        many existing call sites)."""
+        return self._load_raw()[0]
+
+    def load_seen(self) -> dict[str, float]:
+        """The first-seen map ``{hotkey: first_seen_ts}``."""
+        return self._load_raw()[1]
+
+    def _persist(self, benched: dict[str, float], seen: dict[str, float]) -> None:
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=os.path.dirname(self._path) or ".", prefix=".rotation-",
             )
             with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
+                json.dump({"benched": benched, "seen": seen}, f)
             os.replace(tmp, self._path)
             tmp = None
         except Exception:
@@ -180,6 +319,35 @@ class RotationLedger:
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def mark_selected(self, hotkeys: list[str], ts: float) -> None:
+        benched, seen = self._load_raw()
+        for hk in hotkeys:
+            if hk:
+                benched[hk] = float(ts)
+                seen.setdefault(hk, float(ts))  # a benched hotkey has been seen
+        self._persist(benched, seen)
+
+    def mark_seen(self, seen_at: Mapping[str, float]) -> None:
+        """Anchor first-seen for ``{hotkey: earliest created_at}`` — min-write.
+
+        A new entry is stamped as given; an existing entry only moves EARLIER
+        (``min``), never later — so a hotkey's clock is pinned to its true
+        first appearance: re-submission can't refresh it, and a store-history
+        backfill (migration) can only restore seniority, not shrink it.
+        """
+        benched, seen = self._load_raw()
+        changed = False
+        for hk, ts in seen_at.items():
+            if not hk:
+                continue
+            ts = float(ts)
+            cur = seen.get(hk)
+            if cur is None or ts < cur:
+                seen[hk] = ts
+                changed = True
+        if changed:
+            self._persist(benched, seen)
 
 
 def _notify_skipped_in_background(
@@ -266,11 +434,63 @@ def apply_rotation_slate(
     """
     if slots <= 0:
         return {"applied": False, "reason": "rotation disabled (slots <= 0)"}
+    from minotaur_subnet.harness.actor import distinct_actor_count, snapshot_resolver
+
     subs = sub_store.list_by_round(round_id)
     candidates = [s for s in subs if _status_value(s) not in _TERMINAL_STATUSES]
+    # None (kill-switch, or no coldkey data yet) => the legacy per-hotkey
+    # selection below (still wait-time ordered, just not actor-aggregated).
+    actor_of = snapshot_resolver()
+    now_ts = time.time() if now is None else now
+    # Record first-seen BEFORE selecting, so a never-benched identity ages from
+    # its first appearance and a fresh mint sorts junior. Anchored at each
+    # submission's server-assigned ``created_at`` and swept over ALL of the
+    # round's submissions — terminal ones included: the build-budget flush has
+    # already parked its unbuilt waiters as WAITLISTED by the time this runs,
+    # and skipping them would restart their wait clock every round they lose
+    # the build race (starving an honest newcomer forever). Enriched with the
+    # store's all-time earliest created_at per hotkey (when the store offers
+    # it), which also auto-migrates never-benched miners off the legacy flat
+    # ledger: their pre-upgrade waiting is reconstructed from submission
+    # history instead of being reset to "now". mark_seen is min-write, so none
+    # of this can ever move a clock later.
+    earliest: dict[str, float] = {}
+    for s in subs:
+        hk = getattr(s, "hotkey", "") or ""
+        if not hk:
+            continue
+        try:
+            created = float(getattr(s, "created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        created = created or now_ts  # never stamp 0.0 (= instant max seniority)
+        if hk not in earliest or created < earliest[hk]:
+            earliest[hk] = created
+    history = getattr(sub_store, "earliest_created_at_by_hotkey", None)
+    if callable(history):
+        try:
+            for hk, ts in (history() or {}).items():
+                if hk in earliest and ts and float(ts) < earliest[hk]:
+                    earliest[hk] = float(ts)
+        except Exception:
+            logger.warning(
+                "rotation: store history for first-seen anchoring failed "
+                "(round-scope created_at used)", exc_info=True,
+            )
+    ledger.mark_seen(earliest)
     selected, skipped = select_rotation_slate(
-        candidates, slots, ledger.load(), round_id,
+        candidates, slots, ledger.load(), round_id, actor_of=actor_of,
+        seen=ledger.load_seen(), now=now_ts,
     )
+    if actor_of is not None:
+        n_actors = distinct_actor_count(
+            (getattr(s, "hotkey", "") or "" for s in candidates), actor_of,
+        )
+        logger.info(
+            "rotation %s: %d candidate(s) from %d actor(s) -> %d selected "
+            "(actor-keyed slate, map=%s)",
+            round_id, len(candidates), n_actors, len(selected), actor_of.source,
+        )
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "

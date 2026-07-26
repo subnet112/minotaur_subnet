@@ -338,6 +338,120 @@ def test_coverage_rate_none_when_no_cow_rows():
     assert cov["top_unservable_pairs"] == []
 
 
+# ── worst_losses (severely-behind pairs, raw basis) ──────────────────────────
+def test_worst_losses_pair_with_bad_median_listed():
+    # 2 quotes at 50% of best -> median 0.5 < 0.9 -> listed, both severe.
+    rows = [
+        _row({"minotaur": _r(out=50), "cow": _r(out=100)},
+             input_symbol="A", output_symbol="B", created_at=1000.0),
+        _row({"minotaur": _r(out=50), "cow": _r(out=100)},
+             input_symbol="A", output_symbol="B", created_at=2000.0),
+    ]
+    wl = compute_chain_stats(rows, 8453)["worst_losses"]
+    assert wl["basis"] == "raw_vs_best_aggregator"
+    assert wl["pairs"] == [{
+        "input": "A", "output": "B", "input_symbol": "A", "output_symbol": "B",
+        "comparisons": 2, "severe_count": 2,
+        "median_relative": 0.5, "worst_relative": 0.5, "last_severe_at": 2000.0,
+    }]
+
+
+def test_worst_losses_one_bad_sample_does_not_qualify():
+    # one severe outlier among parity quotes -> median fine -> NOT listed.
+    rows = [
+        _row({"minotaur": _r(out=10), "cow": _r(out=100)},
+             input_symbol="A", output_symbol="B"),
+        _row({"minotaur": _r(out=100), "cow": _r(out=100)},
+             input_symbol="A", output_symbol="B"),
+        _row({"minotaur": _r(out=100), "cow": _r(out=100)},
+             input_symbol="A", output_symbol="B"),
+    ]
+    assert compute_chain_stats(rows, 8453)["worst_losses"]["pairs"] == []
+
+
+def test_worst_losses_min_samples_floor():
+    # a single severe quote is below the 2-sample floor -> NOT listed.
+    rows = [_row({"minotaur": _r(out=50), "cow": _r(out=100)},
+                 input_symbol="A", output_symbol="B")]
+    assert compute_chain_stats(rows, 8453)["worst_losses"]["pairs"] == []
+
+
+def test_worst_losses_ranked_by_severe_count_then_median():
+    # C->D has 3 severe quotes vs A->B's 2 -> C->D first despite a better median.
+    rows = (
+        [_row({"minotaur": _r(out=20), "cow": _r(out=100)},
+              input_symbol="A", output_symbol="B")] * 2
+        + [_row({"minotaur": _r(out=80), "cow": _r(out=100)},
+                input_symbol="C", output_symbol="D")] * 3
+    )
+    pairs = compute_chain_stats(rows, 8453)["worst_losses"]["pairs"]
+    assert [(p["input"], p["severe_count"]) for p in pairs] == [("C", 3), ("A", 2)]
+
+
+def test_worst_losses_uses_best_aggregator_not_each_source():
+    # 50 vs best(100) = 0.5 even though minotaur beats cow's 40.
+    rows = [
+        _row({"minotaur": _r(out=50), "cow": _r(out=40), "velora": _r(out=100)},
+             input_symbol="A", output_symbol="B"),
+    ] * 2
+    pairs = compute_chain_stats(rows, 8453)["worst_losses"]["pairs"]
+    assert pairs[0]["median_relative"] == 0.5
+
+
+def test_worst_losses_excludes_minotaur_failures():
+    # no-route rows belong to coverage/blindspots, not worst_losses.
+    rows = [_row({"minotaur": _r(status="failed"), "cow": _r(out=100)},
+                 input_symbol="A", output_symbol="B")] * 2
+    assert compute_chain_stats(rows, 8453)["worst_losses"]["pairs"] == []
+
+
+def test_worst_losses_emits_address_and_enriched_symbol():
+    # The severe rows carry only addresses; a LATER row (newest-first order)
+    # resolves TOKA's symbol — the pair view must emit the address (for explorer
+    # links) plus the cross-row-enriched symbol.
+    severe = [_row({"minotaur": _r(out=50), "cow": _r(out=100)},
+                   input_token="0xToken000A", output_token="0xToken000B")] * 2
+    labelled = _row({"minotaur": _r(out=100), "cow": _r(out=100)},
+                    input_token="0xtoken000a", input_symbol="TOKA")
+    pairs = compute_chain_stats([labelled] + severe, 8453)["worst_losses"]["pairs"]
+    assert pairs[0]["input"] == "0xToken000A" and pairs[0]["output"] == "0xToken000B"
+    assert pairs[0]["input_symbol"] == "TOKA"     # enriched, case-insensitive
+    assert pairs[0]["output_symbol"] is None      # never resolved anywhere
+
+
+def test_top_unservable_emits_address_and_symbol():
+    rows = [
+        _row({"minotaur": _r(status="failed")}, trade_source="cow_onchain",
+             input_token="0xAAA", output_token="0xBBB", output_symbol="BBB"),
+    ]
+    top = compute_chain_stats(rows, 8453)["coverage"]["top_unservable_pairs"]
+    assert top[0]["input"] == "0xAAA" and top[0]["input_symbol"] is None
+    assert top[0]["output"] == "0xBBB" and top[0]["output_symbol"] == "BBB"
+
+
+def test_symbol_map_newest_row_wins():
+    from minotaur_subnet.dex_compare.stats import build_symbol_map
+    rows = [  # fetch_since order: newest first
+        _row({}, input_token="0xAAA", input_symbol="NEW"),
+        _row({}, input_token="0xaaa", input_symbol="OLD"),
+    ]
+    assert build_symbol_map(rows) == {"0xaaa": "NEW"}
+
+
+def test_finalize_exposes_tail_percentiles():
+    # 10 comparisons: eight at parity, one at 50%, one at 10% -> the median hides
+    # the tail; p10 (sorted[int(10*0.10)] = 2nd-worst) and worst expose it.
+    rows = (
+        [_row({"minotaur": _r(out=100), "cow": _r(out=100)})] * 8
+        + [_row({"minotaur": _r(out=50), "cow": _r(out=100)})]
+        + [_row({"minotaur": _r(out=10), "cow": _r(out=100)})]
+    )
+    best = compute_chain_stats(rows, 8453)["raw"]["vs_best_aggregator"]
+    assert best["median_relative_output"] == 1.0
+    assert best["p10_relative_output"] == 0.5
+    assert best["worst_relative_output"] == 0.1
+
+
 def test_top_unservable_pairs_ranked():
     rows = [
         _row({"minotaur": _r(status="failed", after_fee=None)}, trade_source="cow_onchain",
@@ -351,5 +465,8 @@ def test_top_unservable_pairs_ranked():
              input_symbol="E", output_symbol="F"),
     ]
     top = compute_chain_stats(rows, 8453)["coverage"]["top_unservable_pairs"]
-    assert top[0] == {"input": "A", "output": "B", "count": 2, "last_error": None}
+    assert top[0] == {
+        "input": "A", "output": "B", "input_symbol": "A", "output_symbol": "B",
+        "count": 2, "last_error": None,
+    }
     assert {t["input"] for t in top} == {"A", "C"}  # E (error) excluded

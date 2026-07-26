@@ -131,6 +131,7 @@ class SubmissionStatus(str, Enum):
 OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
 OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
 OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
+OUTCOME_COPYCAT_CODE = "copycat_code"  # identical code first submitted by ANOTHER actor
 OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
 OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
 OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
@@ -160,6 +161,39 @@ BENCHED_STATUSES = frozenset({
 })
 
 
+def _counts_as_benched(sub: "Submission", current_round_id: str | None) -> bool:
+    """Does this row burn per-commit / per-fingerprint bench quota?
+
+    SCORED/ADOPTED always do — the code demonstrably completed a bench.
+    BENCHMARKING is IN-FLIGHT, not evidence of a completed bench: it is set at
+    screening pass (pre-slate), and a round that dies through the route-path
+    abort (deadline elapsed) skips the reaper and strands rows in BENCHMARKING
+    forever. Counting those burned quota for code that never benched once —
+    observed live 2026-07-26: 3 fingerprints at the cap purely from stranded
+    rows. So BENCHMARKING counts only from the CALLER'S OWN round (in-flight
+    peers racing this submission), never from a bygone round.
+    """
+    if sub.status in (SubmissionStatus.SCORED, SubmissionStatus.ADOPTED):
+        return True
+    return (
+        sub.status is SubmissionStatus.BENCHMARKING
+        and current_round_id is not None
+        and sub.round_id == current_round_id
+    )
+
+# Terminal-for-round states in which the private-repo token has ALREADY been
+# purged (reject/waitlist/adopt all purge). A late benchmark result must never
+# flip one of these back to SCORED — doing so mints a token-less finalist that
+# certifies on-chain and then dies at relayer-finalize "no token — FAIL-CLOSED"
+# (see set_benchmark_result's NO-RESURRECTION guard; live incidents 2026-07-02,
+# 2026-07-07, 2026-07-22). REJECTED alone used to be checked; rotation moving
+# overflow to WAITLISTED (#620) reopened the hole for the WAITLISTED door.
+_NO_RESURRECTION_STATUSES = frozenset({
+    SubmissionStatus.REJECTED,
+    SubmissionStatus.WAITLISTED,
+})
+
+
 # Cap how many submissions keep their (heavy — ~40-70KB each) benchmark_details
 # in the persisted store. Terminal submissions beyond the N most-recent (by
 # epoch) get their details dropped on persist. Without this the store grew
@@ -176,6 +210,50 @@ _DETAILS_STRIPPABLE_STATUSES = frozenset({
     SubmissionStatus.SCORED,
     SubmissionStatus.REJECTED,
 })
+
+# Hard cap on the number of submission RECORDS kept in the store (light rows, not
+# just their details). Applied at load/hydrate ONLY — before this store serves a
+# read or a peer syncs — so we hard-DELETE the oldest terminal rows beyond the cap
+# from the DB. NEVER prunes in-flight submissions or ADOPTED champions (a
+# long-reigning champion's record can be old by created_at but must stay). Bounds
+# RAM + the DB + the shutdown JSON; copycat (`_names`, a separate index) and the
+# benchmark_details retention above are unaffected. 0 = unbounded (off, default).
+#
+# Load-time only because the cross-process pull is append-only (submission_db has
+# NO tombstones): a delete visible to an already-running peer would not propagate.
+# Every process re-hydrates the bounded DB on the coordinated restart, and pruned
+# rows are old + terminal (never re-updated), so it round-trips consistently.
+try:
+    _MAX_RECORDS = int(os.environ.get("SUBMISSIONS_MAX_RECORDS", "0") or "0")
+except ValueError:
+    _MAX_RECORDS = 0
+# Terminal end-states safe to prune when old. ADOPTED (champions) + all in-flight
+# statuses are deliberately excluded so they are always retained.
+_RETENTION_PRUNABLE_VALUES = frozenset({
+    SubmissionStatus.SCORED.value,
+    SubmissionStatus.WAITLISTED.value,
+    SubmissionStatus.REJECTED.value,
+})
+
+
+def _same_operator(hk_a, own_a, hk_b, own_b, actor_of=None) -> bool:
+    """Do two submissions belong to the same OPERATOR?
+
+    True when they share the hotkey, the github account (case-insensitive,
+    both non-empty), or — when ``actor_of`` is given — the resolved actor
+    (coldkey ∪ owner). This is the single definition the per-operator round
+    cap uses; with ``actor_of=None`` it is exactly hotkey ∪ owner.
+    """
+    if hk_a and hk_a == hk_b:
+        return True
+    oa, ob = (own_a or "").strip().lower(), (own_b or "").strip().lower()
+    if oa and oa == ob:
+        return True
+    if actor_of is not None:
+        aa = actor_of(hk_a or "")
+        if aa and aa == actor_of(hk_b or ""):
+            return True
+    return False
 
 
 # ── Solver-name coinage (copycat labeling) ──────────────────────────────────
@@ -562,9 +640,20 @@ class SubmissionStore:
         repo_token: str | None = None,
         github_owner: str | None = None,
         max_per_owner_per_round: int = 0,
+        max_per_actor_per_round: int = 0,
+        actor_of: Any = None,
         max_rounds_per_commit: int = 0,
     ) -> Submission:
         """Create a new submission. Raises ValueError when a per-round cap is hit.
+
+        ``max_per_actor_per_round`` (with ``actor_of``, a hotkey→actor resolver)
+        is the sybil cap: it counts submissions by the same OPERATOR (coldkey ∪
+        github owner, :func:`_same_operator`) for the round. When > 0 it
+        SUPERSEDES ``max_per_owner_per_round`` (the operator definition already
+        subsumes the account match). When <= 0 (kill-switch) the operator
+        keying is fully disabled and ``max_per_owner_per_round`` is enforced
+        on its own, owner-keyed, exactly as before the operator cap existed —
+        the legacy account cap never silently turns off with it.
 
         ``max_per_round`` caps how many submissions a single hotkey may make for
         one round — anti-spam protection for the validator's screening +
@@ -613,24 +702,58 @@ class SubmissionStore:
                     f"time(s) for round {resolved_round_id} "
                     f"(max {max_per_round} per round)"
                 )
-        # Per-(github-account, round) cap — the anti-sybil backstop. Counts ALL of
-        # this GitHub account's submissions for the round REGARDLESS of hotkey, so a
-        # miner spreading one account across N hotkeys still collapses to the cap.
-        # Case-insensitive (GitHub logins are). Skipped when the owner is unknown
-        # (inline-source) or the cap is disabled.
-        owner_key = (github_owner or "").lower()
-        if owner_key and max_per_owner_per_round > 0:
-            owner_count = sum(
-                1 for s in self._submissions.values()
-                if (s.github_owner or "").lower() == owner_key
-                and s.round_id == resolved_round_id
+        # Per-OPERATOR round cap — the anti-sybil backstop, generalizing the old
+        # per-github-account cap. An operator is the actor (coldkey ∪ github
+        # owner, harness/actor.py): one coldkey spread over N hotkeys AND N
+        # github accounts collapses here, so the split-into-many-identities
+        # evasion buys no extra round slots. Degrades to hotkey ∪ owner when
+        # ``actor_of`` is None (pre-metagraph), i.e. exactly the old
+        # per-account behaviour. <= 0 is the kill-switch: operator keying fully
+        # off, and the legacy owner-keyed account cap below takes over — the
+        # two caps are never BOTH silently off. Must mirror the route's
+        # pre-check (routes.py) — this is its atomic TOCTOU backstop.
+        if max_per_actor_per_round > 0:
+            # Only bites when the operator shares SOME cross-hotkey signal (a
+            # github account or a resolved coldkey) — an inline-source,
+            # coldkey-unknown submission is only ever its own hotkey, which the
+            # per-hotkey cap above already governs, so it stays exempt exactly
+            # like the old owner cap.
+            operator_id = (github_owner or "").strip() or (
+                actor_of(hotkey or "") if actor_of is not None else ""
             )
-            if owner_count >= max_per_owner_per_round:
-                raise ValueError(
-                    f"GitHub account {owner_key!r} already submitted {owner_count} "
-                    f"time(s) for round {resolved_round_id} "
-                    f"(max {max_per_owner_per_round} per round per account)"
+            if operator_id and operator_id != hotkey:
+                op_count = sum(
+                    1 for s in self._submissions.values()
+                    if s.round_id == resolved_round_id
+                    and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
                 )
+                if op_count >= max_per_actor_per_round:
+                    raise ValueError(
+                        f"operator {operator_id!r} already submitted {op_count} "
+                        f"time(s) for round {resolved_round_id} "
+                        f"(max {max_per_actor_per_round} per round per operator "
+                        f"— the hotkeys, coldkeys and github accounts of one "
+                        f"operator share the cap); resubmit next round"
+                    )
+        else:
+            # Kill-switch path: the pre-operator-cap per-(github-account, round)
+            # cap, keyed by owner alone. Counts ALL of this GitHub account's
+            # submissions for the round regardless of hotkey; case-insensitive
+            # (GitHub logins are). Skipped when the owner is unknown
+            # (inline-source) or this cap too is disabled.
+            owner_key = (github_owner or "").strip().lower()
+            if owner_key and max_per_owner_per_round > 0:
+                owner_count = sum(
+                    1 for s in self._submissions.values()
+                    if (s.github_owner or "").lower() == owner_key
+                    and s.round_id == resolved_round_id
+                )
+                if owner_count >= max_per_owner_per_round:
+                    raise ValueError(
+                        f"GitHub account {owner_key!r} already submitted "
+                        f"{owner_count} time(s) for round {resolved_round_id} "
+                        f"(max {max_per_owner_per_round} per round per account)"
+                    )
         if max_total_per_round > 0:
             round_total = sum(
                 1 for s in self._submissions.values()
@@ -643,7 +766,9 @@ class SubmissionStore:
                     f"try again next round"
                 )
         if max_rounds_per_commit > 0:
-            benched_rounds = self.count_benched_rounds_by_commit(hotkey, commit_hash)
+            benched_rounds = self.count_benched_rounds_by_commit(
+                hotkey, commit_hash, current_round_id=resolved_round_id,
+            )
             if benched_rounds >= max_rounds_per_commit:
                 raise ValueError(
                     f"Commit {commit_hash[:12]} has already been benchmarked in "
@@ -851,14 +976,69 @@ class SubmissionStore:
             if (s.github_owner or "").lower() == owner and s.round_id == round_id
         )
 
-    def count_benched_rounds_by_commit(self, hotkey: str, commit_hash: str) -> int:
+    def count_by_operator_round(
+        self,
+        hotkey: str,
+        github_owner: str | None,
+        round_id: str,
+        actor_of: Any = None,
+    ) -> int:
+        """Number of submissions for ``round_id`` by the same OPERATOR as
+        ``(hotkey, github_owner)`` — the sybil-cap generalization of
+        :meth:`count_by_owner_round`.
+
+        Two submissions are the same operator when they share ANY of: the
+        hotkey, the github account (case-insensitive), or — when ``actor_of``
+        (a hotkey→actor resolver, harness/actor.py) is supplied — the resolved
+        actor (coldkey ∪ owner union). So one coldkey spread over many hotkeys
+        AND many github accounts still collapses to one operator. With
+        ``actor_of=None`` (no metagraph yet) it degrades to exactly the
+        hotkey ∪ owner behaviour, i.e. the old per-account cap. The submission
+        gate reads this BEFORE any expensive work.
+        """
+        self._maybe_reload()
+        return sum(
+            1 for s in self._submissions.values()
+            if s.round_id == round_id
+            and _same_operator(hotkey, github_owner, s.hotkey, s.github_owner, actor_of)
+        )
+
+    def earliest_created_at_by_hotkey(self) -> dict[str, float]:
+        """``{hotkey: earliest created_at}`` across ALL retained submissions.
+
+        The rotation ledger anchors a never-benched identity's wait clock to
+        this (see rotation.apply_rotation_slate): first-seen = the hotkey's
+        earliest server-assigned ``created_at``, so seniority reflects when the
+        miner truly first appeared — independent of build-race luck within a
+        round, and reconstructible after a ledger upgrade/loss from submission
+        history alone. Records without a created_at (0/None legacy rows) are
+        skipped rather than granting instant max seniority. Bounded by the
+        store's retention pruning; best-effort by design.
+        """
+        self._maybe_reload()
+        out: dict[str, float] = {}
+        for s in self._submissions.values():
+            hk = s.hotkey or ""
+            try:
+                ts = float(s.created_at or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if hk and ts and (hk not in out or ts < out[hk]):
+                out[hk] = ts
+        return out
+
+    def count_benched_rounds_by_commit(
+        self, hotkey: str, commit_hash: str, *, current_round_id: str | None = None,
+    ) -> int:
         """DISTINCT rounds where this miner's exact commit occupied a benchmark
-        slate slot (status in ``BENCHED_STATUSES``).
+        slate slot (see :func:`_counts_as_benched`).
 
         The submission gate reads this to enforce the per-commit participation
         cap BEFORE any expensive work. Scoped to the (hotkey, commit) pair —
         another miner submitting the same commit can't burn this miner's quota.
         Case-insensitive on the hash (git SHAs are hex). Empty commit returns 0.
+        ``current_round_id`` is the caller's round: an in-flight BENCHMARKING
+        row counts only from THAT round — never from a bygone one.
         """
         self._maybe_reload()
         commit = (commit_hash or "").strip().lower()
@@ -868,7 +1048,7 @@ class SubmissionStore:
             s.round_id for s in self._submissions.values()
             if s.hotkey == hotkey
             and (s.commit_hash or "").strip().lower() == commit
-            and s.status in BENCHED_STATUSES
+            and _counts_as_benched(s, current_round_id)
         })
 
     def count_by_round(self, round_id: str) -> int:
@@ -898,6 +1078,28 @@ class SubmissionStore:
             if s.round_id == round_id
         ]
         return sorted(subs, key=lambda s: s.created_at)
+
+    def actor_owner_edges(self) -> dict[str, list[str]]:
+        """``{hotkey: [github_owner, ...]}`` — every github owner each hotkey
+        has ever submitted under.
+
+        Feeds the actor-key owner union (harness/actor.py): coldkeys an
+        operator links by reusing a github owner across them collapse into one
+        scheduling identity, closing the coldkey-split evasion. In-RAM scan
+        (no DB hit); owners are deduped, order-stable. github_owner is derived
+        from the PR clone_url at ingest, so it can't be charged to a victim.
+        """
+        self._maybe_reload()
+        out: dict[str, list[str]] = {}
+        for s in self._submissions.values():
+            owner = (s.github_owner or "").strip()
+            hk = s.hotkey or ""
+            if not owner or not hk:
+                continue
+            owners = out.setdefault(hk, [])
+            if owner not in owners:
+                owners.append(owner)
+        return out
 
     def list_queued(self) -> list[Submission]:
         """List all submissions in QUEUED status."""
@@ -1012,6 +1214,7 @@ class SubmissionStore:
         fingerprint: str,
         *,
         exclude_submission_id: str | None = None,
+        current_round_id: str | None = None,
     ) -> int:
         """DISTINCT rounds in which this normalized fingerprint occupied a
         benchmark slot — ACROSS ALL HOTKEYS.
@@ -1019,8 +1222,10 @@ class SubmissionStore:
         The cross-hotkey scope is the point: the per-(hotkey, commit) cap gives
         every sybil hotkey its own quota for the same bytes; this counter gives
         the CODE one quota, however many hotkeys ship it. Mirrors the commit
-        cap's accounting: only BENCHED statuses count, so rotation-not-selected
-        and screening rejections don't burn quota.
+        cap's accounting (:func:`_counts_as_benched`): completed benches always
+        count; in-flight BENCHMARKING only from ``current_round_id`` — so
+        rotation-not-selected, screening rejections and rows stranded by an
+        aborted round don't burn quota.
         """
         self._maybe_reload()
         rounds: set[str] = set()
@@ -1029,9 +1234,53 @@ class SubmissionStore:
                 continue
             if exclude_submission_id and sub.submission_id == exclude_submission_id:
                 continue
-            if sub.status in BENCHED_STATUSES and sub.round_id:
+            if _counts_as_benched(sub, current_round_id) and sub.round_id:
                 rounds.add(sub.round_id)
         return len(rounds)
+
+    def fingerprint_usage(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+        current_round_id: str | None = None,
+    ) -> tuple[list[tuple[str, float, str, str]], int]:
+        """One pass over the store for everything the screening fingerprint
+        checks need: ``(submitters, benched_round_count)``.
+
+        ``submitters`` is ``(hotkey, created_at, submission_id, status_value)``
+        for every submission carrying this normalized fingerprint — ANY
+        status, ANY round. Any-status scope on purpose (unlike the
+        benched-rounds quota): the cross-actor copy reject must see a copy
+        that is merely in flight, or identical code from N actors flows until
+        one of them benches. The submission_id makes first-submitter ordering
+        total even on a created_at tie.
+
+        ``benched_round_count`` mirrors
+        :meth:`count_benched_rounds_for_fingerprint` exactly (distinct rounds,
+        BENCHED statuses only) — bundled here so the screening pipeline scans
+        the store once, not twice, per submission.
+        """
+        self._maybe_reload()
+        submitters: list[tuple[str, float, str, str]] = []
+        benched_rounds: set[str] = set()
+        for sub in self._submissions.values():
+            if sub.content_fingerprint != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            status = getattr(sub.status, "value", None) or str(sub.status or "")
+            submitters.append(
+                (
+                    sub.hotkey or "",
+                    float(sub.created_at or 0.0),
+                    sub.submission_id,
+                    str(status),
+                ),
+            )
+            if _counts_as_benched(sub, current_round_id) and sub.round_id:
+                benched_rounds.add(sub.round_id)
+        return submitters, len(benched_rounds)
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
@@ -1178,18 +1427,24 @@ class SubmissionStore:
         verdict. The display rank is written via :meth:`set_benchmark_rank` in a
         separate pass, so there is no longer a "don't clobber a real score" guard.
 
-        NO RESURRECTION: a terminally REJECTED submission is never flipped back
-        to SCORED, no matter what a late benchmark result says. Rotation rejects
-        the slate overflow at round close "regardless of benchmark progress" and
-        PURGES the private-repo token (irreversibly — memory AND encrypted
-        sidecar), but an in-flight bench finishing after that, or a restart
-        re-benching an orphaned round, used to resurrect the submission here.
-        The resurrected record then ranked (and under the tie-break ladder
-        frequently WON) as finalist, certified, and died at relayer-finalize
-        "no token — FAIL-CLOSED", aborting the round (observed live 2026-07-07:
-        5 consecutive merge_failed rounds). Bench details are still recorded so
-        the miner's report shows how they scored; the terminal status and its
-        reason are immutable.
+        NO RESURRECTION: a submission that is already terminal-for-round with
+        its token purged (REJECTED or WAITLISTED — see
+        ``_NO_RESURRECTION_STATUSES``) is never flipped back to SCORED, no
+        matter what a late benchmark result says. Rotation parks the slate
+        overflow at round close "regardless of benchmark progress" — as
+        WAITLISTED since #620, REJECTED before it — and PURGES the private-repo
+        token (irreversibly, memory AND encrypted sidecar). An in-flight bench
+        finishing after that, or a restart re-benching an orphaned round, used
+        to resurrect the submission here; the resurrected record then ranked
+        (and under the tie-break ladder frequently WON) as finalist, certified
+        on-chain, and died at relayer-finalize "no token — FAIL-CLOSED",
+        refusing the adoption (live incidents 2026-07-02, 2026-07-07 with 5
+        consecutive merge_failed rounds, and 2026-07-22 sub_a91b87fdd63e: the
+        guard covered only REJECTED, so a WAITLISTED-then-re-benched sub slipped
+        through). A waitlisted sub was also NOT on this round's slate, so
+        resurrecting it to finalist-eligible SCORED is a fairness break on top
+        of the token loss. Bench details are still recorded so the miner's
+        report shows how they scored; the terminal status is immutable.
         """
         self._maybe_reload()
         sub = self._submissions.get(submission_id)
@@ -1201,11 +1456,13 @@ class SubmissionStore:
         if details is not None:
             sub.benchmark_details = details
 
-        if sub.status == SubmissionStatus.REJECTED:
+        if sub.status in _NO_RESURRECTION_STATUSES:
             logger.info(
-                "set_benchmark_result: %s is terminally REJECTED (%s) — "
-                "recording bench details but NOT resurrecting to SCORED",
-                submission_id, (sub.rejection_reason or "?")[:80],
+                "set_benchmark_result: %s is terminal-for-round (%s, token "
+                "purged) — recording bench details but NOT resurrecting to "
+                "SCORED",
+                submission_id,
+                getattr(sub.status, "value", sub.status),
             )
             sub.updated_at = time.time()
             self._persist_records([sub])
@@ -1843,6 +2100,41 @@ class SubmissionStore:
             stripped.append(sub.submission_id)
         return stripped
 
+    def _apply_record_retention(self, data: dict[str, dict]) -> dict[str, dict]:
+        """Cap the store at ``SUBMISSIONS_MAX_RECORDS`` by hard-deleting the OLDEST
+        terminal rows beyond the cap (see ``_MAX_RECORDS``). Called once, at load,
+        on the raw DB rows before hydration — the only place a delete is safe given
+        the append-only cross-process sync. Returns the retained map.
+
+        Keeps every in-flight submission and every ADOPTED champion regardless of
+        age; only SCORED / WAITLISTED / REJECTED rows are eligible to be pruned,
+        oldest (by ``created_at``) first. A no-op when the cap is 0/unset or the
+        store is already within it.
+        """
+        cap = _MAX_RECORDS
+        if cap <= 0 or len(data) <= cap:
+            return data
+        over = len(data) - cap
+        prunable = [
+            (sid, d) for sid, d in data.items()
+            if str(d.get("status")) in _RETENTION_PRUNABLE_VALUES
+        ]
+        if over <= 0 or not prunable:
+            return data
+        prunable.sort(key=lambda kv: kv[1].get("created_at", 0) or 0)  # oldest first
+        drop_ids = [sid for sid, _ in prunable[:over]]
+        if not drop_ids:
+            return data
+        if self._db is not None:
+            self._db.delete_records(drop_ids)
+        drop_set = set(drop_ids)
+        kept = {sid: d for sid, d in data.items() if sid not in drop_set}
+        logger.info(
+            "submission retention: pruned %d old terminal record(s) (kept %d, cap=%d)",
+            len(drop_ids), len(kept), cap,
+        )
+        return kept
+
     def _load(self, *, quiet: bool = False) -> None:
         """Hydrate the in-memory dict from the SQLite DB. ``quiet`` skips the info
         log. The per-record row-building below is byte-identical to the legacy
@@ -1857,6 +2149,7 @@ class SubmissionStore:
             # have, which _upsert_one absorbs idempotently.
             seq_before_hydrate = self._db.max_seq() if self._db is not None else 0
             data = dict(self._db.load_all()) if self._db is not None else {}
+            data = self._apply_record_retention(data)
             submissions: dict[str, Submission] = {}
             by_hotkey_round: dict[str, str] = {}
             by_hotkey_epoch: dict[str, str] = {}

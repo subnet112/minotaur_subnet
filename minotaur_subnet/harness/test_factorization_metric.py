@@ -15,7 +15,12 @@ from __future__ import annotations
 import ast
 import textwrap
 
-from minotaur_subnet.harness.screening import _module_max_region, max_region_nodes
+from minotaur_subnet.harness.screening import (
+    _module_max_region,
+    _solver_exec_command,
+    banned_imports,
+    max_region_nodes,
+)
 
 
 def _mrn(src: str) -> int:
@@ -179,15 +184,54 @@ def test_dynamic_code_calls_flags_bare_exec_eval(tmp_path):
         "y = eval('2 + 2')\n"
     )
     hits = dynamic_code_calls(str(tmp_path))
-    assert hits == ["a.py:1", "a.py:2"]
+    assert hits == ["a.py:1 exec", "a.py:2 eval"]
 
 
-def test_dynamic_code_calls_ignores_attribute_calls_and_compile(tmp_path):
+def test_dynamic_code_calls_flags_compile_and_dunder_import(tmp_path):
+    # compile() / __import__() were previously ALLOWED — the analyzability gate
+    # bans them: both build/resolve code the AST can't otherwise follow.
+    (tmp_path / "c.py").write_text(
+        "code = compile('1', '<s>', 'eval')\n"
+        "m = __import__('king_base')\n"
+    )
+    assert dynamic_code_calls(str(tmp_path)) == [
+        "c.py:1 compile", "c.py:2 __import__",
+    ]
+
+
+def test_dynamic_code_calls_flags_dynamic_import_and_code_construction(tmp_path):
+    # Attribute form, matched on the trailing name so an ALIASED importlib/types
+    # is still caught: importlib.import_module(<var>) + types.FunctionType/CodeType.
+    (tmp_path / "d.py").write_text(
+        "import importlib as il, types\n"
+        "base = il.import_module(_m)\n"       # d.py:2 import_module
+        "fn = types.FunctionType(c, {})\n"    # d.py:3 FunctionType
+        "co = types.CodeType()\n"             # d.py:4 CodeType
+    )
+    assert dynamic_code_calls(str(tmp_path)) == [
+        "d.py:2 import_module", "d.py:3 FunctionType", "d.py:4 CodeType",
+    ]
+
+
+def test_dynamic_code_calls_flags_shim_import_indirection(tmp_path):
+    # Regression on the LIVE obfuscator: james_base.py resolves its real base
+    # module through `__import__(_m)` with a VARIABLE name — invisible to a
+    # static import scan, the exact AST-blinding this gate closes.
+    (tmp_path / "james_base.py").write_text(
+        'import kb_a122b33 as base_module\n'
+        'for _m in ("king_solver", "king_base"):\n'
+        '    v = getattr(__import__(_m), "SOLVER_VERSION", "")\n'
+    )
+    assert dynamic_code_calls(str(tmp_path)) == ["james_base.py:3 __import__"]
+
+
+def test_dynamic_code_calls_ignores_benign_attribute_calls(tmp_path):
+    # Attribute calls whose trailing name is NOT in the ban stay clean: re.compile
+    # (the builtin `compile` is bare-name only) and a miner method named `eval`.
     (tmp_path / "b.py").write_text(
         "import re\n"
-        "pat = re.compile('x')\n"       # attribute call — not flagged
-        "tree.eval(ctx)\n"              # attribute call — not flagged
-        "code = compile('1', '<s>', 'eval')\n"  # compile not banned
+        "pat = re.compile('x')\n"       # attribute `.compile` — not the builtin
+        "tree.eval(ctx)\n"              # attribute `.eval` — a miner method
     )
     assert dynamic_code_calls(str(tmp_path)) == []
 
@@ -228,11 +272,201 @@ def test_floor_armed_passes_clean_code(tmp_path, monkeypatch):
     assert res.passed is True
 
 
-def test_floor_armed_rejects_dynamic_code_first(tmp_path, monkeypatch):
-    # exec/eval is checked before the cap: even TINY code with exec rejects.
+def test_dynamic_code_rejected_before_too_entangled(tmp_path, monkeypatch):
+    # Analyzability takes precedence over the cap: even TINY code with exec
+    # rejects as dynamic_code, never reaching the (huge) entanglement cap.
     repo = _valid_repo(tmp_path, "exec('x = 1')\n")
     monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
     res = run_stage_1(str(repo))
     assert res.passed is False
     assert res.error_code == "dynamic_code"
-    assert "solver.py:1" in res.details
+    assert "solver.py:1 exec" in res.details
+
+
+def test_dynamic_code_rejects_even_when_floor_unarmed(tmp_path, monkeypatch):
+    # DECOUPLED: the analyzability ban does NOT depend on MAX_REGION_NODES.
+    # With the factor floor disarmed (None), __import__ indirection still rejects.
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)
+    repo = _valid_repo(tmp_path, "m = __import__('king_base')\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "dynamic_code"
+    assert "__import__" in res.details
+
+
+def test_dynamic_code_ban_can_be_disarmed(tmp_path, monkeypatch):
+    # Escape hatch: DYNAMIC_CODE_ARMED=False → observe-only (logs, never rejects),
+    # even with the factor floor also disarmed. Proves the arming is what gates.
+    monkeypatch.setattr(_screening, "DYNAMIC_CODE_ARMED", False)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", None)
+    repo = _valid_repo(tmp_path, "code = compile('1', '<s>', 'eval')\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+def test_dynamic_code_armed_by_default():
+    # Ships ENFORCING (unlike the observe-only import ban), version-stamped.
+    assert _screening.DYNAMIC_CODE_ARMED is True
+    assert _screening.DYNAMIC_CODE_VERSION == 1
+
+
+# ── Banned-import scan (defence-in-depth PREVENT layer) ───────────────────────
+
+
+def test_banned_imports_catches_nested_urllib_gadget(tmp_path):
+    # The chain-killer "putty" class: `import urllib.request` NESTED in a function
+    # (invisible to a tree.body-only scan). ast.walk must catch it.
+    (tmp_path / "a.py").write_text(
+        "import json\n"
+        "def _quote():\n"
+        "    import urllib.request as u\n"
+        "    return u\n"
+    )
+    hits = banned_imports(str(tmp_path))
+    assert hits == ["a.py:3 urllib.request"]
+
+
+def test_banned_imports_flags_from_and_socket(tmp_path):
+    (tmp_path / "b.py").write_text(
+        "import socket\n"
+        "from http.client import HTTPConnection\n"
+    )
+    mods = {h.split()[1] for h in banned_imports(str(tmp_path))}
+    assert mods == {"socket", "http.client"}
+
+
+def test_banned_imports_ignores_relative_and_legit(tmp_path):
+    # Relative imports are in-tree; web3/eth_abi/json/os are legitimate.
+    (tmp_path / "c.py").write_text(
+        "from . import helper\n"
+        "from .strategies import router\n"
+        "import json, os\n"
+        "from eth_abi import encode\n"
+        "from minotaur_subnet.sdk import intent_solver\n"
+    )
+    assert banned_imports(str(tmp_path)) == []
+
+
+def test_banned_imports_skips_unparseable(tmp_path):
+    (tmp_path / "ok.py").write_text("import socket\n")
+    (tmp_path / "broken.py").write_text("def (:\n")  # SyntaxError — skipped
+    assert banned_imports(str(tmp_path)) == ["ok.py:1 socket"]
+
+
+def test_banned_imports_observe_only_by_default(tmp_path, monkeypatch):
+    # Ships INERT: a banned import is LOGGED but does NOT reject while unarmed.
+    assert _screening.BANNED_IMPORTS_ARMED is False  # default
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)  # keep factor happy
+    repo = _valid_repo(tmp_path, "import socket\ndef f():\n    return 1\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is True  # observe-only → not gated
+
+
+def test_banned_imports_armed_rejects(tmp_path, monkeypatch):
+    monkeypatch.setattr(_screening, "BANNED_IMPORTS_ARMED", True)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
+    repo = _valid_repo(tmp_path, "import socket\ndef f():\n    return 1\n")
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "banned_import"
+    assert "socket" in res.details
+    # persist-on-reject: metrics still ride the StageResult.
+    assert isinstance(res.max_region_nodes, int)
+
+
+def test_banned_imports_armed_passes_clean_solver(tmp_path, monkeypatch):
+    monkeypatch.setattr(_screening, "BANNED_IMPORTS_ARMED", True)
+    monkeypatch.setattr(_screening, "MAX_REGION_NODES", 10_000)
+    repo = _valid_repo(
+        tmp_path,
+        "import json, os\nfrom eth_abi import encode\ndef f():\n    return encode\n",
+    )
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+# ── Stage-2 exec container hardening (import/init run untrusted code) ──────────
+
+
+def test_solver_exec_command_is_hardened():
+    """The import/init containers — the FIRST place solver code executes — must
+    carry the same containment as the benchmark/live runs (orchestrator's
+    DOCKER_SECURITY_OPTS): cap-drop, no-new-privileges, pids-limit, plus the
+    pre-existing network/fs/mem/cpu caps."""
+    cmd = _solver_exec_command("solver-img:screening", "print('x')")
+    joined = " ".join(cmd)
+    for flag in (
+        "--network=none", "--read-only",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--pids-limit=256",
+        "--memory=2g", "--cpus=1.0",
+    ):
+        assert flag in cmd, f"missing hardening flag: {flag}"
+    # runs the passed script under an explicit python entrypoint on the image
+    assert cmd[-3:] == ["solver-img:screening", "-c", "print('x')"]
+    assert "--entrypoint" in cmd and "python" in cmd
+
+
+# ── Deadwood floor (PREVENT layer) ────────────────────────────────────────────
+
+from minotaur_subnet.harness import deadwood as _deadwood
+
+
+def _dead_lineage_repo(tmp_path):
+    """A repo whose solver.py is clean but which carries an UNREACHABLE
+    dead-lineage module — the shim/superseded-generation obfuscation shape that
+    deadwood Tier A counts (imported from nowhere ⇒ whole-file dead mass)."""
+    repo = _valid_repo(tmp_path, "SOLVER_CLASS = object\n")
+    (tmp_path / "kb_dead_lineage.py").write_text(
+        "".join(
+            f"def _f{i}():\n    x = {i}\n    y = x + 1\n    return y\n"
+            for i in range(60)
+        )
+    )
+    return repo
+
+
+def test_deadwood_floor_pinned_to_gap_cut():
+    # Pinned to the 2026-07 soak valley (clean lineages ≤3871, obfuscated ≥5560).
+    assert _deadwood.UNPRODUCTIVE_NODES_MAX == 4600
+
+
+def test_deadwood_floor_rejects_dead_lineage_over_cap(tmp_path, monkeypatch):
+    repo = _dead_lineage_repo(tmp_path)
+    measured = _deadwood.unproductive_nodes(str(repo)).unproductive_nodes
+    assert isinstance(measured, int) and measured > 0
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", measured - 1)
+    res = run_stage_1(str(repo))
+    assert res.passed is False
+    assert res.error_code == "too_much_deadwood"
+    # The rejected value + offenders still ride on the StageResult (persisted so
+    # the miner sees exactly which dead files to delete).
+    assert res.unproductive_nodes == measured
+    assert res.unproductive_top_offenders
+
+
+def test_deadwood_floor_passes_under_cap(tmp_path, monkeypatch):
+    repo = _dead_lineage_repo(tmp_path)
+    measured = _deadwood.unproductive_nodes(str(repo)).unproductive_nodes
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", measured + 1)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+
+
+def test_deadwood_floor_disarmed_observes_only(tmp_path, monkeypatch):
+    # None ⇒ the dead mass is measured + persisted but never gates.
+    repo = _dead_lineage_repo(tmp_path)
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", None)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+    assert isinstance(res.unproductive_nodes, int) and res.unproductive_nodes > 0
+
+
+def test_deadwood_floor_skips_none_value(tmp_path, monkeypatch):
+    # An unparseable non-exempt file ⇒ unproductive_nodes=None; the armed floor
+    # must NOT reject on None (stage 2's import check backstops unparseable code).
+    repo = _valid_repo(tmp_path, "SOLVER_CLASS = object\n")
+    (tmp_path / "broken.py").write_text("def (:\n")  # SyntaxError
+    monkeypatch.setattr(_deadwood, "UNPRODUCTIVE_NODES_MAX", 0)
+    res = run_stage_1(str(repo))
+    assert res.passed is True
+    assert res.unproductive_nodes is None

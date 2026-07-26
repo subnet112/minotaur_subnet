@@ -69,7 +69,7 @@ def _accumulate(acc: dict[str, Any], mino: int, other: int) -> None:
 
 def _finalize(acc: dict[str, Any]) -> dict[str, Any]:
     comparable = acc["comparable"]
-    rels = acc["relatives"]
+    rels = sorted(acc["relatives"])
     return {
         "comparable": comparable,
         "minotaur_wins": acc["wins"],
@@ -78,6 +78,9 @@ def _finalize(acc: dict[str, Any]) -> dict[str, Any]:
         "win_rate": round(acc["wins"] / comparable, 4) if comparable else None,
         "median_relative_output": round(statistics.median(rels), 6) if rels else None,
         "mean_relative_output": round(statistics.fmean(rels), 6) if rels else None,
+        # tail — median/mean hide severe losses (live: median 0.998 vs mean 0.938)
+        "p10_relative_output": round(rels[int(len(rels) * 0.10)], 6) if rels else None,
+        "worst_relative_output": round(rels[0], 6) if rels else None,
     }
 
 
@@ -292,32 +295,136 @@ def _tradeable_at_size(row: dict[str, Any]) -> bool:
     return gate.get("status") == "ok"
 
 
-def _top_unservable(rows: list[dict[str, Any]], n: int = 10) -> list[dict[str, Any]]:
+def build_symbol_map(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """``address(lower) -> symbol`` from every row that has one resolved.
+
+    A token's symbol may be resolved on some rows and not others (resolution
+    landed later; RPC hiccups). Newest-first row order means the freshest
+    resolution wins — pair-emitting views use this so a token labels the same
+    everywhere it appears. Shared with blindspots."""
+    symbols: dict[str, str] = {}
+    for row in reversed(rows):  # rows arrive newest-first; let newest overwrite
+        for addr_key, sym_key in (("input_token", "input_symbol"), ("output_token", "output_symbol")):
+            addr, sym = row.get(addr_key), row.get(sym_key)
+            if addr and sym:
+                symbols[str(addr).lower()] = sym
+    return symbols
+
+
+def _pair_fields(
+    row: dict[str, Any], symbols: dict[str, str],
+) -> tuple[tuple[Any, Any], dict[str, Any]]:
+    """Address-keyed pair identity + display fields for pair-emitting views.
+
+    ``input``/``output`` are ADDRESSES (frontends need them for explorer links);
+    ``input_symbol``/``output_symbol`` are best-known labels, nullable. Rows
+    without an address (shouldn't happen — the store requires one) fall back to
+    the symbol for both identity and display, never to None."""
+    in_addr, out_addr = row.get("input_token"), row.get("output_token")
+    in_sym = row.get("input_symbol") or (symbols.get(str(in_addr).lower()) if in_addr else None)
+    out_sym = row.get("output_symbol") or (symbols.get(str(out_addr).lower()) if out_addr else None)
+    key = (in_addr or in_sym, out_addr or out_sym)
+    fields = {
+        "input": in_addr or in_sym,
+        "output": out_addr or out_sym,
+        "input_symbol": in_sym,
+        "output_symbol": out_sym,
+    }
+    return key, fields
+
+
+def _top_unservable(
+    rows: list[dict[str, Any]], symbols: dict[str, str], n: int = 10,
+) -> list[dict[str, Any]]:
     """Most-frequent real (cow_onchain) token pairs the solver could NOT route —
     the addressable demand we don't serve yet. Only genuine no-route ('failed')
     gaps count; transient errors are excluded."""
     counts: dict[tuple, int] = {}
     last_err: dict[tuple, Any] = {}
+    fields_by_pair: dict[tuple, dict[str, Any]] = {}
     for row in rows:
         if row.get("trade_source") != "cow_onchain":
             continue
         mino = (row.get("results") or {}).get("minotaur") or {}
         if mino.get("status") != "failed":
             continue
-        pair = (
-            row.get("input_symbol") or row.get("input_token"),
-            row.get("output_symbol") or row.get("output_token"),
-        )
+        pair, fields = _pair_fields(row, symbols)
+        fields_by_pair.setdefault(pair, fields)
         counts[pair] = counts.get(pair, 0) + 1
         last_err[pair] = mino.get("error")
     ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:n]
     return [
-        {"input": p[0], "output": p[1], "count": c, "last_error": last_err[p]}
+        {**fields_by_pair[p], "count": c, "last_error": last_err[p]}
         for p, c in ranked
     ]
 
 
+# A pair is a "worst loss" when Minotaur's GROSS output persistently trails the
+# best aggregator's — at gross, fees/gas don't apply, so the deficit is the route
+# itself (the per-pair complement of top_unservable_pairs: served, but badly).
+# Qualification is on the pair's MEDIAN so one bad sample can't rank it; the floor
+# matches blindspots.MIN_SAMPLES (sparse per-pair sampling — counts are returned
+# so consumers judge confidence themselves).
+SEVERE_LOSS_THRESHOLD = 0.9
+WORST_LOSSES_MIN_SAMPLES = 2
+
+
+def _worst_losses(
+    rows: list[dict[str, Any]], symbols: dict[str, str], n: int = 15,
+) -> list[dict[str, Any]]:
+    """Token pairs whose median gross output is severely behind the best
+    aggregator, ranked by severe-quote count (demand-weighted), worst-median
+    tie-break. Ungated, like the raw leaderboard."""
+    pairs: dict[tuple, dict[str, Any]] = {}
+    fields_by_pair: dict[tuple, dict[str, Any]] = {}
+    for row in rows:
+        results = row.get("results") or {}
+        mino = results.get("minotaur") or {}
+        if mino.get("status") != "ok":
+            continue
+        mino_gross = _int(mino.get("output_raw"))
+        if mino_gross is None or mino_gross <= 0:
+            continue
+        best: int | None = None
+        for s in AGGREGATOR_SOURCES:
+            r = results.get(s) or {}
+            if r.get("status") != "ok":
+                continue
+            s_out = _int(r.get("output_raw"))
+            if s_out is None or s_out <= 0:
+                continue
+            best = s_out if best is None else max(best, s_out)
+        if best is None:
+            continue
+        key, fields = _pair_fields(row, symbols)
+        fields_by_pair.setdefault(key, fields)
+        p = pairs.setdefault(key, {"rels": [], "severe": 0, "last_severe_at": None})
+        rel = mino_gross / best
+        p["rels"].append(rel)
+        if rel < SEVERE_LOSS_THRESHOLD:
+            p["severe"] += 1
+            ts = _float(row.get("created_at"))
+            if ts is not None and (p["last_severe_at"] is None or ts > p["last_severe_at"]):
+                p["last_severe_at"] = ts
+    qualified = [
+        {
+            **fields_by_pair[k],
+            "comparisons": len(p["rels"]),
+            "severe_count": p["severe"],
+            "median_relative": round(statistics.median(p["rels"]), 6),
+            "worst_relative": round(min(p["rels"]), 6),
+            "last_severe_at": p["last_severe_at"],
+        }
+        for k, p in pairs.items()
+        if len(p["rels"]) >= WORST_LOSSES_MIN_SAMPLES
+        and statistics.median(p["rels"]) < SEVERE_LOSS_THRESHOLD
+    ]
+    qualified.sort(key=lambda e: (-e["severe_count"], e["median_relative"]))
+    return qualified[:n]
+
+
 def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, Any]:
+    symbols = build_symbol_map(rows)
     coverage = {s: {"ok": 0, "failed": 0, "error": 0, "unsupported": 0} for s in AGGREGATOR_SOURCES}
     mino_ok = mino_fail = 0
     normalized = 0
@@ -414,7 +521,16 @@ def compute_chain_stats(rows: list[dict[str, Any]], chain_id: int) -> dict[str, 
             "minotaur_error": cov_error,
             "coverage_rate": round(cov_ok / (cov_ok + cov_no_route), 4)
                              if (cov_ok + cov_no_route) else None,
-            "top_unservable_pairs": _top_unservable(rows, 10),
+            "top_unservable_pairs": _top_unservable(rows, symbols, 10),
+        },
+        "worst_losses": {
+            "note": "pairs we DO serve but whose median gross output trails the best "
+                    "aggregator by >10% — routing defects (fees/gas don't apply at "
+                    "gross), the served-but-badly complement of top_unservable_pairs. "
+                    "Ranked by severe-quote count; ungated like raw.",
+            "basis": "raw_vs_best_aggregator",
+            "severe_threshold": SEVERE_LOSS_THRESHOLD,
+            "pairs": _worst_losses(rows, symbols, 15),
         },
         "net": {
             "note": "what the user actually receives (after fees + gas) — the honest metric",

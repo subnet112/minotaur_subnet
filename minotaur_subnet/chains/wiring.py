@@ -51,6 +51,19 @@ def sim_rpc_urls() -> dict[int, str]:
     return out
 
 
+def quote_sim_rpc_urls() -> dict[int, str]:
+    """Dedicated /quote simulator fork-targets (``registry.quote_sim_rpc`` per
+    chain). Returns ``{}`` when no chain has a quote fork configured — this empty
+    map is the opt-in gate: no dedicated quote simulator is built and quotes use
+    the shared order simulator (behaviour byte-unchanged)."""
+    out: dict[int, str] = {}
+    for cid in registry.wired_chain_ids():
+        url = registry.quote_sim_rpc(cid)
+        if url:
+            out[cid] = url
+    return out
+
+
 def upstream_rpc_urls() -> dict[int, str]:
     """Fork-source upstream RPCs (``registry.upstream_rpc`` per chain)."""
     out: dict[int, str] = {}

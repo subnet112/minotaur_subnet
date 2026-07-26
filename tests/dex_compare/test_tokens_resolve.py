@@ -89,3 +89,65 @@ def test_nonpositive_amount_returns_none():
         new=AsyncMock(side_effect=[6, 18]),
     ):
         assert _run(resolve_trade_tokens(_order(input_amount="0"), DecimalsCache())) is None
+
+
+# ── SymbolCache (on-chain symbol resolution) ─────────────────────────────────
+_UNKNOWN = "0x1111111111111111111111111111111111111111"
+
+
+def test_symbol_registry_hit_skips_chain_call():
+    from minotaur_subnet.dex_compare.tokens_resolve import SymbolCache
+    mock = AsyncMock(return_value="NOPE")
+    with patch("minotaur_subnet.dex_compare.tokens_resolve.get_erc20_symbol", new=mock):
+        # USDC on Base is in the well-known registry — no RPC needed.
+        assert _run(SymbolCache().get(_USDC_BASE, 8453)) == "USDC"
+    assert mock.await_count == 0
+
+
+def test_symbol_onchain_fallback_cached():
+    from minotaur_subnet.dex_compare.tokens_resolve import SymbolCache
+    cache = SymbolCache()
+    mock = AsyncMock(return_value="PEPE")
+    with patch("minotaur_subnet.dex_compare.tokens_resolve.get_erc20_symbol", new=mock):
+        assert _run(cache.get(_UNKNOWN, 8453)) == "PEPE"
+        assert _run(cache.get(_UNKNOWN, 8453)) == "PEPE"
+    assert mock.await_count == 1  # second call served from cache
+
+
+def test_symbol_failure_negative_cached():
+    from minotaur_subnet.dex_compare.tokens_resolve import SymbolCache
+    cache = SymbolCache()
+    mock = AsyncMock(side_effect=RuntimeError("execution reverted"))
+    with patch("minotaur_subnet.dex_compare.tokens_resolve.get_erc20_symbol", new=mock):
+        assert _run(cache.get(_UNKNOWN, 8453)) is None
+        assert _run(cache.get(_UNKNOWN, 8453)) is None
+    assert mock.await_count == 1  # broken token not re-queried every cycle
+
+
+def test_symbol_sanitized():
+    from minotaur_subnet.dex_compare.tokens_resolve import _sanitize_symbol
+    assert _sanitize_symbol(b"MKR\x00\x00\x00") == "MKR"       # bytes32-style
+    assert _sanitize_symbol("  WETH \n") == "WETH"
+    assert _sanitize_symbol("A" * 100) == "A" * 24              # length cap
+    assert _sanitize_symbol("\x00\x01\x02") is None             # nothing printable
+    assert _sanitize_symbol(123) is None
+
+
+def test_resolve_trade_uses_symbol_cache():
+    from minotaur_subnet.dex_compare.tokens_resolve import SymbolCache
+    with (
+        patch(
+            "minotaur_subnet.dex_compare.tokens_resolve.get_erc20_decimals",
+            new=AsyncMock(side_effect=[6, 18]),
+        ),
+        patch(
+            "minotaur_subnet.dex_compare.tokens_resolve.get_erc20_symbol",
+            new=AsyncMock(return_value="TOKA"),
+        ),
+    ):
+        trade = _run(resolve_trade_tokens(
+            _order(input_token=_UNKNOWN), DecimalsCache(), SymbolCache(),
+        ))
+    assert trade is not None
+    assert trade.input_symbol == "TOKA"    # unknown token resolved on-chain
+    assert trade.output_symbol == "WETH"   # wrapped native from the registry

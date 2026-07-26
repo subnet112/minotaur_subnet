@@ -228,6 +228,12 @@ class EpochManager:
     Tracks the current champion and enforces the dethrone margin.
     """
 
+    # Max transient incumbent-re-bench failures a single round tolerates by
+    # DEFERRING (retrying the re-bench next tick) before it gives up and aborts on
+    # the stale bar. Bounds the wasted re-benches so a persistently-failing re-bench
+    # can't hog the decision window; the decision deadline is the outer bound.
+    INCUMBENT_REFRESH_MAX_ATTEMPTS: int = 3
+
     def __init__(
         self,
         block_loop: Any = None,
@@ -293,6 +299,18 @@ class EpochManager:
         # when set, so the leader never decides adoption on a STALE champion bar —
         # mirroring the follower's conservative REJECT (fleet parity).
         self._incumbent_refresh_failed = False
+        # Whether the LAST refresh failure was TRANSIENT (the re-bench RAISED — a
+        # sim/RPC hiccup, an unsealed fork-pin, RealSimulationUnavailable) as opposed
+        # to PERMANENT (the incumbent's submission record or image is unresolvable).
+        # A transient stale bar must not kill a round a challenger may have won, so
+        # evaluate_round DEFERS (re-tries the re-bench on the next coordinator tick,
+        # bounded by the decision deadline + the attempt cap below) instead of
+        # aborting; a permanent one still aborts fast.
+        self._incumbent_refresh_retryable = False
+        # round_id -> number of transient stale-bar defers so far this round. Bounds
+        # a PERSISTENTLY-failing re-bench so it can't hog the whole decision window
+        # with repeated expensive re-benches — past the cap we abort as before.
+        self._incumbent_refresh_attempts: dict[str, int] = {}
         self._current_session: Any = None  # SolverSession
         self._current_epoch: int = 0
         self._epoch_history: list[dict[str, Any]] = []
@@ -565,6 +583,32 @@ class EpochManager:
                 result["next_round_id"] = next_round.round_id
             return result
 
+        # WAIT FOR THE FULL BENCHED SLATE before ranking/finalizing on an adoptable
+        # finalist. _find_champion_candidates only sees SCORED submissions, so
+        # proceeding here while a slate member is still BENCHMARKING judges a PARTIAL
+        # slate — with two harms: (1) it can crown the best of a partial slate over a
+        # still-running member that would have out-ranked it; under rotation seniority
+        # (#499, LRU) that raced-out member is DE-PRIORITISED next round, so with a
+        # slate of 3 vs a large fleet it may not re-bench for a full rotation cycle
+        # (~hours) — it does NOT self-correct round-to-round; and (2) the still-running
+        # member finishes SCORED after the one-shot _persist_round_relative_counts below
+        # has already run, orphaning its same-pin relative block ("comparison report
+        # unavailable"). DEFER until the slate is terminal — the SAME guard the two
+        # no-finalist paths already use (above and below), just extended to the
+        # has-finalist path. Bounded by the same decision_deadline_epoch
+        # (_maybe_abort_expired_round terminates a round whose slate never scores), and
+        # the decision window is auto-scaled to the benched-slate size, so the full
+        # slate normally lands well inside it. NO-OP in the monolith: when the
+        # coordinator owns the slate it has already run_once()'d the whole slate to
+        # SCORED above, so nothing is in-flight here — this only closes the race on the
+        # two-process split where a separate worker benches the slate asynchronously.
+        # Consensus-neutral: the round stays REPLAYING with no broadcast; the
+        # coordinator re-evaluates next tick once the straggler scores.
+        if self._round_has_inflight_submissions(round_id):
+            result["deferred"] = True
+            result["status_after"] = round_state.status.value
+            return result
+
         # We have a finalist — re-benchmark the incumbent at the current round pin so
         # the comparison is fair (fresh same-pin bar + genesis-as-bar seeding). Without
         # this, a JS scoring update that adds harder scenarios would make the incumbent's
@@ -648,6 +692,46 @@ class EpochManager:
                 result["deferred"] = True
                 result["status_after"] = round_state.status.value
                 return result
+            # DEFER (don't abort) when the ONLY reason no candidate adopted is a
+            # TRANSIENT incumbent re-bench failure (the stale-bar abstain — a flaky
+            # sim/RPC hiccup or an unsealed pin, not a real "didn't beat the champion").
+            # Aborting here kills a round a challenger may legitimately have won on
+            # the strength of a single re-bench blip (the live "stale incumbent bar
+            # (re-benchmark failed)" aborts, round-e29746984). The next coordinator
+            # tick re-runs _refresh_incumbent_score — a fresh retry — so a transient
+            # failure resolves itself; bounded by decision_deadline_epoch
+            # (_maybe_abort_expired_round) AND a per-round attempt cap so a
+            # PERSISTENTLY-failing re-bench can't hog the window with repeated
+            # expensive re-benches. A PERMANENT stale bar (missing incumbent record /
+            # unresolvable image; retryable=False) still aborts fast, as before.
+            if (
+                self._champion.submission_id
+                and getattr(self, "_incumbent_refresh_failed", False)
+                and getattr(self, "_incumbent_refresh_retryable", False)
+            ):
+                attempts = self._incumbent_refresh_attempts.get(round_id, 0) + 1
+                if attempts < self.INCUMBENT_REFRESH_MAX_ATTEMPTS:
+                    # Replace (not update) the map: only ONE round is ever under
+                    # evaluation, and a round aborted by the deadline path
+                    # (_maybe_abort_expired_round → the API-route abort) never
+                    # passes through _complete_round's eviction — its counter
+                    # entry would otherwise leak for the process lifetime.
+                    self._incumbent_refresh_attempts = {round_id: attempts}
+                    result["deferred"] = True
+                    result["status_after"] = round_state.status.value
+                    logger.info(
+                        "evaluate_round: deferring round %s on a transient incumbent "
+                        "re-bench failure (attempt %d/%d) — retrying the re-bench next "
+                        "tick, bounded by the decision deadline",
+                        round_id, attempts, self.INCUMBENT_REFRESH_MAX_ATTEMPTS,
+                    )
+                    return result
+                logger.warning(
+                    "evaluate_round: round %s incumbent re-bench failed %d times "
+                    "(cap reached) — aborting on the stale bar rather than hogging "
+                    "the decision window",
+                    round_id, attempts,
+                )
             # Abort with the TOP-RANKED candidate's reason (the round's headline,
             # same as the pre-fall-through behavior).
             reject_reason = rejections[0][1] if rejections else "did not beat the champion"
@@ -696,6 +780,10 @@ class EpochManager:
             submission_id=finalist.submission_id,
             image_id=finalist.image_id,
         )
+        # Round is leaving REPLAYING for CERTIFYING (won't be re-evaluated) — evict
+        # its transient-re-bench defer counter (set only if it deferred before
+        # recovering), mirroring the _complete_round eviction on the abort paths.
+        self._incumbent_refresh_attempts.pop(round_id, None)
         result["status_after"] = updated.status.value
         result["finalist_submission_id"] = updated.finalist_submission_id
         result["finalist_image_id"] = updated.finalist_image_id
@@ -1451,6 +1539,7 @@ class EpochManager:
         # Stale-bar guard: assume the incumbent score is fresh this round unless a
         # production re-benchmark path below fails (then _should_adopt abstains).
         self._incumbent_refresh_failed = False
+        self._incumbent_refresh_retryable = False
         if not self._champion.submission_id:
             return
         if not self._benchmark_worker:
@@ -1461,9 +1550,17 @@ class EpochManager:
         if self._sub_store:
             incumbent_sub = self._sub_store.get(self._champion.submission_id)
         if incumbent_sub is None:
-            # Incumbent exists but its submission can't be resolved (e.g. a stale
-            # cross-process store reload) → can't re-benchmark the bar → STALE.
+            # Incumbent exists but its submission can't be resolved → can't
+            # re-benchmark the bar → STALE. Treated as PERMANENT (retryable stays
+            # False): a missing champion record won't heal within the decision
+            # window, so aborting fast beats hogging it with pointless retries.
+            # Logged (this path was previously silent — a diagnostic gap).
             self._incumbent_refresh_failed = True
+            logger.warning(
+                "Incumbent %s has no resolvable submission record — STALE bar, "
+                "will abstain (permanent, not retried)",
+                self._champion.submission_id,
+            )
             return
 
         # Prefer the PULLABLE pushed manifest digest (repo@sha256:…) over the local
@@ -1542,11 +1639,19 @@ class EpochManager:
                 diag.get("delivered_value_count", 0),
             )
         except Exception:
-            # Benchmark error (incl. RealSimulationUnavailable) → bar is stale →
-            # _should_adopt abstains rather than deciding on the prior rows.
+            # Benchmark error (incl. RealSimulationUnavailable, an unsealed fork-pin,
+            # or a transient RPC/provider hiccup) → bar is stale → _should_adopt
+            # abstains rather than deciding on the prior rows. Marked RETRYABLE: a
+            # re-bench RAISE is almost always transient (the champion image itself
+            # benched fine when it was adopted), so evaluate_round DEFERS and the next
+            # coordinator tick re-attempts — a single flaky re-bench no longer aborts
+            # a round a challenger may have won. Bounded by the decision deadline and
+            # the per-round attempt cap (_incumbent_refresh_attempts).
             self._incumbent_refresh_failed = True
+            self._incumbent_refresh_retryable = True
             logger.warning(
-                "Failed to re-benchmark incumbent %s — STALE bar, will abstain",
+                "Failed to re-benchmark incumbent %s — STALE bar, will abstain "
+                "(transient; round will retry the re-bench next tick)",
                 self._champion.submission_id,
                 exc_info=True,
             )
@@ -2722,6 +2827,12 @@ class EpochManager:
                 round_state.round_id,
                 abort_reason or "round_aborted",
             )
+
+        # Evict this round's transient-re-bench defer counter — the round is now
+        # terminal so it will never be evaluated again, and the entry would
+        # otherwise leak for the process lifetime (one per transiently-failing
+        # round on the long-lived leader).
+        self._incumbent_refresh_attempts.pop(round_state.round_id, None)
 
         # #227: reap submissions still BENCHMARKING for this now-terminal round.
         # The benchmark worker only processes the current-open or replay round, so
