@@ -35,6 +35,10 @@ class TrackedBridge:
     tracked_at: float = field(default_factory=time.time)
     poll_count: int = 0
     max_polls: int = 120  # ~2 hours at 60s interval
+    # CCTP has no permissionless relayer: once the burn is attested, the
+    # platform self-relays receiveMessage on the destination. Set once that
+    # mint tx has been submitted, so we don't double-mint on re-poll.
+    cctp_minted: bool = False
 
 
 class BridgeTracker:
@@ -160,7 +164,27 @@ class BridgeTracker:
                     error = status.error or "Bridge transfer failed"
                     self._mark_bridge_failed(order_id, error)
                     to_remove.append(order_id)
-                # PENDING / IN_TRANSIT → keep polling
+                elif (
+                    tracked.bridge_protocol == "cctp"
+                    and not tracked.cctp_minted
+                    and status.metadata.get("ready_to_mint")
+                ):
+                    # CCTP: attestation ready → self-relay the destination mint,
+                    # then treat the bridge as complete and run the dest legs.
+                    # On submit failure, keep polling (retry next cycle) — the
+                    # attestation stays valid, funds can't be stranded.
+                    try:
+                        await self._submit_cctp_mint(tracked, status.metadata)
+                        tracked.cctp_minted = True
+                        await self._on_bridge_complete(tracked, status)
+                        to_remove.append(order_id)
+                        completed += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "CCTP mint self-relay failed for %s: %s (retry)",
+                            order_id, exc,
+                        )
+                # PENDING / IN_TRANSIT (not yet attested) → keep polling
             except NotImplementedError:
                 # Stub adapter (e.g. Tensorplex) — skip until real integration
                 logger.debug(
@@ -177,6 +201,45 @@ class BridgeTracker:
             self._tracked.pop(oid, None)
 
         return completed
+
+    async def _submit_cctp_mint(
+        self,
+        tracked: TrackedBridge,
+        metadata: dict,
+    ) -> str:
+        """Self-relay a CCTP mint: submit receiveMessage on the destination.
+
+        CCTP has no permissionless relayer network, so the platform completes
+        the mint once Iris attests. The mintRecipient was pinned in the burn
+        message at source time, so this call can only deliver USDC to that
+        (platform-controlled / user) address — never redirected. Submitted
+        from the relayer wallet via the destination MessageTransmitterV2.
+        Raises on submit failure so the caller retries next poll.
+        """
+        from minotaur_subnet.bridge.cctp import MESSAGE_TRANSMITTER_V2
+
+        message = metadata.get("message") or ""
+        attestation = metadata.get("attestation") or ""
+        if not message or not attestation:
+            raise ValueError("CCTP mint: missing message/attestation")
+
+        def _b(h: str) -> bytes:
+            return bytes.fromhex(h[2:] if h.startswith("0x") else h)
+
+        tx = await self.relayer.call_contract_function(
+            contract_address=MESSAGE_TRANSMITTER_V2,
+            chain_id=tracked.dst_chain_id,
+            signature="receiveMessage(bytes,bytes)",
+            abi_types=["bytes", "bytes"],
+            values=[_b(message), _b(attestation)],
+            gas=300_000,
+        )
+        logger.info(
+            "CCTP mint self-relayed for %s on chain %d: tx=%s",
+            tracked.order_id, tracked.dst_chain_id, tx[:18],
+        )
+        print(f"[BRIDGE] {tracked.order_id}: CCTP mint submitted (tx={tx[:16]})", flush=True)
+        return tx
 
     async def _on_bridge_complete(
         self,
