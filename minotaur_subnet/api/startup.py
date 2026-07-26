@@ -1861,10 +1861,12 @@ async def initialize(ctx: ServerContext) -> dict:
             from minotaur_subnet.bridge.mock import MockBridgeAdapter
             from minotaur_subnet.bridge.tensorplex import TensorplexAdapter
             from minotaur_subnet.bridge.hyperlane import HyperlaneAdapter
+            from minotaur_subnet.bridge.across import AcrossAdapter
             bridge_registry = BridgeRegistry()
             bridge_registry.register(MockBridgeAdapter())
             bridge_registry.register(TensorplexAdapter())
             bridge_registry.register(HyperlaneAdapter())
+            bridge_registry.register(AcrossAdapter())
             logger.info("BridgeRegistry initialized (mock + tensorplex + hyperlane adapters)")
         except Exception as exc:
             logger.warning("BridgeRegistry unavailable: %s", exc)
