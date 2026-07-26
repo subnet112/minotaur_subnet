@@ -1173,6 +1173,12 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if s1.content_fingerprint:
             await offload_write(store.set_content_fingerprint,submission_id, s1.content_fingerprint)
 
+        # Structural fingerprint — persisted the same way; without this the
+        # value computed in stage 1 never reaches the record and the structural
+        # dedup observes NONE on every submission.
+        if s1.structural_fingerprint:
+            await offload_write(store.set_structural_fingerprint, submission_id, s1.structural_fingerprint)
+
         if not s1.passed:
             return  # set_screening_result already rejected
 

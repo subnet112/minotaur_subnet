@@ -1218,6 +1218,20 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist_records([sub])
 
+    def set_structural_fingerprint(self, submission_id: str, value: str) -> None:
+        """Persist the salt-invariant structural fingerprint from screening
+        stage 1 — same compute-once-read-forever discipline as
+        ``set_content_fingerprint``. Without this the field never reaches the
+        record and the structural dedup sees NONE on every submission.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.structural_fingerprint = value
+        sub.updated_at = time.time()
+        self._persist_records([sub])
+
     def count_benched_rounds_for_fingerprint(
         self,
         fingerprint: str,
