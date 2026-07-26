@@ -1737,8 +1737,12 @@ async def _process_scenario(
                             fork_block=fork_block,
                             fork_timestamp=fork_ts,
                         ) if state and state.contract_address else None
+                        # Bridge calls can't execute on a fork — mock them so a
+                        # cross-chain plan is MEASURED rather than fail-closed
+                        # to 0. No-op (same object) for single-chain plans.
+                        sim_plan = _mock_bridge_for_benchmark(plan, state)
                         sim = await simulator.simulate(
-                            plan,
+                            sim_plan,
                             contract_address=state.contract_address if state else None,
                             intent_order=intent_order,
                             token_balances=token_balances,
@@ -2231,6 +2235,79 @@ def _build_token_balances(state: IntentState | None) -> dict[str, int] | None:
             pass
 
     return None
+
+
+def _mock_bridge_for_benchmark(
+    plan: ExecutionPlan, state: IntentState | None,
+) -> ExecutionPlan:
+    """Return the plan to SIMULATE, with bridge calls mocked out.
+
+    Bridge protocol contracts cannot execute on an Anvil fork — there is no
+    relayer to fill an Across deposit and no attestation service to mint a
+    CCTP burn — so a plan carrying real bridge calldata reverts, and
+    ``require_real_sim`` fail-closes it to score 0. That is indistinguishable
+    from "the solver produced garbage", which means a miner who correctly
+    answers a cross-chain scenario is scored exactly like one who didn't
+    answer at all. The validator's own re-simulation already mocks these
+    calls (validator/scoring_engine.py) and the live multi-leg path does too
+    (blockloop/multi_leg.py); the benchmark was the one scoring path that
+    didn't, so the incentive gradient for cross-chain work was flat-to-
+    negative.
+
+    DETERMINISM (this is a consensus-relevant scoring path):
+      - ``mock_bridge_interactions`` is a pure selector-match rewrite with no
+        I/O. It is emphatically NOT the CrossChainCompiler, which fetches
+        LIVE bridge quotes over HTTP — that must never touch the benchmark,
+        or two validators scoring the same plan would disagree.
+      - The rewrite only fires for plans that DECLARE cross-chain intent. A
+        single-chain plan returns the identical object, so every existing
+        champion score stays bit-identical (design §8 compat trap 2).
+
+    ROLLOUT: this changes scoring for cross-chain plans, so — like the
+    analyzability gate and deadwood floor — it must reach the whole fleet in
+    one :stable promotion before any solver emits such a plan. It is inert
+    until one does.
+    """
+    meta = plan.metadata or {}
+    if not (
+        meta.get("cross_chain")
+        or meta.get("multi_leg_plan")
+        or meta.get("cross_chain_plan")
+    ):
+        return plan
+
+    from minotaur_subnet.shared.types import mock_bridge_interactions
+
+    params = (
+        state.raw_params_view()
+        if state is not None and hasattr(state, "raw_params_view")
+        else {}
+    )
+    try:
+        amount = int(params.get("input_amount", 0) or 0)
+    except (ValueError, TypeError):
+        amount = 0
+    mocked = mock_bridge_interactions(
+        plan.interactions,
+        token_address=params.get("input_token", "") or "",
+        amount=amount,
+    )
+    if mocked == plan.interactions:
+        # Declared cross-chain but carries no bridge calldata on this chain
+        # (e.g. a destination-only leg) — nothing to rewrite.
+        return plan
+
+    logger.info(
+        "[benchmark] cross-chain plan: mocked %d bridge call(s) for simulation",
+        sum(1 for a, b in zip(mocked, plan.interactions) if a != b),
+    )
+    return ExecutionPlan(
+        intent_id=plan.intent_id,
+        interactions=mocked,
+        deadline=plan.deadline,
+        nonce=plan.nonce,
+        metadata=plan.metadata,
+    )
 
 
 def _build_benchmark_simulation(
