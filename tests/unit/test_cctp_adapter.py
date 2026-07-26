@@ -156,9 +156,21 @@ class TestCheckStatus:
         with patch.object(adapter, "_fetch_messages", _fake_fetch):
             return _run(adapter.check_status(self.TX, 1, 8453))
 
-    def test_complete(self):
+    def test_complete_status_is_ready_to_mint_not_completed(self):
+        # Iris "complete" = attestation ready, NOT minted. The adapter never
+        # returns COMPLETED (the tracker completes after it mints).
+        result = self._status({"messages": [{
+            "status": "complete", "message": "0xdead", "attestation": "0xc0ffee",
+        }]})
+        assert result.status == BridgeStatusEnum.IN_TRANSIT
+        assert result.metadata["ready_to_mint"] is True
+        assert result.metadata["attestation"] == "0xc0ffee"
+
+    def test_complete_without_attestation_stays_pending(self):
+        # "complete" with no attestation value can't be minted yet.
         result = self._status({"messages": [{"status": "complete"}]})
-        assert result.status == BridgeStatusEnum.COMPLETED
+        assert result.status == BridgeStatusEnum.IN_TRANSIT
+        assert not result.metadata
 
     def test_attested_surfaces_mint_payload(self):
         result = self._status({"messages": [{

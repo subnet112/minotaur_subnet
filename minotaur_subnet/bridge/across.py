@@ -20,10 +20,12 @@ Quoting uses the Across API (``suggested-fees``); the fee and the
 ``quoteTimestamp`` MUST come from the API — the SpokePool rejects
 deposits whose fee/timestamp don't match a recent quote.
 
-SpokePool addresses default to the canonical mainnet deployments but are
-env-overridable (ACROSS_SPOKE_POOL_<chain_id>) — verify against
-https://docs.across.to before first mainnet use, and note the API's
-``spokePoolAddress`` response field is preferred over the static map.
+SpokePool addresses are the canonical mainnet deployments (env-overridable
+via ACROSS_SPOKE_POOL_<chain_id>). Verified 2026-07-26 against
+docs.across.to AND on-chain (ETH 0x5c7BCd6E…, Base 0x09aea4b2… — both live
+SpokePools, wrappedNativeToken()=WETH, fillDeadlineBuffer()=21600s ≥ our
+FILL_DEADLINE_S). The API's ``spokePoolAddress`` response field is still
+preferred over the static map when present.
 """
 
 from __future__ import annotations
