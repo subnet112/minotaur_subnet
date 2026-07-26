@@ -1835,6 +1835,18 @@ async def get_solver_queue(
 
     ``?hotkey=`` filters to one entry AFTER ranking, so a single-miner query
     still reports the global rank/total.
+
+    HONESTY HARDENING (the 2026-07-26 live read taught this): the raw ledger
+    is "every hotkey ever seen", which is NOT "the queue". Dormant miners'
+    clocks grow forever by design (their seniority must survive an absence),
+    and deregistered hotkeys are relics that cannot submit at all (intake
+    fail-closes on metagraph membership) — presenting either as "waiting" read
+    as starvation when nobody active was starved. So each entry now carries
+    ``registered`` (in the current metagraph) and ``contending`` (live
+    submission in the open round — the only entries the next slate can
+    actually seat), and ``rank`` is computed over registered actors only so
+    relics don't hold places in line. The full ledger stays in the response —
+    labeled, never hidden.
     """
     from minotaur_subnet.harness.actor import (
         actor_first_seen,
@@ -1843,6 +1855,7 @@ async def get_solver_queue(
     )
     from minotaur_subnet.harness.rotation import (
         RotationLedger,
+        is_terminal_status,
         rotation_ledger_path,
         wait_ts,
     )
@@ -1857,6 +1870,27 @@ async def get_solver_queue(
     )
     actor_seen = actor_first_seen(seen, resolver) if resolver is not None else {}
     uid_by_hotkey = _hotkey_to_uid_map()
+    # Fail-open like miner_uid: an unsynced/unwired metagraph must degrade
+    # registered to null (indeterminate) — never mark live miners as relics.
+    have_metagraph = bool(uid_by_hotkey)
+
+    # Contending = a live (non-terminal) submission in the current OPEN round.
+    # Pure reads (worker-safe: get_current_round never writes); best-effort —
+    # a failure degrades to "nobody contending", never a 500.
+    round_id: str | None = None
+    contending: set[str] = set()
+    try:
+        current = get_round_store().get_current_round()
+        if current is not None:
+            round_id = current.round_id
+            for s in get_store().list_by_round(round_id):
+                if not is_terminal_status(s):
+                    hk = getattr(s, "hotkey", "") or ""
+                    if hk:
+                        contending.add(hk)
+    except Exception:
+        logger.warning("solver queue: contending lookup failed (degrading)", exc_info=True)
+        round_id, contending = None, set()
 
     entries: list[SolverQueueEntry] = []
     for hk in set(benched) | set(seen):
@@ -1865,6 +1899,8 @@ async def get_solver_queue(
             hotkey=hk,
             miner_uid=uid_by_hotkey.get(hk),
             actor=actor,
+            registered=(hk in uid_by_hotkey) if have_metagraph else None,
+            contending=hk in contending,
             first_seen_at=seen.get(hk),
             last_benched_at=benched.get(hk),
             waiting_since=(
@@ -1876,17 +1912,32 @@ async def get_solver_queue(
     # Seniority order. The hotkey tie-break is only for a stable listing — the
     # real per-round tie-break is the salted per-round shuffle (rotation_sort_key).
     entries.sort(key=lambda e: (e.waiting_since, e.hotkey))
+    # Rank over actors that can still compete: an actor with >= 1 registered
+    # hotkey (or every actor when the metagraph is indeterminate). A relic
+    # actor's entries stay listed but unranked — they hold no place in line.
+    rankable_actors: set[str] = {
+        e.actor or e.hotkey for e in entries if e.registered is not False
+    }
     ranks: dict[str, int] = {}
     for e in entries:
-        e.rank = ranks.setdefault(e.actor or e.hotkey, len(ranks) + 1)
+        key = e.actor or e.hotkey
+        if key in rankable_actors:
+            e.rank = ranks.setdefault(key, len(ranks) + 1)
     total = len(entries)
+    registered_count = (
+        sum(1 for e in entries if e.registered) if have_metagraph else None
+    )
+    contending_count = sum(1 for e in entries if e.contending)
     if hotkey:
         entries = [e for e in entries if e.hotkey == hotkey]
     return SolverQueueResponse(
         generated_at=now,
         actor_keyed=resolver is not None,
+        round_id=round_id,
         total=total,
         count=len(entries),
+        registered_count=registered_count,
+        contending_count=contending_count,
         queue=entries,
     )
 
