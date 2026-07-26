@@ -75,7 +75,10 @@ def compute_chain_blindspots(
     symbols = build_symbol_map(rows)
     agg: dict[tuple, dict[str, Any]] = {}
     for row in rows:
-        if row.get("trade_source") != "cow_onchain":
+        # Classification reads real trades AND active re-probes: a reprobe row is
+        # a synthetic re-ask of a known open pair (minotaur-only), exactly the
+        # signal open/covered needs — while stats/coverage exclude it as demand.
+        if row.get("trade_source") not in ("cow_onchain", "reprobe"):
             continue
         outcome = _outcome(row)
         if outcome is None:
