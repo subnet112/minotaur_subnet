@@ -2260,6 +2260,117 @@ def get_order_signing_payload(order_id: str) -> dict:
     }
 
 
+@router.get("/orders/{order_id}/plan-set")
+def get_order_plan_set(order_id: str) -> dict:
+    """Return the plan-set approval payload for a multi-leg order.
+
+    Available once the solver's cross-chain plan has been platform-compiled
+    (the plan set is the ordered on-chain hash of every leg — forward legs
+    then revert legs). The user signs PlanSetApproval(orderId, planSetHash)
+    ONCE under the chain-agnostic MinotaurPlanSet domain — one wallet prompt
+    covers every chain the intent touches — then POSTs the signature to
+    /orders/{id}/plan-set-signature.
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    plan_set = order.params.get("plan_set")
+    if not plan_set:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Order has no compiled plan set yet — it is not a multi-leg "
+                "order, or cross-chain compilation hasn't run."
+            ),
+        )
+    from eth_hash.auto import keccak as _keccak
+    return {
+        "order_id": order_id,
+        "submitted_by": order.submitted_by,
+        "plan_set": plan_set,
+        "typed_data": {
+            "domain": {"name": "MinotaurPlanSet", "version": "1"},
+            "types": {
+                "PlanSetApproval": [
+                    {"name": "orderId", "type": "bytes32"},
+                    {"name": "planSetHash", "type": "bytes32"},
+                ],
+            },
+            "primaryType": "PlanSetApproval",
+            "message": {
+                "orderId": "0x" + _keccak(order_id.encode()).hex(),
+                "planSetHash": plan_set["plan_set_hash"],
+            },
+        },
+        "note": (
+            "Sign with eth_signTypedData_v4(domain, types, message) OR sign "
+            "the raw 32-byte `plan_set.digest`, then POST "
+            "/orders/{id}/plan-set-signature with {plan_set_signature}. One "
+            "signature authorizes every forward leg AND the agreed revert "
+            "legs; a refreshed leg will require signing an updated set."
+        ),
+    }
+
+
+@router.post("/orders/{order_id}/plan-set-signature")
+async def attach_plan_set_signature(order_id: str, request: Request) -> dict:
+    """Attach the user's PlanSetApproval signature to a multi-leg order.
+
+    Auth mirrors PATCH /orders/{id}/signature: the signature itself proves
+    identity — the server recovers the signer from the sig over THIS order's
+    plan-set digest and requires it to equal ``order.submitted_by``. EOA
+    signatures are verified here; ERC-1271 (smart-account) signatures are
+    accepted optimistically and settled by the contract's SignatureChecker
+    at execution (an invalid one reverts the leg, funds untouched).
+
+    Body shape: ``{"plan_set_signature": "0x..."}``
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    body = await request.json()
+    sig = body.get("plan_set_signature", "")
+    if not sig:
+        raise HTTPException(status_code=400, detail="plan_set_signature required")
+
+    plan_set = order.params.get("plan_set")
+    if not plan_set:
+        raise HTTPException(
+            status_code=409,
+            detail="Order has no compiled plan set to sign",
+        )
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+
+    from minotaur_subnet.consensus.plan_set import verify_plan_set_signature
+    plan_set_hash = bytes.fromhex(plan_set["plan_set_hash"][2:])
+    if not verify_plan_set_signature(owner, order_id, plan_set_hash, sig):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "plan_set_signature does not recover to order.submitted_by "
+                "for this order's plan-set digest"
+            ),
+        )
+
+    order.params["plan_set_signature"] = sig
+    ob.update_order(order_id, params=order.params)
+    if _app_store is not None:
+        try:
+            _app_store.save_order(ob.get(order_id).to_dict())
+        except Exception:
+            pass
+
+    return {"order_id": order_id, "plan_set_signature_attached": True}
+
+
 @router.get("/orders/{order_id}/bridge")
 def get_bridge_status(order_id: str) -> dict:
     """Get bridge transfer status for a cross-chain order.

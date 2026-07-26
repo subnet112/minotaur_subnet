@@ -258,17 +258,12 @@ class BridgeTracker:
             leg_label = f"leg {leg.leg_index} (chain {leg.chain_id})"
             print(f"[BRIDGE] {tracked.order_id}: processing {leg_label}", flush=True)
 
-            # Build ExecutionPlan for this leg
-            leg_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=leg.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **leg.metadata,
-                    "leg_index": leg.leg_index,
-                    "chain_id": leg.chain_id,
-                },
+            # Build ExecutionPlan for this leg — canonical builder so the
+            # submitted plan hash matches the user's signed plan set
+            # (consensus/plan_set.py invariant).
+            from minotaur_subnet.consensus.plan_set import build_leg_execution_plan
+            leg_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), leg,
             )
 
             # Simulate destination leg before consensus
@@ -398,6 +393,15 @@ class BridgeTracker:
             submit_params["intent_selector"] = leg.intent_selector
             if leg.intent_params_hex:
                 submit_params["intent_params_hex"] = leg.intent_params_hex
+            # Plan-set signed path (threaded from the tracking plan): the
+            # destination leg is the one the empty-user-sig hole hit hardest.
+            from minotaur_subnet.consensus.plan_set import thread_plan_set_params
+            thread_plan_set_params(
+                submit_params,
+                tracked.plan.metadata.get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                leg.leg_index,
+            )
             submit_order.params = submit_params
 
             try:

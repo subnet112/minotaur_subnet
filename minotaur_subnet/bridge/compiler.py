@@ -240,12 +240,21 @@ class CrossChainCompiler:
             rollback_legs=rollback_legs,
         )
 
+        # Plan set: the ordered on-chain plan hashes (forward then rollback)
+        # the user signs once via PlanSetApproval. Computed HERE — after the
+        # last metadata write to any leg — because any later drift breaks
+        # on-chain set membership (consensus/plan_set.py invariant).
+        from minotaur_subnet.consensus.plan_set import compute_plan_set
+        plan_set = compute_plan_set(multi_leg, deadline)
+        multi_leg.rollback_plan_hash = "0x" + plan_set.plan_set_hash.hex()
+
         return CompiledCrossChainPlan(
             multi_leg_plan=multi_leg,
             escrow_params=escrow_params,
             bridge_quotes=bridge_quotes,
             simulation_mocks=simulation_mocks,
             solver_plan=solver_plan,
+            plan_set=plan_set,
         )
 
     def _validate(self, plan: CrossChainPlan) -> list[str]:
@@ -337,6 +346,7 @@ class CompiledCrossChainPlan:
     bridge_quotes: list[BridgeQuote]
     simulation_mocks: dict[int, dict[str, Any]]
     solver_plan: CrossChainPlan
+    plan_set: Any = None  # consensus.plan_set.PlanSet
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -344,4 +354,5 @@ class CompiledCrossChainPlan:
             "escrow_params": self.escrow_params,
             "bridge_quotes": [asdict(q) for q in self.bridge_quotes],
             "simulation_mocks": {str(k): v for k, v in self.simulation_mocks.items()},
+            "plan_set": self.plan_set.to_dict() if self.plan_set else None,
         }
