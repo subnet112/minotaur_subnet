@@ -69,13 +69,15 @@ _quote_sim_runner = None
 # gas (so the fee can be priced by us, not the miner), which means an
 # unauthenticated caller spamming quotes can exhaust the leader's simulation
 # capacity. Fixed-window per-IP limiter mirroring apps._debug_rate_limit; tune
-# via QUOTE_RATE_LIMIT_PER_MINUTE (default 30, 0 disables).
+# via QUOTE_RATE_LIMIT_PER_MINUTE (default 20 — the DDoS-Tier1 production
+# value, staged 2026-07-25; 0 disables). nginx adds its own per-IP and global
+# /quote limits in front of this on the leader.
 _QUOTE_RATE_LIMIT_BUCKETS: dict[str, deque] = {}
 _QUOTE_RATE_LIMIT_LOCK = Lock()
 
 
 def _quote_rate_limit(request: Request) -> None:
-    per_minute = int(os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE", "30") or "30")
+    per_minute = int(os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE", "20") or "20")
     if per_minute <= 0:
         return
     now = time.monotonic()

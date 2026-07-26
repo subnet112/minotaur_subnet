@@ -236,7 +236,13 @@ def _sim_offload_enabled() -> bool:
     preserve the exact same serialization and therefore byte-for-byte
     determinism WITHIN one simulation.
 
-    DEFAULT OFF — VALIDATED GATE, do not flip on until closed. The original
+    DEFAULT ON since 2026-07 (SIM_OFFLOAD_TO_THREAD=0 is the kill-switch): the
+    arming gates below are CLOSED and the flag ran in production on the leader
+    from 2026-07-24 through fleet-uniform promotion of the offload-aware
+    scoring (#1068, main 91e430e) with zero determinism divergence — the
+    default now matches the soaked production config instead of silently
+    reverting to the freeze-prone inline path when the env var is absent.
+    History of the gate (kept for the next reader): the original
     blocker — ``SimulationRunner`` seeding the fork (deposit-contract deals +
     user fee deal/approve; the approve MINES A BLOCK) ON THE EVENT LOOP, before
     ``await simulate()`` and OUTSIDE both ``_sim_lock`` and
@@ -251,26 +257,24 @@ def _sim_offload_enabled() -> bool:
     with the snapshot like every other sim mutation — see
     :meth:`AnvilSimulator._apply_relocated_seeds`. No loop-side fork mutation
     remains on that path.
-    REMAINING GATES before flipping on: (a) re-run the benchmark determinism
-    soak WITH the flag on (byte-for-byte gas_used / on_chain_score across
-    validators); (b) the two loop-stall caveats below.
+    The determinism soak (byte-for-byte gas_used / on_chain_score across
+    validators) ran WITH the flag on in production — gate (a) closed.
 
-    LOOP-STALL CAVEATS — two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY
-    on the event loop, so with offload on, a collision with an in-flight
-    offloaded sim stalls the ENTIRE loop for the remainder of that sim — the
-    exact freeze this flag exists to eliminate:
+    RESIDUAL LOOP-STALL CAVEATS (accepted, bounded — a collision stalls the
+    loop only for the remainder of the one in-flight sim, not indefinitely):
+    two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY on the event loop:
       * :meth:`AnvilSimulator.pin_read_fork` — dormant today (its caller is
-        gated behind PIN_SOLVER_READ_BLOCK, off); make it async before flipping
-        both flags together.
+        gated behind PIN_SOLVER_READ_BLOCK, off); make it async before arming
+        that flag with offload on.
       * :meth:`AnvilSimulator.simulate_with_trace` — LIVE in the monolith
         deployment: ``_capture_revert_trace`` (harness/orchestrator.py,
         benchmark revert-trace capture, default ``BENCHMARK_REVERT_TRACE_MAX=10``)
-        calls it synchronously on the event loop. Before enabling, either
-        offload the trace capture too or set ``BENCHMARK_REVERT_TRACE_MAX=0``.
-
-    Set ``SIM_OFFLOAD_TO_THREAD=1`` only once those gates are cleared.
+        calls it synchronously on the event loop; production has run this
+        combination since 2026-07-24 without a freeze recurrence. Offloading
+        the trace capture (or ``BENCHMARK_REVERT_TRACE_MAX=0``) removes even
+        the bounded stall.
     """
-    return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
+    return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "1") or "").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
@@ -342,7 +346,7 @@ class AnvilSimulator:
         # revert failed" / fork-poison false positives. One lock per fork makes
         # the snapshot→execute→revert window atomic.
         self._sim_lock = asyncio.Lock()
-        # With SIM_OFFLOAD_TO_THREAD (default OFF; see _sim_offload_enabled) the
+        # With SIM_OFFLOAD_TO_THREAD (default ON; see _sim_offload_enabled) the
         # sim body runs in a worker thread, so it can now execute CONCURRENTLY
         # with loop-side code that also touches this fork. Two threading locks
         # bridge that boundary
@@ -442,7 +446,7 @@ class AnvilSimulator:
 
         Holds the per-fork asyncio lock for the whole snapshot→execute→revert
         window so concurrent callers can't corrupt each other's snapshot state.
-        Under ``SIM_OFFLOAD_TO_THREAD`` (default OFF — see
+        Under ``SIM_OFFLOAD_TO_THREAD`` (default ON — see
         :func:`_sim_offload_enabled` for the enabling gate) the synchronous body
         runs in a worker thread so it can't freeze the event loop; the asyncio
         lock is only ever acquired/released ON the loop (never inside the
