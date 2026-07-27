@@ -168,6 +168,7 @@ def select_rotation_slate(
     actor_of: Any = None,
     seen: dict[str, float] | None = None,
     now: float | None = None,
+    structural_collapse: bool = False,
 ) -> tuple[list[Any], list[Any]]:
     """PURE: split candidates into (selected, skipped) by wait-time order.
 
@@ -179,6 +180,16 @@ def select_rotation_slate(
     rotating N hotkeys holds one seat, not N — and only when fewer distinct
     actors than slots contend do an actor's further submissions fill the
     leftover seats. ``skipped`` stays in seniority order.
+
+    ``structural_collapse`` (enforce mode) adds an orthogonal cut: seat at most
+    ONE submission per structural fingerprint too, so a fleet of DISTINCT actors
+    (coldkeys) running structurally-identical code (salted constants) — which
+    the per-actor dedup cannot see — holds one seat, not N. Freed slots backfill
+    from the overflow in seniority order but NEVER re-seat an already-benched
+    fingerprint (else the wide fleet just refills the slots its collapse freed);
+    a legit repeat-actor with distinct code can. This changes the benched slate
+    -> the pack hash, so it MUST be promoted fleet-uniform. Fingerprint-less
+    submissions never collapse.
     """
     slots = max(0, int(slots))
     seen = seen or {}
@@ -206,18 +217,39 @@ def select_rotation_slate(
     selected: list[Any] = []
     overflow: list[Any] = []
     seated_actors: set[str] = set()
+    seated_structs: set[str] = set()
+
+    def _struct(sub: Any) -> str | None:
+        if not structural_collapse:
+            return None
+        return getattr(sub, "structural_fingerprint", None) or None
+
     for sub in ordered:
         hk = getattr(sub, "hotkey", "") or ""
         actor = actor_of(hk) or hk
-        if len(selected) < slots and actor not in seated_actors:
+        sfp = _struct(sub)
+        blocked = actor in seated_actors or (sfp is not None and sfp in seated_structs)
+        if len(selected) < slots and not blocked:
             selected.append(sub)
             seated_actors.add(actor)
+            if sfp is not None:
+                seated_structs.add(sfp)
         else:
             overflow.append(sub)
     # Fewer distinct actors than slots: fill from the overflow in seniority
-    # order (repeat actors) rather than waste bench capacity.
-    while len(selected) < slots and overflow:
-        selected.append(overflow.pop(0))
+    # order (repeat actors) rather than waste bench capacity. Under
+    # structural_collapse, skip any overflow whose fingerprint is already
+    # seated so the freed slots go to distinct code, not the fleet's spares.
+    i = 0
+    while len(selected) < slots and i < len(overflow):
+        sfp = _struct(overflow[i])
+        if sfp is not None and sfp in seated_structs:
+            i += 1
+            continue
+        sub = overflow.pop(i)
+        selected.append(sub)
+        if sfp is not None:
+            seated_structs.add(sfp)
     return selected, overflow
 
 
@@ -518,9 +550,15 @@ def apply_rotation_slate(
                 "(round-scope created_at used)", exc_info=True,
             )
     ledger.mark_seen(earliest)
+    # Structural-dedup mode (env-gated, default OFF). In ``enforce`` the slate
+    # collapses cross-actor structural clusters to one slot; ``observe`` only
+    # logs. Read before selection so ``enforce`` feeds select_rotation_slate.
+    from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+    _dedup_mode = structural_dedup_mode()
     selected, skipped = select_rotation_slate(
         candidates, slots, ledger.load(), round_id, actor_of=actor_of,
         seen=ledger.load_seen(), now=now_ts,
+        structural_collapse=(_dedup_mode == "enforce"),
     )
     if actor_of is not None:
         n_actors = distinct_actor_count(
@@ -532,26 +570,30 @@ def apply_rotation_slate(
             round_id, len(candidates), n_actors, len(selected), actor_of.source,
         )
 
-    # Structural-dedup (env-gated, default OFF): flag cross-actor slates where
+    # Structural-dedup (env-gated, default OFF): cross-actor clusters where
     # DISTINCT coldkeys run structurally-identical code (salted constants) —
-    # the sybil that actor-keying alone can't collapse. Only acts when
-    # STRUCTURAL_DEDUP_MODE is set (observe|enforce); logs only for now, does
-    # NOT change selection. Enforce (collapse to one slot) is reserved and
-    # must promote fleet-uniform (it changes the benched slate → the pack hash).
-    from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
-    _dedup_mode = structural_dedup_mode()
+    # the sybil that actor-keying alone can't collapse. Clusters are computed
+    # over the whole candidate pool (not just the slate) for full-fleet
+    # visibility; in ``enforce`` the slate was already collapsed above (<=1 per
+    # fingerprint), so this only reports what happened. ``enforce`` changes the
+    # benched slate -> the pack hash and must be promoted fleet-uniform.
     if _dedup_mode != "off":
         try:
-            clusters = structural_dedup_clusters(selected, actor_of)
+            selected_ids = {id(s) for s in selected}
+            clusters = structural_dedup_clusters(candidates, actor_of)
             for c in clusters:
                 fp = getattr(c[0], "structural_fingerprint", "") or ""
+                in_slate = sum(1 for s in c if id(s) in selected_ids)
                 logger.warning(
-                    "[structural-dedup %s] %s: %d slate submissions share "
-                    "structural fingerprint %s across distinct actors — likely "
-                    "one sybil%s: %s",
+                    "[structural-dedup %s] %s: %d submissions across distinct "
+                    "actors share structural fingerprint %s — likely one sybil"
+                    "%s: %s",
                     _dedup_mode.upper(), round_id, len(c), fp[:16],
-                    " (enforce not yet wired — observing only)"
-                    if _dedup_mode == "enforce" else " (would collapse to 1 slot when armed)",
+                    (" (enforced: %d seated, %d excluded from slate)"
+                     % (in_slate, len(c) - in_slate))
+                    if _dedup_mode == "enforce"
+                    else (" (%d currently in slate; would collapse to 1 when armed)"
+                          % in_slate),
                     ", ".join(
                         f"{getattr(s, 'submission_id', '?')}"
                         f"(hk={(getattr(s, 'hotkey', '') or '')[:10]})"
