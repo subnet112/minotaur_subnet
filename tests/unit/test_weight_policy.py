@@ -55,14 +55,33 @@ def test_build_weights_ramps_champion_with_owner_burn():
     }
 
 
-def test_build_weights_full_to_champion_when_owner_unresolvable(monkeypatch):
-    # No resolvable owner anywhere -> can't burn -> route fully to the champion.
+def test_build_weights_fail_closed_when_owner_unresolvable(monkeypatch):
+    # No resolvable owner anywhere -> can't burn -> FAIL CLOSED: return {} so the
+    # emit path DEFERS (prior on-chain weights persist), NEVER route the champion
+    # 100%. Force truly-unresolvable past the constant fallback by stubbing the
+    # resolver (env delete alone no longer empties it).
+    monkeypatch.setattr(weight_policy, "get_subnet_owner_hotkey", lambda: "")
+    assert build_bootstrap_or_champion_weights("5Gminer", owner_hotkey=None) == {}
+
+
+def test_get_subnet_owner_hotkey_constant_fallback(monkeypatch):
+    # The burn target must never silently vanish: with no env, the fleet-uniform
+    # constant is the last resort; env still wins when set.
     monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
     monkeypatch.delenv("OWNER_HOTKEY", raising=False)
-    assert build_bootstrap_or_champion_weights(
-        "5Gminer",
-        owner_hotkey=None,
-    ) == {"5Gminer": 1.0}
+    assert weight_policy.get_subnet_owner_hotkey() == weight_policy.SN112_OWNER_HOTKEY
+    monkeypatch.setenv("SUBNET_OWNER_HOTKEY", "5Genv")
+    assert weight_policy.get_subnet_owner_hotkey() == "5Genv"
+
+
+def test_burn_applies_via_constant_when_env_absent(monkeypatch):
+    # With no env owner, the constant fallback STILL burns 25% — not 100% to the
+    # miner (the fail-open bug that let a champion pocket the full pool).
+    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
+    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    w = build_bootstrap_or_champion_weights("5Gminer", owner_hotkey=None)
+    assert w["5Gminer"] == CHAMPION_MINER_WEIGHT_FRACTION
+    assert w[weight_policy.SN112_OWNER_HOTKEY] == 1 - CHAMPION_MINER_WEIGHT_FRACTION
 
 
 def test_build_weights_full_to_champion_when_champion_is_owner():
@@ -93,10 +112,14 @@ def test_apply_burn_ramp_caps_miners_preserves_ratios():
     assert abs(ramped["m1"] / ramped["m2"] - 2.0) < 1e-9  # 0.6/0.3 preserved
 
 
-def test_apply_burn_ramp_noop_without_owner(monkeypatch):
-    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
-    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
-    assert apply_champion_burn_ramp({"m1": 1.0}, owner_hotkey=None) == {"m1": 1.0}
+def test_apply_burn_ramp_fail_closed_without_owner(monkeypatch):
+    monkeypatch.setattr(weight_policy, "get_subnet_owner_hotkey", lambda: "")
+    # A burn WAS intended but no owner resolved -> {} (defer), NOT the miner 100%.
+    assert apply_champion_burn_ramp({"m1": 1.0}, owner_hotkey=None) == {}
+    # fraction 1.0 = no burn intended -> miners unchanged even without an owner.
+    assert apply_champion_burn_ramp(
+        {"m1": 1.0}, owner_hotkey=None, miner_fraction=1.0
+    ) == {"m1": 1.0}
 
 
 def test_apply_burn_ramp_drops_owner_and_still_burns():
@@ -188,9 +211,9 @@ def test_maybe_emit_empty_does_not_advance_epoch_clock(monkeypatch):
     the epoch clock must NOT advance — otherwise a late-resolving owner
     (env set after startup, slow chain query) would have to wait a full
     additional epoch_seconds before next attempt."""
-    # No owner_hotkey set anywhere — empty weights inevitable
-    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
-    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    # Force the owner truly-unresolvable (past the constant fallback) so weights
+    # are empty (fail-closed defer).
+    monkeypatch.setattr(weight_policy, "get_subnet_owner_hotkey", lambda: "")
     tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="")
     # Seed the clock so we'd otherwise emit
     tracker.seed_epoch_clock_from_last_emit(9999.0)
@@ -262,11 +285,11 @@ def test_maybe_emit_recovers_after_owner_hotkey_set_late(monkeypatch):
     """Operator-self-heal flow: daemon starts with no owner, emits None
     every tick, then operator sets the hotkey at runtime. The very NEXT
     maybe_emit should emit (no extra wait)."""
-    monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
-    monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+    # Force the initial owner truly-unresolvable (past the constant fallback).
+    monkeypatch.setattr(weight_policy, "get_subnet_owner_hotkey", lambda: "")
     tracker = ChampionWeights(epoch_seconds=1200, owner_hotkey="")
     tracker.seed_epoch_clock_from_last_emit(9999.0)
-    assert tracker.maybe_emit(None) is None  # initially empty
+    assert tracker.maybe_emit(None) is None  # initially empty (fail-closed defer)
 
     # Operator sets the hotkey
     tracker.owner_hotkey = "5Gowner"
