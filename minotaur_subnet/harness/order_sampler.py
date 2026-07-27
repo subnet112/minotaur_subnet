@@ -44,10 +44,10 @@ _PII_FIELDS = {"submitted_by", "interop_address", "user_signature", "hotkey"}
 # re-encodes of byte-identical trades.
 _VOLATILE_PARAMS = {"quoted_output", "platform_fee_wei", "intent_params_hex"}
 
-# Swap-style params handled specially by the near-dup bucket key: the pair is
-# identity, the amount is bucketed by order of magnitude, and the slippage guard
-# scales with the amount (so it would defeat the bucketing if kept exact).
-_BUCKETED_PARAMS = {"input_token", "output_token", "input_amount", "min_output_amount"}
+# (A swap-specific near-dup bucket used to live here — same pair + order-of-
+# magnitude amount collapsed to one shape, with the slippage guard dropped
+# because it scales with the amount. It was removed once measurement showed it
+# collapsed nothing on the live corpus; see _dedup_key.)
 
 
 # Identity / derived params that must NEVER enter a stored quote CASE. A quote case
@@ -106,15 +106,22 @@ def quote_case_id(
 ) -> str:
     """Content-addressed id for a quote CASE — the storage-time collapse key.
 
-    Keyed by the SAME trade-SHAPE the sampler dedups on (``_dedup_key``): same pair +
-    order-of-magnitude amount + other non-bucketed params collapse to ONE id. So exact-
-    amount spam upserts to a single stored row at CAPTURE — bounding table growth to
-    distinct demand shapes with no wall-clock/arrival ordering (the removed newest-N
-    row cap was arrival-ordered, hence non-deterministic; this is not). The storage key
-    and the draw-time dedup are now the SAME function, so ``_dedup_candidates`` is a
-    no-op over the stored set and the corpus stores exactly what it scores. Fleet-
-    uniform → the round-seeded quote draw and the pack hash agree across validators.
+    Keyed by the SAME trade-SHAPE the sampler dedups on (``_dedup_key``): a
+    re-quote of an identical trade upserts to a single stored row at CAPTURE,
+    bounding table growth to distinct demand shapes with no wall-clock/arrival
+    ordering (the removed newest-N row cap was arrival-ordered, hence
+    non-deterministic; this is not). The storage key and the draw-time dedup are
+    the SAME function, so ``_dedup_candidates`` is a no-op over the stored set
+    and the corpus stores exactly what it scores. Fleet-uniform → the
+    round-seeded quote draw and the pack hash agree across validators.
     ``q_`` prefix + 32 hex chars.
+
+    NOTE this id is content-addressed on ``_dedup_key``'s output, so ANY change
+    to that key re-ids every stored row. Dropping the swap near-dup bucket
+    (2026-07-27) re-id'd 2242 of 2246 live rows even though the induced
+    partition was identical. That churn is self-healing: old and new rows for
+    the same trade still collapse together in ``_dedup_candidates`` at draw
+    time, and the orphaned old rows age out via QUOTE_RETENTION_EPOCHS.
     """
     order_shaped = {
         "app_id": app_id or "",
@@ -200,10 +207,11 @@ def sample_historical_orders(
     per-order fork anchor is needed, and the draw stays deterministic per the seed.
 
     Duplicate demand is collapsed before the draw (see ``_dedup_key``): exact
-    re-submissions of one trade, and near-dups on the same pair within the same
-    order-of-magnitude amount, count as ONE candidate — the n_per_chain slots go
-    to distinct scenarios instead of copies, and corpus-stuffing (spamming one
-    trade to weight the draw) loses its cheapest form.
+    re-submissions of one trade count as ONE candidate — the n_per_chain slots
+    go to distinct scenarios instead of copies, and corpus-stuffing (spamming
+    one trade to weight the draw) loses its cheapest form. Collapse is on EXACT
+    param shape; a swap-specific near-dup bucket was removed once measurement
+    showed it collapsed nothing on the live corpus.
 
     The draw is seeded by ``round_id`` ALONE, so EVERY validator derives the
     IDENTICAL subset without broadcasting the selection — one shared corpus that
@@ -462,46 +470,35 @@ def _filter_candidates(
     return candidates
 
 
-def _amount_decade(amount: Any) -> str:
-    """Order-of-magnitude bucket for an integer amount string (wei/base units).
-
-    Non-integer / non-positive values fall back to the raw value so they never
-    wrongly collapse with anything else.
-    """
-    try:
-        value = int(str(amount))
-    except (TypeError, ValueError):
-        return f"raw:{amount}"
-    if value <= 0:
-        return f"raw:{amount}"
-    # len(str(v)) - 1 == floor(log10(v)) for positive ints — no float involved,
-    # so the bucket is exact and platform-independent.
-    return f"e{len(str(value)) - 1}"
-
-
 def _dedup_key(order: dict[str, Any]) -> str:
     """Canonical identity of the trade an order asks a solver to solve.
 
-    Swap-style orders (input_token/output_token/input_amount present) get a
-    NEAR-dup key: same pair + same order-of-magnitude amount collapse, with the
-    amount-scaled slippage guard excluded and every other param kept exact (so an
-    app's extra meaningful params — recipient, path, … — never wrongly collapse).
-    Orders without the swap triple fall back to EXACT-shape identity over all
-    non-volatile params.
+    EXACT-shape identity over every non-volatile param. App-agnostic by
+    construction: it never names a param, so it treats a swap, a vault
+    rebalance and anything else the same way.
+
+    This used to carry a swap-specific NEAR-dup path — same pair + same
+    order-of-magnitude amount collapsed to one shape, with the amount-scaled
+    slippage guard dropped so it couldn't defeat the bucket — justified by the
+    2026-07-02 order corpus, where it collapsed 393 candidates to 173 (55%)
+    against 330 (16%) for exact identity.
+
+    REMOVED 2026-07-27 after re-measuring (tools/corpus_dedup_replay.py). On
+    the 2246-row live QUOTE corpus that now feeds Stage-2, the near-dup key
+    collapsed NOTHING — 2246 distinct shapes either way, pair agreement 1.0000
+    over 2.5M pairs with zero splits and zero merges. The corpus had shifted to
+    blind-spot probing across distinct token pairs, so nearly every row is
+    already a different (pair, decade) shape and the bucketing bought nothing
+    while pinning DEX vocabulary into an app-agnostic path.
+
+    If order volume returns and near-duplicates with it, re-measure with that
+    tool before re-adding anything: the number that justified the special case
+    had gone stale for weeks before anyone checked.
     """
     params = order.get("params") or {}
     core = {k: v for k, v in params.items() if k not in _VOLATILE_PARAMS}
-    prefix = [order.get("app_id", ""), order.get("intent_function", ""),
-              order.get("chain_id")]
-    input_token = core.get("input_token")
-    output_token = core.get("output_token")
-    input_amount = core.get("input_amount")
-    if input_token and output_token and input_amount is not None:
-        rest = {k: v for k, v in core.items() if k not in _BUCKETED_PARAMS}
-        parts = prefix + [str(input_token).lower(), str(output_token).lower(),
-                          _amount_decade(input_amount), rest]
-    else:
-        parts = prefix + [core]
+    parts = [order.get("app_id", ""), order.get("intent_function", ""),
+             order.get("chain_id"), core]
     return json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
 
 

@@ -162,16 +162,22 @@ class TestQuoteParamsFrozen:
                               "captured_opened_epoch": 100, "created_at": 1.0})
             return qid
 
-        q1 = capture("10")                      # decade e1
-        q2 = capture("99")                      # same decade → SAME shape id
+        # A re-quote of the SAME trade collapses to one stored row whose params
+        # stay frozen at first-seen, so a synced follower's replay hash never
+        # moves under it. (Amounts in the same DECADE used to collapse too —
+        # that was the swap near-dup bucket, removed 2026-07-27; the freezing
+        # property it protected is what matters and is unchanged.)
+        q1 = capture("10")
+        q2 = capture("10")                      # exact re-quote → SAME shape id
         assert q1 == q2
         row = s.get_quote(q1)
-        assert row["params"]["input_amount"] == "10"   # FROZEN at first-seen (not 99)
+        assert row["params"]["input_amount"] == "10"   # FROZEN at first-seen
 
         def _replay_hash(qid):
             r = dict(s.get_quote(qid)); r["order_id"] = qid
             return order_replay_hash(r)
 
         h1 = _replay_hash(q1)
-        capture("55")                           # another same-shape re-quote
+        capture("10")                           # another same-shape re-quote
         assert _replay_hash(q1) == h1           # hash unchanged → synced follower won't refuse
+        assert capture("99") != q1              # a different amount is now distinct demand
