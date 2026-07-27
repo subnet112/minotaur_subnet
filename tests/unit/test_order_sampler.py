@@ -163,9 +163,12 @@ class TestDedup:
         sample = sample_historical_orders(store, "round-1", n_per_chain=50)
         assert len(sample) == 1
 
-    def test_near_dups_same_pair_same_decade_collapse(self):
-        # 1 USDC vs 2 USDC on the same pair = one scenario; the slippage guard
-        # scales with the amount and must not defeat the bucket.
+    def test_different_amounts_are_distinct_scenarios(self):
+        # The swap near-dup bucket (same pair + same order-of-magnitude amount
+        # -> one scenario, slippage guard dropped) was REMOVED 2026-07-27: on
+        # the live 2246-row quote corpus it collapsed nothing, so it was pure
+        # DEX vocabulary in an app-agnostic path. Identity is now exact shape,
+        # so 1 USDC and 2 USDC are two scenarios.
         def usdc_swap(oid, amount, min_out):
             return _make_order(oid, params={
                 "input_token": "0xUSDC", "output_token": "0xTOK",
@@ -176,16 +179,30 @@ class TestDedup:
             usdc_swap("ord_b", "2000000", "1980000"),
         ]
         sample = sample_historical_orders(_FakeAppStore(orders), "round-1", n_per_chain=50)
-        assert len(sample) == 1
+        assert len(sample) == 2
 
-    def test_different_decade_pair_or_direction_survive(self):
+    def test_dedup_key_names_no_app_specific_param(self):
+        # The regression this file exists to prevent coming back: identity must
+        # not depend on any param NAME. A rebalance and a swap are dedup'd by
+        # the same rule.
+        import inspect
+
+        from minotaur_subnet.harness import order_sampler
+
+        src = inspect.getsource(order_sampler._dedup_key)
+        body = src.split('"""')[-1]  # exclude the docstring's history note
+        for name in ("input_token", "output_token", "input_amount",
+                     "min_output_amount"):
+            assert name not in body, f"_dedup_key still names {name}"
+
+    def test_different_pair_or_direction_survive(self):
         def swap(oid, inp, out, amount):
             return _make_order(oid, params={
                 "input_token": inp, "output_token": out, "input_amount": amount,
             })
         orders = [
             swap("ord_1usdc", "0xUSDC", "0xTOK", "1000000"),
-            swap("ord_10usdc", "0xUSDC", "0xTOK", "10000000"),   # next decade
+            swap("ord_10usdc", "0xUSDC", "0xTOK", "10000000"),
             swap("ord_pair", "0xUSDC", "0xOTHER", "1000000"),    # different pair
             swap("ord_rev", "0xTOK", "0xUSDC", "1000000"),       # reverse direction
         ]
