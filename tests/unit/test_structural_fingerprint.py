@@ -144,6 +144,87 @@ class TestStructuralDedupClusters:
         assert len(clusters) == 1
 
 
+class TestStructuralCollapseEnforce:
+    """Enforce: select_rotation_slate seats <=1 submission per structural
+    fingerprint, so a distinct-actor fleet running identical code holds one
+    seat and the freed slots go to distinct code."""
+
+    def _actor_of(self, m=None):
+        f = lambda hk: (m or {}).get(hk, hk)  # noqa: E731 — each hk its own actor
+        f.source = "test"
+        return f
+
+    # seniority: sybils first-seen oldest (most senior) so they'd win the slate
+    # by wait-time — enforce must still collapse them despite that seniority.
+    _SEN = {"hkA": 0.0, "hkB": 0.0, "hkC": 0.0, "hkD": 100.0, "hkE": 100.0}
+
+    def _slate(self, subs, slots, collapse):
+        from minotaur_subnet.harness.rotation import select_rotation_slate
+        return select_rotation_slate(
+            subs, slots, {}, "r1", actor_of=self._actor_of(),
+            seen=self._SEN, now=1000.0, structural_collapse=collapse,
+        )
+
+    def test_enforce_collapses_cross_actor_cluster(self):
+        # 3 sybils (distinct actors, one fp, most senior) + 2 distinct miners.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"),
+            _sub("l1", "hkD", "LEGIT1"), _sub("l2", "hkE", "LEGIT2"),
+        ]
+        sel, _ = self._slate(subs, 3, collapse=True)
+        fps = [s.structural_fingerprint for s in sel]
+        assert len(sel) == 3
+        assert fps.count("SYB") == 1                     # collapsed to one
+        assert "LEGIT1" in fps and "LEGIT2" in fps       # freed slots -> distinct code
+
+    def test_observe_off_lets_fleet_capture_the_slate(self):
+        # Same input, collapse OFF: the senior fleet (distinct actors) takes all
+        # 3 slots — the capture enforce exists to stop.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"),
+            _sub("l1", "hkD", "LEGIT1"), _sub("l2", "hkE", "LEGIT2"),
+        ]
+        sel, _ = self._slate(subs, 3, collapse=False)
+        assert [s.structural_fingerprint for s in sel].count("SYB") == 3
+
+    def test_fingerprintless_never_collapse(self):
+        # None fp must not dedup — two unparseable repos are not "one sybil".
+        subs = [_sub("a", "hkA", None), _sub("b", "hkB", None), _sub("c", "hkC", "X")]
+        sel, _ = self._slate(subs, 3, collapse=True)
+        assert len(sel) == 3
+
+    def test_backfill_skips_seated_fingerprint(self):
+        # slots=2: seat 1 sybil + 1 legit, never a 2nd sybil from overflow.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"), _sub("l1", "hkD", "L"),
+        ]
+        sel, skip = self._slate(subs, 2, collapse=True)
+        fps = [s.structural_fingerprint for s in sel]
+        assert len(sel) == 2
+        assert fps.count("SYB") == 1 and "L" in fps
+        # the two non-seated sybils are the overflow (both SYB)
+        assert len(skip) == 2
+        assert all(s.structural_fingerprint == "SYB" for s in skip)
+
+    def test_same_actor_distinct_structure_not_over_collapsed(self):
+        # One actor, two DIFFERENT structures: structure dedup must not drop the
+        # second (actor dedup governs repeats, not structure identity).
+        m = {"hkA": "ck1", "hkB": "ck1"}
+        from minotaur_subnet.harness.rotation import select_rotation_slate
+        subs = [_sub("a", "hkA", "FP1"), _sub("b", "hkB", "FP2")]
+        f = lambda hk: m.get(hk, hk)  # noqa: E731
+        f.source = "test"
+        sel, _ = select_rotation_slate(
+            subs, 2, {}, "r1", actor_of=f, seen={}, now=1.0, structural_collapse=True,
+        )
+        # actor dedup seats one on the first pass, the other backfills (distinct
+        # fp, so structure-collapse doesn't block it).
+        assert len(sel) == 2
+
+
 class TestDedupModeGate:
     def test_default_off(self, monkeypatch):
         from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
