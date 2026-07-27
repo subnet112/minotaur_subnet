@@ -20,7 +20,7 @@ from minotaur_subnet.shared.types import (
     TriggerType,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot
-from minotaur_subnet.v3.contexts import SwapIntentContext
+from minotaur_subnet.v3.contexts import BaseIntentContext
 from minotaur_subnet.harness.snapshot import (
     SnapshotMeta,
     build_synthetic_snapshot,
@@ -261,20 +261,14 @@ class TestSyntheticSnapshot(unittest.TestCase):
             context_version="v3",
             policy_tier=PolicyTier.STRICT,
         )
-        state.typed_context = SwapIntentContext(
+        state.typed_context = BaseIntentContext(
             app_id="dex-app",
             intent_function="swap",
             chain_id=1,
             owner=state.owner,
             contract_address=state.contract_address,
             nonce=state.nonce,
-            raw_params=dict(state.raw_params),
-            input_token="0x" + "aa" * 20,
-            output_token="0x" + "bb" * 20,
-            input_amount=1000,
-            min_output_amount=900,
-            receiver=state.contract_address,
-            fee_tier=3000,
+            raw_params={**dict(state.raw_params), "input_token": "0x" + "aa" * 20, "output_token": "0x" + "bb" * 20, "input_amount": 1000, "min_output_amount": 900, "receiver": state.contract_address, "fee_tier": 3000},
         )
 
         serialized = _state_to_dict(state)
@@ -282,8 +276,11 @@ class TestSyntheticSnapshot(unittest.TestCase):
 
         self.assertEqual(reconstructed.context_version, "v3")
         self.assertEqual(reconstructed.policy_tier, PolicyTier.STRICT)
-        self.assertIsInstance(reconstructed.typed_context, SwapIntentContext)
-        self.assertEqual(reconstructed.typed_context.receiver, state.contract_address)
+        self.assertIsInstance(reconstructed.typed_context, BaseIntentContext)
+        self.assertEqual(
+            reconstructed.typed_context.raw_params["receiver"],
+            state.contract_address,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
