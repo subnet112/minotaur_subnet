@@ -12,17 +12,31 @@ GENESIS_HOTKEY = "__genesis__"
 # Epoch the genesis/bootstrap submission is keyed under in the submission store.
 GENESIS_EPOCH = 0
 
+# SN112 subnet-owner hotkey (public on-chain data) — the champion-burn target.
+# Chain resolution (lookup_subnet_owner_from_chain) is AUTHORITATIVE and picks up
+# an ownership transfer; this constant is the fleet-uniform LAST-RESORT fallback
+# so a node that lacks the SUBNET_OWNER_HOTKEY env AND can't reach the chain
+# still burns to the owner instead of failing open (paying the champion 100%).
+# It is deliberately a code constant, NOT an env default, for the same reason the
+# emission fraction is: a per-node env makes the burn diverge across the fleet
+# (a follower without the env would emit a different vector). Update ONLY on an
+# on-chain ownership transfer — chain resolution already covers the live case.
+SN112_OWNER_HOTKEY = "5E1ohAszHfhyQUEtz6mvCCkW4pYHsinPjxXS938fAZ2jFvCt"
+
 
 def get_subnet_owner_hotkey() -> str:
-    """Return the configured subnet-owner hotkey used for burn routing.
+    """Return the subnet-owner hotkey used for burn routing.
 
-    Reads from env (SUBNET_OWNER_HOTKEY / OWNER_HOTKEY). Returns "" if neither
-    is set. Callers should prefer ``lookup_subnet_owner_from_chain`` which
-    falls through to the on-chain authoritative value.
+    Env (SUBNET_OWNER_HOTKEY / OWNER_HOTKEY) first, then the fleet-uniform
+    ``SN112_OWNER_HOTKEY`` constant — so it NEVER returns "" and the burn target
+    can't silently vanish on a node missing the env. Callers that have a
+    subtensor should still prefer ``resolve_subnet_owner_hotkey`` (chain-primary,
+    authoritative on ownership transfer); this is the env/constant fallback.
     """
     return (
         os.environ.get("SUBNET_OWNER_HOTKEY", "").strip()
         or os.environ.get("OWNER_HOTKEY", "").strip()
+        or SN112_OWNER_HOTKEY
     )
 
 
@@ -143,17 +157,24 @@ def apply_champion_burn_ramp(
     fraction = min(1.0, max(0.0, float(fraction)))
     owner = (owner_hotkey or "").strip() or get_subnet_owner_hotkey()
     if not owner:
-        # Fail LOUD: with no resolvable owner we cannot burn, so the miners would
-        # receive the FULL emission instead of the intended share — the exact thing
-        # this ramp exists to prevent. Surface it so an operator sets the owner.
-        logger.warning(
-            "Champion burn ramp SKIPPED: no subnet owner resolved (set "
-            "SUBNET_OWNER_HOTKEY / OWNER_HOTKEY on the leader, or wire a chain "
-            "fallback) — %d miner(s) would receive the FULL emission share "
-            "instead of %.0f%%.",
-            len(miner_weights), fraction * 100,
+        if fraction >= 1.0:
+            # No burn intended (fraction 1.0 = full emission to miners): the
+            # owner is irrelevant, emit the miner weights unchanged.
+            return miner_weights
+        # FAIL CLOSED. A burn WAS intended but no owner resolved. Returning the
+        # miner weights unchanged would hand them the owner's share — the
+        # fail-OPEN bug where a champion silently pockets 100% for the epoch.
+        # Return {} so the emit path DEFERS (last good on-chain weights persist)
+        # rather than over-pay a miner on a transient owner-resolution failure.
+        # With get_subnet_owner_hotkey's constant fallback this is now
+        # essentially unreachable — kept as defence in depth.
+        logger.error(
+            "Champion burn ramp FAIL-CLOSED: no subnet owner resolved — "
+            "DEFERRING emit (keeping prior on-chain weights) rather than paying "
+            "%d miner(s) the full %.0f%% owner share.",
+            len(miner_weights), (1.0 - fraction) * 100,
         )
-        return miner_weights
+        return {}
     # Drop the owner from the miner set BEFORE ramping. The owner is the burn
     # target, not a candidate miner; leaving it in made the old `owner in
     # miner_weights` guard skip the ramp entirely, so the whole set kept summing
