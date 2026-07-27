@@ -63,6 +63,18 @@ def _safe_read(fn: Any, default: str = "?") -> Any:
         return default
 
 
+def _coerce_chain_id(value: Any) -> int | None:
+    """Best-effort chain-id → int, or None when absent/unparseable."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class SimulatorStateError(RuntimeError):
     """Raised when the anvil fork's baseline state cannot be restored.
 
@@ -2218,29 +2230,50 @@ class MultiChainSimulator:
             return SubtensorSimulator(sidecar_url=url, chain_id=chain_id)
         return AnvilSimulator(rpc_url=url, upstream_rpc_url=upstream, **kwargs)
 
-    def _get_simulator(self, plan: ExecutionPlan) -> AnvilSimulator | None:
-        """Resolve the correct simulator for a plan's chain.
+    def _get_simulator(
+        self, plan: ExecutionPlan, chain_id: Any = None,
+    ) -> AnvilSimulator | None:
+        """Resolve the correct simulator for a sim's chain.
 
-        Resolution order:
-        1. plan.metadata["chain_id"] — explicit hint
-        2. plan.interactions[0].chain_id — inferred from the plan itself
-        3. self.default_chain_id — last-resort (typically local testnet)
+        ``chain_id`` — when the caller passes it — is the request/scenario chain
+        that ALSO resolved the contract address, and is therefore AUTHORITATIVE:
+        the sub-simulator (hence the anvil fork) is selected for it, so the fork
+        always matches the chain the contract lives on. The plan's own chain
+        hint is used only to cross-check (a disagreement is a routing bug and is
+        logged) — it never overrides the request. This closes the split-brain
+        where the contract was resolved for one chain (``req.chain_id``) but the
+        anvil was picked from the plan, e.g. an Ethereum DEX contract simulated
+        on the Base fork → empty ``relayer()`` → silent zero.
+
+        Legacy callers pass no ``chain_id``; those keep the prior plan-derived
+        resolution with a default-chain fallback:
+        1. plan.metadata["chain_id"]  2. plan.interactions[0].chain_id
+        3. self.default_chain_id
         """
-        chain_id = plan.metadata.get("chain_id")
-        if chain_id is None and plan.interactions:
-            # Fallback: infer from the plan's first interaction. Callers
-            # (including /v1/apps/{id}/score) don't always stuff chain_id
-            # into metadata, but every Interaction carries it.
-            chain_id = plan.interactions[0].chain_id
-        if chain_id is None:
-            chain_id = self.default_chain_id
-        if isinstance(chain_id, str):
-            try:
-                chain_id = int(chain_id)
-            except ValueError:
-                chain_id = self.default_chain_id
+        plan_chain = plan.metadata.get("chain_id")
+        if plan_chain is None and plan.interactions:
+            # Every Interaction carries a chain_id even when metadata omits it.
+            plan_chain = plan.interactions[0].chain_id
+        plan_chain = _coerce_chain_id(plan_chain)
 
-        sim = self.simulators.get(chain_id)
+        authoritative = _coerce_chain_id(chain_id)
+        if authoritative is not None:
+            if plan_chain is not None and plan_chain != authoritative:
+                logger.warning(
+                    "sim chain mismatch: request/scenario chain=%s but plan "
+                    "hint chain=%s — routing to the authoritative request chain "
+                    "%s. (A plan mis-stamped with another chain would otherwise "
+                    "run this chain's contract on the wrong fork.)",
+                    authoritative, plan_chain, authoritative,
+                )
+            # Authoritative chain with no configured sub-sim: return None so the
+            # caller fails CLOSED with a clean "no simulator for chain X" error,
+            # rather than silently routing to the default/local fork — that
+            # silent misroute is exactly the footgun this method now prevents.
+            return self.simulators.get(authoritative)
+
+        target = plan_chain if plan_chain is not None else self.default_chain_id
+        sim = self.simulators.get(target)
         if sim is None:
             sim = self.simulators.get(self.default_chain_id)
         return sim
@@ -2293,16 +2326,28 @@ class MultiChainSimulator:
     async def simulate(
         self,
         plan: ExecutionPlan,
+        *,
+        chain_id: Any = None,
         **kwargs: Any,
     ) -> SimulationResult:
-        """Simulate a plan on the correct chain's Anvil fork."""
-        sim = self._get_simulator(plan)
+        """Simulate a plan on the correct chain's Anvil fork.
+
+        ``chain_id`` (the request/scenario chain that resolved the contract
+        address) is authoritative for chain selection — see
+        :meth:`_get_simulator`. It is consumed here and never forwarded to the
+        single-chain ``AnvilSimulator.simulate``.
+        """
+        sim = self._get_simulator(plan, chain_id=chain_id)
         if sim is None:
-            chain_id = plan.metadata.get("chain_id", self.default_chain_id)
+            resolved = (
+                _coerce_chain_id(chain_id)
+                if chain_id is not None
+                else plan.metadata.get("chain_id", self.default_chain_id)
+            )
             return SimulationResult(
                 success=False,
                 gas_used=0,
-                error=f"No simulator configured for chain {chain_id}",
+                error=f"No simulator configured for chain {resolved}",
             )
         return await sim.simulate(plan, **kwargs)
 

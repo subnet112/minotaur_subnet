@@ -132,6 +132,18 @@ class SimulationRunner:
                 if fee_seeds:
                     _seed_kwargs["fee_seeds"] = fee_seeds
 
+                # The ORDER's chain is authoritative for which anvil to run on —
+                # the same chain that resolved ``contract_address``. Pass it to a
+                # MultiChainSimulator so an ETH contract can never be simulated on
+                # the Base fork (the split-brain: contract from the request,
+                # anvil from the plan). Only a MultiChainSimulator accepts it;
+                # a single-chain AnvilSimulator's simulate() does not, so gate on
+                # the router method. Scoped to the single-chain branch — the
+                # cross-chain path routes per-leg and must not receive it.
+                _chain_kwargs: dict[str, Any] = {}
+                if hasattr(self.simulator, "_get_simulator"):
+                    _chain_kwargs["chain_id"] = getattr(order, "chain_id", None)
+
                 if is_cross_chain and hasattr(self.simulator, "simulate_cross_chain"):
                     simulation = await self.simulator.simulate_cross_chain(
                         plan,
@@ -150,6 +162,7 @@ class SimulationRunner:
                         token_balances=sim_token_balances,
                         fork_block=fork_block,
                         pin_only=pin_only,
+                        **_chain_kwargs,
                         **_seed_kwargs,
                     )
                     logger.info("[LOOP] simulation result: success=%s error=%s transfers=%s", simulation.success, simulation.error, len(simulation.token_transfers or []))
