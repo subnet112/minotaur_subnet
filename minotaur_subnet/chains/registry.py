@@ -152,7 +152,11 @@ _SPECS: tuple[ChainSpec, ...] = (
         sim_rpc_envs=("ETH_SIM_RPC_URL",),
         quote_sim_rpc_envs=("ETH_QUOTE_SIM_RPC_URL",),
         upstream_rpc_env="ETH_UPSTREAM_RPC_URL",
-        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH",),
+        # benchmark_rpc is the SOLVER-READ plane (block-pin proxy on prod, where
+        # BENCHMARK_ANVIL_RPC_ETH is set first so ANVIL_RPC_URL is never reached).
+        # It keeps ANVIL_RPC_URL as the local/test fallback — unlike the sim/live
+        # ladders above, which must not, per the note.
+        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
         check_rpc_envs=("ETH_RPC_URL",),
         proxy_upstream_envs=("ETH_RPC_URL", "ETH_UPSTREAM_RPC_URL"),
         boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL"),

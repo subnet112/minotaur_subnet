@@ -201,9 +201,11 @@ def test_chain1_ladders_never_leak_to_anvil_base(monkeypatch):
     # resolver must refuse it and return "" — never read Ethereum off a Base fork.
     _clear(monkeypatch)
     monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    # The SIM/live/read ladders must never leak to the Base anvil. (benchmark_rpc
+    # is the solver-read plane and deliberately keeps ANVIL_RPC_URL as its
+    # local/test fallback — excluded here.)
     for fn in (registry.live_rpc, registry.gas_rpc, registry.consensus_rpc,
-               registry.sim_rpc, registry.check_rpc, registry.boot_rpc,
-               registry.benchmark_rpc):
+               registry.sim_rpc, registry.check_rpc, registry.boot_rpc):
         assert fn(1) == "", f"{fn.__name__}(1) leaked to ANVIL_RPC_URL (Base)"
     # sanity: chain 31337 (local) still legitimately uses ANVIL_RPC_URL
     assert registry.sim_rpc(31337) == "http://anvil-base:8546"
