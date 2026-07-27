@@ -1855,6 +1855,9 @@ async def get_solver_queue(
     )
     from minotaur_subnet.harness.rotation import (
         RotationLedger,
+        absence_reset_seconds,
+        actor_evidence_map,
+        fold_reset,
         is_terminal_status,
         rotation_ledger_path,
         wait_ts,
@@ -1863,12 +1866,24 @@ async def get_solver_queue(
     ledger = RotationLedger(rotation_ledger_path())
     benched = ledger.load()
     seen = ledger.load_seen()
+    active = ledger.load_active()
     resolver = snapshot_resolver()
     now = time.time()
+    # Selection-truth seniority: absence resets folded into the benched anchor
+    # (fold_reset), exactly as the close-time slate selection sorts. The raw
+    # benched map still feeds last_benched_at so bench history stays honest.
+    benched_eff = fold_reset(benched, ledger.load_reset())
     actor_benched = (
-        actor_last_selected(benched, resolver) if resolver is not None else {}
+        actor_last_selected(benched_eff, resolver) if resolver is not None else {}
     )
     actor_seen = actor_first_seen(seen, resolver) if resolver is not None else {}
+    # Absence rule, read-time: an identity absent longer than the window will
+    # re-enter as a newcomer (the persisted reset lands at its return round),
+    # so DISPLAY the demotion now — otherwise a 24d-idle miner still shows at
+    # rank 1 while absent, which is exactly the lie this endpoint exists to
+    # avoid. Same evidence rule as the selection-side detection.
+    threshold = absence_reset_seconds()
+    evidence = actor_evidence_map(active, benched, seen, resolver)
     uid_by_hotkey = _hotkey_to_uid_map()
     # Fail-open like miner_uid: an unsynced/unwired metagraph must degrade
     # registered to null (indeterminate) — never mark live miners as relics.
@@ -1895,19 +1910,29 @@ async def get_solver_queue(
     entries: list[SolverQueueEntry] = []
     for hk in set(benched) | set(seen):
         actor = resolver(hk) if resolver is not None else None
+        waiting = (
+            wait_ts(actor, actor_benched, actor_seen, now)
+            if actor is not None
+            else wait_ts(hk, benched_eff, seen, now)
+        )
+        is_contending = hk in contending
+        expired = False
+        if threshold > 0 and not is_contending:
+            last_evidence = evidence.get(actor or hk, now)
+            if now - last_evidence > threshold:
+                expired = True
+                waiting = max(waiting, now)
         entries.append(SolverQueueEntry(
             hotkey=hk,
             miner_uid=uid_by_hotkey.get(hk),
             actor=actor,
             registered=(hk in uid_by_hotkey) if have_metagraph else None,
-            contending=hk in contending,
+            contending=is_contending,
             first_seen_at=seen.get(hk),
             last_benched_at=benched.get(hk),
-            waiting_since=(
-                wait_ts(actor, actor_benched, actor_seen, now)
-                if actor is not None
-                else wait_ts(hk, benched, seen, now)
-            ),
+            last_active_at=active.get(hk),
+            waiting_since=waiting,
+            seniority_expired=expired,
         ))
     # Seniority order. The hotkey tie-break is only for a stable listing — the
     # real per-round tie-break is the salted per-round shuffle (rotation_sort_key).
