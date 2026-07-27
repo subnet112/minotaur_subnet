@@ -358,3 +358,59 @@ improvements.
   worth it at step 3 or later.
 - Whether the `AWAITING_USER_DECISION` deadline should be user-configurable in
   the quote (longer window = later escrow deadline = longer worst-case refund).
+
+## 12. The adoption incentive: destination delivery reaches the app's scorer (2026-07-27)
+
+No solver emits a `CrossChainPlan` until doing so WINS benchmark cases, and
+nothing in `minotaur_subnet` may know what a swap is — the platform measures,
+the app prices. The mechanism is therefore split across that boundary:
+
+**Platform (app-agnostic).** The benchmark already measures
+`destination_delivered` / `destination_amount_source` (#1133, observe-only).
+Two additions make it creditable:
+
+1. *The measurement rides the sim into the scorer.* The same values persisted
+   on the benchmark row are attached to the `SimulationResult` handed to
+   `score_fn`, and `context.simulation` exposes them to the app's JS (decimal
+   strings — wei above 2^53 must never round-trip through a JS Number). One
+   computation feeds row and scorer; they cannot disagree. The fields are
+   absent everywhere but the benchmark path, so any scorer that ignores them
+   is bit-identical to before.
+2. *The solver shape became observable.* A solver's `bridge_requests` carry no
+   calldata, so its deposit could only measure as `"declared"` — its own
+   number, inflatable, hence never creditable, hence NO gradient. The
+   benchmark now synthesizes the same `transfer(_MOCK_BRIDGE_TARGET, amount)`
+   the mocking path produces (one shared encoder, `mock_bridge_deposit`) and
+   executes it in ONE simulation together with every preceding same-chain leg
+   (`bridge_execution_plan`): a swap-then-bridge journey carries its own
+   earnings to the deposit, and a declared amount the journey never earned
+   reverts. Both plan shapes now measure `"simulated"` on the same terms.
+
+**App (`dex_aggregator_scoring.js`, companion PR in minotaur-apps).** For an
+intent that names `dest_chain_id` (new manifest param, `in_signature:false` so
+the on-chain selector is untouched), the scorer redefines only
+`metadata.raw_output` — the benchmark adoption signal, never read on the live
+path: the measured destination delivery when provenance is `"simulated"`,
+otherwise `"0"`, including for any plan that ignored the requested chain.
+`score`/`valid` keep their exact single-chain semantics in every context, so
+live per-leg scoring and the follower's re-score are untouched. On a
+cross-chain corpus case, bridging-and-delivering now beats every same-chain
+answer, and an unproven claim beats nothing. That is the entire miner
+incentive.
+
+**Arming ladder (order is load-bearing):**
+
+1. Promote the platform exposure fleet-wide (`:stable`) — the app JS is
+   fleet-synced but platform code is not; an app reading a field only the
+   leader emits would split verdicts.
+2. Prove the #1133 exit criterion with `tools/destination_delivery_replay.py`:
+   same case file + same per-chain pins on leader and a follower must produce
+   byte-identical `destination_delivered`, intra- and cross-node.
+3. Update the app record (manifest + scorer) — one app-store mutation,
+   propagated by app-sync; pack hash flips with the record, so this is its own
+   step, never bundled.
+4. Seed cross-chain cases into the corpus (hash-critical, its own promote) and
+   drive live cross-chain `/quote` traffic so blind-spot capture keeps demand
+   fresh.
+5. Announce: point miners at the reference `_generate_cross_chain_plan` in
+   `minotaur-solver` HEAD.

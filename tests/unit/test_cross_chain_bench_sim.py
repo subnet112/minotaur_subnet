@@ -315,16 +315,91 @@ class TestBridgeDepositIsExecuted:
         ))
         assert (moved, source) == (0, "unfilled")
 
-    def test_no_calldata_falls_back_to_declared(self):
+    def test_no_calldata_synthesizes_the_deposit(self):
         import asyncio
-        # Solver shape: the compiler hasn't injected bridge calldata yet, so
-        # there is nothing to execute and the declaration is all there is.
+        # Solver shape: no bridge calldata, but token+amount are declared —
+        # the deposit is SYNTHESIZED and executed, so the amount is observed
+        # off the sim (here: the fake moved it all), never self-reported.
         leg = {**self._bridge_leg(), "interaction_indices": []}
+        chain_sim = _FakeChainSim(success=True, moved=AMOUNT)
+        moved, source = asyncio.run(
+            _multichain({1: chain_sim})._simulate_mocked_bridge(
+                _plan({"legs": [leg]}), leg, {},
+            ))
+        assert (moved, source) == (AMOUNT, "simulated")
+        executed = chain_sim.calls[0].interactions
+        assert len(executed) == 1
+        assert executed[0].call_data.startswith("0xa9059cbb")
+        assert executed[0].target == WETH_ETH
+
+    def test_synthesized_deposit_that_reverts_earns_nothing(self):
+        import asyncio
+        # A solver-shape declaration the journey never earned: the
+        # synthesized transfer reverts. Inflating the declaration now COSTS
+        # the credit instead of granting it.
+        leg = {**self._bridge_leg(), "interaction_indices": []}
+        mc = _multichain({1: _FakeChainSim(success=False)})
+        moved, source = asyncio.run(mc._simulate_mocked_bridge(
+            _plan({"legs": [leg]}), leg, {},
+        ))
+        assert (moved, source) == (0, "unfilled")
+
+    def test_nothing_to_synthesize_falls_back_to_declared(self):
+        import asyncio
+        # No calldata AND no token to transfer (e.g. a native-asset bridge):
+        # nothing executable to observe, so the declaration is all there is —
+        # and it stays LABELLED as such.
+        leg = {**self._bridge_leg(), "interaction_indices": [],
+               "token_in": ""}
         mc = _multichain({1: _FakeChainSim()})
         moved, source = asyncio.run(mc._simulate_mocked_bridge(
             _plan({"legs": [leg]}), leg, {},
         ))
         assert (moved, source) == (AMOUNT, "declared")
+
+    def test_preceding_same_chain_legs_run_before_the_deposit(self):
+        import asyncio
+        # Swap-then-bridge: the source leg's interactions must execute in the
+        # SAME simulation as the deposit, or an honest deposit reverts
+        # against the fork's seeded balances (simulate() is
+        # snapshot-isolated per call).
+        source_leg = {"leg_id": 0, "chain_id": 1, "type": "source",
+                      "interaction_indices": [0]}
+        bridge_leg = {**self._bridge_leg(), "leg_id": 1,
+                      "interaction_indices": [1]}
+        plan = _plan(
+            {"legs": [source_leg, bridge_leg]},
+            interactions=[_ix(1, "38ed1739"), _ix(1, "7b939232")],
+        )
+        chain_sim = _FakeChainSim(success=True, moved=AMOUNT)
+        moved, source = asyncio.run(
+            _multichain({1: chain_sim})._simulate_mocked_bridge(
+                plan, bridge_leg, {},
+            ))
+        assert (moved, source) == (AMOUNT, "simulated")
+        executed = chain_sim.calls[0].interactions
+        assert len(executed) == 2
+        # Source leg first, untouched; then the mocked deposit.
+        assert executed[0].call_data.startswith("0x38ed1739")
+        assert executed[1].call_data.startswith("0xa9059cbb")
+
+    def test_other_chain_legs_stay_out_of_the_deposit_sim(self):
+        import asyncio
+        # A destination leg (other chain) must not leak into the source-side
+        # journey.
+        dest_leg = {"leg_id": 0, "chain_id": 8453, "type": "source",
+                    "interaction_indices": [0]}
+        bridge_leg = {**self._bridge_leg(), "leg_id": 1,
+                      "interaction_indices": [1]}
+        plan = _plan(
+            {"legs": [dest_leg, bridge_leg]},
+            interactions=[_ix(8453), _ix(1, "7b939232")],
+        )
+        chain_sim = _FakeChainSim(success=True, moved=AMOUNT)
+        asyncio.run(_multichain({1: chain_sim})._simulate_mocked_bridge(
+            plan, bridge_leg, {},
+        ))
+        assert len(chain_sim.calls[0].interactions) == 1
 
     def test_bridge_calldata_is_mocked_before_execution(self):
         import asyncio
