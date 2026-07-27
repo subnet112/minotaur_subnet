@@ -26,7 +26,8 @@ def _ref_live_rpc(chain_id, env):
     if chain_id == 8453:
         return g("BASE_UPSTREAM_RPC_URL") or g("BASE_RPC_URL")
     if chain_id == 1:
-        return g("ETH_UPSTREAM_RPC_URL") or g("ETH_RPC_URL") or g("ANVIL_RPC_URL")
+        # ANVIL_RPC_URL (the Base anvil on prod) is NOT a chain-1 fallback.
+        return g("ETH_UPSTREAM_RPC_URL") or g("ETH_RPC_URL")
     if chain_id == 964:
         return (g("BITTENSOR_EVM_UPSTREAM_RPC_URL") or g("BITTENSOR_EVM_RPC_URL")
                 or g("BITTENSOR_EVM_FORK_RPC_URL"))
@@ -39,8 +40,9 @@ def _ref_gas_rpc(chain_id, env):
     if chain_id == 8453:
         return g("BASE_UPSTREAM_RPC_URL") or g("BASE_RPC_URL")
     if chain_id == 1:
+        # ANVIL_RPC_URL (the Base anvil on prod) is NOT a chain-1 fallback.
         return (g("ETH_UPSTREAM_RPC_URL") or g("ETHEREUM_RPC_URL")
-                or g("ETH_RPC_URL") or g("ANVIL_RPC_URL"))
+                or g("ETH_RPC_URL"))
     if chain_id == 964:
         return g("BITTENSOR_EVM_UPSTREAM_RPC_URL") or g("BITTENSOR_EVM_RPC_URL")
     return ""
@@ -62,6 +64,8 @@ def _ref_consensus_rpc(chain_id, env):
         u = g("ETH_UPSTREAM_RPC_URL")
         if u:
             return u
+        # chain 1 must NEVER fall to the generic ANVIL/BASE endpoint (Base leak).
+        return ""
     return g("ANVIL_RPC_URL") or g("BASE_RPC_URL") or "http://localhost:8545"
 
 
@@ -181,11 +185,28 @@ def test_boot_rpc_chain1_prefers_real_ethereum_rpc(monkeypatch):
     assert registry.boot_rpc(1) == "https://eth.example/v2/key"
 
 
-def test_boot_rpc_chain1_falls_back_to_anvil_for_local_dev(monkeypatch):
+def test_boot_rpc_chain1_never_leaks_to_anvil(monkeypatch):
+    # ANVIL_RPC_URL is the Base anvil on prod — chain 1 must NOT fall to it even
+    # when the ETH envs are missing (Ethereum requires explicit ETH_* envs; local
+    # dev/CI never runs chain 1: local_testnet supported_chains = [31337, 8453]).
     monkeypatch.delenv("ETHEREUM_RPC_URL", raising=False)
     monkeypatch.delenv("ETH_RPC_URL", raising=False)
-    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
-    assert registry.boot_rpc(1) == "http://localhost:8545"
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    assert registry.boot_rpc(1) == ""
+
+
+def test_chain1_ladders_never_leak_to_anvil_base(monkeypatch):
+    # The Base-anvil leak behind the DexAggregatorV2 relayer() UNRESOLVED
+    # incident: with ONLY ANVIL_RPC_URL set (= the Base anvil), every chain-1
+    # resolver must refuse it and return "" — never read Ethereum off a Base fork.
+    _clear(monkeypatch)
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    for fn in (registry.live_rpc, registry.gas_rpc, registry.consensus_rpc,
+               registry.sim_rpc, registry.check_rpc, registry.boot_rpc,
+               registry.benchmark_rpc):
+        assert fn(1) == "", f"{fn.__name__}(1) leaked to ANVIL_RPC_URL (Base)"
+    # sanity: chain 31337 (local) still legitimately uses ANVIL_RPC_URL
+    assert registry.sim_rpc(31337) == "http://anvil-base:8546"
 
 
 def test_boot_rpc_other_chains_unchanged(monkeypatch):

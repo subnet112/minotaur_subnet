@@ -135,24 +135,27 @@ _SPECS: tuple[ChainSpec, ...] = (
         rpc_env="ETHEREUM_RPC_URL",
         is_poa=False,
         explorer="https://etherscan.io",
-        live_rpc_envs=("ETH_UPSTREAM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
+        # NOTE: ``ANVIL_RPC_URL`` is DELIBERATELY ABSENT from every chain-1
+        # ladder. On production nodes ANVIL_RPC_URL is the *Base* anvil (misnamed
+        # legacy), so listing it here silently forked/read Ethereum against a
+        # Base node — no ETH pools, wrong/absent contracts, empty plans, zero
+        # quotes, and the DexAggregatorV2 relayer() UNRESOLVED incident. A
+        # chain's ladder must never contain another chain's endpoint. Ethereum
+        # requires its OWN explicit envs (ETH_*); local dev/CI never runs chain 1
+        # (local_testnet supported_chains = [31337, 8453]).
+        live_rpc_envs=("ETH_UPSTREAM_RPC_URL", "ETH_RPC_URL"),
         gas_rpc_envs=(
-            "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL",
+            "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL",
         ),
         consensus_rpc_envs=("ETH_UPSTREAM_RPC_URL",),
         consensus_public_fallback=None,
-        sim_rpc_envs=("ETH_SIM_RPC_URL", "ANVIL_RPC_URL"),
+        sim_rpc_envs=("ETH_SIM_RPC_URL",),
         quote_sim_rpc_envs=("ETH_QUOTE_SIM_RPC_URL",),
         upstream_rpc_env="ETH_UPSTREAM_RPC_URL",
-        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        check_rpc_envs=("ETH_RPC_URL", "ANVIL_RPC_URL"),
+        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH",),
+        check_rpc_envs=("ETH_RPC_URL",),
         proxy_upstream_envs=("ETH_RPC_URL", "ETH_UPSTREAM_RPC_URL"),
-        # The live solver plans chain-1 routes against this endpoint. On
-        # production nodes ANVIL_RPC_URL is the BASE anvil (misnamed legacy),
-        # so it must only be the local-dev fallback — booting the solver with
-        # chain 1 → Base anvil makes every chain-1 generate_plan come back
-        # empty (no Ethereum pools on a Base fork) and live /quote returns 0.
-        boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
+        boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL"),
         is_anchor=False,
         lookback_epochs=3,   # ~12s blocks: 3 epochs clears 12-conf by round open
         fee_floor_wei=33_000_000_000_000,
@@ -361,6 +364,12 @@ def consensus_rpc(chain_id: int) -> str:
             return u
         if s.consensus_public_fallback:
             return s.consensus_public_fallback
+        # The generic ANVIL/BASE fallback below is the LOCAL NODE (testnet/dev,
+        # where the local node IS the live chain). ANVIL_RPC_URL is the Base
+        # anvil on prod, so it must NEVER be handed to Ethereum (chain 1) — a
+        # cross-chain read. Fail loud (return "") for chain 1 instead.
+        if s.chain_id == 1:
+            return ""
     return (
         os.environ.get("ANVIL_RPC_URL", "").strip()
         or os.environ.get("BASE_RPC_URL", "").strip()
