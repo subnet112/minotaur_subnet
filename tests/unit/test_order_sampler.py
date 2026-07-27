@@ -318,3 +318,57 @@ class TestEmpty:
         store = _FakeAppStore(orders)
         sample = sample_historical_orders(store, "round-1", n_per_chain=10)
         assert len(sample) == 3
+
+
+class TestCoreNamesNoAppSpecificABI:
+    """Core must not carry any single app's ABI. The selector map that lived in
+    order_processor ({swap, execute, buy, rebalance} -> canonical signatures)
+    was one app's contract baked into a path every app goes through."""
+
+    def test_order_processor_has_no_hardcoded_signature_map(self):
+        import inspect
+
+        from minotaur_subnet.blockloop import order_processor
+
+        src = inspect.getsource(order_processor)
+        for sig in ("swap(address,address,uint256,uint256,address)",
+                    "buy(address,address,uint256,uint256,address)",
+                    "rebalance(address[],uint256[],address)"):
+            assert sig not in src, f"order_processor still hardcodes {sig}"
+
+    def test_selector_comes_from_the_manifest(self):
+        from minotaur_subnet.blockloop.order_processor import OrderProcessor
+        from eth_hash.auto import keccak
+
+        class FakeApp:
+            manifest = {
+                "intent_functions": [{
+                    "name": "swap",
+                    "params": {
+                        "input_token": {"type": "address", "source": "user"},
+                        "output_token": {"type": "address", "source": "user"},
+                        "input_amount": {"type": "uint256", "source": "user"},
+                        "min_output_amount": {"type": "uint256", "source": "quote"},
+                        "receiver": {"type": "address", "source": "system"},
+                    },
+                }],
+            }
+
+        class FakeStore:
+            def get_app(self, app_id): return FakeApp()
+
+        proc = OrderProcessor.__new__(OrderProcessor)
+        proc.app_store = FakeStore()
+        # Same selector the deleted map produced for this signature.
+        expected = keccak(b"swap(address,address,uint256,uint256,address)")[:4].hex()
+        assert proc._selector_from_manifest("app-1", "swap") == expected
+
+    def test_unknown_intent_returns_none_rather_than_guessing(self):
+        from minotaur_subnet.blockloop.order_processor import OrderProcessor
+
+        class FakeStore:
+            def get_app(self, app_id): return None
+
+        proc = OrderProcessor.__new__(OrderProcessor)
+        proc.app_store = FakeStore()
+        assert proc._selector_from_manifest("app-1", "whatever") is None
