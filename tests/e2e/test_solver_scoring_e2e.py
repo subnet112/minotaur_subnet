@@ -100,8 +100,7 @@ def test_snapshot():
         block_number=1,
         timestamp=int(time.time()),
         prices={"ETH/USD": 2000.0, "USDC/USD": 1.0},
-        dex_config={},
-    )
+            )
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────
