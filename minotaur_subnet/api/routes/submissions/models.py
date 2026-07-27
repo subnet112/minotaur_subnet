@@ -295,10 +295,21 @@ class SolverQueueEntry(BaseModel):
     # have benched (that is what waiting_since aggregates).
     first_seen_at: float | None = None
     last_benched_at: float | None = None
+    # Last submission activity for this hotkey (rotation ledger `active` map,
+    # store-backfilled). null = no activity recorded yet. Render idle time
+    # from THIS, not waiting_since.
+    last_active_at: float | None = None
     # The seniority clock the next slate selection will sort by — the ACTOR's
-    # wait_ts (max last-bench over its hotkeys, else min first-seen): LOWER =
-    # waiting longer = seated sooner. See harness/rotation.wait_ts.
+    # wait_ts (max last-bench over its hotkeys, else min first-seen), with
+    # absence resets folded in AND, for identities absent longer than the
+    # reset window, the hypothetical return demotion applied (= now): what
+    # selection WOULD use if they submitted right now. LOWER = waiting longer
+    # = seated sooner. See harness/rotation.wait_ts / absence_reset_seconds.
     waiting_since: float = 0.0
+    # True when this entry's accrued seniority has lapsed under the absence
+    # rule (last activity older than the reset window): on return it re-enters
+    # as a newcomer. Sorts to the BACK of the queue accordingly.
+    seniority_expired: bool = False
     # 1-based dense rank over distinct actors in seniority order (an actor's
     # hotkeys share one rank — the slate soft-dedups per actor). Ranked over
     # actors with >= 1 REGISTERED hotkey only, so deregistered relics don't

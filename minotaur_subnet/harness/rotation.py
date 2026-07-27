@@ -93,6 +93,72 @@ def rotation_ledger_path() -> str:
     return os.path.join(base or ".", "solver_rotation.json")
 
 
+def absence_reset_seconds() -> float:
+    """Absence window after which accrued seniority is forfeited (seconds).
+
+    ``SOLVER_ROTATION_ABSENCE_RESET_SECONDS``; code default 4 days, ``0``
+    disables. Seniority must be EARNED BY PRESENCE: a miner idle 24 days used
+    to re-enter at the FRONT of the queue (its wait clock kept aging while it
+    was gone), out-senioring everyone actively rotating. With this window, an
+    identity whose last submission activity is older than the threshold
+    re-enters as a NEWCOMER (clock = return time) — the same junior-ing the
+    fresh-mint rule applies, extended to lapsed identities. The discriminator
+    is ACTIVITY, not clock age: a continuously-submitting miner merely starved
+    by capacity (233h waits were real under the 3-seat slate) keeps its full
+    seniority. Default lives in code so a leader failover keeps the guard.
+    """
+    raw = os.environ.get("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", "").strip()
+    try:
+        return float(raw) if raw else 4 * 86400.0
+    except ValueError:
+        return 4 * 86400.0
+
+
+def fold_reset(
+    benched: dict[str, float],
+    reset: dict[str, float],
+) -> dict[str, float]:
+    """Fold absence-reset stamps into the benched map (max-merge) — PURE.
+
+    A reset acts like a phantom bench at the return time: :func:`wait_ts`
+    prefers the benched anchor when present, so max-merging the reset there
+    makes the returner exactly as junior as someone benched at that moment —
+    without corrupting the honest on-disk ``benched`` map (``last_benched_at``
+    display stays real). Works at both hotkey level and after the MAX actor
+    aggregation (:func:`actor.actor_last_selected` preserves the fold).
+    """
+    if not reset:
+        return benched
+    out = dict(benched)
+    for k, ts in reset.items():
+        if ts > out.get(k, 0.0):
+            out[k] = ts
+    return out
+
+
+def actor_evidence_map(
+    active: dict[str, float],
+    benched: dict[str, float],
+    seen: dict[str, float],
+    actor_of: Any = None,
+) -> dict[str, float]:
+    """Last evidence of life per actor — PURE, shared by the absence-reset
+    detection and the queue endpoint's display so the two can never drift.
+
+    Per hotkey: submission activity where known, else any ledger trace
+    (bench / first-seen). Per actor: MAX over ALL its hotkeys — a fleet is
+    absent only if all its identities were (one active sibling keeps the
+    whole actor's clock alive, consistent with shared actor seniority).
+    """
+    out: dict[str, float] = {}
+    for hk in set(active) | set(benched) | set(seen):
+        ev = active.get(hk, 0.0) or max(benched.get(hk, 0.0), seen.get(hk, 0.0))
+        actor = (actor_of(hk) if actor_of is not None else hk) or hk
+        if ev > out.get(actor, 0.0):
+            out[actor] = ev
+    return out
+
+
 def wait_ts(
     key: str,
     benched: dict[str, float],
@@ -332,20 +398,31 @@ class RotationLedger:
     def __init__(self, path: str) -> None:
         self._path = str(path)
 
-    def _load_raw(self) -> tuple[dict[str, float], dict[str, float]]:
+    def _load_raw(
+        self,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+        """(benched, seen, active, reset) — v3 on-disk shape.
+
+        ``active`` = last submission activity per hotkey (max-write, stamped
+        every rotation pass); ``reset`` = absence-reset stamps (max-write, the
+        "your clock restarted here" record — folded into benched at READ time
+        via :func:`fold_reset`, never mutating the honest bench history).
+        v2 files ({benched, seen}) load with empty active/reset; legacy flat
+        files load as before.
+        """
         try:
             with open(self._path) as f:
                 raw = json.load(f)
         except FileNotFoundError:
-            return {}, {}
+            return {}, {}, {}, {}
         except Exception:
             logger.warning(
                 "rotation ledger unreadable (%s) — treating all miners as never-benched",
                 self._path, exc_info=True,
             )
-            return {}, {}
+            return {}, {}, {}, {}
         if not isinstance(raw, dict):
-            return {}, {}
+            return {}, {}, {}, {}
 
         def _floats(d: Any) -> dict[str, float]:
             out: dict[str, float] = {}
@@ -358,11 +435,16 @@ class RotationLedger:
             return out
 
         if isinstance(raw.get("benched"), dict) or isinstance(raw.get("seen"), dict):
-            return _floats(raw.get("benched")), _floats(raw.get("seen"))
+            return (
+                _floats(raw.get("benched")),
+                _floats(raw.get("seen")),
+                _floats(raw.get("active")),
+                _floats(raw.get("reset")),
+            )
         # Legacy flat file: {hotkey: last_benched_ts}. Seed `seen` from it so
         # miners with history aren't demoted to brand-new on the first v2 write.
         benched = _floats(raw)
-        return benched, dict(benched)
+        return benched, dict(benched), {}, {}
 
     def load(self) -> dict[str, float]:
         """The benched map ``{hotkey: last_selected_ts}`` (name kept for the
@@ -373,14 +455,31 @@ class RotationLedger:
         """The first-seen map ``{hotkey: first_seen_ts}``."""
         return self._load_raw()[1]
 
-    def _persist(self, benched: dict[str, float], seen: dict[str, float]) -> None:
+    def load_active(self) -> dict[str, float]:
+        """The activity map ``{hotkey: last_submission_created_at}``."""
+        return self._load_raw()[2]
+
+    def load_reset(self) -> dict[str, float]:
+        """The absence-reset map ``{hotkey: clock_restarted_at}``."""
+        return self._load_raw()[3]
+
+    def _persist(
+        self,
+        benched: dict[str, float],
+        seen: dict[str, float],
+        active: dict[str, float],
+        reset: dict[str, float],
+    ) -> None:
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=os.path.dirname(self._path) or ".", prefix=".rotation-",
             )
             with os.fdopen(fd, "w") as f:
-                json.dump({"benched": benched, "seen": seen}, f)
+                json.dump(
+                    {"benched": benched, "seen": seen, "active": active, "reset": reset},
+                    f,
+                )
             os.replace(tmp, self._path)
             tmp = None
         except Exception:
@@ -393,12 +492,12 @@ class RotationLedger:
                     pass
 
     def mark_selected(self, hotkeys: list[str], ts: float) -> None:
-        benched, seen = self._load_raw()
+        benched, seen, active, reset = self._load_raw()
         for hk in hotkeys:
             if hk:
                 benched[hk] = float(ts)
                 seen.setdefault(hk, float(ts))  # a benched hotkey has been seen
-        self._persist(benched, seen)
+        self._persist(benched, seen, active, reset)
 
     def mark_seen(self, seen_at: Mapping[str, float]) -> None:
         """Anchor first-seen for ``{hotkey: earliest created_at}`` — min-write.
@@ -408,7 +507,7 @@ class RotationLedger:
         first appearance: re-submission can't refresh it, and a store-history
         backfill (migration) can only restore seniority, not shrink it.
         """
-        benched, seen = self._load_raw()
+        benched, seen, active, reset = self._load_raw()
         changed = False
         for hk, ts in seen_at.items():
             if not hk:
@@ -419,7 +518,42 @@ class RotationLedger:
                 seen[hk] = ts
                 changed = True
         if changed:
-            self._persist(benched, seen)
+            self._persist(benched, seen, active, reset)
+
+    def mark_active(self, active_at: Mapping[str, float]) -> None:
+        """Record submission activity ``{hotkey: created_at}`` — max-write.
+
+        The activity anchor the absence rule measures gaps against. Max-write:
+        activity can only move FORWARD; a stale backfill can never shrink a
+        fresher record.
+        """
+        benched, seen, active, reset = self._load_raw()
+        changed = False
+        for hk, ts in active_at.items():
+            if not hk:
+                continue
+            ts = float(ts)
+            if ts > active.get(hk, 0.0):
+                active[hk] = ts
+                changed = True
+        if changed:
+            self._persist(benched, seen, active, reset)
+
+    def mark_reset(self, hotkeys: Iterable[str], ts: float) -> None:
+        """Stamp absence resets ``hotkey -> ts`` — max-write.
+
+        Persisted so the demotion STICKS: without it a returner would be
+        junior for exactly one round and then jump back to the front on its
+        stale bench anchor next round.
+        """
+        benched, seen, active, reset = self._load_raw()
+        changed = False
+        for hk in hotkeys:
+            if hk and float(ts) > reset.get(hk, 0.0):
+                reset[hk] = float(ts)
+                changed = True
+        if changed:
+            self._persist(benched, seen, active, reset)
 
 
 def _notify_skipped_in_background(
@@ -550,14 +684,88 @@ def apply_rotation_slate(
                 "(round-scope created_at used)", exc_info=True,
             )
     ledger.mark_seen(earliest)
+
+    # ── Absence reset: seniority is earned by presence ───────────────────────
+    # An identity whose last submission activity is older than the window
+    # re-enters as a NEWCOMER: without this, a miner idle for weeks kept aging
+    # its wait clock and re-entered at the FRONT of the queue, out-senioring
+    # everyone actively rotating (observed 2026-07-26: 24d-idle at rank 1).
+    # Keyed on ACTIVITY, never clock age — a continuously-submitting miner
+    # merely starved by capacity keeps full seniority. Detection runs BEFORE
+    # this round's activity stamp (a returner's fresh submission must not mask
+    # the gap it returned from) and the reset is PERSISTED (mark_reset) so the
+    # demotion sticks beyond the return round. Actor-level: a fleet is absent
+    # only if ALL its identities were (one active sibling keeps the whole
+    # actor's clock alive — consistent with shared actor seniority).
+    threshold = absence_reset_seconds()
+    if threshold > 0 and candidates:
+        active = ledger.load_active()
+        # Backfill prior activity from store history (excluding THIS round) so
+        # the first post-upgrade pass never mistakes a starved-but-active miner
+        # for a returning absentee. Best-effort, max-write semantics.
+        history_latest = getattr(sub_store, "latest_created_at_by_hotkey", None)
+        if callable(history_latest):
+            try:
+                for hk, ts in (history_latest(exclude_round_id=round_id) or {}).items():
+                    if ts and float(ts) > active.get(hk, 0.0):
+                        active[hk] = float(ts)
+            except Exception:
+                logger.warning(
+                    "rotation: store history for activity backfill failed "
+                    "(ledger activity only)", exc_info=True,
+                )
+        actor_evidence = actor_evidence_map(
+            active, ledger.load(), ledger.load_seen(), actor_of,
+        )
+
+        def _actor(hk: str) -> str:
+            return (actor_of(hk) if actor_of is not None else hk) or hk
+
+        to_reset: list[str] = []
+        lapsed: set[str] = set()
+        for s in candidates:
+            hk = getattr(s, "hotkey", "") or ""
+            if not hk:
+                continue
+            a = _actor(hk)
+            # Unknown actor (no trace at all) => genuinely new => already a
+            # newcomer via first-seen; no reset needed.
+            evidence = actor_evidence.get(a, now_ts)
+            if now_ts - evidence > threshold:
+                to_reset.append(hk)
+                lapsed.add(a)
+        if to_reset:
+            ledger.mark_reset(to_reset, now_ts)
+            logger.info(
+                "rotation %s: absence reset for %d hotkey(s) / %d actor(s) — "
+                "last activity > %.0fs ago; re-entering as newcomers",
+                round_id, len(to_reset), len(lapsed), threshold,
+            )
+    # Stamp this round's activity AFTER detection (see above). Swept over ALL
+    # of the round's submissions, terminal included — same rationale as
+    # mark_seen: losing the build race is still presence.
+    activity: dict[str, float] = {}
+    for s in subs:
+        hk = getattr(s, "hotkey", "") or ""
+        if not hk:
+            continue
+        try:
+            created = float(getattr(s, "created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        created = created or now_ts
+        if created > activity.get(hk, 0.0):
+            activity[hk] = created
+    ledger.mark_active(activity)
+
     # Structural-dedup mode (env-gated, default OFF). In ``enforce`` the slate
     # collapses cross-actor structural clusters to one slot; ``observe`` only
     # logs. Read before selection so ``enforce`` feeds select_rotation_slate.
     from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
     _dedup_mode = structural_dedup_mode()
     selected, skipped = select_rotation_slate(
-        candidates, slots, ledger.load(), round_id, actor_of=actor_of,
-        seen=ledger.load_seen(), now=now_ts,
+        candidates, slots, fold_reset(ledger.load(), ledger.load_reset()),
+        round_id, actor_of=actor_of, seen=ledger.load_seen(), now=now_ts,
         structural_collapse=(_dedup_mode == "enforce"),
     )
     if actor_of is not None:
