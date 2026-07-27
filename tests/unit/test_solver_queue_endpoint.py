@@ -35,6 +35,10 @@ def ledger_path(tmp_path, monkeypatch):
     path = tmp_path / "solver_rotation.json"
     monkeypatch.setenv("SOLVER_ROTATION_LEDGER_PATH", str(path))
     monkeypatch.delenv("SOLVER_ACTOR_KEY", raising=False)
+    # The absence rule is off by default in these tests: the fixtures use tiny
+    # epoch-adjacent timestamps that would ALL read as >4d-lapsed against real
+    # wall-clock now. The absence-specific tests re-enable it explicitly.
+    monkeypatch.setenv("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", "0")
     monkeypatch.setattr(routes_mod, "_hotkey_to_uid_map", lambda: {})
     monkeypatch.setattr(
         routes_mod, "get_round_store",
@@ -212,6 +216,72 @@ def test_contending_lookup_failure_degrades(ledger_path, monkeypatch):
     # Best-effort: degrade to "nobody contending", never a 500.
     assert resp.round_id is None and resp.contending_count == 0
     assert resp.queue[0].contending is False and resp.queue[0].rank == 1
+
+
+# ── absence rule: lapsed seniority demotes to the back of the queue ──────────
+
+def test_lapsed_absentee_demoted_to_newcomer(ledger_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setenv("SOLVER_ACTOR_KEY", "hotkey")
+    monkeypatch.setenv("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", str(4 * 86400))
+    now = _time.time()
+    # hkDormant benched 24d ago with no activity since; hkFresh benched 1h ago.
+    _write_ledger(
+        ledger_path,
+        benched={"hkDormant": now - 24 * 86400, "hkFresh": now - 3600},
+        seen={"hkDormant": now - 30 * 86400, "hkFresh": now - 86400},
+    )
+    resp = _queue()
+    by = {e.hotkey: e for e in resp.queue}
+    # Absent > window: seniority lapsed — displayed as what selection WOULD
+    # do on return (newcomer), so the 24d-idle entry sorts BEHIND the fresh one.
+    assert by["hkDormant"].seniority_expired is True
+    assert by["hkDormant"].waiting_since >= now - 1
+    assert by["hkFresh"].seniority_expired is False
+    assert [e.hotkey for e in resp.queue] == ["hkFresh", "hkDormant"]
+    assert by["hkFresh"].rank == 1 and by["hkDormant"].rank == 2
+    # Bench history stays honest — demotion never rewrites last_benched_at.
+    assert by["hkDormant"].last_benched_at == pytest.approx(now - 24 * 86400)
+
+
+def test_contending_entry_never_demoted(ledger_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setenv("SOLVER_ACTOR_KEY", "hotkey")
+    monkeypatch.setenv("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", str(4 * 86400))
+    monkeypatch.setattr(
+        routes_mod, "get_round_store",
+        lambda: SimpleNamespace(
+            get_current_round=lambda: SimpleNamespace(round_id="r-1"),
+        ),
+    )
+    monkeypatch.setattr(
+        routes_mod, "get_store",
+        lambda: SimpleNamespace(list_by_round=lambda rid: [
+            SimpleNamespace(hotkey="hkBack", status="benchmarking"),
+        ]),
+    )
+    now = _time.time()
+    _write_ledger(ledger_path, benched={"hkBack": now - 24 * 86400}, seen={})
+    resp = _queue()
+    e = resp.queue[0]
+    # Present in the round = not absent: the entry keeps its (stale) clock for
+    # display; the selection-side reset lands at close.
+    assert e.contending is True and e.seniority_expired is False
+    assert e.waiting_since == pytest.approx(now - 24 * 86400)
+
+
+def test_absence_rule_killswitch_off(ledger_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setenv("SOLVER_ACTOR_KEY", "hotkey")
+    monkeypatch.setenv("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", "0")
+    now = _time.time()
+    _write_ledger(ledger_path, benched={"hkDormant": now - 24 * 86400}, seen={})
+    resp = _queue()
+    assert resp.queue[0].seniority_expired is False
+    assert resp.queue[0].waiting_since == pytest.approx(now - 24 * 86400)
 
 
 # ── round responses: benched_slate + incumbent_hotkey exposure ───────────────

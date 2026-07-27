@@ -54,6 +54,15 @@ from minotaur_subnet.simulator.revert_decoder import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_read(fn: Any, default: str = "?") -> Any:
+    """Best-effort read for diagnostics — a failing probe must never mask the
+    original error it is trying to explain."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return default
+
+
 class SimulatorStateError(RuntimeError):
     """Raised when the anvil fork's baseline state cannot be restored.
 
@@ -779,6 +788,29 @@ class AnvilSimulator:
                 "to": target,
                 "data": "0x" + relayer_sig.hex(),
             })
+            # An empty (or too-short) return means relayer() didn't resolve at
+            # THIS fork state — e.g. the contract has no code at this block
+            # (fork pinned/forked below the deploy block) or the address is on
+            # the wrong chain's fork. Web3.to_checksum_address("0x") would then
+            # raise a cryptic ValueError. Fail closed with a DIAGNOSABLE log
+            # (chain / fork block / code length) and return None ("unresolved",
+            # not scored) so callers skip the probe cleanly instead of throwing.
+            if len(relayer_result) < 20:
+                chain_id = _safe_read(lambda: self.w3.eth.chain_id)
+                fork_block = _safe_read(lambda: self.w3.eth.block_number)
+                code_len = _safe_read(lambda: len(self.w3.eth.get_code(target)))
+                logger.warning(
+                    "scoreIntent: relayer() UNRESOLVED for %s — empty call "
+                    "return (chain=%s fork_block=%s contract_code_len=%s); "
+                    "skipping sim (unresolved, not scored)",
+                    target, chain_id, fork_block, code_len,
+                )
+                print(
+                    f"[SIM] relayer() UNRESOLVED for {target} chain={chain_id} "
+                    f"fork_block={fork_block} code_len={code_len}",
+                    flush=True,
+                )
+                return None
             relayer_addr = Web3.to_checksum_address(
                 "0x" + relayer_result[-20:].hex()
             )
