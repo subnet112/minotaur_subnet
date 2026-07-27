@@ -1475,12 +1475,23 @@ async def score_plan(
 
     if _simulator is not None:
         try:
+            # ``chain_id`` (resolved above, same chain as contract_address) is
+            # authoritative for anvil selection. plan.metadata.setdefault above
+            # can't fix a plan already mis-stamped with another chain, so pass
+            # it explicitly — a MultiChainSimulator routes by it and never runs
+            # this contract on another chain's fork.
+            _chain_kwargs = (
+                {"chain_id": chain_id}
+                if hasattr(_simulator, "_get_simulator")
+                else {}
+            )
             simulation = await _simulator.simulate(
                 plan,
                 contract_address=contract_address or None,
                 intent_order=intent_order,
                 token_balances=token_balances,
                 fork_block=body.fork_block,
+                **_chain_kwargs,
             )
             simulation_mode = "anvil"
         except Exception as exc:

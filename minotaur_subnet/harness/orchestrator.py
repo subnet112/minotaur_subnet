@@ -1758,12 +1758,23 @@ async def _process_scenario(
                         # cross-chain plan is MEASURED rather than fail-closed
                         # to 0. No-op (same object) for single-chain plans.
                         sim_plan = _mock_bridge_for_benchmark(plan, state)
+                        # The scenario's chain (state.chain_id) is authoritative
+                        # for anvil selection — it also resolved contract_address
+                        # and fork_block above — so a plan mis-stamped with
+                        # another chain can't run this contract on the wrong fork.
+                        # Only a MultiChainSimulator consumes chain_id.
+                        _chain_kwargs = (
+                            {"chain_id": getattr(state, "chain_id", None)}
+                            if hasattr(simulator, "_get_simulator")
+                            else {}
+                        )
                         sim = await simulator.simulate(
                             sim_plan,
                             contract_address=state.contract_address if state else None,
                             intent_order=intent_order,
                             token_balances=token_balances,
                             fork_block=fork_block,
+                            **_chain_kwargs,
                             # BENCHMARK-ONLY: run the GasMeter probe so rows
                             # carry pre-refund metered gas. This is THE only
                             # call site that sets it — the live rail (order
