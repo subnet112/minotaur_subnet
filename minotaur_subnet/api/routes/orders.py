@@ -38,6 +38,27 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+class _SkipQuoteCapture(Exception):
+    """Raised to abandon quote-case capture DELIBERATELY (not a failure).
+
+    Capture is fail-closed: a quote whose params the app does not declare is
+    not stored, because storing the declared subset would silently drop the
+    trade descriptor (see order_sampler.quote_case_params).
+    """
+
+
+def _manifest_for_quote(app_id: str) -> dict | None:
+    """The app's manifest for quote-case capture; None on any lookup problem
+    (capture then skips, logged — it must never fail a quote)."""
+    if _app_store is None:
+        return None
+    try:
+        manifest = getattr(_app_store.get_app(app_id), "manifest", None)
+    except Exception:  # noqa: BLE001
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
 # Leader-mode detection (PR-2, audit H5): third-party follower validators
 # set ENABLE_SOLVER_ROUND_COORDINATOR=0 in their compose (canonical
 # follower-mode flag). On those nodes, POST /v1/apps/{id}/orders MUST
@@ -1894,7 +1915,7 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     #
     # Identity/derived params (receiver, intent_params_hex, permit, …) are stripped
     # before storage: quote cases are served on the PUBLIC /v1/quotes, so only the
-    # trade descriptor is retained. See QUOTE_PARAM_STRIP_FIELDS.
+    # trade descriptor is retained. See order_sampler.quote_case_params.
     if (
         _IS_LEADER_NODE
         and s is not None
@@ -1903,7 +1924,7 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     ):
         try:
             from minotaur_subnet.harness.order_sampler import (
-                QUOTE_PARAM_STRIP_FIELDS,
+                quote_case_params,
                 quote_case_id,
             )
             # ROUND ANCHOR (Phase-2): stamp the quote with the CURRENT round's
@@ -1922,10 +1943,19 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
             if _cur_epoch is None:
                 logger.debug("quote-case capture skipped: no current round to anchor")
             else:
-                _q_params = {
-                    k: v for k, v in (req.params or {}).items()
-                    if k not in QUOTE_PARAM_STRIP_FIELDS
-                }
+                # ALLOWLIST: store exactly the params the app declares
+                # source=user. Fails closed — a quote whose params the app
+                # does not declare is not stored at all, because keeping the
+                # declared subset would silently drop the trade descriptor.
+                _q_params, _q_why = quote_case_params(
+                    _manifest_for_quote(app_id), req.intent_function, req.params,
+                )
+                if _q_params is None:
+                    logger.info(
+                        "quote-case capture skipped for %s (%s): %s",
+                        app_id, req.intent_function, _q_why,
+                    )
+                    raise _SkipQuoteCapture
                 _q_id = quote_case_id(
                     app_id, req.chain_id, req.intent_function, _q_params,
                 )
@@ -1959,6 +1989,8 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                         "captured_opened_epoch": int(_cur_epoch),
                     })
                 _maybe_prune_quotes(s, int(_cur_epoch))
+        except _SkipQuoteCapture:
+            pass          # deliberate, already logged at info above
         except Exception:
             logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
 

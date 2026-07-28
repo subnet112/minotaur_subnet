@@ -548,3 +548,87 @@ class TestQuoteRetirementExclusion:
         store = _RetiringQuoteStore(AppStatus.RETIRED)
         # RETIRED is epoch-independent → dropped even well before any cutover.
         assert self._sampled_ids(store, 999) == []
+
+
+class TestQuoteCaseAllowlist:
+    """Stored quote params are an app-declared ALLOWLIST, not a denylist.
+
+    The denylist it replaces carried its own warning: "a denylist can miss a
+    novel identity key". Measured against the live corpus before shipping —
+    12 of 2372 stored quotes would change, and the shape of those 12 drove
+    the fail-closed design below.
+    """
+
+    MANIFEST = {"intent_functions": [{
+        "name": "swap",
+        "params": {
+            "input_token": {"type": "address", "source": "user"},
+            "output_token": {"type": "address", "source": "user"},
+            "input_amount": {"type": "uint256", "source": "user"},
+            "min_output_amount": {"type": "uint256", "source": "quote"},
+            "receiver": {"type": "address", "source": "system"},
+            "unwrap_output": {"type": "bool", "source": "system"},
+        },
+    }]}
+
+    def _call(self, params, manifest=None, fn="swap"):
+        from minotaur_subnet.harness.order_sampler import quote_case_params
+        return quote_case_params(
+            self.MANIFEST if manifest is None else manifest, fn, params,
+        )
+
+    def test_keeps_only_user_declared_params(self):
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "min_output_amount": "9",       # source=quote  -> dropped
+            "receiver": "0xUSER",           # source=system -> dropped
+        })
+        assert why == "ok"
+        assert kept == {"input_token": "0xA", "output_token": "0xB",
+                        "input_amount": "10"}
+
+    def test_system_flag_is_not_part_of_the_trade(self):
+        # unwrap_output is source=system. It was previously STORED (it appears
+        # in none of the three denylist sets), which is why quotes differing
+        # only by unwrap_output=False read as distinct demand.
+        kept, _ = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "unwrap_output": False,
+        })
+        assert "unwrap_output" not in kept
+
+    def test_novel_identity_key_cannot_leak(self):
+        # The exact hole the denylist's own comment warned about: a key it
+        # never heard of reaching a public endpoint by omission.
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "delegate": "0xSECRET",
+        })
+        assert kept is None and "undeclared" in why
+
+    def test_undeclared_naming_fails_closed(self):
+        # Live corpus had 3 quotes using token_in/token_out/amount_in for
+        # intent "swap". Keeping only the DECLARED subset would leave them
+        # with EMPTY params — all three collapsing to one meaningless case.
+        kept, why = self._call({
+            "token_in": "0xA", "token_out": "0xB", "amount_in": "10",
+        })
+        assert kept is None and "undeclared" in why
+
+    def test_undeclared_intent_function_fails_closed(self):
+        kept, why = self._call({"input_token": "0xA"}, fn="execute")
+        assert kept is None and "declares no params" in why
+
+    def test_no_manifest_fails_closed(self):
+        kept, why = self._call({"input_token": "0xA"}, manifest={})
+        assert kept is None and "declares no params" in why
+
+    def test_platform_appended_fields_are_not_undeclared(self):
+        # intent_params_hex / platform_fee_wei are appended by the platform,
+        # not supplied by the caller — they must not trip the fail-closed path.
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "intent_params_hex": "0xdead", "platform_fee_wei": "5",
+        })
+        assert why == "ok"
+        assert set(kept) == {"input_token", "output_token", "input_amount"}
