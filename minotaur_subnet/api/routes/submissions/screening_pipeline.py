@@ -1442,13 +1442,16 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 return
             await offload_write(store.set_provenance,submission_id, provenance)
 
-        # Extract solver info from stage 2 details. The SDK contract version
-        # rides along as a structured field on the StageResult rather than
-        # through this string-parse, but is still written by the same call —
-        # so if the name/version parse below fails, the version observation is
-        # dropped with it. Acceptable while this is observe-only: the dominant
-        # failure is stage 2's metadata JSON not parsing at all, which already
-        # leaves s2.sdk_version None. Revisit before anything GATES on it.
+        # Record the SDK contract generation FIRST and unconditionally. It
+        # arrives as a structured field on the StageResult, so unlike solver
+        # name/version below it does not depend on parsing prose out of
+        # `details` — and writing it separately means a malformed `details`
+        # cannot silently cost us the observation. None is written through
+        # deliberately: it is the meaningful "pre-marker" reading, not a
+        # missing one.
+        await offload_write(store.set_sdk_version, submission_id, s2.sdk_version)
+
+        # Extract solver info from stage 2 details.
         if ":" in s2.details:
             try:
                 info_part = s2.details.split(": ", 1)[1]
@@ -1457,7 +1460,6 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                     submission_id,
                     name=name_ver[0],
                     version=name_ver[1] if len(name_ver) > 1 else None,
-                    sdk_version=s2.sdk_version,
                 )
             except (IndexError, ValueError):
                 pass

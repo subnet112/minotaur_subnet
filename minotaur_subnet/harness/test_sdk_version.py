@@ -14,8 +14,10 @@ population counts, never as a crash.
 from __future__ import annotations
 
 import io
+import tempfile
 import unittest
 from dataclasses import asdict
+from pathlib import Path
 
 from minotaur_subnet.sdk import SDK_VERSION as SDK_VERSION_FROM_PACKAGE
 from minotaur_subnet.sdk.intent_solver import IntentSolver, SolverMetadata
@@ -24,6 +26,7 @@ from minotaur_subnet.harness.orchestrator import SolverSession
 from minotaur_subnet.harness.protocol import HarnessResponse
 from minotaur_subnet.harness.runner import SolverRunner
 from minotaur_subnet.harness.screening import ScreeningResult, StageResult
+from minotaur_subnet.harness.submission_store import SubmissionStore
 
 
 class _StubSolver(IntentSolver):
@@ -161,6 +164,87 @@ class TestScreeningCarriers(unittest.TestCase):
         d = result.to_dict()
         self.assertIsNone(d["solver_sdk_version"])
         self.assertIsNone(d["stages"]["stage_2"]["sdk_version"])
+
+
+class TestSubmissionRecord(unittest.TestCase):
+    """`sdk_version` on the submission record, and its independence from the
+    self-declared solver name/version."""
+
+    def setUp(self):
+        self.store = SubmissionStore()
+
+    def _new(self, hotkey: str = "5GrwvaEF_test"):
+        return self.store.create(
+            repo_url="https://github.com/miner/solver",
+            commit_hash="abc123",
+            epoch=42,
+            hotkey=hotkey,
+        )
+
+    def test_defaults_to_none(self):
+        self.assertIsNone(self._new().sdk_version)
+
+    def test_set_and_read_back(self):
+        sub = self._new()
+        self.store.set_sdk_version(sub.submission_id, "1.0.0")
+        self.assertEqual(self.store.get(sub.submission_id).sdk_version, "1.0.0")
+
+    def test_none_is_written_through_not_ignored(self):
+        """A re-screen that reads pre-marker must CLEAR a stale version.
+
+        None is the meaningful 'this vendored a pre-marker SDK' observation,
+        so treating it as 'no update' would let a resubmit that downgraded its
+        vendored SDK keep reporting the older, higher version.
+        """
+        sub = self._new()
+        self.store.set_sdk_version(sub.submission_id, "1.0.0")
+        self.store.set_sdk_version(sub.submission_id, None)
+        self.assertIsNone(self.store.get(sub.submission_id).sdk_version)
+
+    def test_set_solver_info_does_not_disturb_it(self):
+        """The two are written independently.
+
+        `set_solver_info` is guarded by a string-parse of screening prose and
+        also drives copycat name-coining. If the version rode along with it,
+        a malformed `details` would silently cost the observation — this pins
+        that they do not interact.
+        """
+        sub = self._new()
+        self.store.set_sdk_version(sub.submission_id, "1.0.0")
+        self.store.set_solver_info(sub.submission_id, name="MySolver", version="9.9.9")
+        updated = self.store.get(sub.submission_id)
+        self.assertEqual(updated.sdk_version, "1.0.0")
+        self.assertEqual(updated.solver_name, "MySolver")
+        self.assertEqual(updated.solver_version, "9.9.9")
+
+    def test_serializes_into_record_dicts(self):
+        sub = self._new()
+        self.store.set_sdk_version(sub.submission_id, "1.0.0")
+        updated = self.store.get(sub.submission_id)
+        self.assertEqual(updated.to_dict()["sdk_version"], "1.0.0")
+        self.assertEqual(updated.status_dict()["sdk_version"], "1.0.0")
+
+    def test_survives_persist_reload_round_trip(self):
+        """Both the writer and the record reconstructor must carry the field.
+
+        If either side drops it the value never survives a restart, and every
+        consumer silently reads None — which is indistinguishable from a real
+        pre-marker solver, so the population count would be quietly wrong
+        rather than visibly broken.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "subs.json"
+            store1 = SubmissionStore(persist_path=persist_path)
+            sub = store1.create(
+                repo_url="https://github.com/miner/solver",
+                commit_hash="abc123",
+                epoch=42,
+                hotkey="5GrwvaEF_test",
+            )
+            store1.set_sdk_version(sub.submission_id, "1.0.0")
+
+            store2 = SubmissionStore(persist_path=persist_path)
+            self.assertEqual(store2.get(sub.submission_id).sdk_version, "1.0.0")
 
 
 if __name__ == "__main__":

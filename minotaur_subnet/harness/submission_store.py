@@ -1256,6 +1256,31 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist_records([sub])
 
+    @_write_locked
+    def set_sdk_version(self, submission_id: str, value: str | None) -> None:
+        """Persist the SDK contract generation read out of the image in stage 2.
+
+        Deliberately its OWN setter rather than a parameter on
+        ``set_solver_info``: that call is guarded by a string-parse of
+        ``details`` and also drives copycat name-coining, so a version
+        observation riding along with it would be dropped whenever the name
+        parse failed, and could not be written without also touching the
+        coining registry. The two are independent facts about a submission and
+        are written independently.
+
+        ``value`` is deliberately Optional and written through even when None
+        — None is the meaningful "pre-marker" observation, not a missing one,
+        and writing it through means a re-screen of a resubmit that downgraded
+        its vendored SDK reports the truth rather than a stale version.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.sdk_version = value
+        sub.updated_at = time.time()
+        self._persist_records([sub])
+
     def set_structural_fingerprint(self, submission_id: str, value: str) -> None:
         """Persist the salt-invariant structural fingerprint from screening
         stage 1 — same compute-once-read-forever discipline as
@@ -1428,7 +1453,6 @@ class SubmissionStore:
         submission_id: str,
         name: str | None = None,
         version: str | None = None,
-        sdk_version: str | None = None,
     ) -> None:
         """Set solver metadata from screening and apply first-to-coin labeling.
 
@@ -1447,12 +1471,10 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_name = name
         sub.solver_version = version
-        # Unlike name/version — which are self-declared free text — this comes
-        # from the vendored package inside the built image, so it is not the
-        # miner's claim about themselves. None here means pre-marker, and is
-        # written through as None rather than left stale so a re-screen of a
-        # downgraded resubmit reports the truth.
-        sub.sdk_version = sdk_version
+        # NOTE: the SDK contract version is NOT written here — it is read from
+        # the vendored package rather than self-declared, and is recorded
+        # unconditionally by set_sdk_version so it survives a failed parse of
+        # the name/version prose this call depends on.
         # Recompute copycat state from scratch each call, so a re-screen with a
         # changed name re-evaluates cleanly rather than sticking to a stale flag.
         sub.is_copycat = False
