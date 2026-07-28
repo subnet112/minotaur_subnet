@@ -512,9 +512,12 @@ class OrderProcessor:
                 self.order_persistence.sync(order.order_id)
                 return False
 
+        # The app's manifest drives simulator token seeding — the platform
+        # does not guess which params an order spends (v3.manifest.spend_params).
         simulation = await self.simulation_runner.simulate(
             plan, order, contract_address, intent_order_dict,
             is_cross_chain, deployed_contract,
+            manifest=self._manifest_for(order.app_id),
         )
 
         # Protocol-fee certification — the never-lose-money gate, upstream of
@@ -865,6 +868,17 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    def _manifest_for(self, app_id: str) -> dict | None:
+        """The app's manifest, or None. Never raises — a manifest lookup
+        failure must degrade to "cannot seed" (logged by the caller), not take
+        down order processing."""
+        try:
+            manifest = getattr(self.app_store.get_app(app_id), "manifest", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Manifest lookup failed for %s: %s", app_id, exc)
+            return None
+        return manifest if isinstance(manifest, dict) else None
 
     def _selector_from_manifest(self, app_id: str, intent_function: str) -> str | None:
         """4-byte selector for ``intent_function``, computed from the app's own
