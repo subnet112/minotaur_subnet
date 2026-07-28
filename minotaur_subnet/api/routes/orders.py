@@ -1653,14 +1653,22 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     # CrossChainPlan through the platform compiler to get LIVE
                     # bridge quotes (fee/ETA/min output) + the revert plan per
                     # failure point, instead of trusting the solver's estimate.
-                    # Falls back to the legacy metadata copy when the compiler
-                    # isn't wired or the plan doesn't compile; gas stays at floor
-                    # either way (no per-leg sim on this path yet).
+                    # With a simulator wired (the same per-chain runner the
+                    # single-chain branch uses), the compiled journey also runs
+                    # per-leg, upgrading the estimate to a platform-verified
+                    # destination output (estimated_output_source =
+                    # "leg_simulation"). Falls back to the legacy metadata copy
+                    # when the compiler isn't wired or the plan doesn't compile.
                     from minotaur_subnet.api.services.cross_chain_quote import (
                         build_cross_chain_quote,
                     )
                     _xc_quote = await build_cross_chain_quote(
                         _pmeta, getattr(bl, "cross_chain_compiler", None),
+                        simulator=getattr(_sim_runner, "simulator", None),
+                        bridge_registry=getattr(
+                            _sim_runner, "bridge_registry", None,
+                        ),
+                        params=req.params,
                     )
                     if _xc_quote and _xc_quote.get("estimated_output"):
                         result["delivered"] = int(_xc_quote["estimated_output"])
