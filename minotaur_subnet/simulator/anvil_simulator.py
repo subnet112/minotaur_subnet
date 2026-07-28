@@ -811,15 +811,32 @@ class AnvilSimulator:
                 chain_id = _safe_read(lambda: self.w3.eth.chain_id)
                 fork_block = _safe_read(lambda: self.w3.eth.block_number)
                 code_len = _safe_read(lambda: len(self.w3.eth.get_code(target)))
+                # DIAGNOSTIC (2026-07-28): pin why an ETH contract reaches a Base
+                # anvil. Log what the PLAN / intent_order think their chain is vs
+                # the anvil chain above. A plan-chain that disagrees with the
+                # anvil chain means a mis-stamped plan won _get_simulator (the
+                # authoritative chain_id wasn't threaded); an order_chain that
+                # matches the anvil but a foreign contract means the scenario's
+                # chain/contract disagree. scenario= identifies the corpus source.
+                plan_meta_chain = _safe_read(lambda: plan.metadata.get("chain_id"))
+                plan_ix_chain = _safe_read(
+                    lambda: plan.interactions[0].chain_id if plan.interactions else None)
+                order_chain = _safe_read(
+                    lambda: intent_order.get("chain_id") if isinstance(intent_order, dict) else None)
+                scen = _safe_read(lambda: (plan.metadata or {}).get("_scenario_name"))
                 logger.warning(
                     "scoreIntent: relayer() UNRESOLVED for %s — empty call "
-                    "return (chain=%s fork_block=%s contract_code_len=%s); "
-                    "skipping sim (unresolved, not scored)",
+                    "return (anvil_chain=%s fork_block=%s contract_code_len=%s | "
+                    "plan.meta_chain=%s plan.ix_chain=%s order.chain=%s "
+                    "scenario=%s); skipping sim (unresolved, not scored)",
                     target, chain_id, fork_block, code_len,
+                    plan_meta_chain, plan_ix_chain, order_chain, scen,
                 )
                 print(
-                    f"[SIM] relayer() UNRESOLVED for {target} chain={chain_id} "
-                    f"fork_block={fork_block} code_len={code_len}",
+                    f"[SIM] relayer() UNRESOLVED for {target} anvil_chain={chain_id} "
+                    f"fork_block={fork_block} code_len={code_len} "
+                    f"plan_meta_chain={plan_meta_chain} plan_ix_chain={plan_ix_chain} "
+                    f"order_chain={order_chain} scenario={scen}",
                     flush=True,
                 )
                 return None
