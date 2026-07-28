@@ -87,9 +87,12 @@ def test_eth_prefers_upstream(clean_env):
     assert consensus_chain_rpc_url(1) == "https://eth-mainnet.example.com/v2/key"
 
 
-def test_eth_falls_back_to_anvil(clean_env):
-    clean_env.setenv("ANVIL_RPC_URL", "http://anvil-eth:8545")
-    assert consensus_chain_rpc_url(1) == "http://anvil-eth:8545"
+def test_eth_never_falls_back_to_anvil(clean_env):
+    # ANVIL_RPC_URL is the Base anvil on prod — chain 1 must refuse it (a
+    # cross-chain read) and return "" when no ETH upstream is configured, rather
+    # than resolve Ethereum consensus against a Base fork.
+    clean_env.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    assert consensus_chain_rpc_url(1) == ""
 
 
 # ── chain 31337 / unknown (local Anvil) ─────────────────────────────

@@ -196,6 +196,85 @@ def _forward_legs(meta: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def bridge_execution_plan(
+    plan: ExecutionPlan,
+    bridge_leg: dict[str, Any],
+) -> ExecutionPlan | None:
+    """The ONE simulation that makes a bridge deposit observable.
+
+    Two things have to hold for the observed deposit to mean anything:
+
+    1. **The deposit must execute against what the plan actually earned.**
+       Each ``simulate()`` call is snapshot-isolated, so simulating the
+       bridge leg alone runs it against the fork's seeded balances — a
+       swap-then-bridge plan would see its (honest) deposit revert because
+       the swap's output never existed in that sim. So every PRECEDING leg
+       that executes on the bridge's own chain is prepended, in leg order,
+       and the whole journey up to the deposit runs as one simulation.
+
+    2. **A solver-shape bridge leg must be executable at all.** The solver
+       declares ``bridge_requests`` abstractly — no calldata — which is why
+       it could only ever measure as "declared" (its own number, gameable).
+       When the leg carries no interactions, the deposit is SYNTHESIZED as
+       the same ``transfer(_MOCK_BRIDGE_TARGET, amount)`` the mocking path
+       produces (shared encoder: ``mock_bridge_deposit``), so a declared
+       amount the preceding legs never earned reverts instead of being
+       credited — identical anti-gaming semantics for both plan shapes.
+
+    Returns None when there is nothing executable to observe (no calldata
+    and no token/amount to synthesize from — e.g. a native-asset bridge with
+    no ERC-20 to transfer); the caller falls back to the declared amount,
+    labelled as such.
+    """
+    from minotaur_subnet.shared.types import (
+        extract_leg_plan,
+        mock_bridge_deposit,
+        mock_bridge_interactions,
+    )
+
+    meta = plan.metadata or {}
+    legs = meta.get("legs") or []
+    bridge_id = bridge_leg.get("leg_id")
+    bridge_chain = bridge_leg.get("chain_id")
+
+    try:
+        declared = int(bridge_leg.get("bridge_amount") or 0)
+    except (ValueError, TypeError):
+        declared = 0
+    token_in = str(bridge_leg.get("token_in") or "")
+
+    # The deposit itself: mock real calldata, synthesize when there is none.
+    bridge_ixs = extract_leg_plan(plan, bridge_id).interactions
+    if bridge_ixs:
+        deposit = mock_bridge_interactions(bridge_ixs, token_in, declared)
+    elif token_in and declared > 0:
+        deposit = [mock_bridge_deposit(token_in, declared, int(bridge_chain or 0))]
+    else:
+        return None
+
+    combined: list[Interaction] = []
+    for leg in sorted(legs, key=lambda l: l.get("leg_id", 0)):
+        if leg.get("leg_id") == bridge_id:
+            break
+        if leg.get("runtime") == "substrate" or leg.get("type") in ("wait", "bridge"):
+            # Substrate/wait legs don't run on this fork; an EARLIER bridge
+            # leg (multi-hop) already moved its funds off — neither belongs
+            # in this journey.
+            continue
+        if leg.get("chain_id") != bridge_chain:
+            continue
+        combined.extend(extract_leg_plan(plan, leg["leg_id"]).interactions)
+    combined.extend(deposit)
+
+    return ExecutionPlan(
+        intent_id=plan.intent_id,
+        interactions=combined,
+        deadline=plan.deadline,
+        nonce=plan.nonce,
+        metadata=plan.metadata,
+    )
+
+
 def observed_bridged_amount(transfers: Any) -> int:
     """How much actually left for the bridge, read off the simulation.
 

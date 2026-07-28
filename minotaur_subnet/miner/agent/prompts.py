@@ -338,12 +338,15 @@ When researching protocols for strategy development, follow this order:
 
 ## State Parameters
 
-Prefer `state.typed_context` when it is available. Validators may attach typed
-runtime views such as `SwapIntentContext`, `TwapIntentContext`, and
-`RebalanceIntentContext`.
+Validators attach `state.typed_context`, a runtime view carrying the app,
+intent function, chain, owner and the app's raw params. It is deliberately
+NOT app-shaped: the platform does not know what your app's params mean, so it
+does not pre-interpret them. Read `raw_params` and interpret them against
+your app's manifest, which declares each param's type and source.
 
 The structured runtime contract is:
-- `state.typed_context`: authoritative typed app/runtime view
+- `state.typed_context`: runtime view (app_id, intent_function, chain_id,
+  owner, contract_address, nonce, raw_params)
 - `state.raw_params`: raw app/runtime params payload
 - `state.control`: runtime control metadata such as `_intent_function`
 
