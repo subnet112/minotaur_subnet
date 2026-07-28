@@ -27,7 +27,7 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
     ScoreResult,
 )
-from minotaur_subnet.v3.contexts import SwapIntentContext
+from minotaur_subnet.v3.contexts import BaseIntentContext
 
 
 # ─── Test JS Scoring Modules ───────────────────────────────────────────────
@@ -152,19 +152,14 @@ async def test_state_to_dict_includes_typed_context():
         nonce=7,
         owner="0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         raw_params={"input_token": "0x1111111111111111111111111111111111111111"},
-        typed_context=SwapIntentContext(
+        typed_context=BaseIntentContext(
             app_id="test-swap-001",
             intent_function="swap",
             chain_id=1,
             owner="0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
             contract_address="0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             nonce=7,
-            raw_params={"input_token": "0x1111111111111111111111111111111111111111"},
-            input_token="0x1111111111111111111111111111111111111111",
-            output_token="0x2222222222222222222222222222222222222222",
-            input_amount=100,
-            min_output_amount=90,
-            receiver="0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            raw_params={**{"input_token": "0x1111111111111111111111111111111111111111"}, "input_token": "0x1111111111111111111111111111111111111111", "output_token": "0x2222222222222222222222222222222222222222", "input_amount": 100, "min_output_amount": 90, "receiver": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
         ),
     )
 
@@ -172,7 +167,8 @@ async def test_state_to_dict_includes_typed_context():
     assert result["raw_params"]["input_token"] == "0x1111111111111111111111111111111111111111"
     assert result["control"] == {}
     assert result["typed_context"]["intent_function"] == "swap"
-    assert result["typed_context"]["input_amount"] == 100
+    # App params live in raw_params now — the context is not swap-shaped.
+    assert result["typed_context"]["raw_params"]["input_amount"] == 100
     assert "input_token" not in result
 
 
