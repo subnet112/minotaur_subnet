@@ -1677,8 +1677,18 @@ class BenchmarkWorker:
         app_def = apps_by_id.get(app_id)
         if app_def is None:
             return None
-        deployment = self._app_store.get_deployment(app_id)
-        contract_address = deployment.contract_address if deployment else ""
+        # Resolve the deployment for the ORDER'S OWN chain — NOT the chain-less
+        # primary. A Base order (chain 8453) must score against the Base
+        # deployment; the chain-less get_deployment returns the primary
+        # (order-ready-preferred, typically Ethereum), so a Base order was built
+        # with the Ethereum contract and then — once the sim anvil correctly
+        # follows state.chain_id (the #1154 fix) — that ETH address has no code
+        # on the Base fork → relayer() UNRESOLVED, scenario scores 0. Skip when
+        # the app isn't deployed on the order's chain rather than mis-route.
+        deployment = self._app_store.get_deployment(app_id, chain_id=chain_id)
+        if deployment is None:
+            return None
+        contract_address = deployment.contract_address or ""
 
         # Snapshot per chain (cached). Use synthetic snapshot here —
         # the solver re-queries live pool state via RPC anyway.
