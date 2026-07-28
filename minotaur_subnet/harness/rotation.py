@@ -810,6 +810,55 @@ def apply_rotation_slate(
                 )
         except Exception:
             logger.debug("structural-dedup observe failed for %s", round_id, exc_info=True)
+
+    # ── Structural CO-OCCURRENCE evidence (the automatic operator merge) ────
+    # WHO shipped identical structure TOGETHER this round, recorded per actor
+    # pair. The collapse above is per-round and per-fingerprint, so a ring that
+    # re-rolls its fingerprint every round pays nothing for being caught; this
+    # ledger keys on the ACTORS instead, which cost a registration burn each.
+    # Swept over ALL of the round's submissions (not just the candidates): a
+    # ring member parked by the build budget is still evidence of who submits
+    # together. Merges take effect from the NEXT selection pass — this one
+    # already froze its resolver. Best-effort: never blocks a close.
+    from minotaur_subnet.harness.actor import (
+        record_structural_coclusters,
+        structural_merge_min_rounds,
+        structural_merge_mode,
+    )
+
+    _merge_mode = structural_merge_mode()
+    if _merge_mode != "off" and actor_of is not None:
+        try:
+            # Grouped by fingerprint over HOTKEYS, deliberately NOT through
+            # structural_dedup_clusters: that helper needs >=2 distinct ACTORS,
+            # which an already-merged ring no longer has — it would stop
+            # refreshing its own evidence and the merge would lapse on the TTL.
+            # record_structural_coclusters folds hotkeys to their pre-merge
+            # identity and drops single-identity groups.
+            _by_fp: dict[str, set[str]] = {}
+            for s in subs:
+                fp = getattr(s, "structural_fingerprint", None)
+                hk = getattr(s, "hotkey", "") or ""
+                if fp and hk:
+                    _by_fp.setdefault(fp, set()).add(hk)
+            _clusters = [hks for hks in _by_fp.values() if len(hks) >= 2]
+            for group in record_structural_coclusters(round_id, _clusters):
+                logger.warning(
+                    "[structural-merge %s] %s: %d actors co-shipped identical "
+                    "structure in >=%d rounds — one operator%s: %s",
+                    _merge_mode.upper(), round_id, len(group),
+                    structural_merge_min_rounds(),
+                    (" (merged from the next pass: one queue seat, one build "
+                     "unit, one submission per round)")
+                    if _merge_mode == "enforce"
+                    else " (would merge when armed; selection unchanged)",
+                    ", ".join(sorted(a[:12] for a in group)),
+                )
+        except Exception:
+            logger.warning(
+                "structural co-occurrence pass failed for %s (ignored)",
+                round_id, exc_info=True,
+            )
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "
