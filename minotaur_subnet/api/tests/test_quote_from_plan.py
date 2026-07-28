@@ -101,12 +101,18 @@ class _FakeSimRunner:
 
     async def simulate(
         self, plan, order, contract_address, intent_order, is_cross_chain, deployed,
-        fork_block=None, pin_only=False,
+        fork_block=None, pin_only=False, manifest=None,
     ):
+        # `manifest` is spied on, not ignored: seeding is manifest-derived, so a
+        # quote path that stops passing one silently stops seeding and every
+        # quote reverts to 0. This double omitted the parameter entirely, which
+        # meant the real call raised TypeError — swallowed by the handler into a
+        # "simulation failed" warning — so the tests could not tell a wired call
+        # site from an unwired one.
         self.calls.append(SimpleNamespace(
             plan=plan, order=order, contract_address=contract_address,
             intent_order=intent_order, is_cross_chain=is_cross_chain, deployed=deployed,
-            fork_block=fork_block, pin_only=pin_only,
+            fork_block=fork_block, pin_only=pin_only, manifest=manifest,
         ))
         if self._result is not None:
             return self._result
@@ -122,6 +128,23 @@ class _FakeSimRunner:
         )
 
 
+# A real store record carries a manifest, and the quote path needs one to derive
+# simulator seeding (#1166/#1179). These fixtures previously omitted it, so they
+# could not represent the failure that shipped: with no manifest available from
+# any source the handler passed None, spend_token_balances declined to seed, and
+# every quote sim reverted in safeTransferFrom.
+_APP_MANIFEST = {
+    "intent_functions": [{
+        "name": "swap",
+        "params": {
+            "input_token":  {"type": "address", "source": "user"},
+            "output_token": {"type": "address", "source": "user"},
+            "input_amount": {"type": "uint256", "source": "user"},
+        },
+    }],
+}
+
+
 class _FakeStore:
     def __init__(self) -> None:
         self.attempts: list[tuple] = []
@@ -130,6 +153,7 @@ class _FakeStore:
         return SimpleNamespace(
             app_id=app_id, name="DexAggregator",
             js_code="function score(){return 1;}",
+            manifest=_APP_MANIFEST,
         )
 
     def get_deployment(self, app_id, chain_id=None):
@@ -260,6 +284,15 @@ class TestQuoteFromGeneratePlan(unittest.TestCase):
         # bare-interaction path (0 delivered), which is exactly the V2
         # chain-1 zero-quote bug's final layer.
         self.assertEqual(runner.calls[0].contract_address, _DEPLOYED)
+        # And a manifest must reach the simulator, because seeding is derived
+        # from it (#1166/#1179). Shipping without this wired sent None down the
+        # quote path, so spend_token_balances declined to seed, every quote sim
+        # reverted in safeTransferFrom, and the live zero-output rate went
+        # 50.4% -> 100% while nothing raised.
+        self.assertIsNotNone(
+            runner.calls[0].manifest,
+            "quote path must pass a manifest or seeding silently stops",
+        )
         # Revert-avoidance: the order's submitted_by == the intent_order's source
         # == the receiver the encoder was handed (the pre-funded Anvil default).
         self.assertEqual(
@@ -502,6 +535,7 @@ class _RetireStore:
         return SimpleNamespace(
             app_id=app_id, name="DexAggregator",
             js_code="function score(){return 1;}",
+            manifest=_APP_MANIFEST,
         )
 
     def get_deployment(self, app_id, chain_id=None):

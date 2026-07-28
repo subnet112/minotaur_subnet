@@ -146,3 +146,46 @@ def test_quote_sourced_amount_is_not_the_spend_side():
         "input_token": _TOK, "input_amount": "1000", "min_output_amount": "990",
     }))
     assert sim.sim_kwargs["token_balances"] == {_TOK: 1000}
+
+
+# ── Regression: the caller MUST pass a manifest ─────────────────────────────
+#
+# Seeding became manifest-derived in #1166/#1179, but only ONE of the two
+# SimulationRunner.simulate() callers was wired: order_processor passed a
+# manifest, the /quote path did not. `manifest` defaults to None, so quote
+# sims silently stopped seeding — every quote reverted in safeTransferFrom and
+# recorded estimated_output=0 (measured live: zero-output rate 50.4% -> 100%).
+# Nothing failed; the log even blamed the app's manifest.
+
+def test_no_manifest_means_no_seeding_at_all():
+    """Pin the failure mode itself, so its cause is unambiguous in future.
+
+    This is the behaviour that bit us: not a crash, not an exception — just
+    silently empty balances.
+    """
+    sim = _RecSim()
+    res = _run(sim, _order({"input_token": _TOK, "input_amount": "1000"}), manifest={})
+    assert res.success                                   # no crash — that is the danger
+    assert not sim.sim_kwargs.get("token_balances")      # ...and nothing was seeded
+
+
+def test_manifest_none_is_logged_as_a_wiring_bug_not_a_manifest_gap(caplog):
+    """A caller that forgets `manifest` is a PLATFORM bug and must say so.
+
+    The original message blamed the app's manifest for what was our own
+    unwired call site, which is why the regression read as an app problem.
+    """
+    import logging
+    sim = _RecSim()
+    with caplog.at_level(logging.DEBUG, logger="minotaur_subnet.blockloop.simulation"):
+        _run(sim, _order({"input_token": _TOK, "input_amount": "1000"}), manifest={})
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a missing manifest must be ERROR, not a WARNING lost in the noise"
+    assert "wiring bug" in errors[0].getMessage()
+
+
+def test_declared_manifest_still_seeds_normally():
+    """The fix must not make a well-formed manifest stop seeding."""
+    sim = _RecSim()
+    _run(sim, _order({"input_token": _TOK, "input_amount": "1000"}))
+    assert sim.sim_kwargs["token_balances"] == {_TOK: 1000}
