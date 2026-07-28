@@ -20,7 +20,7 @@ from minotaur_subnet.shared.types import (
     TriggerType,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot
-from minotaur_subnet.v3.contexts import BaseIntentContext
+from minotaur_subnet.v3.contexts import SwapIntentContext
 from minotaur_subnet.harness.snapshot import (
     SnapshotMeta,
     build_synthetic_snapshot,
@@ -214,39 +214,6 @@ def _make_valid_repo(tmpdir: str) -> str:
     )
     (repo / "README.md").write_text("# My Solver\n")
     return str(repo)
-
-
-    def test_snapshot_state_roundtrip_preserves_typed_context(self):
-        """A typed context survives snapshot state serialisation.
-
-        Restores coverage dropped by the MarketSnapshot cleanup (#1161), now
-        written against the APP-AGNOSTIC context: app params ride in
-        raw_params rather than in swap-shaped attributes.
-        """
-        state = IntentState(
-            contract_address="0x" + "ab" * 20,
-            chain_id=1,
-            nonce=3,
-            owner="0x" + "cd" * 20,
-            raw_params={"input_token": "0xA", "input_amount": "1000"},
-        )
-        state.typed_context = BaseIntentContext(
-            app_id="app-1",
-            intent_function="swap",
-            chain_id=1,
-            owner=state.owner,
-            contract_address=state.contract_address,
-            nonce=3,
-            raw_params={"input_token": "0xA", "input_amount": "1000"},
-        )
-
-        reconstructed = _dict_to_state(_state_to_dict(state))
-
-        self.assertIsInstance(reconstructed.typed_context, BaseIntentContext)
-        self.assertEqual(reconstructed.typed_context.intent_function, "swap")
-        self.assertEqual(
-            reconstructed.typed_context.raw_params["input_amount"], "1000",
-        )
 
 
 class TestScreeningStage1(unittest.TestCase):
