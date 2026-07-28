@@ -71,6 +71,13 @@ _QUOTE_IDENTITY_PARAMS = {
 # and braces, and the fallback when an app declares no params at all.
 QUOTE_PARAM_STRIP_FIELDS = _PII_FIELDS | _VOLATILE_PARAMS | _QUOTE_IDENTITY_PARAMS
 
+# Chain-routing fields _resolve_token_params derives from the tokens and writes
+# into req.params before capture. Recomputable, never caller-authored — they
+# must not make the fail-closed allowlist skip a quote, and they are never
+# stored (only declared source=user params are). ``dest_chain_id`` is NOT one
+# of these: see the comment at the unknown-check below.
+_PLATFORM_DERIVED_PARAMS = {"input_chain_id", "output_chain_id"}
+
 
 def quote_case_params(
     manifest: Any,
@@ -124,9 +131,21 @@ def quote_case_params(
     supplied = dict(params or {})
     # Fields the platform itself appends are never the caller's trade
     # descriptor; ignore them rather than treating them as undeclared.
+    # Two kinds beyond QUOTE_PARAM_STRIP_FIELDS, both written into
+    # req.params by _resolve_token_params BEFORE capture sees them:
+    #   - underscore-prefixed downstream tags (``_input_token_is_native``);
+    #   - derived chain-routing fields (``input_chain_id``/``output_chain_id``,
+    #     recomputable from the tokens).
+    # ``dest_chain_id`` is deliberately NOT here: delivery chain IS trade
+    # descriptor, so it stays declared-or-fail-closed — a cross-chain quote
+    # captured without it would bench as a same-chain trade the user never
+    # asked for.
     unknown = [
         k for k in supplied
-        if k not in declared and k not in QUOTE_PARAM_STRIP_FIELDS
+        if k not in declared
+        and k not in QUOTE_PARAM_STRIP_FIELDS
+        and k not in _PLATFORM_DERIVED_PARAMS
+        and not k.startswith("_")
     ]
     if unknown:
         return None, f"request carries undeclared params: {sorted(unknown)}"
