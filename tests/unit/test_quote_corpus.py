@@ -606,6 +606,48 @@ class TestQuoteCaseAllowlist:
         })
         assert kept is None and "undeclared" in why
 
+    def test_platform_appended_fields_do_not_fail_capture(self):
+        # _resolve_token_params writes derived chain-routing fields and
+        # underscore-prefixed downstream tags into req.params BEFORE capture
+        # sees them (e.g. a native-sentinel input, or CAIP-10 cross-chain
+        # token addresses). Platform bookkeeping must never make the
+        # fail-closed allowlist skip a quote the app itself fully declares.
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "input_chain_id": 8453, "output_chain_id": 1,
+            "_input_token_is_native": True,
+        })
+        assert why == "ok"
+        assert kept == {"input_token": "0xA", "output_token": "0xB",
+                        "input_amount": "10"}
+        # Never stored either — they are recomputable, not caller-authored.
+        assert "input_chain_id" not in kept
+        assert "_input_token_is_native" not in kept
+
+    def test_dest_chain_id_stays_declared_or_fail_closed(self):
+        # dest_chain_id IS trade descriptor — delivery on another chain.
+        # Undeclared, it must fail closed (a cross-chain quote captured
+        # without it would bench as a same-chain trade)...
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "dest_chain_id": "1",
+        })
+        assert kept is None and "dest_chain_id" in why
+        # ...and once the app declares it source=user, it is retained.
+        manifest = {"intent_functions": [{
+            "name": "swap",
+            "params": {
+                **self.MANIFEST["intent_functions"][0]["params"],
+                "dest_chain_id": {"type": "uint256", "source": "user"},
+            },
+        }]}
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "dest_chain_id": "1",
+        }, manifest=manifest)
+        assert why == "ok"
+        assert kept["dest_chain_id"] == "1"
+
     def test_undeclared_naming_fails_closed(self):
         # Live corpus had 3 quotes using token_in/token_out/amount_in for
         # intent "swap". Keeping only the DECLARED subset would leave them
