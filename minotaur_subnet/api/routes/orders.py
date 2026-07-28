@@ -1817,6 +1817,13 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                         _intent_order, False, _deployed,
                         fork_block=_pin_block,
                         pin_only=_pin_block is not None,
+                        # REQUIRED since seeding became manifest-derived (#1179):
+                        # without it spend_token_balances gets None, declines to
+                        # seed, and the sim reverts in safeTransferFrom for every
+                        # quote. Falls back to the store manifest because the JS
+                        # engine only caches manifests for apps something has
+                        # already scored.
+                        manifest=_bench_manifest or getattr(app_def, "manifest", None),
                     )
                     if _pin_block is None:
                         # Cold window: remember the block the fork just landed on
