@@ -259,6 +259,12 @@ class StageResult:
     # bundle as content_fingerprint, so StageResult MUST accept it or the
     # **_dw_fields spread below raises TypeError and rejects every submission.
     structural_fingerprint: str | None = None
+    # SDK contract generation vendored by this submission, read out of the
+    # built image in stage 2 (None on other stages / errors, and None when the
+    # submission vendored a pre-marker SDK — absence IS the signal, not a
+    # failure to detect). Detection only: nothing rejects on this value today.
+    # See sdk/version.py.
+    sdk_version: str | None = None
 
 
 @dataclass
@@ -269,6 +275,7 @@ class ScreeningResult:
     image_tag: str | None = None          # Set if stage 2+ passes (built image)
     solver_name: str | None = None        # From metadata
     solver_version: str | None = None     # From metadata
+    solver_sdk_version: str | None = None  # Vendored SDK generation (None = pre-marker)
     failed_stage: int | None = None
     rejection_reason: str | None = None
 
@@ -279,6 +286,7 @@ class ScreeningResult:
             "image_tag": self.image_tag,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "solver_sdk_version": self.solver_sdk_version,
             "failed_stage": self.failed_stage,
             "rejection_reason": self.rejection_reason,
             "stages": {
@@ -289,6 +297,7 @@ class ScreeningResult:
                     "error_code": s.error_code,
                     "max_region_nodes": s.max_region_nodes,
                     "unproductive_nodes": s.unproductive_nodes,
+                    "sdk_version": s.sdk_version,
                 }
                 for s in self.stages
             },
@@ -984,8 +993,17 @@ async def _run_stage_2_locked(
         "m = s.metadata(); "
         "assert m.name, 'metadata().name is empty'; "
         "assert m.version, 'metadata().version is empty'; "
+        # Read the SDK contract version out of the VENDORED package — this
+        # runs inside the built image, so it reports the generation the
+        # submission actually carries. getattr-with-default rather than a
+        # try/except because the whole probe is a ';'-joined one-liner, and
+        # because a missing symbol is the expected pre-marker case, not an
+        # error. See sdk/version.py.
+        "import importlib as _il; "
+        "_sdkv = getattr(_il.import_module('minotaur_subnet.sdk'), 'SDK_VERSION', None); "
         "import json; "
-        "print(json.dumps({'name': m.name, 'version': m.version, 'types': m.supported_intent_types}))"
+        "print(json.dumps({'name': m.name, 'version': m.version, "
+        "'types': m.supported_intent_types, 'sdk_version': _sdkv}))"
     )
 
     init_cmd = _solver_exec_command(image_tag, init_script)
@@ -1024,9 +1042,16 @@ async def _run_stage_2_locked(
         )
 
     # Parse metadata from stdout
+    sdk_version: str | None = None
     try:
         meta_data = json.loads(stdout.decode("utf-8").strip())
         details = f"Image built, init OK: {meta_data['name']} v{meta_data['version']}"
+        # Carried as a STRUCTURED field rather than parsed back out of
+        # `details` (which is how solver name/version are still recovered
+        # downstream) — a version string is not worth another round-trip
+        # through prose.
+        raw = meta_data.get("sdk_version")
+        sdk_version = str(raw) if raw else None
     except (json.JSONDecodeError, KeyError):
         details = "Image built, init OK"
 
@@ -1034,6 +1059,7 @@ async def _run_stage_2_locked(
         stage=2, passed=True,
         duration_ms=_elapsed(start),
         details=details,
+        sdk_version=sdk_version,
     )
 
 

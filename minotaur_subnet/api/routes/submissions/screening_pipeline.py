@@ -1442,7 +1442,16 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 return
             await offload_write(store.set_provenance,submission_id, provenance)
 
-        # Extract solver info from stage 2 details
+        # Record the SDK contract generation FIRST and unconditionally. It
+        # arrives as a structured field on the StageResult, so unlike solver
+        # name/version below it does not depend on parsing prose out of
+        # `details` — and writing it separately means a malformed `details`
+        # cannot silently cost us the observation. None is written through
+        # deliberately: it is the meaningful "pre-marker" reading, not a
+        # missing one.
+        await offload_write(store.set_sdk_version, submission_id, s2.sdk_version)
+
+        # Extract solver info from stage 2 details.
         if ":" in s2.details:
             try:
                 info_part = s2.details.split(": ", 1)[1]
