@@ -346,6 +346,13 @@ class Submission:
     provenance: dict[str, Any] | None = None
     solver_path: str | None = None  # Local path to solver .py (source submissions)
     solver_name: str | None = None
+    # SDK contract generation this submission vendored, read out of the built
+    # image in screening stage 2. None ⇔ the submission vendored a pre-marker
+    # SDK — absence is the signal, and records that predate the marker are
+    # correctly indistinguishable from solvers that genuinely lack it.
+    # OBSERVE-ONLY: nothing accepts, rejects, ranks or scores on this value.
+    # See sdk/version.py.
+    sdk_version: str | None = None
     solver_version: str | None = None
 
     # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
@@ -365,6 +372,12 @@ class Submission:
     # — the "same code, same quota" identity that comment/whitespace/nonce
     # rotation cannot refresh. None on records that predate the metric.
     content_fingerprint: str | None = None
+    # Structural fingerprint (harness/structural_fingerprint, screening stage 1)
+    # — salt-invariant identity (constant values erased) that collapses a
+    # coldkey fleet shipping structurally-identical code even when each salts a
+    # constant to mint a distinct content_fingerprint. Consumed OBSERVE-ONLY by
+    # rotation's structural dedup; None on records that predate the metric.
+    structural_fingerprint: str | None = None
 
     # Deadwood metric (Phase 0, OBSERVE-ONLY): AST-node mass of the submission
     # tree that provably does no work at runtime (unreachable files + dead
@@ -436,10 +449,12 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "sdk_version": self.sdk_version,
             "is_copycat": self.is_copycat,
             "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
+            "structural_fingerprint": self.structural_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "unproductive_metric_version": self.unproductive_metric_version,
             "unproductive_top_offenders": self.unproductive_top_offenders,
@@ -465,10 +480,12 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "sdk_version": self.sdk_version,
             "display_name": self.display_name,
             "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
             "content_fingerprint": self.content_fingerprint,
+            "structural_fingerprint": self.structural_fingerprint,
             "unproductive_nodes": self.unproductive_nodes,
             "benchmark_rank": self.benchmark_rank,
             "rejection_reason": self.rejection_reason,
@@ -862,10 +879,12 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            sdk_version=record.get("sdk_version"),
             is_copycat=bool(record.get("is_copycat", False)),
             coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
             content_fingerprint=record.get("content_fingerprint"),
+            structural_fingerprint=record.get("structural_fingerprint"),
             unproductive_nodes=record.get("unproductive_nodes"),
             unproductive_metric_version=record.get("unproductive_metric_version"),
             unproductive_top_offenders=record.get("unproductive_top_offenders"),
@@ -1024,6 +1043,34 @@ class SubmissionStore:
             except (TypeError, ValueError):
                 ts = 0.0
             if hk and ts and (hk not in out or ts < out[hk]):
+                out[hk] = ts
+        return out
+
+    def latest_created_at_by_hotkey(
+        self, *, exclude_round_id: str | None = None,
+    ) -> dict[str, float]:
+        """``{hotkey: latest created_at}`` across retained submissions — the
+        activity mirror of :meth:`earliest_created_at_by_hotkey`.
+
+        Powers the rotation ledger's absence-reset backfill (see
+        rotation.apply_rotation_slate): a miner's PRIOR activity anchor must be
+        reconstructible after a ledger upgrade so a continuously-contending
+        (merely starved) miner is never mistaken for a returning absentee on
+        the first post-upgrade pass. ``exclude_round_id`` omits the current
+        round's submissions — a returner's fresh submission must not mask the
+        gap it returned from. Bounded by store retention; best-effort.
+        """
+        self._maybe_reload()
+        out: dict[str, float] = {}
+        for s in self._submissions.values():
+            if exclude_round_id is not None and s.round_id == exclude_round_id:
+                continue
+            hk = s.hotkey or ""
+            try:
+                ts = float(s.created_at or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if hk and ts and (hk not in out or ts > out[hk]):
                 out[hk] = ts
         return out
 
@@ -1209,6 +1256,45 @@ class SubmissionStore:
         sub.updated_at = time.time()
         self._persist_records([sub])
 
+    @_write_locked
+    def set_sdk_version(self, submission_id: str, value: str | None) -> None:
+        """Persist the SDK contract generation read out of the image in stage 2.
+
+        Deliberately its OWN setter rather than a parameter on
+        ``set_solver_info``: that call is guarded by a string-parse of
+        ``details`` and also drives copycat name-coining, so a version
+        observation riding along with it would be dropped whenever the name
+        parse failed, and could not be written without also touching the
+        coining registry. The two are independent facts about a submission and
+        are written independently.
+
+        ``value`` is deliberately Optional and written through even when None
+        — None is the meaningful "pre-marker" observation, not a missing one,
+        and writing it through means a re-screen of a resubmit that downgraded
+        its vendored SDK reports the truth rather than a stale version.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.sdk_version = value
+        sub.updated_at = time.time()
+        self._persist_records([sub])
+
+    def set_structural_fingerprint(self, submission_id: str, value: str) -> None:
+        """Persist the salt-invariant structural fingerprint from screening
+        stage 1 — same compute-once-read-forever discipline as
+        ``set_content_fingerprint``. Without this the field never reaches the
+        record and the structural dedup sees NONE on every submission.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.structural_fingerprint = value
+        sub.updated_at = time.time()
+        self._persist_records([sub])
+
     def count_benched_rounds_for_fingerprint(
         self,
         fingerprint: str,
@@ -1385,6 +1471,10 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_name = name
         sub.solver_version = version
+        # NOTE: the SDK contract version is NOT written here — it is read from
+        # the vendored package rather than self-declared, and is recorded
+        # unconditionally by set_sdk_version so it survives a failed parse of
+        # the name/version prose this call depends on.
         # Recompute copycat state from scratch each call, so a re-screen with a
         # changed name re-evaluates cleanly rather than sticking to a stale flag.
         sub.is_copycat = False
@@ -2177,10 +2267,12 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    sdk_version=d.get("sdk_version"),
                     is_copycat=bool(d.get("is_copycat", False)),
                     coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
                     content_fingerprint=d.get("content_fingerprint"),
+                    structural_fingerprint=d.get("structural_fingerprint"),
                     unproductive_nodes=d.get("unproductive_nodes"),
                     unproductive_metric_version=d.get("unproductive_metric_version"),
                     unproductive_top_offenders=d.get("unproductive_top_offenders"),

@@ -89,14 +89,21 @@ class TestQuoteCaseId:
         }
         assert len(ids) == 5
 
-    def test_same_shape_collapses(self):
-        # ...but different amounts in the SAME order-of-magnitude collapse to one id,
-        # so exact-amount spam upserts to a single stored row (bounded growth).
+    def test_identical_shape_collapses(self):
+        # An exact re-quote of the same trade upserts to a single stored row.
+        # Amount-BUCKETED collapse (10 and 99 sharing an id) was the swap
+        # near-dup rule, removed 2026-07-27 — it collapsed nothing on the live
+        # corpus, so it was DEX vocabulary in an app-agnostic path.
+        p = {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"}
+        assert quote_case_id("app", 8453, "swap", dict(p)) == \
+               quote_case_id("app", 8453, "swap", dict(p))
+
+    def test_different_amounts_no_longer_collapse(self):
         a = quote_case_id("app", 8453, "swap",
                           {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"})
         b = quote_case_id("app", 8453, "swap",
                           {"input_token": "0xA", "output_token": "0xB", "input_amount": "99"})
-        assert a == b
+        assert a != b
 
 
 class TestDeterminism:
@@ -178,17 +185,28 @@ class TestCapAndGrouping:
 
 
 class TestDedupAndPii:
-    def test_near_dup_same_pair_and_decade_collapse(self):
-        # Same pair, same order-of-magnitude amount → ONE representative, even
-        # though the exact amounts (hence quote_ids) differ.
-        quotes = []
-        for i in range(10):
-            p = {"input_token": "0xA", "output_token": "0xB",
-                 "input_amount": str(1_000_000_000_000_000_000 + i)}
-            quotes.append(_make_quote(chain_id=8453, params=p))
+    def test_exact_reposts_of_one_trade_collapse(self):
+        # Identical params collapse to one representative. (Near-dup collapse
+        # across DIFFERENT amounts in the same decade was the swap bucket,
+        # removed 2026-07-27 — see order_sampler._dedup_key.)
+        p = {"input_token": "0xA", "output_token": "0xB",
+             "input_amount": str(1_000_000_000_000_000_000)}
+        quotes = [_make_quote(chain_id=8453, params=dict(p)) for _ in range(10)]
         store = _FakeQuoteStore(quotes)
         got = sample_historical_quotes(store, "r", n_per_chain=50)
         assert len(got) == 1
+
+    def test_distinct_amounts_are_distinct_demand(self):
+        quotes = [
+            _make_quote(chain_id=8453, params={
+                "input_token": "0xA", "output_token": "0xB",
+                "input_amount": str(1_000_000_000_000_000_000 + i),
+            })
+            for i in range(10)
+        ]
+        store = _FakeQuoteStore(quotes)
+        got = sample_historical_quotes(store, "r", n_per_chain=50)
+        assert len(got) == 10
 
     def test_pii_stripped(self):
         q = _make_quote(quote_id="q_pii")
@@ -530,3 +548,87 @@ class TestQuoteRetirementExclusion:
         store = _RetiringQuoteStore(AppStatus.RETIRED)
         # RETIRED is epoch-independent → dropped even well before any cutover.
         assert self._sampled_ids(store, 999) == []
+
+
+class TestQuoteCaseAllowlist:
+    """Stored quote params are an app-declared ALLOWLIST, not a denylist.
+
+    The denylist it replaces carried its own warning: "a denylist can miss a
+    novel identity key". Measured against the live corpus before shipping —
+    12 of 2372 stored quotes would change, and the shape of those 12 drove
+    the fail-closed design below.
+    """
+
+    MANIFEST = {"intent_functions": [{
+        "name": "swap",
+        "params": {
+            "input_token": {"type": "address", "source": "user"},
+            "output_token": {"type": "address", "source": "user"},
+            "input_amount": {"type": "uint256", "source": "user"},
+            "min_output_amount": {"type": "uint256", "source": "quote"},
+            "receiver": {"type": "address", "source": "system"},
+            "unwrap_output": {"type": "bool", "source": "system"},
+        },
+    }]}
+
+    def _call(self, params, manifest=None, fn="swap"):
+        from minotaur_subnet.harness.order_sampler import quote_case_params
+        return quote_case_params(
+            self.MANIFEST if manifest is None else manifest, fn, params,
+        )
+
+    def test_keeps_only_user_declared_params(self):
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "min_output_amount": "9",       # source=quote  -> dropped
+            "receiver": "0xUSER",           # source=system -> dropped
+        })
+        assert why == "ok"
+        assert kept == {"input_token": "0xA", "output_token": "0xB",
+                        "input_amount": "10"}
+
+    def test_system_flag_is_not_part_of_the_trade(self):
+        # unwrap_output is source=system. It was previously STORED (it appears
+        # in none of the three denylist sets), which is why quotes differing
+        # only by unwrap_output=False read as distinct demand.
+        kept, _ = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "unwrap_output": False,
+        })
+        assert "unwrap_output" not in kept
+
+    def test_novel_identity_key_cannot_leak(self):
+        # The exact hole the denylist's own comment warned about: a key it
+        # never heard of reaching a public endpoint by omission.
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "delegate": "0xSECRET",
+        })
+        assert kept is None and "undeclared" in why
+
+    def test_undeclared_naming_fails_closed(self):
+        # Live corpus had 3 quotes using token_in/token_out/amount_in for
+        # intent "swap". Keeping only the DECLARED subset would leave them
+        # with EMPTY params — all three collapsing to one meaningless case.
+        kept, why = self._call({
+            "token_in": "0xA", "token_out": "0xB", "amount_in": "10",
+        })
+        assert kept is None and "undeclared" in why
+
+    def test_undeclared_intent_function_fails_closed(self):
+        kept, why = self._call({"input_token": "0xA"}, fn="execute")
+        assert kept is None and "declares no params" in why
+
+    def test_no_manifest_fails_closed(self):
+        kept, why = self._call({"input_token": "0xA"}, manifest={})
+        assert kept is None and "declares no params" in why
+
+    def test_platform_appended_fields_are_not_undeclared(self):
+        # intent_params_hex / platform_fee_wei are appended by the platform,
+        # not supplied by the caller — they must not trip the fail-closed path.
+        kept, why = self._call({
+            "input_token": "0xA", "output_token": "0xB", "input_amount": "10",
+            "intent_params_hex": "0xdead", "platform_fee_wei": "5",
+        })
+        assert why == "ok"
+        assert set(kept) == {"input_token", "output_token", "input_amount"}

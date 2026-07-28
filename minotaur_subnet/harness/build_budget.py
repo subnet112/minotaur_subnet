@@ -27,6 +27,21 @@ submits two minutes after a bot flood loses only the builds that PHYSICALLY
 started before it arrived (~1 per 1-3 min), and outranks every queued bot for
 the next unit. Budget-winners keep today's near-immediate build feedback.
 
+HOLDBACK (late-senior protection). Pacing orders waiters who are PRESENT, but
+when builds finish in seconds (warm docker caches on unchanged re-submissions)
+the whole budget can be spent on arrival order minutes after open — before a
+slower-submitting senior miner's pipeline has even pushed (observed 2026-07-26:
+the most senior waiter, ~40h since last bench, arrived 8 min after open and
+found 8/8 units gone to a 48-second bot flood, twice in a row). So the last
+``SOLVER_BUILD_HOLDBACK_UNITS`` units (default 3; 0 disables) are not
+dispensable until ``SOLVER_BUILD_HOLDBACK_SECONDS`` (default 600) after the
+round's gate state is created (~= the first submission's stage-2 entry): the
+flood spends the immediate units, and anyone arriving within the window gets
+ranked by seniority for the held-back remainder. A quiet round loses nothing —
+the units dispense the moment the window lapses (waiters re-dispatch on their
+poll tick, so no grant/release event is needed) and post-close stragglers keep
+the full budget exactly as before.
+
 ONE WAIT-TIME QUEUE (no pools). Units are handed to waiters by
 ``rotation.wait_ts`` seniority — "waiting since when": a hotkey's (actor's) last
 bench, or, if it never benched, its FIRST-SEEN time. A freshly-minted identity's
@@ -36,11 +51,33 @@ newcomer-lottery / spillover apparatus: those existed only because the previous
 rule treated never-benched as MOST senior (ts 0.0), which handed fresh sybils
 the front of the queue and forced a reserved "proven" share to defend against
 it. With first-seen aging there is nothing to defend — minting buys the back of
-the line — so the gate is just: order all waiters by (fresh-actor-first,
-wait-time), grant while budget and pacing allow. Soft per-actor dedup keeps a
-fleet from taking a second unit while any other actor waits; leftover budget in
-a quiet round still fills. Starvation-free: an honest newcomer ages toward the
-front as others bench and reset, benching in its fair turn.
+the line — so the gate is just: order all waiters by (fresh-first, wait-time),
+grant while budget and pacing allow. Soft per-actor dedup keeps a fleet from
+taking a second unit while any other actor waits; leftover budget in a quiet
+round still fills. Starvation-free: an honest newcomer ages toward the front as
+others bench and reset, benching in its fair turn.
+
+STRUCTURAL DEDUP (fresh-CODE, not just fresh-actor). "Fresh" is a per-actor AND
+per-structural-fingerprint bit: a waiter whose actor has spent a unit, OR whose
+structural fingerprint (harness/structural_fingerprint, computed in stage 1 and
+therefore available here) has already been built this round, sorts behind every
+waiter that is fresh on both. WHY: the slate's structural collapse
+(``STRUCTURAL_DEDUP_MODE=enforce``, rotation.select_rotation_slate) seats at
+most one submission per fingerprint, but the build budget was blind to code
+identity — a fleet of DISTINCT coldkeys running structurally-identical code took
+a unit each on the fresh-ACTOR rule, and the slate then collapsed all of them
+back to one seat. Observed 2026-07-27 (rounds e29752736/787/959/e29753023): 7 of
+the 8 units went to one fingerprint, the slate collapsed them to 1, and the
+round benched 2 of its 3 slots while 23 structurally-distinct submissions sat
+parked with no image. Making the queue fingerprint-aware spends the budget on
+DISTINCT code, so the collapsed slate has diverse candidates to seat.
+
+Gated by ``SOLVER_BUILD_STRUCTURAL_DEDUP`` (default: follow the slate lever —
+on iff ``STRUCTURAL_DEDUP_MODE=enforce``; ``1``/``0`` force it either way), read
+ONCE per round at ensure_round so a mid-round env change can't reorder a queue.
+Fingerprint-less waiters never collapse (same rule as the slate), leftover
+budget still fills, and the legacy no-coldkey-map path stays exactly as it was
+(no dedup of either kind — the slate does not collapse there either).
 
 RESTART SAFETY (single-charge). The gate is in-process state; a restart wipes
 it while ``resume_stranded_screenings`` re-kicks pipelines from scratch. On
@@ -116,6 +153,60 @@ def round_build_budget() -> int:
         return 8
 
 
+def holdback_units() -> int:
+    """How many budget units are reserved for the holdback window —
+    ``SOLVER_BUILD_HOLDBACK_UNITS``, default 3 in code, 0 = no holdback
+    (kill-switch: exact pre-holdback dispatch). Values above the round budget
+    simply hold the whole budget until the window lapses.
+    """
+    raw = os.environ.get("SOLVER_BUILD_HOLDBACK_UNITS", "3").strip() or "3"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
+def holdback_seconds() -> float:
+    """How long after gate creation the held-back units stay reserved —
+    ``SOLVER_BUILD_HOLDBACK_SECONDS``, default 600. Anchored at ensure_round
+    (the first stage-2 entry of the round, seconds after open under a flood);
+    in a quiet round the anchor drifts later, which is harmless — a quiet
+    round has budget to spare either way.
+    """
+    raw = os.environ.get("SOLVER_BUILD_HOLDBACK_SECONDS", "600").strip() or "600"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 600.0
+
+
+def structural_build_dedup_enabled() -> bool:
+    """Does the build queue treat a repeat STRUCTURAL FINGERPRINT as "already
+    served" (see the module docstring)?
+
+    ``SOLVER_BUILD_STRUCTURAL_DEDUP``: ``1``/``true``/``on`` forces it on,
+    ``0``/``false``/``off`` is the kill-switch, and anything else (the default,
+    unset) FOLLOWS THE SLATE LEVER — on iff ``STRUCTURAL_DEDUP_MODE=enforce``.
+    Following is the right default because the wasted-slot failure this fixes
+    exists only when the slate actually collapses fingerprints: with the slate
+    lever off or in observe, a fleet's siblings still occupy seats, so
+    reordering builds away from them would change who benches without filling
+    anything.
+
+    Leader-local admission control (which submissions get a docker build), not
+    a consensus parameter — unlike the slate collapse it feeds, it does not
+    touch the pack hash.
+    """
+    raw = os.environ.get("SOLVER_BUILD_STRUCTURAL_DEDUP", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+
+    return structural_dedup_mode() == "enforce"
+
+
 def _dispatch_concurrency() -> int:
     """Grant pacing width — mirrors screening's stage-2 build semaphore
     (``SCREENING_BUILD_CONCURRENCY``, default 1) so granted builds never queue
@@ -160,6 +251,10 @@ class _Waiter:
     # ordering is stable across a mid-round metagraph re-sync.
     key: tuple[float, str, str] | tuple[float, str]
     actor: str = ""
+    # Salt-invariant structural fingerprint from screening stage 1 ("" when the
+    # caller has none — fingerprint-less waiters never collapse, matching the
+    # slate rule in rotation.select_rotation_slate).
+    struct_fp: str = ""
     event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: BuildGrant | None = None
 
@@ -177,12 +272,17 @@ class _RoundGateState:
     actor_last: dict[str, float] = field(default_factory=dict)
     actor_seen: dict[str, float] = field(default_factory=dict)
     now_at: float = 0.0
+    # Snapshotted ONCE at ensure_round: a mid-round env flip must not reorder a
+    # queue that is already dispensing (same discipline as the ledger snapshot).
+    struct_dedup: bool = False
     charged_actors: set[str] = field(default_factory=set)
+    charged_structs: set[str] = field(default_factory=set)
     charged_ids: set[str] = field(default_factory=set)
     charged: int = 0
     in_flight: set[str] = field(default_factory=set)
     waiters: list[_Waiter] = field(default_factory=list)
     flushed: bool = False
+    holdback_lapse_logged: bool = False
 
     @property
     def total_charged(self) -> int:
@@ -220,15 +320,17 @@ class BuildBudgetGate:
         self,
         round_id: str,
         *,
-        prior_attempts: list[tuple[str, str]] | None = None,
+        prior_attempts: list[tuple[str, ...]] | None = None,
     ) -> None:
         """Create (idempotently) the gate state for a round.
 
         ``prior_attempts`` is the restart-rebuild input: ``(submission_id,
-        hotkey)`` pairs whose stage-2 build already started in an earlier
-        process life. Each is charged EXACTLY ONCE against its pool here, and
-        acquire() later grants them for free — a restart never double-charges
-        the round or resets the budget (see module docstring, RESTART SAFETY).
+        hotkey)`` — or ``(submission_id, hotkey, structural_fingerprint)``, so
+        the rebuilt charges also restore the round's built-fingerprint set —
+        whose stage-2 build already started in an earlier process life. Each is
+        charged EXACTLY ONCE against its pool here, and acquire() later grants
+        them for free — a restart never double-charges the round or resets the
+        budget (see module docstring, RESTART SAFETY).
         """
         if round_id in self._rounds:
             return
@@ -250,11 +352,17 @@ class BuildBudgetGate:
             actor_last=actor_last,
             actor_seen=actor_seen,
             now_at=self._now(),
+            # Only meaningful with a coldkey map: the legacy path dispatches in
+            # pure key order (no dedup of either kind) and the slate does not
+            # collapse there either.
+            struct_dedup=(actor_of is not None and structural_build_dedup_enabled()),
         )
-        for sid, hotkey in prior_attempts or []:
+        for entry in prior_attempts or []:
+            sid, hotkey = entry[0], entry[1]
+            struct_fp = entry[2] if len(entry) > 2 else ""
             if sid in state.charged_ids:
                 continue
-            self._charge_unit(state, sid, hotkey)
+            self._charge_unit(state, sid, hotkey, struct_fp)
         self._rounds[round_id] = state
         if prior_attempts:
             logger.info(
@@ -285,22 +393,43 @@ class BuildBudgetGate:
         return state.actor_of(hotkey) or hotkey
 
     @staticmethod
-    def _charge_unit(state: _RoundGateState, submission_id: str, hotkey: str) -> None:
+    def _charge_unit(
+        state: _RoundGateState,
+        submission_id: str,
+        hotkey: str,
+        struct_fp: str = "",
+    ) -> None:
         """Record one spent budget unit for ``submission_id`` (idempotence is
         the caller's job via ``charged_ids``)."""
         state.charged_ids.add(submission_id)
         state.charged_actors.add(BuildBudgetGate._actor(state, hotkey))
+        if struct_fp:
+            state.charged_structs.add(struct_fp)
         state.charged += 1
+
+    @staticmethod
+    def _already_served(state: _RoundGateState, waiter: _Waiter) -> bool:
+        """Has this waiter's ACTOR — or, under structural dedup, its CODE —
+        already spent a unit this round? The "fresh" bit `_pick_next` sorts on.
+        """
+        if waiter.actor in state.charged_actors:
+            return True
+        return bool(
+            state.struct_dedup
+            and waiter.struct_fp
+            and waiter.struct_fp in state.charged_structs
+        )
 
     def _pick_next(self, state: _RoundGateState) -> _Waiter | None:
         """The next waiter to grant — one wait-time queue, no pools.
 
-        Order: fresh-actor first (an actor that has NOT yet spent a unit this
-        round sorts ahead of one that has — soft per-actor dedup, so a fleet
-        never multiplies its build share by hotkey count), then by wait-time
-        seniority (``_Waiter.key``: last-benched, or first-seen for a
-        never-benched identity — a fresh mint is junior). Budget never wasted:
-        once every fresh actor is served, repeat actors fill the remainder.
+        Order: fresh first (an actor that has NOT yet spent a unit this round —
+        and, under structural dedup, code whose fingerprint has not been built
+        this round — sorts ahead of a repeat; so neither a hotkey fleet nor a
+        structurally-identical coldkey fleet multiplies its build share), then
+        by wait-time seniority (``_Waiter.key``: last-benched, or first-seen for
+        a never-benched identity — a fresh mint is junior). Budget never wasted:
+        once every fresh waiter is served, repeats fill the remainder.
         """
         if not state.waiters:
             return None
@@ -308,15 +437,24 @@ class BuildBudgetGate:
             return min(state.waiters, key=lambda w: w.key)
         return min(
             state.waiters,
-            key=lambda w: (w.actor in state.charged_actors, w.key),
+            key=lambda w: (self._already_served(state, w), w.key),
         )
 
     # ── dispatch machinery ───────────────────────────────────────────────
 
     def _grant(self, state: _RoundGateState, waiter: _Waiter) -> None:
+        # Captured BEFORE the charge, so the log says whether this unit bought
+        # the round DISTINCT code or a repeat of something already building.
+        repeat_struct = bool(
+            state.struct_dedup
+            and waiter.struct_fp
+            and waiter.struct_fp in state.charged_structs
+        )
         state.waiters.remove(waiter)
         state.charged_ids.add(waiter.submission_id)
         state.charged_actors.add(waiter.actor)
+        if waiter.struct_fp:
+            state.charged_structs.add(waiter.struct_fp)
         state.charged += 1
         state.in_flight.add(waiter.submission_id)
         waiter.outcome = BuildGrant(
@@ -326,11 +464,36 @@ class BuildBudgetGate:
         waiter.event.set()
         logger.info(
             "[build-budget] %s: granted build to %s (hotkey=%s actor=%s "
-            "spent=%d/%d in_flight=%d waiting=%d)",
+            "struct=%s%s spent=%d/%d structs=%d in_flight=%d waiting=%d)",
             state.round_id, waiter.submission_id, waiter.hotkey[:12],
-            waiter.actor[:12], state.charged, state.budget,
+            waiter.actor[:12], (waiter.struct_fp or "none")[:8],
+            " REPEAT (no fresh-code waiter)" if repeat_struct else "",
+            state.charged, state.budget, len(state.charged_structs),
             len(state.in_flight), len(state.waiters),
         )
+
+    def _dispensable_budget(self, state: _RoundGateState) -> int:
+        """The budget _dispatch may spend RIGHT NOW: the full budget once the
+        holdback window has lapsed (or with holdback disabled), else the
+        budget minus the held-back units. Only pre-flush dispatch is bounded
+        by this — the post-close straggler grant in acquire() keeps the full
+        budget on purpose (the window is long past by any real close).
+        """
+        held = holdback_units()
+        if held <= 0:
+            return state.budget
+        if self._now() - state.now_at < holdback_seconds():
+            return max(0, state.budget - held)
+        if not state.holdback_lapse_logged:
+            state.holdback_lapse_logged = True
+            if state.charged >= state.budget - held:
+                logger.info(
+                    "[build-budget] %s: holdback window lapsed — %d held "
+                    "unit(s) now dispensable (%d/%d spent, %d waiting)",
+                    state.round_id, min(held, state.budget),
+                    state.charged, state.budget, len(state.waiters),
+                )
+        return state.budget
 
     def _dispatch(self, state: _RoundGateState) -> None:
         if state.flushed:
@@ -339,7 +502,7 @@ class BuildBudgetGate:
         while (
             state.waiters
             and len(state.in_flight) < concurrency
-            and state.charged < state.budget
+            and state.charged < self._dispensable_budget(state)
         ):
             pick = self._pick_next(state)
             if pick is None:
@@ -356,12 +519,16 @@ class BuildBudgetGate:
         round_id: str,
         prior_attempt: bool = False,
         round_is_open: Callable[[], bool] | None = None,
+        structural_fingerprint: str = "",
     ) -> BuildGrant:
         """Ask for a build unit; may WAIT (until grant, or the close-time
         flush, or a detected round close). ``prior_attempt`` marks a restart
         re-dispatch whose unit was already spent — it passes free, exactly
-        once. Callers must ensure_round() first and must release() after the
-        build whenever this returns granted.
+        once. ``structural_fingerprint`` is the caller's stage-1 fingerprint
+        (optional; "" opts this waiter out of the structural collapse, exactly
+        like a fingerprint-less submission in the slate). Callers must
+        ensure_round() first and must release() after the build whenever this
+        returns granted.
         """
         state = self._rounds.get(round_id)
         if state is None:
@@ -379,7 +546,9 @@ class BuildBudgetGate:
         # (or earlier in this one) — pass free, and count exactly once.
         if prior_attempt or submission_id in state.charged_ids:
             if submission_id not in state.charged_ids:
-                self._charge_unit(state, submission_id, hotkey)
+                self._charge_unit(
+                    state, submission_id, hotkey, structural_fingerprint,
+                )
             state.in_flight.add(submission_id)
             return BuildGrant(
                 granted=True, charged=False,
@@ -393,7 +562,9 @@ class BuildBudgetGate:
             # exactly the pre-gate semantics for slow screeners, still bounded
             # by the round's budget — otherwise deny (caller parks no-fault).
             if state.total_charged < state.budget:
-                self._charge_unit(state, submission_id, hotkey)
+                self._charge_unit(
+                    state, submission_id, hotkey, structural_fingerprint,
+                )
                 state.in_flight.add(submission_id)
                 return BuildGrant(
                     granted=True, charged=True,
@@ -422,6 +593,7 @@ class BuildBudgetGate:
                 )
             ),
             actor=self._actor(state, hotkey or ""),
+            struct_fp=structural_fingerprint or "",
         )
         state.waiters.append(waiter)
         self._dispatch(state)
@@ -429,6 +601,13 @@ class BuildBudgetGate:
             try:
                 await asyncio.wait_for(waiter.event.wait(), timeout=_WAIT_POLL_SECONDS)
             except asyncio.TimeoutError:
+                # Held-back units dispense on a clock, not an event: with no
+                # grant/release traffic after the holdback window lapses,
+                # somebody has to run dispatch — the poll tick is that
+                # somebody (worst case one poll interval of extra latency).
+                self._dispatch(state)
+                if waiter.outcome is not None:
+                    return waiter.outcome
                 # Round closed without a rotation flush (manual close / abort)
                 # — self-evict so the coroutine never waits forever. The
                 # caller parks the submission no-fault.
@@ -535,9 +714,12 @@ class BuildBudgetGate:
             return None
         return {
             "budget": state.budget,
+            "dispensable_budget": self._dispensable_budget(state),
             "charged_count": state.charged,
             "charged": sorted(state.charged_ids),
             "charged_actors": sorted(state.charged_actors),
+            "structural_dedup": state.struct_dedup,
+            "charged_structs": sorted(state.charged_structs),
             "in_flight": sorted(state.in_flight),
             "waiting": [w.submission_id for w in state.waiters],
             "flushed": state.flushed,

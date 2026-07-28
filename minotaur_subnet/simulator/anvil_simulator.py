@@ -54,6 +54,27 @@ from minotaur_subnet.simulator.revert_decoder import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_read(fn: Any, default: str = "?") -> Any:
+    """Best-effort read for diagnostics — a failing probe must never mask the
+    original error it is trying to explain."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return default
+
+
+def _coerce_chain_id(value: Any) -> int | None:
+    """Best-effort chain-id → int, or None when absent/unparseable."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class SimulatorStateError(RuntimeError):
     """Raised when the anvil fork's baseline state cannot be restored.
 
@@ -236,7 +257,13 @@ def _sim_offload_enabled() -> bool:
     preserve the exact same serialization and therefore byte-for-byte
     determinism WITHIN one simulation.
 
-    DEFAULT OFF — VALIDATED GATE, do not flip on until closed. The original
+    DEFAULT ON since 2026-07 (SIM_OFFLOAD_TO_THREAD=0 is the kill-switch): the
+    arming gates below are CLOSED and the flag ran in production on the leader
+    from 2026-07-24 through fleet-uniform promotion of the offload-aware
+    scoring (#1068, main 91e430e) with zero determinism divergence — the
+    default now matches the soaked production config instead of silently
+    reverting to the freeze-prone inline path when the env var is absent.
+    History of the gate (kept for the next reader): the original
     blocker — ``SimulationRunner`` seeding the fork (deposit-contract deals +
     user fee deal/approve; the approve MINES A BLOCK) ON THE EVENT LOOP, before
     ``await simulate()`` and OUTSIDE both ``_sim_lock`` and
@@ -251,26 +278,24 @@ def _sim_offload_enabled() -> bool:
     with the snapshot like every other sim mutation — see
     :meth:`AnvilSimulator._apply_relocated_seeds`. No loop-side fork mutation
     remains on that path.
-    REMAINING GATES before flipping on: (a) re-run the benchmark determinism
-    soak WITH the flag on (byte-for-byte gas_used / on_chain_score across
-    validators); (b) the two loop-stall caveats below.
+    The determinism soak (byte-for-byte gas_used / on_chain_score across
+    validators) ran WITH the flag on in production — gate (a) closed.
 
-    LOOP-STALL CAVEATS — two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY
-    on the event loop, so with offload on, a collision with an in-flight
-    offloaded sim stalls the ENTIRE loop for the remainder of that sim — the
-    exact freeze this flag exists to eliminate:
+    RESIDUAL LOOP-STALL CAVEATS (accepted, bounded — a collision stalls the
+    loop only for the remainder of the one in-flight sim, not indefinitely):
+    two callers take ``_fork_mutation_lock`` SYNCHRONOUSLY on the event loop:
       * :meth:`AnvilSimulator.pin_read_fork` — dormant today (its caller is
-        gated behind PIN_SOLVER_READ_BLOCK, off); make it async before flipping
-        both flags together.
+        gated behind PIN_SOLVER_READ_BLOCK, off); make it async before arming
+        that flag with offload on.
       * :meth:`AnvilSimulator.simulate_with_trace` — LIVE in the monolith
         deployment: ``_capture_revert_trace`` (harness/orchestrator.py,
         benchmark revert-trace capture, default ``BENCHMARK_REVERT_TRACE_MAX=10``)
-        calls it synchronously on the event loop. Before enabling, either
-        offload the trace capture too or set ``BENCHMARK_REVERT_TRACE_MAX=0``.
-
-    Set ``SIM_OFFLOAD_TO_THREAD=1`` only once those gates are cleared.
+        calls it synchronously on the event loop; production has run this
+        combination since 2026-07-24 without a freeze recurrence. Offloading
+        the trace capture (or ``BENCHMARK_REVERT_TRACE_MAX=0``) removes even
+        the bounded stall.
     """
-    return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "0") or "").strip().lower() in {
+    return (os.environ.get("SIM_OFFLOAD_TO_THREAD", "1") or "").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
@@ -342,7 +367,7 @@ class AnvilSimulator:
         # revert failed" / fork-poison false positives. One lock per fork makes
         # the snapshot→execute→revert window atomic.
         self._sim_lock = asyncio.Lock()
-        # With SIM_OFFLOAD_TO_THREAD (default OFF; see _sim_offload_enabled) the
+        # With SIM_OFFLOAD_TO_THREAD (default ON; see _sim_offload_enabled) the
         # sim body runs in a worker thread, so it can now execute CONCURRENTLY
         # with loop-side code that also touches this fork. Two threading locks
         # bridge that boundary
@@ -442,7 +467,7 @@ class AnvilSimulator:
 
         Holds the per-fork asyncio lock for the whole snapshot→execute→revert
         window so concurrent callers can't corrupt each other's snapshot state.
-        Under ``SIM_OFFLOAD_TO_THREAD`` (default OFF — see
+        Under ``SIM_OFFLOAD_TO_THREAD`` (default ON — see
         :func:`_sim_offload_enabled` for the enabling gate) the synchronous body
         runs in a worker thread so it can't freeze the event loop; the asyncio
         lock is only ever acquired/released ON the loop (never inside the
@@ -775,6 +800,46 @@ class AnvilSimulator:
                 "to": target,
                 "data": "0x" + relayer_sig.hex(),
             })
+            # An empty (or too-short) return means relayer() didn't resolve at
+            # THIS fork state — e.g. the contract has no code at this block
+            # (fork pinned/forked below the deploy block) or the address is on
+            # the wrong chain's fork. Web3.to_checksum_address("0x") would then
+            # raise a cryptic ValueError. Fail closed with a DIAGNOSABLE log
+            # (chain / fork block / code length) and return None ("unresolved",
+            # not scored) so callers skip the probe cleanly instead of throwing.
+            if len(relayer_result) < 20:
+                chain_id = _safe_read(lambda: self.w3.eth.chain_id)
+                fork_block = _safe_read(lambda: self.w3.eth.block_number)
+                code_len = _safe_read(lambda: len(self.w3.eth.get_code(target)))
+                # DIAGNOSTIC (2026-07-28): pin why an ETH contract reaches a Base
+                # anvil. Log what the PLAN / intent_order think their chain is vs
+                # the anvil chain above. A plan-chain that disagrees with the
+                # anvil chain means a mis-stamped plan won _get_simulator (the
+                # authoritative chain_id wasn't threaded); an order_chain that
+                # matches the anvil but a foreign contract means the scenario's
+                # chain/contract disagree. scenario= identifies the corpus source.
+                plan_meta_chain = _safe_read(lambda: plan.metadata.get("chain_id"))
+                plan_ix_chain = _safe_read(
+                    lambda: plan.interactions[0].chain_id if plan.interactions else None)
+                order_chain = _safe_read(
+                    lambda: intent_order.get("chain_id") if isinstance(intent_order, dict) else None)
+                scen = _safe_read(lambda: (plan.metadata or {}).get("_scenario_name"))
+                logger.warning(
+                    "scoreIntent: relayer() UNRESOLVED for %s — empty call "
+                    "return (anvil_chain=%s fork_block=%s contract_code_len=%s | "
+                    "plan.meta_chain=%s plan.ix_chain=%s order.chain=%s "
+                    "scenario=%s); skipping sim (unresolved, not scored)",
+                    target, chain_id, fork_block, code_len,
+                    plan_meta_chain, plan_ix_chain, order_chain, scen,
+                )
+                print(
+                    f"[SIM] relayer() UNRESOLVED for {target} anvil_chain={chain_id} "
+                    f"fork_block={fork_block} code_len={code_len} "
+                    f"plan_meta_chain={plan_meta_chain} plan_ix_chain={plan_ix_chain} "
+                    f"order_chain={order_chain} scenario={scen}",
+                    flush=True,
+                )
+                return None
             relayer_addr = Web3.to_checksum_address(
                 "0x" + relayer_result[-20:].hex()
             )
@@ -2182,29 +2247,50 @@ class MultiChainSimulator:
             return SubtensorSimulator(sidecar_url=url, chain_id=chain_id)
         return AnvilSimulator(rpc_url=url, upstream_rpc_url=upstream, **kwargs)
 
-    def _get_simulator(self, plan: ExecutionPlan) -> AnvilSimulator | None:
-        """Resolve the correct simulator for a plan's chain.
+    def _get_simulator(
+        self, plan: ExecutionPlan, chain_id: Any = None,
+    ) -> AnvilSimulator | None:
+        """Resolve the correct simulator for a sim's chain.
 
-        Resolution order:
-        1. plan.metadata["chain_id"] — explicit hint
-        2. plan.interactions[0].chain_id — inferred from the plan itself
-        3. self.default_chain_id — last-resort (typically local testnet)
+        ``chain_id`` — when the caller passes it — is the request/scenario chain
+        that ALSO resolved the contract address, and is therefore AUTHORITATIVE:
+        the sub-simulator (hence the anvil fork) is selected for it, so the fork
+        always matches the chain the contract lives on. The plan's own chain
+        hint is used only to cross-check (a disagreement is a routing bug and is
+        logged) — it never overrides the request. This closes the split-brain
+        where the contract was resolved for one chain (``req.chain_id``) but the
+        anvil was picked from the plan, e.g. an Ethereum DEX contract simulated
+        on the Base fork → empty ``relayer()`` → silent zero.
+
+        Legacy callers pass no ``chain_id``; those keep the prior plan-derived
+        resolution with a default-chain fallback:
+        1. plan.metadata["chain_id"]  2. plan.interactions[0].chain_id
+        3. self.default_chain_id
         """
-        chain_id = plan.metadata.get("chain_id")
-        if chain_id is None and plan.interactions:
-            # Fallback: infer from the plan's first interaction. Callers
-            # (including /v1/apps/{id}/score) don't always stuff chain_id
-            # into metadata, but every Interaction carries it.
-            chain_id = plan.interactions[0].chain_id
-        if chain_id is None:
-            chain_id = self.default_chain_id
-        if isinstance(chain_id, str):
-            try:
-                chain_id = int(chain_id)
-            except ValueError:
-                chain_id = self.default_chain_id
+        plan_chain = plan.metadata.get("chain_id")
+        if plan_chain is None and plan.interactions:
+            # Every Interaction carries a chain_id even when metadata omits it.
+            plan_chain = plan.interactions[0].chain_id
+        plan_chain = _coerce_chain_id(plan_chain)
 
-        sim = self.simulators.get(chain_id)
+        authoritative = _coerce_chain_id(chain_id)
+        if authoritative is not None:
+            if plan_chain is not None and plan_chain != authoritative:
+                logger.warning(
+                    "sim chain mismatch: request/scenario chain=%s but plan "
+                    "hint chain=%s — routing to the authoritative request chain "
+                    "%s. (A plan mis-stamped with another chain would otherwise "
+                    "run this chain's contract on the wrong fork.)",
+                    authoritative, plan_chain, authoritative,
+                )
+            # Authoritative chain with no configured sub-sim: return None so the
+            # caller fails CLOSED with a clean "no simulator for chain X" error,
+            # rather than silently routing to the default/local fork — that
+            # silent misroute is exactly the footgun this method now prevents.
+            return self.simulators.get(authoritative)
+
+        target = plan_chain if plan_chain is not None else self.default_chain_id
+        sim = self.simulators.get(target)
         if sim is None:
             sim = self.simulators.get(self.default_chain_id)
         return sim
@@ -2257,16 +2343,28 @@ class MultiChainSimulator:
     async def simulate(
         self,
         plan: ExecutionPlan,
+        *,
+        chain_id: Any = None,
         **kwargs: Any,
     ) -> SimulationResult:
-        """Simulate a plan on the correct chain's Anvil fork."""
-        sim = self._get_simulator(plan)
+        """Simulate a plan on the correct chain's Anvil fork.
+
+        ``chain_id`` (the request/scenario chain that resolved the contract
+        address) is authoritative for chain selection — see
+        :meth:`_get_simulator`. It is consumed here and never forwarded to the
+        single-chain ``AnvilSimulator.simulate``.
+        """
+        sim = self._get_simulator(plan, chain_id=chain_id)
         if sim is None:
-            chain_id = plan.metadata.get("chain_id", self.default_chain_id)
+            resolved = (
+                _coerce_chain_id(chain_id)
+                if chain_id is not None
+                else plan.metadata.get("chain_id", self.default_chain_id)
+            )
             return SimulationResult(
                 success=False,
                 gas_used=0,
-                error=f"No simulator configured for chain {chain_id}",
+                error=f"No simulator configured for chain {resolved}",
             )
         return await sim.simulate(plan, **kwargs)
 
@@ -2274,27 +2372,49 @@ class MultiChainSimulator:
         self,
         plan: ExecutionPlan,
         bridge_registry: Any = None,
+        deterministic_bridge: bool = False,
         **kwargs: Any,
     ) -> SimulationResult:
         """Simulate a cross-chain plan by running each leg independently.
 
         Source and destination legs are simulated on their respective chain
-        forks.  Bridge legs are not simulated — a quote estimate is used
-        instead.  Falls back to single-chain ``simulate()`` when the plan
-        has no ``metadata["legs"]``.
+        forks.  Bridge legs are not simulated — an estimate is used instead.
+        Accepts the legacy ``metadata["legs"]`` convention directly and
+        projects the modern ``multi_leg_plan`` / ``cross_chain_plan`` shapes
+        onto it; falls back to single-chain ``simulate()`` when the plan is
+        not multi-leg at all.
 
         Args:
-            plan: Execution plan (may contain ``metadata["legs"]``).
-            bridge_registry: Optional ``BridgeRegistry`` for bridge quotes.
+            plan: Execution plan (legacy ``metadata["legs"]`` or a modern
+                cross-chain shape).
+            bridge_registry: Optional ``BridgeRegistry`` for LIVE bridge
+                quotes. Correct for the live rail; must NOT be passed from
+                the benchmark — see ``deterministic_bridge``.
+            deterministic_bridge: Use the fixed-fee benchmark bridge model
+                (simulator/cross_chain_bench) applied to the amount the
+                source leg was OBSERVED to move, instead of a live quote.
+                Required for any scored path: a live quote makes two
+                validators seed the destination fork differently, and the
+                solver's own declared output is self-reported. Ignores
+                ``bridge_registry`` when set.
             **kwargs: Forwarded to per-chain ``AnvilSimulator.simulate()``.
 
         Returns:
             Combined ``SimulationResult`` with ``leg_results`` and
             ``bridge_estimate`` populated.
         """
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            benchmark_bridge_estimate,
+            normalize_to_legs,
+            observed_bridged_amount,
+        )
+
+        if not plan.metadata.get("legs"):
+            normalized = normalize_to_legs(plan)
+            if normalized is None:
+                return await self.simulate(plan, **kwargs)
+            plan = normalized
         legs = plan.metadata.get("legs")
-        if not legs:
-            return await self.simulate(plan, **kwargs)
 
         leg_results: dict[int, Any] = {}
         bridge_estimate: dict[str, Any] | None = None
@@ -2338,7 +2458,27 @@ class MultiChainSimulator:
                 continue
 
             if leg.get("type") == "bridge":
-                # Don't simulate bridge — use quote estimate
+                # Don't simulate the bridge itself — estimate what arrives.
+                if deterministic_bridge:
+                    # Scored path. EXECUTE the deposit with its calldata
+                    # mocked to an ERC-20 transfer, rather than assuming it
+                    # succeeds: the proxy only holds what the source leg
+                    # actually produced, so a plan declaring a bridge amount
+                    # it never earned reverts here instead of being credited
+                    # for delivery on the far side. The amount is then read
+                    # back off the simulation — not off the plan.
+                    moved, amount_source = await self._simulate_mocked_bridge(
+                        plan, leg, kwargs,
+                    )
+                    bridge_estimate = benchmark_bridge_estimate(
+                        moved, leg.get("token_out", ""), amount_source,
+                    )
+                    leg_results[leg_id] = {
+                        "success": moved > 0,
+                        "type": "bridge",
+                        "bridge_estimate": bridge_estimate,
+                    }
+                    continue
                 if bridge_registry is not None:
                     try:
                         token_in = plan.metadata.get("bridge_token", "")
@@ -2430,6 +2570,63 @@ class MultiChainSimulator:
             leg_results=leg_results,
             bridge_estimate=bridge_estimate,
         )
+
+    async def _simulate_mocked_bridge(
+        self,
+        plan: ExecutionPlan,
+        leg: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[int, str]:
+        """Run the journey up to and including the bridge deposit; report what moved.
+
+        Returns ``(amount, source)`` where source is:
+          "simulated" — the deposit executed (real calldata mocked, or
+              synthesized for the calldata-less solver shape) after the
+              preceding same-chain legs, and this is the amount observed
+              leaving for the bridge. Trustworthy: an amount the journey
+              didn't actually earn cannot transfer.
+          "declared"  — nothing executable to observe (no calldata AND no
+              token/amount to synthesize a deposit from, or no simulator for
+              the chain), so the plan's declared amount is all there is.
+              Weaker, and labelled as such.
+          "unfilled"  — the deposit (or a leg before it) reverted, or moved
+              nothing. No credit.
+        """
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            bridge_execution_plan,
+            observed_bridged_amount,
+        )
+
+        try:
+            declared = int(leg.get("bridge_amount") or 0)
+        except (ValueError, TypeError):
+            declared = 0
+
+        # One combined simulation: every preceding same-chain leg, then the
+        # deposit (mocked, or SYNTHESIZED for the calldata-less solver
+        # shape). Simulating the bridge leg alone would run it against the
+        # fork's seeded balances — crediting bridge-first plans while
+        # reverting honest swap-then-bridge ones — and the solver shape
+        # could only ever measure as "declared" (self-reported). See
+        # cross_chain_bench.bridge_execution_plan.
+        mocked = bridge_execution_plan(plan, leg)
+        if mocked is None:
+            return max(0, declared), "declared"
+
+        sim = self.simulators.get(leg.get("chain_id", self.default_chain_id))
+        if sim is None:
+            return max(0, declared), "declared"
+
+        try:
+            result = await sim.simulate(mocked, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Mocked bridge leg simulation failed: %s", exc)
+            return 0, "unfilled"
+        if not result.success:
+            return 0, "unfilled"
+
+        moved = observed_bridged_amount(result.token_transfers)
+        return (moved, "simulated") if moved > 0 else (0, "unfilled")
 
     def is_connected(self) -> bool:
         """True if at least one chain simulator is connected."""

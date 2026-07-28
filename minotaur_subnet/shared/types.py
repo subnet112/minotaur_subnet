@@ -134,8 +134,35 @@ class Interaction:
 # Kept for backward compatibility with legacy cross-chain path.
 _BRIDGE_CALL_SELECTORS = {
     "81b4e8b4",  # Hyperlane transferRemote(uint32,bytes32,uint256)
+    "7b939232",  # Across depositV3(address,address,address,address,uint256,
+                 #   uint256,uint256,address,uint32,uint32,uint32,bytes)
+    "8e0250ee",  # CCTP v2 depositForBurn(uint256,uint32,bytes32,address,
+                 #   bytes32,uint256,uint32)
 }
 _MOCK_BRIDGE_TARGET = "0x" + "BB" * 20
+
+
+def mock_bridge_deposit(
+    token_address: str,
+    amount: int,
+    chain_id: int,
+) -> "Interaction":
+    """The canonical mocked bridge deposit: ``token.transfer(mock, amount)``.
+
+    One encoder for BOTH replacement (a real bridge call being mocked) and
+    synthesis (a solver-shape bridge leg that carries no calldata yet) — the
+    two paths must stay byte-identical so the observed amount can never
+    depend on which shape the plan arrived in.
+    """
+    from eth_abi import encode as _enc
+    return Interaction(
+        target=token_address,
+        value="0",
+        call_data="0x" + "a9059cbb" + _enc(
+            ["address", "uint256"], [_MOCK_BRIDGE_TARGET, max(0, int(amount))],
+        ).hex(),
+        chain_id=chain_id,
+    )
 
 
 def mock_bridge_interactions(
@@ -163,16 +190,8 @@ def mock_bridge_interactions(
             # Replace with: token.transfer(mockBridge, amount)
             if not amount:
                 logger.warning("mock_bridge_interactions: no amount provided, mock may be inaccurate")
-            from eth_abi import encode as _enc
-            mock_cd = "0x" + "a9059cbb" + _enc(
-                ["address", "uint256"],
-                [_MOCK_BRIDGE_TARGET, amount if amount else 0],
-            ).hex()
-            result.append(Interaction(
-                target=token_address or ix.target,
-                value="0",
-                call_data=mock_cd,
-                chain_id=ix.chain_id,
+            result.append(mock_bridge_deposit(
+                token_address or ix.target, amount, ix.chain_id,
             ))
         else:
             result.append(ix)
@@ -431,25 +450,41 @@ class CrossChainPlan:
     The platform's CrossChainCompiler converts this into an executable
     MultiLegPlan with bridge calldata, escrow, rollback, and simulation
     mocks — none of which the solver controls.
+
+    revert_legs (OPTIONAL, additive): solver-authored recovery legs, one per
+    failure point. Each is a ChainLeg whose ``metadata["revert_for_leg"]``
+    names the (0-based) solver leg whose failure it recovers from — e.g. a
+    destination-chain swap back to the bridged asset when leg 1 can't meet
+    its min-out. The compiler validates them like forward legs (bridge
+    selectors banned) and appends the platform's reverse-bridge after them,
+    so an absent/failed solver revert still falls back to the reverse-bridge
+    rollback. Solvers that don't emit revert_legs are unaffected: the field
+    is omitted from serialization when empty, keeping the wire shape
+    byte-identical to pre-revert_legs plans.
     """
     legs: list[ChainLeg]
     bridge_requests: list[BridgeRequest]
+    revert_legs: list[ChainLeg] = field(default_factory=list)
 
     @property
     def is_cross_chain(self) -> bool:
         return len(self.bridge_requests) > 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "legs": [leg.to_dict() for leg in self.legs],
             "bridge_requests": [br.to_dict() for br in self.bridge_requests],
         }
+        if self.revert_legs:
+            d["revert_legs"] = [leg.to_dict() for leg in self.revert_legs]
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CrossChainPlan":
         return cls(
             legs=[ChainLeg.from_dict(l) for l in d.get("legs", [])],
             bridge_requests=[BridgeRequest.from_dict(br) for br in d.get("bridge_requests", [])],
+            revert_legs=[ChainLeg.from_dict(l) for l in d.get("revert_legs", [])],
         )
 
 
@@ -492,6 +527,17 @@ class SimulationResult:
     gas_metered: int | None = None
     leg_results: dict[int, Any] | None = None       # leg_id -> per-leg sim result dict
     bridge_estimate: dict[str, Any] | None = None    # bridge quote data for cross-chain
+    # The platform's DESTINATION-LEG delivery measurement for a multi-leg plan
+    # (simulator/cross_chain_bench.py, benchmark path only): exact decimal wei
+    # string observed on the plan's final leg, and the provenance of that
+    # amount ("simulated" | "declared" | "unfilled"). Attached by the
+    # benchmark orchestrator AFTER the scored simulation so the app's OWN
+    # scorer can read it from context.simulation and decide what delivery on
+    # another chain is worth — the platform never interprets these itself
+    # (what an intent must deliver, and where, is the app's contract).
+    # None everywhere but the benchmark path, and for every single-leg plan.
+    destination_delivered: str | None = None
+    destination_amount_source: str | None = None
 
 
 # ── cross-chain plan helpers ─────────────────────────────────────────────────

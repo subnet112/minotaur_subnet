@@ -42,6 +42,8 @@ from .models import (
     CloseRoundRequest,
     DiagnosticScoreRequest,
     SolverChampionResponse,
+    SolverQueueEntry,
+    SolverQueueResponse,
     SolverRoundResponse,
     SolverRoundSummary,
     SolverRoundsResponse,
@@ -1775,6 +1777,10 @@ def _round_summary_from_dict(d: dict[str, Any]) -> SolverRoundSummary:
         effective_epoch=d.get("effective_epoch"),
         effective_at=epoch_start_ts(d.get("effective_epoch")),
         abort_reason=d.get("abort_reason"),
+        incumbent_hotkey=d.get("incumbent_hotkey"),
+        benched_slate=(
+            list(d["benched_slate"]) if isinstance(d.get("benched_slate"), list) else None
+        ),
         created_at=float(d.get("created_at") or 0.0),
         updated_at=float(d.get("updated_at") or 0.0),
     )
@@ -1803,6 +1809,161 @@ async def list_solver_rounds(
         limit=limit,
         offset=offset,
         rounds=[_round_summary_from_dict(d) for d in rows],
+    )
+
+
+@router.get("/solver/queue", response_model=SolverQueueResponse)
+async def get_solver_queue(
+    hotkey: str | None = Query(None),
+) -> SolverQueueResponse:
+    """Rotation-queue standing per hotkey: last benched, first seen, seniority.
+
+    A read-only join of the rotation ledger (harness/rotation.py) with the
+    actor resolver (harness/actor.py) — the SAME inputs the close-time slate
+    selection sorts by, so a miner can see exactly where they stand instead of
+    inferring it from waitlist prose: ``last_benched_at`` answers "when was I
+    last benchmarked", ``waiting_since`` is the seniority clock the next slate
+    sorts by (lower = seated sooner), and ``rank`` is the indicative position
+    among distinct actors. Powers the dashboard's per-miner stats page.
+
+    Leader-local by nature: the ledger is the leader's admission-control state,
+    so on followers / split benchmark workers the file is absent and the queue
+    is empty — same category as the waitlist context on submission status.
+    Public read: the ledger holds only hotkeys + timestamps, all reconstructible
+    from public submission history and on-chain coldkeys (the rotation docstring
+    explicitly promises the ordering is recomputable from public data).
+
+    ``?hotkey=`` filters to one entry AFTER ranking, so a single-miner query
+    still reports the global rank/total.
+
+    HONESTY HARDENING (the 2026-07-26 live read taught this): the raw ledger
+    is "every hotkey ever seen", which is NOT "the queue". Dormant miners'
+    clocks grow forever by design (their seniority must survive an absence),
+    and deregistered hotkeys are relics that cannot submit at all (intake
+    fail-closes on metagraph membership) — presenting either as "waiting" read
+    as starvation when nobody active was starved. So each entry now carries
+    ``registered`` (in the current metagraph) and ``contending`` (live
+    submission in the open round — the only entries the next slate can
+    actually seat), and ``rank`` is computed over registered actors only so
+    relics don't hold places in line. The full ledger stays in the response —
+    labeled, never hidden.
+    """
+    from minotaur_subnet.harness.actor import (
+        actor_first_seen,
+        actor_last_selected,
+        snapshot_resolver,
+    )
+    from minotaur_subnet.harness.rotation import (
+        RotationLedger,
+        absence_reset_seconds,
+        actor_evidence_map,
+        fold_reset,
+        is_terminal_status,
+        rotation_ledger_path,
+        wait_ts,
+    )
+
+    ledger = RotationLedger(rotation_ledger_path())
+    benched = ledger.load()
+    seen = ledger.load_seen()
+    active = ledger.load_active()
+    resolver = snapshot_resolver()
+    now = time.time()
+    # Selection-truth seniority: absence resets folded into the benched anchor
+    # (fold_reset), exactly as the close-time slate selection sorts. The raw
+    # benched map still feeds last_benched_at so bench history stays honest.
+    benched_eff = fold_reset(benched, ledger.load_reset())
+    actor_benched = (
+        actor_last_selected(benched_eff, resolver) if resolver is not None else {}
+    )
+    actor_seen = actor_first_seen(seen, resolver) if resolver is not None else {}
+    # Absence rule, read-time: an identity absent longer than the window will
+    # re-enter as a newcomer (the persisted reset lands at its return round),
+    # so DISPLAY the demotion now — otherwise a 24d-idle miner still shows at
+    # rank 1 while absent, which is exactly the lie this endpoint exists to
+    # avoid. Same evidence rule as the selection-side detection.
+    threshold = absence_reset_seconds()
+    evidence = actor_evidence_map(active, benched, seen, resolver)
+    uid_by_hotkey = _hotkey_to_uid_map()
+    # Fail-open like miner_uid: an unsynced/unwired metagraph must degrade
+    # registered to null (indeterminate) — never mark live miners as relics.
+    have_metagraph = bool(uid_by_hotkey)
+
+    # Contending = a live (non-terminal) submission in the current OPEN round.
+    # Pure reads (worker-safe: get_current_round never writes); best-effort —
+    # a failure degrades to "nobody contending", never a 500.
+    round_id: str | None = None
+    contending: set[str] = set()
+    try:
+        current = get_round_store().get_current_round()
+        if current is not None:
+            round_id = current.round_id
+            for s in get_store().list_by_round(round_id):
+                if not is_terminal_status(s):
+                    hk = getattr(s, "hotkey", "") or ""
+                    if hk:
+                        contending.add(hk)
+    except Exception:
+        logger.warning("solver queue: contending lookup failed (degrading)", exc_info=True)
+        round_id, contending = None, set()
+
+    entries: list[SolverQueueEntry] = []
+    for hk in set(benched) | set(seen):
+        actor = resolver(hk) if resolver is not None else None
+        waiting = (
+            wait_ts(actor, actor_benched, actor_seen, now)
+            if actor is not None
+            else wait_ts(hk, benched_eff, seen, now)
+        )
+        is_contending = hk in contending
+        expired = False
+        if threshold > 0 and not is_contending:
+            last_evidence = evidence.get(actor or hk, now)
+            if now - last_evidence > threshold:
+                expired = True
+                waiting = max(waiting, now)
+        entries.append(SolverQueueEntry(
+            hotkey=hk,
+            miner_uid=uid_by_hotkey.get(hk),
+            actor=actor,
+            registered=(hk in uid_by_hotkey) if have_metagraph else None,
+            contending=is_contending,
+            first_seen_at=seen.get(hk),
+            last_benched_at=benched.get(hk),
+            last_active_at=active.get(hk),
+            waiting_since=waiting,
+            seniority_expired=expired,
+        ))
+    # Seniority order. The hotkey tie-break is only for a stable listing — the
+    # real per-round tie-break is the salted per-round shuffle (rotation_sort_key).
+    entries.sort(key=lambda e: (e.waiting_since, e.hotkey))
+    # Rank over actors that can still compete: an actor with >= 1 registered
+    # hotkey (or every actor when the metagraph is indeterminate). A relic
+    # actor's entries stay listed but unranked — they hold no place in line.
+    rankable_actors: set[str] = {
+        e.actor or e.hotkey for e in entries if e.registered is not False
+    }
+    ranks: dict[str, int] = {}
+    for e in entries:
+        key = e.actor or e.hotkey
+        if key in rankable_actors:
+            e.rank = ranks.setdefault(key, len(ranks) + 1)
+    total = len(entries)
+    registered_count = (
+        sum(1 for e in entries if e.registered) if have_metagraph else None
+    )
+    contending_count = sum(1 for e in entries if e.contending)
+    if hotkey:
+        entries = [e for e in entries if e.hotkey == hotkey]
+    return SolverQueueResponse(
+        generated_at=now,
+        actor_keyed=resolver is not None,
+        round_id=round_id,
+        total=total,
+        count=len(entries),
+        registered_count=registered_count,
+        contending_count=contending_count,
+        queue=entries,
     )
 
 

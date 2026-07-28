@@ -1026,7 +1026,14 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
         return
     try:
         prior = [
-            (s.submission_id, s.hotkey or "")
+            (
+                s.submission_id,
+                s.hotkey or "",
+                # Restores the round's built-fingerprint set too, so a restart
+                # cannot hand the structural-dedup queue a clean slate and
+                # re-spend the budget on code it already built.
+                getattr(s, "structural_fingerprint", "") or "",
+            )
             for s in store.list_by_round(round_id)
             if _has_prior_build_attempt(s)
         ]
@@ -1038,15 +1045,16 @@ def _ensure_budget_round(store: Any, round_id: str) -> None:
         )
 
 
-async def _acquire_build_grant(store: Any, sub: Any):
+async def _acquire_build_grant(store: Any, sub: Any, structural_fingerprint: str = ""):
     """Wire the pipeline into the per-round build-budget gate (may WAIT).
 
     Gathers the leader-local context the gate needs — a liveness probe (so a
-    waiter never outlives a round closed without a rotation flush) and the
-    restart-rebuild input (prior build attempts, charged exactly once) — then
-    asks for a unit. Units are dispensed from one wait-time seniority queue
-    (last bench, or first-seen for the never-benched). See
-    harness/build_budget.py for the allocation rules and the 2026-07-16
+    waiter never outlives a round closed without a rotation flush), the
+    restart-rebuild input (prior build attempts, charged exactly once) and the
+    stage-1 structural fingerprint (so the queue can prefer DISTINCT code, not
+    just distinct actors) — then asks for a unit. Units are dispensed from one
+    wait-time seniority queue (last bench, or first-seen for the never-benched).
+    See harness/build_budget.py for the allocation rules and the 2026-07-16
     build-flood rationale.
     """
     from minotaur_subnet.harness.build_budget import get_build_budget_gate
@@ -1075,6 +1083,13 @@ async def _acquire_build_grant(store: Any, sub: Any):
         round_id=round_id,
         prior_attempt=_has_prior_build_attempt(fresh),
         round_is_open=_round_is_open,
+        # Stage 1's value, falling back to the record (a resumed pipeline that
+        # skipped the recompute). "" opts out of the structural collapse.
+        structural_fingerprint=(
+            structural_fingerprint
+            or getattr(fresh, "structural_fingerprint", "")
+            or ""
+        ),
     )
 
 
@@ -1172,6 +1187,12 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # still record the identity they were rejected under.
         if s1.content_fingerprint:
             await offload_write(store.set_content_fingerprint,submission_id, s1.content_fingerprint)
+
+        # Structural fingerprint — persisted the same way; without this the
+        # value computed in stage 1 never reaches the record and the structural
+        # dedup observes NONE on every submission.
+        if s1.structural_fingerprint:
+            await offload_write(store.set_structural_fingerprint, submission_id, s1.structural_fingerprint)
 
         if not s1.passed:
             return  # set_screening_result already rejected
@@ -1292,11 +1313,15 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # from a per-round budget (SOLVER_ROUND_INTAKE_MAX, default 8, 0 =
         # unlimited) by WAIT-TIME SENIORITY — one queue ordered by last bench
         # (or first-seen for the never-benched; a fresh mint sorts junior),
-        # with soft per-operator dedup — instead of arrival order. This
-        # acquire may WAIT (until a unit frees, or the close-time flush parks
-        # us); budget-winners proceed immediately, so their near-immediate
-        # feedback is preserved. See harness/build_budget.py.
-        grant = await _acquire_build_grant(store, sub)
+        # with soft per-operator dedup and (under STRUCTURAL_DEDUP_MODE=enforce)
+        # per-structural-fingerprint dedup, so the budget buys DISTINCT code —
+        # instead of arrival order. This acquire may WAIT (until a unit frees,
+        # or the close-time flush parks us); budget-winners proceed immediately,
+        # so their near-immediate feedback is preserved. See
+        # harness/build_budget.py.
+        grant = await _acquire_build_grant(
+            store, sub, s1.structural_fingerprint or "",
+        )
         if not grant.granted:
             # No-fault denial: never a REJECT for flow control. The close-time
             # flush usually parked us already (grant.parked); otherwise park
@@ -1417,7 +1442,16 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                 return
             await offload_write(store.set_provenance,submission_id, provenance)
 
-        # Extract solver info from stage 2 details
+        # Record the SDK contract generation FIRST and unconditionally. It
+        # arrives as a structured field on the StageResult, so unlike solver
+        # name/version below it does not depend on parsing prose out of
+        # `details` — and writing it separately means a malformed `details`
+        # cannot silently cost us the observation. None is written through
+        # deliberately: it is the meaningful "pre-marker" reading, not a
+        # missing one.
+        await offload_write(store.set_sdk_version, submission_id, s2.sdk_version)
+
+        # Extract solver info from stage 2 details.
         if ":" in s2.details:
             try:
                 info_part = s2.details.split(": ", 1)[1]

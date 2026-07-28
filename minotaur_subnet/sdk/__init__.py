@@ -39,6 +39,11 @@ from minotaur_subnet.sdk.registry import ProcessorRegistry
 # v2 interface
 from minotaur_subnet.sdk.intent_solver import IntentSolver, MarketSnapshot, SolverMetadata
 
+# SDK contract version. NOTE: unrelated to the v1/v2 ABC axis above — this
+# marks which generation of the field/data contract a solver vendored. Its
+# ABSENCE identifies pre-marker solvers. See sdk/version.py.
+from minotaur_subnet.sdk.version import SDK_VERSION
+
 __all__ = [
     # v1
     "IntentProcessor",
@@ -48,4 +53,6 @@ __all__ = [
     "IntentSolver",
     "MarketSnapshot",
     "SolverMetadata",
+    # contract version
+    "SDK_VERSION",
 ]

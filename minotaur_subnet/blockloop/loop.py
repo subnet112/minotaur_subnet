@@ -154,6 +154,10 @@ class BlockLoop:
             app_store=app_store,
         )
         self._multi_leg_orchestrator.bridge_tracker = bridge_tracker
+        # Reverse ref: destination-leg failures park for the user's
+        # revert-or-refresh decision via the orchestrator (flag-gated).
+        if bridge_tracker is not None:
+            bridge_tracker.multi_leg_orchestrator = self._multi_leg_orchestrator
         self._order_processor = self._build_order_processor()
 
     def _build_order_processor(self) -> OrderProcessor:
@@ -188,6 +192,21 @@ class BlockLoop:
         loaded = self.load_open_orders_from_store()
         if loaded > 0:
             logger.info("Loaded %d persisted OPEN orders from store", loaded)
+
+        # Multi-leg orders parked on user action (plan-set signature, revert-
+        # or-refresh decision) depend on in-process tasks that a restart
+        # kills, and they aren't in the OPEN set above — re-arm them here.
+        try:
+            recovered = await self._multi_leg_orchestrator.recover_parked_orders()
+            if any(recovered.values()):
+                logger.info(
+                    "Parked multi-leg recovery: %d reloaded, %d resumed, "
+                    "%d watchers re-armed",
+                    recovered["reloaded"], recovered["resumed"],
+                    recovered["watchers_rearmed"],
+                )
+        except Exception as exc:
+            logger.error("Parked multi-leg recovery failed: %s", exc, exc_info=True)
 
         logger.info(
             "BlockLoop started (tick_interval=%.1fs, threshold=%.2f)",

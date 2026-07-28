@@ -28,8 +28,14 @@ PROVEN_LEDGER = {"hk-old": 100.0, "hk-mid": 200.0, "hk-new": 300.0}
 
 
 def _gate(ledger=None, seen=None, now=1000.0, budget=None,
-          concurrency=None, monkeypatch=None):
-    """Build a gate + round with explicit env, injectable clock/ledger/seen."""
+          concurrency=None, holdback=0, holdback_secs=None,
+          monkeypatch=None):
+    """Build a gate + round with explicit env, injectable clock/ledger/seen.
+
+    ``holdback`` pins ``SOLVER_BUILD_HOLDBACK_UNITS`` and defaults to 0
+    (disabled) so the pre-holdback tests keep testing exactly what they test;
+    the holdback section below passes explicit values.
+    """
     assert monkeypatch is not None
     if budget is None:
         monkeypatch.delenv("SOLVER_ROUND_INTAKE_MAX", raising=False)
@@ -39,6 +45,11 @@ def _gate(ledger=None, seen=None, now=1000.0, budget=None,
         monkeypatch.delenv("SCREENING_BUILD_CONCURRENCY", raising=False)
     else:
         monkeypatch.setenv("SCREENING_BUILD_CONCURRENCY", str(concurrency))
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", str(holdback))
+    if holdback_secs is None:
+        monkeypatch.delenv("SOLVER_BUILD_HOLDBACK_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_SECONDS", str(holdback_secs))
     clock = {"t": now}
     gate = BuildBudgetGate(
         ledger_loader=lambda: dict(ledger or {}),
@@ -283,4 +294,114 @@ def test_prior_attempt_flag_grants_free_even_if_rebuild_missed_it(monkeypatch):
         grant = await _acquire(gate, "s-resumed", "hk-r", prior=True)
         assert grant.granted and not grant.charged
         assert gate.snapshot(ROUND)["charged"] == ["s-resumed"]
+    asyncio.run(main())
+
+
+# ── holdback: late-senior protection ─────────────────────────────────────────
+
+def test_holdback_env_defaults(monkeypatch):
+    monkeypatch.delenv("SOLVER_BUILD_HOLDBACK_UNITS", raising=False)
+    monkeypatch.delenv("SOLVER_BUILD_HOLDBACK_SECONDS", raising=False)
+    assert bb.holdback_units() == 3
+    assert bb.holdback_seconds() == 600.0
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", "garbage")
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_SECONDS", "garbage")
+    assert bb.holdback_units() == 3
+    assert bb.holdback_seconds() == 600.0
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", "-2")
+    assert bb.holdback_units() == 0                      # clamped, = disabled
+
+
+def test_holdback_reserves_units_within_window(monkeypatch):
+    async def main():
+        # Budget 3, hold 2: an open-time flood gets exactly ONE build even
+        # though pacing (concurrency 3) would allow all three at once.
+        gate = _gate(budget=3, concurrency=3, holdback=2, holdback_secs=600,
+                     monkeypatch=monkeypatch)
+        tasks = [_spawn(gate, f"s{i}", f"hk{i}") for i in range(3)]
+        await _settle()
+        assert sum(t.done() for t in tasks) == 1
+        assert gate.snapshot(ROUND)["dispensable_budget"] == 1
+        # Window lapses: the next dispatch (any grant/release/poll tick)
+        # hands out the held units.
+        gate._clock["t"] = 1000.0 + 601
+        assert gate.snapshot(ROUND)["dispensable_budget"] == 3
+        gate.release(ROUND, "s0")
+        gate.release(ROUND, "s1")
+        gate.release(ROUND, "s2")
+        await _settle()
+        assert all(t.done() and t.result().granted for t in tasks)
+    asyncio.run(main())
+
+
+def test_late_senior_wins_a_heldback_unit(monkeypatch):
+    async def main():
+        # The 2026-07-26 starvation shape: a warm-cache flood at open would
+        # have spent the whole budget on arrival order before the most senior
+        # miner's slower pipeline ever submitted. With one unit held back,
+        # the senior arrival at T+5min outranks the queued flood for it.
+        gate = _gate(ledger={"hk-old": 100.0}, budget=2, concurrency=2,
+                     holdback=1, holdback_secs=600, monkeypatch=monkeypatch)
+        t_a = _spawn(gate, "s-a", "hk-a")                # fresh mint, junior
+        await _settle()
+        t_b = _spawn(gate, "s-b", "hk-b")                # fresh mint, junior
+        await _settle()
+        assert sum(t.done() for t in (t_a, t_b)) == 1    # 1 immediate unit
+        gate._clock["t"] = 1300.0                        # T+5min, in window
+        t_old = _spawn(gate, "s-old", "hk-old")          # benched 100 = senior
+        await _settle()
+        assert not t_old.done()
+        gate._clock["t"] = 1700.0                        # window lapsed
+        gate.release(ROUND, "s-a")                       # flood build finished
+        gate.release(ROUND, "s-b")
+        await _settle()
+        assert t_old.done() and t_old.result().granted
+        # Budget 2/2 spent — the remaining flood waiter stays parked.
+        assert sum(t.done() for t in (t_a, t_b)) == 1
+        gate.flush_round(ROUND)
+        await _settle()
+    asyncio.run(main())
+
+
+def test_holdback_dispenses_via_poll_tick_without_events(monkeypatch):
+    async def main():
+        # No grant/release traffic after the window lapses: the waiter's own
+        # poll tick must run dispatch, else held units strand until close.
+        monkeypatch.setattr(bb, "_WAIT_POLL_SECONDS", 0.02)
+        gate = _gate(budget=2, concurrency=2, holdback=1, holdback_secs=100,
+                     monkeypatch=monkeypatch)
+        assert (await _acquire(gate, "s-1", "hk-1")).granted
+        task = _spawn(gate, "s-2", "hk-2")
+        await _settle()
+        assert not task.done()
+        gate._clock["t"] = 1000.0 + 101                  # lapse, zero events
+        grant = await asyncio.wait_for(task, timeout=2.0)
+        assert grant.granted and grant.charged
+    asyncio.run(main())
+
+
+def test_holdback_above_budget_holds_everything_until_lapse(monkeypatch):
+    async def main():
+        gate = _gate(budget=2, concurrency=2, holdback=5, holdback_secs=600,
+                     monkeypatch=monkeypatch)
+        tasks = [_spawn(gate, f"s{i}", f"hk{i}") for i in range(2)]
+        await _settle()
+        assert not any(t.done() for t in tasks)
+        assert gate.snapshot(ROUND)["dispensable_budget"] == 0
+        gate._clock["t"] = 1000.0 + 601
+        gate.release(ROUND, "s-none")                    # any dispatch trigger
+        await _settle()
+        assert all(t.done() and t.result().granted for t in tasks)
+    asyncio.run(main())
+
+
+def test_post_close_straggler_ignores_holdback(monkeypatch):
+    async def main():
+        # Flush during the window: the post-close straggler path keeps the
+        # FULL budget (pre-holdback semantics for slow screeners).
+        gate = _gate(budget=2, concurrency=2, holdback=2, holdback_secs=600,
+                     monkeypatch=monkeypatch)
+        gate.flush_round(ROUND)
+        grant = await _acquire(gate, "s-late", "hk-late", open_=False)
+        assert grant.granted and grant.charged
     asyncio.run(main())

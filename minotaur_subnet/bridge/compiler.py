@@ -56,15 +56,28 @@ class CrossChainCompiler:
         user_address: str,
         contract_address: str,
         deadline: int,
+        app_addresses: dict[int, str] | None = None,
     ) -> "CompiledCrossChainPlan":
         """Compile a solver's cross-chain plan into executable form.
 
         Args:
             solver_plan: The solver's CrossChainPlan (untrusted).
             order_id: The intent order ID.
-            user_address: The user's address (bridge recipient override).
+            user_address: The user's address — origin-refund target, escrow
+                beneficiary, and the fallback bridge recipient.
             contract_address: The App contract address on the source chain.
             deadline: Order deadline timestamp.
+            app_addresses: The App's contract address per chain id. The
+                bridge recipient on a chain with a following leg MUST be the
+                App there: ``escrowDeposit`` gates on
+                ``balanceOf(address(this))``, so a hop that delivers anywhere
+                else leaves the destination leg with nothing to spend and no
+                escrow to refund (see
+                docs/architecture/cross-chain-review-2026-07-26.md §2).
+                Omitted/unknown → falls back to ``user_address``, which keeps
+                funds safe in the user's wallet but ends the multi-leg flow
+                there; callers that need the flow to complete should resolve
+                this map and fail closed (``OrderProcessor`` does).
 
         Returns:
             CompiledCrossChainPlan with executable MultiLegPlan, escrow params,
@@ -109,8 +122,20 @@ class CrossChainCompiler:
             if i < len(solver_plan.bridge_requests):
                 br = solver_plan.bridge_requests[i]
 
-                # Override recipient with user address (solver can't control this)
-                safe_recipient = user_address
+                # Recipient/refund split — both platform-chosen, never
+                # solver-controlled. The destination fill goes to the App on
+                # the destination chain so escrowDeposit can gate it and the
+                # user can reclaim via the escrowRefund timelock; the ORIGIN
+                # refund (bridge never fills) goes straight to the user,
+                # whose wallet is already a terminal safe state.
+                safe_recipient = (app_addresses or {}).get(br.dst_chain_id) or user_address
+                if safe_recipient == user_address:
+                    logger.warning(
+                        "No App address for destination chain %d — bridging to "
+                        "the user's wallet; the destination leg cannot execute "
+                        "against it and no escrow will be recorded",
+                        br.dst_chain_id,
+                    )
 
                 # Get bridge quote
                 quote = await self.bridge_registry.best_quote(
@@ -139,7 +164,7 @@ class CrossChainCompiler:
                         f"Bridge adapter '{quote.protocol}' not found"
                     )
                 bridge_interactions = adapter.build_bridge_interactions(
-                    quote, safe_recipient,
+                    quote, safe_recipient, refund_recipient=user_address,
                 )
 
                 # Get simulation mock config from adapter
@@ -156,6 +181,8 @@ class CrossChainCompiler:
                     "bridge_estimated_output": quote.estimated_output,
                     "bridge_fee": quote.fee,
                     "bridge_recipient": safe_recipient,
+                    "bridge_refund_recipient": user_address,
+                    "bridge_recipient_is_app": safe_recipient != user_address,
                     "_platform_compiled": True,
                 }
                 forward_legs.append(LegPlan(
@@ -186,8 +213,13 @@ class CrossChainCompiler:
                         br.dst_chain_id, br.src_chain_id,
                     )
                     if reverse_quote and adapter:
+                        # Reverse bridge is the terminal step of a revert: the
+                        # user's own wallet on the source chain is the goal, and
+                        # an expiry refund on the destination chain should reach
+                        # them too. Both addresses are the user by design.
                         reverse_ixs = adapter.build_bridge_interactions(
                             reverse_quote, user_address,
+                            refund_recipient=user_address,
                         )
                         rollback_legs.append(LegPlan(
                             leg_index=100 + len(rollback_legs),
@@ -207,10 +239,46 @@ class CrossChainCompiler:
 
                 leg_index += 1
 
+        # Solver-authored revert legs (optional, additive). Each recovers
+        # from the failure of one solver leg — e.g. swap back to the bridged
+        # asset on the destination chain — and runs BEFORE the platform's
+        # reverse-bridge for that failure point (the orchestrator executes
+        # rollback legs in reverse forward-leg order, and the solver leg's
+        # forward index is always higher than the preceding bridge leg's).
+        # The reverse-bridge legs above stay as the unconditional fallback:
+        # a stale solver revert that misses its own min-out fails its leg
+        # and the escrow-refund backstop still applies.
+        for revert_leg in solver_plan.revert_legs:
+            solver_leg_idx = int(revert_leg.metadata["revert_for_leg"])
+            # Forward legs alternate solver/bridge, so solver leg j sits at
+            # forward index 2*j.
+            forward_idx = 2 * solver_leg_idx
+            rollback_legs.append(LegPlan(
+                leg_index=200 + len(rollback_legs),
+                chain_id=revert_leg.chain_id,
+                intent_selector=revert_leg.intent_selector,
+                intent_params_hex=revert_leg.intent_params_hex,
+                interactions=list(revert_leg.interactions),
+                rollback_for=forward_idx,
+                metadata={
+                    **revert_leg.metadata,
+                    "type": "rollback_solver",
+                    "_platform_compiled": True,
+                },
+            ))
+
         multi_leg = MultiLegPlan(
             forward_legs=forward_legs,
             rollback_legs=rollback_legs,
         )
+
+        # Plan set: the ordered on-chain plan hashes (forward then rollback)
+        # the user signs once via PlanSetApproval. Computed HERE — after the
+        # last metadata write to any leg — because any later drift breaks
+        # on-chain set membership (consensus/plan_set.py invariant).
+        from minotaur_subnet.consensus.plan_set import compute_plan_set
+        plan_set = compute_plan_set(multi_leg, deadline)
+        multi_leg.rollback_plan_hash = "0x" + plan_set.plan_set_hash.hex()
 
         return CompiledCrossChainPlan(
             multi_leg_plan=multi_leg,
@@ -218,6 +286,7 @@ class CrossChainCompiler:
             bridge_quotes=bridge_quotes,
             simulation_mocks=simulation_mocks,
             solver_plan=solver_plan,
+            plan_set=plan_set,
         )
 
     def _validate(self, plan: CrossChainPlan) -> list[str]:
@@ -253,8 +322,13 @@ class CrossChainCompiler:
                         f"{plan.legs[i + 1].chain_id}"
                     )
 
-        # Verify no bridge protocol selectors in solver interactions
-        for i, leg in enumerate(plan.legs):
+        # Verify no bridge protocol selectors in solver interactions —
+        # forward AND revert legs (the revert path is solver code too).
+        labeled_legs = [(f"leg[{i}]", leg) for i, leg in enumerate(plan.legs)]
+        labeled_legs += [
+            (f"revert_leg[{i}]", leg) for i, leg in enumerate(plan.revert_legs)
+        ]
+        for label, leg in labeled_legs:
             for ix in leg.interactions:
                 raw_cd = (ix.call_data or "")
                 if raw_cd.startswith("0x"):
@@ -262,9 +336,31 @@ class CrossChainCompiler:
                 selector = raw_cd[:8] if len(raw_cd) >= 8 else ""
                 if selector in _BRIDGE_CALL_SELECTORS:
                     errors.append(
-                        f"leg[{i}] contains bridge selector {selector} — "
+                        f"{label} contains bridge selector {selector} — "
                         f"solvers must not include bridge calldata"
                     )
+
+        # Solver revert legs: each must name the solver leg it recovers from,
+        # and execute on that leg's chain (where the stranded funds sit).
+        for i, leg in enumerate(plan.revert_legs):
+            target = leg.metadata.get("revert_for_leg")
+            if not isinstance(target, int) or isinstance(target, bool):
+                errors.append(
+                    f"revert_leg[{i}]: metadata.revert_for_leg must be an "
+                    f"integer solver-leg index"
+                )
+                continue
+            if not (1 <= target < len(plan.legs)):
+                errors.append(
+                    f"revert_leg[{i}]: revert_for_leg {target} out of range "
+                    f"(must name a post-bridge leg, 1..{len(plan.legs) - 1})"
+                )
+                continue
+            if leg.chain_id != plan.legs[target].chain_id:
+                errors.append(
+                    f"revert_leg[{i}]: chain {leg.chain_id} != chain "
+                    f"{plan.legs[target].chain_id} of the leg it reverts"
+                )
 
         return errors
 
@@ -282,6 +378,7 @@ class CompiledCrossChainPlan:
     bridge_quotes: list[BridgeQuote]
     simulation_mocks: dict[int, dict[str, Any]]
     solver_plan: CrossChainPlan
+    plan_set: Any = None  # consensus.plan_set.PlanSet
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -289,4 +386,5 @@ class CompiledCrossChainPlan:
             "escrow_params": self.escrow_params,
             "bridge_quotes": [asdict(q) for q in self.bridge_quotes],
             "simulation_mocks": {str(k): v for k, v in self.simulation_mocks.items()},
+            "plan_set": self.plan_set.to_dict() if self.plan_set else None,
         }

@@ -38,6 +38,27 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+class _SkipQuoteCapture(Exception):
+    """Raised to abandon quote-case capture DELIBERATELY (not a failure).
+
+    Capture is fail-closed: a quote whose params the app does not declare is
+    not stored, because storing the declared subset would silently drop the
+    trade descriptor (see order_sampler.quote_case_params).
+    """
+
+
+def _manifest_for_quote(app_id: str) -> dict | None:
+    """The app's manifest for quote-case capture; None on any lookup problem
+    (capture then skips, logged — it must never fail a quote)."""
+    if _app_store is None:
+        return None
+    try:
+        manifest = getattr(_app_store.get_app(app_id), "manifest", None)
+    except Exception:  # noqa: BLE001
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
 # Leader-mode detection (PR-2, audit H5): third-party follower validators
 # set ENABLE_SOLVER_ROUND_COORDINATOR=0 in their compose (canonical
 # follower-mode flag). On those nodes, POST /v1/apps/{id}/orders MUST
@@ -69,13 +90,15 @@ _quote_sim_runner = None
 # gas (so the fee can be priced by us, not the miner), which means an
 # unauthenticated caller spamming quotes can exhaust the leader's simulation
 # capacity. Fixed-window per-IP limiter mirroring apps._debug_rate_limit; tune
-# via QUOTE_RATE_LIMIT_PER_MINUTE (default 30, 0 disables).
+# via QUOTE_RATE_LIMIT_PER_MINUTE (default 20 — the DDoS-Tier1 production
+# value, staged 2026-07-25; 0 disables). nginx adds its own per-IP and global
+# /quote limits in front of this on the leader.
 _QUOTE_RATE_LIMIT_BUCKETS: dict[str, deque] = {}
 _QUOTE_RATE_LIMIT_LOCK = Lock()
 
 
 def _quote_rate_limit(request: Request) -> None:
-    per_minute = int(os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE", "30") or "30")
+    per_minute = int(os.environ.get("QUOTE_RATE_LIMIT_PER_MINUTE", "20") or "20")
     if per_minute <= 0:
         return
     now = time.monotonic()
@@ -1647,20 +1670,46 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     if _pmeta.get(_k) is not None
                 }
                 if _pmeta.get("cross_chain"):
-                    # Cross-chain plans can't be single-fork-simulated here. Derive
-                    # a best-effort estimate from plan metadata rather than 0 so
-                    # cross-chain quotes don't regress; gas stays at floor.
-                    _xc_amt = (
-                        _pmeta.get("dst_amount")
-                        or _pmeta.get("expected_output")
-                        or _pmeta.get("bridge_amount")
+                    # Unified cross-chain quote: dry-compile the solver's
+                    # CrossChainPlan through the platform compiler to get LIVE
+                    # bridge quotes (fee/ETA/min output) + the revert plan per
+                    # failure point, instead of trusting the solver's estimate.
+                    # With a simulator wired (the same per-chain runner the
+                    # single-chain branch uses), the compiled journey also runs
+                    # per-leg, upgrading the estimate to a platform-verified
+                    # destination output (estimated_output_source =
+                    # "leg_simulation"). Falls back to the legacy metadata copy
+                    # when the compiler isn't wired or the plan doesn't compile.
+                    from minotaur_subnet.api.services.cross_chain_quote import (
+                        build_cross_chain_quote,
                     )
-                    if _xc_amt is not None:
-                        try:
-                            result["delivered"] = int(_xc_amt)
-                            negative = False
-                        except (ValueError, TypeError):
-                            pass
+                    _xc_quote = await build_cross_chain_quote(
+                        _pmeta, getattr(bl, "cross_chain_compiler", None),
+                        simulator=getattr(_sim_runner, "simulator", None),
+                        bridge_registry=getattr(
+                            _sim_runner, "bridge_registry", None,
+                        ),
+                        params=req.params,
+                    )
+                    if _xc_quote and _xc_quote.get("estimated_output"):
+                        result["delivered"] = int(_xc_quote["estimated_output"])
+                        result["metadata"]["cross_chain_quote"] = _xc_quote
+                        negative = False
+                    else:
+                        # Legacy fallback: best-effort estimate from plan
+                        # metadata rather than 0 so cross-chain quotes don't
+                        # regress.
+                        _xc_amt = (
+                            _pmeta.get("dst_amount")
+                            or _pmeta.get("expected_output")
+                            or _pmeta.get("bridge_amount")
+                        )
+                        if _xc_amt is not None:
+                            try:
+                                result["delivered"] = int(_xc_amt)
+                                negative = False
+                            except (ValueError, TypeError):
+                                pass
                 elif _deployed and _has_sim:
                     # Run the SAME scoreIntent path the benchmark scores (proxy
                     # deploy, token funding, plan execution, transfer capture) so
@@ -1866,7 +1915,7 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     #
     # Identity/derived params (receiver, intent_params_hex, permit, …) are stripped
     # before storage: quote cases are served on the PUBLIC /v1/quotes, so only the
-    # trade descriptor is retained. See QUOTE_PARAM_STRIP_FIELDS.
+    # trade descriptor is retained. See order_sampler.quote_case_params.
     if (
         _IS_LEADER_NODE
         and s is not None
@@ -1875,7 +1924,7 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
     ):
         try:
             from minotaur_subnet.harness.order_sampler import (
-                QUOTE_PARAM_STRIP_FIELDS,
+                quote_case_params,
                 quote_case_id,
             )
             # ROUND ANCHOR (Phase-2): stamp the quote with the CURRENT round's
@@ -1894,10 +1943,19 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
             if _cur_epoch is None:
                 logger.debug("quote-case capture skipped: no current round to anchor")
             else:
-                _q_params = {
-                    k: v for k, v in (req.params or {}).items()
-                    if k not in QUOTE_PARAM_STRIP_FIELDS
-                }
+                # ALLOWLIST: store exactly the params the app declares
+                # source=user. Fails closed — a quote whose params the app
+                # does not declare is not stored at all, because keeping the
+                # declared subset would silently drop the trade descriptor.
+                _q_params, _q_why = quote_case_params(
+                    _manifest_for_quote(app_id), req.intent_function, req.params,
+                )
+                if _q_params is None:
+                    logger.info(
+                        "quote-case capture skipped for %s (%s): %s",
+                        app_id, req.intent_function, _q_why,
+                    )
+                    raise _SkipQuoteCapture
                 _q_id = quote_case_id(
                     app_id, req.chain_id, req.intent_function, _q_params,
                 )
@@ -1931,6 +1989,8 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                         "captured_opened_epoch": int(_cur_epoch),
                     })
                 _maybe_prune_quotes(s, int(_cur_epoch))
+        except _SkipQuoteCapture:
+            pass          # deliberate, already logged at info above
         except Exception:
             logger.debug("quote-case capture failed for %s", app_id, exc_info=True)
 
@@ -2240,6 +2300,295 @@ def get_order_signing_payload(order_id: str) -> dict:
             "uint256-max sentinel shown."
         ),
     }
+
+
+@router.get("/orders/{order_id}/plan-set")
+def get_order_plan_set(order_id: str) -> dict:
+    """Return the plan-set approval payload for a multi-leg order.
+
+    Available once the solver's cross-chain plan has been platform-compiled
+    (the plan set is the ordered on-chain hash of every leg — forward legs
+    then revert legs). The user signs PlanSetApproval(orderId, planSetHash)
+    ONCE under the chain-agnostic MinotaurPlanSet domain — one wallet prompt
+    covers every chain the intent touches — then POSTs the signature to
+    /orders/{id}/plan-set-signature.
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    plan_set = order.params.get("plan_set")
+    if not plan_set:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Order has no compiled plan set yet — it is not a multi-leg "
+                "order, or cross-chain compilation hasn't run."
+            ),
+        )
+    from eth_hash.auto import keccak as _keccak
+    return {
+        "order_id": order_id,
+        "submitted_by": order.submitted_by,
+        "plan_set": plan_set,
+        "typed_data": {
+            "domain": {"name": "MinotaurPlanSet", "version": "1"},
+            "types": {
+                "PlanSetApproval": [
+                    {"name": "orderId", "type": "bytes32"},
+                    {"name": "planSetHash", "type": "bytes32"},
+                ],
+            },
+            "primaryType": "PlanSetApproval",
+            "message": {
+                "orderId": "0x" + _keccak(order_id.encode()).hex(),
+                "planSetHash": plan_set["plan_set_hash"],
+            },
+        },
+        "note": (
+            "Sign with eth_signTypedData_v4(domain, types, message) OR sign "
+            "the raw 32-byte `plan_set.digest`, then POST "
+            "/orders/{id}/plan-set-signature with {plan_set_signature}. One "
+            "signature authorizes every forward leg AND the agreed revert "
+            "legs; a refreshed leg will require signing an updated set."
+        ),
+    }
+
+
+@router.post("/orders/{order_id}/plan-set-signature")
+async def attach_plan_set_signature(order_id: str, request: Request) -> dict:
+    """Attach the user's PlanSetApproval signature to a multi-leg order.
+
+    Auth mirrors PATCH /orders/{id}/signature: the signature itself proves
+    identity — the server recovers the signer from the sig over THIS order's
+    plan-set digest and requires it to equal ``order.submitted_by``. EOA
+    signatures are verified here; ERC-1271 (smart-account) signatures are
+    accepted optimistically and settled by the contract's SignatureChecker
+    at execution (an invalid one reverts the leg, funds untouched).
+
+    Body shape: ``{"plan_set_signature": "0x..."}``
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    body = await request.json()
+    sig = body.get("plan_set_signature", "")
+    if not sig:
+        raise HTTPException(status_code=400, detail="plan_set_signature required")
+
+    plan_set = order.params.get("plan_set")
+    if not plan_set:
+        raise HTTPException(
+            status_code=409,
+            detail="Order has no compiled plan set to sign",
+        )
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+
+    from minotaur_subnet.consensus.plan_set import verify_plan_set_signature
+    plan_set_hash = bytes.fromhex(plan_set["plan_set_hash"][2:])
+    if not verify_plan_set_signature(owner, order_id, plan_set_hash, sig):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "plan_set_signature does not recover to order.submitted_by "
+                "for this order's plan-set digest"
+            ),
+        )
+
+    order.params["plan_set_signature"] = sig
+    ob.update_order(order_id, params=order.params)
+    if _app_store is not None:
+        try:
+            _app_store.save_order(ob.get(order_id).to_dict())
+        except Exception:
+            pass
+
+    result: dict[str, Any] = {
+        "order_id": order_id, "plan_set_signature_attached": True,
+    }
+
+    # Resume an order parked by the plan-set gate. Orchestration runs in the
+    # background: leg execution takes minutes (simulate → quorum → relay, per
+    # leg), far longer than an HTTP request should hold. The client polls
+    # GET /orders/{id} from here.
+    from minotaur_subnet.orderbook.orderbook import OrderStatus as _OS
+    if order.status == _OS.AWAITING_PLAN_SET_SIGNATURE:
+        bl = _block_loop
+        orchestrator = getattr(bl, "_multi_leg_orchestrator", None) if bl else None
+        if orchestrator is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Order is awaiting a plan-set signature but no multi-leg "
+                    "orchestrator is available on this node; the signature was "
+                    "attached and can be resumed from the leader"
+                ),
+            )
+        import asyncio as _asyncio
+        task = _asyncio.create_task(
+            _resume_plan_set_order(orchestrator, order_id),
+        )
+        # Keep a strong reference: the event loop only holds a weak one, so an
+        # unreferenced task can be garbage-collected mid-flight.
+        _RESUME_TASKS.add(task)
+        task.add_done_callback(_RESUME_TASKS.discard)
+        result["resuming"] = True
+
+    return result
+
+
+# Strong references to in-flight plan-set resume tasks (see above).
+_RESUME_TASKS: set = set()
+
+
+async def _resume_plan_set_order(orchestrator: Any, order_id: str) -> None:
+    """Background resume for a plan-set-gated order (errors are logged only —
+    a failed resume leaves the order parked, with nothing executed)."""
+    try:
+        await orchestrator.resume_after_plan_set_signature(order_id)
+    except Exception as exc:
+        logger.error(
+            "Plan-set resume failed for %s: %s", order_id, exc, exc_info=True,
+        )
+
+
+@router.get("/orders/{order_id}/recovery")
+def get_order_recovery(order_id: str) -> dict:
+    """Recovery context for a multi-leg order awaiting a user decision.
+
+    Available when a leg failed with funds in a safe state (origin refund
+    received, or asset held in on-chain escrow with a permissionless
+    timelocked refund). The user chooses via POST /orders/{id}/decision:
+    execute the pre-agreed revert plan, or refresh the failed leg with a
+    new quote. No decision by ``decision_deadline`` → automatic revert.
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+    recovery = order.params.get("recovery")
+    if not recovery:
+        raise HTTPException(
+            status_code=409,
+            detail="Order has no pending recovery decision",
+        )
+    return {
+        "order_id": order_id,
+        "status": getattr(order.status, "value", str(order.status)),
+        "failed_leg_index": recovery.get("failed_leg_index"),
+        "reason": recovery.get("reason"),
+        "options": recovery.get("options", ["revert", "refresh"]),
+        "decision_deadline": recovery.get("decision_deadline"),
+        "escrow_params": recovery.get("escrow_params"),
+        "resolved": recovery.get("resolved"),
+        "revert_legs": len(recovery.get("rollback_legs", [])),
+        "note": (
+            "POST /orders/{id}/decision with {action: 'revert'|'refresh', "
+            "owner_signature} — an EIP-191 signature over "
+            "'order-decision:{order_id}:{action}' by the order's "
+            "submitted_by. Undecided orders auto-revert at "
+            "decision_deadline; the on-chain escrowRefund remains available "
+            "after the escrow deadline regardless."
+        ),
+    }
+
+
+@router.post("/orders/{order_id}/decision")
+async def post_order_decision(order_id: str, request: Request) -> dict:
+    """Resolve a parked multi-leg order: revert or refresh.
+
+    - ``revert``: execute the pre-agreed revert plan (the rollback legs
+      covered by the user's plan-set signature).
+    - ``refresh``: end this order's orchestration (REFRESHING) — the failed
+      leg re-quotes as a NEW single-chain order over the escrowed asset,
+      which current solvers handle natively.
+
+    Auth: EIP-191 ``owner_signature`` over ``order-decision:{order_id}:{action}``
+    must recover to ``order.submitted_by`` (same challenge pattern as the
+    order reader-sig).
+
+    Body shape: ``{"action": "revert"|"refresh", "owner_signature": "0x..."}``
+    """
+    ob = _require_orderbook()
+    order = ob.get(order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    body = await request.json()
+    action = (body.get("action") or "").strip().lower()
+    if action not in ("revert", "refresh"):
+        raise HTTPException(
+            status_code=400, detail="action must be 'revert' or 'refresh'",
+        )
+
+    sig = body.get("owner_signature", "")
+    owner = (getattr(order, "submitted_by", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="Order has no submitted_by; can't verify ownership",
+        )
+    if not _verify_decision_sig(owner, order_id, action, sig):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "owner_signature does not recover to order.submitted_by for "
+                f"'order-decision:{order_id}:{action}'"
+            ),
+        )
+
+    bl = _block_loop
+    orchestrator = getattr(bl, "_multi_leg_orchestrator", None) if bl else None
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Multi-leg orchestrator unavailable on this node",
+        )
+    try:
+        result = await orchestrator.resolve_user_decision(order_id, action)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if _app_store is not None:
+        try:
+            _app_store.save_order(ob.get(order_id).to_dict())
+        except Exception:
+            pass
+    return {"order_id": order_id, **result}
+
+
+def _verify_decision_sig(
+    submitted_by: str, order_id: str, action: str, sig_hex: str,
+) -> bool:
+    """Verify an EIP-191 sig over ``order-decision:{order_id}:{action}``.
+
+    A decision changes execution state, so unlike the reader-sig this gates
+    a state change — but both options only move funds along paths the user
+    already authorized (the signed revert plan, or nothing until a new
+    signed order), so deadline-binding is unnecessary: replaying a stale
+    'revert' decision is at worst the same auto-revert the timeout runs.
+    """
+    if not submitted_by or not sig_hex or not order_id:
+        return False
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except Exception:
+        return False
+    try:
+        msg = encode_defunct(text=f"order-decision:{order_id}:{action}")
+        sig = sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
+        recovered = Account.recover_message(msg, signature=sig)
+    except Exception:
+        return False
+    return recovered.lower() == submitted_by.lower()
 
 
 @router.get("/orders/{order_id}/bridge")

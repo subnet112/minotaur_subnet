@@ -1372,10 +1372,25 @@ async def score_plan(
 
     params = body.params
 
-    # Look up deployment for contract_address and chain_id
+    # Look up deployment for contract_address and chain_id.
+    #
+    # Resolve the deployment for the REQUESTED chain — NOT the chain-less
+    # primary. A miner dry-running a Base (8453) strategy sends chain_id=8453;
+    # ``chain_id`` is authoritative for anvil selection below, so if we resolved
+    # the contract chain-lessly we'd get the app's PRIMARY deployment (the
+    # Ethereum contract) and then run scoreIntent against it on the Base fork —
+    # where it has no code. relayer() returns empty, the sim fails closed, and
+    # EVERY Base strategy scores 0 ("scoreIntent reverted") even when correct.
+    # Mirrors the /quote route (orders.get_quote), which already resolves
+    # per-chain. chain_id==0 keeps the auto-detect: primary deployment, adopt
+    # its chain so contract and fork stay on the same chain.
     chain_id = body.chain_id
     contract_address = ""
-    deployment = s.get_deployment(app_id)
+    deployment = (
+        s.get_deployment(app_id, chain_id=chain_id)
+        if chain_id
+        else s.get_deployment(app_id)
+    )
     if deployment:
         contract_address = deployment.contract_address or ""
         if chain_id == 0:
@@ -1475,12 +1490,23 @@ async def score_plan(
 
     if _simulator is not None:
         try:
+            # ``chain_id`` (resolved above, same chain as contract_address) is
+            # authoritative for anvil selection. plan.metadata.setdefault above
+            # can't fix a plan already mis-stamped with another chain, so pass
+            # it explicitly — a MultiChainSimulator routes by it and never runs
+            # this contract on another chain's fork.
+            _chain_kwargs = (
+                {"chain_id": chain_id}
+                if hasattr(_simulator, "_get_simulator")
+                else {}
+            )
             simulation = await _simulator.simulate(
                 plan,
                 contract_address=contract_address or None,
                 intent_order=intent_order,
                 token_balances=token_balances,
                 fork_block=body.fork_block,
+                **_chain_kwargs,
             )
             simulation_mode = "anvil"
         except Exception as exc:

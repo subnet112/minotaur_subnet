@@ -116,6 +116,14 @@ class DexCompareConfig:
     cow_min_block_span: int = 100           # floor when adaptively halving on range caps
     cow_dedup_by_pair: bool = False         # OFF -> uniform over distinct trades (recommended)
 
+    # ── active blindspot re-probe ────────────────────────────────────────
+    # Blindspot detection is passive (waits for the corpus to re-sample a
+    # pair); the reprober requotes open blindspots against OUR solver only so
+    # closed gaps surface without waiting for the market to re-trade them.
+    # 0 disables the reprober entirely (drip AND sweep).
+    reprobe_per_cycle: int = 2       # least-recently-probed open pairs per cycle
+    reprobe_sweep_batch: int = 15    # pairs per cycle while draining an adoption sweep
+
 
 def load_config() -> DexCompareConfig:
     """Build a :class:`DexCompareConfig` from the process environment."""
@@ -163,4 +171,6 @@ def load_config() -> DexCompareConfig:
         cow_max_block_span=_env_int("DEX_COMPARE_COW_MAX_SPAN", 2000),
         cow_min_block_span=_env_int("DEX_COMPARE_COW_MIN_SPAN", 100),
         cow_dedup_by_pair=_env_true("DEX_COMPARE_COW_DEDUP_PAIR", False),
+        reprobe_per_cycle=_env_int("DEX_COMPARE_REPROBE_PER_CYCLE", 2),
+        reprobe_sweep_batch=_env_int("DEX_COMPARE_SWEEP_BATCH", 15),
     )

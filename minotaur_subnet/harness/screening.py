@@ -139,6 +139,16 @@ _BANNED_DYNAMIC_ATTR_CALLS = frozenset({
     "import_module",   # importlib.import_module(<name>)
     "FunctionType",    # types.FunctionType(<code>, globals, ...)
     "CodeType",        # types.CodeType(...)
+    # v2: the spec-loader spelling of dynamic import — importlib.util.
+    # spec_from_file_location(...) + module_from_spec(...) does nothing until
+    # spec.loader.exec_module(mod) runs it, so banning the one call that
+    # EXECUTES the loaded module kills the whole pattern without needing to
+    # chase the builder names. The current champion's `_apex_champ.py`
+    # strategies-loader uses exactly this (in-tree files, so v1 tolerated it as
+    # analyzable) — prospective-only like every gate: the standing champion is
+    # never re-screened, but forks must replace the loader with static imports
+    # of `strategies/<app_id>/strategy.py` to pass intake.
+    "exec_module",     # spec.loader.exec_module(<module>)
 })
 
 # Always-on (armed): the primitives above have no legitimate solver use, so —
@@ -146,7 +156,7 @@ _BANNED_DYNAMIC_ATTR_CALLS = frozenset({
 # constant for the same fleet-uniform, version-stamped discipline (and an escape
 # hatch if an unforeseen false positive ever surfaces during rollout).
 DYNAMIC_CODE_ARMED: bool = True
-DYNAMIC_CODE_VERSION = 1
+DYNAMIC_CODE_VERSION = 2  # v2 adds exec_module to the attribute ban
 
 # ── Banned in-tree imports (defence-in-depth PREVENT layer) ───────────────────
 #
@@ -173,20 +183,31 @@ _BANNED_IMPORT_MODULES = frozenset({
     "marshal",
 })
 
-# Observe-only until soaked, mirroring the MAX_REGION_NODES rollout discipline:
-# while False, stage 1 LOGS what it would reject but never rejects (the PR ships
-# INERT). A follow-up flips it to True once the live fleet's import profile
-# confirms no legitimate solver trips it. A CODE constant (never env-read), so
-# the gate is fleet-uniform — the FLOOR_BPS/FLOOR_VERSION discipline.
-#
-# ARMING PRECONDITION: the scan matches TOP-LEVEL modules, so today it flags
-# legitimate code — `from urllib.parse import urlparse` (used by this codebase
-# itself) and `from http import HTTPStatus` hit the `urllib`/`http` bans just
-# like the exfil gadgets do. Flipping this flag alone is NOT sufficient: arming
-# first requires a submodule allowlist (at minimum urllib.parse), shaped by the
-# dotted names the observe-only soak logs record.
-BANNED_IMPORTS_ARMED: bool = False
-BANNED_IMPORTS_VERSION = 1
+# Benign submodules of otherwise-banned top-level packages. The soak (below)
+# demanded exactly one: `urllib.parse` — pure string manipulation, no I/O, and
+# the one spelling legitimate code actually uses (this codebase included). Both
+# import spellings are exempt (`import urllib.parse` / `from urllib.parse
+# import urlparse`, and `from urllib import parse`); `urllib.request` /
+# `urllib.error` and every other submodule stay banned. `http` deliberately has
+# NO allowlisted submodule: `from http import HTTPStatus` never appeared in the
+# soak, and http.client is a live transport.
+_ALLOWED_SUBMODULE_IMPORTS = frozenset({"urllib.parse"})
+
+# ARMED v2 (2026-07-26) after the observe-only soak. The precondition the v1
+# comment demanded is met: across the full retained leader log window the scan
+# recorded 257 hits and every single one was `urllib.request` (the chain-killer
+# "putty" exfil-gadget class) — zero benign dotted names (`urllib.parse`,
+# `http`) ever appeared in a submission, so the only refinement needed is the
+# `urllib.parse` allowlist above. Rejects are prospective-only: NEW submissions
+# gate, the standing champion is never re-screened (same discipline as
+# DYNAMIC_CODE_ARMED) — but note the current champion lineage itself carries 5
+# `urllib.request` hits, so forks must strip them to pass intake. That is the
+# point: the ban forces the fleet to shed the latent gadget. A CODE constant
+# (never env-read), so the gate is fleet-uniform — the FLOOR_VERSION
+# discipline; accept/reject-changing ⇒ MUST ride the next develop→main
+# promote so followers gate identically.
+BANNED_IMPORTS_ARMED: bool = True
+BANNED_IMPORTS_VERSION = 2
 
 # Named scopes that START a new region: a nested def/class's *body* leaves its
 # parent region (its header still counts in the parent). Lambdas, comprehensions
@@ -233,6 +254,17 @@ class StageResult:
     # Set by stage 1 only; same compute-once-read-forever discipline as
     # max_region_nodes. Feeds the cross-hotkey resubmit quota.
     content_fingerprint: str | None = None
+    # Structural fingerprint (harness/structural_fingerprint) — salt-invariant
+    # identity for the observe-only structural dedup. In the same _dw_fields
+    # bundle as content_fingerprint, so StageResult MUST accept it or the
+    # **_dw_fields spread below raises TypeError and rejects every submission.
+    structural_fingerprint: str | None = None
+    # SDK contract generation vendored by this submission, read out of the
+    # built image in stage 2 (None on other stages / errors, and None when the
+    # submission vendored a pre-marker SDK — absence IS the signal, not a
+    # failure to detect). Detection only: nothing rejects on this value today.
+    # See sdk/version.py.
+    sdk_version: str | None = None
 
 
 @dataclass
@@ -243,6 +275,7 @@ class ScreeningResult:
     image_tag: str | None = None          # Set if stage 2+ passes (built image)
     solver_name: str | None = None        # From metadata
     solver_version: str | None = None     # From metadata
+    solver_sdk_version: str | None = None  # Vendored SDK generation (None = pre-marker)
     failed_stage: int | None = None
     rejection_reason: str | None = None
 
@@ -253,6 +286,7 @@ class ScreeningResult:
             "image_tag": self.image_tag,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "solver_sdk_version": self.solver_sdk_version,
             "failed_stage": self.failed_stage,
             "rejection_reason": self.rejection_reason,
             "stages": {
@@ -263,6 +297,7 @@ class ScreeningResult:
                     "error_code": s.error_code,
                     "max_region_nodes": s.max_region_nodes,
                     "unproductive_nodes": s.unproductive_nodes,
+                    "sdk_version": s.sdk_version,
                 }
                 for s in self.stages
             },
@@ -343,7 +378,7 @@ def dynamic_code_calls(repo_path: str) -> list[str]:
         the callee is an ``ast.Name`` (a method named ``eval`` on a miner's own
         object is NOT flagged).
       * ATTRIBUTE calls — ``….import_module`` / ``….FunctionType`` /
-        ``….CodeType``, matched on the trailing attribute so an aliased
+        ``….CodeType`` / ``….exec_module``, matched on the trailing attribute so an aliased
         ``importlib`` / ``types`` is still caught.
 
     These build code from strings, construct code objects, or resolve modules
@@ -388,9 +423,14 @@ def banned_imports(repo_path: str) -> list[str]:
     native-FFI / serialization). Uses ``ast.walk`` so a nested
     ``import urllib.request`` inside a function is caught, not just module-level
     imports — the exfil-gadget class hides exactly there. Relative imports
-    (``from . import x``) are in-tree and never flagged. The full dotted name is
-    recorded (e.g. ``urllib.request``) so the observe-only logs can drive
-    submodule refinement before the ban is armed. Sorted, deterministic.
+    (``from . import x``) are in-tree and never flagged. Dotted names in
+    :data:`_ALLOWED_SUBMODULE_IMPORTS` are exempt in every spelling that binds
+    ONLY the benign submodule: ``import urllib.parse``, ``from urllib.parse
+    import urlparse`` and ``from urllib import parse`` all pass, while ``import
+    urllib``, ``import urllib.request`` and ``from urllib import parse,
+    request`` are still flagged. The full dotted name is recorded (e.g.
+    ``urllib.request``) so the logs keep driving submodule refinement. Sorted,
+    deterministic.
     """
     root = Path(repo_path)
     hits: list[str] = []
@@ -406,9 +446,21 @@ def banned_imports(repo_path: str) -> list[str]:
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module]
+                # `from urllib import parse` binds only the submodule — treat it
+                # as urllib.parse. Any alias outside the allowlist (e.g. `from
+                # urllib import parse, request`) keeps the bare module name.
+                if node.module in _BANNED_IMPORT_MODULES and all(
+                    f"{node.module}.{alias.name}" in _ALLOWED_SUBMODULE_IMPORTS
+                    for alias in node.names
+                ):
+                    names = [f"{node.module}.{alias.name}" for alias in node.names]
+                else:
+                    names = [node.module]
             for name in names:
-                if name.split(".")[0] in _BANNED_IMPORT_MODULES:
+                if (
+                    name.split(".")[0] in _BANNED_IMPORT_MODULES
+                    and name not in _ALLOWED_SUBMODULE_IMPORTS
+                ):
                     hits.append(f"{py.relative_to(root)}:{node.lineno} {name}")
     return sorted(hits)
 
@@ -559,6 +611,25 @@ def run_stage_1(repo_path: str) -> StageResult:
             fingerprint[:16], FINGERPRINT_VERSION, repo_path,
         )
         _dw_fields["content_fingerprint"] = fingerprint
+
+    # Structural fingerprint — same pass, same persist-on-reject discipline.
+    # Salt-invariant identity (docstring-stripped, constant-erased AST) so a
+    # fleet of coldkeys shipping structurally-identical code shows as one
+    # identity even when each salts a constant to mint a distinct
+    # content_fingerprint. Consumed observe-only by rotation's structural
+    # dedup (see harness/structural_fingerprint.py).
+    from minotaur_subnet.harness.structural_fingerprint import (
+        STRUCTURAL_FINGERPRINT_VERSION,
+        repo_structural_fingerprint,
+    )
+
+    struct_fp = repo_structural_fingerprint(repo_path)
+    if struct_fp:
+        logger.info(
+            "[fingerprint] structural_fingerprint=%s version=%d repo=%s",
+            struct_fp[:16], STRUCTURAL_FINGERPRINT_VERSION, repo_path,
+        )
+        _dw_fields["structural_fingerprint"] = struct_fp
 
     # Static-analyzability ban (always-on PREVENT layer; INDEPENDENT of the
     # factor floor — code built from strings / dynamically imported is invisible
@@ -922,8 +993,17 @@ async def _run_stage_2_locked(
         "m = s.metadata(); "
         "assert m.name, 'metadata().name is empty'; "
         "assert m.version, 'metadata().version is empty'; "
+        # Read the SDK contract version out of the VENDORED package — this
+        # runs inside the built image, so it reports the generation the
+        # submission actually carries. getattr-with-default rather than a
+        # try/except because the whole probe is a ';'-joined one-liner, and
+        # because a missing symbol is the expected pre-marker case, not an
+        # error. See sdk/version.py.
+        "import importlib as _il; "
+        "_sdkv = getattr(_il.import_module('minotaur_subnet.sdk'), 'SDK_VERSION', None); "
         "import json; "
-        "print(json.dumps({'name': m.name, 'version': m.version, 'types': m.supported_intent_types}))"
+        "print(json.dumps({'name': m.name, 'version': m.version, "
+        "'types': m.supported_intent_types, 'sdk_version': _sdkv}))"
     )
 
     init_cmd = _solver_exec_command(image_tag, init_script)
@@ -962,9 +1042,16 @@ async def _run_stage_2_locked(
         )
 
     # Parse metadata from stdout
+    sdk_version: str | None = None
     try:
         meta_data = json.loads(stdout.decode("utf-8").strip())
         details = f"Image built, init OK: {meta_data['name']} v{meta_data['version']}"
+        # Carried as a STRUCTURED field rather than parsed back out of
+        # `details` (which is how solver name/version are still recovered
+        # downstream) — a version string is not worth another round-trip
+        # through prose.
+        raw = meta_data.get("sdk_version")
+        sdk_version = str(raw) if raw else None
     except (json.JSONDecodeError, KeyError):
         details = "Image built, init OK"
 
@@ -972,6 +1059,7 @@ async def _run_stage_2_locked(
         stage=2, passed=True,
         duration_ms=_elapsed(start),
         details=details,
+        sdk_version=sdk_version,
     )
 
 

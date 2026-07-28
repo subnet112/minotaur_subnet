@@ -1677,8 +1677,18 @@ class BenchmarkWorker:
         app_def = apps_by_id.get(app_id)
         if app_def is None:
             return None
-        deployment = self._app_store.get_deployment(app_id)
-        contract_address = deployment.contract_address if deployment else ""
+        # Resolve the deployment for the ORDER'S OWN chain — NOT the chain-less
+        # primary. A Base order (chain 8453) must score against the Base
+        # deployment; the chain-less get_deployment returns the primary
+        # (order-ready-preferred, typically Ethereum), so a Base order was built
+        # with the Ethereum contract and then — once the sim anvil correctly
+        # follows state.chain_id (the #1154 fix) — that ETH address has no code
+        # on the Base fork → relayer() UNRESOLVED, scenario scores 0. Skip when
+        # the app isn't deployed on the order's chain rather than mis-route.
+        deployment = self._app_store.get_deployment(app_id, chain_id=chain_id)
+        if deployment is None:
+            return None
+        contract_address = deployment.contract_address or ""
 
         # Snapshot per chain (cached). Use synthetic snapshot here —
         # the solver re-queries live pool state via RPC anyway.
@@ -2572,6 +2582,17 @@ class BenchmarkWorker:
                 # deployed on more than one chain. None on legacy rows / single
                 # -chain apps (transition falls back to the primary deployment).
                 "chain_id": getattr(r, "chain_id", None),
+                # PHASE 0, OBSERVE-ONLY: destination-chain delivery for a
+                # cross-chain plan (exact decimal wei string) and where the
+                # bridged amount came from ("simulated" = observed leaving the
+                # source fork, "declared" = the plan's own number). None on
+                # every single-chain row. Recorded so the leader/follower
+                # determinism check has something to compare BEFORE any
+                # scoring rule is allowed to consume it — never feeds `score`.
+                "destination_delivered": getattr(r, "destination_delivered", None),
+                "destination_amount_source": getattr(
+                    r, "destination_amount_source", None,
+                ),
             }
             # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
             # tag — ADDITIVE keys, present ONLY when the probe measured this

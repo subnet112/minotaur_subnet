@@ -31,6 +31,64 @@ def cross_chain_enabled() -> bool:
     return _env_bool("CROSS_CHAIN_ENABLED", default=False)
 
 
+def cross_chain_user_decision_enabled() -> bool:
+    """Revert-or-refresh recovery: park failed multi-leg orders in
+    AWAITING_USER_DECISION so the user chooses between the pre-agreed
+    revert plan and a fresh per-leg quote, instead of the platform
+    auto-rolling-back immediately.
+
+    OFF (default): current behavior — automatic rollback on any leg
+    failure. Only meaningful when CROSS_CHAIN_ENABLED is also on.
+
+    Safety note: the decision window is bounded
+    (CROSS_CHAIN_DECISION_WINDOW_S, default 1800s) and expires into the
+    pre-agreed auto-revert. A restart mid-window kills the in-process
+    watcher, but the block loop's boot sweep
+    (MultiLegOrchestrator.recover_parked_orders) reloads parked orders and
+    re-arms the watcher on its ORIGINAL deadline, so an expired window
+    still fires. The on-chain escrowRefund timelock remains the
+    unconditional backstop underneath both.
+    """
+    return _env_bool("CROSS_CHAIN_USER_DECISION", default=False)
+
+
+def cross_chain_require_plan_set_signature() -> bool:
+    """Hold a compiled multi-leg order until the user has signed its plan set.
+
+    The plan set only exists AFTER platform compilation (it hashes the
+    compiled legs, including live bridge calldata), and compilation is
+    immediately followed by execution — so without this gate there is no
+    moment at which a wallet can sign, ``order.params["plan_set_signature"]``
+    is always absent, and every leg falls back to the legacy quorum-only
+    ``executeLeg``. That is the "destination leg executes with an empty user
+    signature" hole (docs/architecture/cross-chain-intents.md §5).
+
+    ON: a compiled multi-leg order parks in ``AWAITING_PLAN_SET_SIGNATURE``.
+    The client fetches GET /orders/{id}/plan-set, signs
+    PlanSetApproval(orderId, planSetHash), and POSTs it back; the attach
+    endpoint resumes orchestration. Nothing has executed and no funds have
+    moved while it waits, so an order the user never signs simply expires at
+    its own deadline.
+
+    OFF (default): today's behaviour — compile straight into execution under
+    validator quorum alone.
+
+    ARMING ORDER: turn this ON (and soak) BEFORE arming the contract-side
+    ``planSetSignatureRequired``. Reversed, the contract rejects every leg the
+    pipeline submits, because none of them carry a signature.
+    """
+    return _env_bool("CROSS_CHAIN_REQUIRE_PLAN_SET_SIG", default=False)
+
+
+def cross_chain_decision_window_s() -> int:
+    """Seconds the user has to pick revert vs refresh before auto-revert."""
+    import os as _os
+    try:
+        return int(_os.environ.get("CROSS_CHAIN_DECISION_WINDOW_S", "1800"))
+    except ValueError:
+        return 1800
+
+
 CROSS_CHAIN_DISABLED_MESSAGE = (
     "Cross-chain / multi-leg orders are not enabled in this environment. "
     "Beta scope is single-chain Base (chain 8453). "

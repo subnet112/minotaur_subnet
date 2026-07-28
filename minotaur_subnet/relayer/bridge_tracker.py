@@ -35,10 +35,25 @@ class TrackedBridge:
     tracked_at: float = field(default_factory=time.time)
     poll_count: int = 0
     max_polls: int = 120  # ~2 hours at 60s interval
+    # CCTP has no permissionless relayer: once the burn is attested, the
+    # platform self-relays receiveMessage on the destination. Set once that
+    # mint tx has been submitted, so we don't double-mint on re-poll.
+    cctp_minted: bool = False
+    # One-shot ops escalation for a committed-rail transfer that blew past
+    # max_polls (see _fail_bridge): the funds aren't lost, delivery is just
+    # late, so we keep polling instead of dead-ending — but somebody should
+    # know. Bounded by COMMITTED_MAX_POLL_FACTOR.
+    stall_escalated: bool = False
 
 
 class BridgeTracker:
     """Polls bridge adapters and completes cross-chain orders.
+
+    COMMITTED_MAX_POLL_FACTOR bounds how far past ``max_polls`` a
+    committed-rail transfer keeps being polled before we stop: the funds are
+    already gone from the source and only the delivery is outstanding, so
+    giving up at the normal timeout would abandon a mint that still needs
+    relaying. 10x ≈ 20h at the default 60s interval.
 
     Args:
         bridge_registry: Registry of bridge adapters.
@@ -46,6 +61,8 @@ class BridgeTracker:
         relayer: Relayer for submitting destination legs.
         poll_interval: Seconds between polling cycles.
     """
+
+    COMMITTED_MAX_POLL_FACTOR = 10
 
     def __init__(
         self,
@@ -65,6 +82,10 @@ class BridgeTracker:
 
         self._tracked: dict[str, TrackedBridge] = {}
         self._running = False
+        # Back-ref to the MultiLegOrchestrator (wired in blockloop/loop.py)
+        # so destination-leg failures can park for the user's
+        # revert-or-refresh decision instead of dead-ending in BRIDGE_FAILED.
+        self.multi_leg_orchestrator: Any = None
 
     def track(
         self,
@@ -124,13 +145,31 @@ class BridgeTracker:
         for order_id, tracked in list(self._tracked.items()):
             tracked.poll_count += 1
 
-            # Max polls exceeded → mark as failed
+            # Max polls exceeded. On a refundable rail that's the end of the
+            # attempt. On a COMMITTED rail (CCTP burn) the funds are already
+            # gone from the source and the mint is merely late — dropping the
+            # entry here would abandon the self-relay that still has to fire,
+            # so keep polling to a hard ceiling and escalate to ops instead.
             if tracked.poll_count > tracked.max_polls:
+                if not self._refunds_on_origin(tracked) and (
+                    tracked.poll_count
+                    <= tracked.max_polls * self.COMMITTED_MAX_POLL_FACTOR
+                ):
+                    if not tracked.stall_escalated:
+                        tracked.stall_escalated = True
+                        logger.error(
+                            "Bridge %s STALLED for order %s after %d polls — "
+                            "funds are committed on the source chain and the "
+                            "delivery is still pending; continuing to poll "
+                            "(ops escalation)",
+                            tracked.bridge_protocol, order_id, tracked.poll_count,
+                        )
+                    continue
                 logger.warning(
                     "Bridge timeout for order %s after %d polls",
                     order_id, tracked.poll_count,
                 )
-                self._mark_bridge_failed(order_id, "Bridge polling timeout")
+                await self._fail_bridge(tracked, "Bridge polling timeout")
                 to_remove.append(order_id)
                 continue
 
@@ -154,9 +193,29 @@ class BridgeTracker:
                     completed += 1
                 elif status.status == BridgeStatusEnum.FAILED:
                     error = status.error or "Bridge transfer failed"
-                    self._mark_bridge_failed(order_id, error)
+                    await self._fail_bridge(tracked, error)
                     to_remove.append(order_id)
-                # PENDING / IN_TRANSIT → keep polling
+                elif (
+                    tracked.bridge_protocol == "cctp"
+                    and not tracked.cctp_minted
+                    and status.metadata.get("ready_to_mint")
+                ):
+                    # CCTP: attestation ready → self-relay the destination mint,
+                    # then treat the bridge as complete and run the dest legs.
+                    # On submit failure, keep polling (retry next cycle) — the
+                    # attestation stays valid, funds can't be stranded.
+                    try:
+                        await self._submit_cctp_mint(tracked, status.metadata)
+                        tracked.cctp_minted = True
+                        await self._on_bridge_complete(tracked, status)
+                        to_remove.append(order_id)
+                        completed += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "CCTP mint self-relay failed for %s: %s (retry)",
+                            order_id, exc,
+                        )
+                # PENDING / IN_TRANSIT (not yet attested) → keep polling
             except NotImplementedError:
                 # Stub adapter (e.g. Tensorplex) — skip until real integration
                 logger.debug(
@@ -173,6 +232,45 @@ class BridgeTracker:
             self._tracked.pop(oid, None)
 
         return completed
+
+    async def _submit_cctp_mint(
+        self,
+        tracked: TrackedBridge,
+        metadata: dict,
+    ) -> str:
+        """Self-relay a CCTP mint: submit receiveMessage on the destination.
+
+        CCTP has no permissionless relayer network, so the platform completes
+        the mint once Iris attests. The mintRecipient was pinned in the burn
+        message at source time, so this call can only deliver USDC to that
+        (platform-controlled / user) address — never redirected. Submitted
+        from the relayer wallet via the destination MessageTransmitterV2.
+        Raises on submit failure so the caller retries next poll.
+        """
+        from minotaur_subnet.bridge.cctp import MESSAGE_TRANSMITTER_V2
+
+        message = metadata.get("message") or ""
+        attestation = metadata.get("attestation") or ""
+        if not message or not attestation:
+            raise ValueError("CCTP mint: missing message/attestation")
+
+        def _b(h: str) -> bytes:
+            return bytes.fromhex(h[2:] if h.startswith("0x") else h)
+
+        tx = await self.relayer.call_contract_function(
+            contract_address=MESSAGE_TRANSMITTER_V2,
+            chain_id=tracked.dst_chain_id,
+            signature="receiveMessage(bytes,bytes)",
+            abi_types=["bytes", "bytes"],
+            values=[_b(message), _b(attestation)],
+            gas=300_000,
+        )
+        logger.info(
+            "CCTP mint self-relayed for %s on chain %d: tx=%s",
+            tracked.order_id, tracked.dst_chain_id, tx[:18],
+        )
+        print(f"[BRIDGE] {tracked.order_id}: CCTP mint submitted (tx={tx[:16]})", flush=True)
+        return tx
 
     async def _on_bridge_complete(
         self,
@@ -258,17 +356,12 @@ class BridgeTracker:
             leg_label = f"leg {leg.leg_index} (chain {leg.chain_id})"
             print(f"[BRIDGE] {tracked.order_id}: processing {leg_label}", flush=True)
 
-            # Build ExecutionPlan for this leg
-            leg_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=leg.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **leg.metadata,
-                    "leg_index": leg.leg_index,
-                    "chain_id": leg.chain_id,
-                },
+            # Build ExecutionPlan for this leg — canonical builder so the
+            # submitted plan hash matches the user's signed plan set
+            # (consensus/plan_set.py invariant).
+            from minotaur_subnet.consensus.plan_set import build_leg_execution_plan
+            leg_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), leg,
             )
 
             # Simulate destination leg before consensus
@@ -294,7 +387,10 @@ class BridgeTracker:
                     )
                     if sim and not sim.success:
                         logger.warning("Dest leg simulation failed for %s %s", tracked.order_id, leg_label)
-                        self._mark_bridge_failed(tracked.order_id, f"Dest leg {leg.leg_index} simulation failed")
+                        await self._fail_dest_leg(
+                            tracked, order, leg.leg_index,
+                            f"Dest leg {leg.leg_index} simulation failed",
+                        )
                         return
                     print(f"[BRIDGE] {tracked.order_id}: {leg_label} simulation passed", flush=True)
                 except Exception as exc:
@@ -398,6 +494,15 @@ class BridgeTracker:
             submit_params["intent_selector"] = leg.intent_selector
             if leg.intent_params_hex:
                 submit_params["intent_params_hex"] = leg.intent_params_hex
+            # Plan-set signed path (threaded from the tracking plan): the
+            # destination leg is the one the empty-user-sig hole hit hardest.
+            from minotaur_subnet.consensus.plan_set import thread_plan_set_params
+            thread_plan_set_params(
+                submit_params,
+                tracked.plan.metadata.get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                leg.leg_index,
+            )
             submit_order.params = submit_params
 
             try:
@@ -408,12 +513,14 @@ class BridgeTracker:
                 print(f"[BRIDGE] {tracked.order_id}: {leg_label} submit success={submit_result.success} tx={submit_result.tx_hash} err={submit_result.error}", flush=True)
             except Exception as exc:
                 logger.error("Bridge dest leg submit failed: %s", exc)
-                self._mark_bridge_failed(tracked.order_id, f"Dest leg failed: {exc}")
+                await self._fail_dest_leg(
+                    tracked, order, leg.leg_index, f"Dest leg failed: {exc}",
+                )
                 return
 
             if not submit_result.success:
-                self._mark_bridge_failed(
-                    tracked.order_id,
+                await self._fail_dest_leg(
+                    tracked, order, leg.leg_index,
                     f"Dest leg {leg.leg_index} failed: {submit_result.error}",
                 )
                 return
@@ -556,6 +663,142 @@ class BridgeTracker:
             error=error,
         )
         logger.warning("Cross-chain order %s → BRIDGE_FAILED: %s", order_id, error)
+
+    def _refunds_on_origin(self, tracked: TrackedBridge) -> bool:
+        """Does this rail return the funds to the user if it never delivers?
+
+        Read off the adapter (``REFUNDS_ON_ORIGIN``). Unknown protocol →
+        False: never tell a user a refund is coming unless the rail actually
+        provides one.
+        """
+        registry = getattr(self, "bridge_registry", None)
+        adapter = registry.get(tracked.bridge_protocol) if registry else None
+        return bool(getattr(adapter, "REFUNDS_ON_ORIGIN", False))
+
+    async def _fail_bridge(self, tracked: TrackedBridge, error: str) -> None:
+        """The bridge HOP itself failed — expired unfilled, or polled out.
+
+        Distinct from a destination-leg failure: nothing arrived on the
+        destination, so there is no escrow and no executable revert (the
+        rollback legs are reverse-bridges that would run on the destination
+        chain, where the funds never landed).
+
+        What comes next depends on the RAIL, not on the failure:
+
+        - **Refundable** (Across): the deposit returns to the depositor —
+          the user's own wallet — on the origin chain. Nothing to revert,
+          and the one decision left is whether to re-quote, so park with
+          ``refresh`` as the sole option.
+        - **Committed** (CCTP burn, Hyperlane lock): the source funds are
+          gone and the delivery is late, not lost. There is no refund to
+          announce and no re-quote to make — offering either would be false.
+          Record the accurate terminal state and escalate; the mint/message
+          can still be completed manually and remains permissionless.
+
+        Falls back to the legacy BRIDGE_FAILED state when the recovery
+        feature is off or the orchestrator isn't wired.
+        """
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+
+        if not self._refunds_on_origin(tracked):
+            logger.error(
+                "Committed-rail bridge %s did not deliver for order %s (%s) — "
+                "source funds are irreversibly committed; the delivery is "
+                "still pending and can be completed permissionlessly. Manual "
+                "escalation required; no refund or re-quote applies.",
+                tracked.bridge_protocol, tracked.order_id, error,
+            )
+            self._mark_bridge_failed(
+                tracked.order_id,
+                f"{error} — {tracked.bridge_protocol} funds are committed on "
+                f"the source chain and delivery is still pending (no origin "
+                f"refund exists for this rail); escalated for manual "
+                f"completion",
+            )
+            return
+
+        orchestrator = self.multi_leg_orchestrator
+        order = self.orderbook.get(tracked.order_id) if self.orderbook else None
+        if (
+            not cross_chain_user_decision_enabled()
+            or orchestrator is None
+            or order is None
+        ):
+            self._mark_bridge_failed(tracked.order_id, error)
+            return
+
+        meta = tracked.plan.metadata or {}
+        try:
+            await orchestrator.park_for_user_decision(
+                order, [], [],
+                meta.get("contract_address", ""),
+                {"plan_set": meta.get("plan_set"),
+                 "escrow_params": meta.get("escrow_params")},
+                tracked.plan.metadata.get("bridge_leg_index", -1),
+                f"{error} (origin-chain refund to your wallet)",
+                options=["refresh"],
+                expiry_status=OrderStatus.BRIDGE_FAILED,
+            )
+        except Exception as exc:
+            logger.error(
+                "Park-for-decision failed for %s (%s) — falling back to "
+                "BRIDGE_FAILED", tracked.order_id, exc,
+            )
+            self._mark_bridge_failed(tracked.order_id, error)
+
+    async def _fail_dest_leg(
+        self,
+        tracked: TrackedBridge,
+        order: Any,
+        failed_leg_index: int,
+        error: str,
+    ) -> None:
+        """Destination-leg failure: park for revert-or-refresh when enabled.
+
+        This is the design's core decision point — bridged funds sit in
+        on-chain escrow (deposit done, release gated), so waiting for the
+        user is safe. Falls back to the legacy BRIDGE_FAILED dead-end when
+        the feature is off or the orchestrator isn't wired.
+        """
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+
+        orchestrator = self.multi_leg_orchestrator
+        if not cross_chain_user_decision_enabled() or orchestrator is None:
+            self._mark_bridge_failed(tracked.order_id, error)
+            return
+
+        from minotaur_subnet.shared.types import LegPlan
+
+        meta = tracked.plan.metadata or {}
+        all_legs = {
+            l["leg_index"]: LegPlan.from_dict(l)
+            for l in (meta.get("multi_leg_plan") or {}).get("forward_legs", [])
+        }
+        completed = [
+            all_legs[i] for i in meta.get("completed_leg_indices", [])
+            if i in all_legs
+        ]
+        rollbacks = [
+            LegPlan.from_dict(d) for d in meta.get("rollback_legs", [])
+        ]
+        try:
+            await orchestrator.park_for_user_decision(
+                order, completed, rollbacks,
+                meta.get("contract_address", ""),
+                {"plan_set": meta.get("plan_set"),
+                 "escrow_params": meta.get("escrow_params")},
+                failed_leg_index, error,
+            )
+        except Exception as exc:
+            logger.error(
+                "Park-for-decision failed for %s (%s) — falling back to "
+                "BRIDGE_FAILED", tracked.order_id, exc,
+            )
+            self._mark_bridge_failed(tracked.order_id, error)
 
     async def run_loop(self) -> None:
         """Background polling loop. Runs until stop() is called."""

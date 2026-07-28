@@ -1,0 +1,279 @@
+"""Structural fingerprint + observe-only structural dedup.
+
+Pins the two properties that make it safe: a salted constant collapses to ONE
+structural identity (catches the sybil), while a real logic change diverges it
+(fork-and-improve keeps its own slot).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from minotaur_subnet.harness.structural_fingerprint import (
+    repo_structural_fingerprint,
+    structural_python_bytes,
+)
+from minotaur_subnet.harness.code_fingerprint import source_fingerprint
+from minotaur_subnet.harness.rotation import structural_dedup_clusters
+
+
+def _fp(src: str) -> bytes:
+    return structural_python_bytes(src)
+
+
+BASE = '''
+BUILD_SALT = "aaaaaaaa"
+class SwapSolver:
+    def route(self, amount):
+        x = amount * 2
+        if x > 100:
+            return x - 1
+        return x
+'''
+
+
+class TestStructuralInvariance:
+    def test_salted_constant_same_structure(self):
+        # The sybil move: identical code, one salted build-constant per copy.
+        a = BASE
+        b = BASE.replace('"aaaaaaaa"', '"bbbbbbbb"')
+        c = BASE.replace('"aaaaaaaa"', '"cccccccc"')
+        # Structural fp collapses all three...
+        assert _fp(a) == _fp(b) == _fp(c)
+        # ...while the CONTENT fp (which keeps constant values) splits them —
+        # this is exactly the gap the structural fp closes.
+        assert source_fingerprint(a) != source_fingerprint(b)
+
+    def test_salted_number_same_structure(self):
+        a = BASE
+        b = BASE.replace('BUILD_SALT = "aaaaaaaa"', "BUILD_SALT = 12345")
+        # different constant TYPE (str vs int) → different structure (correct:
+        # a type change is a real change). Same type, different value → same:
+        b2 = BASE.replace('BUILD_SALT = "aaaaaaaa"', 'BUILD_SALT = "zzzzzzzz"')
+        assert _fp(a) == _fp(b2)
+        assert _fp(a) != _fp(b)
+
+    def test_docstring_and_comment_invariant(self):
+        a = BASE
+        b = '"""a docstring."""\n' + BASE + "\n# a comment\n"
+        assert _fp(a) == _fp(b)
+
+    def test_real_logic_change_diverges(self):
+        # A genuine improvement: extra branch / different call → distinct fp.
+        improved = BASE.replace(
+            "        return x", "        y = self.optimize(x)\n        return y"
+        )
+        assert _fp(BASE) != _fp(improved)
+
+    def test_renamed_identifiers_currently_diverge(self):
+        # v1 keeps identifiers (documented conservative choice) — renaming a
+        # function is NOT yet caught. Pins the known scope limit.
+        renamed = BASE.replace("def route", "def compute")
+        assert _fp(BASE) != _fp(renamed)
+
+    def test_deterministic(self):
+        assert _fp(BASE) == _fp(BASE)
+
+    def test_unparseable_falls_back_to_raw(self):
+        bad = "def (:\n  broken"
+        assert structural_python_bytes(bad) == bad.encode("utf-8", "surrogateescape")
+
+
+class TestRepoFingerprint:
+    def test_py_only_data_files_ignored(self, tmp_path):
+        (tmp_path / "solver.py").write_text(BASE)
+        (tmp_path / "replay.json").write_text('{"nonce": 1}')
+        fp1 = repo_structural_fingerprint(str(tmp_path))
+        # A salted data file must NOT mint a new structural identity.
+        (tmp_path / "replay.json").write_text('{"nonce": 999999}')
+        fp2 = repo_structural_fingerprint(str(tmp_path))
+        assert fp1 == fp2 and fp1 is not None
+
+    def test_salted_constant_repo_collapses(self, tmp_path):
+        d1 = tmp_path / "m1"; d1.mkdir(); (d1 / "s.py").write_text(BASE)
+        d2 = tmp_path / "m2"; d2.mkdir()
+        (d2 / "s.py").write_text(BASE.replace('"aaaaaaaa"', '"salted!!"'))
+        assert repo_structural_fingerprint(str(d1)) == repo_structural_fingerprint(str(d2))
+
+    def test_no_python_returns_none(self, tmp_path):
+        (tmp_path / "data.json").write_text("{}")
+        assert repo_structural_fingerprint(str(tmp_path)) is None
+
+
+def _sub(sid, hk, fp):
+    return SimpleNamespace(submission_id=sid, hotkey=hk, structural_fingerprint=fp)
+
+
+class TestStructuralDedupClusters:
+    # actor_of maps hotkey → coldkey/actor
+    def _actor_of(self, m):
+        f = lambda hk: m.get(hk, hk)  # noqa: E731
+        f.source = "test"
+        return f
+
+    def test_cross_actor_same_fp_clusters(self):
+        # 3 distinct actors (coldkeys), one structural fp — the live sybil.
+        subs = [_sub("a", "hk1", "FP"), _sub("b", "hk2", "FP"), _sub("c", "hk3", "FP")]
+        actor_of = self._actor_of({"hk1": "ck1", "hk2": "ck2", "hk3": "ck3"})
+        clusters = structural_dedup_clusters(subs, actor_of)
+        assert len(clusters) == 1
+        assert {s.submission_id for s in clusters[0]} == {"a", "b", "c"}
+
+    def test_same_actor_not_clustered(self):
+        # One actor's own resubmissions — actor-keying already dedups these.
+        subs = [_sub("a", "hk1", "FP"), _sub("b", "hk2", "FP")]
+        actor_of = self._actor_of({"hk1": "ck1", "hk2": "ck1"})  # same coldkey
+        assert structural_dedup_clusters(subs, actor_of) == []
+
+    def test_distinct_fp_not_clustered(self):
+        subs = [_sub("a", "hk1", "FP1"), _sub("b", "hk2", "FP2")]
+        actor_of = self._actor_of({"hk1": "ck1", "hk2": "ck2"})
+        assert structural_dedup_clusters(subs, actor_of) == []
+
+    def test_missing_fp_ignored(self):
+        # No structural fp (unparseable / pre-metric) never manufactures a cluster.
+        subs = [_sub("a", "hk1", None), _sub("b", "hk2", None)]
+        actor_of = self._actor_of({"hk1": "ck1", "hk2": "ck2"})
+        assert structural_dedup_clusters(subs, actor_of) == []
+
+    def test_no_actor_map_uses_hotkey(self):
+        subs = [_sub("a", "hk1", "FP"), _sub("b", "hk2", "FP")]
+        clusters = structural_dedup_clusters(subs, None)
+        assert len(clusters) == 1
+
+
+class TestStructuralCollapseEnforce:
+    """Enforce: select_rotation_slate seats <=1 submission per structural
+    fingerprint, so a distinct-actor fleet running identical code holds one
+    seat and the freed slots go to distinct code."""
+
+    def _actor_of(self, m=None):
+        f = lambda hk: (m or {}).get(hk, hk)  # noqa: E731 — each hk its own actor
+        f.source = "test"
+        return f
+
+    # seniority: sybils first-seen oldest (most senior) so they'd win the slate
+    # by wait-time — enforce must still collapse them despite that seniority.
+    _SEN = {"hkA": 0.0, "hkB": 0.0, "hkC": 0.0, "hkD": 100.0, "hkE": 100.0}
+
+    def _slate(self, subs, slots, collapse):
+        from minotaur_subnet.harness.rotation import select_rotation_slate
+        return select_rotation_slate(
+            subs, slots, {}, "r1", actor_of=self._actor_of(),
+            seen=self._SEN, now=1000.0, structural_collapse=collapse,
+        )
+
+    def test_enforce_collapses_cross_actor_cluster(self):
+        # 3 sybils (distinct actors, one fp, most senior) + 2 distinct miners.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"),
+            _sub("l1", "hkD", "LEGIT1"), _sub("l2", "hkE", "LEGIT2"),
+        ]
+        sel, _ = self._slate(subs, 3, collapse=True)
+        fps = [s.structural_fingerprint for s in sel]
+        assert len(sel) == 3
+        assert fps.count("SYB") == 1                     # collapsed to one
+        assert "LEGIT1" in fps and "LEGIT2" in fps       # freed slots -> distinct code
+
+    def test_observe_off_lets_fleet_capture_the_slate(self):
+        # Same input, collapse OFF: the senior fleet (distinct actors) takes all
+        # 3 slots — the capture enforce exists to stop.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"),
+            _sub("l1", "hkD", "LEGIT1"), _sub("l2", "hkE", "LEGIT2"),
+        ]
+        sel, _ = self._slate(subs, 3, collapse=False)
+        assert [s.structural_fingerprint for s in sel].count("SYB") == 3
+
+    def test_fingerprintless_never_collapse(self):
+        # None fp must not dedup — two unparseable repos are not "one sybil".
+        subs = [_sub("a", "hkA", None), _sub("b", "hkB", None), _sub("c", "hkC", "X")]
+        sel, _ = self._slate(subs, 3, collapse=True)
+        assert len(sel) == 3
+
+    def test_backfill_skips_seated_fingerprint(self):
+        # slots=2: seat 1 sybil + 1 legit, never a 2nd sybil from overflow.
+        subs = [
+            _sub("s1", "hkA", "SYB"), _sub("s2", "hkB", "SYB"),
+            _sub("s3", "hkC", "SYB"), _sub("l1", "hkD", "L"),
+        ]
+        sel, skip = self._slate(subs, 2, collapse=True)
+        fps = [s.structural_fingerprint for s in sel]
+        assert len(sel) == 2
+        assert fps.count("SYB") == 1 and "L" in fps
+        # the two non-seated sybils are the overflow (both SYB)
+        assert len(skip) == 2
+        assert all(s.structural_fingerprint == "SYB" for s in skip)
+
+    def test_same_actor_distinct_structure_not_over_collapsed(self):
+        # One actor, two DIFFERENT structures: structure dedup must not drop the
+        # second (actor dedup governs repeats, not structure identity).
+        m = {"hkA": "ck1", "hkB": "ck1"}
+        from minotaur_subnet.harness.rotation import select_rotation_slate
+        subs = [_sub("a", "hkA", "FP1"), _sub("b", "hkB", "FP2")]
+        f = lambda hk: m.get(hk, hk)  # noqa: E731
+        f.source = "test"
+        sel, _ = select_rotation_slate(
+            subs, 2, {}, "r1", actor_of=f, seen={}, now=1.0, structural_collapse=True,
+        )
+        # actor dedup seats one on the first pass, the other backfills (distinct
+        # fp, so structure-collapse doesn't block it).
+        assert len(sel) == 2
+
+
+class TestDedupModeGate:
+    def test_default_off(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.delenv("STRUCTURAL_DEDUP_MODE", raising=False)
+        assert structural_dedup_mode() == "off"
+
+    def test_observe(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "observe")
+        assert structural_dedup_mode() == "observe"
+
+    def test_enforce(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "ENFORCE")
+        assert structural_dedup_mode() == "enforce"
+
+    def test_unknown_falls_back_to_off(self, monkeypatch):
+        from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+        monkeypatch.setenv("STRUCTURAL_DEDUP_MODE", "yes")  # typo → fail safe
+        assert structural_dedup_mode() == "off"
+
+
+class TestStageResultAcceptsFingerprint:
+    """Regression: _dw_fields (incl. structural_fingerprint) is spread into
+    StageResult during screening — StageResult MUST accept it, or every
+    submission is rejected with 'Screening error: StageResult.__init__()'."""
+    def test_stageresult_takes_structural_fingerprint(self):
+        from minotaur_subnet.harness.screening import StageResult
+        sr = StageResult(stage=1, passed=True, structural_fingerprint="fp")
+        assert sr.structural_fingerprint == "fp"
+
+
+class TestStructuralFingerprintPersistence:
+    """Regression: the value computed in screening must actually REACH the
+    record. screening_pipeline persists it via store.set_structural_fingerprint
+    (mirroring set_content_fingerprint) — without that call every submission
+    reads structural_fingerprint=None and the dedup can never fire."""
+
+    def test_set_and_survives_reload(self, tmp_path):
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+        p = tmp_path / "subs.json"
+        store = SubmissionStore(persist_path=p)
+        sub = store.create(
+            repo_url="https://example.com/r.git", commit_hash="c1",
+            epoch=1, hotkey="hk", round_id="r1",
+        )
+        store.set_structural_fingerprint(sub.submission_id, "s" * 64)
+        # in-memory
+        assert store.get(sub.submission_id).structural_fingerprint == "s" * 64
+        # survives to_dict/from_dict round-trip (fresh store from same file)
+        store2 = SubmissionStore(persist_path=p)
+        assert store2.get(sub.submission_id).structural_fingerprint == "s" * 64

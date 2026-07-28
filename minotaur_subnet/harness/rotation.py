@@ -93,6 +93,72 @@ def rotation_ledger_path() -> str:
     return os.path.join(base or ".", "solver_rotation.json")
 
 
+def absence_reset_seconds() -> float:
+    """Absence window after which accrued seniority is forfeited (seconds).
+
+    ``SOLVER_ROTATION_ABSENCE_RESET_SECONDS``; code default 4 days, ``0``
+    disables. Seniority must be EARNED BY PRESENCE: a miner idle 24 days used
+    to re-enter at the FRONT of the queue (its wait clock kept aging while it
+    was gone), out-senioring everyone actively rotating. With this window, an
+    identity whose last submission activity is older than the threshold
+    re-enters as a NEWCOMER (clock = return time) — the same junior-ing the
+    fresh-mint rule applies, extended to lapsed identities. The discriminator
+    is ACTIVITY, not clock age: a continuously-submitting miner merely starved
+    by capacity (233h waits were real under the 3-seat slate) keeps its full
+    seniority. Default lives in code so a leader failover keeps the guard.
+    """
+    raw = os.environ.get("SOLVER_ROTATION_ABSENCE_RESET_SECONDS", "").strip()
+    try:
+        return float(raw) if raw else 4 * 86400.0
+    except ValueError:
+        return 4 * 86400.0
+
+
+def fold_reset(
+    benched: dict[str, float],
+    reset: dict[str, float],
+) -> dict[str, float]:
+    """Fold absence-reset stamps into the benched map (max-merge) — PURE.
+
+    A reset acts like a phantom bench at the return time: :func:`wait_ts`
+    prefers the benched anchor when present, so max-merging the reset there
+    makes the returner exactly as junior as someone benched at that moment —
+    without corrupting the honest on-disk ``benched`` map (``last_benched_at``
+    display stays real). Works at both hotkey level and after the MAX actor
+    aggregation (:func:`actor.actor_last_selected` preserves the fold).
+    """
+    if not reset:
+        return benched
+    out = dict(benched)
+    for k, ts in reset.items():
+        if ts > out.get(k, 0.0):
+            out[k] = ts
+    return out
+
+
+def actor_evidence_map(
+    active: dict[str, float],
+    benched: dict[str, float],
+    seen: dict[str, float],
+    actor_of: Any = None,
+) -> dict[str, float]:
+    """Last evidence of life per actor — PURE, shared by the absence-reset
+    detection and the queue endpoint's display so the two can never drift.
+
+    Per hotkey: submission activity where known, else any ledger trace
+    (bench / first-seen). Per actor: MAX over ALL its hotkeys — a fleet is
+    absent only if all its identities were (one active sibling keeps the
+    whole actor's clock alive, consistent with shared actor seniority).
+    """
+    out: dict[str, float] = {}
+    for hk in set(active) | set(benched) | set(seen):
+        ev = active.get(hk, 0.0) or max(benched.get(hk, 0.0), seen.get(hk, 0.0))
+        actor = (actor_of(hk) if actor_of is not None else hk) or hk
+        if ev > out.get(actor, 0.0):
+            out[actor] = ev
+    return out
+
+
 def wait_ts(
     key: str,
     benched: dict[str, float],
@@ -168,6 +234,7 @@ def select_rotation_slate(
     actor_of: Any = None,
     seen: dict[str, float] | None = None,
     now: float | None = None,
+    structural_collapse: bool = False,
 ) -> tuple[list[Any], list[Any]]:
     """PURE: split candidates into (selected, skipped) by wait-time order.
 
@@ -179,6 +246,16 @@ def select_rotation_slate(
     rotating N hotkeys holds one seat, not N — and only when fewer distinct
     actors than slots contend do an actor's further submissions fill the
     leftover seats. ``skipped`` stays in seniority order.
+
+    ``structural_collapse`` (enforce mode) adds an orthogonal cut: seat at most
+    ONE submission per structural fingerprint too, so a fleet of DISTINCT actors
+    (coldkeys) running structurally-identical code (salted constants) — which
+    the per-actor dedup cannot see — holds one seat, not N. Freed slots backfill
+    from the overflow in seniority order but NEVER re-seat an already-benched
+    fingerprint (else the wide fleet just refills the slots its collapse freed);
+    a legit repeat-actor with distinct code can. This changes the benched slate
+    -> the pack hash, so it MUST be promoted fleet-uniform. Fingerprint-less
+    submissions never collapse.
     """
     slots = max(0, int(slots))
     seen = seen or {}
@@ -206,19 +283,80 @@ def select_rotation_slate(
     selected: list[Any] = []
     overflow: list[Any] = []
     seated_actors: set[str] = set()
+    seated_structs: set[str] = set()
+
+    def _struct(sub: Any) -> str | None:
+        if not structural_collapse:
+            return None
+        return getattr(sub, "structural_fingerprint", None) or None
+
     for sub in ordered:
         hk = getattr(sub, "hotkey", "") or ""
         actor = actor_of(hk) or hk
-        if len(selected) < slots and actor not in seated_actors:
+        sfp = _struct(sub)
+        blocked = actor in seated_actors or (sfp is not None and sfp in seated_structs)
+        if len(selected) < slots and not blocked:
             selected.append(sub)
             seated_actors.add(actor)
+            if sfp is not None:
+                seated_structs.add(sfp)
         else:
             overflow.append(sub)
     # Fewer distinct actors than slots: fill from the overflow in seniority
-    # order (repeat actors) rather than waste bench capacity.
-    while len(selected) < slots and overflow:
-        selected.append(overflow.pop(0))
+    # order (repeat actors) rather than waste bench capacity. Under
+    # structural_collapse, skip any overflow whose fingerprint is already
+    # seated so the freed slots go to distinct code, not the fleet's spares.
+    i = 0
+    while len(selected) < slots and i < len(overflow):
+        sfp = _struct(overflow[i])
+        if sfp is not None and sfp in seated_structs:
+            i += 1
+            continue
+        sub = overflow.pop(i)
+        selected.append(sub)
+        if sfp is not None:
+            seated_structs.add(sfp)
     return selected, overflow
+
+
+def structural_dedup_clusters(
+    subs: list[Any],
+    actor_of: Any = None,
+) -> list[list[Any]]:
+    """Group submissions that share a structural fingerprint ACROSS DISTINCT
+    actors — the sybil signature (one codebase, N coldkeys, salted constants).
+
+    Returns one list per offending fingerprint, each holding the ≥2
+    submissions that share it AND belong to ≥2 distinct actors, sorted so the
+    caller can keep a stable representative. Submissions with no structural
+    fingerprint (unparseable / pre-metric) are ignored — never grouped, so a
+    missing value can't manufacture a false cluster.
+
+    PURE + observe-safe: does not mutate or select. ``select_rotation_slate``
+    already soft-dedups per actor; this is the orthogonal cut that a fleet of
+    DISTINCT coldkeys running identical code slips through. Phase 0 only
+    reports these; arming (collapsing them to one slot) is gated and MUST be
+    promoted fleet-uniform because it changes the benched slate → the pack
+    hash.
+    """
+    by_fp: dict[str, list[Any]] = {}
+    for s in subs:
+        fp = getattr(s, "structural_fingerprint", None)
+        if fp:
+            by_fp.setdefault(fp, []).append(s)
+
+    clusters: list[list[Any]] = []
+    for fp, group in by_fp.items():
+        if len(group) < 2:
+            continue
+        actors = {
+            (actor_of(getattr(g, "hotkey", "") or "") if actor_of else None)
+            or (getattr(g, "hotkey", "") or "")
+            for g in group
+        }
+        if len(actors) >= 2:
+            clusters.append(list(group))
+    return clusters
 
 
 class RotationLedger:
@@ -260,20 +398,31 @@ class RotationLedger:
     def __init__(self, path: str) -> None:
         self._path = str(path)
 
-    def _load_raw(self) -> tuple[dict[str, float], dict[str, float]]:
+    def _load_raw(
+        self,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+        """(benched, seen, active, reset) — v3 on-disk shape.
+
+        ``active`` = last submission activity per hotkey (max-write, stamped
+        every rotation pass); ``reset`` = absence-reset stamps (max-write, the
+        "your clock restarted here" record — folded into benched at READ time
+        via :func:`fold_reset`, never mutating the honest bench history).
+        v2 files ({benched, seen}) load with empty active/reset; legacy flat
+        files load as before.
+        """
         try:
             with open(self._path) as f:
                 raw = json.load(f)
         except FileNotFoundError:
-            return {}, {}
+            return {}, {}, {}, {}
         except Exception:
             logger.warning(
                 "rotation ledger unreadable (%s) — treating all miners as never-benched",
                 self._path, exc_info=True,
             )
-            return {}, {}
+            return {}, {}, {}, {}
         if not isinstance(raw, dict):
-            return {}, {}
+            return {}, {}, {}, {}
 
         def _floats(d: Any) -> dict[str, float]:
             out: dict[str, float] = {}
@@ -286,11 +435,16 @@ class RotationLedger:
             return out
 
         if isinstance(raw.get("benched"), dict) or isinstance(raw.get("seen"), dict):
-            return _floats(raw.get("benched")), _floats(raw.get("seen"))
+            return (
+                _floats(raw.get("benched")),
+                _floats(raw.get("seen")),
+                _floats(raw.get("active")),
+                _floats(raw.get("reset")),
+            )
         # Legacy flat file: {hotkey: last_benched_ts}. Seed `seen` from it so
         # miners with history aren't demoted to brand-new on the first v2 write.
         benched = _floats(raw)
-        return benched, dict(benched)
+        return benched, dict(benched), {}, {}
 
     def load(self) -> dict[str, float]:
         """The benched map ``{hotkey: last_selected_ts}`` (name kept for the
@@ -301,14 +455,31 @@ class RotationLedger:
         """The first-seen map ``{hotkey: first_seen_ts}``."""
         return self._load_raw()[1]
 
-    def _persist(self, benched: dict[str, float], seen: dict[str, float]) -> None:
+    def load_active(self) -> dict[str, float]:
+        """The activity map ``{hotkey: last_submission_created_at}``."""
+        return self._load_raw()[2]
+
+    def load_reset(self) -> dict[str, float]:
+        """The absence-reset map ``{hotkey: clock_restarted_at}``."""
+        return self._load_raw()[3]
+
+    def _persist(
+        self,
+        benched: dict[str, float],
+        seen: dict[str, float],
+        active: dict[str, float],
+        reset: dict[str, float],
+    ) -> None:
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=os.path.dirname(self._path) or ".", prefix=".rotation-",
             )
             with os.fdopen(fd, "w") as f:
-                json.dump({"benched": benched, "seen": seen}, f)
+                json.dump(
+                    {"benched": benched, "seen": seen, "active": active, "reset": reset},
+                    f,
+                )
             os.replace(tmp, self._path)
             tmp = None
         except Exception:
@@ -321,12 +492,12 @@ class RotationLedger:
                     pass
 
     def mark_selected(self, hotkeys: list[str], ts: float) -> None:
-        benched, seen = self._load_raw()
+        benched, seen, active, reset = self._load_raw()
         for hk in hotkeys:
             if hk:
                 benched[hk] = float(ts)
                 seen.setdefault(hk, float(ts))  # a benched hotkey has been seen
-        self._persist(benched, seen)
+        self._persist(benched, seen, active, reset)
 
     def mark_seen(self, seen_at: Mapping[str, float]) -> None:
         """Anchor first-seen for ``{hotkey: earliest created_at}`` — min-write.
@@ -336,7 +507,7 @@ class RotationLedger:
         first appearance: re-submission can't refresh it, and a store-history
         backfill (migration) can only restore seniority, not shrink it.
         """
-        benched, seen = self._load_raw()
+        benched, seen, active, reset = self._load_raw()
         changed = False
         for hk, ts in seen_at.items():
             if not hk:
@@ -347,7 +518,42 @@ class RotationLedger:
                 seen[hk] = ts
                 changed = True
         if changed:
-            self._persist(benched, seen)
+            self._persist(benched, seen, active, reset)
+
+    def mark_active(self, active_at: Mapping[str, float]) -> None:
+        """Record submission activity ``{hotkey: created_at}`` — max-write.
+
+        The activity anchor the absence rule measures gaps against. Max-write:
+        activity can only move FORWARD; a stale backfill can never shrink a
+        fresher record.
+        """
+        benched, seen, active, reset = self._load_raw()
+        changed = False
+        for hk, ts in active_at.items():
+            if not hk:
+                continue
+            ts = float(ts)
+            if ts > active.get(hk, 0.0):
+                active[hk] = ts
+                changed = True
+        if changed:
+            self._persist(benched, seen, active, reset)
+
+    def mark_reset(self, hotkeys: Iterable[str], ts: float) -> None:
+        """Stamp absence resets ``hotkey -> ts`` — max-write.
+
+        Persisted so the demotion STICKS: without it a returner would be
+        junior for exactly one round and then jump back to the front on its
+        stale bench anchor next round.
+        """
+        benched, seen, active, reset = self._load_raw()
+        changed = False
+        for hk in hotkeys:
+            if hk and float(ts) > reset.get(hk, 0.0):
+                reset[hk] = float(ts)
+                changed = True
+        if changed:
+            self._persist(benched, seen, active, reset)
 
 
 def _notify_skipped_in_background(
@@ -478,9 +684,89 @@ def apply_rotation_slate(
                 "(round-scope created_at used)", exc_info=True,
             )
     ledger.mark_seen(earliest)
+
+    # ── Absence reset: seniority is earned by presence ───────────────────────
+    # An identity whose last submission activity is older than the window
+    # re-enters as a NEWCOMER: without this, a miner idle for weeks kept aging
+    # its wait clock and re-entered at the FRONT of the queue, out-senioring
+    # everyone actively rotating (observed 2026-07-26: 24d-idle at rank 1).
+    # Keyed on ACTIVITY, never clock age — a continuously-submitting miner
+    # merely starved by capacity keeps full seniority. Detection runs BEFORE
+    # this round's activity stamp (a returner's fresh submission must not mask
+    # the gap it returned from) and the reset is PERSISTED (mark_reset) so the
+    # demotion sticks beyond the return round. Actor-level: a fleet is absent
+    # only if ALL its identities were (one active sibling keeps the whole
+    # actor's clock alive — consistent with shared actor seniority).
+    threshold = absence_reset_seconds()
+    if threshold > 0 and candidates:
+        active = ledger.load_active()
+        # Backfill prior activity from store history (excluding THIS round) so
+        # the first post-upgrade pass never mistakes a starved-but-active miner
+        # for a returning absentee. Best-effort, max-write semantics.
+        history_latest = getattr(sub_store, "latest_created_at_by_hotkey", None)
+        if callable(history_latest):
+            try:
+                for hk, ts in (history_latest(exclude_round_id=round_id) or {}).items():
+                    if ts and float(ts) > active.get(hk, 0.0):
+                        active[hk] = float(ts)
+            except Exception:
+                logger.warning(
+                    "rotation: store history for activity backfill failed "
+                    "(ledger activity only)", exc_info=True,
+                )
+        actor_evidence = actor_evidence_map(
+            active, ledger.load(), ledger.load_seen(), actor_of,
+        )
+
+        def _actor(hk: str) -> str:
+            return (actor_of(hk) if actor_of is not None else hk) or hk
+
+        to_reset: list[str] = []
+        lapsed: set[str] = set()
+        for s in candidates:
+            hk = getattr(s, "hotkey", "") or ""
+            if not hk:
+                continue
+            a = _actor(hk)
+            # Unknown actor (no trace at all) => genuinely new => already a
+            # newcomer via first-seen; no reset needed.
+            evidence = actor_evidence.get(a, now_ts)
+            if now_ts - evidence > threshold:
+                to_reset.append(hk)
+                lapsed.add(a)
+        if to_reset:
+            ledger.mark_reset(to_reset, now_ts)
+            logger.info(
+                "rotation %s: absence reset for %d hotkey(s) / %d actor(s) — "
+                "last activity > %.0fs ago; re-entering as newcomers",
+                round_id, len(to_reset), len(lapsed), threshold,
+            )
+    # Stamp this round's activity AFTER detection (see above). Swept over ALL
+    # of the round's submissions, terminal included — same rationale as
+    # mark_seen: losing the build race is still presence.
+    activity: dict[str, float] = {}
+    for s in subs:
+        hk = getattr(s, "hotkey", "") or ""
+        if not hk:
+            continue
+        try:
+            created = float(getattr(s, "created_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            created = 0.0
+        created = created or now_ts
+        if created > activity.get(hk, 0.0):
+            activity[hk] = created
+    ledger.mark_active(activity)
+
+    # Structural-dedup mode (env-gated, default OFF). In ``enforce`` the slate
+    # collapses cross-actor structural clusters to one slot; ``observe`` only
+    # logs. Read before selection so ``enforce`` feeds select_rotation_slate.
+    from minotaur_subnet.harness.structural_fingerprint import structural_dedup_mode
+    _dedup_mode = structural_dedup_mode()
     selected, skipped = select_rotation_slate(
-        candidates, slots, ledger.load(), round_id, actor_of=actor_of,
-        seen=ledger.load_seen(), now=now_ts,
+        candidates, slots, fold_reset(ledger.load(), ledger.load_reset()),
+        round_id, actor_of=actor_of, seen=ledger.load_seen(), now=now_ts,
+        structural_collapse=(_dedup_mode == "enforce"),
     )
     if actor_of is not None:
         n_actors = distinct_actor_count(
@@ -491,6 +777,88 @@ def apply_rotation_slate(
             "(actor-keyed slate, map=%s)",
             round_id, len(candidates), n_actors, len(selected), actor_of.source,
         )
+
+    # Structural-dedup (env-gated, default OFF): cross-actor clusters where
+    # DISTINCT coldkeys run structurally-identical code (salted constants) —
+    # the sybil that actor-keying alone can't collapse. Clusters are computed
+    # over the whole candidate pool (not just the slate) for full-fleet
+    # visibility; in ``enforce`` the slate was already collapsed above (<=1 per
+    # fingerprint), so this only reports what happened. ``enforce`` changes the
+    # benched slate -> the pack hash and must be promoted fleet-uniform.
+    if _dedup_mode != "off":
+        try:
+            selected_ids = {id(s) for s in selected}
+            clusters = structural_dedup_clusters(candidates, actor_of)
+            for c in clusters:
+                fp = getattr(c[0], "structural_fingerprint", "") or ""
+                in_slate = sum(1 for s in c if id(s) in selected_ids)
+                logger.warning(
+                    "[structural-dedup %s] %s: %d submissions across distinct "
+                    "actors share structural fingerprint %s — likely one sybil"
+                    "%s: %s",
+                    _dedup_mode.upper(), round_id, len(c), fp[:16],
+                    (" (enforced: %d seated, %d excluded from slate)"
+                     % (in_slate, len(c) - in_slate))
+                    if _dedup_mode == "enforce"
+                    else (" (%d currently in slate; would collapse to 1 when armed)"
+                          % in_slate),
+                    ", ".join(
+                        f"{getattr(s, 'submission_id', '?')}"
+                        f"(hk={(getattr(s, 'hotkey', '') or '')[:10]})"
+                        for s in c
+                    ),
+                )
+        except Exception:
+            logger.debug("structural-dedup observe failed for %s", round_id, exc_info=True)
+
+    # ── Structural CO-OCCURRENCE evidence (the automatic operator merge) ────
+    # WHO shipped identical structure TOGETHER this round, recorded per actor
+    # pair. The collapse above is per-round and per-fingerprint, so a ring that
+    # re-rolls its fingerprint every round pays nothing for being caught; this
+    # ledger keys on the ACTORS instead, which cost a registration burn each.
+    # Swept over ALL of the round's submissions (not just the candidates): a
+    # ring member parked by the build budget is still evidence of who submits
+    # together. Merges take effect from the NEXT selection pass — this one
+    # already froze its resolver. Best-effort: never blocks a close.
+    from minotaur_subnet.harness.actor import (
+        record_structural_coclusters,
+        structural_merge_min_rounds,
+        structural_merge_mode,
+    )
+
+    _merge_mode = structural_merge_mode()
+    if _merge_mode != "off" and actor_of is not None:
+        try:
+            # Grouped by fingerprint over HOTKEYS, deliberately NOT through
+            # structural_dedup_clusters: that helper needs >=2 distinct ACTORS,
+            # which an already-merged ring no longer has — it would stop
+            # refreshing its own evidence and the merge would lapse on the TTL.
+            # record_structural_coclusters folds hotkeys to their pre-merge
+            # identity and drops single-identity groups.
+            _by_fp: dict[str, set[str]] = {}
+            for s in subs:
+                fp = getattr(s, "structural_fingerprint", None)
+                hk = getattr(s, "hotkey", "") or ""
+                if fp and hk:
+                    _by_fp.setdefault(fp, set()).add(hk)
+            _clusters = [hks for hks in _by_fp.values() if len(hks) >= 2]
+            for group in record_structural_coclusters(round_id, _clusters):
+                logger.warning(
+                    "[structural-merge %s] %s: %d actors co-shipped identical "
+                    "structure in >=%d rounds — one operator%s: %s",
+                    _merge_mode.upper(), round_id, len(group),
+                    structural_merge_min_rounds(),
+                    (" (merged from the next pass: one queue seat, one build "
+                     "unit, one submission per round)")
+                    if _merge_mode == "enforce"
+                    else " (would merge when armed; selection unchanged)",
+                    ", ".join(sorted(a[:12] for a in group)),
+                )
+        except Exception:
+            logger.warning(
+                "structural co-occurrence pass failed for %s (ignored)",
+                round_id, exc_info=True,
+            )
     reject_reason = (
         f"not selected for {round_id} (rotation: "
         f"{len(candidates)} candidates, {slots} slots) — resubmit "

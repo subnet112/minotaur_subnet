@@ -1313,3 +1313,46 @@ class TestEnrichIntentsWithManifests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOrderToScenarioPerChain(unittest.TestCase):
+    """An order must be replayed against the deployment on ITS OWN chain, not the
+    chain-less primary. Regression for the DexAggregatorV2 relayer() UNRESOLVED:
+    a Base order was built with the Ethereum contract, which (once the sim anvil
+    correctly follows the scenario chain) has no code on the Base fork."""
+
+    def _worker(self, dep_for):
+        app_store = MagicMock()
+        app_store.get_deployment.side_effect = dep_for
+        return BenchmarkWorker(SubmissionStore(), app_store=app_store, use_docker=False)
+
+    def test_order_uses_its_own_chain_deployment(self):
+        from minotaur_subnet.shared.types import AppStatus
+        ADDR = {1: "0x" + "cd" * 20, 8453: "0x" + "e0" * 20}
+
+        def dep_for(app_id, chain_id=None):
+            if chain_id not in ADDR:
+                return None
+            d = MagicMock()
+            d.chain_id = chain_id
+            d.contract_address = ADDR[chain_id]
+            d.status = AppStatus.SOLVED
+            return d
+
+        worker = self._worker(dep_for)
+        order = {"app_id": "dex", "chain_id": 8453, "order_id": "o1",
+                 "params": {"input_token": "0x" + "83" * 20, "input_amount": "1"}}
+        res = worker._order_to_scenario(order, {"dex": _make_intent("dex")}, {})
+        self.assertIsNotNone(res)
+        _, state, _ = res
+        self.assertEqual(state.chain_id, 8453)
+        self.assertEqual(state.contract_address, ADDR[8453])  # Base, NOT the ETH primary
+
+    def test_order_on_undeployed_chain_is_skipped(self):
+        def dep_for(app_id, chain_id=None):
+            return None  # app not deployed on the order's chain
+
+        worker = self._worker(dep_for)
+        order = {"app_id": "dex", "chain_id": 8453, "order_id": "o2", "params": {}}
+        # Skip rather than mis-route to another chain's contract.
+        self.assertIsNone(worker._order_to_scenario(order, {"dex": _make_intent("dex")}, {}))

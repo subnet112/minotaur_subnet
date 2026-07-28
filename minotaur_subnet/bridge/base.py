@@ -46,6 +46,10 @@ class BridgeStatus:
     dst_tx_hash: str | None = None
     amount_received: int | None = None
     error: str | None = None
+    # Adapter-specific payload for the tracker (additive). CCTP uses it to
+    # surface the attested message the platform must self-relay on the
+    # destination ({ready_to_mint, message, attestation}).
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BridgeAdapter(ABC):
@@ -59,6 +63,23 @@ class BridgeAdapter(ABC):
     """
 
     PROTOCOL: str = ""
+
+    #: What happens to the user's funds when a transfer does NOT deliver.
+    #:
+    #: True  — the ORIGIN chain refunds the depositor (Across returns an
+    #:         unfilled deposit at ``fillDeadline``). The funds come home by
+    #:         themselves, so the only decision left for the user is whether
+    #:         to re-quote.
+    #: False — the source funds are irreversibly committed and delivery is a
+    #:         question of *when*, not *whether*: burn-and-mint (CCTP — the
+    #:         burn cannot be undone and the attestation stays valid forever)
+    #:         and lock-and-mint (Hyperlane) rails. There is nothing to
+    #:         refund and nothing to re-quote; a stalled transfer is an ops
+    #:         escalation, not a user choice.
+    #:
+    #: Defaults False so we never promise a refund we can't verify — the
+    #: recovery flow's wording and options branch on this.
+    REFUNDS_ON_ORIGIN: bool = False
 
     @abstractmethod
     async def quote(
@@ -84,13 +105,28 @@ class BridgeAdapter(ABC):
     def build_bridge_interactions(
         self,
         quote: BridgeQuote,
-        sender: str,
+        recipient: str,
+        refund_recipient: str | None = None,
     ) -> list[Interaction]:
         """Build the on-chain interactions to initiate a bridge transfer.
 
+        The two addresses are deliberately SEPARATE — they land in different
+        chains' states and want different owners:
+
         Args:
             quote: A quote from this adapter's ``quote()`` method.
-            sender: The address initiating the bridge (token holder).
+            recipient: Who receives the funds on the DESTINATION chain. For a
+                multi-leg intent this is the destination App contract, whose
+                ``escrowDeposit`` gate + user-callable ``escrowRefund``
+                timelock are what make the hop safe (see
+                docs/architecture/cross-chain-intents.md §1, state 3/4).
+                Pinned into the deposit at source-commitment time, so no
+                downstream party can redirect it.
+            refund_recipient: Who receives an ORIGIN-chain refund if the
+                bridge never delivers (Across: the depositor, refunded at
+                ``fillDeadline``). This must stay the USER — a refund into
+                the app would need a second recovery path to get home.
+                Defaults to ``recipient`` for rails with no refund concept.
 
         Returns:
             List of Interactions (e.g., approve + bridge deposit).

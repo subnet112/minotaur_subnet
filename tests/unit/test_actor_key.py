@@ -209,6 +209,7 @@ def test_fleet_gets_one_lottery_ticket():
 def test_soft_per_actor_dedup_prefers_fresh_actors(monkeypatch):
     _with_map()
     monkeypatch.setenv("SOLVER_ROUND_INTAKE_MAX", "3")
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", "0")  # dispatch-order test, no holdback
     monkeypatch.setenv("SCREENING_BUILD_CONCURRENCY", "1")
 
     async def run():
@@ -243,6 +244,7 @@ def test_soft_per_actor_dedup_prefers_fresh_actors(monkeypatch):
 def test_repeat_actor_still_served_when_alone(monkeypatch):
     _with_map()
     monkeypatch.setenv("SOLVER_ROUND_INTAKE_MAX", "3")
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", "0")  # dispatch-order test, no holdback
     monkeypatch.setenv("SCREENING_BUILD_CONCURRENCY", "2")
 
     async def run():
@@ -264,6 +266,7 @@ def test_legacy_dispatch_has_no_per_hotkey_dedup(monkeypatch):
     # the pre-actor-keying code — pure key order, no dedup — so a hotkey's
     # second submission still beats a junior competitor.
     monkeypatch.setenv("SOLVER_ROUND_INTAKE_MAX", "3")
+    monkeypatch.setenv("SOLVER_BUILD_HOLDBACK_UNITS", "0")  # dispatch-order test, no holdback
     monkeypatch.setenv("SCREENING_BUILD_CONCURRENCY", "1")
 
     async def run():

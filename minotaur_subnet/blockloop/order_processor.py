@@ -340,17 +340,22 @@ class OrderProcessor:
 
         # Cross-chain plan compilation: solver provides CrossChainPlan,
         # platform compiles it into MultiLegPlan with bridge calldata + escrow.
+        # See _resolve_app_addresses for the fail-closed destination policy.
         cross_chain_plan_dict = plan.metadata.get("cross_chain_plan")
         if cross_chain_plan_dict and self.cross_chain_compiler is not None:
             try:
                 from minotaur_subnet.shared.types import CrossChainPlan
                 solver_plan = CrossChainPlan.from_dict(cross_chain_plan_dict)
+                app_addresses = self._resolve_app_addresses(
+                    order.app_id, solver_plan, deployed_contract, order.chain_id,
+                )
                 compiled = await self.cross_chain_compiler.compile(
                     solver_plan,
                     order_id=order.order_id,
                     user_address=order.submitted_by,
                     contract_address=deployed_contract or "",
                     deadline=int(order.deadline),
+                    app_addresses=app_addresses,
                 )
                 # Replace plan metadata with platform-compiled version
                 plan.metadata["multi_leg_plan"] = compiled.multi_leg_plan.to_dict()
@@ -358,8 +363,35 @@ class OrderProcessor:
                 plan.metadata["escrow_params"] = compiled.escrow_params
                 plan.metadata["simulation_mocks"] = compiled.simulation_mocks
                 plan.metadata["_platform_compiled"] = True
+                # Plan set: expose the signable digest on the ORDER so the
+                # user's wallet can sign PlanSetApproval (POST
+                # /orders/{id}/plan-set-signature attaches the result); ride
+                # the plan metadata so orchestrators thread it to the relayer.
+                if compiled.plan_set is not None:
+                    from minotaur_subnet.consensus.plan_set import plan_set_digest
+                    _ps = compiled.plan_set.to_dict()
+                    _ps["digest"] = "0x" + plan_set_digest(
+                        order.order_id, compiled.plan_set.plan_set_hash,
+                    ).hex()
+                    plan.metadata["plan_set"] = _ps
+                    order.params["plan_set"] = _ps
+                    self.order_persistence.sync(order.order_id)
                 # Remove solver's raw plan (prevent bypass)
                 plan.metadata.pop("cross_chain_plan", None)
+                # The App address per chain has to outlive this call: the
+                # plan-set resume path and /orders/{id}/bridge both read it
+                # back from the stored plan.
+                plan.metadata["contract_address"] = deployed_contract or ""
+                # Persist the COMPILED plan on the order. The earlier
+                # update_order(plan=...) above ran BEFORE compilation, so
+                # without this the stored plan never carries multi_leg_plan /
+                # cross_chain / plan_set — which is why GET
+                # /orders/{id}/bridge always answered "not a cross-chain
+                # order", and what the resume path below reads.
+                self.orderbook.update_order(
+                    order.order_id, plan=_plan_to_dict(plan),
+                )
+                self.order_persistence.sync(order.order_id)
                 logger.info(
                     "Cross-chain compiled for %s: %d legs, %d bridges",
                     order.order_id,
@@ -384,6 +416,30 @@ class OrderProcessor:
                     "Multi-leg order %s: %d forward legs, %d rollback legs",
                     order.order_id, len(multi_leg.forward_legs), len(multi_leg.rollback_legs),
                 )
+                # Plan-set gate: hold before the FIRST leg until the user has
+                # signed the compiled set. Nothing has executed yet, so
+                # waiting here costs only latency; executing here instead
+                # would spend the user's funds under quorum alone.
+                from minotaur_subnet.shared.feature_flags import (
+                    cross_chain_require_plan_set_signature,
+                )
+                if (
+                    cross_chain_require_plan_set_signature()
+                    and plan.metadata.get("plan_set")
+                    and not order.params.get("plan_set_signature")
+                ):
+                    self.orderbook.update_order(
+                        order.order_id,
+                        status=OrderStatus.AWAITING_PLAN_SET_SIGNATURE,
+                        error=None,
+                    )
+                    self.order_persistence.sync(order.order_id)
+                    logger.info(
+                        "Multi-leg order %s: awaiting plan-set signature "
+                        "(GET /orders/%s/plan-set to sign)",
+                        order.order_id, order.order_id,
+                    )
+                    return True
                 return await self.multi_leg_orchestrator.process(
                     order, multi_leg, deployed_contract,
                     plan_metadata=plan.metadata,
@@ -398,19 +454,26 @@ class OrderProcessor:
             # look it up from the plan metadata or the order's intent_function
             _raw_sel = order.params.get("intent_selector") or plan.metadata.get("intent_selector") or ""
             if not _raw_sel or not all(c in '0123456789abcdefABCDEF' for c in _raw_sel.replace("0x", "")):
-                # Compute from intent function name using the contract's
-                # registered selector convention (keccak of canonical sig).
-                # For DexAggregatorApp: swap(address,address,uint256,uint256,address)
-                from eth_hash.auto import keccak as _keccak
-                _fn = order.intent_function or "swap"
-                _KNOWN_SIGS = {
-                    "swap": "swap(address,address,uint256,uint256,address)",
-                    "execute": "swap(address,address,uint256,uint256,address)",
-                    "buy": "buy(address,address,uint256,uint256,address)",
-                    "rebalance": "rebalance(address[],uint256[],address)",
-                }
-                _sig = _KNOWN_SIGS.get(_fn, f"{_fn}()")
-                _raw_sel = _keccak(_sig.encode())[:4].hex()
+                # Derive the selector from the APP'S OWN manifest — the same
+                # generic, manifest-driven path the submit-order endpoint uses.
+                #
+                # This used to be a hardcoded {swap, execute, buy, rebalance} ->
+                # canonical-signature map, i.e. one app's ABI baked into a path
+                # every app goes through. It resolves identically for the app it
+                # was written for (verified against the live DexAggregator
+                # manifest: both produce d5bcb9b5) and, unlike the map, is
+                # correct for an app whose intent this file has never heard of.
+                _fn = order.intent_function or ""
+                _raw_sel = self._selector_from_manifest(order.app_id, _fn) or ""
+                if not _raw_sel:
+                    # No manifest entry: fall back to the no-arg convention,
+                    # which is what the map did for any unlisted intent.
+                    from eth_hash.auto import keccak as _keccak
+                    logger.warning(
+                        "No manifest signature for %s.%s — falling back to the "
+                        "no-arg selector convention", order.app_id, _fn,
+                    )
+                    _raw_sel = _keccak(f"{_fn}()".encode())[:4].hex()
             intent_order_dict = {
                 "order_id": order.order_id,
                 "app": contract_address,
@@ -449,9 +512,12 @@ class OrderProcessor:
                 self.order_persistence.sync(order.order_id)
                 return False
 
+        # The app's manifest drives simulator token seeding — the platform
+        # does not guess which params an order spends (v3.manifest.spend_params).
         simulation = await self.simulation_runner.simulate(
             plan, order, contract_address, intent_order_dict,
             is_cross_chain, deployed_contract,
+            manifest=self._manifest_for(order.app_id),
         )
 
         # Protocol-fee certification — the never-lose-money gate, upstream of
@@ -802,6 +868,96 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    def _manifest_for(self, app_id: str) -> dict | None:
+        """The app's manifest, or None. Never raises — a manifest lookup
+        failure must degrade to "cannot seed" (logged by the caller), not take
+        down order processing."""
+        try:
+            manifest = getattr(self.app_store.get_app(app_id), "manifest", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Manifest lookup failed for %s: %s", app_id, exc)
+            return None
+        return manifest if isinstance(manifest, dict) else None
+
+    def _selector_from_manifest(self, app_id: str, intent_function: str) -> str | None:
+        """4-byte selector for ``intent_function``, computed from the app's own
+        manifest. ``None`` when the app declares no such intent.
+
+        Defensive: a manifest that fails to parse must not take down order
+        processing — the caller falls back to the no-arg convention and logs.
+        """
+        if not app_id or not intent_function:
+            return None
+        try:
+            from minotaur_subnet.v3.manifest import (
+                compute_selector_from_manifest,
+                manifest_from_legacy_dict,
+            )
+
+            app = self.app_store.get_app(app_id)
+            manifest = getattr(app, "manifest", None)
+            if not isinstance(manifest, dict) or "intent_functions" not in manifest:
+                return None
+            selector = compute_selector_from_manifest(
+                manifest_from_legacy_dict(manifest), intent_function,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Manifest selector lookup failed for %s.%s: %s",
+                app_id, intent_function, exc,
+            )
+            return None
+        return str(selector).replace("0x", "") if selector else None
+
+    def _resolve_app_addresses(
+        self,
+        app_id: str,
+        solver_plan: Any,
+        deployed_contract: str,
+        source_chain_id: int,
+    ) -> dict[int, str]:
+        """Map chain id → this App's contract address, for every chain the
+        plan touches.
+
+        The compiler pins each bridge's destination recipient to the App on
+        the receiving chain, because that is the only address
+        ``escrowDeposit`` can gate (it checks
+        ``IERC20(token).balanceOf(address(this))``) and therefore the only
+        one the user can reclaim from via the ``escrowRefund`` timelock.
+
+        FAIL CLOSED: if a bridge lands on a chain with no order-ready
+        deployment, the destination leg could never execute — the hop would
+        deliver into the user's wallet and the intent would dead-end with no
+        escrow behind it. Raising here rejects the order at compile time
+        instead of moving the user's funds to a place the plan can't
+        continue from.
+        """
+        from minotaur_subnet.bridge.compiler import CrossChainCompileError
+
+        addresses: dict[int, str] = {}
+        if deployed_contract:
+            addresses[int(source_chain_id)] = deployed_contract
+
+        for br in getattr(solver_plan, "bridge_requests", []) or []:
+            dst = int(br.dst_chain_id)
+            if dst in addresses:
+                continue
+            dep = self.app_store.get_deployment(app_id, chain_id=dst)
+            if dep is None or not dep.contract_address:
+                raise CrossChainCompileError(
+                    f"App {app_id} has no deployment on destination chain "
+                    f"{dst} — a bridge there would strand the intent (no "
+                    f"escrow, no executable destination leg)"
+                )
+            if not dep.status.is_order_ready():
+                raise CrossChainCompileError(
+                    f"App {app_id} deployment on destination chain {dst} is "
+                    f"not order-ready (status: {dep.status.value})"
+                )
+            addresses[dst] = dep.contract_address
+
+        return addresses
 
     async def _perpetual_funds_check(self, order: Any, spender: str) -> bool:
         """Live balance+allowance gate for a perpetual's NEXT fill (#1/#3).

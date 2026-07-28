@@ -2066,10 +2066,12 @@ class TestEpochManagerOwnerResolution:
         assert mgr._resolved_owner == "5Genv"  # real fallback value cached
 
     def test_empty_not_cached_when_no_owner_anywhere(self, monkeypatch):
-        """When neither chain nor env yields an owner, '' is returned and NOT
-        cached — so a later chain/env value can still win."""
-        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
-        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+        """When neither chain nor env/constant yields an owner, '' is returned
+        and NOT cached — so a later chain/env value can still win. Force the
+        resolver empty past the constant fallback to exercise the caching logic
+        in isolation."""
+        import minotaur_subnet.epoch.manager as _mgrmod
+        monkeypatch.setattr(_mgrmod, "get_subnet_owner_hotkey", lambda: "")
         source = MagicMock()
         source.resolve_subnet_owner = MagicMock(return_value="")
 

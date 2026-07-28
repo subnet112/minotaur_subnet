@@ -91,17 +91,13 @@ class MultiLegOrchestrator:
             )
             self._sync(order.order_id)
 
-            # Build an ExecutionPlan from this leg
-            leg_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=leg.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **leg.metadata,
-                    "leg_index": leg.leg_index,
-                    "chain_id": leg.chain_id,
-                },
+            # Build an ExecutionPlan from this leg — through the canonical
+            # builder: the plan-set signature hashes legs via the SAME
+            # constructor, and any metadata drift breaks on-chain set
+            # membership (consensus/plan_set.py invariant).
+            from minotaur_subnet.consensus.plan_set import build_leg_execution_plan
+            leg_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), leg,
             )
 
             # Check if this leg depends on a bridge (wait for bridge completion)
@@ -128,11 +124,16 @@ class MultiLegOrchestrator:
                                 "src_chain_id": src_chain_id,
                                 "dst_chain_id": dst_chain_id,
                                 "bridge_protocol": bridge_protocol,
+                                # Which leg the hop belongs to — reported as
+                                # failed_leg_index if the bridge never delivers.
+                                "bridge_leg_index": dep.leg_index,
                                 "contract_address": contract_address,
                                 "multi_leg_plan": multi_leg_plan.to_dict(),
                                 "remaining_legs": [l.to_dict() for l in remaining_legs],
                                 "rollback_legs": [l.to_dict() for l in multi_leg_plan.rollback_legs],
                                 "completed_leg_indices": [l.leg_index for l in completed_legs],
+                                "plan_set": (plan_metadata or {}).get("plan_set"),
+                                "escrow_params": (plan_metadata or {}).get("escrow_params"),
                             },
                         )
 
@@ -303,7 +304,11 @@ class MultiLegOrchestrator:
 
                 if consensus_result and not consensus_result.reached:
                     logger.warning("[MULTI-LEG] %s: %s consensus failed, rolling back", order.order_id, leg_label)
-                    await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                    await self._fail_leg(
+                        order, completed_legs, multi_leg_plan.rollback_legs,
+                        contract_address, plan_metadata, leg.leg_index,
+                        f"Leg {leg.leg_index} consensus failed",
+                    )
                     return False
 
             # Submit this leg via relayer — use per-leg params so the
@@ -314,6 +319,15 @@ class MultiLegOrchestrator:
             submit_params["intent_selector"] = leg.intent_selector
             if leg.intent_params_hex:
                 submit_params["intent_params_hex"] = leg.intent_params_hex
+            # Plan-set signed path: when the user signed the plan set, the
+            # relayer submits via executeLegSigned (membership-proved).
+            from minotaur_subnet.consensus.plan_set import thread_plan_set_params
+            thread_plan_set_params(
+                submit_params,
+                (plan_metadata or {}).get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                leg.leg_index,
+            )
             submit_order.params = submit_params
 
             logger.info("[MULTI-LEG] %s: submitting %s to relayer (selector=%s)", order.order_id, leg_label, leg.intent_selector)
@@ -325,7 +339,11 @@ class MultiLegOrchestrator:
                 logger.info("[MULTI-LEG] %s: %s relayer result: success=%s tx=%s err=%s", order.order_id, leg_label, submit_result.success, submit_result.tx_hash, submit_result.error)
             except Exception as exc:
                 logger.error("[MULTI-LEG] %s: %s relayer EXCEPTION: %s", order.order_id, leg_label, exc, exc_info=True)
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                await self._fail_leg(
+                    order, completed_legs, multi_leg_plan.rollback_legs,
+                    contract_address, plan_metadata, leg.leg_index,
+                    f"Leg {leg.leg_index} relayer exception: {exc}",
+                )
                 return False
 
             if not submit_result.success:
@@ -333,7 +351,11 @@ class MultiLegOrchestrator:
                     "Multi-leg %s: %s submission failed: %s",
                     order.order_id, leg_label, submit_result.error,
                 )
-                await self._execute_rollback(order, completed_legs, multi_leg_plan.rollback_legs, contract_address)
+                await self._fail_leg(
+                    order, completed_legs, multi_leg_plan.rollback_legs,
+                    contract_address, plan_metadata, leg.leg_index,
+                    f"Leg {leg.leg_index} submission failed: {submit_result.error}",
+                )
                 return False
 
             logger.info("Multi-leg %s: %s completed (tx=%s)", order.order_id, leg_label, submit_result.tx_hash)
@@ -355,12 +377,338 @@ class MultiLegOrchestrator:
         )
         return True
 
+    async def resume_after_plan_set_signature(self, order_id: str) -> dict:
+        """Start orchestration for an order parked awaiting its plan-set sig.
+
+        Called by POST /orders/{id}/plan-set-signature once the signature has
+        been verified and attached. The compiled plan is read back from the
+        stored order (order_processor persists it before parking), so this
+        survives a restart between compile and signature — the user's wallet
+        prompt can take as long as it takes. If the restart lands between the
+        signature and the resume, recover_parked_orders re-fires this at boot.
+
+        Raises ValueError on bad state; the caller maps it to an HTTP error.
+        """
+        from minotaur_subnet.shared.types import MultiLegPlan
+
+        order = self.orderbook.get(order_id)
+        if order is None:
+            raise ValueError(f"Order not found: {order_id}")
+        if order.status != OrderStatus.AWAITING_PLAN_SET_SIGNATURE:
+            raise ValueError(
+                f"Order {order_id} is not awaiting a plan-set signature "
+                f"(status={getattr(order.status, 'value', order.status)})"
+            )
+        if not order.params.get("plan_set_signature"):
+            raise ValueError(f"Order {order_id} has no plan-set signature attached")
+
+        plan = order.plan or {}
+        metadata = plan.get("metadata", {}) if isinstance(plan, dict) else {}
+        multi_leg_dict = metadata.get("multi_leg_plan")
+        if not multi_leg_dict:
+            raise ValueError(
+                f"Order {order_id} has no compiled multi-leg plan to resume"
+            )
+        multi_leg = MultiLegPlan.from_dict(multi_leg_dict)
+
+        logger.info("Multi-leg %s: resuming after plan-set signature", order_id)
+        ok = await self.process(
+            order, multi_leg, metadata.get("contract_address", ""),
+            plan_metadata=metadata,
+        )
+        final = self.orderbook.get(order_id)
+        return {
+            "resumed": True,
+            "success": bool(ok),
+            "status": getattr(final.status, "value", str(final.status)) if final else "unknown",
+        }
+
+    async def recover_parked_orders(self) -> dict[str, int]:
+        """Boot sweep: re-arm every multi-leg order parked on user action.
+
+        Both parked states depend on a live in-process task — the plan-set
+        resume fired from the attach endpoint, and the decision-window
+        watcher — and neither survives a restart. Worse, parked orders
+        aren't in the OPEN set that ``load_open_orders`` restores, so before
+        this sweep a restart made them unreachable to the API entirely.
+
+        Reloads them into the OrderBook, then:
+          - AWAITING_PLAN_SET_SIGNATURE **with** a signature → resume
+            orchestration (the signature landed, the process died before the
+            legs ran);
+          - AWAITING_PLAN_SET_SIGNATURE **without** one → leave parked; the
+            user hasn't signed, and nothing has executed;
+          - AWAITING_USER_DECISION unresolved → re-arm the timeout watcher
+            on its ORIGINAL deadline, so an expired window fires promptly
+            instead of silently never firing.
+
+        Never raises: a failed recovery must not stop the block loop.
+        """
+        counts = {"reloaded": 0, "resumed": 0, "watchers_rearmed": 0}
+        if self.order_persistence is None or self.orderbook is None:
+            return counts
+
+        try:
+            parked = self.order_persistence.load_parked_orders(self.orderbook)
+        except Exception as exc:
+            logger.error("Parked-order reload failed: %s", exc, exc_info=True)
+            return counts
+        counts["reloaded"] = len(parked)
+
+        for order in parked:
+            try:
+                if order.status == OrderStatus.AWAITING_PLAN_SET_SIGNATURE:
+                    if not order.params.get("plan_set_signature"):
+                        continue
+                    logger.info(
+                        "Boot recovery: resuming %s (plan-set signature was "
+                        "attached before restart)", order.order_id,
+                    )
+                    asyncio.create_task(
+                        self._recover_resume(order.order_id),
+                    )
+                    counts["resumed"] += 1
+                elif order.status == OrderStatus.AWAITING_USER_DECISION:
+                    recovery = order.params.get("recovery") or {}
+                    if recovery.get("resolved"):
+                        continue
+                    deadline = int(recovery.get("decision_deadline") or 0)
+                    logger.info(
+                        "Boot recovery: re-arming decision watcher for %s "
+                        "(deadline %d)", order.order_id, deadline,
+                    )
+                    asyncio.create_task(
+                        self._decision_timeout_watch(order.order_id, deadline),
+                    )
+                    counts["watchers_rearmed"] += 1
+            except Exception as exc:
+                logger.error(
+                    "Boot recovery failed for %s: %s", order.order_id, exc,
+                )
+        return counts
+
+    async def _recover_resume(self, order_id: str) -> None:
+        """Background plan-set resume for the boot sweep (logs, never raises —
+        a failure leaves the order parked, with nothing executed)."""
+        try:
+            await self.resume_after_plan_set_signature(order_id)
+        except Exception as exc:
+            logger.error("Boot resume failed for %s: %s", order_id, exc)
+
+    async def _fail_leg(
+        self,
+        order: Order,
+        completed_legs: list,
+        rollback_legs: list,
+        contract_address: str,
+        plan_metadata: dict | None,
+        failed_leg_index: int,
+        reason: str,
+    ) -> None:
+        """Route a leg failure: park for the user's revert-or-refresh
+        decision when the feature is on, else the legacy auto-rollback."""
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_user_decision_enabled,
+        )
+        if cross_chain_user_decision_enabled():
+            await self.park_for_user_decision(
+                order, completed_legs, rollback_legs, contract_address,
+                plan_metadata, failed_leg_index, reason,
+            )
+        else:
+            await self._execute_rollback(
+                order, completed_legs, rollback_legs, contract_address,
+                plan_metadata,
+            )
+
+    async def park_for_user_decision(
+        self,
+        order: Order,
+        completed_legs: list,
+        rollback_legs: list,
+        contract_address: str,
+        plan_metadata: dict | None,
+        failed_leg_index: int,
+        reason: str,
+        options: list[str] | None = None,
+        expiry_status: Any = None,
+    ) -> None:
+        """Park a failed multi-leg order in AWAITING_USER_DECISION.
+
+        The user's funds are in a safe state at every parkable failure point
+        (origin refund received, or asset held in on-chain escrow with a
+        permissionless timelocked refund), so waiting is safe. The user
+        chooses via POST /orders/{id}/decision:
+          - revert  → execute the pre-agreed revert plan (the same rollback
+                      legs the plan-set signature covers)
+          - refresh → this order's orchestration ends (REFRESHING); the
+                      failed leg re-quotes as a NEW single-chain order over
+                      the escrowed asset
+        No decision by the deadline → auto-revert (never leave funds waiting
+        on an absent user past the escrow window). A restart mid-window kills
+        the watcher task, but recover_parked_orders re-arms it at boot on the
+        same deadline; the on-chain escrowRefund timelock remains the
+        unconditional backstop underneath both.
+
+        ``options`` narrows the offer when a choice isn't actually available.
+        A failed bridge HOP passes ["refresh"]: nothing reached the
+        destination, so the revert legs (reverse-bridges that run there)
+        have no funds to move and offering "revert" would be a lie. With no
+        revert available, expiry falls through to ``expiry_status`` (a
+        terminal state) instead of auto-reverting.
+        """
+        import time as _time
+
+        from minotaur_subnet.shared.feature_flags import (
+            cross_chain_decision_window_s,
+        )
+
+        options = list(options) if options else ["revert", "refresh"]
+        deadline = int(_time.time()) + cross_chain_decision_window_s()
+        # Everything the resolver needs must survive in order.params — the
+        # in-memory leg objects don't outlive a restart.
+        order.params["recovery"] = {
+            "failed_leg_index": failed_leg_index,
+            "reason": reason,
+            "options": options,
+            "expiry_status": (
+                getattr(expiry_status, "value", expiry_status)
+                if expiry_status is not None else None
+            ),
+            "decision_deadline": deadline,
+            "completed_legs": [l.to_dict() for l in completed_legs],
+            "rollback_legs": [l.to_dict() for l in rollback_legs],
+            "contract_address": contract_address,
+            "plan_set": (plan_metadata or {}).get("plan_set"),
+            "escrow_params": (plan_metadata or {}).get("escrow_params"),
+            "resolved": None,
+        }
+        self.orderbook.update_order(
+            order.order_id,
+            status=OrderStatus.AWAITING_USER_DECISION,
+            params=order.params,
+            error=reason,
+        )
+        self._sync(order.order_id)
+        logger.info(
+            "Multi-leg %s: parked for user decision (leg %d, deadline %d): %s",
+            order.order_id, failed_leg_index, deadline, reason,
+        )
+        asyncio.create_task(self._decision_timeout_watch(order.order_id, deadline))
+
+    async def _decision_timeout_watch(self, order_id: str, deadline: int) -> None:
+        """Auto-revert when the decision window expires undecided."""
+        import time as _time
+
+        while True:
+            await asyncio.sleep(10)
+            order = self.orderbook.get(order_id)
+            if order is None:
+                return
+            recovery = order.params.get("recovery") or {}
+            if recovery.get("resolved"):
+                return  # endpoint already resolved it
+            if order.status != OrderStatus.AWAITING_USER_DECISION:
+                return
+            if _time.time() >= deadline:
+                options = recovery.get("options") or ["revert", "refresh"]
+                if "revert" not in options:
+                    # Nothing to revert (failed bridge hop — the origin
+                    # refund is already the resolution). Settle into the
+                    # terminal state rather than pretending a revert ran.
+                    expiry = recovery.get("expiry_status") or OrderStatus.BRIDGE_FAILED
+                    logger.info(
+                        "Multi-leg %s: decision window expired with no revert "
+                        "option — settling as %s", order_id, expiry,
+                    )
+                    self.orderbook.update_order(order_id, status=expiry)
+                    self._sync(order_id)
+                    return
+                logger.info(
+                    "Multi-leg %s: decision window expired — auto-revert",
+                    order_id,
+                )
+                try:
+                    await self.resolve_user_decision(order_id, "revert")
+                except Exception as exc:
+                    logger.error(
+                        "Multi-leg %s: timeout auto-revert failed: %s",
+                        order_id, exc,
+                    )
+                return
+
+    async def resolve_user_decision(self, order_id: str, action: str) -> dict:
+        """Execute the user's (or the timeout's) revert-or-refresh choice.
+
+        Returns a result dict for the API. Raises ValueError on bad
+        action/state — the caller maps it to an HTTP error.
+        """
+        from minotaur_subnet.shared.types import LegPlan
+
+        if action not in ("revert", "refresh"):
+            raise ValueError(f"Unknown recovery action: {action}")
+        order = self.orderbook.get(order_id)
+        if order is None:
+            raise ValueError(f"Order not found: {order_id}")
+        if order.status != OrderStatus.AWAITING_USER_DECISION:
+            raise ValueError(
+                f"Order {order_id} is not awaiting a decision "
+                f"(status={getattr(order.status, 'value', order.status)})"
+            )
+        recovery = order.params.get("recovery") or {}
+        if recovery.get("resolved"):
+            raise ValueError(f"Order {order_id} decision already resolved")
+        offered = recovery.get("options") or ["revert", "refresh"]
+        if action not in offered:
+            raise ValueError(
+                f"Action '{action}' is not available for order {order_id} "
+                f"(offered: {', '.join(offered)})"
+            )
+
+        recovery["resolved"] = action
+        order.params["recovery"] = recovery
+        self.orderbook.update_order(order_id, params=order.params)
+        self._sync(order_id)
+
+        if action == "refresh":
+            # This order's orchestration ends here. The client submits a NEW
+            # single-chain order over the escrowed asset (an ordinary atomic
+            # intent — no solver-side concept of "refresh" needed). Escrow
+            # stays claimable via the timelocked escrowRefund if the refresh
+            # never completes.
+            self.orderbook.update_order(order_id, status=OrderStatus.REFRESHING)
+            self._sync(order_id)
+            return {
+                "action": "refresh",
+                "escrow_params": recovery.get("escrow_params"),
+                "note": (
+                    "Submit a new single-chain order over the escrowed asset "
+                    "to re-quote the failed leg; escrowRefund remains "
+                    "available after the escrow deadline."
+                ),
+            }
+
+        # revert: run the pre-agreed rollback legs (plan-set-covered)
+        completed = [LegPlan.from_dict(d) for d in recovery.get("completed_legs", [])]
+        rollbacks = [LegPlan.from_dict(d) for d in recovery.get("rollback_legs", [])]
+        await self._execute_rollback(
+            order, completed, rollbacks,
+            recovery.get("contract_address", ""),
+            {"plan_set": recovery.get("plan_set")},
+        )
+        final = self.orderbook.get(order_id)
+        return {
+            "action": "revert",
+            "status": getattr(final.status, "value", str(final.status)) if final else "unknown",
+        }
+
     async def _execute_rollback(
         self,
         order: Order,
         completed_legs: list,
         rollback_legs: list,
         contract_address: str,
+        plan_metadata: dict | None = None,
     ) -> None:
         """Execute rollback legs in reverse order for completed forward legs.
 
@@ -385,22 +733,30 @@ class MultiLegOrchestrator:
                 logger.warning("No rollback leg for forward leg %d", completed_leg.leg_index)
                 continue
 
-            rollback_plan = ExecutionPlan(
-                intent_id=order.app_id,
-                interactions=rollback.interactions,
-                deadline=int(order.deadline),
-                nonce=0,
-                metadata={
-                    **rollback.metadata,
-                    "leg_index": rollback.leg_index,
-                    "chain_id": rollback.chain_id,
-                    "is_rollback": True,
-                },
+            from minotaur_subnet.consensus.plan_set import (
+                build_leg_execution_plan,
+                thread_plan_set_params,
             )
+            rollback_plan = build_leg_execution_plan(
+                order.app_id, int(order.deadline), rollback, is_rollback=True,
+            )
+
+            # Rollback legs are members of the user-signed plan set too —
+            # the agreed revert plan executes under the same signature.
+            from copy import copy as _copy
+            submit_order = _copy(order)
+            submit_params = dict(order.params)
+            thread_plan_set_params(
+                submit_params,
+                (plan_metadata or {}).get("plan_set"),
+                order.params.get("plan_set_signature", ""),
+                rollback.leg_index,
+            )
+            submit_order.params = submit_params
 
             try:
                 result = await self.relayer.submit_plan(
-                    order, rollback_plan, 0.5, None,
+                    submit_order, rollback_plan, 0.5, None,
                     contract_address=contract_address,
                 )
                 if result.success:

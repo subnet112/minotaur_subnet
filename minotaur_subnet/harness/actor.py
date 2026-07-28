@@ -25,10 +25,32 @@ actor is the connected component of a hotkey under TWO kinds of link:
     the PR's clone_url (routes.py) — an attacker cannot charge a victim's
     identity without controlling the repo — so the union is not poisonable.
 
-The union is over a bipartite graph of {coldkey, github-owner} tokens: for each
+  * OPERATOR MERGE (union, from evidence): identifiers proven to be one
+    operator collapse into one actor even when they share neither a coldkey nor
+    a github owner. Two sources — a static, evidence-documented list in code
+    (plus ``SOLVER_ACTOR_MERGE_EXTRA``), and the structural CO-OCCURRENCE
+    ledger below. This closes the shape the 2026-07-28 audit found live: a ring
+    of 13 coldkeys, ONE hotkey each, each under its OWN throwaway github
+    account, so both links above see 13 singleton actors and every per-actor
+    cap is satisfied 13 times in parallel.
+
+The union is over a graph of {coldkey, github-owner, hotkey} tokens: for each
 submitted hotkey, union its coldkey token (or its own hotkey token if unmapped)
-with each github owner it has used. Transitivity does the rest — every coldkey
-touching any owner in a fleet's owner set collapses to one component.
+with each github owner it has used, then union every merge group. Transitivity
+does the rest — every coldkey touching any owner in a fleet's owner set
+collapses to one component.
+
+STRUCTURAL CO-OCCURRENCE (the automatic merge). The ring above re-rolls its
+structural fingerprint EVERY round, so no equality key on code can ever catch
+it: what identifies it is the pattern, not the hash — the same actors appearing
+together in a same-fingerprint cluster round after round (measured over 26 live
+rounds: 79 actor pairs co-clustered in 25 of them, while exactly ONE pair in the
+whole window co-occurred just once). :func:`record_structural_coclusters` (fed
+by the close-time slate pass) accumulates per-pair round evidence in a sidecar,
+and pairs seen together in ``STRUCTURAL_ACTOR_MERGE_MIN_ROUNDS`` distinct rounds
+merge. Keyed on COLDKEYS, which cost a registration burn each — so re-rolling
+the code does not shake the merge off, and evidence older than the TTL decays so
+an honest pair that once forked the same baseline does not stay merged forever.
 
 None-CONTRACT (unchanged): ``None`` when the ``SOLVER_ACTOR_KEY=hotkey``
 kill-switch is set OR no coldkey map exists yet (pre-first-sync). The owner
@@ -51,7 +73,13 @@ the SAME actor rule as close-time rotation.
 SCOPE. Leader-local admission control, the same category as the intake caps and
 the rotation ledger: no wire-format, store-schema or consensus change. The
 rotation ledger keeps its ``{hotkey: ts}`` schema; aggregation happens at READ
-time (:func:`actor_last_selected`), so the change is instantly revertible.
+time (:func:`actor_last_selected`), so the change is instantly revertible. A
+merge adds NO new cap and no new rejection path — it only supplies the missing
+edge in the identity graph, after which the caps that already run do the work
+(``SUBMISSIONS_MAX_PER_ACTOR_PER_ROUND=1`` rejects the ring's 2nd..Nth
+submission each round at intake, one seniority clock, one build unit, one slate
+seat). Because it changes the benched slate → the pack hash, arming the
+structural merge MUST be promoted fleet-uniform.
 """
 
 from __future__ import annotations
@@ -96,6 +124,120 @@ def owner_union_enabled() -> bool:
     return os.environ.get(
         "SOLVER_ACTOR_OWNER_UNION", "1",
     ).strip().lower() not in ("0", "false", "no", "off")
+
+
+# ── operator merges: identifiers proven to be ONE operator ───────────────────
+
+# Static, evidence-documented merges. Hardcoded like ``shared.signer_denylist``
+# so the protection cannot be lost by a missing env var; each entry states the
+# evidence that justified it. Entries are COLDKEYS (an operator can mint hotkeys
+# under a coldkey for free, so merging the coldkey covers the fleet); a hotkey
+# or github owner works too — every token form of an identifier is unioned.
+_STATIC_ACTOR_MERGES: tuple[frozenset[str], ...] = (
+    # 2026-07-28 — "fp-ring": 13 coldkeys, ONE hotkey each (uids 117/126/127/
+    # 128/157/158/159/160/161/173/176/177/178), each under its own throwaway
+    # github account, all shipping structurally-identical solvers whose
+    # solver_name embeds the round id (aurora-swap-engine-fp29753820n1,
+    # halcyon-mino-solver-fp29753820n1, sable-dex-router-fp…). Evidence: the
+    # ring's members co-clustered on one structural fingerprint in 25 of 26
+    # measured rounds and registered in three batches (07-16 06:31, 07-16
+    # 11:43, 07-20 08:51); it re-rolls the fingerprint every round, defeating
+    # every equality key, and took 5 of 8 build units and up to 2 of 3 slate
+    # seats per round while ~28 other submissions shared the remainder.
+    frozenset({
+        "5GEfnqKjL17Ta2govfz9rv9PhUQw86RFp6kvZdgLxGWLuZBD",  # uid 117
+        "5GgrdnnPuxiU5iXeDbdq1FUjWyWVEjNPSHNZsbVJhxLLsSyC",  # uid 128
+        "5GdfDv3EoWorapgFY7TPTed1v8ESeGSrnuu2TZ26jPSPSzuC",  # uid 160
+        "5HmKDgzKt6KRj3WfXD3vd2fWiKBjaxG4uYPuWrbdApZx5Dfq",  # uid 161
+        "5FF8NEw4nc6rh6pmFRBFoAfcLpgPRiUQFnt66PPD1FeVBc8X",  # uid 159
+        "5CGS8ZTeS3XgUo4BQfPH8NnJzUVuJnWdi3pbrSdidMAVfMzi",  # uid 158
+        "5EvavNeH9JuWRrbWwJrmmp7J8YPTm8dmHm6V38LsjYp4pa3L",  # uid 126
+        "5DWnrP1EJtVnG2fneBvVhAhjyM24Lf31wXycM2aTmWi2vrNu",  # uid 127
+        "5FsCAcRLtjUEnNy2ux6M3FyDAfiCgsqWqPQFLKCQFY5ucLRG",  # uid 157
+        "5DCKr2ChZVzvzXRRbeBY5Hk9BohPAfpS2HbRdupYCaYRxA4R",  # uid 176
+        "5F6sPTG1csHsSEQNBYaRwjHD2zCJToRs9B4br7PkWLYPagQf",  # uid 177
+        "5DtLdZreG6ZNc4d4T6LLspjqgzpUfFQVfjXnp5UdLra5783a",  # uid 178
+        "5GBrU1Yy7MhpNbrveEY25PVcCJdFqC6c3NmUdFkH2gNsLX67",  # uid 173
+    }),
+)
+
+# Per-pair structural co-occurrence evidence, next to the other sidecars.
+_STRUCT_LINK_SIDECAR = "actor_structural_links.json"
+# Cap the round-id history kept per pair: only the DISTINCT-round count matters
+# and the threshold is single digits, so a short window bounds the file.
+_STRUCT_LINK_MAX_ROUNDS = 32
+
+
+def static_merges_enabled() -> bool:
+    """Apply :data:`_STATIC_ACTOR_MERGES` (``SOLVER_ACTOR_STATIC_MERGE``,
+    default on; ``0`` is the kill-switch — the ring reverts to N actors)."""
+    return os.environ.get(
+        "SOLVER_ACTOR_STATIC_MERGE", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def extra_merge_groups() -> list[frozenset[str]]:
+    """Operator merges from ``SOLVER_ACTOR_MERGE_EXTRA`` — groups separated by
+    ``;``, members by ``,`` (e.g. ``ckA,ckB;ckC,ckD``). Lets an operator add a
+    freshly-caught ring without a deploy; single-member groups are ignored."""
+    raw = os.environ.get("SOLVER_ACTOR_MERGE_EXTRA", "").strip()
+    groups: list[frozenset[str]] = []
+    for chunk in raw.split(";"):
+        members = {m.strip() for m in chunk.split(",") if m.strip()}
+        if len(members) >= 2:
+            groups.append(frozenset(members))
+    return groups
+
+
+def structural_merge_mode() -> str:
+    """How the structural CO-OCCURRENCE evidence acts —
+    ``STRUCTURAL_ACTOR_MERGE_MODE``:
+
+      * ``observe`` (DEFAULT) — record co-occurrence and LOG the merges it
+        would make; the actor map is unchanged.
+      * ``enforce`` — also apply them: co-occurring actors become one actor,
+        so every per-actor cap, the seniority clock, the build budget and the
+        slate see one operator. Changes the benched slate → the pack hash, so
+        it MUST be promoted fleet-uniform.
+      * ``off`` — record nothing, apply nothing.
+
+    Unknown values fall back to ``observe`` (record + report, never silently
+    change selection).
+    """
+    v = os.environ.get("STRUCTURAL_ACTOR_MERGE_MODE", "").strip().lower()
+    return v if v in ("off", "observe", "enforce") else "observe"
+
+
+def structural_merge_min_rounds() -> int:
+    """Distinct rounds a pair must co-cluster before it merges —
+    ``STRUCTURAL_ACTOR_MERGE_MIN_ROUNDS``, default 3 in code.
+
+    Honest miners forking a shared baseline collide occasionally; a coordinated
+    ring collides every round (live: 79 pairs in 25 of 26 rounds, exactly one
+    pair at a single round). 3 sits above the accidental band and below any
+    ring's cadence. Values < 2 are clamped to 2 — a single co-occurrence is
+    never enough.
+    """
+    raw = os.environ.get("STRUCTURAL_ACTOR_MERGE_MIN_ROUNDS", "3").strip() or "3"
+    try:
+        return max(2, int(raw))
+    except ValueError:
+        return 3
+
+
+def structural_merge_ttl_seconds() -> float:
+    """How long a pair's co-occurrence evidence survives without a repeat —
+    ``STRUCTURAL_ACTOR_MERGE_TTL_DAYS``, default 30 days, ``0`` = never expire.
+
+    Evidence decays so a merge is a statement about CURRENT behaviour: two
+    miners who once forked the same baseline drift apart and un-merge, while a
+    ring that keeps co-submitting keeps refreshing its own evidence.
+    """
+    raw = os.environ.get("STRUCTURAL_ACTOR_MERGE_TTL_DAYS", "30").strip() or "30"
+    try:
+        return max(0.0, float(raw)) * 86400.0
+    except ValueError:
+        return 30 * 86400.0
 
 
 def set_coldkey_provider(provider: Callable[[], dict[str, str]] | None) -> None:
@@ -222,6 +364,149 @@ def _owner_map() -> dict[str, list[str]]:
     return out
 
 
+# ── structural co-occurrence ledger (the automatic merge) ────────────────────
+
+def _pair_key(a: str, b: str) -> str:
+    lo, hi = (a, b) if a <= b else (b, a)
+    return f"{lo}|{hi}"
+
+
+def _load_struct_links() -> dict[str, dict[str, Any]]:
+    """``{"<a>|<b>": {"rounds": [...], "last": ts}}`` — the raw evidence."""
+    raw = _read_sidecar(_STRUCT_LINK_SIDECAR)
+    pairs = raw.get("pairs") if isinstance(raw.get("pairs"), dict) else {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, val in (pairs or {}).items():
+        if not isinstance(val, dict):
+            continue
+        rounds = val.get("rounds")
+        if not isinstance(rounds, list):
+            continue
+        try:
+            last = float(val.get("last") or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        out[str(key)] = {"rounds": [str(r) for r in rounds if r], "last": last}
+    return out
+
+
+def base_identity(hotkey: str) -> str:
+    """A hotkey's PRE-MERGE identity: its coldkey, or itself when unmapped.
+
+    Evidence is keyed on this, never on the resolved actor: once a ring is
+    merged its members all resolve to ONE actor, so an actor-keyed recorder
+    would see no cross-actor cluster, stop refreshing the evidence, and let the
+    merge expire on the TTL — a 30-day flap. The base identity keeps refreshing
+    for as long as the ring keeps co-submitting.
+    """
+    hotkey = hotkey or ""
+    return _coldkey_map().get(hotkey) or hotkey
+
+
+def record_structural_coclusters(
+    round_id: str,
+    clusters: Iterable[Iterable[str]],
+    now: float | None = None,
+) -> list[frozenset[str]]:
+    """Record that these HOTKEYS shipped structurally-identical code in one
+    round; return the merge groups that are armed AFTER this record.
+
+    One call per round (the close-time slate pass). Hotkeys are folded to their
+    base identity (:func:`base_identity`) first, so a single operator's own
+    sibling hotkeys are ONE member and never manufacture evidence against
+    themselves. A pair is credited at most once per round — a ring cannot
+    frame a victim by submitting the victim's structure many times in one
+    round, only by doing it across ``structural_merge_min_rounds()`` DISTINCT
+    rounds, which requires the victim to keep co-appearing. Evidence older than
+    the TTL is pruned here, so the file stays bounded and a merge always
+    reflects current behaviour.
+
+    Best-effort and never raises: losing this ledger degrades to "no automatic
+    merges", exactly the pre-feature behaviour.
+    """
+    if structural_merge_mode() == "off":
+        return []
+    now = time.time() if now is None else now
+    try:
+        links = _load_struct_links()
+        ttl = structural_merge_ttl_seconds()
+        for cluster in clusters:
+            members = sorted({base_identity(str(hk)) for hk in cluster if hk})
+            if len(members) < 2:
+                continue
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    entry = links.setdefault(_pair_key(a, b), {"rounds": [], "last": 0.0})
+                    if round_id and round_id not in entry["rounds"]:
+                        entry["rounds"].append(round_id)
+                        del entry["rounds"][:-_STRUCT_LINK_MAX_ROUNDS]
+                    entry["last"] = now
+        if ttl > 0:
+            links = {k: v for k, v in links.items() if now - float(v["last"] or 0.0) <= ttl}
+        _persist_sidecar(_STRUCT_LINK_SIDECAR, {"version": 1, "pairs": links})
+        return _groups_from_links(links)
+    except Exception:
+        logger.warning(
+            "structural co-occurrence record failed for %s (no automatic "
+            "merges this round)", round_id, exc_info=True,
+        )
+        return []
+
+
+def _groups_from_links(links: Mapping[str, Mapping[str, Any]]) -> list[frozenset[str]]:
+    """Connected components over pairs that cleared the round threshold."""
+    threshold = structural_merge_min_rounds()
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    linked = False
+    for key, val in links.items():
+        if len({str(r) for r in (val.get("rounds") or [])}) < threshold:
+            continue
+        a, _, b = key.partition("|")
+        if not a or not b:
+            continue
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+            linked = True
+    if not linked:
+        return []
+    comps: dict[str, set[str]] = {}
+    for node in list(parent):
+        comps.setdefault(find(node), set()).add(node)
+    return [frozenset(m) for m in comps.values() if len(m) >= 2]
+
+
+def structural_merge_groups() -> list[frozenset[str]]:
+    """Armed automatic merges from the persisted evidence (mode-independent —
+    callers decide whether to APPLY them; ``merge_groups`` applies only in
+    ``enforce``, while ``observe`` uses this for reporting)."""
+    try:
+        return _groups_from_links(_load_struct_links())
+    except Exception:
+        logger.warning("structural link ledger unreadable (no merges)", exc_info=True)
+        return []
+
+
+def merge_groups() -> list[frozenset[str]]:
+    """Every operator merge to APPLY: static (unless kill-switched) + env extras
+    + structural co-occurrence (only in ``enforce``)."""
+    groups: list[frozenset[str]] = []
+    if static_merges_enabled():
+        groups.extend(_STATIC_ACTOR_MERGES)
+    groups.extend(extra_merge_groups())
+    if structural_merge_mode() == "enforce":
+        groups.extend(structural_merge_groups())
+    return groups
+
+
 # ── union-find over coldkey ∪ github-owner ───────────────────────────────────
 
 def _build_actor_map(
@@ -279,6 +564,25 @@ def _build_actor_map(
                 ot = f"own:{owner}"
                 tokens.add(ot)
                 union(t, ot)
+
+    # Operator merges: union EVERY token form of each member, so a group may
+    # name coldkeys, hotkeys or owners interchangeably and still collapse.
+    # Token forms that no submitted hotkey uses are inert — they are never
+    # added to ``tokens``, so they cannot become a component's label.
+    for group in merge_groups():
+        anchor: str | None = None
+        for ident in sorted(group):
+            forms = [f"ck:{ident}", f"own:{ident}", f"hk:{ident}"]
+            if ident in coldkey_map:
+                # Named by HOTKEY: merge the identity it actually resolves to
+                # (its coldkey), not just its own inert hotkey token.
+                forms.append(base(ident))
+            for form in forms:
+                find(form)
+                if anchor is None:
+                    anchor = form
+                else:
+                    union(anchor, form)
 
     # Best clean label per component: coldkey > owner > hotkey, smallest within.
     def _rank(tok: str) -> tuple[int, str]:
