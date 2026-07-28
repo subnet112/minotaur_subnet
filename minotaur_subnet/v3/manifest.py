@@ -272,6 +272,212 @@ def compute_selector_from_manifest(
     return keccak(signature.encode())[:4].hex()
 
 
+def normalize_swap_intent_params(
+    params: dict[str, Any],
+    *,
+    manifest: IntentManifest | None = None,
+    intent_name: str = "swap",
+    receiver_default: str = "",
+    slippage_bps: int | None = None,
+) -> dict[str, Any]:
+    """Normalize swap params to one runtime shape using manifest hints when present.
+
+    Supports aliases from DCA-style params (tokenIn/tokenOut/amountPerBuy) and
+    yield-style params (asset/amount) so the baseline solver can handle multiple
+    app types without separate strategies.
+    """
+    input_token = (
+        params.get("input_token", "")
+        or params.get("tokenIn", "")
+        or params.get("token_in", "")
+    )
+    output_token = (
+        params.get("output_token", "")
+        or params.get("tokenOut", "")
+        or params.get("token_out", "")
+    )
+
+    input_amount_raw = (
+        params.get("input_amount", 0)
+        or params.get("amountPerBuy", 0)
+        or params.get("amount_per_buy", 0)
+        or params.get("amount", 0)
+    )
+    input_amount = int(input_amount_raw or 0)
+
+    min_output_raw = (
+        params.get("min_output_amount")
+        or params.get("output_amount")
+        or params.get("minAmountOut")
+        or params.get("min_amount_out")
+    )
+    if min_output_raw not in (None, ""):
+        min_output_amount = int(min_output_raw)
+    elif slippage_bps is not None and input_amount > 0:
+        min_output_amount = input_amount * (10000 - slippage_bps) // 10000
+    else:
+        min_output_amount = 0
+
+    receiver_field = canonical_swap_receiver_field(manifest, intent_name=intent_name)
+    receiver = _resolve_swap_receiver(
+        params,
+        canonical_field=receiver_field,
+        receiver_default=receiver_default,
+    )
+
+    fee_tier = params.get(
+        "fee_tier",
+        _intent_field_default(manifest, intent_name, "fee_tier", 3000),
+    )
+    permit_deadline = params.get(
+        "permit_deadline",
+        _intent_field_default(manifest, intent_name, "permit_deadline", 0),
+    )
+    permit_v = params.get(
+        "permit_v",
+        _intent_field_default(manifest, intent_name, "permit_v", 0),
+    )
+    permit_r = params.get(
+        "permit_r",
+        _intent_field_default(manifest, intent_name, "permit_r", "0x" + "00" * 32),
+    )
+    permit_s = params.get(
+        "permit_s",
+        _intent_field_default(manifest, intent_name, "permit_s", "0x" + "00" * 32),
+    )
+
+    return {
+        "input_token": input_token,
+        "output_token": output_token,
+        "input_amount": input_amount,
+        "min_output_amount": min_output_amount,
+        "receiver": receiver,
+        "receiver_field": receiver_field,
+        "fee_tier": int(fee_tier or 3000),
+        "permit_deadline": int(permit_deadline or 0),
+        "permit_v": int(permit_v or 0),
+        "permit_r": permit_r,
+        "permit_s": permit_s,
+    }
+
+
+def normalize_twap_intent_params(
+    params: dict[str, Any],
+    *,
+    manifest: IntentManifest | None = None,
+    intent_name: str = "twap",
+    receiver_default: str = "",
+    slippage_bps: int | None = None,
+) -> dict[str, Any]:
+    """Normalize TWAP params to one runtime shape using manifest hints when present."""
+    total_amount = int(params.get("total_amount", 0) or 0)
+    num_chunks = int(params.get("num_chunks", 0) or 0)
+    interval_seconds = int(params.get("interval_seconds", 0) or 0)
+    chunks_executed = int(params.get("chunks_executed", 0) or 0)
+    last_chunk_time = int(params.get("last_chunk_time", 0) or 0)
+    fee_tier = int(
+        params.get(
+            "fee_tier",
+            _intent_field_default(manifest, intent_name, "fee_tier", 3000),
+        ) or 3000
+    )
+    receiver_field = canonical_swap_receiver_field(manifest, intent_name=intent_name)
+    receiver = _resolve_swap_receiver(
+        params,
+        canonical_field=receiver_field,
+        receiver_default=receiver_default,
+    )
+
+    min_output_raw = params.get("min_output_per_chunk")
+    if min_output_raw not in (None, ""):
+        min_output_per_chunk = int(min_output_raw)
+    elif slippage_bps is not None and total_amount > 0 and num_chunks > 0:
+        chunk_amount = total_amount // num_chunks
+        min_output_per_chunk = chunk_amount * (10000 - slippage_bps) // 10000
+    else:
+        min_output_per_chunk = 0
+
+    return {
+        "input_token": params.get("input_token", ""),
+        "output_token": params.get("output_token", ""),
+        "total_amount": total_amount,
+        "num_chunks": num_chunks,
+        "interval_seconds": interval_seconds,
+        "chunks_executed": chunks_executed,
+        "last_chunk_time": last_chunk_time,
+        "min_output_per_chunk": min_output_per_chunk,
+        "receiver": receiver,
+        "receiver_field": receiver_field,
+        "fee_tier": fee_tier,
+    }
+
+
+def normalize_rebalance_intent_params(
+    params: dict[str, Any],
+    *,
+    manifest: IntentManifest | None = None,
+    intent_name: str = "rebalance",
+) -> dict[str, Any]:
+    """Normalize rebalance params using manifest defaults when available."""
+    threshold_pct = params.get(
+        "threshold_pct",
+        _intent_field_default(manifest, intent_name, "threshold_pct", 0.0),
+    )
+    total_value_usd = params.get(
+        "total_value_usd",
+        _intent_field_default(manifest, intent_name, "total_value_usd", 0.0),
+    )
+    return {
+        "target_allocations": dict(params.get("target_allocations", {}) or {}),
+        "current_allocations": dict(params.get("current_allocations", {}) or {}),
+        "threshold_pct": float(threshold_pct or 0.0),
+        "total_value_usd": float(total_value_usd or 0.0),
+        "token_addresses": dict(params.get("token_addresses", {}) or {}),
+        "token_decimals": {
+            key: int(value)
+            for key, value in dict(params.get("token_decimals", {}) or {}).items()
+        },
+    }
+
+
+def canonical_swap_receiver_field(
+    manifest: IntentManifest | None,
+    *,
+    intent_name: str = "swap",
+) -> str:
+    """Return the manifest-preferred receiver-like field name for swap intents."""
+    if manifest is None:
+        return "receiver"
+    intent = manifest.get_intent(intent_name)
+    if intent is None:
+        return "receiver"
+    field_names = {field.name for field in intent.params}
+    if "receiver" in field_names:
+        return "receiver"
+    if "recipient" in field_names:
+        return "recipient"
+    return "receiver"
+
+
+def _resolve_swap_receiver(
+    params: dict[str, Any],
+    *,
+    canonical_field: str,
+    receiver_default: str,
+) -> str:
+    if canonical_field == "recipient":
+        return (
+            params.get("recipient")
+            or params.get("receiver")
+            or receiver_default
+        )
+    return (
+        params.get("receiver")
+        or params.get("recipient")
+        or receiver_default
+    )
+
+
 def _intent_field_default(
     manifest: IntentManifest | None,
     intent_name: str,
@@ -287,110 +493,3 @@ def _intent_field_default(
     if field is None or field.default is None:
         return fallback
     return field.default
-
-
-# ── Spend-side inference (simulator token seeding) ──────────────────────────
-
-
-def spend_params(
-    manifest: IntentManifest | dict[str, Any] | None,
-    intent_function: str,
-) -> tuple[str | None, str | None]:
-    """Infer ``(token_param, amount_param)`` — the app's spend side.
-
-    The simulator must pre-fund whatever an order spends, or the intent
-    reverts in safeTransferFrom and scores 0. Which params those are is the
-    APP's business, and the manifest already says: the spend side is a
-    user-supplied address paired with a user-supplied amount. ``source=quote``
-    (a slippage guard) and ``source=system`` (receiver, permit fields) are
-    excluded by construction, as are ``in_signature=False`` computed params.
-
-    Returns ``(None, None)`` when the app declares no UNAMBIGUOUS pair — an
-    app with several user-supplied amounts has to say which one it spends,
-    and guessing there is exactly the failure this replaces. Callers must
-    treat that as "cannot seed" and say so out loud; a silently unseeded order
-    scores 0 and looks like a bad solver rather than a manifest gap.
-    """
-    fns: list[Any]
-    if isinstance(manifest, dict):
-        fns = manifest.get("intent_functions", []) or []
-    elif manifest is not None:
-        fns = list(getattr(manifest, "intents", []) or [])
-    else:
-        return None, None
-
-    for fn in fns:
-        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-        if name != intent_function:
-            continue
-        raw = fn.get("params") if isinstance(fn, dict) else getattr(fn, "params", None)
-        if isinstance(raw, dict):
-            items = list(raw.items())
-        else:
-            items = [
-                (
-                    p.get("name") if isinstance(p, dict) else getattr(p, "name", None),
-                    p,
-                )
-                for p in (raw or [])
-            ]
-
-        addrs: list[str] = []
-        amounts: list[str] = []
-        for pname, spec in items:
-            if not pname:
-                continue
-            get = (
-                spec.get if isinstance(spec, dict)
-                else lambda k, d=None: getattr(spec, k, d)
-            )
-            if str(get("source", "user")).lower() != "user":
-                continue
-            if get("in_signature") is False:
-                continue
-            vt = str(get("type", None) or get("value_type", None) or "").lower()
-            if vt.startswith("address"):
-                addrs.append(pname)
-            elif vt.startswith(("uint", "int")):
-                amounts.append(pname)
-
-        if len(amounts) != 1 or not addrs:
-            return None, None
-        return addrs[0], amounts[0]
-    return None, None
-
-
-def spend_token_balances(
-    manifest: IntentManifest | dict[str, Any] | None,
-    intent_function: str,
-    params: dict[str, Any],
-    *,
-    default_chain_id: int = 0,
-) -> tuple[dict[str, int] | None, str]:
-    """``({token: amount}, "ok")`` for the simulator, or ``(None, reason)``.
-
-    The reason is for the caller to LOG — see spend_params on why a silent
-    decline is the wrong failure mode.
-    """
-    tok_p, amt_p = spend_params(manifest, intent_function)
-    if not tok_p or not amt_p:
-        return None, (
-            f"app declares no unambiguous spend pair for intent "
-            f"'{intent_function}'"
-        )
-    token = params.get(tok_p)
-    amount = params.get(amt_p)
-    if not token or amount is None:
-        return None, f"order omits {tok_p}/{amt_p}"
-    token = str(token)
-    if token.startswith("eip155:"):
-        from minotaur_subnet.shared.interop_address import parse_address
-
-        try:
-            token = parse_address(token, default_chain_id=default_chain_id).address
-        except ValueError:
-            return None, f"unparseable interop address in {tok_p}"
-    try:
-        return {token: int(amount)}, "ok"
-    except (TypeError, ValueError):
-        return None, f"non-integer {amt_p}"

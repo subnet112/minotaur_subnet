@@ -1300,29 +1300,6 @@ class BenchmarkWorker:
                     intent_def.app_id, old, js_hash,
                 )
 
-        # Resolve each app's declared quality metric ONCE per run. An invalid
-        # declaration must not silently mis-rank a contest, but it also must not
-        # take down the round for every other app — the offending app falls back
-        # to the default and the reason is logged loudly.
-        from minotaur_subnet.shared import quality_metric
-
-        _metrics: dict[str, quality_metric.QualityMetric] = {}
-        for intent_def, _, _ in intents:
-            try:
-                _metrics[intent_def.app_id] = quality_metric.resolve(
-                    engine.get_manifest(intent_def.app_id),
-                )
-            except quality_metric.QualityMetricError as exc:
-                logger.error(
-                    "[benchmark] app %s declares an uncomparable quality_metric "
-                    "(%s) — scoring it on the default metric instead",
-                    intent_def.app_id, exc,
-                )
-                _metrics[intent_def.app_id] = quality_metric.DEFAULT
-
-        def _metric_for(app_id: str) -> quality_metric.QualityMetric:
-            return _metrics.get(app_id, quality_metric.DEFAULT)
-
         async def score_fn(
             app_id: str,
             plan: ExecutionPlan,
@@ -1330,18 +1307,6 @@ class BenchmarkWorker:
             state: IntentState,
         ) -> ScoreResult:
             result = await engine.score(app_id, plan, simulation, state)
-            # Per-order signal for the relative rule. WHICH number that is comes
-            # from the app's own declared quality metric (shared/quality_metric):
-            # the default is metadata.raw_output — the DEX aggregator's delivered
-            # amount, i.e. everything below — but an app whose orders deliver no
-            # tokens declares e.g. source="js_score" instead and is rankable on
-            # its own terms. The contract rides the row so the decision stays
-            # reproducible from the stored artifact.
-            _metric = _metric_for(app_id)
-            if _metric is not quality_metric.DEFAULT:
-                result.quality_metric = _metric
-                result.raw_output = quality_metric.extract(result, _metric)
-                return result
             # Relative per-order scoring source: the RAW delivered output now comes
             # from the LIVE scorer's own result metadata (metadata.raw_output), set
             # by the raw-output scorer an operator PUTs into the LIVE js_code slot at
@@ -1531,15 +1496,9 @@ class BenchmarkWorker:
         one per operational per-chain deployment.
         """
         if self._app_store is None:
-            # No app store -> nothing to benchmark. This used to fabricate three
-            # hardcoded DEX intents (a swap, a limit order, a multi-token swap)
-            # as a "testing/MVP" fallback; benchmarking imaginary swaps is not a
-            # sensible default for a platform whose apps are arbitrary, and the
-            # honest answer for "no apps configured" is no intents.
-            logger.warning(
-                "[benchmark] no app store configured — no intents to benchmark",
-            )
-            return []
+            # Fallback: use synthetic intents for testing/MVP
+            from minotaur_subnet.harness.snapshot import build_synthetic_intents
+            return build_synthetic_intents()
 
         # Round-anchored retirement cutover: a RETIRING deployment stays in the
         # synthetic set until its stamped effective epoch, then drops — evaluated
@@ -2602,14 +2561,6 @@ class BenchmarkWorker:
                 # the legacy ``shadow_score`` key for rows persisted before the
                 # rename — see relative_scoring._raw_output.)
                 "raw_output": getattr(r, "raw_output", None),
-                # App-declared quality-metric contract (shared/quality_metric).
-                # Omitted entirely for the platform default, so DEX rows are
-                # byte-identical to before and legacy rows read as default.
-                **(
-                    {"metric": _qm.to_dict()}
-                    if (_qm := getattr(r, "quality_metric", None)) is not None
-                    else {}
-                ),
                 "elapsed_ms": r.elapsed_ms,
                 "error": r.error,
                 "revert_reason": getattr(r, "revert_reason", None),

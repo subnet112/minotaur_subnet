@@ -22,7 +22,7 @@ from minotaur_subnet.shared.types import (
     PolicyTier,
     SimulationResult,
 )
-from minotaur_subnet.v3.contexts import BaseIntentContext
+from minotaur_subnet.v3.contexts import SwapIntentContext
 
 
 @pytest.fixture
@@ -220,7 +220,7 @@ class TestSolverSwap:
         assert result.orders_processed == 1
 
     @pytest.mark.asyncio
-    async def test_block_loop_builds_generic_typed_context_when_enabled(self, temp_store, monkeypatch):
+    async def test_block_loop_builds_swap_typed_context_when_enabled(self, temp_store, monkeypatch):
         monkeypatch.setenv("V3_TYPED_CONTEXTS_ENABLED", "1")
 
         app = AppIntentDefinition(
@@ -294,16 +294,11 @@ class TestSolverSwap:
         state = captured["state"]
         assert state.context_version == "v3"
         assert state.policy_tier == PolicyTier.STRICT
-        # The context is app-AGNOSTIC: it carries the app's params verbatim
-        # rather than pre-interpreting them into swap-shaped attributes
-        # (receiver / input_amount / min_output_amount used to be typed
-        # fields on a BaseIntentContext). The platform does not know what an
-        # app's params mean; the solver reads them against its manifest.
-        assert isinstance(state.typed_context, BaseIntentContext)
+        assert isinstance(state.typed_context, SwapIntentContext)
         assert state.typed_context.contract_address == "0x" + "ab" * 20
-        assert state.typed_context.intent_function == "swap"
-        assert state.typed_context.raw_params["input_amount"] == "1000"
-        assert state.typed_context.raw_params["min_output_amount"] == "900"
+        assert state.typed_context.receiver == "0x" + "ab" * 20
+        assert state.typed_context.input_amount == 1000
+        assert state.typed_context.min_output_amount == 900
 
     @pytest.mark.asyncio
     async def test_policy_assessment_shadow_mode_persists_assessment(self, temp_store, monkeypatch):

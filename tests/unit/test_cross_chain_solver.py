@@ -114,27 +114,33 @@ class TestCrossChainDetection:
 
     def test_cross_chain_uses_typed_swap_params_with_raw_dest_metadata(self, solver, app):
         """Swap fields may come from typed_context while dest_chain_id stays raw."""
-        from minotaur_subnet.v3.contexts import BaseIntentContext
+        from minotaur_subnet.v3.contexts import SwapIntentContext
         state = IntentState(
             contract_address="0x" + "aa" * 20,
             chain_id=1,
             nonce=0,
             owner="0x" + "bb" * 20,
             raw_params={"dest_chain_id": "964"},
-            typed_context=BaseIntentContext(
-            app_id=app.app_id,
-            intent_function="execute",
-            chain_id=1,
-            owner="0x" + "bb" * 20,
-            contract_address="0x" + "aa" * 20,
-            nonce=0,
-            raw_params={**{
+            typed_context=SwapIntentContext(
+                app_id=app.app_id,
+                intent_function="execute",
+                chain_id=1,
+                owner="0x" + "bb" * 20,
+                contract_address="0x" + "aa" * 20,
+                nonce=0,
+                raw_params={
                     "_intent_function": "execute",
                     "input_token": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
                     "output_token": "0x77E06c9eCCf2E797fd462A92b6D7642EF85b0A44",
                     "input_amount": "1000000000000000000",
-                }, "input_token": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "output_token": "0x77E06c9eCCf2E797fd462A92b6D7642EF85b0A44", "input_amount": 1_000_000_000_000_000_000, "min_output_amount": 0, "receiver": "0x" + "aa" * 20, "fee_tier": 3000},
-        ),
+                },
+                input_token="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                output_token="0x77E06c9eCCf2E797fd462A92b6D7642EF85b0A44",
+                input_amount=1_000_000_000_000_000_000,
+                min_output_amount=0,
+                receiver="0x" + "aa" * 20,
+                fee_tier=3000,
+            ),
         )
         plan = solver.generate_plan(app, state, None)
         assert plan is not None

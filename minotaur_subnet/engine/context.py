@@ -80,14 +80,6 @@ def _simulation_to_dict(sim: SimulationResult) -> dict[str, Any]:
         "gas_used": sim.gas_used,
         "gasUsed": sim.gas_used,  # Also provide camelCase for JS convention
     }
-    # The App contract's OWN verdict on this plan (scoreIntent BPS, 0..10000).
-    # Exposed so a scorer can build its quality metric from the contract rather
-    # than re-deriving it in JS — the platform never reads scoreIntent for
-    # adoption itself, the app's JS decides (see shared/quality_metric). None
-    # when the bare interaction path ran (no scoreIntent call) or on a mock.
-    if getattr(sim, "on_chain_score", None) is not None:
-        result["on_chain_score"] = sim.on_chain_score
-        result["onChainScore"] = sim.on_chain_score
     # The platform's destination-leg delivery measurement for a multi-leg
     # plan (benchmark path only — see SimulationResult). The amount stays a
     # DECIMAL STRING end-to-end: it is wei that can exceed 2^53, and the

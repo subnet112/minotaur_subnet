@@ -388,23 +388,14 @@ def dict_to_state(d: dict[str, Any]) -> IntentState:
 
 
 def dict_to_snapshot(d: dict[str, Any]) -> MarketSnapshot:
-    """Reconstruct a MarketSnapshot from a dict.
-
-    Tolerant of the pre-app_data wire shape: a payload still carrying
-    ``pool_states`` / ``dex_config`` (an older validator, or a solver echoing
-    one back) is accepted and those keys are folded into ``app_data`` rather
-    than rejected, so the two sides can roll independently.
-    """
-    app_data = dict(d.get("app_data") or {})
-    for legacy in ("pool_states", "dex_config"):
-        if d.get(legacy):
-            app_data.setdefault(legacy, d[legacy])
+    """Reconstruct a MarketSnapshot from a dict."""
     return MarketSnapshot(
         chain_id=d["chain_id"],
         block_number=d["block_number"],
         timestamp=d["timestamp"],
         prices=d.get("prices", {}),
+        pool_states=d.get("pool_states", {}),
         balances=d.get("balances", {}),
+        dex_config=d.get("dex_config", {}),
         raw_state=d.get("raw_state", {}),
-        app_data=app_data,
     )
