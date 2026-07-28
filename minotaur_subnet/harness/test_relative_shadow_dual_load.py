@@ -78,7 +78,7 @@ def _state():
 
 
 def _snap():
-    return MarketSnapshot(chain_id=1, block_number=1, timestamp=int(time.time()), prices={}, dex_config={})
+    return MarketSnapshot(chain_id=1, block_number=1, timestamp=int(time.time()), prices={}, )
 
 
 def _plan():
