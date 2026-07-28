@@ -112,6 +112,36 @@ class TestNormalize:
         # None = "keep your single-chain path"; nothing to measure elsewhere.
         assert normalize_to_legs(_plan({"route": "univ3"})) is None
 
+    def test_solver_shape_bridge_token_out_is_destination_mapped(self):
+        # Soak finding 2026-07-28: the request carries the SOURCE token;
+        # seeding the destination fork with it deals an address that has no
+        # code there (Base WETH on Ethereum) and honest plans measure null.
+        meta = {
+            "cross_chain_plan": {
+                "legs": [
+                    {"chain_id": 8453, "interactions": []},
+                    {"chain_id": 1, "interactions": [asdict(_ix(1))]},
+                ],
+                "bridge_requests": [{
+                    "token": WETH_BASE, "amount": AMOUNT,
+                    "src_chain_id": 8453, "dst_chain_id": 1,
+                }],
+            },
+        }
+        legs = normalize_to_legs(_plan(meta)).metadata["legs"]
+        bridge = [l for l in legs if l["type"] == "bridge"][0]
+        assert bridge["token_out"] == WETH_ETH   # destination-chain address
+        assert bridge["token_in"] == WETH_BASE   # deposit stays source-side
+
+    def test_unmapped_bridge_token_passes_through(self):
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        exotic = "0x" + "ab" * 20
+        assert map_bridged_token(exotic, 8453, 1) == exotic
+        assert map_bridged_token("", 8453, 1) == ""
+        assert map_bridged_token(WETH_BASE, "garbage", 1) == WETH_BASE
+        # Case-insensitive on the source side, canonical casing out.
+        assert map_bridged_token(WETH_BASE.upper().replace("0X", "0x"), 8453, 1) == WETH_ETH
+
     def test_cross_chain_plan_becomes_legs(self):
         out = normalize_to_legs(_plan(_cross_chain_plan_meta()))
         legs = out.metadata["legs"]
@@ -468,3 +498,43 @@ class TestObserveOnly:
             SingleChainOnly(), _plan(_multi_leg_plan_meta()), None, None, None,
         ))
         assert out == (None, None)
+
+    def test_solver_shape_delivery_is_extracted(self):
+        # Soak finding 2026-07-28: the extraction walked plan.metadata["legs"]
+        # (legacy-only), while the solver's cross_chain_plan — the shape
+        # miners emit — was normalized on a COPY inside the simulator. A
+        # perfectly delivered journey measured null. The measurement must
+        # normalize the plan it extracts from.
+        import asyncio
+        from minotaur_subnet.harness.orchestrator import (
+            _ANVIL_DEFAULT_ACCOUNT,
+            _measure_destination_delivery,
+        )
+        from minotaur_subnet.shared.types import SimulationResult, TokenTransfer
+
+        delivered = AMOUNT - 10**15
+
+        class RecordingSimulator:
+            async def simulate_cross_chain(self, plan, **kw):
+                legs = plan.metadata["legs"]
+                dest = [l for l in legs if l["type"] == "destination"]
+                assert dest, "normalized legs must reach the simulator"
+                return SimulationResult(
+                    success=True,
+                    leg_results={dest[0]["leg_id"]: {
+                        "success": True,
+                        "token_transfers": [{
+                            "token": WETH_ETH,
+                            "from": "0x" + "12" * 20,
+                            "to": _ANVIL_DEFAULT_ACCOUNT,
+                            "amount": str(delivered),
+                        }],
+                    }},
+                    bridge_estimate={"amount_source": "simulated"},
+                )
+
+        out = asyncio.run(_measure_destination_delivery(
+            RecordingSimulator(), _plan(_cross_chain_plan_meta()),
+            None, None, None,
+        ))
+        assert out == (str(delivered), "simulated")

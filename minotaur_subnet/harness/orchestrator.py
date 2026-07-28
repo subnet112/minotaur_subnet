@@ -2388,12 +2388,28 @@ async def _measure_destination_delivery(
     Returns ``(delivered_wei_str | None, amount_source | None)``. Never
     raises: an observation failing must not fail a benchmark row.
     """
-    from minotaur_subnet.simulator.cross_chain_bench import is_cross_chain_plan
+    from minotaur_subnet.simulator.cross_chain_bench import (
+        is_cross_chain_plan,
+        normalize_to_legs,
+    )
 
     if not is_cross_chain_plan(plan):
         return None, None
     if simulator is None or not hasattr(simulator, "simulate_cross_chain"):
         return None, None
+
+    # Normalize HERE, not only inside the simulator: the delivered-amount
+    # extraction below walks metadata["legs"], which only the LEGACY shape
+    # carries. The modern shapes — the solver's cross_chain_plan, the very
+    # one miners emit — were normalized onto a COPY inside
+    # simulate_cross_chain, so dest_ids stayed empty and the measurement
+    # returned null on a perfectly delivered journey (soak finding,
+    # 2026-07-28). Idempotent for legacy plans; None means cross-chain was
+    # declared but there is no multi-leg journey to measure.
+    normalized = normalize_to_legs(plan)
+    if normalized is None:
+        return None, None
+    plan = normalized
 
     try:
         result = await simulator.simulate_cross_chain(
