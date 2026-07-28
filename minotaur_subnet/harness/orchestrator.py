@@ -489,6 +489,12 @@ class SolverSession:
             description=r.get("description", ""),
             supported_chains=r.get("supported_chains", [1]),
             supported_intent_types=r.get("supported_intent_types", ["swap"]),
+            # Absent ⇔ the solver vendored a pre-marker SDK whose runner does
+            # not inject this. Read field-by-field (never SolverMetadata(**r))
+            # so a NEWER solver reporting keys this validator does not know
+            # about is ignored rather than raising — that is what lets the
+            # marker roll out across a fleet that promotes unevenly.
+            sdk_version=r.get("sdk_version"),
         )
 
     async def generate_plan(
