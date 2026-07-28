@@ -102,14 +102,32 @@ class SimulationRunner:
             if token_balances is None and order.params:
                 # LOUD on purpose. An unseeded order reverts in
                 # safeTransferFrom and scores 0, which reads as a bad solver
-                # rather than a manifest gap. Measured against the live corpus
-                # (tools/seeding_replay.py) this fires for undeclared intent
-                # functions only — 1 of 2367 quotes, itself already broken.
-                logger.warning(
-                    "Not seeding order %s (app %s, intent %r): %s — its "
-                    "simulation will revert if the intent spends tokens",
-                    order.order_id, order.app_id, order.intent_function, reason,
-                )
+                # rather than a manifest gap.
+                #
+                # Two very different causes, kept distinguishable because
+                # conflating them cost us a live regression: the quote path
+                # shipped without passing `manifest` at all (#1179), every
+                # quote sim silently stopped seeding, and the resulting log
+                # blamed the APP's manifest for what was OUR wiring bug.
+                # `not manifest` rather than `is None`: the JS engine stores
+                # `manifest or {}`, so an app it never loaded reports {} — no
+                # more usable than None, and equally not the app's fault.
+                if not manifest:
+                    logger.error(
+                        "Not seeding order %s (app %s, intent %r): NO manifest "
+                        "reached the simulator (caller passed %r) — this is a "
+                        "platform wiring bug, not an app manifest gap. Every "
+                        "order down this path reverts in safeTransferFrom and "
+                        "scores 0.",
+                        order.order_id, order.app_id, order.intent_function,
+                        manifest,
+                    )
+                else:
+                    logger.warning(
+                        "Not seeding order %s (app %s, intent %r): %s — its "
+                        "simulation will revert if the intent spends tokens",
+                        order.order_id, order.app_id, order.intent_function, reason,
+                    )
 
             # Deposit-model apps are funded on the CONTRACT rather than the
             # executor, because their scoreIntent pulls via _fundFromContract.
