@@ -108,7 +108,9 @@ def make_snapshot() -> MarketSnapshot:
         block_number=18500000,
         timestamp=1700000000,
         prices={"ETH/USD": 1850.0},
-                    )
+        pool_states={},
+        dex_config={},
+    )
 
 
 class StubSolver(IntentSolver):

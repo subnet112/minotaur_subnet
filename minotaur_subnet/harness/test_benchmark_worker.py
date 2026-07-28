@@ -85,7 +85,8 @@ def _make_snapshot():
         block_number=18000000,
         timestamp=int(time.time()),
         prices={"ETH/USD": 2500.0, "USDC/USD": 1.0},
-            )
+        dex_config={"router_address": "0xE592427A0AEce92De3Edee1F18E0157C05861564"},
+    )
 
 
 def _make_plan(intent_id: str = "test-swap"):
@@ -108,40 +109,6 @@ def _make_plan(intent_id: str = "test-swap"):
         deadline=int(time.time()) + 300,
         nonce=0,
     )
-
-
-def _stub_intents(worker):
-    """Give a worker one GENERIC benchmark intent.
-
-    These tests exercise run_once's submission handling, not intent content.
-    They used to lean on build_synthetic_intents' three hardcoded DEX intents
-    (a swap, a limit order, a multi-token swap) just to clear the fail-closed
-    "no active benchmark intents" guard. Core no longer invents app-shaped
-    work, so stub a shapeless intent here instead.
-    """
-    from minotaur_subnet.sdk.intent_solver import MarketSnapshot
-    from minotaur_subnet.shared.types import (
-        AppIntentConfig, AppIntentDefinition, IntentState, TriggerType,
-    )
-
-    intent = AppIntentDefinition(
-        app_id="app-under-test",
-        name="App Under Test",
-        version="1.0.0",
-        intent_type="",
-        js_code="// scoring",
-        config=AppIntentConfig(
-            supported_chains=[1], trigger_type=TriggerType.USER_TRIGGERED,
-        ),
-    )
-    state = IntentState(
-        contract_address="0x" + "11" * 20, chain_id=1, nonce=0,
-        owner="0x" + "aa" * 20, raw_params={},
-    )
-    snapshot = MarketSnapshot(chain_id=1, block_number=1, timestamp=1)
-    worker._load_benchmark_intents = lambda: [(intent, state, snapshot)]
-    return worker
-
 
 class _RecordingEngine:
     """Minimal JsExecutionEngine stand-in that records load_intent calls."""
@@ -446,7 +413,6 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         # use_docker=False bypasses the "real simulator not wired" defer guard;
         # _benchmark_submission is mocked so no container actually runs.
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
 
         # Mock the actual benchmarking to avoid Docker. raw_output>0 makes the
         # order deliver value, so the submission passes the validity gate -> SCORED.
@@ -539,7 +505,6 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         # No image_tag or solver_path set
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
 
@@ -573,7 +538,6 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
             )
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
         # sub2 delivers value on TWO orders, sub1 on ONE — sub2 is net-broader.
         value_orders = {
             sub1.submission_id: [("test_a", "1000")],
@@ -619,12 +583,10 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         self.assertEqual(len(details["per_intent"]), 2)
 
     def test_load_synthetic_intents_without_app_store(self):
-        """Without an app store there is nothing to benchmark.
-
-        This used to fabricate three hardcoded DEX intents. Core does not
-        invent app-shaped work; the caller's fail-closed guard handles it."""
+        """Without an app store, synthetic intents are used."""
         worker = BenchmarkWorker(SubmissionStore(), app_store=None)
-        self.assertEqual(worker._load_benchmark_intents(), [])
+        intents = worker._load_benchmark_intents()
+        self.assertEqual(len(intents), 3)  # build_synthetic_intents returns 3
 
     def test_stop(self):
         worker = BenchmarkWorker(SubmissionStore())
@@ -656,7 +618,6 @@ class TestBenchmarkWorkerLogic(unittest.TestCase):
         store.set_image_id(challenger.submission_id, "sha256:" + "b" * 64)
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
 
         # Challenger beats the champion on the shared order (2000 > 1000).
         async def mock_benchmark(image_tag, intents, score_fn):
@@ -853,7 +814,6 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.set_solver_path(sub.submission_id, "/tmp/fake_solver.py")
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
 
         result = asyncio.run(worker.run_once())
         self.assertEqual(result, 1)
@@ -878,7 +838,6 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.set_image_tag(sub.submission_id, "solver-abc:screening")
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
 
         async def mock_benchmark_submission(image_tag, intents, score_fn):
             self.fail("Docker benchmark should not be called when solver_path exists")
@@ -903,7 +862,6 @@ class TestBenchmarkWorkerSolverPath(unittest.TestCase):
         store.set_solver_path(sub.submission_id, "/tmp/solver.py")
 
         worker = BenchmarkWorker(store, use_docker=False)
-        _stub_intents(worker)
         with patch.dict(os.environ, {"ALLOW_SUBPROCESS_BENCHMARK": "0"}, clear=False):
             processed = asyncio.run(worker.run_once())
         self.assertEqual(processed, 1)
