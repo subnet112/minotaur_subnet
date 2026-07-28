@@ -454,19 +454,26 @@ class OrderProcessor:
             # look it up from the plan metadata or the order's intent_function
             _raw_sel = order.params.get("intent_selector") or plan.metadata.get("intent_selector") or ""
             if not _raw_sel or not all(c in '0123456789abcdefABCDEF' for c in _raw_sel.replace("0x", "")):
-                # Compute from intent function name using the contract's
-                # registered selector convention (keccak of canonical sig).
-                # For DexAggregatorApp: swap(address,address,uint256,uint256,address)
-                from eth_hash.auto import keccak as _keccak
-                _fn = order.intent_function or "swap"
-                _KNOWN_SIGS = {
-                    "swap": "swap(address,address,uint256,uint256,address)",
-                    "execute": "swap(address,address,uint256,uint256,address)",
-                    "buy": "buy(address,address,uint256,uint256,address)",
-                    "rebalance": "rebalance(address[],uint256[],address)",
-                }
-                _sig = _KNOWN_SIGS.get(_fn, f"{_fn}()")
-                _raw_sel = _keccak(_sig.encode())[:4].hex()
+                # Derive the selector from the APP'S OWN manifest — the same
+                # generic, manifest-driven path the submit-order endpoint uses.
+                #
+                # This used to be a hardcoded {swap, execute, buy, rebalance} ->
+                # canonical-signature map, i.e. one app's ABI baked into a path
+                # every app goes through. It resolves identically for the app it
+                # was written for (verified against the live DexAggregator
+                # manifest: both produce d5bcb9b5) and, unlike the map, is
+                # correct for an app whose intent this file has never heard of.
+                _fn = order.intent_function or ""
+                _raw_sel = self._selector_from_manifest(order.app_id, _fn) or ""
+                if not _raw_sel:
+                    # No manifest entry: fall back to the no-arg convention,
+                    # which is what the map did for any unlisted intent.
+                    from eth_hash.auto import keccak as _keccak
+                    logger.warning(
+                        "No manifest signature for %s.%s — falling back to the "
+                        "no-arg selector convention", order.app_id, _fn,
+                    )
+                    _raw_sel = _keccak(f"{_fn}()".encode())[:4].hex()
             intent_order_dict = {
                 "order_id": order.order_id,
                 "app": contract_address,
@@ -505,9 +512,12 @@ class OrderProcessor:
                 self.order_persistence.sync(order.order_id)
                 return False
 
+        # The app's manifest drives simulator token seeding — the platform
+        # does not guess which params an order spends (v3.manifest.spend_params).
         simulation = await self.simulation_runner.simulate(
             plan, order, contract_address, intent_order_dict,
             is_cross_chain, deployed_contract,
+            manifest=self._manifest_for(order.app_id),
         )
 
         # Protocol-fee certification — the never-lose-money gate, upstream of
@@ -858,6 +868,47 @@ class OrderProcessor:
             contract_address=contract_address,
         )
         return sig
+
+    def _manifest_for(self, app_id: str) -> dict | None:
+        """The app's manifest, or None. Never raises — a manifest lookup
+        failure must degrade to "cannot seed" (logged by the caller), not take
+        down order processing."""
+        try:
+            manifest = getattr(self.app_store.get_app(app_id), "manifest", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Manifest lookup failed for %s: %s", app_id, exc)
+            return None
+        return manifest if isinstance(manifest, dict) else None
+
+    def _selector_from_manifest(self, app_id: str, intent_function: str) -> str | None:
+        """4-byte selector for ``intent_function``, computed from the app's own
+        manifest. ``None`` when the app declares no such intent.
+
+        Defensive: a manifest that fails to parse must not take down order
+        processing — the caller falls back to the no-arg convention and logs.
+        """
+        if not app_id or not intent_function:
+            return None
+        try:
+            from minotaur_subnet.v3.manifest import (
+                compute_selector_from_manifest,
+                manifest_from_legacy_dict,
+            )
+
+            app = self.app_store.get_app(app_id)
+            manifest = getattr(app, "manifest", None)
+            if not isinstance(manifest, dict) or "intent_functions" not in manifest:
+                return None
+            selector = compute_selector_from_manifest(
+                manifest_from_legacy_dict(manifest), intent_function,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Manifest selector lookup failed for %s.%s: %s",
+                app_id, intent_function, exc,
+            )
+            return None
+        return str(selector).replace("0x", "") if selector else None
 
     def _resolve_app_addresses(
         self,

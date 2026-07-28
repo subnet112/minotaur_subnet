@@ -20,55 +20,47 @@ from minotaur_subnet.chains import registry
 #  Reference implementations — verbatim copies of the original inlined logic.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ref_live_rpc(chain_id, env):
-    # app_registry_cache / validator_registry_cache / score_threshold_cache
+def _ref_archive(chain_id, env):
+    # ROLE 1 — the single archive ladder now shared by live_rpc / gas_rpc /
+    # check_rpc (and the primary rung of consensus_rpc). No cross-chain leak.
     g = lambda k: env.get(k, "").strip()  # noqa: E731
     if chain_id == 8453:
         return g("BASE_UPSTREAM_RPC_URL") or g("BASE_RPC_URL")
     if chain_id == 1:
-        return g("ETH_UPSTREAM_RPC_URL") or g("ETH_RPC_URL") or g("ANVIL_RPC_URL")
+        return (g("ETH_UPSTREAM_RPC_URL") or g("ETHEREUM_RPC_URL")
+                or g("ETH_RPC_URL"))
     if chain_id == 964:
         return (g("BITTENSOR_EVM_UPSTREAM_RPC_URL") or g("BITTENSOR_EVM_RPC_URL")
                 or g("BITTENSOR_EVM_FORK_RPC_URL"))
     return ""
 
 
-def _ref_gas_rpc(chain_id, env):
-    # fee_policy._live_gas_rpc_url
-    g = lambda k: env.get(k, "").strip()  # noqa: E731
-    if chain_id == 8453:
-        return g("BASE_UPSTREAM_RPC_URL") or g("BASE_RPC_URL")
-    if chain_id == 1:
-        return (g("ETH_UPSTREAM_RPC_URL") or g("ETHEREUM_RPC_URL")
-                or g("ETH_RPC_URL") or g("ANVIL_RPC_URL"))
-    if chain_id == 964:
-        return g("BITTENSOR_EVM_UPSTREAM_RPC_URL") or g("BITTENSOR_EVM_RPC_URL")
-    return ""
+# live / gas / check all collapsed onto the one archive role.
+_ref_live_rpc = _ref_archive
+_ref_gas_rpc = _ref_archive
+_ref_check_rpc = _ref_archive
 
 
 def _ref_consensus_rpc(chain_id, env):
-    # protocol_config.consensus_chain_rpc_url
+    # protocol_config.consensus_chain_rpc_url — archive, then public fallback,
+    # then the LOCAL node (chain 1 fails loud; never a cross-chain read).
     g = lambda k: env.get(k, "").strip()  # noqa: E731
-    if chain_id == 8453:
-        u = g("BASE_UPSTREAM_RPC_URL")
-        if u:
-            return u
-    elif chain_id == 964:
-        u = g("BITTENSOR_EVM_UPSTREAM_RPC_URL") or g("BITTENSOR_EVM_RPC_URL")
-        if u:
-            return u
+    u = _ref_archive(chain_id, env)
+    if u:
+        return u
+    if chain_id == 964:
         return "https://lite.chain.opentensor.ai"
-    elif chain_id == 1:
-        u = g("ETH_UPSTREAM_RPC_URL")
-        if u:
-            return u
-    return g("ANVIL_RPC_URL") or g("BASE_RPC_URL") or "http://localhost:8545"
+    if chain_id == 1:
+        return ""
+    return (g("LOCAL_ANVIL_RPC_URL") or g("ANVIL_RPC_URL")
+            or "http://localhost:8545")
 
 
 # ── env-matrix driver ─────────────────────────────────────────────────────────
 
 _ALL_RPC_ENVS = [
-    "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL",
+    "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL",
+    "ANVIL_RPC_URL", "LOCAL_ANVIL_RPC_URL",
     "BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL",
     "BITTENSOR_EVM_UPSTREAM_RPC_URL", "BITTENSOR_EVM_RPC_URL",
     "BITTENSOR_EVM_FORK_RPC_URL",
@@ -181,11 +173,52 @@ def test_boot_rpc_chain1_prefers_real_ethereum_rpc(monkeypatch):
     assert registry.boot_rpc(1) == "https://eth.example/v2/key"
 
 
-def test_boot_rpc_chain1_falls_back_to_anvil_for_local_dev(monkeypatch):
+def test_boot_rpc_chain1_never_leaks_to_anvil(monkeypatch):
+    # ANVIL_RPC_URL is the Base anvil on prod — chain 1 must NOT fall to it even
+    # when the ETH envs are missing (Ethereum requires explicit ETH_* envs; local
+    # dev/CI never runs chain 1: local_testnet supported_chains = [31337, 8453]).
     monkeypatch.delenv("ETHEREUM_RPC_URL", raising=False)
     monkeypatch.delenv("ETH_RPC_URL", raising=False)
-    monkeypatch.setenv("ANVIL_RPC_URL", "http://localhost:8545")
-    assert registry.boot_rpc(1) == "http://localhost:8545"
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    assert registry.boot_rpc(1) == ""
+
+
+def test_chain1_ladders_never_leak_to_anvil_base(monkeypatch):
+    # The Base-anvil leak behind the DexAggregatorV2 relayer() UNRESOLVED
+    # incident: with ONLY ANVIL_RPC_URL set (= the Base anvil), every chain-1
+    # resolver must refuse it and return "" — never read Ethereum off a Base fork.
+    _clear(monkeypatch)
+    monkeypatch.setenv("ANVIL_RPC_URL", "http://anvil-base:8546")
+    # The SIM/live/read ladders must never leak to the Base anvil. (benchmark_rpc
+    # is the solver-read plane and deliberately keeps ANVIL_RPC_URL as its
+    # local/test fallback — excluded here.)
+    for fn in (registry.live_rpc, registry.gas_rpc, registry.consensus_rpc,
+               registry.sim_rpc, registry.check_rpc, registry.boot_rpc):
+        assert fn(1) == "", f"{fn.__name__}(1) leaked to ANVIL_RPC_URL (Base)"
+    # sanity: chain 31337 (local) still legitimately uses ANVIL_RPC_URL
+    assert registry.sim_rpc(31337) == "http://anvil-base:8546"
+
+
+# ── Fleet-wide invariant: no chain's read/sim role resolves a FOREIGN anvil ──
+@pytest.mark.parametrize("victim, foreign_env", [
+    (1, "ANVIL_RPC_URL"), (1, "LOCAL_ANVIL_RPC_URL"),
+    (1, "BASE_RPC_URL"), (1, "BASE_SIM_RPC_URL"), (1, "BASE_UPSTREAM_RPC_URL"),
+    (964, "ANVIL_RPC_URL"), (964, "LOCAL_ANVIL_RPC_URL"),
+    (964, "BASE_RPC_URL"), (964, "ETH_RPC_URL"),
+])
+def test_no_role_resolves_a_foreign_anvil(monkeypatch, victim, foreign_env):
+    """The permanent guardrail: with ONLY another chain's endpoint set, NONE of a
+    chain's read/sim/consensus/boot roles may resolve to it. Generalises the
+    chain-1 Base-anvil leak fix to every chain and every role."""
+    _clear(monkeypatch)
+    for k in ("ETH_SIM_RPC_URL", "BASE_SIM_RPC_URL", "ETH_QUOTE_SIM_RPC_URL",
+              "BASE_QUOTE_SIM_RPC_URL", "BITTENSOR_CHOPSTICKS_SIM_RPC_URL"):
+        monkeypatch.delenv(k, raising=False)
+    foreign = "http://foreign-node:9999"
+    monkeypatch.setenv(foreign_env, foreign)
+    for role in (registry.live_rpc, registry.gas_rpc, registry.check_rpc,
+                 registry.consensus_rpc, registry.sim_rpc, registry.boot_rpc):
+        assert role(victim) != foreign, f"{role.__name__}({victim}) leaked {foreign_env}"
 
 
 def test_boot_rpc_other_chains_unchanged(monkeypatch):

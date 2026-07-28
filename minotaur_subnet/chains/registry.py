@@ -28,6 +28,31 @@ Two kinds of field, kept deliberately separate:
 Import-cheap on purpose (stdlib only): consensus and harness code imports it freely
 without pulling in web3. ``blockchain/chains.get_web3`` and ``relayer/chain_config``
 become thin readers of this table.
+
+RPC ROLE MODEL (2026-07-27 cleanup). The RPC endpoints a chain needs group into a
+few ROLES, not one ladder per call-site. What used to be nine near-duplicate
+ladders is now:
+
+  * ROLE 1 — ARCHIVE (``archive_envs``): the chain's real archive RPC. ONE ladder
+    shared by every live-chain read — ``live_rpc`` (registry/validator/score
+    caches), ``gas_rpc`` (fee policy), ``check_rpc`` (health probes), and the
+    primary rung of ``consensus_rpc`` (+ its ``consensus_public_fallback``).
+  * ROLE 2 — SIM FORK (``sim_rpc_envs`` / ``quote_sim_rpc_envs``): the scoring/order
+    anvil, and the OPTIONAL dedicated /quote anvil (kept separate on purpose —
+    sharing an anvil corrupts the snapshot/revert bracket).
+  * ROLE 3 — FORK SOURCE (``upstream_rpc_env`` / ``proxy_upstream_envs``): what the
+    anvils fork FROM, and what the read-proxy sidecar dials.
+  * ROLE 4 — BENCHMARK anvil (``benchmark_rpc_envs``): the sandboxed benchmark
+    read path (block-pin proxy on prod). Distinct from sim — NOT merged.
+  * ROLE 5 — BOOT (``boot_rpc_envs``): the live solver's real RPC for faucet/boot.
+
+HARD INVARIANT: a chain's ARCHIVE/SIM ladder must NEVER contain another chain's
+dedicated anvil. The legacy ``ANVIL_RPC_URL`` meant "the Base anvil" on prod and
+"the local anvil" in dev; wedged into Ethereum's ladders it read ETH state off a
+Base fork (the DexAggregatorV2 relayer() UNRESOLVED / split-brain bugs). The local
+anvil is now the explicit ``LOCAL_ANVIL_RPC_URL`` (``ANVIL_RPC_URL`` kept as the
+back-compat fallback). ``tests/unit/test_chain_registry.py::
+test_no_role_resolves_a_foreign_anvil`` enforces the invariant fleet-wide.
 """
 from __future__ import annotations
 
@@ -56,15 +81,20 @@ class ChainSpec:
     explorer: str = ""
 
     # ── env-resolved RPC ladders (ordered env-var names) ──────────────────────
-    # Strict live-chain reads (registry / validator-set / score caches): the
-    # operator's *_UPSTREAM_RPC_URL, then plain RPC. Empty tuple -> "" (unknown).
-    live_rpc_envs: tuple[str, ...] = ()
-    # Gas-price read (fee_policy) — like live but chain-specific extras.
-    gas_rpc_envs: tuple[str, ...] = ()
-    # Consensus reads (protocol_config): UPSTREAM-only, with public/local fallback.
-    consensus_rpc_envs: tuple[str, ...] = ()
+    # ROLE 1 — ARCHIVE READS of the real chain. One ladder for every live-chain
+    # read: registry / validator-set / score caches (was live_rpc), the gas-price
+    # read (was gas_rpc), consensus reads (was consensus_rpc, + the public
+    # fallback below), and health / contract-presence probes (was check_rpc).
+    # These four collapsed into ONE role: they all want "this chain's real
+    # archive RPC", the operator's *_UPSTREAM_RPC_URL then plain RPC. Empty
+    # tuple -> "" (unknown). A chain's archive ladder must NEVER contain another
+    # chain's anvil (see the chain-1 note below + test_chain1_ladders_never_leak).
+    archive_envs: tuple[str, ...] = ()
+    # Consensus-only extra: a public/local fallback when the archive is unset
+    # (the local node IS the live chain on testnet/dev; 964's lite endpoint).
     consensus_public_fallback: str | None = None
-    # Simulator fork target (the api/validator sim_rpc_urls builder).
+    # ROLE 2 — SIM FORK target: the scoring/order-processing anvil (the
+    # api/validator sim_rpc_urls builder).
     sim_rpc_envs: tuple[str, ...] = ()
     # OPTIONAL dedicated /quote simulator fork-target (a SEPARATE anvil from the
     # order sim, so quote sims never queue behind order-processing on the shared
@@ -73,21 +103,19 @@ class ChainSpec:
     # its evm_snapshot/evm_revert would interleave with the order sim's, silently
     # corrupting both. Empty => no dedicated fork => quotes use the shared runner.
     quote_sim_rpc_envs: tuple[str, ...] = ()
-    # Fork SOURCE the anvil forks from (upstream_rpc_urls builder + pin derivation).
+    # ROLE 3 — FORK SOURCE the anvils fork from (upstream_rpc_urls builder + pin
+    # derivation, and the read-proxy sidecar dials it via proxy_upstream below).
     upstream_rpc_env: str | None = None
-    # Benchmark-sandbox anvil (orchestrator build_rpc_url_map).
+    # ROLE 4 — BENCHMARK sandbox anvil (orchestrator build_rpc_url_map). Distinct
+    # from sim (a separate sandboxed anvil) — NOT merged.
     benchmark_rpc_envs: tuple[str, ...] = ()
-    # Plain-RPC ladder for health / contract-presence probes (contract_checks,
-    # metrics) — just needs *a* working RPC, upstream not required.
-    check_rpc_envs: tuple[str, ...] = ()
     # Upstream the read-proxy sidecar dials for this chain (read_proxy_manager
     # UPSTREAMS): plain RPC preferred, then the fork upstream. Falls back to
     # ``consensus_public_fallback`` (e.g. the BT-EVM lite endpoint) when set.
     proxy_upstream_envs: tuple[str, ...] = ()
-    # Live-RPC ladder used to build the faucet + boot-solver rpc_urls
-    # (startup/validator). First configured env wins — the LIVE solver plans
-    # against this endpoint, so it must be the chain's REAL RPC, with the
-    # local anvil only as a dev fallback.
+    # ROLE 5 — BOOT: live-RPC ladder for the faucet + boot-solver rpc_urls
+    # (startup/validator). The LIVE solver plans against this endpoint, so it
+    # must be the chain's REAL RPC — distinct from sim/benchmark, NOT merged.
     boot_rpc_envs: tuple[str, ...] = ()
 
     # ── consensus-static (CODE constants; fold into pack hash) ────────────────
@@ -135,24 +163,26 @@ _SPECS: tuple[ChainSpec, ...] = (
         rpc_env="ETHEREUM_RPC_URL",
         is_poa=False,
         explorer="https://etherscan.io",
-        live_rpc_envs=("ETH_UPSTREAM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
-        gas_rpc_envs=(
-            "ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL",
-        ),
-        consensus_rpc_envs=("ETH_UPSTREAM_RPC_URL",),
+        # NOTE: ``ANVIL_RPC_URL`` is DELIBERATELY ABSENT from every chain-1
+        # ladder. On production nodes ANVIL_RPC_URL is the *Base* anvil (misnamed
+        # legacy), so listing it here silently forked/read Ethereum against a
+        # Base node — no ETH pools, wrong/absent contracts, empty plans, zero
+        # quotes, and the DexAggregatorV2 relayer() UNRESOLVED incident. A
+        # chain's ladder must never contain another chain's endpoint. Ethereum
+        # requires its OWN explicit envs (ETH_*); local dev/CI never runs chain 1
+        # (local_testnet supported_chains = [31337, 8453]).
+        archive_envs=("ETH_UPSTREAM_RPC_URL", "ETHEREUM_RPC_URL", "ETH_RPC_URL"),
         consensus_public_fallback=None,
-        sim_rpc_envs=("ETH_SIM_RPC_URL", "ANVIL_RPC_URL"),
+        sim_rpc_envs=("ETH_SIM_RPC_URL",),
         quote_sim_rpc_envs=("ETH_QUOTE_SIM_RPC_URL",),
         upstream_rpc_env="ETH_UPSTREAM_RPC_URL",
-        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        check_rpc_envs=("ETH_RPC_URL", "ANVIL_RPC_URL"),
+        # benchmark_rpc is the SOLVER-READ plane (block-pin proxy on prod, where
+        # BENCHMARK_ANVIL_RPC_ETH is set first so the local anvil is never
+        # reached). It keeps the LOCAL anvil as the local/test fallback — unlike
+        # the sim/archive ladders above, which must not (Base-anvil leak).
+        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "LOCAL_ANVIL_RPC_URL", "ANVIL_RPC_URL"),
         proxy_upstream_envs=("ETH_RPC_URL", "ETH_UPSTREAM_RPC_URL"),
-        # The live solver plans chain-1 routes against this endpoint. On
-        # production nodes ANVIL_RPC_URL is the BASE anvil (misnamed legacy),
-        # so it must only be the local-dev fallback — booting the solver with
-        # chain 1 → Base anvil makes every chain-1 generate_plan come back
-        # empty (no Ethereum pools on a Base fork) and live /quote returns 0.
-        boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL", "ANVIL_RPC_URL"),
+        boot_rpc_envs=("ETHEREUM_RPC_URL", "ETH_RPC_URL"),
         is_anchor=False,
         lookback_epochs=3,   # ~12s blocks: 3 epochs clears 12-conf by round open
         fee_floor_wei=33_000_000_000_000,
@@ -166,9 +196,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         rpc_env="BASE_RPC_URL",
         is_poa=True,
         explorer="https://basescan.org",
-        live_rpc_envs=("BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL"),
-        gas_rpc_envs=("BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL"),
-        consensus_rpc_envs=("BASE_UPSTREAM_RPC_URL",),
+        archive_envs=("BASE_UPSTREAM_RPC_URL", "BASE_RPC_URL"),
         consensus_public_fallback=None,
         sim_rpc_envs=("BASE_SIM_RPC_URL", "BASE_RPC_URL"),
         quote_sim_rpc_envs=("BASE_QUOTE_SIM_RPC_URL",),
@@ -176,7 +204,6 @@ _SPECS: tuple[ChainSpec, ...] = (
         benchmark_rpc_envs=(
             "BENCHMARK_ANVIL_RPC_BASE", "BASE_SIM_RPC_URL", "BASE_RPC_URL",
         ),
-        check_rpc_envs=("BASE_RPC_URL",),
         proxy_upstream_envs=("BASE_RPC_URL", "BASE_UPSTREAM_RPC_URL"),
         boot_rpc_envs=("BASE_RPC_URL",),
         is_anchor=True,          # the primary benchmark anchor (was ROUND_ANCHOR_CHAINS)
@@ -191,14 +218,10 @@ _SPECS: tuple[ChainSpec, ...] = (
         rpc_env="BITTENSOR_EVM_RPC_URL",
         is_poa=False,
         explorer="https://evm.taostats.io",
-        live_rpc_envs=(
+        archive_envs=(
             "BITTENSOR_EVM_UPSTREAM_RPC_URL",
             "BITTENSOR_EVM_RPC_URL",
             "BITTENSOR_EVM_FORK_RPC_URL",
-        ),
-        gas_rpc_envs=("BITTENSOR_EVM_UPSTREAM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
-        consensus_rpc_envs=(
-            "BITTENSOR_EVM_UPSTREAM_RPC_URL", "BITTENSOR_EVM_RPC_URL",
         ),
         consensus_public_fallback="https://lite.chain.opentensor.ai",
         # Sim target = the Chopsticks anvil-dialect sidecar (native precompiles
@@ -212,7 +235,6 @@ _SPECS: tuple[ChainSpec, ...] = (
             "BITTENSOR_EVM_SIM_RPC_URL",
             "BITTENSOR_EVM_RPC_URL",
         ),
-        check_rpc_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_FORK_RPC_URL"),
         proxy_upstream_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_UPSTREAM_RPC_URL"),
         boot_rpc_envs=("BITTENSOR_EVM_RPC_URL",),
         is_anchor=False,
@@ -224,17 +246,17 @@ _SPECS: tuple[ChainSpec, ...] = (
         chain_id=31337,
         name="Anvil",
         slug="eth",   # legacy CHAIN_NAMES routed 31337 through the "eth" proxy slug
+        # The LOCAL anvil. LOCAL_ANVIL_RPC_URL is the new explicit name; ANVIL_RPC_URL
+        # is kept as the back-compat fallback (the legacy overloaded name).
         rpc_env="ANVIL_RPC_URL",
         is_poa=False,
         explorer="http://localhost:8545",
-        live_rpc_envs=(),   # the live-read caches only knew 8453/1/964 -> "" here
-        gas_rpc_envs=(),
-        consensus_rpc_envs=(),
+        archive_envs=(),   # the live-read caches only knew 8453/1/964 -> "" here
         consensus_public_fallback=None,
-        sim_rpc_envs=("ANVIL_RPC_URL",),
+        sim_rpc_envs=("LOCAL_ANVIL_RPC_URL", "ANVIL_RPC_URL"),
         upstream_rpc_env=None,   # local testnet forks from nothing
-        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "ANVIL_RPC_URL"),
-        boot_rpc_envs=("ANVIL_RPC_URL",),
+        benchmark_rpc_envs=("BENCHMARK_ANVIL_RPC_ETH", "LOCAL_ANVIL_RPC_URL", "ANVIL_RPC_URL"),
+        boot_rpc_envs=("LOCAL_ANVIL_RPC_URL", "ANVIL_RPC_URL"),
         is_anchor=False,
         lookback_epochs=1,
         fee_floor_wei=0,
@@ -331,41 +353,53 @@ def _first_env(names: tuple[str, ...]) -> str:
     return ""
 
 
-def live_rpc(chain_id: int) -> str:
-    """LIVE-chain RPC for registry / validator-set / score reads.
+def _local_node_url() -> str:
+    """The LOCAL node used as the live chain on testnet/dev. LOCAL_ANVIL_RPC_URL
+    is the new explicit name; ANVIL_RPC_URL is the back-compat fallback."""
+    return (
+        os.environ.get("LOCAL_ANVIL_RPC_URL", "").strip()
+        or os.environ.get("ANVIL_RPC_URL", "").strip()
+        or "http://localhost:8545"
+    )
 
-    Replaces the byte-identical ``_chain_rpc_env`` in ``app_registry_cache`` /
-    ``validator_registry_cache`` / ``score_threshold_cache``. Returns ``""`` when
-    no live RPC is configured (callers fail open with a WARN, as before).
+
+def _archive(chain_id: int) -> str:
+    """ROLE 1 — this chain's real ARCHIVE RPC (the operator's *_UPSTREAM then
+    plain RPC). Shared by every live-chain read: live_rpc / gas_rpc / check_rpc,
+    and the primary rung of consensus_rpc. Returns "" when unknown/unconfigured.
     """
     s = spec(chain_id)
-    return _first_env(s.live_rpc_envs) if s is not None else ""
+    return _first_env(s.archive_envs) if s is not None else ""
+
+
+def live_rpc(chain_id: int) -> str:
+    """Live-chain RPC for registry / validator-set / score reads (was a distinct
+    ladder; now the shared archive role). "" when unconfigured (callers WARN)."""
+    return _archive(chain_id)
 
 
 def gas_rpc(chain_id: int) -> str:
-    """LIVE RPC for the gas-price read (``fee_policy._live_gas_rpc_url``)."""
-    s = spec(chain_id)
-    return _first_env(s.gas_rpc_envs) if s is not None else ""
+    """Live RPC for the gas-price read (``fee_policy``) — the archive role."""
+    return _archive(chain_id)
 
 
 def consensus_rpc(chain_id: int) -> str:
     """RPC for consensus chain reads (``protocol_config.consensus_chain_rpc_url``).
 
-    UPSTREAM-preferred, then a chain-specific public fallback, then the local
-    Anvil URL — the local node IS the live chain for testnet/dev.
+    Archive-preferred, then a chain-specific public fallback, then the LOCAL node
+    (testnet/dev, where the local node IS the live chain). Chain 1 fails loud
+    (returns "") rather than fall to the local/Base node — never a cross-chain read.
     """
     s = spec(chain_id)
     if s is not None:
-        u = _first_env(s.consensus_rpc_envs)
+        u = _archive(chain_id)
         if u:
             return u
         if s.consensus_public_fallback:
             return s.consensus_public_fallback
-    return (
-        os.environ.get("ANVIL_RPC_URL", "").strip()
-        or os.environ.get("BASE_RPC_URL", "").strip()
-        or "http://localhost:8545"
-    )
+        if s.chain_id == 1:
+            return ""
+    return _local_node_url()
 
 
 def sim_rpc(chain_id: int) -> str:
@@ -397,9 +431,9 @@ def benchmark_rpc(chain_id: int) -> str:
 
 
 def check_rpc(chain_id: int) -> str:
-    """Plain-RPC for health / contract-presence probes (contract_checks, metrics)."""
-    s = spec(chain_id)
-    return _first_env(s.check_rpc_envs) if s is not None else ""
+    """RPC for health / contract-presence probes (contract_checks, metrics) — the
+    archive role (was a distinct ladder)."""
+    return _archive(chain_id)
 
 
 def proxy_upstream(chain_id: int) -> str:

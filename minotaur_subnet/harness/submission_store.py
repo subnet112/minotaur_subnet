@@ -1036,6 +1036,34 @@ class SubmissionStore:
                 out[hk] = ts
         return out
 
+    def latest_created_at_by_hotkey(
+        self, *, exclude_round_id: str | None = None,
+    ) -> dict[str, float]:
+        """``{hotkey: latest created_at}`` across retained submissions — the
+        activity mirror of :meth:`earliest_created_at_by_hotkey`.
+
+        Powers the rotation ledger's absence-reset backfill (see
+        rotation.apply_rotation_slate): a miner's PRIOR activity anchor must be
+        reconstructible after a ledger upgrade so a continuously-contending
+        (merely starved) miner is never mistaken for a returning absentee on
+        the first post-upgrade pass. ``exclude_round_id`` omits the current
+        round's submissions — a returner's fresh submission must not mask the
+        gap it returned from. Bounded by store retention; best-effort.
+        """
+        self._maybe_reload()
+        out: dict[str, float] = {}
+        for s in self._submissions.values():
+            if exclude_round_id is not None and s.round_id == exclude_round_id:
+                continue
+            hk = s.hotkey or ""
+            try:
+                ts = float(s.created_at or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if hk and ts and (hk not in out or ts > out[hk]):
+                out[hk] = ts
+        return out
+
     def count_benched_rounds_by_commit(
         self, hotkey: str, commit_hash: str, *, current_round_id: str | None = None,
     ) -> int:
@@ -1215,6 +1243,20 @@ class SubmissionStore:
         if sub is None:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.content_fingerprint = value
+        sub.updated_at = time.time()
+        self._persist_records([sub])
+
+    def set_structural_fingerprint(self, submission_id: str, value: str) -> None:
+        """Persist the salt-invariant structural fingerprint from screening
+        stage 1 — same compute-once-read-forever discipline as
+        ``set_content_fingerprint``. Without this the field never reaches the
+        record and the structural dedup sees NONE on every submission.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.structural_fingerprint = value
         sub.updated_at = time.time()
         self._persist_records([sub])
 

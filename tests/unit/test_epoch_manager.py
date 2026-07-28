@@ -2066,10 +2066,12 @@ class TestEpochManagerOwnerResolution:
         assert mgr._resolved_owner == "5Genv"  # real fallback value cached
 
     def test_empty_not_cached_when_no_owner_anywhere(self, monkeypatch):
-        """When neither chain nor env yields an owner, '' is returned and NOT
-        cached — so a later chain/env value can still win."""
-        monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
-        monkeypatch.delenv("OWNER_HOTKEY", raising=False)
+        """When neither chain nor env/constant yields an owner, '' is returned
+        and NOT cached — so a later chain/env value can still win. Force the
+        resolver empty past the constant fallback to exercise the caching logic
+        in isolation."""
+        import minotaur_subnet.epoch.manager as _mgrmod
+        monkeypatch.setattr(_mgrmod, "get_subnet_owner_hotkey", lambda: "")
         source = MagicMock()
         source.resolve_subnet_owner = MagicMock(return_value="")
 
@@ -2112,7 +2114,11 @@ class TestBenchmarkSnapshotWiring:
         # Synthetic snapshot has block_number=18500000
         assert snapshot.block_number == 18500000
         assert snapshot.chain_id == 1
-        assert "ETH/USD" in snapshot.prices
+        # The synthetic snapshot no longer synthesises a price table: it was
+        # derived from a hardcoded Uniswap USD table, which is app-specific.
+        # An app that needs prices populates them via app_data / its own
+        # snapshot contribution.
+        assert snapshot.prices == {}
 
     @pytest.mark.asyncio
     async def test_uses_builder_when_available(self):
@@ -2126,8 +2132,7 @@ class TestBenchmarkSnapshotWiring:
             block_number=19000000,
             timestamp=1700100000,
             prices={"ETH/USD": 2000.0},
-            dex_config={},
-        )
+                    )
         mock_builder.build_chain_snapshot = AsyncMock(return_value=live_snapshot)
 
         store = SubmissionStore()
@@ -2166,7 +2171,11 @@ class TestBenchmarkSnapshotWiring:
 
         # Should fall back to synthetic
         assert snapshot.block_number == 18500000
-        assert "ETH/USD" in snapshot.prices
+        # The synthetic snapshot no longer synthesises a price table: it was
+        # derived from a hardcoded Uniswap USD table, which is app-specific.
+        # An app that needs prices populates them via app_data / its own
+        # snapshot contribution.
+        assert snapshot.prices == {}
 
     def test_set_epoch_block(self):
         """set_epoch_block updates the worker's block number."""

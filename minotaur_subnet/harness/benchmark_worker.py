@@ -1531,9 +1531,15 @@ class BenchmarkWorker:
         one per operational per-chain deployment.
         """
         if self._app_store is None:
-            # Fallback: use synthetic intents for testing/MVP
-            from minotaur_subnet.harness.snapshot import build_synthetic_intents
-            return build_synthetic_intents()
+            # No app store -> nothing to benchmark. This used to fabricate three
+            # hardcoded DEX intents (a swap, a limit order, a multi-token swap)
+            # as a "testing/MVP" fallback; benchmarking imaginary swaps is not a
+            # sensible default for a platform whose apps are arbitrary, and the
+            # honest answer for "no apps configured" is no intents.
+            logger.warning(
+                "[benchmark] no app store configured — no intents to benchmark",
+            )
+            return []
 
         # Round-anchored retirement cutover: a RETIRING deployment stays in the
         # synthetic set until its stamped effective epoch, then drops — evaluated

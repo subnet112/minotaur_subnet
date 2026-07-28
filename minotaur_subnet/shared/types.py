@@ -142,6 +142,29 @@ _BRIDGE_CALL_SELECTORS = {
 _MOCK_BRIDGE_TARGET = "0x" + "BB" * 20
 
 
+def mock_bridge_deposit(
+    token_address: str,
+    amount: int,
+    chain_id: int,
+) -> "Interaction":
+    """The canonical mocked bridge deposit: ``token.transfer(mock, amount)``.
+
+    One encoder for BOTH replacement (a real bridge call being mocked) and
+    synthesis (a solver-shape bridge leg that carries no calldata yet) — the
+    two paths must stay byte-identical so the observed amount can never
+    depend on which shape the plan arrived in.
+    """
+    from eth_abi import encode as _enc
+    return Interaction(
+        target=token_address,
+        value="0",
+        call_data="0x" + "a9059cbb" + _enc(
+            ["address", "uint256"], [_MOCK_BRIDGE_TARGET, max(0, int(amount))],
+        ).hex(),
+        chain_id=chain_id,
+    )
+
+
 def mock_bridge_interactions(
     interactions: list["Interaction"],
     token_address: str = "",
@@ -167,16 +190,8 @@ def mock_bridge_interactions(
             # Replace with: token.transfer(mockBridge, amount)
             if not amount:
                 logger.warning("mock_bridge_interactions: no amount provided, mock may be inaccurate")
-            from eth_abi import encode as _enc
-            mock_cd = "0x" + "a9059cbb" + _enc(
-                ["address", "uint256"],
-                [_MOCK_BRIDGE_TARGET, amount if amount else 0],
-            ).hex()
-            result.append(Interaction(
-                target=token_address or ix.target,
-                value="0",
-                call_data=mock_cd,
-                chain_id=ix.chain_id,
+            result.append(mock_bridge_deposit(
+                token_address or ix.target, amount, ix.chain_id,
             ))
         else:
             result.append(ix)
@@ -512,6 +527,17 @@ class SimulationResult:
     gas_metered: int | None = None
     leg_results: dict[int, Any] | None = None       # leg_id -> per-leg sim result dict
     bridge_estimate: dict[str, Any] | None = None    # bridge quote data for cross-chain
+    # The platform's DESTINATION-LEG delivery measurement for a multi-leg plan
+    # (simulator/cross_chain_bench.py, benchmark path only): exact decimal wei
+    # string observed on the plan's final leg, and the provenance of that
+    # amount ("simulated" | "declared" | "unfilled"). Attached by the
+    # benchmark orchestrator AFTER the scored simulation so the app's OWN
+    # scorer can read it from context.simulation and decide what delivery on
+    # another chain is worth — the platform never interprets these itself
+    # (what an intent must deliver, and where, is the app's contract).
+    # None everywhere but the benchmark path, and for every single-leg plan.
+    destination_delivered: str | None = None
+    destination_amount_source: str | None = None
 
 
 # ── cross-chain plan helpers ─────────────────────────────────────────────────

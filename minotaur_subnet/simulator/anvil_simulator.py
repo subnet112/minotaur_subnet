@@ -54,6 +54,27 @@ from minotaur_subnet.simulator.revert_decoder import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_read(fn: Any, default: str = "?") -> Any:
+    """Best-effort read for diagnostics — a failing probe must never mask the
+    original error it is trying to explain."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return default
+
+
+def _coerce_chain_id(value: Any) -> int | None:
+    """Best-effort chain-id → int, or None when absent/unparseable."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class SimulatorStateError(RuntimeError):
     """Raised when the anvil fork's baseline state cannot be restored.
 
@@ -779,6 +800,29 @@ class AnvilSimulator:
                 "to": target,
                 "data": "0x" + relayer_sig.hex(),
             })
+            # An empty (or too-short) return means relayer() didn't resolve at
+            # THIS fork state — e.g. the contract has no code at this block
+            # (fork pinned/forked below the deploy block) or the address is on
+            # the wrong chain's fork. Web3.to_checksum_address("0x") would then
+            # raise a cryptic ValueError. Fail closed with a DIAGNOSABLE log
+            # (chain / fork block / code length) and return None ("unresolved",
+            # not scored) so callers skip the probe cleanly instead of throwing.
+            if len(relayer_result) < 20:
+                chain_id = _safe_read(lambda: self.w3.eth.chain_id)
+                fork_block = _safe_read(lambda: self.w3.eth.block_number)
+                code_len = _safe_read(lambda: len(self.w3.eth.get_code(target)))
+                logger.warning(
+                    "scoreIntent: relayer() UNRESOLVED for %s — empty call "
+                    "return (chain=%s fork_block=%s contract_code_len=%s); "
+                    "skipping sim (unresolved, not scored)",
+                    target, chain_id, fork_block, code_len,
+                )
+                print(
+                    f"[SIM] relayer() UNRESOLVED for {target} chain={chain_id} "
+                    f"fork_block={fork_block} code_len={code_len}",
+                    flush=True,
+                )
+                return None
             relayer_addr = Web3.to_checksum_address(
                 "0x" + relayer_result[-20:].hex()
             )
@@ -2186,29 +2230,50 @@ class MultiChainSimulator:
             return SubtensorSimulator(sidecar_url=url, chain_id=chain_id)
         return AnvilSimulator(rpc_url=url, upstream_rpc_url=upstream, **kwargs)
 
-    def _get_simulator(self, plan: ExecutionPlan) -> AnvilSimulator | None:
-        """Resolve the correct simulator for a plan's chain.
+    def _get_simulator(
+        self, plan: ExecutionPlan, chain_id: Any = None,
+    ) -> AnvilSimulator | None:
+        """Resolve the correct simulator for a sim's chain.
 
-        Resolution order:
-        1. plan.metadata["chain_id"] — explicit hint
-        2. plan.interactions[0].chain_id — inferred from the plan itself
-        3. self.default_chain_id — last-resort (typically local testnet)
+        ``chain_id`` — when the caller passes it — is the request/scenario chain
+        that ALSO resolved the contract address, and is therefore AUTHORITATIVE:
+        the sub-simulator (hence the anvil fork) is selected for it, so the fork
+        always matches the chain the contract lives on. The plan's own chain
+        hint is used only to cross-check (a disagreement is a routing bug and is
+        logged) — it never overrides the request. This closes the split-brain
+        where the contract was resolved for one chain (``req.chain_id``) but the
+        anvil was picked from the plan, e.g. an Ethereum DEX contract simulated
+        on the Base fork → empty ``relayer()`` → silent zero.
+
+        Legacy callers pass no ``chain_id``; those keep the prior plan-derived
+        resolution with a default-chain fallback:
+        1. plan.metadata["chain_id"]  2. plan.interactions[0].chain_id
+        3. self.default_chain_id
         """
-        chain_id = plan.metadata.get("chain_id")
-        if chain_id is None and plan.interactions:
-            # Fallback: infer from the plan's first interaction. Callers
-            # (including /v1/apps/{id}/score) don't always stuff chain_id
-            # into metadata, but every Interaction carries it.
-            chain_id = plan.interactions[0].chain_id
-        if chain_id is None:
-            chain_id = self.default_chain_id
-        if isinstance(chain_id, str):
-            try:
-                chain_id = int(chain_id)
-            except ValueError:
-                chain_id = self.default_chain_id
+        plan_chain = plan.metadata.get("chain_id")
+        if plan_chain is None and plan.interactions:
+            # Every Interaction carries a chain_id even when metadata omits it.
+            plan_chain = plan.interactions[0].chain_id
+        plan_chain = _coerce_chain_id(plan_chain)
 
-        sim = self.simulators.get(chain_id)
+        authoritative = _coerce_chain_id(chain_id)
+        if authoritative is not None:
+            if plan_chain is not None and plan_chain != authoritative:
+                logger.warning(
+                    "sim chain mismatch: request/scenario chain=%s but plan "
+                    "hint chain=%s — routing to the authoritative request chain "
+                    "%s. (A plan mis-stamped with another chain would otherwise "
+                    "run this chain's contract on the wrong fork.)",
+                    authoritative, plan_chain, authoritative,
+                )
+            # Authoritative chain with no configured sub-sim: return None so the
+            # caller fails CLOSED with a clean "no simulator for chain X" error,
+            # rather than silently routing to the default/local fork — that
+            # silent misroute is exactly the footgun this method now prevents.
+            return self.simulators.get(authoritative)
+
+        target = plan_chain if plan_chain is not None else self.default_chain_id
+        sim = self.simulators.get(target)
         if sim is None:
             sim = self.simulators.get(self.default_chain_id)
         return sim
@@ -2261,16 +2326,28 @@ class MultiChainSimulator:
     async def simulate(
         self,
         plan: ExecutionPlan,
+        *,
+        chain_id: Any = None,
         **kwargs: Any,
     ) -> SimulationResult:
-        """Simulate a plan on the correct chain's Anvil fork."""
-        sim = self._get_simulator(plan)
+        """Simulate a plan on the correct chain's Anvil fork.
+
+        ``chain_id`` (the request/scenario chain that resolved the contract
+        address) is authoritative for chain selection — see
+        :meth:`_get_simulator`. It is consumed here and never forwarded to the
+        single-chain ``AnvilSimulator.simulate``.
+        """
+        sim = self._get_simulator(plan, chain_id=chain_id)
         if sim is None:
-            chain_id = plan.metadata.get("chain_id", self.default_chain_id)
+            resolved = (
+                _coerce_chain_id(chain_id)
+                if chain_id is not None
+                else plan.metadata.get("chain_id", self.default_chain_id)
+            )
             return SimulationResult(
                 success=False,
                 gas_used=0,
-                error=f"No simulator configured for chain {chain_id}",
+                error=f"No simulator configured for chain {resolved}",
             )
         return await sim.simulate(plan, **kwargs)
 
@@ -2483,20 +2560,23 @@ class MultiChainSimulator:
         leg: dict[str, Any],
         kwargs: dict[str, Any],
     ) -> tuple[int, str]:
-        """Run a bridge leg with its calldata mocked; report what moved.
+        """Run the journey up to and including the bridge deposit; report what moved.
 
         Returns ``(amount, source)`` where source is:
-          "simulated" — the deposit executed and this is the amount observed
-              leaving for the bridge. Trustworthy: an amount the plan didn't
-              actually earn cannot transfer.
-          "declared"  — the leg carries no bridge calldata to execute (the
-              solver's own plan shape, where the compiler hasn't injected it
-              yet), so the plan's declared amount is all there is. Weaker,
-              and labelled as such.
-          "unfilled"  — the deposit reverted, or moved nothing. No credit.
+          "simulated" — the deposit executed (real calldata mocked, or
+              synthesized for the calldata-less solver shape) after the
+              preceding same-chain legs, and this is the amount observed
+              leaving for the bridge. Trustworthy: an amount the journey
+              didn't actually earn cannot transfer.
+          "declared"  — nothing executable to observe (no calldata AND no
+              token/amount to synthesize a deposit from, or no simulator for
+              the chain), so the plan's declared amount is all there is.
+              Weaker, and labelled as such.
+          "unfilled"  — the deposit (or a leg before it) reverted, or moved
+              nothing. No credit.
         """
-        from minotaur_subnet.shared.types import mock_bridge_interactions
         from minotaur_subnet.simulator.cross_chain_bench import (
+            bridge_execution_plan,
             observed_bridged_amount,
         )
 
@@ -2505,25 +2585,21 @@ class MultiChainSimulator:
         except (ValueError, TypeError):
             declared = 0
 
-        leg_plan = extract_leg_plan(plan, leg["leg_id"])
-        if not leg_plan.interactions:
+        # One combined simulation: every preceding same-chain leg, then the
+        # deposit (mocked, or SYNTHESIZED for the calldata-less solver
+        # shape). Simulating the bridge leg alone would run it against the
+        # fork's seeded balances — crediting bridge-first plans while
+        # reverting honest swap-then-bridge ones — and the solver shape
+        # could only ever measure as "declared" (self-reported). See
+        # cross_chain_bench.bridge_execution_plan.
+        mocked = bridge_execution_plan(plan, leg)
+        if mocked is None:
             return max(0, declared), "declared"
 
         sim = self.simulators.get(leg.get("chain_id", self.default_chain_id))
         if sim is None:
             return max(0, declared), "declared"
 
-        mocked = ExecutionPlan(
-            intent_id=leg_plan.intent_id,
-            interactions=mock_bridge_interactions(
-                leg_plan.interactions,
-                token_address=leg.get("token_in", "") or "",
-                amount=declared,
-            ),
-            deadline=leg_plan.deadline,
-            nonce=leg_plan.nonce,
-            metadata=leg_plan.metadata,
-        )
         try:
             result = await sim.simulate(mocked, **kwargs)
         except Exception as exc:  # noqa: BLE001

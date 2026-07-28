@@ -89,14 +89,21 @@ class TestQuoteCaseId:
         }
         assert len(ids) == 5
 
-    def test_same_shape_collapses(self):
-        # ...but different amounts in the SAME order-of-magnitude collapse to one id,
-        # so exact-amount spam upserts to a single stored row (bounded growth).
+    def test_identical_shape_collapses(self):
+        # An exact re-quote of the same trade upserts to a single stored row.
+        # Amount-BUCKETED collapse (10 and 99 sharing an id) was the swap
+        # near-dup rule, removed 2026-07-27 — it collapsed nothing on the live
+        # corpus, so it was DEX vocabulary in an app-agnostic path.
+        p = {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"}
+        assert quote_case_id("app", 8453, "swap", dict(p)) == \
+               quote_case_id("app", 8453, "swap", dict(p))
+
+    def test_different_amounts_no_longer_collapse(self):
         a = quote_case_id("app", 8453, "swap",
                           {"input_token": "0xA", "output_token": "0xB", "input_amount": "10"})
         b = quote_case_id("app", 8453, "swap",
                           {"input_token": "0xA", "output_token": "0xB", "input_amount": "99"})
-        assert a == b
+        assert a != b
 
 
 class TestDeterminism:
@@ -178,17 +185,28 @@ class TestCapAndGrouping:
 
 
 class TestDedupAndPii:
-    def test_near_dup_same_pair_and_decade_collapse(self):
-        # Same pair, same order-of-magnitude amount → ONE representative, even
-        # though the exact amounts (hence quote_ids) differ.
-        quotes = []
-        for i in range(10):
-            p = {"input_token": "0xA", "output_token": "0xB",
-                 "input_amount": str(1_000_000_000_000_000_000 + i)}
-            quotes.append(_make_quote(chain_id=8453, params=p))
+    def test_exact_reposts_of_one_trade_collapse(self):
+        # Identical params collapse to one representative. (Near-dup collapse
+        # across DIFFERENT amounts in the same decade was the swap bucket,
+        # removed 2026-07-27 — see order_sampler._dedup_key.)
+        p = {"input_token": "0xA", "output_token": "0xB",
+             "input_amount": str(1_000_000_000_000_000_000)}
+        quotes = [_make_quote(chain_id=8453, params=dict(p)) for _ in range(10)]
         store = _FakeQuoteStore(quotes)
         got = sample_historical_quotes(store, "r", n_per_chain=50)
         assert len(got) == 1
+
+    def test_distinct_amounts_are_distinct_demand(self):
+        quotes = [
+            _make_quote(chain_id=8453, params={
+                "input_token": "0xA", "output_token": "0xB",
+                "input_amount": str(1_000_000_000_000_000_000 + i),
+            })
+            for i in range(10)
+        ]
+        store = _FakeQuoteStore(quotes)
+        got = sample_historical_quotes(store, "r", n_per_chain=50)
+        assert len(got) == 10
 
     def test_pii_stripped(self):
         q = _make_quote(quote_id="q_pii")

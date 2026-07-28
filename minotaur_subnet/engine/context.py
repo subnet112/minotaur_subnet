@@ -88,6 +88,18 @@ def _simulation_to_dict(sim: SimulationResult) -> dict[str, Any]:
     if getattr(sim, "on_chain_score", None) is not None:
         result["on_chain_score"] = sim.on_chain_score
         result["onChainScore"] = sim.on_chain_score
+    # The platform's destination-leg delivery measurement for a multi-leg
+    # plan (benchmark path only — see SimulationResult). The amount stays a
+    # DECIMAL STRING end-to-end: it is wei that can exceed 2^53, and the
+    # scorer must never see it as a lossy JS Number. Absent for single-leg
+    # plans and off the benchmark path, so a scorer that ignores it is
+    # bit-identical to today.
+    if getattr(sim, "destination_delivered", None) is not None:
+        result["destination_delivered"] = str(sim.destination_delivered)
+        result["destinationDelivered"] = result["destination_delivered"]
+    if getattr(sim, "destination_amount_source", None) is not None:
+        result["destination_amount_source"] = str(sim.destination_amount_source)
+        result["destinationAmountSource"] = result["destination_amount_source"]
     if sim.error is not None:
         result["error"] = sim.error
     if sim.token_transfers:

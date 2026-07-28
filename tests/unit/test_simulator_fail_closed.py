@@ -71,3 +71,41 @@ def test_score_threshold_invalidate_single_key() -> None:
     score_threshold_cache.invalidate("0xaa", 8453)
     assert (8453, "0xaa") not in score_threshold_cache._CACHE
     assert (964, "0xbb") in score_threshold_cache._CACHE
+
+
+def test_scoreintent_unresolved_relayer_returns_none_with_diagnostics(caplog):
+    """When relayer() returns empty at the current fork state (contract has no
+    code at this block, or wrong-chain fork), _simulate_via_score_intent must
+    fail closed cleanly — return None and log chain / fork block / code length —
+    instead of throwing a cryptic ValueError from to_checksum_address('0x').
+
+    Regression for the dex_compare reprobe tracebacks on the V2 DexAggregator
+    after the in-place redeploy.
+    """
+    import logging
+    from types import SimpleNamespace
+    from minotaur_subnet.simulator.anvil_simulator import AnvilSimulator
+
+    class _Eth:
+        chain_id = 1
+        block_number = 25_600_000  # below a hypothetical deploy block
+
+        def call(self, _tx):
+            return b""  # empty relayer() return — the failure under test
+
+        def get_code(self, _addr):
+            return b""  # no code at the address on this fork
+
+    # Bypass __init__ (needs a live RPC) — the guard returns before touching any
+    # other attribute, so a mock w3 is all that's needed.
+    sim = AnvilSimulator.__new__(AnvilSimulator)
+    sim.w3 = SimpleNamespace(eth=_Eth())
+
+    with caplog.at_level(logging.WARNING):
+        out = sim._simulate_via_score_intent("0x" + "cd" * 20, {}, None)
+
+    assert out is None  # unresolved -> None, no exception raised
+    msg = " ".join(r.message for r in caplog.records)
+    assert "relayer() UNRESOLVED" in msg
+    assert "fork_block=25600000" in msg  # diagnostics actually logged
+    assert "contract_code_len=0" in msg
