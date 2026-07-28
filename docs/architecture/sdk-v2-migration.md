@@ -13,18 +13,39 @@ solver used them; the SDK's own docstring tells solvers to prefer RPC. On that
 evidence they were removed (#1161).
 
 The **live champion** reads `snapshot.pool_states` with unguarded attribute
-access:
+access (the line the incident was predicted from):
 
 ```
 king_base.py:2926   pool_states = (snapshot.pool_states if snapshot and snapshot.pool_states else {}) or {}
 king_base.py:4048   pool_states = (snapshot.pool_states if snapshot and snapshot.pool_states else {}) or {}
-solver.py:401       ps = getattr(snapshot, "pool_states", None)      # the only safe one
+solver.py:401       ps = getattr(snapshot, "pool_states", None)      # explicitly tolerant
 ```
 
-`snapshot and snapshot.pool_states` touches the attribute to evaluate the
-guard, so the removal turns it into an `AttributeError` inside plan
-generation — every scored scenario fails, for the incumbent, on the hour the
-leader auto-updates. The whole batch was reverted.
+### What the removal actually does — solvers VENDOR the SDK
+
+`/app/minotaur_subnet` inside a solver image is the miner's OWN copy.
+`import minotaur_subnet` in the container resolves there, never to the
+validator's installed package, and the container runs its own
+`harness/runner.py` -> `dict_to_snapshot` over JSON on stdin. Verified on the
+live images (#1175).
+
+That determines the blast radius of any removal:
+
+| Kind | Effect of removing it from this repo |
+|---|---|
+| **SDK symbol** (class, helper) | the vendored copy is untouched; the solver keeps importing its own. Diverges only when the miner re-vendors. |
+| **Wire field** (a serialised `MarketSnapshot` / `IntentState` attribute) | we stop SENDING the key; the vendored `dict_to_snapshot` defaults it, so `snapshot.pool_states` yields `{}` and **does not raise** |
+| **Protocol shape** (renaming a JSON key the vendored runner requires) | the only class that genuinely crashes an existing solver |
+
+So #1161 would **not** have raised `AttributeError`. The champion's guard
+would have gone falsy and it would have fallen through to its RPC branch. The
+batch was reverted on the belief that it would crash the incumbent; that
+belief was wrong.
+
+The revert still stands, for a different and less dramatic reason: **silent
+divergence**. An incumbent's fallback path goes dead, its scores move, and
+nothing errors anywhere — harder to attribute after the fact than a crash,
+not easier.
 
 ### The reasoning error, stated plainly
 
@@ -34,9 +55,13 @@ forked-and-improved from a base we publish, and is invisible to grep here. An
 in-repo search returning nothing is not evidence of no consumers — it is
 evidence of no consumers *we can see*, which is the smaller half.
 
-Worse, an earlier instinct that removal "breaks every existing solver" was
-retracted as "unverified and overstated" on the strength of that same
-incomplete search. The instinct was right; the retraction was the mistake.
+The deeper error is that the same claim was then asserted in BOTH directions
+from evidence that could not reach it: first "this breaks every existing
+solver", then a retraction of that as "unverified and overstated", then an
+urgent revert on a predicted `AttributeError` that vendoring makes impossible.
+Three positions, none measured. The fix is not to hold the opposite belief
+more firmly — it is to stop asserting miner-side behaviour without reading
+miner-side code, which is what `tools/solver_surface_audit.py` now does.
 
 ---
 
@@ -57,10 +82,13 @@ Removing or renaming anything in that table is a breaking change to an
 interface with an installed base we do not control. Adding to it is safe.
 
 > The reverted batch also deleted `SwapIntentContext` / `TwapIntentContext` /
-> `RebalanceIntentContext` (#1163), which are equally reachable. The champion
-> was checked for `pool_states` and **not** for those, so whether #1163 was
-> independently safe is still unknown — it must be measured the same way
-> before it returns.
+> `RebalanceIntentContext` (#1163). That question is now **answered** rather
+> than assumed: `solver_surface_audit --preset v3-contexts` finds 20
+> dependencies across the live images, including
+> `from minotaur_subnet.v3.contexts import SwapIntentContext` and an
+> `isinstance()` on it. Under vendoring it would not have crashed, but the
+> isinstance branch would have silently stopped matching — so #1163 was not
+> independently safe either.
 
 ---
 
@@ -79,9 +107,21 @@ Ship the new shape alongside the old. For the snapshot that means:
   value was;
 - **keep the fields**, defaulting to `{}`.
 
-A solver reading `snapshot.pool_states` gets `{}`, its `else` branch fires,
-and it falls through to the RPC path the SDK already recommends. The platform
-stops modelling a DEX on day one; nothing breaks.
+Note carefully what this does and does not buy, because the naive version of
+the argument is wrong under vendoring:
+
+- It does **not** avoid an `AttributeError` today. A vendored solver defaults
+  the field either way, so "removed" and "present but empty" look identical
+  to it right now.
+- It **does** avoid a delayed, self-inflicted break on RE-VENDOR. Once the
+  field is gone from our SDK, the next miner to re-vendor gets a dataclass
+  without it, and their existing `snapshot.pool_states` line starts raising —
+  at a moment of their choosing, in their image, looking like our fault.
+  Keeping the field deprecated-but-present means a re-vendor stays safe and
+  gives them a window to migrate.
+- Both variants change behaviour silently (empty pool state). That is
+  unavoidable if the platform is to stop modelling a DEX, and is exactly what
+  the deprecation signal in Phase B is for.
 
 The same shape applies elsewhere: keep the archetype context classes as thin
 aliases of the base while `build_typed_context` stops producing them.
@@ -103,7 +143,7 @@ docker run --rm --entrypoint sh --network none <solver-image> \
   -c "grep -rn 'pool_states\|dex_config' /app --include=*.py"
 ```
 
-This is exactly the check that caught the incident, run before the change
+This is the check that answered the question, run before the change
 rather than after. It generalises to every submission in the current slate,
 not just the champion — see §5.
 
@@ -131,8 +171,8 @@ genuinely cannot express it.
 
 ## 5. Tooling to build first
 
-`tools/solver_surface_audit.py` — read-only, mirrors the two replay harnesses
-already in `tools/`:
+`tools/solver_surface_audit.py` — **built and landed in #1175**. Read-only,
+mirrors the two replay harnesses already in `tools/`:
 
 - enumerate the current slate's solver images from the submission store;
 - grep each for a candidate symbol (`pool_states`, `SwapIntentContext`, …);
@@ -150,8 +190,8 @@ token seeding, and simply not applied to the SDK surface. This closes that.
 
 | Reverted | Re-land as |
 |---|---|
-| #1161 MarketSnapshot | Phase A: keep fields empty, delete the Uniswap machinery + synthetic pool generator. ~90% of the value, zero break. |
-| #1163 v3 archetypes | Audit the slate for the context classes first. If referenced, keep them as aliases of the base while `build_typed_context` stops emitting them. |
+| #1161 MarketSnapshot | Phase A: keep fields empty, delete the Uniswap machinery + synthetic pool generator. ~90% of the value, no re-vendor landmine. |
+| #1163 v3 archetypes | Audited (#1175): 20 live dependencies. Keep the classes as aliases of the base while `build_typed_context` stops emitting them. |
 | #1166 token seeding | Platform-internal — no solver surface. Re-land as-is. |
 | #1168 quote allowlist | Platform-internal — no solver surface. Re-land as-is; still a pack-hash move needing a fleet-uniform promote. |
 | #1141 quality metric | Platform-internal, plus the unresolved §6 mutability question from `app-quality-metric.md`. |
