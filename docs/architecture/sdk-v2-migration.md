@@ -151,7 +151,9 @@ Retirement is its own promote, with its own revert plan.
 
 ---
 
-## 4. Why not a versioned `IntentSolver` base class
+## 4. Versioning the contract, not the base class
+
+### 4a. Not a versioned `IntentSolver` base class
 
 The obvious alternative — ship `IntentSolverV2` and let miners subclass the
 new one — is worse here:
@@ -166,6 +168,79 @@ The field-level lifecycle above gets the same outcome with no fork. Reserve a
 genuine v2 base class for a change to the **method contract** (a new required
 method, or a changed `generate_plan` signature), where additive evolution
 genuinely cannot express it.
+
+### 4b. But DO version the contract — `sdk_version` (landed)
+
+Rejecting the forked base class is not the same as rejecting versioning, and
+the first draft of this section conflated the two. What §3 lacked was any way
+to answer *"which generation is this solver?"* — so every retirement decision
+in Phase C was a judgement call rather than a query, and Phase B's "deprecate
+loudly" had no forcing function behind it.
+
+The marker that fixes this is `SDK_VERSION` (`minotaur_subnet/sdk/version.py`),
+and the property that makes it cheap is the vendoring mechanism from §1:
+
+**Absence is the signal.** Solvers that vendored the SDK before the marker
+existed report no `sdk_version` at all, so `sdk_version is None ⇔ pre-marker`.
+Nothing needs retroactive stamping and there is no flag day — detection works
+on the fleet exactly as it stands. Verified against two live solver images:
+both report `None`.
+
+It is read in two independent places, deliberately:
+
+| Where | Mechanism | Answers |
+|---|---|---|
+| Screening stage 2 | in-container probe reads the **vendored** `minotaur_subnet.sdk` | what this submission carries, recorded on the record |
+| Benchmark runtime | vendored `runner.py` injects it into the `METADATA` reply | what the solver being benchmarked right now carries |
+
+Both read the vendored package rather than anything the miner declares. The
+runner **overwrites** any miner-supplied `SolverMetadata.sdk_version`, so the
+field reports what the code IS, not what it claims — a self-report would be
+worthless as a migration signal.
+
+Rollout is safe in both directions, which is what lets it land on a fleet that
+promotes unevenly:
+
+- **new solver → old validator**: `orchestrator.metadata()` rebuilds
+  `SolverMetadata` field-by-field with `r.get(...)`, never
+  `SolverMetadata(**r)`, so an unknown key is ignored rather than raising.
+  There is a regression test pinning this specifically, because "simplifying"
+  it to `**r` would turn every newer solver into a benchmark failure.
+- **old solver → new validator**: key absent, `.get` yields `None`, reads as
+  pre-marker.
+
+**This is detection only.** Nothing accepts, rejects, ranks or scores on the
+value today. Arming a floor — *"submissions must vendor ≥ X"* — is the forcing
+function that makes Phase C converge instead of waiting indefinitely on
+voluntary migration, but it is a separate and deliberate change, and it should
+not be armed until the recorded distribution shows what fraction of the live
+slate it would reject.
+
+### 4c. The constraint a version floor must not break
+
+Versioning the **requirement** is safe. Versioning the **payload** is not,
+while both generations compete.
+
+The relative adoption rule compares champion against challenger *per order
+across one shared corpus*. If a pre-marker solver were sent `pool_states` and
+a 1.x solver were not, the two would be scored on different inputs and the
+comparison would be meaningless. So during any transition every solver keeps
+receiving an identical snapshot; what a version bump changes is only what new
+submissions are **allowed to rely on**.
+
+This still permits Phase A work to land immediately: dropping a field for
+*everyone at once* is a uniform change and keeps the contest coherent. What it
+forbids is the tempting shortcut of handing newer solvers a cleaner snapshot
+early.
+
+### 4d. Naming hazard
+
+`v1` and `v2` are **already taken** in `sdk/__init__.py`, on a different axis:
+`IntentProcessor` is v1 and `IntentSolver` is v2. That axis is about which ABC
+a miner subclasses; `sdk_version` is about which generation of the data
+contract they vendored, and the two move independently. Refer to generations
+by number ("pre-marker", "1.x") and avoid calling this "the v2 SDK" — §4a and
+§4b would otherwise read as contradicting each other.
 
 ---
 

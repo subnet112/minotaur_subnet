@@ -41,6 +41,7 @@ from minotaur_subnet.harness.protocol import (
     dict_to_state,
 )
 from minotaur_subnet.sdk.intent_solver import IntentSolver
+from minotaur_subnet.sdk.version import SDK_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,16 @@ class SolverRunner:
 
     def _handle_metadata(self, params: dict[str, Any]) -> dict[str, Any]:
         meta = self.solver.metadata()
-        return asdict(meta)
+        d = asdict(meta)
+        # Report the SDK generation actually vendored into THIS image, not
+        # whatever the solver declared — this runner is part of the vendored
+        # copy, so the constant it reads is ground truth. Overwrites any
+        # miner-supplied value, which makes the marker unspoofable from
+        # solver code. Solvers that vendored a pre-marker SDK ship a runner
+        # without this line and report no key at all, which is exactly the
+        # signal the validator reads. See sdk/version.py.
+        d["sdk_version"] = SDK_VERSION
+        return d
 
     def _handle_generate_plan(self, params: dict[str, Any]) -> dict[str, Any]:
         intent = dict_to_intent(params["intent"])
