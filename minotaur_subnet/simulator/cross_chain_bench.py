@@ -56,6 +56,51 @@ _LEG_SOURCE = "source"
 _LEG_BRIDGE = "bridge"
 _LEG_DESTINATION = "destination"
 
+# Canonical per-chain addresses of bridgeable assets. A CODE CONSTANT — same
+# discipline as BENCHMARK_BRIDGE_FEE_BPS (anything that feeds scoring and can
+# differ between two nodes eventually will). Mirrors the adapters' static
+# maps (bridge/across.py TOKEN_MAP, CCTP's USDC domains); keep in sync by
+# hand, never read from a live adapter here.
+#
+# WHY (soak finding, 2026-07-28): a solver-shape ``bridge_request`` carries
+# ONE token — the SOURCE chain's address. Destination-fork seeding used it
+# verbatim, so a Base→ETH plan tried to deal Base's WETH (0x4200…06) on the
+# Ethereum fork (no code there), the deal failed, and the destination leg
+# could never spend: correct plans measured null in exactly the direction we
+# want miners to solve. The identity mapping MUST be platform-derived: were
+# it solver-declared, declaring a cheap token would get its balance seeded
+# equal to the bridged amount of the real one — free destination inventory.
+_CANONICAL_TOKEN_BY_CHAIN: dict[str, dict[int, str]] = {
+    "WETH": {
+        1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        8453: "0x4200000000000000000000000000000000000006",
+    },
+    "USDC": {
+        1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    },
+}
+
+
+def map_bridged_token(token: str, src_chain_id: Any, dst_chain_id: Any) -> str:
+    """The destination-chain address of the asset a bridge leg moves.
+
+    Unmapped tokens pass through unchanged — the seeding then fails exactly
+    as it always did for an unknown asset, which is the fail-closed outcome
+    (no credit), never a mis-credit.
+    """
+    try:
+        src, dst = int(src_chain_id), int(dst_chain_id)
+    except (TypeError, ValueError):
+        return token
+    t = str(token or "").lower()
+    if not t:
+        return token
+    for by_chain in _CANONICAL_TOKEN_BY_CHAIN.values():
+        if by_chain.get(src, "").lower() == t:
+            return by_chain.get(dst) or token
+    return token
+
 
 def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
     """Does this plan DECLARE cross-chain intent?
@@ -188,7 +233,13 @@ def _forward_legs(meta: dict[str, Any]) -> list[dict[str, Any]]:
                     "interactions": [],
                     "type": _LEG_BRIDGE,
                     "bridge_amount": br.get("amount"),
-                    "token_out": br.get("token") or "",
+                    # token_out seeds the DESTINATION fork, so it must be the
+                    # asset's address on the destination chain — the request
+                    # carries only the source-chain address.
+                    "token_out": map_bridged_token(
+                        br.get("token") or "",
+                        br.get("src_chain_id"), br.get("dst_chain_id"),
+                    ),
                     "token_in": br.get("token") or "",
                 })
         return out
