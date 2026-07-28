@@ -781,6 +781,74 @@ class TestScorePlanRoutes(unittest.TestCase):
         self.assertEqual(state_arg.control["_intent_function"], "swap")
         self.assertNotIn("should_not_be_used", state_arg.raw_params)
 
+    def test_score_resolves_requested_chain_contract(self):
+        """A Base (8453) dry-run must score against the Base deployment, NOT the
+        app's primary (chain-1) contract. Regression: score_plan resolved the
+        contract chain-lessly (primary = ETH) while chain_id (authoritative for
+        anvil selection) was 8453 — so scoreIntent ran the ETH contract on the
+        Base fork, relayer() returned empty, and every Base strategy scored 0.
+        """
+        from unittest.mock import AsyncMock
+        from minotaur_subnet.shared.types import (
+            ScoreResult, SimulationResult, AppIntentDefinition,
+            DeploymentResult, AppStatus,
+        )
+        from minotaur_subnet.api.server import store as server_store
+
+        app_id = "multichain-score-app"
+        eth_contract = "0x" + "cd" * 20   # primary (chain 1)
+        base_contract = "0x" + "e0" * 20  # chain 8453
+
+        # Save the app + two per-chain deployments directly (the create route
+        # compiles Solidity/JS, which needs the forge+node toolchain; this test
+        # only exercises contract resolution, so bypass the compile).
+        server_store.save_app(AppIntentDefinition(
+            app_id=app_id, name="Multichain Score App", version="1.0.0",
+            intent_type="swap",
+            js_code="module.exports = { score: () => ({score: 0.9}) }",
+        ))
+        server_store.save_deployment(DeploymentResult(
+            app_id=app_id, status=AppStatus.ACTIVE,
+            contract_address=eth_contract, chain_id=1,
+        ))
+        server_store.save_deployment(DeploymentResult(
+            app_id=app_id, status=AppStatus.ACTIVE,
+            contract_address=base_contract, chain_id=8453,
+        ))
+
+        mock_engine = MagicMock()
+        mock_engine._intents = {app_id: "// js"}
+        mock_engine.get_manifest.return_value = None  # intent_order builder → None (clean)
+        mock_engine.score = AsyncMock(return_value=ScoreResult(score=0.9, valid=True))
+        apps_module.set_js_engine(mock_engine)
+
+        mock_sim = MagicMock()  # MagicMock has _get_simulator -> chain_id is threaded
+        mock_sim.simulate = AsyncMock(return_value=SimulationResult(
+            success=True, gas_used=150000, on_chain_score=8500,
+        ))
+        apps_module.set_simulator(mock_sim)
+
+        try:
+            resp = self.client.post(f"/v1/apps/{app_id}/score", json={
+                "chain_id": 8453,
+                "plan": {"interactions": [
+                    {"target": "0x00", "value": "0", "call_data": "0x"}]},
+                "params": {},
+            })
+            self.assertEqual(resp.status_code, 200)
+            mock_sim.simulate.assert_called_once()
+            _, kwargs = mock_sim.simulate.call_args
+            # The Base contract — not the ETH primary — reaches the simulator,
+            # and the anvil is selected for the same chain.
+            self.assertEqual(
+                (kwargs.get("contract_address") or "").lower(),
+                base_contract.lower(),
+            )
+            self.assertEqual(kwargs.get("chain_id"), 8453)
+        finally:
+            apps_module.set_simulator(None)
+            apps_module.set_js_engine(None)
+
     def test_score_with_simulator(self):
         """When simulator is available, simulation_mode should be 'anvil'."""
         from unittest.mock import AsyncMock
