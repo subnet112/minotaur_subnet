@@ -259,6 +259,11 @@ class BenchmarkResult:
     # consumes; NEVER feeds the aggregate `score`. (Formerly ``shadow_score`` — the
     # observe-only shadow scorer it was named after is gone.)
     raw_output: str | None = None
+    # The app's declared quality-metric contract for this row
+    # (shared.quality_metric.QualityMetric), or None for the platform default.
+    # Persisted onto the row as ``metric`` so the adoption decision is
+    # reproducible from the stored artifact alone.
+    quality_metric: Any = None
     # PRE-REFUND metered scoreIntent gas from the benchmark-only GasMeter probe
     # (anvil_simulator.GAS_METER_RUNTIME_HEX; basis "scoreintent_prerefund_v1").
     # Set ONLY for a real (non-mock), successful simulation whose probe
@@ -1871,6 +1876,13 @@ async def _process_scenario(
                     # ScoreResult; absent (pre-cutover scorer) -> stays None. The
                     # relative adoption rule consumes it; never affects br.score.
                     br.raw_output = getattr(score_result, "raw_output", None)
+                    # The app's declared quality-metric contract, carried so the
+                    # adoption rule can normalise/validate this row without
+                    # looking anything up (shared/quality_metric). None for the
+                    # default contract, so today's rows gain zero bytes.
+                    br.quality_metric = getattr(
+                        score_result, "quality_metric", None,
+                    )
 
                     # Compute composite score for auto-triggered intents
                     if is_auto and br.trigger_decision is not None:
