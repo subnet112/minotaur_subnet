@@ -85,7 +85,7 @@ def verify_required_contracts(*, timeout_s: float = 10.0) -> list[str]:
         rpc = _resolve_rpc(check.chain_id)
         if not rpc:
             _cspec = registry.spec(check.chain_id)
-            fallback_names = _cspec.check_rpc_envs if _cspec is not None else ()
+            fallback_names = _cspec.archive_envs if _cspec is not None else ()
             errors.append(
                 f"{check.label}: {check.env_var} is set but no RPC is configured for "
                 f"chain {check.chain_id} (set one of: {', '.join(fallback_names) or 'n/a'})"

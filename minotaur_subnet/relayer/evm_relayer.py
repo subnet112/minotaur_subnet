@@ -819,6 +819,30 @@ class EvmRelayer(RelayerBase):
         )
         return address, tx_hash_hex
 
+    def _broadcast_and_confirm(
+        self, w3: Any, signed_tx: Any, chain_id: int, wallet: str,
+        *, desc: str, require_success: bool = True,
+    ) -> str:
+        """Broadcast a pre-signed tx, wait for the receipt, and keep the nonce
+        cache honest.
+
+        ``get_and_increment`` already advanced the local nonce for this
+        (chain, wallet). On ANY failure — dropped send, RPC timeout, or revert —
+        INVALIDATE it so the next tx re-reads the on-chain nonce instead of
+        sending a gapped tx that wedges every later send from this wallet.
+        Mirrors the submit_plan / deploy_contract guards; the registry / escrow /
+        admin calls below previously lacked it. Returns the tx hash hex string.
+        """
+        try:
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if require_success and receipt["status"] != 1:
+                raise RuntimeError(f"{desc} reverted: tx={tx_hash.hex()}")
+            return tx_hash.hex()
+        except Exception:
+            self._nonce_manager.invalidate(chain_id, wallet)
+            raise
+
     async def register_intent(
         self,
         contract_address: str,
@@ -866,10 +890,10 @@ class EvmRelayer(RelayerBase):
         })
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-
-        return tx_hash.hex()
+        return self._broadcast_and_confirm(
+            w3, signed, chain_id, config.relayer_wallet,
+            desc="registerIntent", require_success=False,
+        )
 
     async def sync_validators(
         self,
@@ -906,10 +930,10 @@ class EvmRelayer(RelayerBase):
         })
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-
-        return tx_hash.hex()
+        return self._broadcast_and_confirm(
+            w3, signed, chain_id, config.relayer_wallet,
+            desc="updateValidators", require_success=False,
+        )
 
     async def get_tx_status(self, tx_hash: str, chain_id: int) -> dict:
         """Check status of a submitted transaction."""
@@ -978,14 +1002,12 @@ class EvmRelayer(RelayerBase):
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            raise RuntimeError(f"escrowDeposit reverted: tx={tx_hash.hex()}")
-
+        tx_hash = self._broadcast_and_confirm(
+            w3, signed, chain_id, wallet, desc="escrowDeposit",
+        )
         logger.info("escrowDeposit OK: order=%s leg=%d amount=%d tx=%s",
-                     order_id[:16], leg_index, amount, tx_hash.hex()[:16])
-        return tx_hash.hex()
+                     order_id[:16], leg_index, amount, tx_hash[:16])
+        return tx_hash
 
     async def call_contract_function(
         self,
@@ -1032,13 +1054,11 @@ class EvmRelayer(RelayerBase):
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            raise RuntimeError(f"{signature} reverted: tx={tx_hash.hex()}")
-
-        logger.info("%s OK: to=%s tx=%s", signature, contract_address[:10], tx_hash.hex()[:16])
-        return tx_hash.hex()
+        tx_hash = self._broadcast_and_confirm(
+            w3, signed, chain_id, wallet, desc=signature,
+        )
+        logger.info("%s OK: to=%s tx=%s", signature, contract_address[:10], tx_hash[:16])
+        return tx_hash
 
     async def call_escrow_release(
         self,
@@ -1089,14 +1109,12 @@ class EvmRelayer(RelayerBase):
         }
 
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            raise RuntimeError(f"escrowRelease reverted: tx={tx_hash.hex()}")
-
+        tx_hash = self._broadcast_and_confirm(
+            w3, signed, chain_id, wallet, desc="escrowRelease",
+        )
         logger.info("escrowRelease OK: order=%s leg=%d tx=%s",
-                     order_id[:16], leg_index, tx_hash.hex()[:16])
-        return tx_hash.hex()
+                     order_id[:16], leg_index, tx_hash[:16])
+        return tx_hash
 
     def _resolve_wallet(self, chain_id: int) -> str:
         """Get the relayer wallet address for a chain."""

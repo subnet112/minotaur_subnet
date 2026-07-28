@@ -20,18 +20,17 @@ from minotaur_subnet.shared.types import (
     TriggerType,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot
-from minotaur_subnet.v3.contexts import SwapIntentContext
+from minotaur_subnet.v3.contexts import BaseIntentContext
 from minotaur_subnet.harness.snapshot import (
     SnapshotMeta,
     build_synthetic_snapshot,
-    build_synthetic_intents,
     save_snapshot,
     load_snapshot,
     load_chain_snapshot,
     _dict_to_state,
     _state_to_dict,
     MONITORED_TOKENS,
-    UNISWAP_V3_CONFIG,
+
 )
 from minotaur_subnet.harness.screening import (
     run_stage_1,
@@ -55,12 +54,10 @@ class TestSnapshotSerialization(unittest.TestCase):
             chain_id=1,
             block_number=18500000,
             timestamp=1700000000,
-            prices={"ETH/USD": 1850.0, "USDC/USD": 1.0},
-            pool_states={
+            app_data={"pools": {
                 "0xpool1": {"token0": "0xa", "token1": "0xb", "fee": 3000},
-            },
+            }},
             balances={"0xa": "1000000"},
-            dex_config={"router": "0xrouter"},
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -75,10 +72,9 @@ class TestSnapshotSerialization(unittest.TestCase):
             ls = loaded_snapshots[1]
             self.assertEqual(ls.chain_id, 1)
             self.assertEqual(ls.block_number, 18500000)
-            self.assertEqual(ls.prices["ETH/USD"], 1850.0)
-            self.assertIn("0xpool1", ls.pool_states)
+            self.assertIn("0xpool1", ls.app_data["pools"])
             self.assertEqual(ls.balances["0xa"], "1000000")
-            self.assertEqual(ls.dex_config["router"], "0xrouter")
+
             self.assertEqual(loaded_intents, [])
 
     def test_save_and_load_with_intents(self):
@@ -145,7 +141,7 @@ class TestSnapshotSerialization(unittest.TestCase):
         meta = SnapshotMeta(epoch=1, timestamp=1700000000, chains=[1])
         snapshot = MarketSnapshot(
             chain_id=1, block_number=18500000, timestamp=1700000000,
-            prices={"ETH/USD": 1850.0},
+            app_data={"note": "carried through untouched"},
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,7 +149,7 @@ class TestSnapshotSerialization(unittest.TestCase):
 
             loaded = load_chain_snapshot(tmpdir, chain_id=1)
             self.assertEqual(loaded.chain_id, 1)
-            self.assertEqual(loaded.prices["ETH/USD"], 1850.0)
+            self.assertEqual(loaded.app_data["note"], "carried through untouched")
 
     def test_load_chain_snapshot_missing(self):
         """load_chain_snapshot raises for missing chain."""
@@ -180,116 +176,29 @@ class TestSnapshotSerialization(unittest.TestCase):
             self.assertIn("chain_1.json", files)
             self.assertIn("chain_8453.json", files)
             self.assertIn("intents.json", files)
-            self.assertIn("prices.json", files)
 
 
 class TestSyntheticSnapshot(unittest.TestCase):
     """Test synthetic snapshot generation for screening."""
 
-    def test_synthetic_snapshot_has_prices(self):
-        """Synthetic snapshot includes price feeds."""
+    def test_synthetic_snapshot_carries_block_context_only(self):
+        """The synthetic snapshot models no protocol.
+
+        It used to synthesise Uniswap V3 pool states, a USD price table and a
+        dex_config of router addresses — for fields nothing read. An app that
+        needs app-specific state populates app_data.
+        """
         snap = build_synthetic_snapshot(chain_id=1)
-        self.assertIn("ETH/USD", snap.prices)
-        self.assertIn("USDC/USD", snap.prices)
-        self.assertEqual(snap.prices["ETH/USD"], 1850.0)
-
-    def test_synthetic_snapshot_has_pools(self):
-        """Synthetic snapshot includes pool states."""
-        snap = build_synthetic_snapshot(chain_id=1)
-        self.assertGreater(len(snap.pool_states), 0)
-
-        # Check pool structure
-        pool = list(snap.pool_states.values())[0]
-        self.assertIn("token0", pool)
-        self.assertIn("token1", pool)
-        self.assertIn("fee", pool)
-        self.assertIn("sqrtPriceX96", pool)
-        self.assertIn("liquidity", pool)
-
-    def test_synthetic_snapshot_has_dex_config(self):
-        """Synthetic snapshot includes DEX configuration."""
-        snap = build_synthetic_snapshot(chain_id=1)
-        self.assertIn("router", snap.dex_config)
-
-    def test_synthetic_intents_count(self):
-        """build_synthetic_intents returns 3 intents."""
-        intents = build_synthetic_intents()
-        self.assertEqual(len(intents), 3)
-
-    def test_synthetic_intents_types(self):
-        """Synthetic intents cover user-triggered and auto-triggered."""
-        intents = build_synthetic_intents()
-
-        types = [i[0].config.trigger_type for i in intents]
-        self.assertIn(TriggerType.USER_TRIGGERED, types)
-        self.assertIn(TriggerType.AUTO_TRIGGERED, types)
-
-    def test_synthetic_intents_have_valid_state(self):
-        """Synthetic intents have state with required swap params."""
-        intents = build_synthetic_intents()
-
-        for intent, state, snapshot in intents:
-            self.assertTrue(state.contract_address.startswith("0x"))
-            self.assertEqual(len(state.contract_address), 42)
-            self.assertGreater(state.nonce, 0)
-            self.assertIsInstance(snapshot, MarketSnapshot)
-
-    def test_synthetic_intent_swap_params(self):
-        """First synthetic intent (swap) has proper input/output tokens."""
-        intents = build_synthetic_intents()
-        intent, state, snapshot = intents[0]
-
-        self.assertEqual(intent.intent_type, "swap")
-        self.assertIn("input_token", state.raw_params)
-        self.assertIn("output_token", state.raw_params)
-        self.assertIn("input_amount", state.raw_params)
-        self.assertTrue(state.raw_params["input_token"].startswith("0x"))
-
-    def test_snapshot_state_roundtrip_preserves_typed_context_metadata(self):
-        """Snapshot helpers preserve typed context, policy tier, and context version."""
-        state = IntentState(
-            contract_address="0x" + "11" * 20,
-            chain_id=1,
-            nonce=7,
-            owner="0x" + "22" * 20,
-            raw_params={
-                "input_token": "0x" + "aa" * 20,
-                "output_token": "0x" + "bb" * 20,
-                "input_amount": "1000",
-                "min_output_amount": "900",
-            },
-            context_version="v3",
-            policy_tier=PolicyTier.STRICT,
-        )
-        state.typed_context = SwapIntentContext(
-            app_id="dex-app",
-            intent_function="swap",
-            chain_id=1,
-            owner=state.owner,
-            contract_address=state.contract_address,
-            nonce=state.nonce,
-            raw_params=dict(state.raw_params),
-            input_token="0x" + "aa" * 20,
-            output_token="0x" + "bb" * 20,
-            input_amount=1000,
-            min_output_amount=900,
-            receiver=state.contract_address,
-            fee_tier=3000,
-        )
-
-        serialized = _state_to_dict(state)
-        reconstructed = _dict_to_state(serialized)
-
-        self.assertEqual(reconstructed.context_version, "v3")
-        self.assertEqual(reconstructed.policy_tier, PolicyTier.STRICT)
-        self.assertIsInstance(reconstructed.typed_context, SwapIntentContext)
-        self.assertEqual(reconstructed.typed_context.receiver, state.contract_address)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#                     SCREENING STAGE 1 TESTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
+        self.assertEqual(snap.chain_id, 1)
+        self.assertGreater(snap.block_number, 0)
+        self.assertEqual(snap.app_data, {})
+        # prices survives as a GENERIC concept (any app may have a price
+        # feed); the platform simply no longer derives it from Uniswap.
+        self.assertEqual(snap.prices, {})
+        for gone in ("pool_states", "dex_config"):
+            self.assertFalse(
+                hasattr(snap, gone), f"MarketSnapshot still carries {gone}",
+            )
 
 def _make_valid_repo(tmpdir: str) -> str:
     """Create a minimal valid solver repo in tmpdir."""
@@ -305,6 +214,39 @@ def _make_valid_repo(tmpdir: str) -> str:
     )
     (repo / "README.md").write_text("# My Solver\n")
     return str(repo)
+
+
+    def test_snapshot_state_roundtrip_preserves_typed_context(self):
+        """A typed context survives snapshot state serialisation.
+
+        Restores coverage dropped by the MarketSnapshot cleanup (#1161), now
+        written against the APP-AGNOSTIC context: app params ride in
+        raw_params rather than in swap-shaped attributes.
+        """
+        state = IntentState(
+            contract_address="0x" + "ab" * 20,
+            chain_id=1,
+            nonce=3,
+            owner="0x" + "cd" * 20,
+            raw_params={"input_token": "0xA", "input_amount": "1000"},
+        )
+        state.typed_context = BaseIntentContext(
+            app_id="app-1",
+            intent_function="swap",
+            chain_id=1,
+            owner=state.owner,
+            contract_address=state.contract_address,
+            nonce=3,
+            raw_params={"input_token": "0xA", "input_amount": "1000"},
+        )
+
+        reconstructed = _dict_to_state(_state_to_dict(state))
+
+        self.assertIsInstance(reconstructed.typed_context, BaseIntentContext)
+        self.assertEqual(reconstructed.typed_context.intent_function, "swap")
+        self.assertEqual(
+            reconstructed.typed_context.raw_params["input_amount"], "1000",
+        )
 
 
 class TestScreeningStage1(unittest.TestCase):

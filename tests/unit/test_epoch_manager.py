@@ -2114,7 +2114,11 @@ class TestBenchmarkSnapshotWiring:
         # Synthetic snapshot has block_number=18500000
         assert snapshot.block_number == 18500000
         assert snapshot.chain_id == 1
-        assert "ETH/USD" in snapshot.prices
+        # The synthetic snapshot no longer synthesises a price table: it was
+        # derived from a hardcoded Uniswap USD table, which is app-specific.
+        # An app that needs prices populates them via app_data / its own
+        # snapshot contribution.
+        assert snapshot.prices == {}
 
     @pytest.mark.asyncio
     async def test_uses_builder_when_available(self):
@@ -2128,8 +2132,7 @@ class TestBenchmarkSnapshotWiring:
             block_number=19000000,
             timestamp=1700100000,
             prices={"ETH/USD": 2000.0},
-            dex_config={},
-        )
+                    )
         mock_builder.build_chain_snapshot = AsyncMock(return_value=live_snapshot)
 
         store = SubmissionStore()
@@ -2168,7 +2171,11 @@ class TestBenchmarkSnapshotWiring:
 
         # Should fall back to synthetic
         assert snapshot.block_number == 18500000
-        assert "ETH/USD" in snapshot.prices
+        # The synthetic snapshot no longer synthesises a price table: it was
+        # derived from a hardcoded Uniswap USD table, which is app-specific.
+        # An app that needs prices populates them via app_data / its own
+        # snapshot contribution.
+        assert snapshot.prices == {}
 
     def test_set_epoch_block(self):
         """set_epoch_block updates the worker's block number."""

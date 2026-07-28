@@ -1851,6 +1851,16 @@ async def _process_scenario(
                         ) = await _measure_destination_delivery(
                             simulator, plan, state, token_balances, fork_block,
                         )
+                        # Hand the measurement to the app's scorer: the SAME
+                        # values persisted on the row ride the sim into
+                        # context.simulation (engine/context.py), so the app
+                        # JS can price destination delivery itself. One
+                        # computation feeds both the stored artifact and the
+                        # scorer — they can never disagree.
+                        sim.destination_delivered = br.destination_delivered
+                        sim.destination_amount_source = (
+                            br.destination_amount_source
+                        )
                     score_result = await score_fn(
                         intent.app_id, plan, sim, state,
                     )
