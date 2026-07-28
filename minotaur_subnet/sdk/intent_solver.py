@@ -155,6 +155,13 @@ class SolverMetadata:
         supported_chains: Chain IDs this solver supports.
         supported_intent_types: Intent types this solver handles.
             Must contain at least one type.
+        sdk_version: Which generation of the SDK contract this solver
+            vendored. Do NOT set this yourself — the harness runner
+            overwrites whatever you put here with the version of the SDK
+            actually vendored into the image, so it reports what the code
+            IS rather than what it claims. ``None`` means the solver
+            vendored an SDK from before the marker existed. See
+            ``sdk/version.py``.
     """
 
     name: str
@@ -163,6 +170,8 @@ class SolverMetadata:
     description: str = ""
     supported_chains: list[int] = field(default_factory=list)
     supported_intent_types: list[str] = field(default_factory=lambda: ["swap"])
+    # Runner-injected, not miner-declared — see the docstring above.
+    sdk_version: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

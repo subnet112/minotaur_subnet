@@ -346,6 +346,13 @@ class Submission:
     provenance: dict[str, Any] | None = None
     solver_path: str | None = None  # Local path to solver .py (source submissions)
     solver_name: str | None = None
+    # SDK contract generation this submission vendored, read out of the built
+    # image in screening stage 2. None ⇔ the submission vendored a pre-marker
+    # SDK — absence is the signal, and records that predate the marker are
+    # correctly indistinguishable from solvers that genuinely lack it.
+    # OBSERVE-ONLY: nothing accepts, rejects, ranks or scores on this value.
+    # See sdk/version.py.
+    sdk_version: str | None = None
     solver_version: str | None = None
 
     # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
@@ -442,6 +449,7 @@ class Submission:
             "solver_path": self.solver_path,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "sdk_version": self.sdk_version,
             "is_copycat": self.is_copycat,
             "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
@@ -472,6 +480,7 @@ class Submission:
             "provenance": self.provenance,
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
+            "sdk_version": self.sdk_version,
             "display_name": self.display_name,
             "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
@@ -870,6 +879,7 @@ class SubmissionStore:
             solver_path=record.get("solver_path"),
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
+            sdk_version=record.get("sdk_version"),
             is_copycat=bool(record.get("is_copycat", False)),
             coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
@@ -1418,6 +1428,7 @@ class SubmissionStore:
         submission_id: str,
         name: str | None = None,
         version: str | None = None,
+        sdk_version: str | None = None,
     ) -> None:
         """Set solver metadata from screening and apply first-to-coin labeling.
 
@@ -1436,6 +1447,12 @@ class SubmissionStore:
             raise KeyError(f"Submission not found: {submission_id}")
         sub.solver_name = name
         sub.solver_version = version
+        # Unlike name/version — which are self-declared free text — this comes
+        # from the vendored package inside the built image, so it is not the
+        # miner's claim about themselves. None here means pre-marker, and is
+        # written through as None rather than left stale so a re-screen of a
+        # downgraded resubmit reports the truth.
+        sub.sdk_version = sdk_version
         # Recompute copycat state from scratch each call, so a re-screen with a
         # changed name re-evaluates cleanly rather than sticking to a stale flag.
         sub.is_copycat = False
@@ -2228,6 +2245,7 @@ class SubmissionStore:
                     solver_path=d.get("solver_path"),
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
+                    sdk_version=d.get("sdk_version"),
                     is_copycat=bool(d.get("is_copycat", False)),
                     coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
