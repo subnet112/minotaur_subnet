@@ -287,3 +287,110 @@ def _intent_field_default(
     if field is None or field.default is None:
         return fallback
     return field.default
+
+
+# ── Spend-side inference (simulator token seeding) ──────────────────────────
+
+
+def spend_params(
+    manifest: IntentManifest | dict[str, Any] | None,
+    intent_function: str,
+) -> tuple[str | None, str | None]:
+    """Infer ``(token_param, amount_param)`` — the app's spend side.
+
+    The simulator must pre-fund whatever an order spends, or the intent
+    reverts in safeTransferFrom and scores 0. Which params those are is the
+    APP's business, and the manifest already says: the spend side is a
+    user-supplied address paired with a user-supplied amount. ``source=quote``
+    (a slippage guard) and ``source=system`` (receiver, permit fields) are
+    excluded by construction, as are ``in_signature=False`` computed params.
+
+    Returns ``(None, None)`` when the app declares no UNAMBIGUOUS pair — an
+    app with several user-supplied amounts has to say which one it spends,
+    and guessing there is exactly the failure this replaces. Callers must
+    treat that as "cannot seed" and say so out loud; a silently unseeded order
+    scores 0 and looks like a bad solver rather than a manifest gap.
+    """
+    fns: list[Any]
+    if isinstance(manifest, dict):
+        fns = manifest.get("intent_functions", []) or []
+    elif manifest is not None:
+        fns = list(getattr(manifest, "intents", []) or [])
+    else:
+        return None, None
+
+    for fn in fns:
+        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+        if name != intent_function:
+            continue
+        raw = fn.get("params") if isinstance(fn, dict) else getattr(fn, "params", None)
+        if isinstance(raw, dict):
+            items = list(raw.items())
+        else:
+            items = [
+                (
+                    p.get("name") if isinstance(p, dict) else getattr(p, "name", None),
+                    p,
+                )
+                for p in (raw or [])
+            ]
+
+        addrs: list[str] = []
+        amounts: list[str] = []
+        for pname, spec in items:
+            if not pname:
+                continue
+            get = (
+                spec.get if isinstance(spec, dict)
+                else lambda k, d=None: getattr(spec, k, d)
+            )
+            if str(get("source", "user")).lower() != "user":
+                continue
+            if get("in_signature") is False:
+                continue
+            vt = str(get("type", None) or get("value_type", None) or "").lower()
+            if vt.startswith("address"):
+                addrs.append(pname)
+            elif vt.startswith(("uint", "int")):
+                amounts.append(pname)
+
+        if len(amounts) != 1 or not addrs:
+            return None, None
+        return addrs[0], amounts[0]
+    return None, None
+
+
+def spend_token_balances(
+    manifest: IntentManifest | dict[str, Any] | None,
+    intent_function: str,
+    params: dict[str, Any],
+    *,
+    default_chain_id: int = 0,
+) -> tuple[dict[str, int] | None, str]:
+    """``({token: amount}, "ok")`` for the simulator, or ``(None, reason)``.
+
+    The reason is for the caller to LOG — see spend_params on why a silent
+    decline is the wrong failure mode.
+    """
+    tok_p, amt_p = spend_params(manifest, intent_function)
+    if not tok_p or not amt_p:
+        return None, (
+            f"app declares no unambiguous spend pair for intent "
+            f"'{intent_function}'"
+        )
+    token = params.get(tok_p)
+    amount = params.get(amt_p)
+    if not token or amount is None:
+        return None, f"order omits {tok_p}/{amt_p}"
+    token = str(token)
+    if token.startswith("eip155:"):
+        from minotaur_subnet.shared.interop_address import parse_address
+
+        try:
+            token = parse_address(token, default_chain_id=default_chain_id).address
+        except ValueError:
+            return None, f"unparseable interop address in {tok_p}"
+    try:
+        return {token: int(amount)}, "ok"
+    except (TypeError, ValueError):
+        return None, f"non-integer {amt_p}"
