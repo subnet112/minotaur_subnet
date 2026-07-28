@@ -25,33 +25,38 @@ Key design points:
 
 Example usage::
 
-    class MySolver(IntentSolver):
+    class MySwapSolver(IntentSolver):
         def initialize(self, config):
             self.rpc_urls = config.get("rpc_urls", {})
+            self.routing_table = build_routing_table(config)
 
         def generate_plan(self, intent, state, snapshot=None):
-            params = state.raw_params_view()
+            if getattr(state, "typed_context", None) is not None:
+                params = state.typed_context.raw_params
+            else:
+                params = state.raw_params_view()
 
-            # Read whatever live state THIS app's intents need. The platform
-            # does not model it for you — it hands you the chain and the
-            # order, and your app's manifest says what the params mean.
-            rpc = self.rpc_urls.get(state.chain_id)
-            if not rpc:
-                raise ValueError("No RPC configured for this chain")
-
+            # Prefer RPC for live data, fall back to snapshot
+            if self.rpc_urls.get(state.chain_id):
+                pools = self.query_pools_via_rpc(state.chain_id)
+            elif snapshot and snapshot.pool_states:
+                pools = snapshot.pool_states
+            else:
+                raise ValueError("No RPC or snapshot available")
+            route = self.routing_table.find_best(pools, params)
             return ExecutionPlan(
                 intent_id=intent.app_id,
-                interactions=self.build_interactions(rpc, params),
+                interactions=route.to_interactions(),
                 deadline=int(time.time()) + 300,
                 nonce=state.nonce,
             )
 
         def metadata(self):
             return SolverMetadata(
-                name="my-solver",
+                name="my-swap-solver",
                 version="1.0.0",
                 author="5Grwva...",
-                supported_intent_types=["<your app's intent>"],
+                supported_intent_types=["swap"],
             )
 
     # Required: tells the benchmarking harness which class to instantiate
@@ -83,35 +88,27 @@ from minotaur_subnet.shared.types import (
 
 @dataclass
 class MarketSnapshot:
-    """Point-in-time chain state for plan generation.
+    """Point-in-time market data for plan generation.
 
     Used primarily for benchmarking and as a fallback when RPC access is
     unavailable. Production solvers should prefer querying on-chain state
     directly via RPC URLs provided in ``initialize(config["rpc_urls"])``.
 
-    APP-AGNOSTIC by construction. This used to carry ``prices``,
-    ``pool_states`` ("reserves for V2, liquidity/sqrtPriceX96/tick for V3")
-    and ``dex_config`` ("DEX router addresses") — i.e. the platform defined
-    "market data" as Uniswap state, because the first app was a DEX. Nothing
-    in the platform ever read those fields back, no reference solver used
-    them, and populating them cost live pool RPC reads on every snapshot. An
-    app whose intents aren't swaps got a snapshot describing pools it does not
-    care about and no place for the state it does.
-
-    Anything app-specific now goes in ``app_data``, populated by that app's
-    own snapshot contribution — the same "app declares, platform carries"
-    shape as the quality metric.
-
     Attributes:
         chain_id: Target chain ID (e.g., 1 for Ethereum, 8453 for Base).
         block_number: The block at which this snapshot was taken.
         timestamp: Unix timestamp of the snapshot block.
+        prices: Token price feeds keyed by pair
+            (e.g., {"ETH/USD": 1850.0, "USDC/USD": 1.0}).
+        pool_states: DEX pool states keyed by pool address. Each entry
+            contains protocol-specific data (reserves for V2, liquidity/
+            sqrtPriceX96/tick for V3).
         balances: Token balances for the intent contract address, keyed
             by token address (values as decimal strings in smallest unit).
+        dex_config: DEX router addresses and protocol configuration
+            (e.g., router addresses, factory addresses, fee tiers).
         raw_state: Additional contract storage data. Keyed by contract
             address, values are protocol-specific.
-        app_data: App-namespaced extras. The platform carries this through
-            untouched and never interprets it.
     """
 
     chain_id: int
@@ -119,9 +116,10 @@ class MarketSnapshot:
     timestamp: int
 
     prices: dict[str, float] = field(default_factory=dict)
+    pool_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     balances: dict[str, str] = field(default_factory=dict)
+    dex_config: dict[str, Any] = field(default_factory=dict)
     raw_state: dict[str, Any] = field(default_factory=dict)
-    app_data: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def empty(cls, chain_id: int = 31337) -> "MarketSnapshot":

@@ -67,74 +67,10 @@ _QUOTE_IDENTITY_PARAMS = {
 }
 
 # The full set stripped from a quote's params at capture time (identity + PII +
-# volatile). Retained as a BACKSTOP under the manifest allowlist below — belt
-# and braces, and the fallback when an app declares no params at all.
+# volatile). quote_case_id already ignores _VOLATILE_PARAMS internally; capture
+# strips the whole set so the STORED (and publicly served) params carry only the
+# trade descriptor.
 QUOTE_PARAM_STRIP_FIELDS = _PII_FIELDS | _VOLATILE_PARAMS | _QUOTE_IDENTITY_PARAMS
-
-
-def quote_case_params(
-    manifest: Any,
-    intent_function: str,
-    params: dict[str, Any] | None,
-) -> tuple[dict[str, Any] | None, str]:
-    """The params to STORE for a quote case — an app-declared ALLOWLIST.
-
-    A quote case is served publicly on /v1/quotes and replicated fleet-wide,
-    so only the trade descriptor may be retained. That used to be enforced by
-    a DENYLIST (``_QUOTE_IDENTITY_PARAMS``) whose own comment flagged the
-    hole:
-
-        if a non-swap app is ever added whose trade legitimately needs an
-        address param, revisit this as an allowlist — a denylist can miss a
-        novel identity key
-
-    The manifest already closes it: keep exactly the params the app declares
-    ``source=user`` (its trade descriptor) and drop everything else —
-    ``source=quote`` derivations, ``source=system`` platform fields, and
-    anything undeclared. A novel identity key (``delegate``, ``operator``)
-    can no longer reach a public endpoint by omission.
-
-    FAILS CLOSED. Returns ``(None, reason)`` when the app declares no params
-    for this intent, or when the request carries params it does not declare.
-    Storing the declared subset in that case would silently discard the trade
-    descriptor — measured against the live corpus, three quotes using an
-    undeclared ``token_in``/``token_out``/``amount_in`` naming would have
-    collapsed to a single EMPTY-param case. A quote we cannot describe is not
-    a quote we should store.
-    """
-    declared: dict[str, str] = {}
-    fns = (manifest or {}).get("intent_functions", []) or [] if isinstance(manifest, dict) else []
-    for fn in fns:
-        if fn.get("name") != intent_function:
-            continue
-        raw = fn.get("params")
-        items = (
-            list(raw.items()) if isinstance(raw, dict)
-            else [(p.get("name"), p) for p in (raw or []) if isinstance(p, dict)]
-        )
-        declared = {
-            n: str(spec.get("source", "user")).lower()
-            for n, spec in items
-            if n and isinstance(spec, dict)
-        }
-        break
-    if not declared:
-        return None, f"app declares no params for intent '{intent_function}'"
-
-    supplied = dict(params or {})
-    # Fields the platform itself appends are never the caller's trade
-    # descriptor; ignore them rather than treating them as undeclared.
-    unknown = [
-        k for k in supplied
-        if k not in declared and k not in QUOTE_PARAM_STRIP_FIELDS
-    ]
-    if unknown:
-        return None, f"request carries undeclared params: {sorted(unknown)}"
-
-    kept = {k: v for k, v in supplied.items() if declared.get(k) == "user"}
-    if not kept:
-        return None, "no user-supplied params to describe the trade"
-    return kept, "ok"
 
 
 # Stage-2 SHARED corpus size per chain — THE SINGLE SOURCE OF TRUTH, consensus-

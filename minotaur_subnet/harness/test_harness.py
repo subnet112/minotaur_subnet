@@ -49,7 +49,7 @@ from minotaur_subnet.harness.protocol import (
     dict_to_snapshot,
 )
 from minotaur_subnet.harness.runner import SolverRunner, load_solver
-from minotaur_subnet.v3.contexts import BaseIntentContext
+from minotaur_subnet.v3.contexts import SwapIntentContext
 
 
 # ── Test fixtures ────────────────────────────────────────────────────────
@@ -108,7 +108,9 @@ def make_snapshot() -> MarketSnapshot:
         block_number=18500000,
         timestamp=1700000000,
         prices={"ETH/USD": 1850.0},
-                    )
+        pool_states={},
+        dex_config={},
+    )
 
 
 class StubSolver(IntentSolver):
@@ -272,22 +274,26 @@ class TestProtocolSerialization(unittest.TestCase):
         """dict_to_state restores typed context and v3 metadata when present."""
         original = make_state()
         original.context_version = "v3"
-        original.typed_context = BaseIntentContext(
+        original.typed_context = SwapIntentContext(
             app_id="test-001",
             intent_function="swap",
             chain_id=1,
             owner=original.owner,
             contract_address=original.contract_address,
             nonce=original.nonce,
-            raw_params={**dict(original.raw_params), "input_token": USDC, "output_token": WETH, "input_amount": 1_000_000_000, "min_output_amount": 500_000_000, "receiver": original.contract_address, "fee_tier": 3000},
+            raw_params=dict(original.raw_params),
+            input_token=USDC,
+            output_token=WETH,
+            input_amount=1_000_000_000,
+            min_output_amount=500_000_000,
+            receiver=original.contract_address,
+            fee_tier=3000,
         )
         d = asdict(original)
         reconstructed = dict_to_state(d)
         self.assertEqual(reconstructed.context_version, "v3")
-        self.assertIsInstance(reconstructed.typed_context, BaseIntentContext)
-        self.assertEqual(
-            reconstructed.typed_context.raw_params["input_amount"], 1_000_000_000,
-        )
+        self.assertIsInstance(reconstructed.typed_context, SwapIntentContext)
+        self.assertEqual(reconstructed.typed_context.input_amount, 1_000_000_000)
 
     def test_dict_to_snapshot(self):
         """dict_to_snapshot reconstructs MarketSnapshot."""

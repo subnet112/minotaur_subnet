@@ -5,42 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from minotaur_subnet.v3.manifest import spend_token_balances
 from minotaur_subnet.shared.types import ExecutionPlan, SimulationResult
 from minotaur_subnet.shared.simulation import build_mock_simulation
 from minotaur_subnet.orderbook.orderbook import Order
 
 logger = logging.getLogger(__name__)
-
-
-def _funds_from_contract(manifest: Any, intent_function: str) -> bool:
-    """Does this app declare that the intent is funded ON THE CONTRACT?
-
-    Deposit-model apps (their scoreIntent pulls via _fundFromContract) set
-    ``funds_from_contract: true`` on the intent in their manifest. This used
-    to be inferred from an "amountPerBuy" param existing — one DCA app's
-    param name standing in for a platform concept. Absent declaration means
-    the executor is funded, which is the common case.
-    """
-    if manifest is None:
-        return False
-    fns = (
-        manifest.get("intent_functions", []) or []
-        if isinstance(manifest, dict)
-        else list(getattr(manifest, "intents", []) or [])
-    )
-    for fn in fns:
-        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-        if name != intent_function:
-            continue
-        meta = (
-            fn.get("metadata") if isinstance(fn, dict)
-            else getattr(fn, "metadata", None)
-        ) or {}
-        if isinstance(fn, dict) and fn.get("funds_from_contract") is not None:
-            return bool(fn["funds_from_contract"])
-        return bool(meta.get("funds_from_contract"))
-    return False
 
 
 class SimulationRunner:
@@ -72,7 +41,6 @@ class SimulationRunner:
         deployed_contract: str,
         fork_block: int | None = None,
         pin_only: bool = False,
-        manifest: Any = None,
     ) -> SimulationResult:
         """Simulate an execution plan.
 
@@ -86,41 +54,40 @@ class SimulationRunner:
         head-refork behaviour, so scoring / order-processing are unchanged.
         """
         if self.simulator is not None:
-            # Seed the simulator with whatever this order SPENDS, read from
-            # the app's own manifest (v3.manifest.spend_token_balances).
-            #
-            # This used to guess from a fixed alias list —
-            # input_token/tokenIn/token_in/asset paired with
-            # input_amount/amountPerBuy/amount_per_buy/amount — i.e. the
-            # platform holding a table of app archetypes (swap / DCA / yield)
-            # and pattern-matching orders against it. An app outside the table
-            # was simply not seeded.
-            token_balances, reason = spend_token_balances(
-                manifest, order.intent_function, order.params,
-                default_chain_id=order.chain_id,
+            # Seed the simulator with input tokens from order params.
+            # For swap-style: tokens go to the executor (user/proxy).
+            # For deposit-style (DCA): tokens go to the contract address
+            # because scoreIntent uses _fundFromContract.
+            token_balances = None
+            input_token = (
+                order.params.get("input_token")
+                or order.params.get("tokenIn")
+                or order.params.get("token_in")
+                or order.params.get("asset")
             )
-            if token_balances is None and order.params:
-                # LOUD on purpose. An unseeded order reverts in
-                # safeTransferFrom and scores 0, which reads as a bad solver
-                # rather than a manifest gap. Measured against the live corpus
-                # (tools/seeding_replay.py) this fires for undeclared intent
-                # functions only — 1 of 2367 quotes, itself already broken.
-                logger.warning(
-                    "Not seeding order %s (app %s, intent %r): %s — its "
-                    "simulation will revert if the intent spends tokens",
-                    order.order_id, order.app_id, order.intent_function, reason,
-                )
+            # Strip CAIP-10 prefix if present (e.g. eip155:8453:0x833589...)
+            if input_token and input_token.startswith("eip155:"):
+                try:
+                    from minotaur_subnet.shared.interop_address import parse_address
+                    ia = parse_address(input_token, default_chain_id=order.chain_id)
+                    input_token = ia.address
+                except ValueError:
+                    pass
+            input_amount = (
+                order.params.get("input_amount")
+                or order.params.get("amountPerBuy")
+                or order.params.get("amount_per_buy")
+                or order.params.get("amount")
+            )
+            if input_token and input_amount:
+                try:
+                    token_balances = {input_token: int(input_amount)}
+                except (ValueError, TypeError):
+                    pass
 
-            # Deposit-model apps are funded on the CONTRACT rather than the
-            # executor, because their scoreIntent pulls via _fundFromContract.
-            # An app declares that in its manifest; it used to be inferred
-            # from an "amountPerBuy" param existing, which is one DCA app's
-            # vocabulary rather than a platform concept.
-            seed_contract = (
-                deployed_contract
-                if (deployed_contract and _funds_from_contract(manifest, order.intent_function))
-                else None
-            )
+            # For deposit-model apps, seed the contract rather than the executor
+            is_deposit_model = order.params.get("amountPerBuy") or order.params.get("amount_per_buy")
+            seed_contract = deployed_contract if (is_deposit_model and deployed_contract) else None
 
             try:
                 # Fork seeds are applied INSIDE simulate() now — after the

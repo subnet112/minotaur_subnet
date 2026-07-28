@@ -25,19 +25,9 @@ from; the shadow scorer is gone, so the field now matches the value it carries.
 Reads still accept the legacy ``shadow_score`` key for rows persisted before the
 rename — see :func:`_raw_output`.)
 
-WHICH number a row carries is the APP's to declare, not this rule's. The default
-is the delivered-output metric described above (the DEX aggregator's, and what
-every existing row carries), but an app may declare another source, polarity,
-scale and validity rule in its manifest — see ``shared/quality_metric``. This
-module normalises whatever it is to a higher-is-better exact integer at the
-``_comparable_of`` / ``_row_has_value`` seam and compares ratios; nothing here
-knows what a swap is. Rows without a declared contract take the original code
-path unchanged, so existing verdicts are bit-identical.
-
 This module is PURE: a stateless decision function over result objects, duck-typed
-on ``intent_id`` / ``raw_output`` / ``metric`` (no imports from the heavy harness
-path — ``shared/quality_metric`` is dependency-free), so it stays trivially
-testable and import-light.
+on ``intent_id`` / ``raw_output`` (no imports from the heavy harness path), so it
+stays trivially testable and import-light.
 """
 
 from __future__ import annotations
@@ -375,51 +365,6 @@ def _has_value(score: Any) -> bool:
     return parsed is not None and parsed > MIN_VALID_OUTPUT
 
 
-# ── App-declared metric seam ────────────────────────────────────────────────
-#
-# The two functions below are the ONLY places this rule decides what a row's
-# per-order number means. Everything above and below them is polarity-free
-# ratio arithmetic that works for any metric.
-#
-# A row may carry its app's declared quality-metric contract (see
-# shared/quality_metric — a dependency-free module, so importing it keeps this
-# one import-light as documented). Rows without one — every row written before
-# this landed, and every app on the platform default — take the original code
-# path unchanged, so the DEX aggregator's verdicts stay bit-identical.
-
-
-def _metric_of(row: Any) -> Any:
-    from minotaur_subnet.shared import quality_metric
-
-    return quality_metric.from_row(row)
-
-
-def _comparable_of(row: Any) -> int | None:
-    """A row's per-order value, normalised to HIGHER-IS-BETTER exact integer."""
-    from minotaur_subnet.shared import quality_metric
-
-    metric = _metric_of(row)
-    if metric == quality_metric.DEFAULT:
-        return _parse_output(_raw_output(row))
-    return quality_metric.comparable(_raw_output(row), metric)
-
-
-def _row_has_value(row: Any) -> bool:
-    """Did this row produce a usable signal, per its app's validity rule?
-
-    For the default contract this is the delivered-output rule verbatim. An
-    app that declares ``validity: "any_row"`` counts a produced metric even
-    when it is zero — which is what makes an app whose orders legitimately
-    move no tokens rankable at all, instead of being rejected as invalid.
-    """
-    from minotaur_subnet.shared import quality_metric
-
-    metric = _metric_of(row)
-    if metric == quality_metric.DEFAULT:
-        return _has_value(_raw_output(row))
-    return quality_metric.has_value(_raw_output(row), metric)
-
-
 def factor_delta_between(
     champion_nodes: int | None,
     challenger_nodes: int | None,
@@ -606,10 +551,10 @@ def evaluate_relative_adoption(
     for iid in sorted(set(champ_by) | set(chal_by)):
         champ_row = champ_by.get(iid)
         chal_row = chal_by.get(iid)
-        champ_i = _comparable_of(champ_row)
-        chal_i = _comparable_of(chal_row)
-        champ_has = _row_has_value(champ_row)
-        chal_has = _row_has_value(chal_row)
+        champ_i = _parse_output(_raw_output(champ_row))
+        chal_i = _parse_output(_raw_output(chal_row))
+        champ_has = champ_i is not None and champ_i > MIN_VALID_OUTPUT
+        chal_has = chal_i is not None and chal_i > MIN_VALID_OUTPUT
         ratio: float | None = None
         bar_s: str | None = None
         bar_verdict: str | None = None
@@ -995,8 +940,8 @@ def blind_spot_bar_from_rows(rows: list[Any] | None) -> dict[str, str]:
         iid = _field(r, "intent_id")
         if iid is None:
             continue
-        v = _comparable_of(r)
-        if _row_has_value(r) and v is not None:
+        v = _parse_output(_raw_output(r))
+        if v is not None and v > MIN_VALID_OUTPUT:
             bar[str(iid)] = str(v)
     return bar
 
@@ -1141,26 +1086,17 @@ def has_raw_output_rows(rows: list[Any] | None) -> bool:
 
 
 def has_delivered_value_rows(rows: list[Any] | None) -> bool:
-    """True when at least one per-order row produced a usable signal.
+    """True when at least one per-order row DELIVERED value (parsed raw output > 0).
 
     The fleet-uniform VALIDITY GATE that replaced the retired scalar
-    ``benchmark_score > 0`` check: a submission is valid iff at least one order
-    cleared its app's validity rule. Stricter than :func:`has_raw_output_rows`
-    (which passes a solver that emitted only ``"0"`` rows). Every gate site
-    (worker, manager, follower) imports THIS one definition so leader/follower
-    parity is guaranteed by construction. Accepts the legacy ``shadow_score``
-    key via :func:`_raw_output`.
-
-    What "usable" means is the APP's to declare (shared/quality_metric). On the
-    platform default it is the DEX rule verbatim — delivered output > 0, so a
-    zero-delivery solver is REJECTED rather than merely scored 0. An app that
-    declares ``validity: "any_row"`` is valid once it produced its metric at
-    all: without that, an app whose orders legitimately move no tokens to a
-    receiver could never pass this gate and could never hold a champion.
-    (The name is kept for its five import sites; "delivered value" now means
-    "produced its declared signal".)
+    ``benchmark_score > 0`` check: a submission is valid iff it delivered a usable
+    output on >= 1 order. Stricter than :func:`has_raw_output_rows` (which passes a
+    solver that emitted only ``"0"`` rows) — a zero-delivery solver is REJECTED, not
+    merely scored 0. Every gate site (worker, manager, follower) imports THIS one
+    definition so leader/follower parity is guaranteed by construction. Accepts the
+    legacy ``shadow_score`` key via :func:`_raw_output`.
     """
-    return any(_row_has_value(r) for r in rows or [])
+    return any(_has_value(_raw_output(r)) for r in rows or [])
 
 
 def relative_reason(

@@ -139,7 +139,8 @@ def _make_snapshot():
     from minotaur_subnet.sdk.intent_solver import MarketSnapshot
 
     return MarketSnapshot(
-        chain_id=1, block_number=1, timestamp=1, prices={}, )
+        chain_id=1, block_number=1, timestamp=1, prices={}, pool_states={}, dex_config={}
+    )
 
 
 class _FakeSession:
