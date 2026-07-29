@@ -223,9 +223,42 @@ def _self_container_id() -> str:
     return socket.gethostname()
 
 
+async def _pick_egress_net(names: list[str], sandbox: str) -> str | None:
+    """The api network the proxy must share for EGRESS, picked from ``names``.
+
+    Docker's inspect map lists networks ALPHABETICALLY, and the api sits on
+    internal nets that sort before its egress one (``docker-control`` <
+    ``production_minotaur``) — so the old "first non-sandbox" pick attached a
+    recreated proxy to an internal-only net: no DNS/internet, every un-pinned
+    upstream forward died on name resolution (2026-07-30, ~800 failures/min
+    mid-benchmark) and solver reads timed out into silently-zeroed orders.
+    Prefer the first candidate whose Internal flag is verifiably false (one
+    ``network ls``); a candidate the listing can't classify beats one known
+    internal; when the listing itself fails (socket-proxy denial) fall back to
+    the legacy first pick — resolution must never block the ensure (#301).
+    """
+    candidates = [n for n in names if n and n != sandbox]
+    if not candidates:
+        return None
+    rc, out, _err = await _docker("network", "ls", "--format", "{{.Name}}|{{.Internal}}")
+    if rc == 0 and out.strip():
+        internal: dict[str, bool] = {}
+        for line in out.splitlines():
+            name, sep, flag = line.strip().partition("|")
+            if sep:
+                internal[name] = flag.strip().lower() == "true"
+        for n in candidates:
+            if internal.get(n) is False:
+                return n
+        for n in candidates:
+            if n not in internal:
+                return n
+    return candidates[0]
+
+
 async def _resolve_self_image_and_net() -> tuple[str, str | None]:
     """The api's own image + its minotaur/validator network (to launch the proxy from the
-    same image, attached to the same egress net).
+    same image, attached to the same egress net — see :func:`_pick_egress_net`).
 
     Identifies itself by the REAL container id (see :func:`_self_container_id`),
     then tries the precise ``docker inspect self``; falls back to ``docker ps``
@@ -240,16 +273,14 @@ async def _resolve_self_image_and_net() -> tuple[str, str | None]:
     )
     if rc == 0 and "|" in info:
         image, nets_s = info.split("|", 1)
-        net = next((n for n in nets_s.split() if n and n != sandbox), None)
+        net = await _pick_egress_net(nets_s.split(), sandbox)
         return image.strip(), net
     rc, row, _ = await _docker(
         "ps", "--no-trunc", "--filter", f"id={host}", "--format", "{{.Image}}|{{.Networks}}",
     )
     if rc == 0 and "|" in row:
         image, nets_s = row.split("|", 1)
-        net = next(
-            (n.strip() for n in nets_s.split(",") if n.strip() and n.strip() != sandbox), None
-        )
+        net = await _pick_egress_net([n.strip() for n in nets_s.split(",")], sandbox)
         return image.strip(), net
     return "", None
 
