@@ -1011,6 +1011,7 @@ def relative_counts(
     bar_age_s: float | None = None,
     factor_delta: int = 0,
     deadwood_delta: int = 0,
+    adoption_chains: set[int] | frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
 
@@ -1048,6 +1049,11 @@ def relative_counts(
         champion_results, challenger_results, tol_bps=tol_bps,
         champion_bar=champion_bar, bar_age_s=bar_age_s,
         factor_delta=factor_delta, deadwood_delta=deadwood_delta,
+        # MUST be forwarded, or the miner-facing counts contradict the decision:
+        # an order on an off-gate chain reads as a plain "better" here while the
+        # verdict correctly ignored it, producing exactly the "1 better yet NOT
+        # ADOPTED" display that this module's callers promise never to emit.
+        adoption_chains=adoption_chains,
     )
     return counts_from_verdict(res)
 
