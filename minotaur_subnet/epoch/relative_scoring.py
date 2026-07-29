@@ -290,11 +290,40 @@ def adoption_scored_chains() -> frozenset[int] | None:
 
     OPERATIONAL: this changes the adoption verdict → the benchmark pack hash, so
     it MUST be set FLEET-UNIFORM (same value on the leader and every follower) or
-    validators will diverge. It is the transitional lever for a chain that began
-    scoring MID-REIGN (Base, post-#1174): set ``ADOPTION_SCORED_CHAINS=1`` so Base
-    is measured-but-observe-only in adoption until a champion is crowned with Base
-    live, then clear it. A durable auto-derivation (record the champion's
-    adoption-time chains at hot-swap) is the follow-up that retires this env.
+    validators will diverge. Note that uniformity of the ENV is not sufficient on
+    its own — every call site must actually pass the result through; six of ten
+    once did not, so followers voted on an ungated rule while the leader adopted
+    on a gated one.
+
+    HOW TO BRING A GATED CHAIN BACK IN (the reason this env exists)
+    --------------------------------------------------------------
+    Clearing this env is only safe once the CURRENT champion was itself made to
+    earn coverage on the chain. Clear it while the incumbent holds an unearned
+    head-start there and you recreate the exact wall the gate was added to
+    remove: the incumbent delivers value on orders the challenger has no row
+    for, each one lands as ``dropped``, and ``n_dropped == 0`` is an absolute
+    veto — no challenger can be adopted, however good it is. That failure mode
+    ran for 46 hours and 19 consecutive rounds before the gate was introduced.
+
+    :func:`scoring_chains_from_rows` is snapshotted onto the champion at every
+    hot-swap (``ChampionInfo.adoption_chains``, persisted next to the blind-spot
+    bar) precisely so that question is answerable. The swap logs both sets, and
+    logs a ``gate candidate`` line when the new champion scored on a chain the
+    gate excludes — i.e. it earned coverage there WITHOUT being held to it, so
+    clearing now would hold its successors to a bar it never cleared.
+
+    The safe sequence is therefore:
+
+      1. leave the gate set; let champions turn over normally;
+      2. wait for a champion whose ``adoption_chains`` INCLUDE the gated chain
+         AND which was crowned with the chain counted (no ``gate candidate``
+         warning) — that champion has genuinely earned the coverage;
+      3. clear the env, fleet-uniform, on a round boundary.
+
+    Reading the gate from the champion record instead of this env is the
+    remaining step that retires it entirely. Deliberately NOT done here: it
+    changes the verdict the moment it lands, and the record has to exist and be
+    inspected across a few reigns first. The capture is the prerequisite.
     """
     import os
 
@@ -978,6 +1007,39 @@ def bar_kwargs_from_record(
     }
 
 
+def scoring_chains_from_rows(rows: list[Any] | None) -> frozenset[int]:
+    """The chains that were actually SCORING in a benchmark — PURE.
+
+    A chain counts when at least one row on it DELIVERED VALUE. A chain present
+    in the corpus but delivering nothing for anybody (Base before its contracts
+    were reachable) is NOT scoring, which is the whole distinction the adoption
+    chain gate rests on.
+
+    Snapshot this over the winner's rows AT ADOPTION, exactly like
+    :func:`blind_spot_bar_from_rows`, to record what the incumbent was actually
+    made to earn coverage on. That record is what lets the gate retire itself:
+    a champion crowned while a chain was scoring HAS earned coverage there, so
+    holding its successors to that chain is fair; a champion crowned before it
+    scored has not, and gating the chain out for its reign is what stops a
+    head-start it never earned from walling every challenger.
+
+    Returns a frozenset (empty when no row delivered), so a caller can
+    distinguish "nothing scored" from ``None`` = "no record, gate disabled".
+    """
+    chains: set[int] = set()
+    for r in rows or []:
+        chain = _coerce_chain(_field(r, "chain_id"))
+        if chain is None:
+            continue
+        raw = _raw_output(r)
+        try:
+            if raw is not None and int(raw) > MIN_VALID_OUTPUT:
+                chains.add(chain)
+        except (TypeError, ValueError):
+            continue
+    return frozenset(chains)
+
+
 def blind_spot_bar_from_rows(rows: list[Any] | None) -> dict[str, str]:
     """Build the blind-spot repeat bar from per-order rows — PURE.
 
@@ -1011,6 +1073,7 @@ def relative_counts(
     bar_age_s: float | None = None,
     factor_delta: int = 0,
     deadwood_delta: int = 0,
+    adoption_chains: set[int] | frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
 
@@ -1048,6 +1111,11 @@ def relative_counts(
         champion_results, challenger_results, tol_bps=tol_bps,
         champion_bar=champion_bar, bar_age_s=bar_age_s,
         factor_delta=factor_delta, deadwood_delta=deadwood_delta,
+        # MUST be forwarded, or the miner-facing counts contradict the decision:
+        # an order on an off-gate chain reads as a plain "better" here while the
+        # verdict correctly ignored it, producing exactly the "1 better yet NOT
+        # ADOPTED" display that this module's callers promise never to emit.
+        adoption_chains=adoption_chains,
     )
     return counts_from_verdict(res)
 

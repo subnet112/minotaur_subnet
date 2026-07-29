@@ -42,10 +42,46 @@ def test_round_store_bar_roundtrip(tmp_path):
     )
     assert store.get_champion_adoption_bar() == {
         "submission_id": "sub_a", "outputs": {"o1": "5000"}, "activated_at": 123.0,
+        # Adoption-time scoring chains ride in the same record. None here =
+        # "not recorded" (this caller passed no chains), which readers must keep
+        # distinct from [] = "recorded, nothing scored".
+        "chains": None,
     }
     # Restart: a fresh store on the same path restores the record.
     reloaded = RoundStore(persist_path=path)
     assert reloaded.get_champion_adoption_bar()["outputs"] == {"o1": "5000"}
+
+
+def test_round_store_persists_adoption_chains(tmp_path):
+    """The chain set must survive a restart, or the gate's basis silently changes.
+
+    It cannot be recomputed after the fact — the per-round incumbent re-bench
+    overwrites the rows it is derived from — so losing it on restart would leave
+    no way to tell whether the sitting champion was ever held to a gated chain.
+    """
+    path = tmp_path / "rounds.json"
+    store = RoundStore(persist_path=path)
+    store.set_champion_adoption_bar(
+        submission_id="sub_a", outputs={"o1": "5000"}, activated_at=1.0,
+        chains=frozenset({1, 8453}),
+    )
+    # Sorted on write so two validators serialise the same champion identically.
+    assert store.get_champion_adoption_bar()["chains"] == [1, 8453]
+
+    reloaded = RoundStore(persist_path=path)
+    assert reloaded.get_champion_adoption_bar()["chains"] == [1, 8453]
+
+
+def test_round_store_distinguishes_empty_chains_from_unrecorded(tmp_path):
+    store = RoundStore(persist_path=tmp_path / "rounds.json")
+    store.set_champion_adoption_bar(
+        submission_id="sub_a", outputs=None, activated_at=1.0, chains=frozenset(),
+    )
+    assert store.get_champion_adoption_bar()["chains"] == []   # recorded, nothing scored
+    store.set_champion_adoption_bar(
+        submission_id="sub_b", outputs=None, activated_at=2.0,
+    )
+    assert store.get_champion_adoption_bar()["chains"] is None  # not recorded
 
 
 def test_round_store_bar_overwrite_clears(tmp_path):
