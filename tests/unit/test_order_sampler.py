@@ -353,6 +353,74 @@ class TestCoreNamesNoAppSpecificABI:
                     "rebalance(address[],uint256[],address)"):
             assert sig not in src, f"order_processor still hardcodes {sig}"
 
+    def test_no_core_module_hardcodes_an_app_signature(self):
+        """Scan the WHOLE package, not one module.
+
+        The original version of this guard checked only order_processor — so the
+        identical map survived in harness/orchestrator.py and
+        validator/scoring_engine.py for weeks, and those two then resolved the
+        same intent_function to a DIFFERENT selector than the order path.
+        Whole-tree is the only scope that actually prevents the creep.
+
+        Exemptions are paths where an app's ABI legitimately belongs: reference
+        solvers, the example app, and tests (which must be able to name a
+        signature in order to assert about it).
+        """
+        import pathlib
+
+        import minotaur_subnet
+
+        root = pathlib.Path(minotaur_subnet.__file__).parent
+        canonical = (
+            "swap(address,address,uint256,uint256,address)",
+            "buy(address,address,uint256,uint256,address)",
+            "rebalance(address[],uint256[],address)",
+        )
+        exempt_parts = ("sdk/solvers", "docker/", "scoring_lab/", "test_")
+        # KNOWN, JUSTIFIED occurrences. An allowlist rather than a path glob, so
+        # a NEW hardcoded signature anywhere still fails this test.
+        #
+        # _signature_verify: the EIP-712 default when a submitted order carries
+        # no intent_selector. This is signature COMPATIBILITY, not scoring —
+        # changing the default would reject orders that were validly signed
+        # against it. Fixing it needs a migration (require intent_selector, or
+        # resolve the app's manifest inside the verifier), which does not belong
+        # in a de-DEX refactor.
+        known = {
+            "api/routes/_signature_verify.py",
+        }
+        offenders: list[str] = []
+        for path in root.rglob("*.py"):
+            rel = str(path.relative_to(root))
+            if any(part in rel for part in exempt_parts) or rel in known:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for sig in canonical:
+                if sig in text:
+                    offenders.append(f"{rel}: {sig}")
+        assert not offenders, (
+            "core must not hardcode any app's canonical signature — derive it "
+            "from the app manifest (v3.manifest.selector_from_legacy_manifest). "
+            "Offenders:\n  " + "\n  ".join(offenders)
+        )
+
+    def test_known_signature_exemption_still_exists(self):
+        """Guard the allowlist above: if the exempted file stops hardcoding the
+        signature, the entry is stale and must be deleted so the allowlist never
+        silently covers a future regression in that path."""
+        import pathlib
+
+        import minotaur_subnet
+
+        p = (
+            pathlib.Path(minotaur_subnet.__file__).parent
+            / "api" / "routes" / "_signature_verify.py"
+        )
+        assert "swap(address,address,uint256,uint256,address)" in p.read_text(), (
+            "_signature_verify no longer hardcodes the swap signature — remove "
+            "it from the `known` allowlist in the test above"
+        )
+
     def test_selector_comes_from_the_manifest(self):
         from minotaur_subnet.blockloop.order_processor import OrderProcessor
         from eth_hash.auto import keccak
