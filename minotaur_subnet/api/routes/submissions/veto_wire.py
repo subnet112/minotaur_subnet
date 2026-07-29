@@ -915,9 +915,19 @@ async def run_slice_bench(
 
     # 5. Slice-local verdict with the AUTHORITATIVE rule, then extract the
     #    hard-veto evidence.
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
+        evaluate_relative_adoption,
+    )
 
-    verdict = evaluate_relative_adoption(champ_results, chal_results)
+    # "AUTHORITATIVE rule" is only true if this is gated the SAME way the leader's
+    # adoption verdict is. Ungated, a follower veto-confirms hard violations on
+    # off-gate chains that the leader's verdict never counted — a divergence that
+    # a fleet-uniform ADOPTION_SCORED_CHAINS cannot fix, because this path did not
+    # read the env at all.
+    verdict = evaluate_relative_adoption(
+        champ_results, chal_results, adoption_chains=adoption_scored_chains(),
+    )
     violations, counts, calibration_rows, matched_rows = extract_slice_evidence(
         verdict, slice_orders, calib_orders, chal_results,
     )
@@ -1340,7 +1350,10 @@ async def reverify_dissents(
     Any resolution/bench gap is a swallowed no-op (returns ran=False) — an
     observe pass must never raise into the coordinator.
     """
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
+        evaluate_relative_adoption,
+    )
     from minotaur_subnet.harness.benchmark_worker import ExplicitOrderUnavailable
     from minotaur_subnet.harness.image_transport import is_digest_ref
     from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
@@ -1406,7 +1419,12 @@ async def reverify_dissents(
             worker._epoch_block_number = int(pin)
             champ = await worker.benchmark_explicit_orders(a0.incumbent_image_ref, chain_orders)
             chal = await worker.benchmark_explicit_orders(a0.candidate_image_ref, chain_orders)
-            verdict = evaluate_relative_adoption(champ, chal)
+            # Same gate as the leader's verdict — see the note at the slice-local
+            # verdict above. This loop is PER-CHAIN, so without the gate an
+            # off-gate chain's slice can produce confirmed violations on its own.
+            verdict = evaluate_relative_adoption(
+                champ, chal, adoption_chains=adoption_scored_chains(),
+            )
             violations, _c, _cal, _m = extract_slice_evidence(verdict, chain_orders, [], chal)
             confirmed_ids.update(v.order_id for v in violations)
             benched_ids.update(o.get("order_id") for o in chain_orders if o.get("order_id"))

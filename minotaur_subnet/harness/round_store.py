@@ -494,6 +494,7 @@ class RoundStore:
         submission_id: str | None,
         outputs: dict[str, str] | None,
         activated_at: float,
+        chains: frozenset[int] | set[int] | None = None,
     ) -> None:
         """Record the adoption-time bar for the champion just activated.
 
@@ -501,12 +502,23 @@ class RoundStore:
         empty/None ``outputs`` still overwrites — a champion adopted without
         rows must CLEAR the displaced champion's bar, never inherit it (the
         record is matched to the incumbent by submission_id at read time as the
-        second guard)."""
+        second guard).
+
+        ``chains`` is the adoption-time SCORING chain set
+        (relative_scoring.scoring_chains_from_rows) — which chains this champion
+        was actually made to earn coverage on. Persisted for the same reason as
+        the bar: it cannot be recomputed later, because the per-round incumbent
+        re-bench overwrites the rows it is derived from. Stored as a sorted list
+        so two validators serialise it identically. ``None`` (default) writes
+        null and is what a caller that has no record should pass — it means "not
+        recorded", which readers must distinguish from an empty set ("recorded,
+        nothing scored")."""
         self._maybe_reload()
         self._champion_adoption_bar = {
             "submission_id": submission_id,
             "outputs": dict(outputs or {}),
             "activated_at": float(activated_at),
+            "chains": sorted(chains) if chains is not None else None,
         }
         self._persist()
 
