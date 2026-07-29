@@ -132,6 +132,7 @@ OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
 OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
 OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
 OUTCOME_COPYCAT_CODE = "copycat_code"  # identical code first submitted by ANOTHER actor
+OUTCOME_STRUCTURAL_DUPLICATE = "structural_duplicate"  # same operator already queues this structure
 OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
 OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
 OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
@@ -1367,6 +1368,49 @@ class SubmissionStore:
             if _counts_as_benched(sub, current_round_id) and sub.round_id:
                 benched_rounds.add(sub.round_id)
         return submitters, len(benched_rounds)
+
+    def structural_fingerprint_live(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> list[tuple[str, str, str]]:
+        """Every LIVE submission carrying this STRUCTURAL fingerprint, as
+        ``(hotkey, submission_id, status_value)``.
+
+        "Live" = still holds or contends for a queue seat: queued, any
+        screening stage, pending selection, benchmarking, scored, waitlisted.
+        REJECTED is out (a lost duplicate frees the structure), and ADOPTED is
+        out ON PURPOSE — the champion's own operator must be able to iterate
+        on the champion's structure (measured 2026-07-29: a real -123-node
+        improvement kept the incumbent's exact structural fingerprint).
+
+        Read-only scan, same access pattern as :meth:`fingerprint_usage`.
+        """
+        self._maybe_reload()
+        live = {
+            SubmissionStatus.QUEUED.value,
+            SubmissionStatus.SCREENING_STAGE_1.value,
+            SubmissionStatus.SCREENING_STAGE_2.value,
+            SubmissionStatus.SCREENING_STAGE_3.value,
+            SubmissionStatus.PENDING_SELECTION.value,
+            SubmissionStatus.BENCHMARKING.value,
+            SubmissionStatus.SCORED.value,
+            SubmissionStatus.WAITLISTED.value,
+        }
+        out: list[tuple[str, str, str]] = []
+        if not fingerprint:
+            return out
+        for sub in self._submissions.values():
+            if getattr(sub, "structural_fingerprint", None) != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            status = str(getattr(sub.status, "value", None) or sub.status or "")
+            if status not in live:
+                continue
+            out.append((sub.hotkey or "", sub.submission_id, status))
+        return out
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
