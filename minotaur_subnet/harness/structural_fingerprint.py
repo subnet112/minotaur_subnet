@@ -74,17 +74,29 @@ def structural_dedup_mode() -> str:
         explicitly in the leader env so the lever is visible.
       * ``observe`` — Phase 0: LOG cross-actor structural clusters at slate
         selection; selection unchanged.
-      * ``enforce`` — RESERVED (not yet wired): collapse a cross-actor
-        structural cluster to one slate slot. Changes the benched slate → the
-        pack hash, so arming it MUST be fleet-uniform. Until the collapse is
-        implemented, ``enforce`` behaves as ``observe`` and logs that it is
-        not yet enforcing.
+      * ``reject`` — one queue seat per (OPERATOR, structure): a submission
+        whose structural fingerprint matches a LIVE submission from the SAME
+        operator is rejected at intake, pre-build, with the duplicate named
+        (screening_pipeline). Cross-operator matches are deliberately out of
+        scope here — includes ``observe`` logging.
+      * ``enforce`` — DEPRECATED, do not arm. Collapses a CROSS-ACTOR
+        structural cluster to one slate slot + build-budget preference for
+        novel fingerprints. Measured 2026-07-29: the fingerprint cannot
+        separate a copy from an improvement (a champion fork with a real
+        -123-node factorization win kept the champion's exact fingerprint),
+        so population-keyed enforcement starved fork-and-improve — ~30-member
+        champion-lineage clusters sat 22-28 waitlisted while novel-fp
+        mutations were built and seated; flipping to ``observe`` produced
+        perfect-tie verdicts within one round and a dethrone in 2.5h. The
+        cross-actor fleet threat belongs to OPERATOR identity (actor
+        owner-union merges), not code shape. Kept only so an already-set env
+        keeps its (known-bad) meaning rather than silently becoming ``off``.
 
     Unknown values fall back to ``off`` (fail safe — an env typo must not
     silently enable a slate-changing feature).
     """
     v = os.environ.get("STRUCTURAL_DEDUP_MODE", "").strip().lower()
-    return v if v in ("off", "observe", "enforce") else "off"
+    return v if v in ("off", "observe", "reject", "enforce") else "off"
 
 # Bump on ANY change to the normalization below (see module docstring).
 STRUCTURAL_FINGERPRINT_VERSION = 1
