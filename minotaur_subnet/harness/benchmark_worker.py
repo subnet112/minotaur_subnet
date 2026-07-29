@@ -49,6 +49,7 @@ from minotaur_subnet.harness.orchestrator import (
 )
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 from minotaur_subnet.epoch.relative_scoring import (
+    adoption_scored_chains,
     evaluate_relative_adoption,
     has_delivered_value_rows,
 )
@@ -2063,9 +2064,15 @@ class BenchmarkWorker:
         # The AUTHORITATIVE verdict is the per-order relative rule over the RAW
         # delivered output (raw_output), IDENTICAL to the leader + followers —
         # including the blind-spot bar kwargs (inert while the record doesn't
-        # match the adopted incumbent, e.g. a genesis reference).
+        # match the adopted incumbent, e.g. a genesis reference) AND the
+        # adoption-time chain gate. The gate was missing here: this shadow vote
+        # counted off-gate chains the leader's verdict ignored, so a follower
+        # could vote the opposite way on a candidate whose only wins (or only
+        # drops) were off-gate — invisible, because both sides logged a
+        # confident "authoritative" verdict.
         verdict = evaluate_relative_adoption(
             champ_results, chal_results,
+            adoption_chains=adoption_scored_chains(),
             **self._blind_spot_bar_kwargs(self._resolve_incumbent_submission()),
         )
         # [gas-shadow] soak observability — champion vs challenger metered
@@ -2695,8 +2702,15 @@ class BenchmarkWorker:
         def _net_better(sub) -> int:
             rows = (sub.benchmark_details or {}).get("per_intent") or []
             # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
-            # ahead of a genuine win (disarmed: no-op).
-            v = evaluate_relative_adoption(champ_rows, rows, **bar_kwargs)
+            # ahead of a genuine win (disarmed: no-op). The chain gate matters
+            # here too: this net-better RANK decides which candidate becomes
+            # finalist, so counting off-gate wins ranks a candidate first on
+            # credit the adoption verdict will then refuse to give it.
+            v = evaluate_relative_adoption(
+                champ_rows, rows,
+                adoption_chains=adoption_scored_chains(),
+                **bar_kwargs,
+            )
             return v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
 
         # Highest net-better first; content-addressed tie-break (host-deterministic).

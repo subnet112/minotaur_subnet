@@ -2078,6 +2078,12 @@ class EpochManager:
                     counts = relative_counts(
                         champ_rows, comp_rows,
                         factor_delta=delta, deadwood_delta=dw_delta,
+                        # The chain gate belongs here for the SAME reason as the
+                        # bar kwargs above: without it an off-gate order counts
+                        # as "better" in the miner-facing block while the verdict
+                        # ignored it, which is how a Base-only win rendered as
+                        # "1 better · NOT ADOPTED THIS ROUND" on the frontend.
+                        adoption_chains=adoption_scored_chains(),
                         **self._blind_spot_bar_kwargs(),
                     )
                     # Attach same-pin factorization / deadwood / gas rule context
