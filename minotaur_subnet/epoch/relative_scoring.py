@@ -270,6 +270,41 @@ def _field(item: Any, name: str) -> Any:
     return getattr(item, name, None)
 
 
+def _coerce_chain(value: Any) -> int | None:
+    """Best-effort ``int`` for a per-order ``chain_id`` (int or decimal str).
+    ``None`` on anything unparseable — the caller then treats the order as
+    un-gated (counts normally), never silently dropping it."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def adoption_scored_chains() -> frozenset[int] | None:
+    """The chains that COUNT for the adoption decision — the adoption-time chain
+    gate input for :func:`evaluate_relative_adoption` (``adoption_chains``).
+
+    Sourced from ``ADOPTION_SCORED_CHAINS`` (comma-separated chain ids, e.g.
+    ``"1"`` or ``"1,8453"``). Unset / empty ⇒ ``None`` ⇒ every chain counts ⇒
+    the verdict is bit-identical to before the gate existed.
+
+    OPERATIONAL: this changes the adoption verdict → the benchmark pack hash, so
+    it MUST be set FLEET-UNIFORM (same value on the leader and every follower) or
+    validators will diverge. It is the transitional lever for a chain that began
+    scoring MID-REIGN (Base, post-#1174): set ``ADOPTION_SCORED_CHAINS=1`` so Base
+    is measured-but-observe-only in adoption until a champion is crowned with Base
+    live, then clear it. A durable auto-derivation (record the champion's
+    adoption-time chains at hot-swap) is the follow-up that retires this env.
+    """
+    import os
+
+    raw = os.environ.get("ADOPTION_SCORED_CHAINS", "").strip()
+    if not raw:
+        return None
+    chains = {c for tok in raw.split(",") if (c := _coerce_chain(tok.strip())) is not None}
+    return frozenset(chains) or None
+
+
 def _raw_output(item: Any) -> Any:
     """Read a per-order RAW delivered output off a result row.
 
@@ -429,6 +464,7 @@ def evaluate_relative_adoption(
     bar_age_s: float | None = None,
     factor_delta: int = 0,
     deadwood_delta: int = 0,
+    adoption_chains: set[int] | frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
@@ -568,7 +604,27 @@ def evaluate_relative_adoption(
         # ``dropped`` order is a hard loss via its own verdict, not this flag).
         catastrophic = False
 
-        if champ_has and chal_has:
+        # ADOPTION-TIME CHAIN GATE. ``adoption_chains`` is the set of chains that
+        # were SCORING when the current champion was crowned. An order on any OTHER
+        # chain is OBSERVE-ONLY for the adoption decision — recorded for display but
+        # folded into NONE of the counts (win/matched/blind/dropped/compared). WHY:
+        # a chain that only started scoring MID-REIGN (e.g. Base flipping from
+        # "0 for everyone" to live) must not retroactively wall challengers — the
+        # incumbent was never made to earn coverage there, yet its head-start would
+        # otherwise be an un-nettable ``dropped`` hard veto against every challenger.
+        # None (default) ⇒ every chain counts ⇒ behaviour is bit-identical to before.
+        order_chain = _field(champ_row, "chain_id")
+        if order_chain is None:
+            order_chain = _field(chal_row, "chain_id")
+        gated_out = (
+            adoption_chains is not None
+            and order_chain is not None
+            and _coerce_chain(order_chain) not in adoption_chains
+        )
+
+        if gated_out:
+            verdict = "offgate"
+        elif champ_has and chal_has:
             # EXACT-INTEGER verdict — cross-multiply the BPS band, no float.
             ratio = _display_ratio(chal_i, champ_i)  # type: ignore[arg-type]
             if chal_i * _BPS < champ_i * (_BPS - tol_bps):  # type: ignore[operator]

@@ -37,6 +37,7 @@ from minotaur_subnet.harness.submission_store import (
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
+    adoption_scored_chains,
     blind_spot_bar_from_rows,
     evaluate_relative_adoption,
     has_delivered_value_rows,
@@ -1459,7 +1460,9 @@ class EpochManager:
             # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
             # candidate above one with a genuine win (disarmed: no-op).
             v = evaluate_relative_adoption(
-                champ_rows, self._per_intent(s), **self._blind_spot_bar_kwargs(),
+                champ_rows, self._per_intent(s),
+                adoption_chains=adoption_scored_chains(),
+                **self._blind_spot_bar_kwargs(),
             )
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
             nodes = getattr(s, "max_region_nodes", None)
@@ -1716,6 +1719,7 @@ class EpochManager:
                     getattr(incumbent_sub, "unproductive_metric_version", None),
                     getattr(challenger, "unproductive_metric_version", None),
                 ),
+                adoption_chains=adoption_scored_chains(),
                 **self._blind_spot_bar_kwargs(),
             )
             adopt = bool(verdict["adopt"])
@@ -1953,6 +1957,7 @@ class EpochManager:
                     getattr(incumbent_sub, "unproductive_metric_version", None),
                     getattr(challenger, "unproductive_metric_version", None),
                 ),
+                adoption_chains=adoption_scored_chains(),
                 **self._blind_spot_bar_kwargs(),
             )
 
