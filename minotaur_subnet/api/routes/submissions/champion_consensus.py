@@ -397,6 +397,7 @@ async def _independent_adopt_vote(
         run_benchmark,
     )
     from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
         deadwood_delta_between,
         evaluate_relative_adoption,
         factor_delta_between,
@@ -581,6 +582,7 @@ async def _independent_adopt_vote(
         champ_results, chal_results,
         factor_delta=factor_delta,
         deadwood_delta=deadwood_delta,
+        adoption_chains=adoption_scored_chains(),
         **_bar_kwargs(incumbent_sub),
     )
     adopt = bool(verdict["adopt"])
