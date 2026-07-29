@@ -535,6 +535,38 @@ def autoscaled_decision_window(
     return max(scaled, int(floor_epochs))
 
 
+def early_activation_effective_epoch(
+    close_anchored_epoch: int,
+    current_epoch: int,
+    margin_epochs: int,
+) -> int:
+    """The effective epoch for a certification landing NOW (early activation).
+
+    The close-time schedule anchors activation at ``close + ACTIVATION_DELAY``,
+    sized for the WORST-case decision (the autoscaled window) — so a round
+    whose certification lands early idles out the remainder doing nothing
+    (~15-30 min at slate 6, on every adopt). With a margin armed, activation
+    follows the ACTUAL certification instead: ``current + margin``, clamped to
+    never land LATER than the close-anchored schedule. The margin exists so the
+    fleet holds the certificate before the swap takes effect — it must cover
+    the certify-broadcast fan-out plus one follower pull-reconcile cycle
+    (5 min), hence the recommended 10.
+
+    ``margin_epochs <= 0`` keeps the legacy deadline-anchored schedule
+    unchanged (the default — this is opt-in via
+    ``SOLVER_ROUND_EARLY_ACTIVATION_MARGIN_EPOCHS``).
+
+    Cross-version safe by construction: the effective epoch rides the SIGNED
+    champion certificate, and every node — current or older code — already
+    stores the certificate's value verbatim at certify
+    (``round_store.certify_round``), so followers inherit the early epoch with
+    no code change and no fleet-uniform rollout requirement.
+    """
+    if margin_epochs <= 0:
+        return int(close_anchored_epoch)
+    return min(int(close_anchored_epoch), int(current_epoch) + int(margin_epochs))
+
+
 def _round_certification_deadline_elapsed(round_state: RoundState) -> bool:
     """Return whether the round can no longer be certified."""
     if round_state.certificate is not None:
