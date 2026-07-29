@@ -23,6 +23,7 @@ from minotaur_subnet.epoch.relative_scoring import (
     evaluate_relative_adoption,
     has_raw_output_rows,
     relative_counts,
+    scoring_chains_from_rows,
     relative_reason,
 )
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
@@ -1749,3 +1750,49 @@ def test_display_counts_agree_with_the_verdict_under_the_gate():
     assert verdict["adopt"] is False          # the only win was off-gate
     assert counts["better"] == 0              # ...so nothing is advertised as better
     assert counts["verdict"] != "dethrone"
+
+
+# ── scoring_chains_from_rows: the record that lets the gate retire ───────────
+#
+# Captured at hot-swap because it cannot be recomputed later (the incumbent
+# re-bench overwrites per_intent). It answers the only question that makes
+# clearing ADOPTION_SCORED_CHAINS safe: was this champion ever held to the
+# gated chain?
+
+def test_scoring_chains_only_counts_chains_that_delivered():
+    """A chain present in the corpus but delivering nothing is NOT scoring.
+
+    This is the distinction the whole gate rests on — Base existed in the corpus
+    long before it paid out for anybody.
+    """
+    rows = [
+        _rc("eth1", "100", 1),
+        _rc("base1", None, 8453),   # no plan
+        _rc("base2", "0", 8453),    # reverted → zero
+    ]
+    assert scoring_chains_from_rows(rows) == frozenset({1})
+
+
+def test_scoring_chains_picks_up_a_chain_once_it_pays():
+    rows = [_rc("eth1", "100", 1), _rc("base1", "500", 8453)]
+    assert scoring_chains_from_rows(rows) == frozenset({1, 8453})
+
+
+def test_scoring_chains_empty_is_not_none():
+    """`frozenset()` means "recorded, nothing scored"; None means "no record".
+
+    Readers must be able to tell those apart — one is a fact about the reign,
+    the other is absence of data.
+    """
+    assert scoring_chains_from_rows([]) == frozenset()
+    assert scoring_chains_from_rows(None) == frozenset()
+
+
+def test_scoring_chains_tolerates_junk_rows():
+    """Unparseable chain / output must be skipped, never raise on the swap path."""
+    rows = [
+        {"intent_id": "a", "raw_output": "100", "chain_id": "not-a-chain"},
+        {"intent_id": "b", "raw_output": "junk", "chain_id": 1},
+        {"intent_id": "c", "raw_output": "7", "chain_id": "8453"},  # str chain ok
+    ]
+    assert scoring_chains_from_rows(rows) == frozenset({8453})
