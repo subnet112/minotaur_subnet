@@ -60,9 +60,16 @@ see ``docs/architecture/sdk-v2-migration.md`` §4.
 
 from __future__ import annotations
 
-# First versioned generation of the solver SDK contract. Solvers that vendored
-# an earlier copy have no SDK_VERSION symbol at all — see "ABSENCE IS THE
+# Versioned generations of the solver SDK contract. Solvers that vendored an
+# earlier copy have no SDK_VERSION symbol at all — see "ABSENCE IS THE
 # SIGNAL" above.
-SDK_VERSION = "1.0.0"
+#
+#   1.0.0 — first marked generation (the marker itself, #1176).
+#   1.1.0 — Phase B deprecation generation: MarketSnapshot
+#           prices/pool_states/dex_config warn on access; retirement target
+#           2026-09-01, evidence-gated (sdk-v2-migration.md Phase C). A
+#           solver reporting >= 1.1.0 re-vendored AFTER the warnings existed
+#           — exactly the population the Phase C audit wants to measure.
+SDK_VERSION = "1.1.0"
 
 __all__ = ["SDK_VERSION"]
