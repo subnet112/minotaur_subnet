@@ -2200,14 +2200,25 @@ def _build_benchmark_intent_order(
     if not intent_params_hex:
         return None
 
-    # Resolve intent selector
-    from eth_hash.auto import keccak as _keccak
-    _KNOWN_SIGS = {
-        "swap": "swap(address,address,uint256,uint256,address)",
-        "execute": "swap(address,address,uint256,uint256,address)",
-    }
-    sig = _KNOWN_SIGS.get(fn_name, f"{fn_name}()")
-    selector = _keccak(sig.encode())[:4].hex()
+    # Resolve the intent selector from the APP'S OWN manifest — the same
+    # manifest that drove the encoder immediately above, and the same
+    # manifest-driven path order_processor uses since #1152.
+    #
+    # This was a literal {swap, execute} -> canonical-signature map, i.e. one
+    # app's ABI in the path every benchmarked app goes through, and it left the
+    # benchmark DISAGREEING with the order path: #1152 removed the map from
+    # order_processor, so the same intent_function resolved to two different
+    # selectors depending on which path you came through.
+    #
+    # Verified against the LIVE DexAggregator manifest before writing this:
+    # swap -> d5bcb9b5 both ways, an exact drop-in for 3386 of 3387 corpus rows.
+    # The one row that changes carries intent_function="execute", which the map
+    # aliased to the SWAP signature while the app declares no such intent — core
+    # guessing on the app's behalf is precisely what is being removed here, and
+    # order_processor already stopped doing it.
+    from minotaur_subnet.v3.manifest import selector_from_legacy_manifest
+
+    selector = selector_from_legacy_manifest(manifest, fn_name)
 
     # Deterministic order_id — unique per scenario within a run (the CREATE2
     # proxy concern), and IDENTICAL across validators / champion-vs-challenger

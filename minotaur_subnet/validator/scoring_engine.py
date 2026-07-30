@@ -186,6 +186,32 @@ class ScoringEngine:
 
         return True, ""
 
+    def _manifest_for_app(self, app_id: str) -> dict | None:
+        """The app's raw manifest dict, for selector resolution.
+
+        Prefers the JS engine's cached copy (the same source the quote path
+        uses) and falls back to the store record, because the engine only caches
+        manifests for apps something has already scored. Fail-soft: a follower
+        that cannot resolve a manifest must fall through to the no-arg selector
+        convention and log, never raise mid-re-simulation.
+        """
+        if not app_id:
+            return None
+        try:
+            engine = getattr(self, "js_engine", None)
+            if engine is not None and hasattr(engine, "get_manifest"):
+                m = engine.get_manifest(app_id)
+                if isinstance(m, dict) and m:
+                    return m
+            store = getattr(self, "store", None)
+            if store is not None:
+                m = getattr(store.get_app(app_id), "manifest", None)
+                if isinstance(m, dict) and m:
+                    return m
+        except Exception:  # noqa: BLE001 — resolution is best-effort
+            logger.warning("manifest lookup failed for %s", app_id, exc_info=True)
+        return None
+
     async def _simulate_plan(
         self,
         plan: ExecutionPlan,
@@ -228,15 +254,22 @@ class ScoringEngine:
                     c in '0123456789abcdefABCDEF'
                     for c in _raw_sel.replace("0x", "")
                 ):
-                    from eth_hash.auto import keccak as _keccak
-                    _fn = intent_function or "swap"
-                    _KNOWN_SIGS = {
-                        "swap": "swap(address,address,uint256,uint256,address)",
-                        "execute": "swap(address,address,uint256,uint256,address)",
-                        "buy": "buy(address,address,uint256,uint256,address)",
-                    }
-                    _sig = _KNOWN_SIGS.get(_fn, f"{_fn}()")
-                    _raw_sel = _keccak(_sig.encode())[:4].hex()
+                    # Selector from the APP'S OWN manifest via the one shared
+                    # helper — see v3.manifest.selector_from_legacy_manifest.
+                    # This was a literal {swap, execute, buy} -> canonical
+                    # signature map: one app's ABI on the FOLLOWER re-simulation
+                    # path, and worse, it disagreed with the order path after
+                    # #1152 removed the same map from order_processor. A follower
+                    # resolving a different selector than the leader re-scores
+                    # the order against a different contract entrypoint.
+                    from minotaur_subnet.v3.manifest import (
+                        selector_from_legacy_manifest,
+                    )
+
+                    _raw_sel = selector_from_legacy_manifest(
+                        self._manifest_for_app(getattr(deployment, "app_id", "")),
+                        intent_function or "",
+                    )
                 intent_order_dict = {
                     "order_id": order_id,
                     "app": contract_address,
