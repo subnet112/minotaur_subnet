@@ -108,6 +108,9 @@ class AdvancedSwapSolver(IntentSolver):
         if self.rpc_urls.get(chain_id):
             pool_states = self._query_pools_rpc(chain_id, input_token, output_token)
         elif snapshot and snapshot.pool_states:
+            # DEPRECATED fallback (SDK v2 Phase B): snapshot.pool_states
+            # empties after 2026-09-01 (evidence-gated). Prefer the RPC
+            # branch above — it is the only durable data source.
             pool_states = snapshot.pool_states
         else:
             pool_states = {}
