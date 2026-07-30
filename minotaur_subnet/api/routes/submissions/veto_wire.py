@@ -585,12 +585,29 @@ def build_assignments(
 # follower's slice.
 K_CONSECUTIVE_UNSUPPORTED: int = 3
 
+# A validator whose assignment cannot be DELIVERED at all (connection refused/
+# timeout/no URL — SEND_UNREACHABLE) also becomes terminal, after a LONGER
+# streak. Without this, a dead peer is "might still answer" for the whole
+# observe window and every phase with one down validator resolves
+# window_elapsed instead of all_terminal — measured 2026-07-30: 20 min of pure
+# post-vote wait on EVERY adopt round, for a peer whose sends had failed 100%
+# for weeks. 10 consecutive failures at the tick-driven resend cadence
+# (~5-20s apart) ≈ 1-3.5 min of sustained unreachability; a follower briefly
+# restarting mid-phase risks an abstain (bounded harm — the observe record
+# fail-opens anyway), a follower that ACKs even once resets the streak. Any
+# successful contact — ACK or deterministic reject — resets it.
+K_CONSECUTIVE_UNREACHABLE: int = 10
+
 # (round_id, validator_evm) -> consecutive deterministic-reject count.
 _SEND_REJECT_STREAKS: dict[tuple[str, str], int] = {}
+
+# (round_id, validator_evm) -> consecutive transport-failure count.
+_SEND_UNREACHABLE_STREAKS: dict[tuple[str, str], int] = {}
 
 
 def _reset_send_streaks() -> None:
     _SEND_REJECT_STREAKS.clear()
+    _SEND_UNREACHABLE_STREAKS.clear()
 
 
 async def fan_out_assignments(
@@ -629,13 +646,20 @@ async def fan_out_assignments(
     poster = post_json or _default
     skip = {e.lower() for e in (exclude or set())}
 
+    def _unreachable(key: tuple[str, str]) -> str:
+        # Transport failure: no contact was made — accrue toward the
+        # unreachable-terminal streak; the reject streak resets (it counts
+        # CONSECUTIVE deterministic rejects, and a gap is not a reject).
+        _SEND_REJECT_STREAKS.pop(key, None)
+        _SEND_UNREACHABLE_STREAKS[key] = _SEND_UNREACHABLE_STREAKS.get(key, 0) + 1
+        return SEND_UNREACHABLE
+
     async def _send_one(assignment: SliceAssignment) -> tuple[str, str]:
         evm = assignment.validator_evm.lower()
         key = (assignment.round_id, evm)
         base = (peer_urls.get(evm) or "").rstrip("/")
         if not base:
-            _SEND_REJECT_STREAKS.pop(key, None)
-            return evm, SEND_UNREACHABLE
+            return evm, _unreachable(key)
         payload = sign_payload(assignment.to_payload())
         try:
             status, _body = await poster(f"{base}{ASSIGNMENT_PATH}", payload)
@@ -643,16 +667,18 @@ async def fan_out_assignments(
             logger.info(
                 "[distributed-veto] assignment send to %s failed: %s", evm, exc,
             )
-            _SEND_REJECT_STREAKS.pop(key, None)
-            return evm, SEND_UNREACHABLE
+            return evm, _unreachable(key)
         if status in (200, 202):
             _SEND_REJECT_STREAKS.pop(key, None)
+            _SEND_UNREACHABLE_STREAKS.pop(key, None)
             return evm, SEND_ACKED
         if status in (401, 403, 404, 405, 409, 410, 422):
+            # Contact made (a live server answered) — the unreachable streak
+            # resets even though the answer was a reject.
+            _SEND_UNREACHABLE_STREAKS.pop(key, None)
             _SEND_REJECT_STREAKS[key] = _SEND_REJECT_STREAKS.get(key, 0) + 1
             return evm, SEND_UNSUPPORTED
-        _SEND_REJECT_STREAKS.pop(key, None)
-        return evm, SEND_UNREACHABLE
+        return evm, _unreachable(key)
 
     targets = [a for a in assignments if a.validator_evm.lower() not in skip]
     if not targets:
@@ -679,12 +705,25 @@ def consecutive_reject_terminal(round_id: str, validator_evm: str) -> bool:
     )
 
 
+def consecutive_unreachable_terminal(round_id: str, validator_evm: str) -> bool:
+    """Whether a validator's assignment has failed DELIVERY
+    K_CONSECUTIVE_UNREACHABLE straight times this round (so the coordinator
+    marks it terminal and ``resolve_phase`` can early-resolve ``all_terminal``
+    instead of idling to ``window_elapsed``)."""
+    return (
+        _SEND_UNREACHABLE_STREAKS.get((round_id, validator_evm.lower()), 0)
+        >= K_CONSECUTIVE_UNREACHABLE
+    )
+
+
 def forget_round_send_state(round_id: str) -> None:
-    """Drop all per-round send bookkeeping (reject streaks + signed-serve cache)
-    when a phase resolves or is evicted — else these module dicts leak one entry
-    per (round, validator) for the whole leader uptime."""
+    """Drop all per-round send bookkeeping (reject/unreachable streaks + the
+    signed-serve cache) when a phase resolves or is evicted — else these module
+    dicts leak one entry per (round, validator) for the whole leader uptime."""
     for key in [k for k in _SEND_REJECT_STREAKS if k[0] == round_id]:
         _SEND_REJECT_STREAKS.pop(key, None)
+    for key in [k for k in _SEND_UNREACHABLE_STREAKS if k[0] == round_id]:
+        _SEND_UNREACHABLE_STREAKS.pop(key, None)
     for key in [k for k in _SIGNED_SERVE_CACHE if k[0] == round_id]:
         _SIGNED_SERVE_CACHE.pop(key, None)
 
