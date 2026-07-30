@@ -15,7 +15,13 @@
 # that's already down/flapping. Run it any time the stack is unhappy — it is
 # idempotent and safe to re-run.
 #
+# Only ONE instance runs at a time (flock). A second invocation — typically the
+# hourly cron firing while a manual run is still in round-drain — logs and exits
+# 0 rather than interleaving container recreates. Override the lock path with
+# MINOTAUR_UPDATE_LOCK.
+#
 # What it does, in order:
+#   0. LOCK — take a non-blocking single-instance lock; skip if one is held.
 #   1. PREFLIGHT — verifies docker/compose, the compose file, and that the
 #      MANDATORY env vars are actually set (not left at YOUR_* placeholders).
 #      A missing signing key or fork-upstream RPC is the #1 cause of a stuck
@@ -46,10 +52,12 @@
 # this on the subnet's publish cadence, e.g. hourly from cron:
 #   0 * * * * cd /opt/minotaur/platform/validator && ./update.sh >> update.log 2>&1
 #
-# Exit codes: 0 = healthy · 1 = failed (rolled back to previous image if one
-# existed; else node still down — see the diagnosis printed above) · 2 =
-# precondition error (bad env / missing compose / docker) · 3 = rollback ALSO
-# failed (node DOWN, manual intervention required).
+# Exit codes: 0 = healthy, OR skipped because another instance holds the lock
+# (see the log line — a skip is deliberately not an error, so cron does not
+# alarm on it) · 1 = failed (rolled back to previous image if one existed; else
+# node still down — see the diagnosis printed above) · 2 = precondition error
+# (bad env / missing compose / docker / unopenable lock file) · 3 = rollback
+# ALSO failed (node DOWN, manual intervention required).
 #
 set -euo pipefail
 
@@ -95,7 +103,9 @@ for arg in "$@"; do
   case "$arg" in
     --no-pull) DO_PULL=0 ;;
     --skip-env-check) SKIP_ENV_CHECK=1 ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    # Print the whole comment header, not a hardcoded line range: the previous
+    # '2,45p' silently truncated mid-"Usage" the moment the header grew.
+    -h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown arg: $arg (see --help)"; exit 2 ;;
   esac
 done
@@ -104,6 +114,48 @@ cd "$DIR"
 log()  { printf '[update %s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 warn() { printf '[update %s] ⚠️  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 err()  { printf '[update %s] ‼️  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+
+# ── 0a. SINGLE-INSTANCE LOCK ──────────────────────────────────────────────
+# Two of these must never run at once. The round-drain below waits up to
+# DRAIN_MAX_WAIT (default 600s) before recreating, so a run started at :05 can
+# still be live when the next hourly cron fires — and a manual run straddling
+# :05 collides with cron by construction. Observed on the lead 2026-07-29:
+# a manual run and the :05 cron both sat in round-drain, on course for
+# overlapping `compose up -d` against the same project.
+#
+# The damage is not hypothetical. This script force-recreates anvils and
+# api/validator; two interleaved recreates can leave a service down, and every
+# recreate resets the api's in-memory champion state — back-to-back recreates
+# that day cost the champion a weight-emission window (burn took 100% until the
+# next round evaluated and re-POSTed a mapping).
+#
+# Non-blocking on purpose: a queued second run would recreate the stack AGAIN
+# immediately after the first finished, which is exactly what we are preventing.
+# Skipping is correct — the next cron tick picks up whatever is still pending.
+# Exits 0 because a skip is not a failure and cron must not alarm on it.
+LOCK_FILE="${MINOTAUR_UPDATE_LOCK:-$DIR/.update.lock}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE" || { err "cannot open lock file $LOCK_FILE"; exit 2; }
+  if ! flock -n 9; then
+    log "another update.sh is already running (lock: $LOCK_FILE) — skipping this run."
+    log "  the running instance may be in round-drain (up to ${MINOTAUR_DRAIN_MAX_WAIT:-600}s); it will finish on its own."
+    exit 0
+  fi
+  # FD 9 stays open for the life of the script and the lock releases when the
+  # kernel closes it — on normal exit, `set -e` abort, or a crash.
+  #
+  # CAVEAT, measured rather than assumed: children INHERIT fd 9, so killing the
+  # script does NOT free the lock immediately — an orphaned child (the drain
+  # loop's `sleep`, or `compose up --wait`) keeps holding it. Verified: SIGKILL
+  # the holder and the lock stayed held until the child exited, then freed.
+  # So a killed run blocks the next one for at most the remaining life of its
+  # longest child (SERVICE_WAIT-bounded, i.e. minutes) — self-clearing, never
+  # permanent, and no stale-lock reaper is needed. If you kill a run and want
+  # the next cron tick to proceed at once, kill its process GROUP.
+else
+  warn "flock not found — running WITHOUT a single-instance lock."
+  warn "  a concurrent run (manual + cron) can interleave container recreates."
+fi
 
 # docker compose v2 (plugin) or v1 (standalone)
 # Compose invocation. A LEAD deployment ships a dc.sh wrapper next to this script
