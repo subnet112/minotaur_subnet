@@ -186,6 +186,16 @@ class MarketSnapshot:
     raw_state: dict[str, Any] = {}             # Additional contract storage
 ```
 
+> **DEPRECATED (SDK v2 Phase B):** `prices`, `pool_states` and `dex_config`
+> are deprecated — reading them logs a one-time `DeprecationWarning` in your
+> solver logs. Replacement: do your own pool/price discovery via RPC
+> (`initialize(config["rpc_urls"])`), the way current champion lineages
+> already do. The platform stops populating these fields after
+> **2026-09-01** (evidence-gated: retirement only happens once the live-image
+> surface audit shows no solver depends on them). After that, a vendored SDK
+> reads them as **empty** — silently, with no error — so migrate before
+> relying on the fallback.
+
 Pool states contain protocol-specific data:
 - **Uniswap V3:** `token0`, `token1`, `fee`, `sqrtPriceX96`, `liquidity`
 - **Uniswap V2:** `token0`, `token1`, `reserve0`, `reserve1`

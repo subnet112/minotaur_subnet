@@ -128,10 +128,20 @@ aliases of the base while `build_typed_context` stops producing them.
 
 ### Phase B — deprecate with a signal miners actually receive
 
-1. `DeprecationWarning` on access (a `__getattr__` shim on the dataclass, so
-   reading an emptied field is visible in solver logs).
-2. The miner agent prompt and submission spec state the replacement.
-3. A dated retirement target, announced once, not implied.
+**SHIPPED 2026-07-30.** Retirement target: **2026-09-01**, evidence-gated
+(Phase C still requires a clean live-image audit regardless of the date).
+
+1. `DeprecationWarning` on access — `MarketSnapshot.__getattribute__` warns
+   once per field per process, through BOTH `warnings` and a `logger.warning`
+   (default warning filters hide DeprecationWarning outside `__main__`; the
+   log line is visible in container logs unconditionally). Reaches a miner
+   exactly when they re-vendor — and `SDK_VERSION` was bumped to `1.1.0` so
+   the re-vendored-after-warnings population is measurable.
+2. Replacement stated in `docs/solver/solver_guide.md`,
+   `docs/miner/solver-api.md`, `docs/miner/custom-solver.md`, and the miner
+   agent prompt: solver-owned RPC discovery via
+   `initialize(config["rpc_urls"])`.
+3. Dated target announced with the cross-chain scoring announcement.
 
 ### Phase C — retire on measured evidence, not on a timer
 
