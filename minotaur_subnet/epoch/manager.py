@@ -2390,14 +2390,31 @@ class EpochManager:
             submission.submission_id,
         )
         if _gate is not None:
-            _unearned = (self._champion.adoption_chains or frozenset()) - _gate
-            if _unearned:
+            _ungated_scored = (self._champion.adoption_chains or frozenset()) - _gate
+            if _ungated_scored:
+                # OBSERVATION, not a verdict. An earlier version of this line
+                # told the operator that clearing the env "would hold its
+                # successors to a bar it never had to clear", i.e. wait. That
+                # advice was UNSATISFIABLE: it fires whenever the champion
+                # scores on an excluded chain, champions routinely do, and the
+                # only way to get a champion crowned WITH the chain counted is
+                # to clear the env first. The green light it asked you to wait
+                # for could never occur.
+                #
+                # It is also the wrong question. A head-start only walls
+                # challengers if the champion delivers on orders they DON'T —
+                # which shows up as n_dropped RISING when the chain is counted,
+                # and cannot be determined here, with no challenger in hand.
+                # Measured live: a champion scoring on Base produced +0 added
+                # drops in 25 of 30 candidate comparisons, and the positives
+                # were genuine coverage failures the gate was hiding.
                 logger.info(
-                    "gate candidate: champion %s scored on %s which the gate "
-                    "excludes — it earned coverage there WITHOUT being held to "
-                    "it. Clearing ADOPTION_SCORED_CHAINS now would hold its "
-                    "successors to a bar it never had to clear.",
-                    submission.submission_id, sorted(_unearned),
+                    "champion %s scored on %s, which the gate excludes — that "
+                    "coverage is NOT counted in adoption while the gate holds. "
+                    "This is an observation, not a reason to keep the gate: "
+                    "decide by measuring whether counting the chain ADDS "
+                    "dropped orders for live challengers.",
+                    submission.submission_id, sorted(_ungated_scored),
                 )
         if self._sub_store is not None:
             await offload_write(self._sub_store.adopt, submission.submission_id)
