@@ -79,3 +79,6 @@ minotaur_subnet/store/data/*.db-shm
 
 # JS sandbox native deps (isolated-vm) — built in the Docker builder stage, never committed
 minotaur_subnet/engine/node_modules/
+
+# update.sh single-instance lock (platform/validator/update.sh)
+.update.lock
