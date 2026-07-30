@@ -4025,7 +4025,18 @@ async def initialize(ctx: ServerContext) -> dict:
                                     timeout_s=15.0,
                                 )
                                 for a in phase.assignments:
+                                    # Terminal on K consecutive deterministic
+                                    # rejects (LD 12) OR K consecutive transport
+                                    # failures — a peer whose sends fail 100%
+                                    # can never claim, and without a terminal
+                                    # mark it holds EVERY phase to the full
+                                    # window (20 min/adopt of pure wait,
+                                    # measured 2026-07-30). Either way the
+                                    # phase early-resolves all_terminal once
+                                    # every assignee is accounted for.
                                     if veto_wire.consecutive_reject_terminal(
+                                        round_id, a.validator_evm,
+                                    ) or veto_wire.consecutive_unreachable_terminal(
                                         round_id, a.validator_evm,
                                     ):
                                         veto_wire.REGISTRY.mark_unsupported(
