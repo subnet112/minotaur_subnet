@@ -268,6 +268,11 @@ Well-known contract addresses (Ethereum mainnet / Anvil fork):
 to check pool liquidity, oracle prices, protocol parameters, etc. Hardcoded
 assumptions (like fee tiers) will fail when the actual chain state differs.
 
+**Do NOT rely on `snapshot.pool_states` / `snapshot.prices` / `snapshot.dex_config`.**
+They are deprecated (SDK v2 Phase B) and the platform stops populating them after
+2026-09-01 — a solver that depends on them will silently read empty data. Discover
+pools and prices yourself via RPC (`initialize(config["rpc_urls"])`).
+
 ## Python Environment
 
 You have access to `Bash` (unrestricted) with these packages pre-installed:

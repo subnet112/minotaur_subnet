@@ -86,6 +86,45 @@ from minotaur_subnet.shared.types import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ── SDK v2 Phase B: deprecated DEX-shaped snapshot fields ──────────────────
+#
+# ``prices`` / ``pool_states`` / ``dex_config`` are Uniswap-shaped fields the
+# platform feeds solvers. They are DEPRECATED in favour of solver-owned RPC
+# discovery (the winning lineages already do this; the platform provides
+# ``initialize(config["rpc_urls"])``). Retirement TARGET 2026-09-01 —
+# evidence-gated, not a timer: the fields are removed only once
+# ``tools/solver_surface_audit.py --preset snapshot-dex`` is clean across
+# live solver images (docs/architecture/sdk-v2-migration.md Phase C).
+#
+# The warning fires ON ACCESS (the doc's "signal miners actually receive"):
+# solvers vendor this file, so the shim reaches a miner exactly when they
+# re-vendor — and their solver logs then show every read of a field whose
+# feed will go away. Once per field per process: a signal, not a firehose.
+# Emitted through BOTH channels because default warning filters hide
+# DeprecationWarning in most non-__main__ contexts, while a logger.warning
+# is visible in container logs unconditionally.
+_DEPRECATED_SNAPSHOT_FIELDS = frozenset({"prices", "pool_states", "dex_config"})
+_SNAPSHOT_RETIREMENT_TARGET = "2026-09-01"
+_snapshot_deprecation_warned: set = set()
+
+
+def _warn_deprecated_snapshot_field(name: str) -> None:
+    if name in _snapshot_deprecation_warned:
+        return
+    _snapshot_deprecation_warned.add(name)
+    msg = (
+        f"MarketSnapshot.{name} is deprecated: do your own pool/price "
+        f"discovery via RPC (initialize(config['rpc_urls'])). The platform "
+        f"stops populating this field after {_SNAPSHOT_RETIREMENT_TARGET} "
+        f"(evidence-gated — see docs/architecture/sdk-v2-migration.md); a "
+        f"vendored SDK will then read it as EMPTY, silently, with no error."
+    )
+    import logging as _logging
+    import warnings as _warnings
+    _warnings.warn(msg, DeprecationWarning, stacklevel=3)
+    _logging.getLogger(__name__).warning(msg)
+
+
 @dataclass
 class MarketSnapshot:
     """Point-in-time market data for plan generation.
@@ -93,6 +132,11 @@ class MarketSnapshot:
     Used primarily for benchmarking and as a fallback when RPC access is
     unavailable. Production solvers should prefer querying on-chain state
     directly via RPC URLs provided in ``initialize(config["rpc_urls"])``.
+
+    DEPRECATION (SDK v2 Phase B): ``prices``, ``pool_states`` and
+    ``dex_config`` are deprecated — reading them logs a one-time warning.
+    Replacement: solver-owned RPC discovery. Retirement target 2026-09-01,
+    gated on the live-image surface audit coming back clean.
 
     Attributes:
         chain_id: Target chain ID (e.g., 1 for Ethereum, 8453 for Base).
@@ -120,6 +164,14 @@ class MarketSnapshot:
     balances: dict[str, str] = field(default_factory=dict)
     dex_config: dict[str, Any] = field(default_factory=dict)
     raw_state: dict[str, Any] = field(default_factory=dict)
+
+    def __getattribute__(self, name: str):
+        # Phase B deprecation signal — see _warn_deprecated_snapshot_field.
+        # Fast path first: this runs on EVERY attribute read, so the common
+        # case must stay one frozenset membership test.
+        if name in _DEPRECATED_SNAPSHOT_FIELDS:
+            _warn_deprecated_snapshot_field(name)
+        return object.__getattribute__(self, name)
 
     @classmethod
     def empty(cls, chain_id: int = 31337) -> "MarketSnapshot":
