@@ -261,6 +261,94 @@ class TestFanOut:
         assert sent["0xv1"]["url"] == "http://v1:8080" + veto_wire.ASSIGNMENT_PATH
 
 
+class TestUnreachableTerminal:
+    """A peer whose assignment can never be DELIVERED must become terminal —
+    else one dead validator holds every phase to window_elapsed (measured
+    2026-07-30: 20 min of pure post-vote wait per adopt round)."""
+
+    def setup_method(self):
+        veto_wire._reset_send_streaks()
+
+    @pytest.mark.asyncio
+    async def test_streak_accrues_to_terminal(self):
+        a, _ = _assignment(validator="0xdead")
+
+        async def refuse(url, payload):
+            raise ConnectionError("refused")
+
+        for i in range(veto_wire.K_CONSECUTIVE_UNREACHABLE):
+            assert not veto_wire.consecutive_unreachable_terminal(
+                a.round_id, "0xdead"
+            ), f"terminal too early at {i}"
+            await fan_out_assignments(
+                [a], peer_urls={"0xdead": "http://dead:8080"},
+                sign_payload=lambda p: p, post_json=refuse,
+            )
+        assert veto_wire.consecutive_unreachable_terminal(a.round_id, "0xdead")
+        # ...and resolve_phase turns the marked phase all_terminal
+        from minotaur_subnet.epoch.distributed_veto import resolve_phase
+        phase = VetoPhaseState(
+            candidate_submission_id="sub_1", candidate_image_id=_DIGEST_A,
+            deadline_epoch=100, assignments=[a], unsupported=["0xdead"],
+        )
+        assert resolve_phase(phase, current_epoch=5) == ("resolve", "all_terminal")
+
+    @pytest.mark.asyncio
+    async def test_any_contact_resets_the_streak(self):
+        a, _ = _assignment(validator="0xflaky")
+        calls = {"n": 0}
+
+        async def flaky(url, payload):
+            calls["n"] += 1
+            if calls["n"] % veto_wire.K_CONSECUTIVE_UNREACHABLE == 0:
+                return 409, {"detail": "busy"}   # deterministic reject = contact
+            raise ConnectionError("down")
+
+        for _ in range(veto_wire.K_CONSECUTIVE_UNREACHABLE * 2):
+            await fan_out_assignments(
+                [a], peer_urls={"0xflaky": "http://flaky:8080"},
+                sign_payload=lambda p: p, post_json=flaky,
+            )
+        # periodic contact keeps it non-terminal on the unreachable axis
+        assert not veto_wire.consecutive_unreachable_terminal(a.round_id, "0xflaky")
+
+    @pytest.mark.asyncio
+    async def test_missing_url_accrues(self):
+        a, _ = _assignment(validator="0xnourl")
+        for _ in range(veto_wire.K_CONSECUTIVE_UNREACHABLE):
+            await fan_out_assignments(
+                [a], peer_urls={}, sign_payload=lambda p: p,
+                post_json=AsyncMock(),
+            )
+        assert veto_wire.consecutive_unreachable_terminal(a.round_id, "0xnourl")
+
+    @pytest.mark.asyncio
+    async def test_ack_clears_both_streaks(self):
+        a, _ = _assignment(validator="0xok")
+
+        async def refuse(url, payload):
+            raise ConnectionError("down")
+
+        async def ok(url, payload):
+            return 200, {"accepted": True}
+
+        for _ in range(veto_wire.K_CONSECUTIVE_UNREACHABLE - 1):
+            await fan_out_assignments(
+                [a], peer_urls={"0xok": "http://ok:8080"},
+                sign_payload=lambda p: p, post_json=refuse,
+            )
+        await fan_out_assignments(
+            [a], peer_urls={"0xok": "http://ok:8080"},
+            sign_payload=lambda p: p, post_json=ok,
+        )
+        assert not veto_wire.consecutive_unreachable_terminal(a.round_id, "0xok")
+
+    def test_forget_round_clears_unreachable_state(self):
+        veto_wire._SEND_UNREACHABLE_STREAKS[("round-e9-n1", "0xdead")] = 99
+        veto_wire.forget_round_send_state("round-e9-n1")
+        assert ("round-e9-n1", "0xdead") not in veto_wire._SEND_UNREACHABLE_STREAKS
+
+
 # ── follower: accept + supersession ──────────────────────────────────────────
 
 class _FakeTask:
