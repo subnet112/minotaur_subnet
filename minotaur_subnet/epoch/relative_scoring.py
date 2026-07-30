@@ -297,28 +297,35 @@ def adoption_scored_chains() -> frozenset[int] | None:
 
     HOW TO BRING A GATED CHAIN BACK IN (the reason this env exists)
     --------------------------------------------------------------
-    Clearing this env is only safe once the CURRENT champion was itself made to
-    earn coverage on the chain. Clear it while the incumbent holds an unearned
-    head-start there and you recreate the exact wall the gate was added to
-    remove: the incumbent delivers value on orders the challenger has no row
-    for, each one lands as ``dropped``, and ``n_dropped == 0`` is an absolute
-    veto — no challenger can be adopted, however good it is. That failure mode
-    ran for 46 hours and 19 consecutive rounds before the gate was introduced.
+    The risk being managed: if the incumbent delivers value on orders the
+    challenger has no row for, each lands as ``dropped``, and ``n_dropped == 0``
+    is an absolute veto — no challenger can be adopted, however good. That ran
+    for 46 hours and 19 consecutive rounds before the gate existed.
 
-    :func:`scoring_chains_from_rows` is snapshotted onto the champion at every
-    hot-swap (``ChampionInfo.adoption_chains``, persisted next to the blind-spot
-    bar) precisely so that question is answerable. The swap logs both sets, and
-    logs a ``gate candidate`` line when the new champion scored on a chain the
-    gate excludes — i.e. it earned coverage there WITHOUT being held to it, so
-    clearing now would hold its successors to a bar it never cleared.
+    DECIDE BY MEASUREMENT, NOT BY THE SWAP LOG. An earlier version of this
+    docstring said to wait for "a champion crowned with the chain counted (no
+    ``gate candidate`` warning)". That was CIRCULAR — a champion can only be
+    crowned with the chain counted after the env is cleared, so the condition
+    could never be met. The swap-time log line is an observation about what the
+    champion covers; it cannot see any challenger and so cannot answer the
+    question that matters.
 
-    The safe sequence is therefore:
+    The question that matters is whether counting the chain ADDS dropped orders
+    for live challengers. Recompute a completed round's candidates both ways —
+    ``adoption_chains={1}`` vs ``None`` — over the rows the verdict actually
+    used, and compare ``n_dropped``:
 
-      1. leave the gate set; let champions turn over normally;
-      2. wait for a champion whose ``adoption_chains`` INCLUDE the gated chain
-         AND which was crowned with the chain counted (no ``gate candidate``
-         warning) — that champion has genuinely earned the coverage;
-      3. clear the env, fleet-uniform, on a round boundary.
+      * ``n_dropped`` unchanged  -> counting the chain creates no new hard veto;
+      * ``n_dropped`` rises      -> those are REAL coverage failures the gate is
+        hiding, not artifacts. Under the no-regressions rule vetoing them is the
+        correct outcome; the question is only whether you want them enforced.
+
+    Read the rows FRESH — within the round, before the next round's incumbent
+    re-bench overwrites them. Retrospective recomputes produce large phantom
+    deltas (measured: +43 on a round whose real verdict had none) because the
+    two sides' rows no longer come from the same corpus. ``per_order`` LENGTH
+    vs the candidate's row count is the one signal that stays valid at any age:
+    equal means the champion was benched on the candidates' set.
 
     Reading the gate from the champion record instead of this env is the
     remaining step that retires it entirely. Deliberately NOT done here: it
