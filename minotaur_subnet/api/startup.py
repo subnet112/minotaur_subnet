@@ -4026,22 +4026,30 @@ async def initialize(ctx: ServerContext) -> dict:
                                 )
                                 for a in phase.assignments:
                                     # Terminal on K consecutive deterministic
-                                    # rejects (LD 12) OR K consecutive transport
-                                    # failures — a peer whose sends fail 100%
-                                    # can never claim, and without a terminal
-                                    # mark it holds EVERY phase to the full
-                                    # window (20 min/adopt of pure wait,
-                                    # measured 2026-07-30). Either way the
-                                    # phase early-resolves all_terminal once
-                                    # every assignee is accounted for.
+                                    # rejects (LD 12) OR K consecutive sends
+                                    # without an ACK of ANY kind — a peer whose
+                                    # assignment never lands can never claim,
+                                    # and without a terminal mark it holds
+                                    # EVERY phase to the full window (20
+                                    # min/adopt of pure wait, measured
+                                    # 2026-07-30). Either way the phase
+                                    # early-resolves all_terminal once every
+                                    # assignee is accounted for.
                                     if veto_wire.consecutive_reject_terminal(
                                         round_id, a.validator_evm,
-                                    ) or veto_wire.consecutive_unreachable_terminal(
+                                    ) or veto_wire.consecutive_undelivered_terminal(
                                         round_id, a.validator_evm,
                                     ):
-                                        veto_wire.REGISTRY.mark_unsupported(
+                                        if veto_wire.REGISTRY.mark_unsupported(
                                             round_id, a.validator_evm,
-                                        )
+                                        ):
+                                            logger.info(
+                                                "[distributed-veto] round %s: "
+                                                "%s marked terminal (assignment"
+                                                " undeliverable) — phase can "
+                                                "early-resolve", round_id,
+                                                a.validator_evm,
+                                            )
                         # STREAMING re-verify: dispatch per not-yet-covered veto-
                         # responder as they arrive (each veto gets the full remaining
                         # interior window to confirm), finalize once the full claim
