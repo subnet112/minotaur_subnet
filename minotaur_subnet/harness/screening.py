@@ -733,6 +733,42 @@ def run_stage_1(repo_path: str) -> StageResult:
                 **_dw_fields,
             )
 
+    # Deprecated-wire-surface scan (migration-ladder intake gate, see
+    # harness/deprecated_surface.py). Observe by DEFAULT: log-only, produces
+    # the blast-radius numbers arming requires. Enforce rejects with the
+    # exact lines named, so the miner knows what to change — never a
+    # population-keyed judgment (the 2026-07-29 lesson).
+    from minotaur_subnet.harness import deprecated_surface as _dsf
+    _dsf_mode = _dsf.deprecated_surface_mode()
+    if _dsf_mode != "off":
+        _dsf_hits = _dsf.surface_hits(repo_path)
+        if _dsf_hits:
+            _shown = "; ".join(_dsf_hits[:3]) + ("; …" if len(_dsf_hits) > 3 else "")
+            logger.warning(
+                "[deprecated-surface] %d read(s) of deprecated wire fields "
+                "v%d (%s): %s repo=%s",
+                len(_dsf_hits), _dsf.DEPRECATED_SURFACE_VERSION,
+                "ENFORCE → reject" if _dsf_mode == "enforce"
+                else "observe-only, not gated",
+                _shown, repo_path,
+            )
+            if _dsf_mode == "enforce":
+                return StageResult(
+                    stage=1, passed=False,
+                    duration_ms=_elapsed(start),
+                    details=(
+                        f"Reads deprecated wire field(s) "
+                        f"{'/'.join(_dsf.DEPRECATED_WIRE_SYMBOLS)} — deprecated "
+                        f"since SDK 1.1.0, the platform stops populating them "
+                        f"after 2026-09-01 (they will read as EMPTY, silently). "
+                        f"Use your own RPC discovery "
+                        f"(initialize(config['rpc_urls'])). First hits: {_shown}"
+                    ),
+                    error_code="deprecated_surface",
+                    max_region_nodes=factor_nodes,
+                    **_dw_fields,
+                )
+
     return StageResult(
         stage=1, passed=True,
         duration_ms=_elapsed(start),
