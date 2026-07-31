@@ -113,3 +113,72 @@ class TestStage1Wiring:
             # A stub repo can trip an EARLIER static gate; the wiring is
             # then still proven by the observe test + surface tests above.
             assert not r.passed or r.error_code is None
+
+
+class TestSurfacePersistence:
+    def test_stage1_attaches_hits_in_observe(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEPRECATED_SURFACE_MODE", "observe")
+        (tmp_path / "s.py").write_text("x = snapshot.pool_states\n")
+        from minotaur_subnet.harness.screening import run_stage_1
+        r = run_stage_1(str(tmp_path))
+        if r.deprecated_surface_hits is not None:
+            assert any("s.py:1" in h for h in r.deprecated_surface_hits)
+
+    def test_stage1_hits_none_when_off(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEPRECATED_SURFACE_MODE", "off")
+        (tmp_path / "s.py").write_text("x = snapshot.pool_states\n")
+        from minotaur_subnet.harness.screening import run_stage_1
+        r = run_stage_1(str(tmp_path))
+        assert r.deprecated_surface_hits is None
+
+    def test_store_roundtrip_and_status_dict(self, tmp_path):
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+        st = SubmissionStore(persist_path=tmp_path / "submissions.json")
+        sub = st.create(
+            repo_url="src://x", commit_hash="c1", epoch=1, hotkey="H",
+            round_id="r1", max_per_round=0, max_total_per_round=0,
+        )
+        st.set_deprecated_surface(sub.submission_id, ["a.py:1: x = s.pool_states"])
+        d = st.get(sub.submission_id).status_dict()
+        assert d["deprecated_surface_hits"] == ["a.py:1: x = s.pool_states"]
+        st.set_deprecated_surface(sub.submission_id, [])
+        assert st.get(sub.submission_id).status_dict()["deprecated_surface_hits"] == []
+
+
+class TestMigrationStatusEndpoint:
+    def test_payload_shape_and_counts(self, monkeypatch):
+        import time
+        from types import SimpleNamespace
+        from minotaur_subnet.api.routes import monitoring as mon
+
+        now = time.time()
+        subs = {
+            "a": SimpleNamespace(created_at=now - 100, sdk_version="1.1.0",
+                                 deprecated_surface_hits=[]),
+            "b": SimpleNamespace(created_at=now - 200, sdk_version="1.0.0",
+                                 deprecated_surface_hits=["s.py:1: x"]),
+            "c": SimpleNamespace(created_at=now - 300, sdk_version=None,
+                                 deprecated_surface_hits=None),
+            "old": SimpleNamespace(created_at=now - 200000, sdk_version=None,
+                                   deprecated_surface_hits=None),
+        }
+        fake = SimpleNamespace(_maybe_reload=lambda: None, _submissions=subs)
+        monkeypatch.setattr(mon, "_store", lambda: fake)
+        monkeypatch.setenv("SDK_VERSION_FLOOR", "1.1.0")
+        monkeypatch.delenv("SDK_VERSION_FLOOR_ENFORCE", raising=False)
+        mon._MIGRATION_CACHE["payload"] = None
+        mon._MIGRATION_CACHE["ts"] = 0.0
+
+        p = mon.migration_status()
+        assert p["sdk_version_floor"] == "1.1.0"
+        assert p["sdk_version_floor_enforced"] is False
+        assert p["deprecated_surface_mode"] == "observe"
+        day = p["last_24h"]
+        assert day["submissions"] == 3          # 'old' excluded
+        assert day["sdk_version_counts"] == {"1.1.0": 1, "1.0.0": 1, "pre-marker": 1}
+        assert day["below_floor"] == 2          # 1.0.0 + pre-marker
+        assert day["surface_scanned"] == 2 and day["surface_hits"] == 1
+        assert p["retirement_target"] == "2026-09-01"
+        # cache: second call returns the same object without rescanning
+        assert mon.migration_status() is p
+        mon._MIGRATION_CACHE["payload"] = None

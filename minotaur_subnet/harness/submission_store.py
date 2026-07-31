@@ -357,6 +357,11 @@ class Submission:
     # See sdk/version.py.
     sdk_version: str | None = None
     solver_version: str | None = None
+    # Deprecated-wire-surface hits from screening stage 1 ("path:line: code",
+    # harness/deprecated_surface.py). None = not scanned (mode off / legacy
+    # record); [] = scanned clean. OBSERVE-ONLY telemetry: powers the miner
+    # dashboard's "reads deprecated fields" flag; nothing gates on it here.
+    deprecated_surface_hits: list[str] | None = None
 
     # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
     # free text, so the store coins each distinct non-boilerplate name to the
@@ -453,6 +458,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "sdk_version": self.sdk_version,
+            "deprecated_surface_hits": self.deprecated_surface_hits,
             "is_copycat": self.is_copycat,
             "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
@@ -484,6 +490,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "sdk_version": self.sdk_version,
+            "deprecated_surface_hits": self.deprecated_surface_hits,
             "display_name": self.display_name,
             "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
@@ -883,6 +890,7 @@ class SubmissionStore:
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
             sdk_version=record.get("sdk_version"),
+            deprecated_surface_hits=record.get("deprecated_surface_hits"),
             is_copycat=bool(record.get("is_copycat", False)),
             coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
@@ -1413,6 +1421,25 @@ class SubmissionStore:
                 continue
             out.append((sub.hotkey or "", sub.submission_id, status))
         return out
+
+    @_write_locked
+    def set_deprecated_surface(
+        self, submission_id: str, hits: list[str] | None,
+    ) -> None:
+        """Persist the stage-1 deprecated-wire-surface scan result.
+
+        Same independent-fact discipline as ``set_sdk_version``: written on
+        its own, persist-on-reject friendly (a rejected submission still
+        records what it read). ``[]`` means scanned-and-clean — distinct
+        from None (not scanned), which the dashboard renders differently.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.deprecated_surface_hits = list(hits) if hits is not None else None
+        sub.updated_at = time.time()
+        self._persist_records([sub])
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:
