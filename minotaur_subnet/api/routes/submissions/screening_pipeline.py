@@ -45,6 +45,7 @@ from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
     OUTCOME_COPYCAT_CODE,
+    OUTCOME_SDK_FLOOR,
     OUTCOME_STRUCTURAL_DUPLICATE,
     SubmissionStatus,
     offload_write,
@@ -1537,6 +1538,38 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # deliberately: it is the meaningful "pre-marker" reading, not a
         # missing one.
         await offload_write(store.set_sdk_version, submission_id, s2.sdk_version)
+
+        # SDK version floor (migration-ladder coordination gate — see
+        # harness/deprecated_surface.py). Placed pre-stage-3 so a floored
+        # submission never spends a smoke test. Observe unless
+        # SDK_VERSION_FLOOR_ENFORCE=1. Self-reported value: this gate
+        # ENCOURAGES re-vendoring; the deprecated-surface scan is the proof.
+        from minotaur_subnet.harness import deprecated_surface as _dsf
+        _floor = _dsf.sdk_version_floor()
+        if _floor and _dsf.below_floor(s2.sdk_version, _floor):
+            if _dsf.sdk_floor_enforced():
+                await offload_write(store.reject,
+                    submission_id,
+                    (
+                        f"vendored SDK generation "
+                        f"{s2.sdk_version or 'pre-marker (no SDK_VERSION)'} is "
+                        f"below the submission floor {_floor}. Re-vendor the "
+                        f"SDK from the current baseline "
+                        f"(subnet112/minotaur-solver) — it also carries the "
+                        f"deprecation warnings your solver logs need."
+                    ),
+                    outcome_code=OUTCOME_SDK_FLOOR,
+                )
+                logger.info(
+                    "Submission %s rejected by SDK floor: reports %s < %s",
+                    submission_id, s2.sdk_version, _floor,
+                )
+                return
+            logger.warning(
+                "[sdk-floor] submission %s reports %s < floor %s "
+                "(observe-only, not gated)",
+                submission_id, s2.sdk_version or "pre-marker", _floor,
+            )
 
         # Extract solver info from stage 2 details.
         if ":" in s2.details:
