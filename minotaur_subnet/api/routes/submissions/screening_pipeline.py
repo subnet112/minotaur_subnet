@@ -1231,6 +1231,15 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if s1.structural_fingerprint:
             await offload_write(store.set_structural_fingerprint, submission_id, s1.structural_fingerprint)
 
+        # Deprecated-wire-surface scan result — persist-on-reject like the
+        # metrics above ([] = scanned clean, None = mode off). Powers the
+        # miner dashboard's per-submission migration flag.
+        if s1.deprecated_surface_hits is not None:
+            await offload_write(
+                store.set_deprecated_surface,
+                submission_id, s1.deprecated_surface_hits,
+            )
+
         if not s1.passed:
             return  # set_screening_result already rejected
 
