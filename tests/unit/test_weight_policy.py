@@ -40,7 +40,7 @@ def test_champion_miner_weight_fraction_is_pinned():
     # it, and never let the change sit on develop unpromoted (the leader holds the
     # supermajority of validator stake, so it alone moves consensus and every
     # third-party validator still on the old value gets its vtrust clipped).
-    assert CHAMPION_MINER_WEIGHT_FRACTION == 0.75
+    assert CHAMPION_MINER_WEIGHT_FRACTION == 0.20
 
 
 def test_build_weights_ramps_champion_with_owner_burn():
@@ -75,8 +75,8 @@ def test_get_subnet_owner_hotkey_constant_fallback(monkeypatch):
 
 
 def test_burn_applies_via_constant_when_env_absent(monkeypatch):
-    # With no env owner, the constant fallback STILL burns 25% — not 100% to the
-    # miner (the fail-open bug that let a champion pocket the full pool).
+    # With no env owner, the constant fallback STILL burns the owner share — not
+    # 100% to the miner (the fail-open bug that let a champion pocket the full pool).
     monkeypatch.delenv("SUBNET_OWNER_HOTKEY", raising=False)
     monkeypatch.delenv("OWNER_HOTKEY", raising=False)
     w = build_bootstrap_or_champion_weights("5Gminer", owner_hotkey=None)
