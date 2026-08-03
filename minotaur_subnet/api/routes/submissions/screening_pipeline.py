@@ -45,6 +45,8 @@ from minotaur_subnet.harness.actor import snapshot_resolver
 from minotaur_subnet.harness.submission_store import (
     OUTCOME_BUILD_BUDGET,
     OUTCOME_COPYCAT_CODE,
+    OUTCOME_SDK_FLOOR,
+    OUTCOME_STRUCTURAL_DUPLICATE,
     SubmissionStatus,
     offload_write,
 )
@@ -188,6 +190,41 @@ _SWEEPABLE_STATUSES = frozenset({
     "screening_stage_3",
     "pending_selection",
 })
+
+
+def structural_duplicates_same_operator(
+    live: list[tuple[str, str, str]],
+    *,
+    hotkey: str,
+    resolver: Any,
+) -> list[str]:
+    """Ids among ``live`` owned by the SAME operator as ``hotkey``.
+
+    The per-operator half of ``STRUCTURAL_DEDUP_MODE=reject``: an operator
+    re-rolling the same logic under new salts/names holds ONE queue seat per
+    distinct structure — further copies are rejected at intake with the
+    original named.
+
+    Two deliberate boundaries:
+
+    * CROSS-operator structural matches are never returned. The structural
+      fingerprint cannot separate a copy from an improvement (2026-07-29: a
+      champion fork with a real -123-node factorization win kept the
+      champion's exact fingerprint), so enforcement across operators starves
+      fork-and-improve — that axis belongs to the operator-merge machinery
+      and the content-fingerprint copycat reject, not here.
+    * Operator identity is CONSERVATIVE, same doctrine as the copy reject:
+      ``resolver.mapped`` returns None for a hotkey with no on-chain coldkey
+      (indeterminate), and an indeterminate identity never matches anything —
+      the check stands down rather than guessing.
+
+    ``live`` is ``(hotkey, submission_id, status)`` from
+    ``SubmissionStore.structural_fingerprint_live``.
+    """
+    me = resolver.mapped(hotkey or "")
+    if not me:
+        return []
+    return [sid for hk, sid, _st in live if hk and resolver.mapped(hk) == me]
 
 
 def evaluate_fingerprint_ownership(
@@ -1194,6 +1231,15 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         if s1.structural_fingerprint:
             await offload_write(store.set_structural_fingerprint, submission_id, s1.structural_fingerprint)
 
+        # Deprecated-wire-surface scan result — persist-on-reject like the
+        # metrics above ([] = scanned clean, None = mode off). Powers the
+        # miner dashboard's per-submission migration flag.
+        if s1.deprecated_surface_hits is not None:
+            await offload_write(
+                store.set_deprecated_surface,
+                submission_id, s1.deprecated_surface_hits,
+            )
+
         if not s1.passed:
             return  # set_screening_result already rejected
 
@@ -1295,6 +1341,57 @@ async def _run_screening_pipeline(submission_id: str) -> None:
                     outcome_code="fingerprint_repeat",
                 )
                 return
+
+        # One queue seat per (OPERATOR, structure) — STRUCTURAL_DEDUP_MODE=
+        # reject. The structural fingerprint is salt-invariant, so the same
+        # logic re-rolled under new names/nonces from the SAME operator adds
+        # nothing: reject it pre-build and NAME the submission already
+        # holding the seat, so the miner knows exactly what to change (the
+        # logic) and what not to bother with (the salt). Per-operator ONLY,
+        # and stands down without coldkey attribution — see
+        # structural_duplicates_same_operator for both boundaries.
+        from minotaur_subnet.harness.structural_fingerprint import (
+            structural_dedup_mode,
+        )
+        if structural_dedup_mode() == "reject" and s1.structural_fingerprint:
+            _live_same = store.structural_fingerprint_live(
+                s1.structural_fingerprint, exclude_submission_id=submission_id,
+            )
+            if _live_same:
+                _sres = snapshot_resolver()
+                if _sres is None:
+                    logger.debug(
+                        "structural duplicate reject standing down for %s: no "
+                        "coldkey attribution available",
+                        submission_id,
+                    )
+                else:
+                    _dups = structural_duplicates_same_operator(
+                        _live_same, hotkey=sub.hotkey or "", resolver=_sres,
+                    )
+                    if _dups:
+                        await offload_write(store.reject,
+                            submission_id,
+                            (
+                                f"structurally identical to your own queued "
+                                f"submission {_dups[0]} (structural fingerprint "
+                                f"{s1.structural_fingerprint[:12]}…, matched "
+                                f"across your hotkeys). Rename, reorder, salt "
+                                f"and nonce edits do not make code new — one "
+                                f"queue seat per distinct structure per "
+                                f"operator. Improve the logic, or wait for "
+                                f"{_dups[0]} to resolve."
+                            ),
+                            outcome_code=OUTCOME_STRUCTURAL_DUPLICATE,
+                        )
+                        logger.info(
+                            "Submission %s rejected as same-operator structural "
+                            "duplicate of %s (fp %s, %d live sibling(s), map=%s)",
+                            submission_id, _dups[0],
+                            s1.structural_fingerprint[:12], len(_dups),
+                            _sres.source,
+                        )
+                        return
 
         # Terminal check BEFORE asking for a build unit: close-time rotation can
         # have parked this submission (waitlist/reject) while stage 1 was still
@@ -1450,6 +1547,38 @@ async def _run_screening_pipeline(submission_id: str) -> None:
         # deliberately: it is the meaningful "pre-marker" reading, not a
         # missing one.
         await offload_write(store.set_sdk_version, submission_id, s2.sdk_version)
+
+        # SDK version floor (migration-ladder coordination gate — see
+        # harness/deprecated_surface.py). Placed pre-stage-3 so a floored
+        # submission never spends a smoke test. Observe unless
+        # SDK_VERSION_FLOOR_ENFORCE=1. Self-reported value: this gate
+        # ENCOURAGES re-vendoring; the deprecated-surface scan is the proof.
+        from minotaur_subnet.harness import deprecated_surface as _dsf
+        _floor = _dsf.sdk_version_floor()
+        if _floor and _dsf.below_floor(s2.sdk_version, _floor):
+            if _dsf.sdk_floor_enforced():
+                await offload_write(store.reject,
+                    submission_id,
+                    (
+                        f"vendored SDK generation "
+                        f"{s2.sdk_version or 'pre-marker (no SDK_VERSION)'} is "
+                        f"below the submission floor {_floor}. Re-vendor the "
+                        f"SDK from the current baseline "
+                        f"(subnet112/minotaur-solver) — it also carries the "
+                        f"deprecation warnings your solver logs need."
+                    ),
+                    outcome_code=OUTCOME_SDK_FLOOR,
+                )
+                logger.info(
+                    "Submission %s rejected by SDK floor: reports %s < %s",
+                    submission_id, s2.sdk_version, _floor,
+                )
+                return
+            logger.warning(
+                "[sdk-floor] submission %s reports %s < floor %s "
+                "(observe-only, not gated)",
+                submission_id, s2.sdk_version or "pre-marker", _floor,
+            )
 
         # Extract solver info from stage 2 details.
         if ":" in s2.details:

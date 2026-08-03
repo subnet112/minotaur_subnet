@@ -397,6 +397,7 @@ async def _independent_adopt_vote(
         run_benchmark,
     )
     from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
         deadwood_delta_between,
         evaluate_relative_adoption,
         factor_delta_between,
@@ -455,7 +456,13 @@ async def _independent_adopt_vote(
         # blind-spot cover, so a first champion that delivers value on ANY order
         # adopts (no incumbent benchmark). MUST NOT auto-reject: that would deadlock
         # the very first adoption.
-        verdict = evaluate_relative_adoption([], chal_results)
+        # Gated even at bootstrap: an off-gate chain must not be able to crown
+        # the FIRST champion either, or the gate's whole premise inverts — the
+        # incumbent would be crowned on coverage no later challenger is allowed
+        # to be credited for.
+        verdict = evaluate_relative_adoption(
+            [], chal_results, adoption_chains=adoption_scored_chains(),
+        )
         adopt = bool(verdict["adopt"])
         counts = _counts(verdict)
         logger.info(
@@ -581,6 +588,7 @@ async def _independent_adopt_vote(
         champ_results, chal_results,
         factor_delta=factor_delta,
         deadwood_delta=deadwood_delta,
+        adoption_chains=adoption_scored_chains(),
         **_bar_kwargs(incumbent_sub),
     )
     adopt = bool(verdict["adopt"])

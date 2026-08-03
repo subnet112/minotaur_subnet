@@ -390,13 +390,17 @@ class VetoPhaseRegistry:
     def clear(self) -> None:
         self._phases.clear()
 
-    def mark_unsupported(self, round_id: str, validator_evm: str) -> None:
+    def mark_unsupported(self, round_id: str, validator_evm: str) -> bool:
+        """Idempotently mark a validator terminal for the phase; True only when
+        newly marked (so the caller can log the transition exactly once)."""
         phase = self._phases.get(round_id)
         if phase is None:
-            return
+            return False
         evm = validator_evm.lower()
         if evm not in phase.unsupported:
             phase.unsupported.append(evm)
+            return True
+        return False
 
     def record_response(
         self, round_id: str, response: VetoResponse,
@@ -585,12 +589,30 @@ def build_assignments(
 # follower's slice.
 K_CONSECUTIVE_UNSUPPORTED: int = 3
 
+# A validator whose assignment is never DELIVERED — K consecutive sends
+# without an ACK, of ANY failure kind — also becomes terminal. The counter
+# deliberately mixes transport failures AND deterministic rejects: the first
+# cut of this feature kept two mutually-resetting streaks (reject vs
+# unreachable), and a live peer that ping-pongs quick-401 / 15s-hang defeated
+# both thresholds forever (observed 2026-07-30: 28 logged timeouts interleaved
+# with silent 401s → zero terminal marks → window_elapsed anyway). ONLY a
+# 200/202 ACK proves the assignment landed; everything else is a failed
+# delivery and accrues. 10 straight at the tick-driven resend cadence
+# (~20-60s apart) ≈ 3-10 min of sustained failure; a follower briefly
+# restarting mid-phase risks only an abstain (bounded harm — the observe
+# record fail-opens at the window regardless).
+K_CONSECUTIVE_UNDELIVERED: int = 10
+
 # (round_id, validator_evm) -> consecutive deterministic-reject count.
 _SEND_REJECT_STREAKS: dict[tuple[str, str], int] = {}
+
+# (round_id, validator_evm) -> consecutive sends WITHOUT an ACK (any failure).
+_SEND_UNDELIVERED_STREAKS: dict[tuple[str, str], int] = {}
 
 
 def _reset_send_streaks() -> None:
     _SEND_REJECT_STREAKS.clear()
+    _SEND_UNDELIVERED_STREAKS.clear()
 
 
 async def fan_out_assignments(
@@ -629,13 +651,20 @@ async def fan_out_assignments(
     poster = post_json or _default
     skip = {e.lower() for e in (exclude or set())}
 
+    def _unreachable(key: tuple[str, str]) -> str:
+        # Transport failure: no contact was made — accrue toward the
+        # undelivered-terminal streak; the reject streak resets (it counts
+        # CONSECUTIVE deterministic rejects, and a gap is not a reject).
+        _SEND_REJECT_STREAKS.pop(key, None)
+        _SEND_UNDELIVERED_STREAKS[key] = _SEND_UNDELIVERED_STREAKS.get(key, 0) + 1
+        return SEND_UNREACHABLE
+
     async def _send_one(assignment: SliceAssignment) -> tuple[str, str]:
         evm = assignment.validator_evm.lower()
         key = (assignment.round_id, evm)
         base = (peer_urls.get(evm) or "").rstrip("/")
         if not base:
-            _SEND_REJECT_STREAKS.pop(key, None)
-            return evm, SEND_UNREACHABLE
+            return evm, _unreachable(key)
         payload = sign_payload(assignment.to_payload())
         try:
             status, _body = await poster(f"{base}{ASSIGNMENT_PATH}", payload)
@@ -643,16 +672,21 @@ async def fan_out_assignments(
             logger.info(
                 "[distributed-veto] assignment send to %s failed: %s", evm, exc,
             )
-            _SEND_REJECT_STREAKS.pop(key, None)
-            return evm, SEND_UNREACHABLE
+            return evm, _unreachable(key)
         if status in (200, 202):
             _SEND_REJECT_STREAKS.pop(key, None)
+            _SEND_UNDELIVERED_STREAKS.pop(key, None)
             return evm, SEND_ACKED
         if status in (401, 403, 404, 405, 409, 410, 422):
+            # A reject is contact — but NOT delivery. It accrues on the
+            # undelivered streak too; only an ACK resets that one (see the
+            # ping-pong note on K_CONSECUTIVE_UNDELIVERED).
+            _SEND_UNDELIVERED_STREAKS[key] = (
+                _SEND_UNDELIVERED_STREAKS.get(key, 0) + 1
+            )
             _SEND_REJECT_STREAKS[key] = _SEND_REJECT_STREAKS.get(key, 0) + 1
             return evm, SEND_UNSUPPORTED
-        _SEND_REJECT_STREAKS.pop(key, None)
-        return evm, SEND_UNREACHABLE
+        return evm, _unreachable(key)
 
     targets = [a for a in assignments if a.validator_evm.lower() not in skip]
     if not targets:
@@ -679,12 +713,26 @@ def consecutive_reject_terminal(round_id: str, validator_evm: str) -> bool:
     )
 
 
+def consecutive_undelivered_terminal(round_id: str, validator_evm: str) -> bool:
+    """Whether a validator's assignment has failed DELIVERY (no ACK — any mix
+    of transport failures and rejects) K_CONSECUTIVE_UNDELIVERED straight
+    times this round, so the coordinator marks it terminal and
+    ``resolve_phase`` can early-resolve ``all_terminal`` instead of idling to
+    ``window_elapsed``."""
+    return (
+        _SEND_UNDELIVERED_STREAKS.get((round_id, validator_evm.lower()), 0)
+        >= K_CONSECUTIVE_UNDELIVERED
+    )
+
+
 def forget_round_send_state(round_id: str) -> None:
-    """Drop all per-round send bookkeeping (reject streaks + signed-serve cache)
-    when a phase resolves or is evicted — else these module dicts leak one entry
-    per (round, validator) for the whole leader uptime."""
+    """Drop all per-round send bookkeeping (reject/unreachable streaks + the
+    signed-serve cache) when a phase resolves or is evicted — else these module
+    dicts leak one entry per (round, validator) for the whole leader uptime."""
     for key in [k for k in _SEND_REJECT_STREAKS if k[0] == round_id]:
         _SEND_REJECT_STREAKS.pop(key, None)
+    for key in [k for k in _SEND_UNDELIVERED_STREAKS if k[0] == round_id]:
+        _SEND_UNDELIVERED_STREAKS.pop(key, None)
     for key in [k for k in _SIGNED_SERVE_CACHE if k[0] == round_id]:
         _SIGNED_SERVE_CACHE.pop(key, None)
 
@@ -915,9 +963,19 @@ async def run_slice_bench(
 
     # 5. Slice-local verdict with the AUTHORITATIVE rule, then extract the
     #    hard-veto evidence.
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
+        evaluate_relative_adoption,
+    )
 
-    verdict = evaluate_relative_adoption(champ_results, chal_results)
+    # "AUTHORITATIVE rule" is only true if this is gated the SAME way the leader's
+    # adoption verdict is. Ungated, a follower veto-confirms hard violations on
+    # off-gate chains that the leader's verdict never counted — a divergence that
+    # a fleet-uniform ADOPTION_SCORED_CHAINS cannot fix, because this path did not
+    # read the env at all.
+    verdict = evaluate_relative_adoption(
+        champ_results, chal_results, adoption_chains=adoption_scored_chains(),
+    )
     violations, counts, calibration_rows, matched_rows = extract_slice_evidence(
         verdict, slice_orders, calib_orders, chal_results,
     )
@@ -1340,7 +1398,10 @@ async def reverify_dissents(
     Any resolution/bench gap is a swallowed no-op (returns ran=False) — an
     observe pass must never raise into the coordinator.
     """
-    from minotaur_subnet.epoch.relative_scoring import evaluate_relative_adoption
+    from minotaur_subnet.epoch.relative_scoring import (
+        adoption_scored_chains,
+        evaluate_relative_adoption,
+    )
     from minotaur_subnet.harness.benchmark_worker import ExplicitOrderUnavailable
     from minotaur_subnet.harness.image_transport import is_digest_ref
     from minotaur_subnet.harness.orchestrator import RealSimulationUnavailable
@@ -1406,7 +1467,12 @@ async def reverify_dissents(
             worker._epoch_block_number = int(pin)
             champ = await worker.benchmark_explicit_orders(a0.incumbent_image_ref, chain_orders)
             chal = await worker.benchmark_explicit_orders(a0.candidate_image_ref, chain_orders)
-            verdict = evaluate_relative_adoption(champ, chal)
+            # Same gate as the leader's verdict — see the note at the slice-local
+            # verdict above. This loop is PER-CHAIN, so without the gate an
+            # off-gate chain's slice can produce confirmed violations on its own.
+            verdict = evaluate_relative_adoption(
+                champ, chal, adoption_chains=adoption_scored_chains(),
+            )
             violations, _c, _cal, _m = extract_slice_evidence(verdict, chain_orders, [], chal)
             confirmed_ids.update(v.order_id for v in violations)
             benched_ids.update(o.get("order_id") for o in chain_orders if o.get("order_id"))

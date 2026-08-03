@@ -1287,6 +1287,13 @@ async def score_plan(
     their own archive node. Falls back to mock simulation only if Anvil is
     unavailable (``simulation_mode`` says which ran).
 
+    CROSS-CHAIN plans (metadata ``cross_chain_plan`` / ``multi_leg_plan``)
+    additionally get the exact benchmark destination measurement — the
+    response's ``cross_chain.destination_delivered`` /
+    ``.destination_amount_source`` are computed by the same code path a bench
+    round scores with, so a dry-run answers "what will the contest credit me"
+    before spending a submission.
+
     Gate (audit H4): each call rewinds the chain's Anvil fork and runs JS
     scoring in the sandbox, so it's not anonymous. Accepts EITHER an admin key
     OR a metagraph-registered miner signing the request (see
@@ -1515,12 +1522,38 @@ async def score_plan(
     if simulation is None:
         simulation = build_mock_simulation(plan, params)
 
+    # Cross-chain dry-run parity: when the plan DECLARES cross-chain, run the
+    # exact benchmark measurement (synthesized/mocked bridge deposit executed
+    # against what the source legs earned, fixed-fee bridge model, destination
+    # fork seeded, destination legs executed) and attach the result to the sim
+    # BEFORE scoring — the same ordering the bench uses — so the JS scorer's
+    # raw_output here is bit-for-bit what a bench round would credit. Without
+    # this a correct cross-chain plan dry-runs as raw_output=0 with no way to
+    # tell "broken" from "unmeasured". Never on the mock path (nothing real to
+    # observe), never raises (a failed observation reports null, not a 500).
+    _xc_declared = False
+    if simulation_mode == "anvil":
+        from minotaur_subnet.harness.orchestrator import (
+            _measure_destination_delivery,
+        )
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            is_cross_chain_plan,
+        )
+        if is_cross_chain_plan(plan):
+            _xc_declared = True
+            (
+                simulation.destination_delivered,
+                simulation.destination_amount_source,
+            ) = await _measure_destination_delivery(
+                _simulator, plan, state, token_balances, body.fork_block,
+            )
+
     # Ensure JS code is loaded and score
     try:
         if app_id not in _js_engine._intents:
             await _js_engine.load_intent(app_id, app.js_code)
         score_result = await _js_engine.score(app_id, plan, simulation, state)
-        return {
+        _resp = {
             "app_id": app_id,
             "score": score_result.score,
             "valid": score_result.valid,
@@ -1539,6 +1572,23 @@ async def score_plan(
                 "revert_reason": getattr(simulation, "revert_reason", None),
             },
         }
+        if _xc_declared:
+            # ADDITIVE, only for cross-chain-declaring plans — single-chain
+            # responses are byte-identical to before. amount_source semantics
+            # (identical to the benchmark):
+            #   "simulated" — deposit executed with what your legs earned;
+            #                 destination_delivered is what ARRIVED. Credited.
+            #   "unfilled"  — the journey never earned the deposit (or a leg
+            #                 reverted). Worth zero, and would be in a round.
+            #   "declared"  — nothing executable to observe. Worth zero.
+            #   null        — plan shape unmeasurable (no multi-leg journey).
+            _resp["cross_chain"] = {
+                "destination_delivered": simulation.destination_delivered,
+                "destination_amount_source": (
+                    simulation.destination_amount_source
+                ),
+            }
+        return _resp
     except Exception as exc:
         raise HTTPException(
             status_code=500,

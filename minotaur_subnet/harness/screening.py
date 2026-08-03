@@ -265,6 +265,9 @@ class StageResult:
     # failure to detect). Detection only: nothing rejects on this value today.
     # See sdk/version.py.
     sdk_version: str | None = None
+    # Deprecated-wire-surface hits ("path:line: code") from the stage-1 scan;
+    # None = mode off, [] = scanned clean (harness/deprecated_surface.py).
+    deprecated_surface_hits: list[str] | None = None
 
 
 @dataclass
@@ -276,6 +279,9 @@ class ScreeningResult:
     solver_name: str | None = None        # From metadata
     solver_version: str | None = None     # From metadata
     solver_sdk_version: str | None = None  # Vendored SDK generation (None = pre-marker)
+    # Deprecated-wire-surface hits ("path:line: code"); None = mode off,
+    # [] = scanned clean. Attached by run_stage_1, persisted by the pipeline.
+    deprecated_surface_hits: list[str] | None = None
     failed_stage: int | None = None
     rejection_reason: str | None = None
 
@@ -287,6 +293,7 @@ class ScreeningResult:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "solver_sdk_version": self.solver_sdk_version,
+            "deprecated_surface_hits": self.deprecated_surface_hits,
             "failed_stage": self.failed_stage,
             "rejection_reason": self.rejection_reason,
             "stages": {
@@ -733,11 +740,50 @@ def run_stage_1(repo_path: str) -> StageResult:
                 **_dw_fields,
             )
 
+    # Deprecated-wire-surface scan (migration-ladder intake gate, see
+    # harness/deprecated_surface.py). Observe by DEFAULT: log-only, produces
+    # the blast-radius numbers arming requires. Enforce rejects with the
+    # exact lines named, so the miner knows what to change — never a
+    # population-keyed judgment (the 2026-07-29 lesson).
+    from minotaur_subnet.harness import deprecated_surface as _dsf
+    _dsf_mode = _dsf.deprecated_surface_mode()
+    _dsf_hits: list[str] | None = None
+    if _dsf_mode != "off":
+        _dsf_hits = _dsf.surface_hits(repo_path)
+        if _dsf_hits:
+            _shown = "; ".join(_dsf_hits[:3]) + ("; …" if len(_dsf_hits) > 3 else "")
+            logger.warning(
+                "[deprecated-surface] %d read(s) of deprecated wire fields "
+                "v%d (%s): %s repo=%s",
+                len(_dsf_hits), _dsf.DEPRECATED_SURFACE_VERSION,
+                "ENFORCE → reject" if _dsf_mode == "enforce"
+                else "observe-only, not gated",
+                _shown, repo_path,
+            )
+            if _dsf_mode == "enforce":
+                return StageResult(
+                    stage=1, passed=False,
+                    duration_ms=_elapsed(start),
+                    details=(
+                        f"Reads deprecated wire field(s) "
+                        f"{'/'.join(_dsf.DEPRECATED_WIRE_SYMBOLS)} — deprecated "
+                        f"since SDK 1.1.0, the platform stops populating them "
+                        f"after 2026-09-01 (they will read as EMPTY, silently). "
+                        f"Use your own RPC discovery "
+                        f"(initialize(config['rpc_urls'])). First hits: {_shown}"
+                    ),
+                    error_code="deprecated_surface",
+                    max_region_nodes=factor_nodes,
+                    deprecated_surface_hits=_dsf_hits,
+                    **_dw_fields,
+                )
+
     return StageResult(
         stage=1, passed=True,
         duration_ms=_elapsed(start),
         details="All static checks passed",
         max_region_nodes=factor_nodes,
+        deprecated_surface_hits=_dsf_hits,
         **_dw_fields,
     )
 

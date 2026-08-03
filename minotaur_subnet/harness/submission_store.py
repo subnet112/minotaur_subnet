@@ -132,6 +132,9 @@ OUTCOME_QUOTA_HOTKEY = "quota_hotkey"          # per-hotkey / per-round cap
 OUTCOME_QUOTA_COMMIT = "quota_commit"          # per-(hotkey, commit) cap
 OUTCOME_FINGERPRINT_REPEAT = "fingerprint_repeat"  # cross-hotkey normalized-code cap
 OUTCOME_COPYCAT_CODE = "copycat_code"  # identical code first submitted by ANOTHER actor
+OUTCOME_STRUCTURAL_DUPLICATE = "structural_duplicate"  # same operator already queues this structure
+OUTCOME_SDK_FLOOR = "sdk_floor"                # vendored SDK generation below the submission floor
+OUTCOME_DEPRECATED_SURFACE = "deprecated_surface"  # reads wire fields deprecated for removal
 OUTCOME_CLONE_FAILED = "clone_failed"          # bad token / unreachable repo
 OUTCOME_STATIC_CHECKS = "static_checks_failed"  # stage-1 static policy
 OUTCOME_TOO_ENTANGLED = "too_entangled"        # factorization floor (when armed)
@@ -354,6 +357,11 @@ class Submission:
     # See sdk/version.py.
     sdk_version: str | None = None
     solver_version: str | None = None
+    # Deprecated-wire-surface hits from screening stage 1 ("path:line: code",
+    # harness/deprecated_surface.py). None = not scanned (mode off / legacy
+    # record); [] = scanned clean. OBSERVE-ONLY telemetry: powers the miner
+    # dashboard's "reads deprecated fields" flag; nothing gates on it here.
+    deprecated_surface_hits: list[str] | None = None
 
     # Copycat naming (first-to-coin, hotkey-keyed). solver_name is self-declared
     # free text, so the store coins each distinct non-boilerplate name to the
@@ -450,6 +458,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "sdk_version": self.sdk_version,
+            "deprecated_surface_hits": self.deprecated_surface_hits,
             "is_copycat": self.is_copycat,
             "coined_by_hotkey": self.coined_by_hotkey,
             "max_region_nodes": self.max_region_nodes,
@@ -481,6 +490,7 @@ class Submission:
             "solver_name": self.solver_name,
             "solver_version": self.solver_version,
             "sdk_version": self.sdk_version,
+            "deprecated_surface_hits": self.deprecated_surface_hits,
             "display_name": self.display_name,
             "is_copycat": self.is_copycat,
             "max_region_nodes": self.max_region_nodes,
@@ -880,6 +890,7 @@ class SubmissionStore:
             solver_name=record.get("solver_name"),
             solver_version=record.get("solver_version"),
             sdk_version=record.get("sdk_version"),
+            deprecated_surface_hits=record.get("deprecated_surface_hits"),
             is_copycat=bool(record.get("is_copycat", False)),
             coined_by_hotkey=record.get("coined_by_hotkey"),
             max_region_nodes=record.get("max_region_nodes"),
@@ -1367,6 +1378,68 @@ class SubmissionStore:
             if _counts_as_benched(sub, current_round_id) and sub.round_id:
                 benched_rounds.add(sub.round_id)
         return submitters, len(benched_rounds)
+
+    def structural_fingerprint_live(
+        self,
+        fingerprint: str,
+        *,
+        exclude_submission_id: str | None = None,
+    ) -> list[tuple[str, str, str]]:
+        """Every LIVE submission carrying this STRUCTURAL fingerprint, as
+        ``(hotkey, submission_id, status_value)``.
+
+        "Live" = still holds or contends for a queue seat: queued, any
+        screening stage, pending selection, benchmarking, scored, waitlisted.
+        REJECTED is out (a lost duplicate frees the structure), and ADOPTED is
+        out ON PURPOSE — the champion's own operator must be able to iterate
+        on the champion's structure (measured 2026-07-29: a real -123-node
+        improvement kept the incumbent's exact structural fingerprint).
+
+        Read-only scan, same access pattern as :meth:`fingerprint_usage`.
+        """
+        self._maybe_reload()
+        live = {
+            SubmissionStatus.QUEUED.value,
+            SubmissionStatus.SCREENING_STAGE_1.value,
+            SubmissionStatus.SCREENING_STAGE_2.value,
+            SubmissionStatus.SCREENING_STAGE_3.value,
+            SubmissionStatus.PENDING_SELECTION.value,
+            SubmissionStatus.BENCHMARKING.value,
+            SubmissionStatus.SCORED.value,
+            SubmissionStatus.WAITLISTED.value,
+        }
+        out: list[tuple[str, str, str]] = []
+        if not fingerprint:
+            return out
+        for sub in self._submissions.values():
+            if getattr(sub, "structural_fingerprint", None) != fingerprint:
+                continue
+            if exclude_submission_id and sub.submission_id == exclude_submission_id:
+                continue
+            status = str(getattr(sub.status, "value", None) or sub.status or "")
+            if status not in live:
+                continue
+            out.append((sub.hotkey or "", sub.submission_id, status))
+        return out
+
+    @_write_locked
+    def set_deprecated_surface(
+        self, submission_id: str, hits: list[str] | None,
+    ) -> None:
+        """Persist the stage-1 deprecated-wire-surface scan result.
+
+        Same independent-fact discipline as ``set_sdk_version``: written on
+        its own, persist-on-reject friendly (a rejected submission still
+        records what it read). ``[]`` means scanned-and-clean — distinct
+        from None (not scanned), which the dashboard renders differently.
+        """
+        self._maybe_reload()
+        sub = self._submissions.get(submission_id)
+        if sub is None:
+            raise KeyError(f"Submission not found: {submission_id}")
+        sub.deprecated_surface_hits = list(hits) if hits is not None else None
+        sub.updated_at = time.time()
+        self._persist_records([sub])
 
     @_write_locked
     def set_max_region_nodes(self, submission_id: str, value: int) -> None:

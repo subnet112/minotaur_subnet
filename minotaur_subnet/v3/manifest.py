@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from eth_hash.auto import keccak
 
 from minotaur_subnet.shared.types import AppIntentDefinition, PolicyTier, TriggerType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -270,6 +273,48 @@ def compute_selector_from_manifest(
     if signature is None:
         return None
     return keccak(signature.encode())[:4].hex()
+
+
+def selector_from_legacy_manifest(
+    manifest: dict[str, Any] | None, intent_function: str,
+) -> str:
+    """4-byte intent selector for ``intent_function``, from a raw manifest dict.
+
+    The ONE implementation shared by every path that needs a selector without a
+    parsed :class:`IntentManifest` in hand — the benchmark intent-order builder
+    and the validator scoring engine. Both previously carried their own literal
+    ``{swap, execute, buy} -> canonical signature`` map, i.e. one app's ABI in a
+    path every app goes through. #1152 removed that map from
+    ``blockloop/order_processor`` and left those two copies behind, so the SAME
+    intent_function resolved to DIFFERENT selectors depending on which path
+    reached it. Sharing one function is what stops that recurring.
+
+    Verified against the live DexAggregator manifest: ``swap`` -> ``d5bcb9b5``,
+    identical to the removed map, so this is a drop-in for the app the map was
+    written for and correct for an app core has never heard of.
+
+    Falls back to the no-arg ``fn()`` convention when the app declares no such
+    intent — what the map did for any unlisted name — and LOGS it, because a
+    selector the contract does not implement reverts in scoreIntent and scores
+    0, which reads as a bad solver rather than an undeclared intent.
+    """
+    fn = intent_function or ""
+    try:
+        if isinstance(manifest, dict) and "intent_functions" in manifest:
+            selector = compute_selector_from_manifest(
+                manifest_from_legacy_dict(manifest), fn,
+            )
+            if selector:
+                return str(selector).replace("0x", "")
+    except Exception as exc:  # noqa: BLE001 — a bad manifest must not stop scoring
+        logger.warning("Manifest selector lookup failed for %r: %s", fn, exc)
+
+    logger.warning(
+        "No manifest signature for intent %r — falling back to the no-arg "
+        "selector convention; scoreIntent reverts if the contract does not "
+        "implement %s()", fn, fn,
+    )
+    return keccak(f"{fn}()".encode())[:4].hex()
 
 
 def normalize_swap_intent_params(

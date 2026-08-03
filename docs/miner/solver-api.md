@@ -280,6 +280,16 @@ Point-in-time market data for plan generation. Used primarily during benchmarkin
 | `dex_config` | `dict[str, Any]` | DEX router/factory addresses and config |
 | `raw_state` | `dict[str, Any]` | Additional contract storage data |
 
+> **DEPRECATED (SDK v2 Phase B):** `prices`, `pool_states` and `dex_config`
+> are deprecated — reading them logs a one-time `DeprecationWarning` in your
+> solver logs. Replacement: do your own pool/price discovery via RPC
+> (`initialize(config["rpc_urls"])`), the way current champion lineages
+> already do. The platform stops populating these fields after
+> **2026-09-01** (evidence-gated: retirement only happens once the live-image
+> surface audit shows no solver depends on them). After that, a vendored SDK
+> reads them as **empty** — silently, with no error — so migrate before
+> relying on the fallback.
+
 **Class method:** `MarketSnapshot.empty(chain_id=31337)` creates a minimal empty snapshot for use when the solver builds its own data from RPC.
 
 ### `SolverMetadata`

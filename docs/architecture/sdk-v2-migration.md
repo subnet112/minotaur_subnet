@@ -128,10 +128,20 @@ aliases of the base while `build_typed_context` stops producing them.
 
 ### Phase B — deprecate with a signal miners actually receive
 
-1. `DeprecationWarning` on access (a `__getattr__` shim on the dataclass, so
-   reading an emptied field is visible in solver logs).
-2. The miner agent prompt and submission spec state the replacement.
-3. A dated retirement target, announced once, not implied.
+**SHIPPED 2026-07-30.** Retirement target: **2026-09-01**, evidence-gated
+(Phase C still requires a clean live-image audit regardless of the date).
+
+1. `DeprecationWarning` on access — `MarketSnapshot.__getattribute__` warns
+   once per field per process, through BOTH `warnings` and a `logger.warning`
+   (default warning filters hide DeprecationWarning outside `__main__`; the
+   log line is visible in container logs unconditionally). Reaches a miner
+   exactly when they re-vendor — and `SDK_VERSION` was bumped to `1.1.0` so
+   the re-vendored-after-warnings population is measurable.
+2. Replacement stated in `docs/solver/solver_guide.md`,
+   `docs/miner/solver-api.md`, `docs/miner/custom-solver.md`, and the miner
+   agent prompt: solver-owned RPC discovery via
+   `initialize(config["rpc_urls"])`.
+3. Dated target announced with the cross-chain scoring announcement.
 
 ### Phase C — retire on measured evidence, not on a timer
 
@@ -285,3 +295,34 @@ commits in one batch, not because anything was found wrong with them.
    breaking change forced four safe ones to be reverted with it.
 4. **Treat a retracted safety warning as a claim needing its own evidence.**
    Downgrading a risk is a load-bearing assertion, not a neutral edit.
+
+## 5. The migration ladder — the repeatable procedure
+
+The subnet cannot force a miner's hand: solver images are frozen, certified
+artifacts, and the wire contract must stay identical for every contestant.
+What the subnet owns is the DOOR. The ladder turns every future wire-contract
+change into the same measured sequence (this section added 2026-07-31; the
+DEX-field retirement is its first execution):
+
+1. **Ship the replacement + the version marker** (additive; `sdk_version`).
+2. **Deprecate loudly** — warn-on-access shim, docs, dated evidence-gated
+   target (Phase B).
+3. **Arm the intake gates, observe first** (`harness/deprecated_surface.py`):
+   - *SDK version floor* (`SDK_VERSION_FLOOR`, enforce via
+     `SDK_VERSION_FLOOR_ENFORCE=1`): coordination — forces re-vendoring, which
+     delivers the warnings. Self-reported, so never proof.
+   - *Deprecated-surface scan* (`DEPRECATED_SURFACE_MODE`, default `observe`):
+     proof — rejects (when enforced) submissions whose code actually reads
+     the deprecated fields, with file:line named. Same classification as
+     `tools/solver_surface_audit.py` (keep in sync).
+   Arming either to enforce is accept/reject-changing: fleet-uniform promote,
+   announcement, then the env flip. Observe numbers first — ALWAYS (the
+   2026-07-29 structural-dedup lesson: measure blast radius before gating).
+4. **Let the treadmill run** — champions turn over in hours; within days the
+   throne and the active queue are field-independent by admission.
+5. **Audit clean → retire the wire field** (Phase C as specified above).
+6. **Bump the contract version**; the retired symbols join the audit presets
+   permanently so a regression can't sneak back in.
+
+The gates are leader-local admission control (like the intake caps) —
+per-submission, actionable, never population-keyed.

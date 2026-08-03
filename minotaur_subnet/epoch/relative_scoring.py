@@ -270,6 +270,77 @@ def _field(item: Any, name: str) -> Any:
     return getattr(item, name, None)
 
 
+def _coerce_chain(value: Any) -> int | None:
+    """Best-effort ``int`` for a per-order ``chain_id`` (int or decimal str).
+    ``None`` on anything unparseable — the caller then treats the order as
+    un-gated (counts normally), never silently dropping it."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def adoption_scored_chains() -> frozenset[int] | None:
+    """The chains that COUNT for the adoption decision — the adoption-time chain
+    gate input for :func:`evaluate_relative_adoption` (``adoption_chains``).
+
+    Sourced from ``ADOPTION_SCORED_CHAINS`` (comma-separated chain ids, e.g.
+    ``"1"`` or ``"1,8453"``). Unset / empty ⇒ ``None`` ⇒ every chain counts ⇒
+    the verdict is bit-identical to before the gate existed.
+
+    OPERATIONAL: this changes the adoption verdict → the benchmark pack hash, so
+    it MUST be set FLEET-UNIFORM (same value on the leader and every follower) or
+    validators will diverge. Note that uniformity of the ENV is not sufficient on
+    its own — every call site must actually pass the result through; six of ten
+    once did not, so followers voted on an ungated rule while the leader adopted
+    on a gated one.
+
+    HOW TO BRING A GATED CHAIN BACK IN (the reason this env exists)
+    --------------------------------------------------------------
+    The risk being managed: if the incumbent delivers value on orders the
+    challenger has no row for, each lands as ``dropped``, and ``n_dropped == 0``
+    is an absolute veto — no challenger can be adopted, however good. That ran
+    for 46 hours and 19 consecutive rounds before the gate existed.
+
+    DECIDE BY MEASUREMENT, NOT BY THE SWAP LOG. An earlier version of this
+    docstring said to wait for "a champion crowned with the chain counted (no
+    ``gate candidate`` warning)". That was CIRCULAR — a champion can only be
+    crowned with the chain counted after the env is cleared, so the condition
+    could never be met. The swap-time log line is an observation about what the
+    champion covers; it cannot see any challenger and so cannot answer the
+    question that matters.
+
+    The question that matters is whether counting the chain ADDS dropped orders
+    for live challengers. Recompute a completed round's candidates both ways —
+    ``adoption_chains={1}`` vs ``None`` — over the rows the verdict actually
+    used, and compare ``n_dropped``:
+
+      * ``n_dropped`` unchanged  -> counting the chain creates no new hard veto;
+      * ``n_dropped`` rises      -> those are REAL coverage failures the gate is
+        hiding, not artifacts. Under the no-regressions rule vetoing them is the
+        correct outcome; the question is only whether you want them enforced.
+
+    Read the rows FRESH — within the round, before the next round's incumbent
+    re-bench overwrites them. Retrospective recomputes produce large phantom
+    deltas (measured: +43 on a round whose real verdict had none) because the
+    two sides' rows no longer come from the same corpus. ``per_order`` LENGTH
+    vs the candidate's row count is the one signal that stays valid at any age:
+    equal means the champion was benched on the candidates' set.
+
+    Reading the gate from the champion record instead of this env is the
+    remaining step that retires it entirely. Deliberately NOT done here: it
+    changes the verdict the moment it lands, and the record has to exist and be
+    inspected across a few reigns first. The capture is the prerequisite.
+    """
+    import os
+
+    raw = os.environ.get("ADOPTION_SCORED_CHAINS", "").strip()
+    if not raw:
+        return None
+    chains = {c for tok in raw.split(",") if (c := _coerce_chain(tok.strip())) is not None}
+    return frozenset(chains) or None
+
+
 def _raw_output(item: Any) -> Any:
     """Read a per-order RAW delivered output off a result row.
 
@@ -429,6 +500,7 @@ def evaluate_relative_adoption(
     bar_age_s: float | None = None,
     factor_delta: int = 0,
     deadwood_delta: int = 0,
+    adoption_chains: set[int] | frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Per-order relative adoption verdict — PURE, EXACT-INTEGER.
 
@@ -568,7 +640,27 @@ def evaluate_relative_adoption(
         # ``dropped`` order is a hard loss via its own verdict, not this flag).
         catastrophic = False
 
-        if champ_has and chal_has:
+        # ADOPTION-TIME CHAIN GATE. ``adoption_chains`` is the set of chains that
+        # were SCORING when the current champion was crowned. An order on any OTHER
+        # chain is OBSERVE-ONLY for the adoption decision — recorded for display but
+        # folded into NONE of the counts (win/matched/blind/dropped/compared). WHY:
+        # a chain that only started scoring MID-REIGN (e.g. Base flipping from
+        # "0 for everyone" to live) must not retroactively wall challengers — the
+        # incumbent was never made to earn coverage there, yet its head-start would
+        # otherwise be an un-nettable ``dropped`` hard veto against every challenger.
+        # None (default) ⇒ every chain counts ⇒ behaviour is bit-identical to before.
+        order_chain = _field(champ_row, "chain_id")
+        if order_chain is None:
+            order_chain = _field(chal_row, "chain_id")
+        gated_out = (
+            adoption_chains is not None
+            and order_chain is not None
+            and _coerce_chain(order_chain) not in adoption_chains
+        )
+
+        if gated_out:
+            verdict = "offgate"
+        elif champ_has and chal_has:
             # EXACT-INTEGER verdict — cross-multiply the BPS band, no float.
             ratio = _display_ratio(chal_i, champ_i)  # type: ignore[arg-type]
             if chal_i * _BPS < champ_i * (_BPS - tol_bps):  # type: ignore[operator]
@@ -922,6 +1014,39 @@ def bar_kwargs_from_record(
     }
 
 
+def scoring_chains_from_rows(rows: list[Any] | None) -> frozenset[int]:
+    """The chains that were actually SCORING in a benchmark — PURE.
+
+    A chain counts when at least one row on it DELIVERED VALUE. A chain present
+    in the corpus but delivering nothing for anybody (Base before its contracts
+    were reachable) is NOT scoring, which is the whole distinction the adoption
+    chain gate rests on.
+
+    Snapshot this over the winner's rows AT ADOPTION, exactly like
+    :func:`blind_spot_bar_from_rows`, to record what the incumbent was actually
+    made to earn coverage on. That record is what lets the gate retire itself:
+    a champion crowned while a chain was scoring HAS earned coverage there, so
+    holding its successors to that chain is fair; a champion crowned before it
+    scored has not, and gating the chain out for its reign is what stops a
+    head-start it never earned from walling every challenger.
+
+    Returns a frozenset (empty when no row delivered), so a caller can
+    distinguish "nothing scored" from ``None`` = "no record, gate disabled".
+    """
+    chains: set[int] = set()
+    for r in rows or []:
+        chain = _coerce_chain(_field(r, "chain_id"))
+        if chain is None:
+            continue
+        raw = _raw_output(r)
+        try:
+            if raw is not None and int(raw) > MIN_VALID_OUTPUT:
+                chains.add(chain)
+        except (TypeError, ValueError):
+            continue
+    return frozenset(chains)
+
+
 def blind_spot_bar_from_rows(rows: list[Any] | None) -> dict[str, str]:
     """Build the blind-spot repeat bar from per-order rows — PURE.
 
@@ -955,6 +1080,7 @@ def relative_counts(
     bar_age_s: float | None = None,
     factor_delta: int = 0,
     deadwood_delta: int = 0,
+    adoption_chains: set[int] | frozenset[int] | None = None,
 ) -> dict[str, Any]:
     """Map :func:`evaluate_relative_adoption` onto the API count shape — PURE.
 
@@ -992,6 +1118,11 @@ def relative_counts(
         champion_results, challenger_results, tol_bps=tol_bps,
         champion_bar=champion_bar, bar_age_s=bar_age_s,
         factor_delta=factor_delta, deadwood_delta=deadwood_delta,
+        # MUST be forwarded, or the miner-facing counts contradict the decision:
+        # an order on an off-gate chain reads as a plain "better" here while the
+        # verdict correctly ignored it, producing exactly the "1 better yet NOT
+        # ADOPTED" display that this module's callers promise never to emit.
+        adoption_chains=adoption_chains,
     )
     return counts_from_verdict(res)
 

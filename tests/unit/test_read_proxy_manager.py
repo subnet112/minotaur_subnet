@@ -43,6 +43,7 @@ def test_proxy_running_current_image_left_alone(monkeypatch):
     monkeypatch.setattr(rpm, "_schedule_ensure_retry", lambda: scheduled.append(1))
     fake = FakeDocker([
         (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # _resolve_self -> api image
+        (0, "minotaur|false", ""),                           # network ls (egress pick)
         (0, 'true|sha256:img|["PATH=/usr/bin"]', ""),        # _proxy_state -> running, SAME image
     ])
     monkeypatch.setattr(rpm, "_docker", fake)
@@ -61,6 +62,7 @@ def test_proxy_rpc_env_drift_recreated(monkeypatch):
     monkeypatch.setenv("RPC_PROXY_RESPONSE_CACHE", "0")  # api wants caches OFF
     fake = FakeDocker([
         (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # api image
+        (0, "minotaur|false", ""),                           # network ls (egress pick)
         (0, 'true|sha256:img|["PATH=/usr/bin"]', ""),        # proxy running, NO cache var
         (0, "", ""),                                         # rm -f
         (0, "[{}]", ""),                                     # network inspect -> exists
@@ -79,6 +81,7 @@ def test_proxy_stale_image_recreated(monkeypatch):
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
         (0, "sha256:NEW|minotaur benchmark-sandbox ", ""),  # api image NEW
+        (0, "minotaur|false", ""),                          # network ls (egress pick)
         (0, "true|sha256:OLD", ""),                         # proxy running OLD image
         (0, "", ""),                                        # rm -f
         (0, "[{}]", ""),                                     # network inspect -> net EXISTS (no create)
@@ -100,6 +103,7 @@ def test_env_wired_inspect_403_running_proxy_left(monkeypatch):
     fake = FakeDocker([
         (1, "", "403 Forbidden"),                                          # inspect self -> 403
         (0, "ghcr.io/x:latest|production_minotaur,benchmark-sandbox", ""),  # self ps fallback
+        (0, "production_minotaur|false", ""),                              # network ls (egress pick)
         (1, "", "403 Forbidden"),                                          # inspect proxy -> 403
         (0, "minotaur-rpc-pin-proxy", ""),                                 # proxy ps -> running
     ])
@@ -148,6 +152,7 @@ def test_degraded_boot_background_retry_recovers(monkeypatch):
         (1, "", "403 Forbidden"),   # proxy ps
         # retry pass: docker healed — resolve, proxy absent, launch
         (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # self inspect OK
+        (0, "minotaur|false", ""),                          # network ls (egress pick)
         (1, "", "No such object"),                          # proxy inspect -> absent
         (0, "", ""),                                        # proxy ps -> not running
         (0, "", ""),                                        # rm -f
@@ -173,6 +178,7 @@ def test_launch_when_absent(monkeypatch):
     monkeypatch.setenv("BASE_RPC_URL", "https://base.example")
     fake = FakeDocker([
         (0, "sha256:apiimg|minotaur benchmark-sandbox ", ""),  # api image
+        (0, "minotaur|false", ""),                             # network ls (egress pick)
         (1, "", "No such object"),                             # proxy inspect -> absent
         (0, "", ""),                                           # proxy ps -> empty (not running)
         (0, "", ""),                                           # rm -f
@@ -198,6 +204,7 @@ def test_launch_via_ps_fallback_when_inspect_403(monkeypatch):
     fake = FakeDocker([
         (1, "", "403 Forbidden"),                                          # inspect self -> 403
         (0, "ghcr.io/x/img:latest|production_minotaur,benchmark-sandbox", ""),  # self ps fallback
+        (0, "production_minotaur|false", ""),                                  # network ls (egress pick)
         (1, "", "No such object"),                                         # proxy inspect -> absent
         (0, "", ""),                                                       # proxy ps -> not running
         (0, "", ""),                                                       # rm -f
@@ -219,6 +226,7 @@ def test_create_failure_still_wires_env(monkeypatch):
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
         (0, "sha256:img|minotaur benchmark-sandbox ", ""),   # api image
+        (0, "minotaur|false", ""),                           # network ls (egress pick)
         (1, "", "No such object"),                           # proxy inspect -> absent
         (0, "", ""),                                          # proxy ps -> not running
         (0, "", ""),                                          # rm -f
@@ -295,6 +303,7 @@ def test_launch_path_self_heals_missing_network(monkeypatch):
     monkeypatch.setenv("SOLVER_ROUND_INTERNAL_API_KEY", "tok")
     fake = FakeDocker([
         (0, "sha256:img|minotaur benchmark-sandbox ", ""),  # api image
+        (0, "minotaur|false", ""),                          # network ls (egress pick)
         (1, "", "no such container"),                       # _proxy_state inspect -> not running
         (1, "", "no such container"),                       # _proxy_state ps fallback -> not running
         (0, "", ""),                                        # rm -f
@@ -348,6 +357,59 @@ def test_resolve_self_uses_real_container_id(monkeypatch, tmp_path):
     image, net = asyncio.run(rpm._resolve_self_image_and_net())
     assert image == "sha256:img" and net == "production_minotaur"
     assert fake.calls[0][1] == real_id  # inspect <real id>, not gethostname()
+
+
+def test_resolve_prefers_non_internal_net(monkeypatch, tmp_path):
+    # THE 2026-07-30 INCIDENT: the api's network map sorts internal nets first
+    # (docker-control < production_minotaur), and the old first-non-sandbox pick
+    # attached the recreated proxy to an internal net — no egress, every
+    # un-pinned upstream forward failed DNS. The Internal flag must decide.
+    mi = tmp_path / "mountinfo"
+    mi.write_text("29 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n")
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(mi))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    monkeypatch.setattr(rpm.socket, "gethostname", lambda: "apibox")
+    fake = FakeDocker([
+        (0, "sha256:img|benchmark-sandbox docker-control production_minotaur ", ""),
+        (0, "benchmark-sandbox|true\ndocker-control|true\nproduction_minotaur|false", ""),
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    image, net = asyncio.run(rpm._resolve_self_image_and_net())
+    assert net == "production_minotaur"  # NOT alphabetical docker-control
+
+
+def test_resolve_net_ls_denied_falls_back_to_first(monkeypatch, tmp_path):
+    # socket-proxy denies network ls -> legacy first-non-sandbox pick (never
+    # block the ensure on the socket, #301).
+    mi = tmp_path / "mountinfo"
+    mi.write_text("29 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n")
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(mi))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    monkeypatch.setattr(rpm.socket, "gethostname", lambda: "apibox")
+    fake = FakeDocker([
+        (0, "sha256:img|docker-control production_minotaur ", ""),
+        (1, "", "403 Forbidden"),   # network ls denied
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    _image, net = asyncio.run(rpm._resolve_self_image_and_net())
+    assert net == "docker-control"  # degraded: legacy order, still attaches
+
+
+def test_resolve_unclassified_net_beats_known_internal(monkeypatch, tmp_path):
+    # A candidate MISSING from the listing (can't be proven internal) is
+    # preferred over one the listing marks internal.
+    mi = tmp_path / "mountinfo"
+    mi.write_text("29 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n")
+    monkeypatch.setattr(rpm, "_MOUNTINFO_PATH", str(mi))
+    monkeypatch.setattr(rpm, "_CGROUP_PATH", str(tmp_path / "absent"))
+    monkeypatch.setattr(rpm.socket, "gethostname", lambda: "apibox")
+    fake = FakeDocker([
+        (0, "sha256:img|docker-control minotaur ", ""),
+        (0, "docker-control|true", ""),   # listing omits "minotaur"
+    ])
+    monkeypatch.setattr(rpm, "_docker", fake)
+    _image, net = asyncio.run(rpm._resolve_self_image_and_net())
+    assert net == "minotaur"
 
 
 # ── live-solver net: derived proxy IP + retry-path attach ───────────────────

@@ -261,6 +261,98 @@ class TestFanOut:
         assert sent["0xv1"]["url"] == "http://v1:8080" + veto_wire.ASSIGNMENT_PATH
 
 
+class TestUndeliveredTerminal:
+    """A peer whose assignment never lands (no ACK) must become terminal —
+    else one dead-or-flaky validator holds every phase to window_elapsed
+    (measured 2026-07-30: 20 min of pure post-vote wait per adopt round; the
+    live peer ping-ponged quick-401/timeout, which defeated the first
+    two-streak design — hence ONE undelivered counter, reset only by ACK)."""
+
+    def setup_method(self):
+        veto_wire._reset_send_streaks()
+
+    @pytest.mark.asyncio
+    async def test_streak_accrues_to_terminal(self):
+        a, _ = _assignment(validator="0xdead")
+
+        async def refuse(url, payload):
+            raise ConnectionError("refused")
+
+        for i in range(veto_wire.K_CONSECUTIVE_UNDELIVERED):
+            assert not veto_wire.consecutive_undelivered_terminal(
+                a.round_id, "0xdead"
+            ), f"terminal too early at {i}"
+            await fan_out_assignments(
+                [a], peer_urls={"0xdead": "http://dead:8080"},
+                sign_payload=lambda p: p, post_json=refuse,
+            )
+        assert veto_wire.consecutive_undelivered_terminal(a.round_id, "0xdead")
+        # ...and resolve_phase turns the marked phase all_terminal
+        from minotaur_subnet.epoch.distributed_veto import resolve_phase
+        phase = VetoPhaseState(
+            candidate_submission_id="sub_1", candidate_image_id=_DIGEST_A,
+            deadline_epoch=100, assignments=[a], unsupported=["0xdead"],
+        )
+        assert resolve_phase(phase, current_epoch=5) == ("resolve", "all_terminal")
+
+    @pytest.mark.asyncio
+    async def test_pingpong_reject_timeout_still_terminates(self):
+        # THE LIVE PATTERN (2026-07-30): a peer alternating quick-401 and
+        # 15s-timeout defeated the original reject/unreachable pair (each
+        # reset the other). The single undelivered counter must terminate it.
+        a, _ = _assignment(validator="0xflaky")
+        calls = {"n": 0}
+
+        async def pingpong(url, payload):
+            calls["n"] += 1
+            if calls["n"] % 2 == 0:
+                return 401, {"detail": "unauthorized"}
+            raise ConnectionError("down")
+
+        for _ in range(veto_wire.K_CONSECUTIVE_UNDELIVERED):
+            await fan_out_assignments(
+                [a], peer_urls={"0xflaky": "http://flaky:8080"},
+                sign_payload=lambda p: p, post_json=pingpong,
+            )
+        assert veto_wire.consecutive_undelivered_terminal(a.round_id, "0xflaky")
+
+    @pytest.mark.asyncio
+    async def test_missing_url_accrues(self):
+        a, _ = _assignment(validator="0xnourl")
+        for _ in range(veto_wire.K_CONSECUTIVE_UNDELIVERED):
+            await fan_out_assignments(
+                [a], peer_urls={}, sign_payload=lambda p: p,
+                post_json=AsyncMock(),
+            )
+        assert veto_wire.consecutive_undelivered_terminal(a.round_id, "0xnourl")
+
+    @pytest.mark.asyncio
+    async def test_ack_clears_both_streaks(self):
+        a, _ = _assignment(validator="0xok")
+
+        async def refuse(url, payload):
+            raise ConnectionError("down")
+
+        async def ok(url, payload):
+            return 200, {"accepted": True}
+
+        for _ in range(veto_wire.K_CONSECUTIVE_UNDELIVERED - 1):
+            await fan_out_assignments(
+                [a], peer_urls={"0xok": "http://ok:8080"},
+                sign_payload=lambda p: p, post_json=refuse,
+            )
+        await fan_out_assignments(
+            [a], peer_urls={"0xok": "http://ok:8080"},
+            sign_payload=lambda p: p, post_json=ok,
+        )
+        assert not veto_wire.consecutive_undelivered_terminal(a.round_id, "0xok")
+
+    def test_forget_round_clears_unreachable_state(self):
+        veto_wire._SEND_UNDELIVERED_STREAKS[("round-e9-n1", "0xdead")] = 99
+        veto_wire.forget_round_send_state("round-e9-n1")
+        assert ("round-e9-n1", "0xdead") not in veto_wire._SEND_UNDELIVERED_STREAKS
+
+
 # ── follower: accept + supersession ──────────────────────────────────────────
 
 class _FakeTask:

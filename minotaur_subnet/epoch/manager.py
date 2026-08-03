@@ -37,9 +37,11 @@ from minotaur_subnet.harness.submission_store import (
 )
 from minotaur_subnet.harness.champion_policy import is_submission_champion_eligible
 from minotaur_subnet.epoch.relative_scoring import (
+    adoption_scored_chains,
     blind_spot_bar_from_rows,
     evaluate_relative_adoption,
     has_delivered_value_rows,
+    scoring_chains_from_rows,
 )
 from minotaur_subnet.harness.round_store import (
     ChampionSnapshot,
@@ -208,6 +210,17 @@ class ChampionInfo:
     # only: lost on restart (guard inert until the next adoption) — persisting it
     # in ChampionSnapshot + the consensus proposal is the ARMING-phase work.
     adoption_outputs: dict[str, str] | None = None
+    # ADOPTION-TIME SCORING CHAINS (relative_scoring.scoring_chains_from_rows) —
+    # the chains that actually delivered value when this champion won, i.e. the
+    # chains it was genuinely made to earn coverage on.
+    #
+    # OBSERVE-ONLY today: the gate still reads ADOPTION_SCORED_CHAINS. This is
+    # the record that lets that env retire, and it is captured now because it is
+    # UNRECOVERABLE later — the per-round incumbent re-bench overwrites the
+    # submission's per_intent, exactly as with adoption_outputs above. Without
+    # capturing it at the swap there is no way to answer "was this champion ever
+    # held to Base?", which is the only safe basis for clearing the env.
+    adoption_chains: frozenset[int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +231,12 @@ class ChampionInfo:
             "image_tag": self.image_tag,
             "hotkey": self.hotkey,
             "adopted_at": self.adopted_at,
+            # Sorted list: JSON-safe and stable, so two validators serialising
+            # the same champion produce byte-identical output.
+            "adoption_chains": (
+                sorted(self.adoption_chains)
+                if self.adoption_chains is not None else None
+            ),
         }
 
 
@@ -353,6 +372,9 @@ class EpochManager:
                     else restored.updated_at
                 ),
                 adoption_outputs=self._restored_adoption_outputs(
+                    restored.submission_id,
+                ),
+                adoption_chains=self._restored_adoption_chains(
                     restored.submission_id,
                 ),
             )
@@ -1459,7 +1481,9 @@ class EpochManager:
             # Bar kwargs so an armed repeat doesn't rank a photocopy-cover
             # candidate above one with a genuine win (disarmed: no-op).
             v = evaluate_relative_adoption(
-                champ_rows, self._per_intent(s), **self._blind_spot_bar_kwargs(),
+                champ_rows, self._per_intent(s),
+                adoption_chains=adoption_scored_chains(),
+                **self._blind_spot_bar_kwargs(),
             )
             net = v["n_wins"] + v["n_blind_spots"] - v["n_regressions"] - v["n_dropped"]
             nodes = getattr(s, "max_region_nodes", None)
@@ -1716,6 +1740,7 @@ class EpochManager:
                     getattr(incumbent_sub, "unproductive_metric_version", None),
                     getattr(challenger, "unproductive_metric_version", None),
                 ),
+                adoption_chains=adoption_scored_chains(),
                 **self._blind_spot_bar_kwargs(),
             )
             adopt = bool(verdict["adopt"])
@@ -1877,6 +1902,36 @@ class EpochManager:
         outputs = record.get("outputs")
         return dict(outputs) if isinstance(outputs, dict) and outputs else None
 
+    def _restored_adoption_chains(
+        self, submission_id: str | None,
+    ) -> frozenset[int] | None:
+        """The persisted adoption-time SCORING chains for this champion.
+
+        Same submission_id match + fail-soft discipline as
+        ``_restored_adoption_outputs``. ``None`` means "no record" (champion
+        predates the capture, or a read failed) and MUST stay distinguishable
+        from ``frozenset()`` = "recorded, and nothing scored" — the first is
+        unknown, the second is a fact about that reign.
+        """
+        if self._round_store is None or not submission_id:
+            return None
+        try:
+            record = self._round_store.get_champion_adoption_bar()
+        except Exception:  # additive restore — never break boot
+            return None
+        if not record or record.get("submission_id") != submission_id:
+            return None
+        chains = record.get("chains")
+        if not isinstance(chains, list):
+            return None
+        out: set[int] = set()
+        for c in chains:
+            try:
+                out.add(int(c))
+            except (TypeError, ValueError):
+                continue
+        return frozenset(out)
+
     def _blind_spot_bar_kwargs(self) -> dict[str, Any]:
         """``champion_bar``/``bar_age_s`` kwargs for the relative verdict.
 
@@ -1953,6 +2008,7 @@ class EpochManager:
                     getattr(incumbent_sub, "unproductive_metric_version", None),
                     getattr(challenger, "unproductive_metric_version", None),
                 ),
+                adoption_chains=adoption_scored_chains(),
                 **self._blind_spot_bar_kwargs(),
             )
 
@@ -2073,6 +2129,12 @@ class EpochManager:
                     counts = relative_counts(
                         champ_rows, comp_rows,
                         factor_delta=delta, deadwood_delta=dw_delta,
+                        # The chain gate belongs here for the SAME reason as the
+                        # bar kwargs above: without it an off-gate order counts
+                        # as "better" in the miner-facing block while the verdict
+                        # ignored it, which is how a Base-only win rendered as
+                        # "1 better · NOT ADOPTED THIS ROUND" on the frontend.
+                        adoption_chains=adoption_scored_chains(),
                         **self._blind_spot_bar_kwargs(),
                     )
                     # Attach same-pin factorization / deadwood / gas rule context
@@ -2311,7 +2373,49 @@ class EpochManager:
             # champion won — snapshotted NOW because the per-round incumbent
             # re-bench overwrites the submission's stored per_intent.
             adoption_outputs=blind_spot_bar_from_rows(self._per_intent(submission)),
+            # Which chains this champion was actually made to earn coverage on.
+            # Same snapshot-now reason as adoption_outputs: the incumbent
+            # re-bench overwrites per_intent every round.
+            adoption_chains=scoring_chains_from_rows(self._per_intent(submission)),
         )
+        # Loud, because this is the signal that retires ADOPTION_SCORED_CHAINS:
+        # once a champion is crowned whose adoption chains INCLUDE the gated
+        # chain, that champion has earned coverage there and the env can be
+        # cleared without the head-start wall that made it necessary.
+        _gate = adoption_scored_chains()
+        logger.info(
+            "champion adoption chains: %s (gate=%s) — champion %s",
+            sorted(self._champion.adoption_chains or ()),
+            sorted(_gate) if _gate else "OFF (all chains count)",
+            submission.submission_id,
+        )
+        if _gate is not None:
+            _ungated_scored = (self._champion.adoption_chains or frozenset()) - _gate
+            if _ungated_scored:
+                # OBSERVATION, not a verdict. An earlier version of this line
+                # told the operator that clearing the env "would hold its
+                # successors to a bar it never had to clear", i.e. wait. That
+                # advice was UNSATISFIABLE: it fires whenever the champion
+                # scores on an excluded chain, champions routinely do, and the
+                # only way to get a champion crowned WITH the chain counted is
+                # to clear the env first. The green light it asked you to wait
+                # for could never occur.
+                #
+                # It is also the wrong question. A head-start only walls
+                # challengers if the champion delivers on orders they DON'T —
+                # which shows up as n_dropped RISING when the chain is counted,
+                # and cannot be determined here, with no challenger in hand.
+                # Measured live: a champion scoring on Base produced +0 added
+                # drops in 25 of 30 candidate comparisons, and the positives
+                # were genuine coverage failures the gate was hiding.
+                logger.info(
+                    "champion %s scored on %s, which the gate excludes — that "
+                    "coverage is NOT counted in adoption while the gate holds. "
+                    "This is an observation, not a reason to keep the gate: "
+                    "decide by measuring whether counting the chain ADDS "
+                    "dropped orders for live challengers.",
+                    submission.submission_id, sorted(_ungated_scored),
+                )
         if self._sub_store is not None:
             await offload_write(self._sub_store.adopt, submission.submission_id)
         if self._round_store is not None:
@@ -2324,6 +2428,7 @@ class EpochManager:
                     submission_id=submission.submission_id,
                     outputs=self._champion.adoption_outputs,
                     activated_at=adopted_at,
+                    chains=self._champion.adoption_chains,
                 )
             except Exception:  # additive persistence — never break the swap
                 logger.warning("blind-spot bar persist failed", exc_info=True)

@@ -2485,6 +2485,22 @@ async def initialize(ctx: ServerContext) -> dict:
                 )
             except ValueError:
                 solver_round_activation_delay_epochs = 72
+            # Early activation (opt-in): when > 0, a certification that lands
+            # BEFORE the deadline re-anchors the effective epoch to
+            # certify + margin instead of idling out the close-anchored
+            # schedule (see round_manager.early_activation_effective_epoch —
+            # measured ~15-30 min of pure post-certify waiting per adopt at
+            # slate 6). Leader-side only: the early epoch rides the signed
+            # certificate, which every node stores verbatim at certify. 10
+            # covers the certify fan-out + one follower pull-reconcile (5 min).
+            try:
+                solver_round_early_activation_margin = int(
+                    os.environ.get(
+                        "SOLVER_ROUND_EARLY_ACTIVATION_MARGIN_EPOCHS", "0"
+                    ).strip() or "0",
+                )
+            except ValueError:
+                solver_round_early_activation_margin = 0
             logger.info(
                 "Solver round epoch clock configured: %s",
                 _solver_round_epoch_health(ctx),
@@ -3559,6 +3575,27 @@ async def initialize(ctx: ServerContext) -> dict:
                     "Attempting certification: round=%s finalist=%s",
                     current.round_id, current.finalist_submission_id,
                 )
+                # Early activation (opt-in): re-anchor the effective epoch to the
+                # certification actually landing, instead of the close-anchored
+                # worst-case schedule. Computed HERE (not at close) because only
+                # now is "certification landed" a fact; clamped so it can never
+                # activate later than the close-time schedule.
+                _close_anchored_eff = (
+                    current.effective_epoch or _boundary_epoch_for_round(current)
+                )
+                _effective_epoch = submissions.early_activation_effective_epoch(
+                    _close_anchored_eff,
+                    _current_solver_round_epoch(ctx),
+                    solver_round_early_activation_margin,
+                )
+                if _effective_epoch < _close_anchored_eff:
+                    logger.info(
+                        "Early activation: round=%s effective_epoch %s -> %s "
+                        "(margin=%d epochs, ~%d min sooner)",
+                        current.round_id, _close_anchored_eff, _effective_epoch,
+                        solver_round_early_activation_margin,
+                        _close_anchored_eff - _effective_epoch,
+                    )
                 from fastapi import HTTPException as _HTTPException
                 try:
                     certified = await submissions._certify_solver_round_state(
@@ -3569,7 +3606,7 @@ async def initialize(ctx: ServerContext) -> dict:
                             committee_hash=current.committee_hash,
                             benchmark_pack_hash=current.benchmark_pack_hash,
                             shadow_case_log_hash=current.shadow_case_log_hash,
-                            effective_epoch=current.effective_epoch or _boundary_epoch_for_round(current),
+                            effective_epoch=_effective_epoch,
                             quorum_required=current.quorum_required or 0,
                             approvals=[],
                         )
@@ -3988,12 +4025,31 @@ async def initialize(ctx: ServerContext) -> dict:
                                     timeout_s=15.0,
                                 )
                                 for a in phase.assignments:
+                                    # Terminal on K consecutive deterministic
+                                    # rejects (LD 12) OR K consecutive sends
+                                    # without an ACK of ANY kind — a peer whose
+                                    # assignment never lands can never claim,
+                                    # and without a terminal mark it holds
+                                    # EVERY phase to the full window (20
+                                    # min/adopt of pure wait, measured
+                                    # 2026-07-30). Either way the phase
+                                    # early-resolves all_terminal once every
+                                    # assignee is accounted for.
                                     if veto_wire.consecutive_reject_terminal(
                                         round_id, a.validator_evm,
+                                    ) or veto_wire.consecutive_undelivered_terminal(
+                                        round_id, a.validator_evm,
                                     ):
-                                        veto_wire.REGISTRY.mark_unsupported(
+                                        if veto_wire.REGISTRY.mark_unsupported(
                                             round_id, a.validator_evm,
-                                        )
+                                        ):
+                                            logger.info(
+                                                "[distributed-veto] round %s: "
+                                                "%s marked terminal (assignment"
+                                                " undeliverable) — phase can "
+                                                "early-resolve", round_id,
+                                                a.validator_evm,
+                                            )
                         # STREAMING re-verify: dispatch per not-yet-covered veto-
                         # responder as they arrive (each veto gets the full remaining
                         # interior window to confirm), finalize once the full claim

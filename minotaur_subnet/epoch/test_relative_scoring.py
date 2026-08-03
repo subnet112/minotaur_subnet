@@ -23,6 +23,7 @@ from minotaur_subnet.epoch.relative_scoring import (
     evaluate_relative_adoption,
     has_raw_output_rows,
     relative_counts,
+    scoring_chains_from_rows,
     relative_reason,
 )
 from minotaur_subnet.harness.orchestrator import BenchmarkResult
@@ -106,6 +107,46 @@ def test_dropped_is_a_hard_veto():
     assert res["n_wins"] == 1
     verdicts = {o["intent_id"]: o["verdict"] for o in res["per_order"]}
     assert verdicts["o2"] == "dropped"
+
+
+def _rc(intent_id: str, raw_output, chain_id: int):
+    """A per-order dict row carrying a chain_id (the gate reads chain off the row)."""
+    return {"intent_id": intent_id, "raw_output": raw_output, "chain_id": chain_id}
+
+
+def test_adoption_chain_gate_makes_off_chain_drop_observe_only():
+    # Champion serves two ETH (chain 1) orders and one Base (8453) order. The
+    # challenger WINS both ETH orders but DROPS the Base one.
+    champ = [_rc("eth1", "100", 1), _rc("eth2", "100", 1), _rc("base1", "300", 8453)]
+    chal = [_rc("eth1", "200", 1), _rc("eth2", "200", 1), _rc("base1", None, 8453)]
+
+    # Ungated (default): the Base drop is a HARD VETO — two wins can't rescue it.
+    res = evaluate_relative_adoption(champ, chal)
+    assert res["adopt"] is False
+    assert res["n_dropped"] == 1
+
+    # Gated to ETH only (a champion crowned before Base scored): the Base order is
+    # OBSERVE-ONLY — verdict "offgate", folded into NO count. The two ETH wins now
+    # carry the adoption exactly as they did before Base started scoring.
+    res_gated = evaluate_relative_adoption(champ, chal, adoption_chains={1})
+    assert res_gated["adopt"] is True
+    assert res_gated["n_dropped"] == 0
+    assert res_gated["n_wins"] == 2
+    assert res_gated["scenarios_compared"] == 2  # the Base order is not compared
+    verdicts = {o["intent_id"]: o["verdict"] for o in res_gated["per_order"]}
+    assert verdicts["base1"] == "offgate"
+
+    # None (default) is bit-identical to omitting the kwarg — every chain counts.
+    assert evaluate_relative_adoption(champ, chal, adoption_chains=None) == res
+
+
+def test_adoption_chain_gate_unparseable_chain_counts_normally():
+    # A row with a missing/garbage chain_id must NOT be silently gated out — it
+    # counts normally (fail toward the existing hard-veto behaviour).
+    champ = [{"intent_id": "x", "raw_output": "300"}]  # no chain_id
+    chal = [{"intent_id": "x", "raw_output": None}]
+    res = evaluate_relative_adoption(champ, chal, adoption_chains={1})
+    assert res["n_dropped"] == 1  # still a drop — not gated away
 
 
 def test_tolerance_band_is_matched_not_regression():
@@ -1662,3 +1703,96 @@ def test_relative_reason_phrases_deadwood_win():
     assert "2897" in reason and "2000" in reason
     # The absurd performance phrasing must NOT appear on a deadwood win.
     assert "net better — 0 better" not in reason
+
+
+# ── The gate must reach the MINER-FACING counts, not just the verdict ────────
+#
+# relative_counts() feeds the per-competitor block the frontend renders. It
+# forwarded tol/bar/factor/deadwood but NOT adoption_chains, so an off-gate win
+# was displayed as a plain "better" while the verdict correctly ignored it. The
+# observable result was a competitor row reading "1 better · NOT ADOPTED THIS
+# ROUND" — a contradiction the display path's own comment promises never to emit.
+
+def test_relative_counts_forwards_the_chain_gate():
+    """An off-gate win must not be displayed as `better`."""
+    champ = [_rc("eth1", "100", 1), _rc("base1", "100", 8453)]
+    chal = [_rc("eth1", "100", 1), _rc("base1", "300", 8453)]
+
+    ungated = relative_counts(champ, chal)
+    assert ungated["better"] == 1, "sanity: ungated, the Base win counts"
+
+    gated = relative_counts(champ, chal, adoption_chains={1})
+    assert gated["better"] == 0, "off-gate win must not render as better"
+    assert gated["compared"] == 1, "only the ETH order is comparable"
+
+
+def test_relative_counts_gate_default_is_bit_identical():
+    """Omitting the kwarg must not change any existing display block."""
+    champ = [_rc("eth1", "100", 1), _rc("base1", "100", 8453)]
+    chal = [_rc("eth1", "200", 1), _rc("base1", "300", 8453)]
+    assert relative_counts(champ, chal) == relative_counts(
+        champ, chal, adoption_chains=None,
+    )
+
+
+def test_display_counts_agree_with_the_verdict_under_the_gate():
+    """The invariant the display path claims: counts never contradict the verdict.
+
+    Same rows, same gate → a candidate the verdict refuses to adopt must not be
+    shown with a positive `better`, and one it adopts must not read as `behind`.
+    """
+    champ = [_rc("eth1", "100", 1), _rc("base1", "100", 8453)]
+    chal = [_rc("eth1", "100", 1), _rc("base1", "300", 8453)]
+
+    verdict = evaluate_relative_adoption(champ, chal, adoption_chains={1})
+    counts = relative_counts(champ, chal, adoption_chains={1})
+
+    assert verdict["adopt"] is False          # the only win was off-gate
+    assert counts["better"] == 0              # ...so nothing is advertised as better
+    assert counts["verdict"] != "dethrone"
+
+
+# ── scoring_chains_from_rows: the record that lets the gate retire ───────────
+#
+# Captured at hot-swap because it cannot be recomputed later (the incumbent
+# re-bench overwrites per_intent). It answers the only question that makes
+# clearing ADOPTION_SCORED_CHAINS safe: was this champion ever held to the
+# gated chain?
+
+def test_scoring_chains_only_counts_chains_that_delivered():
+    """A chain present in the corpus but delivering nothing is NOT scoring.
+
+    This is the distinction the whole gate rests on — Base existed in the corpus
+    long before it paid out for anybody.
+    """
+    rows = [
+        _rc("eth1", "100", 1),
+        _rc("base1", None, 8453),   # no plan
+        _rc("base2", "0", 8453),    # reverted → zero
+    ]
+    assert scoring_chains_from_rows(rows) == frozenset({1})
+
+
+def test_scoring_chains_picks_up_a_chain_once_it_pays():
+    rows = [_rc("eth1", "100", 1), _rc("base1", "500", 8453)]
+    assert scoring_chains_from_rows(rows) == frozenset({1, 8453})
+
+
+def test_scoring_chains_empty_is_not_none():
+    """`frozenset()` means "recorded, nothing scored"; None means "no record".
+
+    Readers must be able to tell those apart — one is a fact about the reign,
+    the other is absence of data.
+    """
+    assert scoring_chains_from_rows([]) == frozenset()
+    assert scoring_chains_from_rows(None) == frozenset()
+
+
+def test_scoring_chains_tolerates_junk_rows():
+    """Unparseable chain / output must be skipped, never raise on the swap path."""
+    rows = [
+        {"intent_id": "a", "raw_output": "100", "chain_id": "not-a-chain"},
+        {"intent_id": "b", "raw_output": "junk", "chain_id": 1},
+        {"intent_id": "c", "raw_output": "7", "chain_id": "8453"},  # str chain ok
+    ]
+    assert scoring_chains_from_rows(rows) == frozenset({8453})
