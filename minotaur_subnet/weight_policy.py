@@ -119,7 +119,7 @@ def is_real_miner_hotkey(hotkey: str | None) -> bool:
 # column. There is no env kill switch by design, so the only rollback is another
 # code change + release. Merge and promote back-to-back; never let a change to
 # this value sit on develop, where it reaches the leader alone within the hour.
-CHAMPION_MINER_WEIGHT_FRACTION = 0.75
+CHAMPION_MINER_WEIGHT_FRACTION = 0.20
 
 
 def apply_champion_burn_ramp(
