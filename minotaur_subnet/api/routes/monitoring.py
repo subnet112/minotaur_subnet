@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,10 +11,17 @@ from pydantic import BaseModel
 from minotaur_subnet.api import services as _tools
 from minotaur_subnet.api.routes.apps import _require_admin
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["monitoring"])
 
 
 def _store():
+    """The APP-INTENT store (apps, orders, monitoring).
+
+    NOT the submission store — it has no ``_submissions``. Anything counting
+    submissions wants ``routes.submissions.state.get_store()``.
+    """
     from minotaur_subnet.api.server import store
     return store
 
@@ -115,24 +123,56 @@ def migration_status() -> dict[str, Any]:
 
     counts: dict[str, int] = {}
     below_floor_n = 0
+    unmeasured_n = 0
     surface_hit_n = 0
     scanned_n = 0
     total = 0
     floor = dsf.sdk_version_floor()
+    # The SUBMISSION store, not ``_store()`` (that one is the AppIntentStore and
+    # has no ``_submissions``). Reading the wrong store raised AttributeError
+    # straight into the swallow below, so every field of ``last_24h`` was pinned
+    # at zero and served — for 5 minutes at a time — as if it had been measured.
+    # Zero submissions and zero-because-we-asked-the-wrong-object are opposite
+    # readings, and the retirement gate gets this one as evidence.
+    from minotaur_subnet.api.routes.submissions.state import get_store
+
     try:
-        st = _store()
+        st = get_store()
         st._maybe_reload()
         subs = list(st._submissions.values())
     except Exception:
-        subs = []
-    for sub in subs:
+        # Still best-effort — a store hiccup must not 500 a public dashboard
+        # read — but never silently: an empty window is now reported as the
+        # degraded reading it is, not as a measurement.
+        logger.warning("migration_status: submission store read failed", exc_info=True)
+        subs = None
+    for sub in subs or ():
         created = float(getattr(sub, "created_at", 0) or 0)
         if now - created > 86400:
             continue
         total += 1
-        v = getattr(sub, "sdk_version", None) or "pre-marker"
-        counts[v] = counts.get(v, 0) + 1
-        if floor and dsf.below_floor(getattr(sub, "sdk_version", None), floor):
+        reported = getattr(sub, "sdk_version", None)
+        counts[reported or "pre-marker"] = counts.get(reported or "pre-marker", 0) + 1
+        # UNMEASURED is not the same reading as BELOW FLOOR, and only one of
+        # them is evidence of a migration backlog.
+        #
+        # ``below_floor(None, floor)`` is True by construction — _parse_version
+        # (None) is (0,) — which is right at the ENFORCEMENT gate
+        # (screening_pipeline), where the value has already been read and a None
+        # means a genuinely unmarked solver. It is wrong HERE. This window
+        # includes submissions rejected BEFORE stage 2 ever ran, so their
+        # sdk_version was never read at all.
+        #
+        # Live shape (2026-08-13): of 221 submissions in 24h, 55 had no
+        # sdk_version — and 54 of the 55 were structural-dedup rejects from
+        # operators whose OTHER submissions in the same window reported 1.1.0.
+        # Actual below-floor solvers: zero. Lumping them together would have the
+        # retirement gate read a permanent 55-strong migration backlog that is
+        # really duplicate spam, and it would never shrink however completely
+        # miners migrate.
+        if reported is None:
+            unmeasured_n += 1
+        elif floor and dsf.below_floor(reported, floor):
             below_floor_n += 1
         hits = getattr(sub, "deprecated_surface_hits", None)
         if hits is not None:
@@ -149,14 +189,25 @@ def migration_status() -> dict[str, Any]:
         "sdk_version_floor_enforced": dsf.sdk_floor_enforced(),
         "deprecated_surface_mode": dsf.deprecated_surface_mode(),
         "last_24h": {
+            # True when the store read failed — the counts below are NOT a
+            # measurement and must not be read as "nobody submitted".
+            "degraded": subs is None,
             "submissions": total,
             "sdk_version_counts": counts,
+            # Solvers that REPORTED a generation older than the floor — the
+            # only figure that is evidence of a migration backlog.
             "below_floor": below_floor_n,
+            # Submissions whose SDK generation was never read (rejected before
+            # screening stage 2). Neither migrated nor unmigrated: unknown.
+            "unmeasured": unmeasured_n,
             "surface_scanned": scanned_n,
             "surface_hits": surface_hit_n,
         },
         "docs": "docs/architecture/sdk-v2-migration.md",
     }
-    _MIGRATION_CACHE["ts"] = now
-    _MIGRATION_CACHE["payload"] = payload
+    # Never cache a degraded reading: a single store hiccup would otherwise be
+    # served as the answer for the next 5 minutes.
+    if subs is not None:
+        _MIGRATION_CACHE["ts"] = now
+        _MIGRATION_CACHE["payload"] = payload
     return payload
