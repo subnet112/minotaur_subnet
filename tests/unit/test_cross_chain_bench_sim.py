@@ -61,12 +61,16 @@ def _plan(metadata: dict, interactions=None) -> ExecutionPlan:
 class _State:
     """Minimal IntentState stand-in: the measurement only needs params."""
 
-    def __init__(self, **params):
+    def __init__(self, control=None, **params):
         self._params = params
+        self._control = control or {}
         self.contract_address = None
 
     def raw_params_view(self) -> dict:
         return dict(self._params)
+
+    def control_view(self) -> dict:
+        return dict(self._control)
 
 
 def _cross_chain_plan_meta() -> dict:
@@ -736,3 +740,111 @@ class TestCrossChainGatesAgree:
         for name, meta in self.SHAPES:
             plan = _plan(dict(meta), interactions=[_ix(1, "a9059cbb")])
             assert _mock_bridge_for_benchmark(plan, None) is plan, name
+
+
+APP_BASE = "0xE0D97941103C30799fa0AA9d54a34246846C73bF"
+APP_ETH = "0xcD42Cf6FD6E0C539CaE038Fe6a73C67f8c1c7A52"
+
+
+class TestDeliveryRecipients:
+    """WHO counts as delivery on the destination chain.
+
+    Crediting only ``params['receiver']`` is why the reference solver measured
+    zero on every case: bench state is built with ``owner=""`` and quote cases
+    carry no ``receiver``, so the solver's ``receiver_default =
+    state.contract_address or state.owner`` addressed the APP while the
+    platform watched the anvil default account.
+    """
+
+    def _plan(self, dst=8453):
+        return _plan({"cross_chain": True, "dst_chain_id": dst})
+
+    def test_bare_state_keeps_the_historical_default(self):
+        from minotaur_subnet.harness.orchestrator import (
+            _ANVIL_DEFAULT_ACCOUNT, _delivery_recipients,
+        )
+        got = _delivery_recipients(_State(), self._plan())
+        assert got == {_ANVIL_DEFAULT_ACCOUNT.lower()}
+
+    def test_destination_app_is_credited(self):
+        from minotaur_subnet.harness.orchestrator import _delivery_recipients
+        got = _delivery_recipients(
+            _State(control={"_app_addresses": {8453: APP_BASE, 1: APP_ETH}}),
+            self._plan(8453),
+        )
+        assert APP_BASE.lower() in got
+
+    def test_source_chain_app_is_NOT_credited(self):
+        """The far side's address, never the near side's.
+
+        A transfer to the source-chain address on the destination fork reaches
+        an account with no code there — stranded funds. Crediting it would be a
+        mis-credit dressed as a fix.
+        """
+        from minotaur_subnet.harness.orchestrator import _delivery_recipients
+        got = _delivery_recipients(
+            _State(control={"_app_addresses": {8453: APP_BASE, 1: APP_ETH}}),
+            self._plan(8453),
+        )
+        assert APP_ETH.lower() not in got
+
+    def test_string_keyed_map_resolves(self):
+        # The map survives a JSON round-trip in some callers, which stringifies
+        # the int chain ids.
+        from minotaur_subnet.harness.orchestrator import _delivery_recipients
+        got = _delivery_recipients(
+            _State(control={"_app_addresses": {"8453": APP_BASE}}), self._plan(8453),
+        )
+        assert APP_BASE.lower() in got
+
+    def test_explicit_receiver_replaces_the_default_but_not_the_app(self):
+        from minotaur_subnet.harness.orchestrator import (
+            _ANVIL_DEFAULT_ACCOUNT, _delivery_recipients,
+        )
+        user = "0x" + "99" * 20
+        got = _delivery_recipients(
+            _State(receiver=user, control={"_app_addresses": {8453: APP_BASE}}),
+            self._plan(8453),
+        )
+        assert got == {user, APP_BASE.lower()}
+        assert _ANVIL_DEFAULT_ACCOUNT.lower() not in got
+
+    def test_unresolvable_destination_adds_nothing(self):
+        from minotaur_subnet.harness.orchestrator import (
+            _ANVIL_DEFAULT_ACCOUNT, _delivery_recipients,
+        )
+        for plan_meta in ({}, {"dst_chain_id": None}, {"dst_chain_id": "junk"}):
+            got = _delivery_recipients(
+                _State(control={"_app_addresses": {8453: APP_BASE}}),
+                _plan(plan_meta),
+            )
+            assert got == {_ANVIL_DEFAULT_ACCOUNT.lower()}, plan_meta
+
+    def test_delivery_into_the_destination_app_is_measured(self):
+        """End-to-end: the case that read 0 before this fix."""
+        from minotaur_subnet.harness.orchestrator import _measure_destination_delivery
+        import asyncio
+        out = asyncio.run(_measure_destination_delivery(
+            _dest_sim([_transfer(USDC_BASE, APP_BASE, 320_000_000)]),
+            _plan({**_cross_chain_plan_meta(), "dst_chain_id": 8453}),
+            _State(output_token=USDC_BASE,
+                   control={"_app_addresses": {8453: APP_BASE}}),
+            None, None,
+        ))
+        assert out == ("320000000", "simulated")
+
+    def test_widening_never_lowers_a_measurement(self):
+        """Superset property: every previously-credited transfer still counts."""
+        from minotaur_subnet.harness.orchestrator import (
+            _ANVIL_DEFAULT_ACCOUNT, _measure_destination_delivery,
+        )
+        import asyncio
+        out = asyncio.run(_measure_destination_delivery(
+            _dest_sim([_transfer(USDC_BASE, _ANVIL_DEFAULT_ACCOUNT, 5),
+                       _transfer(USDC_BASE, APP_BASE, 7)]),
+            _plan({**_cross_chain_plan_meta(), "dst_chain_id": 8453}),
+            _State(output_token=USDC_BASE,
+                   control={"_app_addresses": {8453: APP_BASE}}),
+            None, None,
+        ))
+        assert out == ("12", "simulated")
