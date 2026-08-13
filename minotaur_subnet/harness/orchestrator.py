@@ -2333,12 +2333,10 @@ def _mock_bridge_for_benchmark(
     one :stable promotion before any solver emits such a plan. It is inert
     until one does.
     """
+    from minotaur_subnet.simulator.cross_chain_bench import declares_cross_chain
+
     meta = plan.metadata or {}
-    if not (
-        meta.get("cross_chain")
-        or meta.get("multi_leg_plan")
-        or meta.get("cross_chain_plan")
-    ):
+    if not declares_cross_chain(meta):
         return plan
 
     from minotaur_subnet.shared.types import mock_bridge_interactions
@@ -2398,6 +2396,13 @@ async def _measure_destination_delivery(
 
     Returns ``(delivered_wei_str | None, amount_source | None)``. Never
     raises: an observation failing must not fail a benchmark row.
+
+    FLEET UNIFORMITY: the credited quantity is an input to ``raw_output`` and
+    therefore to the adoption verdict, so a leader filtering by token while
+    followers still sum blind would have them disagree on the same plan. This
+    is inert only while nothing emits cross-chain — which is true today and
+    stops being true the moment cross-chain demand is re-seeded. Promote to
+    :stable fleet-wide BEFORE seeding, never after.
     """
     from minotaur_subnet.simulator.cross_chain_bench import (
         is_cross_chain_plan,
@@ -2454,15 +2459,62 @@ async def _measure_destination_delivery(
         params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
     ).lower()
 
+    # WHICH token counts as delivery — the asset the INTENT asked for, taken
+    # from the request params, never from the plan's own metadata.
+    #
+    # Summing every transfer to the receiver regardless of token does not
+    # measure delivery, it measures arrival, and the two come apart exactly
+    # where it matters. A cross-chain intent is "spend WETH on chain A, deliver
+    # USDC on chain B"; a plan that bridges the WETH and simply forwards it,
+    # skipping the destination swap, lands a raw amount ~1e12 larger than the
+    # honest USDC answer purely because WETH has 18 decimals and USDC has 6.
+    # That number becomes ``metadata.raw_output``, which feeds the per-order
+    # relative comparison — so the plan that DIDN'T do the work wins the order
+    # outright and the plan that did is recorded as a regression. The incentive
+    # inverts. (The app's own single-chain scorer never had this hole: it
+    # already filters ``tokenAddr === tokenOut``, and so does the sibling
+    # cross-chain QUOTE path at cross_chain_quote.py — this scored path was the
+    # only one summing blind.)
+    #
+    # Params, not plan metadata, because the plan is solver-authored: filtering
+    # on a solver-declared ``token_out`` would restore the same vector in one
+    # move — declare the cheap token, dump the cheap token, get credited for it.
+    # ``output_token`` is already the DESTINATION-chain address (the CAIP-10
+    # intake derives dest_chain_id from it), so it needs no remapping.
+    expected_token = str(params.get("output_token") or "").lower()
+    if not expected_token:
+        # Fail closed, exactly like the no-destination-leg case above: an
+        # unmeasurable journey reports nothing and earns nothing. Crediting an
+        # unfiltered sum here would be the very mis-credit this guards against.
+        logger.info(
+            "[benchmark] destination delivery not measurable: intent declares "
+            "no output_token to credit against",
+        )
+        return None, amount_source
+
     delivered = 0
+    other_token_amount = 0
     for leg_id in dest_ids:
         for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
             if str(t.get("to", "")).lower() != receiver:
                 continue
             try:
-                delivered += int(t.get("amount") or 0)
+                amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
                 continue
+            if str(t.get("token", "")).lower() != expected_token:
+                other_token_amount += amount
+                continue
+            delivered += amount
+
+    if other_token_amount and not delivered:
+        # The signature of a plan that bridged but never performed the
+        # destination action. Worth a line: pre-filter this scored as a win.
+        logger.info(
+            "[benchmark] destination legs delivered 0 of the requested token "
+            "%s to %s (%d in other tokens ignored)",
+            expected_token, receiver, other_token_amount,
+        )
 
     return str(delivered), amount_source
 

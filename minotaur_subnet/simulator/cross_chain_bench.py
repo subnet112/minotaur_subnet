@@ -30,6 +30,7 @@ anything that feeds scoring and can differ between two nodes eventually will.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from minotaur_subnet.shared.types import (
@@ -102,19 +103,52 @@ def map_bridged_token(token: str, src_chain_id: Any, dst_chain_id: Any) -> str:
     return token
 
 
-def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
-    """Does this plan DECLARE cross-chain intent?
+def declares_cross_chain(meta: Mapping[str, Any] | None) -> bool:
+    """THE cross-chain declaration predicate. Every gate must call this one.
 
-    Declaration, not calldata — the same gate the benchmark's bridge mocking
-    uses, so the two can never disagree about what is cross-chain.
+    Four shapes mean "cross-chain", and which one a plan carries depends only
+    on how far through the pipeline it is — not on whether it is cross-chain:
+
+      ``cross_chain_plan``  the SOLVER's request (what miners emit)
+      ``multi_leg_plan``    the COMPILER's output (carries real bridge calldata)
+      ``cross_chain``       the post-compile marker (``order_processor`` sets it
+                            and pops ``cross_chain_plan``, so it is the only key
+                            a live order's stored plan is guaranteed to have)
+      ``legs``              the LEGACY convention ``normalize_to_legs`` projects
+                            onto, and the shape ``simulate_cross_chain`` walks
+
+    Accepting a subset is how gates silently disagree, and every disagreement
+    found so far failed in the same direction — a plan treated as cross-chain by
+    one gate and as single-chain by another, which reliably reads to a miner as
+    "cross-chain earns nothing". Concretely, before these were unified:
+
+      - the miner-facing quote gate accepted only ``cross_chain``, while the
+        ``build_cross_chain_quote`` behind it reads ``cross_chain_plan`` — so
+        the reference solver's own EVM shape fell through to the single-chain
+        sim, whose empty top-level interactions quote 0;
+      - the benchmark's bridge-mocking gate omitted ``legs``, so a legacy-shape
+        plan was destination-MEASURED but its bridge calldata was never mocked,
+        and therefore reverted in the scored sim.
+
+    Takes the metadata mapping, not the plan, because half the call sites
+    (stored order plans, quote-time plan metadata) only ever hold the dict.
     """
-    meta = plan.metadata or {}
+    meta = meta or {}
     return bool(
         meta.get("legs")
         or meta.get("multi_leg_plan")
         or meta.get("cross_chain_plan")
         or meta.get("cross_chain")
     )
+
+
+def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
+    """Does this plan DECLARE cross-chain intent?
+
+    Declaration, not calldata. Thin wrapper over :func:`declares_cross_chain`
+    so plan-holding and metadata-holding call sites share one definition.
+    """
+    return declares_cross_chain(plan.metadata)
 
 
 def normalize_to_legs(plan: ExecutionPlan) -> ExecutionPlan | None:
