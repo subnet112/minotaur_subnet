@@ -134,25 +134,27 @@ def owner_union_enabled() -> bool:
 # under a coldkey for free, so merging the coldkey covers the fleet); a hotkey
 # or github owner works too — every token form of an identifier is unioned.
 _STATIC_ACTOR_MERGES: tuple[frozenset[str], ...] = (
-    # 2026-07-28 — "fp-ring": 13 coldkeys, ONE hotkey each (uids 117/126/127/
-    # 128/157/158/159/160/161/173/176/177/178), each under its own throwaway
-    # github account, all shipping structurally-identical solvers whose
-    # solver_name embeds the round id (aurora-swap-engine-fp29753820n1,
+    # 2026-07-28 — "fp-ring": originally 13 coldkeys, ONE hotkey each (uids
+    # 117/126/127/128/157/158/159/160/161/173/176/177/178), each under its own
+    # throwaway github account, all shipping structurally-identical solvers
+    # whose solver_name embeds the round id (aurora-swap-engine-fp29753820n1,
     # halcyon-mino-solver-fp29753820n1, sable-dex-router-fp…). Evidence: the
     # ring's members co-clustered on one structural fingerprint in 25 of 26
     # measured rounds and registered in three batches (07-16 06:31, 07-16
     # 11:43, 07-20 08:51); it re-rolls the fingerprint every round, defeating
     # every equality key, and took 5 of 8 build units and up to 2 of 3 slate
     # seats per round while ~28 other submissions shared the remainder.
+    #
+    # 2026-08-13 — NARROWED to the 9 members below: uids 117/126/127/128 were
+    # dropped from the merge, so each is once again its own actor with its own
+    # submission slot, build unit and seniority clock. The 07-28 evidence above
+    # is the record of the ORIGINAL 13-member shape; it is not a claim that the
+    # four dropped uids have been cleared.
     frozenset({
-        "5GEfnqKjL17Ta2govfz9rv9PhUQw86RFp6kvZdgLxGWLuZBD",  # uid 117
-        "5GgrdnnPuxiU5iXeDbdq1FUjWyWVEjNPSHNZsbVJhxLLsSyC",  # uid 128
         "5GdfDv3EoWorapgFY7TPTed1v8ESeGSrnuu2TZ26jPSPSzuC",  # uid 160
         "5HmKDgzKt6KRj3WfXD3vd2fWiKBjaxG4uYPuWrbdApZx5Dfq",  # uid 161
         "5FF8NEw4nc6rh6pmFRBFoAfcLpgPRiUQFnt66PPD1FeVBc8X",  # uid 159
         "5CGS8ZTeS3XgUo4BQfPH8NnJzUVuJnWdi3pbrSdidMAVfMzi",  # uid 158
-        "5EvavNeH9JuWRrbWwJrmmp7J8YPTm8dmHm6V38LsjYp4pa3L",  # uid 126
-        "5DWnrP1EJtVnG2fneBvVhAhjyM24Lf31wXycM2aTmWi2vrNu",  # uid 127
         "5FsCAcRLtjUEnNy2ux6M3FyDAfiCgsqWqPQFLKCQFY5ucLRG",  # uid 157
         "5DCKr2ChZVzvzXRRbeBY5Hk9BohPAfpS2HbRdupYCaYRxA4R",  # uid 176
         "5F6sPTG1csHsSEQNBYaRwjHD2zCJToRs9B4br7PkWLYPagQf",  # uid 177
