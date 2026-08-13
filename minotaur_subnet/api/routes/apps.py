@@ -1545,6 +1545,7 @@ async def score_plan(
     # tell "broken" from "unmeasured". Never on the mock path (nothing real to
     # observe), never raises (a failed observation reports null, not a 500).
     _xc_declared = False
+    _xc_diagnosis: dict[str, Any] | None = None
     if simulation_mode == "anvil":
         from minotaur_subnet.harness.orchestrator import (
             _measure_destination_delivery,
@@ -1557,6 +1558,7 @@ async def score_plan(
             (
                 simulation.destination_delivered,
                 simulation.destination_amount_source,
+                _xc_diagnosis,
             ) = await _measure_destination_delivery(
                 _simulator, plan, state, token_balances, body.fork_block,
             )
@@ -1600,6 +1602,22 @@ async def score_plan(
                 "destination_amount_source": (
                     simulation.destination_amount_source
                 ),
+                # WHY it delivered nothing. Absent when delivery counted, so
+                # its presence is the "here is what to change" signal. The
+                # dry run carries the FULL diagnosis (which recipients count,
+                # how much went elsewhere) rather than the bare code the
+                # benchmark row stores — this response is not persisted, so
+                # detail is free here and expensive there.
+                #   wrong_recipient   - right token, uncounted address. Deliver
+                #                       to `receiver`, or to the App on the
+                #                       DESTINATION chain (see
+                #                       credited_recipients).
+                #   wrong_token       - something reached a counted recipient
+                #                       but not the intent's output_token: you
+                #                       bridged and skipped the dest swap.
+                #   nothing_delivered - the destination legs moved nothing.
+                #   no_output_token   - the intent declared no output token.
+                "diagnosis": _xc_diagnosis,
             }
         return _resp
     except Exception as exc:

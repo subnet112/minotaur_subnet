@@ -167,18 +167,26 @@ async def _run(args: argparse.Namespace) -> int:
 
     runs: list[dict[str, Any]] = []
     for n in range(args.repeat):
-        delivered, source = await _measure_destination_delivery(
+        delivered, source, diagnosis = await _measure_destination_delivery(
             simulator, plan, state, token_balances, fork_block,
         )
         runs.append({
             "run": n,
             "destination_delivered": delivered,
             "destination_amount_source": source,
+            # WHY a zero, when it is one. Part of the determinism surface: the
+            # diagnosis rides a persisted row, so it has to be identical across
+            # runs and validators exactly like the amount is.
+            "destination_delivery_diagnosis": diagnosis,
         })
         print(json.dumps(runs[-1], sort_keys=True))
 
     distinct = {
-        (r["destination_delivered"], r["destination_amount_source"])
+        json.dumps(
+            (r["destination_delivered"], r["destination_amount_source"],
+             r["destination_delivery_diagnosis"]),
+            sort_keys=True,
+        )
         for r in runs
     }
     report = {
