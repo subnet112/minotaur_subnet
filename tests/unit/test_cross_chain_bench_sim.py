@@ -58,6 +58,17 @@ def _plan(metadata: dict, interactions=None) -> ExecutionPlan:
     )
 
 
+class _State:
+    """Minimal IntentState stand-in: the measurement only needs params."""
+
+    def __init__(self, **params):
+        self._params = params
+        self.contract_address = None
+
+    def raw_params_view(self) -> dict:
+        return dict(self._params)
+
+
 def _cross_chain_plan_meta() -> dict:
     """Solver shape: two legs, one bridge request between them."""
     return {
@@ -535,6 +546,193 @@ class TestObserveOnly:
 
         out = asyncio.run(_measure_destination_delivery(
             RecordingSimulator(), _plan(_cross_chain_plan_meta()),
-            None, None, None,
+            _State(output_token=WETH_ETH), None, None,
         ))
         assert out == (str(delivered), "simulated")
+
+
+USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+
+def _dest_sim(transfers, amount_source="simulated"):
+    """Simulator stub whose destination leg reports ``transfers``."""
+    from minotaur_subnet.shared.types import SimulationResult
+
+    class _Sim:
+        async def simulate_cross_chain(self, plan, **kw):
+            legs = plan.metadata["legs"]
+            dest = [l for l in legs if l["type"] == "destination"]
+            return SimulationResult(
+                success=True,
+                leg_results={dest[0]["leg_id"]: {
+                    "success": True, "token_transfers": transfers,
+                }},
+                bridge_estimate={"amount_source": amount_source},
+            )
+
+    return _Sim()
+
+
+def _transfer(token, to, amount):
+    return {"token": token, "from": "0x" + "12" * 20,
+            "to": to, "amount": str(amount)}
+
+
+def _measure(transfers, **params):
+    import asyncio
+    from minotaur_subnet.harness.orchestrator import _measure_destination_delivery
+
+    return asyncio.run(_measure_destination_delivery(
+        _dest_sim(transfers), _plan(_cross_chain_plan_meta()),
+        _State(**params), None, None,
+    ))
+
+
+class TestDeliveryIsTokenFiltered:
+    """Delivery credit counts the asset the INTENT asked for — nothing else.
+
+    Summing every transfer to the receiver measures arrival, not delivery. The
+    two diverge exactly where the incentive lives, so each of these is a way
+    the pre-filter measurement mispriced a plan.
+    """
+
+    def test_only_the_requested_token_is_credited(self):
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        out = _measure(
+            [_transfer(USDC_BASE, _ANVIL_DEFAULT_ACCOUNT, 320_000_000),
+             _transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+            output_token=USDC_BASE,
+        )
+        # The stray WETH leg is change/dust, not delivery.
+        assert out == ("320000000", "simulated")
+
+    def test_bridged_but_unswapped_delivers_nothing(self):
+        """THE inversion this filter exists to stop.
+
+        A plan that bridges WETH and skips the destination swap used to be
+        credited its raw WETH amount — ~1e12x the honest USDC answer purely on
+        decimals — which won the order outright and logged the honest plan as a
+        regression. It delivered none of what was asked for; it scores zero.
+        """
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        honest, _ = _measure(
+            [_transfer(USDC_BASE, _ANVIL_DEFAULT_ACCOUNT, 320_000_000)],
+            output_token=USDC_BASE,
+        )
+        dumper, _ = _measure(
+            [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+            output_token=USDC_BASE,
+        )
+        assert dumper == "0"
+        assert int(honest) > int(dumper)
+
+    def test_token_match_is_case_insensitive(self):
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        out = _measure(
+            [_transfer(USDC_BASE.lower(), _ANVIL_DEFAULT_ACCOUNT, 5)],
+            output_token=USDC_BASE.upper(),
+        )
+        assert out == ("5", "simulated")
+
+    def test_receiver_filter_still_applies(self):
+        # Right token, wrong recipient — the pre-existing guard must survive.
+        out = _measure(
+            [_transfer(USDC_BASE, "0x" + "99" * 20, 320_000_000)],
+            output_token=USDC_BASE,
+        )
+        assert out == ("0", "simulated")
+
+    def test_no_requested_token_fails_closed(self):
+        """Unmeasurable must mean uncredited, never unfiltered.
+
+        Falling back to the blind sum when the intent declares no output token
+        would hand the dumping plan its inflated number back through the gap.
+        """
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        delivered, source = _measure(
+            [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+        )
+        assert delivered is None
+        assert source == "simulated"
+
+    def test_solver_metadata_cannot_choose_the_credited_token(self):
+        """The filter reads intent params, never the solver's own declaration.
+
+        Sourcing it from plan metadata would restore the vector in one move:
+        declare the cheap token, dump the cheap token, get credited for it.
+        """
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        meta = _cross_chain_plan_meta()
+        meta["cross_chain_plan"]["legs"][-1]["token_out"] = WETH_BASE
+        meta["token_out"] = WETH_BASE
+        import asyncio
+        from minotaur_subnet.harness.orchestrator import (
+            _measure_destination_delivery,
+        )
+        out = asyncio.run(_measure_destination_delivery(
+            _dest_sim([_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)]),
+            _plan(meta), _State(output_token=USDC_BASE), None, None,
+        ))
+        assert out == ("0", "simulated")
+
+
+class TestCrossChainGatesAgree:
+    """Every gate asks one predicate, so none can disagree with another.
+
+    Each historical disagreement failed the same way — one gate saw cross-chain
+    where another saw single-chain — and every one of them read to a miner as
+    "cross-chain earns nothing".
+    """
+
+    SHAPES = [
+        ("cross_chain", {"cross_chain": True}),
+        ("cross_chain_plan", {"cross_chain_plan": {"legs": [{}, {}]}}),
+        ("multi_leg_plan", {"multi_leg_plan": {"forward_legs": [{}]}}),
+        ("legs", {"legs": [{"leg_id": 0}]}),
+    ]
+
+    def test_every_declared_shape_is_recognised(self):
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            declares_cross_chain, is_cross_chain_plan,
+        )
+        for name, meta in self.SHAPES:
+            assert declares_cross_chain(meta), name
+            assert is_cross_chain_plan(_plan(meta)), name
+
+    def test_single_chain_is_untouched_by_every_gate(self):
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+        from minotaur_subnet.simulator.cross_chain_bench import declares_cross_chain
+
+        single = _plan({"route": "uniswap_v3"}, interactions=[_ix(1)])
+        assert not declares_cross_chain(single.metadata)
+        # Bit-identical: the same object, not merely an equal one.
+        assert _mock_bridge_for_benchmark(single, None) is single
+
+    def test_legacy_legs_shape_reaches_the_bridge_mocker(self):
+        """The gap that made a legacy plan measurable but unscoreable.
+
+        ``legs`` was measured by the destination observer yet skipped by the
+        bridge mocker, so its real bridge calldata reverted in the scored sim —
+        measured as delivering, scored as failing.
+        """
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        plan = _plan(
+            {"legs": [{"leg_id": 0, "chain_id": 1, "type": "bridge"}]},
+            interactions=[_ix(1, "7b939232")],  # a real bridge selector
+        )
+        mocked = _mock_bridge_for_benchmark(plan, None)
+        assert mocked is not plan, "bridge calldata must be rewritten"
+        assert mocked.interactions != plan.interactions
+
+    def test_widening_is_inert_without_bridge_calldata(self):
+        """Adding ``legs`` to the mock gate cannot move an existing score.
+
+        The rewrite is selector-matched, so a declared plan carrying no bridge
+        calldata returns the identical object however it declared itself.
+        """
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        for name, meta in self.SHAPES:
+            plan = _plan(dict(meta), interactions=[_ix(1, "a9059cbb")])
+            assert _mock_bridge_for_benchmark(plan, None) is plan, name
