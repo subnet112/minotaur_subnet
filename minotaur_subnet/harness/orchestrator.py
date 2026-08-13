@@ -38,6 +38,7 @@ import os
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -2455,9 +2456,7 @@ async def _measure_destination_delivery(
         if state is not None and hasattr(state, "raw_params_view")
         else {}
     )
-    receiver = str(
-        params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
-    ).lower()
+    recipients = _delivery_recipients(state, plan)
 
     # WHICH token counts as delivery — the asset the INTENT asked for, taken
     # from the request params, never from the plan's own metadata.
@@ -2494,29 +2493,102 @@ async def _measure_destination_delivery(
 
     delivered = 0
     other_token_amount = 0
+    wrong_recipient_amount = 0
     for leg_id in dest_ids:
         for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
-            if str(t.get("to", "")).lower() != receiver:
-                continue
             try:
                 amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
+                continue
+            if str(t.get("to", "")).lower() not in recipients:
+                wrong_recipient_amount += amount
                 continue
             if str(t.get("token", "")).lower() != expected_token:
                 other_token_amount += amount
                 continue
             delivered += amount
 
-    if other_token_amount and not delivered:
-        # The signature of a plan that bridged but never performed the
-        # destination action. Worth a line: pre-filter this scored as a win.
+    if not delivered and (other_token_amount or wrong_recipient_amount):
+        # Both zero-delivery signatures are worth distinguishing in the log:
+        # "bridged but never swapped" and "delivered somewhere we don't count"
+        # look identical in the row (0) but need opposite fixes.
         logger.info(
-            "[benchmark] destination legs delivered 0 of the requested token "
-            "%s to %s (%d in other tokens ignored)",
-            expected_token, receiver, other_token_amount,
+            "[benchmark] destination legs credited 0 of %s to %s "
+            "(%d in other tokens, %d to other recipients)",
+            expected_token, sorted(recipients),
+            other_token_amount, wrong_recipient_amount,
         )
 
     return str(delivered), amount_source
+
+
+def _delivery_recipients(
+    plan_state: IntentState | None, plan: ExecutionPlan,
+) -> set[str]:
+    """Addresses whose incoming transfers count as destination delivery.
+
+    Crediting ONLY ``params['receiver']`` is why the reference solver measured
+    zero on every case. A benchmark IntentState is built with ``owner=""``
+    (benchmark_worker.py), quote cases carry no ``receiver``, and the solver's
+    own default is ``receiver_default = state.contract_address or state.owner``
+    — so the solver addresses the destination leg at the APP CONTRACT while the
+    platform was watching only the anvil default account. Neither side is wrong
+    on its own; they were answering different questions.
+
+    The app contract is a legitimate delivery target, not a workaround: under
+    the V2 escrow model the destination funds are SUPPOSED to land in the app
+    (``escrowDeposit`` gates on ``balanceOf(address(this))``, and ``escrowRefund``
+    returns from there), which is exactly why the cross-chain compiler resolves
+    the dest recipient to the App on the DESTINATION chain and fails closed when
+    that chain has no order-ready deployment. The app's own single-chain scorer
+    has always counted both: ``toAddr === receiver || toAddr === appAddr``.
+
+    Deliberately the DESTINATION chain's app address, never the source chain's.
+    They differ, and a transfer to the source-chain address on the destination
+    fork reaches an account with no code there — stranded funds. Crediting that
+    would be a mis-credit, so an unresolvable destination address simply is not
+    added (the measurement then reports what it can see, and a plan delivering
+    only there reads 0 — correctly).
+
+    Strictly a SUPERSET of the previous single-address rule, so this can only
+    ever raise a measured delivery, never lower one.
+    """
+    params = (
+        plan_state.raw_params_view()
+        if plan_state is not None and hasattr(plan_state, "raw_params_view")
+        else {}
+    )
+    control = (
+        plan_state.control_view()
+        if plan_state is not None and hasattr(plan_state, "control_view")
+        else {}
+    )
+
+    out: set[str] = set()
+    receiver = str(params.get("receiver") or "").lower()
+    if receiver:
+        out.add(receiver)
+    else:
+        # Preserve the historical default so single-receiver cases are
+        # unchanged: the pre-funded Anvil account is who the benchmark's
+        # scoreIntent path submits as.
+        out.add(_ANVIL_DEFAULT_ACCOUNT.lower())
+
+    dst_chain = (plan.metadata or {}).get("dst_chain_id")
+    app_addresses = control.get("_app_addresses") or {}
+    if dst_chain is not None and isinstance(app_addresses, Mapping):
+        try:
+            key = int(dst_chain)
+        except (TypeError, ValueError):
+            key = None
+        if key is not None:
+            # Callers may key by int or str depending on where the map came
+            # from (app store vs a JSON round-trip).
+            dest_app = app_addresses.get(key) or app_addresses.get(str(key))
+            if dest_app:
+                out.add(str(dest_app).lower())
+
+    return out
 
 
 def _build_benchmark_simulation(
