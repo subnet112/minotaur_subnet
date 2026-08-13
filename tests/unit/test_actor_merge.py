@@ -98,7 +98,7 @@ def test_merge_may_name_a_hotkey_or_an_owner(monkeypatch):
 def test_static_list_is_on_by_default_and_kill_switchable(monkeypatch):
     monkeypatch.delenv("SOLVER_ACTOR_STATIC_MERGE", raising=False)
     ring = sorted(actor_mod._STATIC_ACTOR_MERGES[0])
-    assert len(ring) == 13                            # the 2026-07-28 fp-ring
+    assert len(ring) == 9                             # fp-ring, narrowed 08-13
     assert all(len(ck) > 40 for ck in ring)           # full SS58, not truncated
     groups = merge_groups()
     assert any(set(ring) <= set(g) for g in groups)
