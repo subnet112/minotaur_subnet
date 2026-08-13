@@ -247,6 +247,17 @@ def build_submission_report(
         dw_block["deadwood_delta"] = rel_dw.get("deadwood_delta")
     report["deadwood_rule"] = dw_block
 
+    # ── cross-chain delivery feedback ─────────────────────────────────────
+    # A cross-chain plan that delivers nothing is the most common cross-chain
+    # outcome, and until this block the only thing a miner could observe was a
+    # per-order verdict of "skip" — which reads as "not counted", not as "you
+    # got it wrong". The three causes need three different fixes, so the row's
+    # stable reason code is aggregated here rather than left in a validator log
+    # nobody outside the fleet can read.
+    xc = _cross_chain_delivery_block(details)
+    if xc is not None:
+        report["cross_chain_delivery"] = xc
+
     if rel is not None:
         report["relative"] = rel
         try:
@@ -676,3 +687,80 @@ def render_report_md(report: dict[str, Any] | None, *, submission_id: str | None
             "the status endpoint._\n"
         )
     return body
+
+
+# Stable codes from ``harness/orchestrator._delivery_diagnosis``, each paired
+# with the one thing the miner should change. Kept here (not in the row) so the
+# wording can improve without touching persisted, fleet-compared data.
+_DELIVERY_REASON_HINTS = {
+    "wrong_recipient": (
+        "The requested output token WAS delivered, but not to an address the "
+        "contest counts. Send the destination leg to the intent's `receiver`, "
+        "or to the App's address on the DESTINATION chain."
+    ),
+    "wrong_token": (
+        "Something reached a counted recipient, but not the intent's "
+        "`output_token` — the signature of bridging and skipping the "
+        "destination swap. Only the asset the intent asked for is credited."
+    ),
+    "nothing_delivered": (
+        "The destination legs moved nothing to anyone. Usually an empty "
+        "destination leg, or one that reverted."
+    ),
+    "no_output_token": (
+        "The intent declared no `output_token`, so there was nothing to "
+        "measure delivery against."
+    ),
+}
+
+
+def _cross_chain_delivery_block(details: Any) -> dict[str, Any] | None:
+    """Aggregate per-row cross-chain delivery outcomes for the miner report.
+
+    ``None`` when this submission had no cross-chain rows at all — which is
+    every submission today, so the report stays byte-identical until a solver
+    actually emits a cross-chain plan.
+    """
+    if not isinstance(details, dict):
+        return None
+    rows = details.get("per_intent")
+    if not isinstance(rows, list):
+        return None
+
+    considered = 0
+    credited = 0
+    reasons: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        delivered = row.get("destination_delivered")
+        reason = row.get("destination_delivery_reason")
+        if delivered is None and reason is None:
+            continue  # single-chain row — the overwhelming majority
+        considered += 1
+        try:
+            if int(delivered or 0) > 0:
+                credited += 1
+                continue
+        except (TypeError, ValueError):
+            pass
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+    if not considered:
+        return None
+
+    block: dict[str, Any] = {
+        "orders": considered,
+        "credited": credited,
+        # Sorted for a stable surface across validators and polls.
+        "reasons": dict(sorted(reasons.items())),
+    }
+    if reasons:
+        # Lead with the most common cause; ties broken by code so the hint a
+        # miner sees does not flip between two equally-frequent reasons.
+        top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        hint = _DELIVERY_REASON_HINTS.get(top)
+        if hint:
+            block["hint"] = hint
+    return block

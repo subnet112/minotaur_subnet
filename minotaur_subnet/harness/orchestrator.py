@@ -1855,8 +1855,17 @@ async def _process_scenario(
                         (
                             br.destination_delivered,
                             br.destination_amount_source,
+                            _delivery_diag,
                         ) = await _measure_destination_delivery(
                             simulator, plan, state, token_balances, fork_block,
+                        )
+                        # Only the stable CODE is persisted. The full diagnosis
+                        # (recipients, amounts) would bloat every row for detail
+                        # the miner can get on demand from the dry run — and
+                        # submission-store bloat has frozen the event loop
+                        # before (#569).
+                        br.destination_delivery_reason = (
+                            (_delivery_diag or {}).get("code")
                         )
                         # Hand the measurement to the app's scorer: the SAME
                         # values persisted on the row ride the sim into
@@ -2395,8 +2404,11 @@ async def _measure_destination_delivery(
     was observed to move — never a live bridge quote (differs between
     validators) and never the solver's declared output (self-reported).
 
-    Returns ``(delivered_wei_str | None, amount_source | None)``. Never
-    raises: an observation failing must not fail a benchmark row.
+    Returns ``(delivered_wei_str | None, amount_source | None, diagnosis |
+    None)``. ``diagnosis`` explains a ZERO — see :func:`_delivery_diagnosis`.
+    It is ``None`` whenever delivery was credited, so its presence IS the
+    "this delivered nothing, and here is why" signal. Never raises: an
+    observation failing must not fail a benchmark row.
 
     FLEET UNIFORMITY: the credited quantity is an input to ``raw_output`` and
     therefore to the adoption verdict, so a leader filtering by token while
@@ -2411,9 +2423,9 @@ async def _measure_destination_delivery(
     )
 
     if not is_cross_chain_plan(plan):
-        return None, None
+        return None, None, None
     if simulator is None or not hasattr(simulator, "simulate_cross_chain"):
-        return None, None
+        return None, None, None
 
     # Normalize HERE, not only inside the simulator: the delivered-amount
     # extraction below walks metadata["legs"], which only the LEGACY shape
@@ -2425,7 +2437,7 @@ async def _measure_destination_delivery(
     # declared but there is no multi-leg journey to measure.
     normalized = normalize_to_legs(plan)
     if normalized is None:
-        return None, None
+        return None, None, None
     plan = normalized
 
     try:
@@ -2438,7 +2450,7 @@ async def _measure_destination_delivery(
         )
     except Exception as exc:  # noqa: BLE001
         logger.info("[benchmark] destination-leg observation failed: %s", exc)
-        return None, None
+        return None, None, None
 
     estimate = getattr(result, "bridge_estimate", None) or {}
     amount_source = estimate.get("amount_source")
@@ -2449,7 +2461,7 @@ async def _measure_destination_delivery(
         leg["leg_id"] for leg in legs_meta if leg.get("type") == "destination"
     ]
     if not dest_ids:
-        return None, amount_source
+        return None, amount_source, None
 
     params = (
         state.raw_params_view()
@@ -2489,37 +2501,91 @@ async def _measure_destination_delivery(
             "[benchmark] destination delivery not measurable: intent declares "
             "no output_token to credit against",
         )
-        return None, amount_source
+        return None, amount_source, {"code": "no_output_token"}
 
-    delivered = 0
-    other_token_amount = 0
-    wrong_recipient_amount = 0
+    # Four buckets, because a zero has more than one cause and they need
+    # OPPOSITE fixes. Collapsing them (as a bare sum does) is what made every
+    # cross-chain zero look identical and unactionable.
+    delivered = 0                 # right token, credited recipient
+    wrong_token_to_recipient = 0  # credited recipient, but not what was asked
+    right_token_elsewhere = 0     # what was asked, delivered somewhere we don't count
     for leg_id in dest_ids:
         for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
             try:
                 amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
                 continue
-            if str(t.get("to", "")).lower() not in recipients:
-                wrong_recipient_amount += amount
-                continue
-            if str(t.get("token", "")).lower() != expected_token:
-                other_token_amount += amount
-                continue
-            delivered += amount
+            right_token = str(t.get("token", "")).lower() == expected_token
+            credited_to = str(t.get("to", "")).lower() in recipients
+            if right_token and credited_to:
+                delivered += amount
+            elif right_token:
+                right_token_elsewhere += amount
+            elif credited_to:
+                wrong_token_to_recipient += amount
 
-    if not delivered and (other_token_amount or wrong_recipient_amount):
-        # Both zero-delivery signatures are worth distinguishing in the log:
-        # "bridged but never swapped" and "delivered somewhere we don't count"
-        # look identical in the row (0) but need opposite fixes.
+    diagnosis = None
+    if not delivered:
+        diagnosis = _delivery_diagnosis(
+            expected_token, recipients,
+            wrong_token_to_recipient, right_token_elsewhere,
+        )
         logger.info(
-            "[benchmark] destination legs credited 0 of %s to %s "
-            "(%d in other tokens, %d to other recipients)",
-            expected_token, sorted(recipients),
-            other_token_amount, wrong_recipient_amount,
+            "[benchmark] destination legs credited 0 of %s — %s",
+            expected_token, diagnosis["code"],
         )
 
-    return str(delivered), amount_source
+    return str(delivered), amount_source, diagnosis
+
+
+def _delivery_diagnosis(
+    expected_token: str,
+    recipients: set[str],
+    wrong_token_to_recipient: int,
+    right_token_elsewhere: int,
+) -> dict[str, Any]:
+    """Why did a cross-chain plan deliver nothing? Answered in a stable code.
+
+    A zero delivery is the single most common cross-chain outcome and, until
+    now, the least actionable thing the platform could tell a miner: the row
+    said ``0`` whether they shipped the wrong asset, shipped to an address the
+    contest does not count, or never built a destination leg at all. Those need
+    three different fixes, and a miner had no way to tell which they had.
+
+    The code vocabulary is CLOSED and the values are content-addressed off the
+    measurement, never free text — this rides a persisted benchmark row that
+    leader and follower compare, so a wording difference between two validator
+    builds must never read as a data difference. Add codes, never reword them.
+
+      ``wrong_recipient``   the requested token WAS delivered, just not to an
+                            address that counts. Nearest miss there is: fix the
+                            destination leg's recipient.
+      ``wrong_token``       something reached a counted recipient, but not what
+                            the intent asked for — the signature of bridging
+                            and skipping the destination swap.
+      ``nothing_delivered`` the destination legs moved nothing at all to
+                            anyone. Usually an empty or reverting leg.
+      ``no_output_token``   the intent declared no output token, so there was
+                            nothing to measure against (set upstream).
+
+    ``wrong_recipient`` outranks ``wrong_token`` when both are present: it is
+    the closer miss and the cheaper fix, so it is the more useful thing to say.
+    """
+    if right_token_elsewhere:
+        code = "wrong_recipient"
+    elif wrong_token_to_recipient:
+        code = "wrong_token"
+    else:
+        code = "nothing_delivered"
+    return {
+        "code": code,
+        "requested_token": expected_token,
+        # Sorted so two validators emit byte-identical diagnoses for the same
+        # observation — this is a set, and set order is not stable.
+        "credited_recipients": sorted(recipients),
+        "delivered_to_others": str(right_token_elsewhere),
+        "other_tokens_delivered": str(wrong_token_to_recipient),
+    }
 
 
 def _delivery_recipients(
