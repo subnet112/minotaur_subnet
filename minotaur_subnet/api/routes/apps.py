@@ -1419,6 +1419,19 @@ async def score_plan(
         intent_function=body.intent_function,
         owner=params.get("owner", ""),
     )
+    # Per-chain app addresses, so the dry run credits destination delivery to
+    # the App on the DESTINATION chain exactly as a bench round does. Without
+    # it the two disagree and the dry run stops being a preview: a plan
+    # delivering into the far-side app escrow would read 0 here and non-zero
+    # in a round. Mirrors the benchmark worker's ``_app_addresses``.
+    try:
+        state.control["_app_addresses"] = {
+            int(cid): (dep.contract_address or "")
+            for cid, dep in s.get_deployments(app_id).items()
+            if dep is not None and dep.contract_address
+        }
+    except Exception:  # noqa: BLE001 - a dry run must not 500 over this
+        pass
 
     # Synthesize a stand-in IntentOrder so the simulator takes the same
     # scoreIntent path production uses. Without this, simulator.simulate()

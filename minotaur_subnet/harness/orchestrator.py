@@ -38,6 +38,7 @@ import os
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -2333,12 +2334,10 @@ def _mock_bridge_for_benchmark(
     one :stable promotion before any solver emits such a plan. It is inert
     until one does.
     """
+    from minotaur_subnet.simulator.cross_chain_bench import declares_cross_chain
+
     meta = plan.metadata or {}
-    if not (
-        meta.get("cross_chain")
-        or meta.get("multi_leg_plan")
-        or meta.get("cross_chain_plan")
-    ):
+    if not declares_cross_chain(meta):
         return plan
 
     from minotaur_subnet.shared.types import mock_bridge_interactions
@@ -2398,6 +2397,13 @@ async def _measure_destination_delivery(
 
     Returns ``(delivered_wei_str | None, amount_source | None)``. Never
     raises: an observation failing must not fail a benchmark row.
+
+    FLEET UNIFORMITY: the credited quantity is an input to ``raw_output`` and
+    therefore to the adoption verdict, so a leader filtering by token while
+    followers still sum blind would have them disagree on the same plan. This
+    is inert only while nothing emits cross-chain — which is true today and
+    stops being true the moment cross-chain demand is re-seeded. Promote to
+    :stable fleet-wide BEFORE seeding, never after.
     """
     from minotaur_subnet.simulator.cross_chain_bench import (
         is_cross_chain_plan,
@@ -2450,21 +2456,139 @@ async def _measure_destination_delivery(
         if state is not None and hasattr(state, "raw_params_view")
         else {}
     )
-    receiver = str(
-        params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
-    ).lower()
+    recipients = _delivery_recipients(state, plan)
+
+    # WHICH token counts as delivery — the asset the INTENT asked for, taken
+    # from the request params, never from the plan's own metadata.
+    #
+    # Summing every transfer to the receiver regardless of token does not
+    # measure delivery, it measures arrival, and the two come apart exactly
+    # where it matters. A cross-chain intent is "spend WETH on chain A, deliver
+    # USDC on chain B"; a plan that bridges the WETH and simply forwards it,
+    # skipping the destination swap, lands a raw amount ~1e12 larger than the
+    # honest USDC answer purely because WETH has 18 decimals and USDC has 6.
+    # That number becomes ``metadata.raw_output``, which feeds the per-order
+    # relative comparison — so the plan that DIDN'T do the work wins the order
+    # outright and the plan that did is recorded as a regression. The incentive
+    # inverts. (The app's own single-chain scorer never had this hole: it
+    # already filters ``tokenAddr === tokenOut``, and so does the sibling
+    # cross-chain QUOTE path at cross_chain_quote.py — this scored path was the
+    # only one summing blind.)
+    #
+    # Params, not plan metadata, because the plan is solver-authored: filtering
+    # on a solver-declared ``token_out`` would restore the same vector in one
+    # move — declare the cheap token, dump the cheap token, get credited for it.
+    # ``output_token`` is already the DESTINATION-chain address (the CAIP-10
+    # intake derives dest_chain_id from it), so it needs no remapping.
+    expected_token = str(params.get("output_token") or "").lower()
+    if not expected_token:
+        # Fail closed, exactly like the no-destination-leg case above: an
+        # unmeasurable journey reports nothing and earns nothing. Crediting an
+        # unfiltered sum here would be the very mis-credit this guards against.
+        logger.info(
+            "[benchmark] destination delivery not measurable: intent declares "
+            "no output_token to credit against",
+        )
+        return None, amount_source
 
     delivered = 0
+    other_token_amount = 0
+    wrong_recipient_amount = 0
     for leg_id in dest_ids:
         for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
-            if str(t.get("to", "")).lower() != receiver:
-                continue
             try:
-                delivered += int(t.get("amount") or 0)
+                amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
                 continue
+            if str(t.get("to", "")).lower() not in recipients:
+                wrong_recipient_amount += amount
+                continue
+            if str(t.get("token", "")).lower() != expected_token:
+                other_token_amount += amount
+                continue
+            delivered += amount
+
+    if not delivered and (other_token_amount or wrong_recipient_amount):
+        # Both zero-delivery signatures are worth distinguishing in the log:
+        # "bridged but never swapped" and "delivered somewhere we don't count"
+        # look identical in the row (0) but need opposite fixes.
+        logger.info(
+            "[benchmark] destination legs credited 0 of %s to %s "
+            "(%d in other tokens, %d to other recipients)",
+            expected_token, sorted(recipients),
+            other_token_amount, wrong_recipient_amount,
+        )
 
     return str(delivered), amount_source
+
+
+def _delivery_recipients(
+    plan_state: IntentState | None, plan: ExecutionPlan,
+) -> set[str]:
+    """Addresses whose incoming transfers count as destination delivery.
+
+    Crediting ONLY ``params['receiver']`` is why the reference solver measured
+    zero on every case. A benchmark IntentState is built with ``owner=""``
+    (benchmark_worker.py), quote cases carry no ``receiver``, and the solver's
+    own default is ``receiver_default = state.contract_address or state.owner``
+    — so the solver addresses the destination leg at the APP CONTRACT while the
+    platform was watching only the anvil default account. Neither side is wrong
+    on its own; they were answering different questions.
+
+    The app contract is a legitimate delivery target, not a workaround: under
+    the V2 escrow model the destination funds are SUPPOSED to land in the app
+    (``escrowDeposit`` gates on ``balanceOf(address(this))``, and ``escrowRefund``
+    returns from there), which is exactly why the cross-chain compiler resolves
+    the dest recipient to the App on the DESTINATION chain and fails closed when
+    that chain has no order-ready deployment. The app's own single-chain scorer
+    has always counted both: ``toAddr === receiver || toAddr === appAddr``.
+
+    Deliberately the DESTINATION chain's app address, never the source chain's.
+    They differ, and a transfer to the source-chain address on the destination
+    fork reaches an account with no code there — stranded funds. Crediting that
+    would be a mis-credit, so an unresolvable destination address simply is not
+    added (the measurement then reports what it can see, and a plan delivering
+    only there reads 0 — correctly).
+
+    Strictly a SUPERSET of the previous single-address rule, so this can only
+    ever raise a measured delivery, never lower one.
+    """
+    params = (
+        plan_state.raw_params_view()
+        if plan_state is not None and hasattr(plan_state, "raw_params_view")
+        else {}
+    )
+    control = (
+        plan_state.control_view()
+        if plan_state is not None and hasattr(plan_state, "control_view")
+        else {}
+    )
+
+    out: set[str] = set()
+    receiver = str(params.get("receiver") or "").lower()
+    if receiver:
+        out.add(receiver)
+    else:
+        # Preserve the historical default so single-receiver cases are
+        # unchanged: the pre-funded Anvil account is who the benchmark's
+        # scoreIntent path submits as.
+        out.add(_ANVIL_DEFAULT_ACCOUNT.lower())
+
+    dst_chain = (plan.metadata or {}).get("dst_chain_id")
+    app_addresses = control.get("_app_addresses") or {}
+    if dst_chain is not None and isinstance(app_addresses, Mapping):
+        try:
+            key = int(dst_chain)
+        except (TypeError, ValueError):
+            key = None
+        if key is not None:
+            # Callers may key by int or str depending on where the map came
+            # from (app store vs a JSON round-trip).
+            dest_app = app_addresses.get(key) or app_addresses.get(str(key))
+            if dest_app:
+                out.add(str(dest_app).lower())
+
+    return out
 
 
 def _build_benchmark_simulation(
