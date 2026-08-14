@@ -1062,3 +1062,62 @@ class TestBridgeCapabilityDescriptor:
         src = inspect.getsource(orchestrator)
         assert "bridge_capability_descriptor()" in src
         assert '"bridge_capability"' in src
+
+
+class TestSolverInitConfigSurvivesTheWire:
+    """Every value a solver is handed must still be its declared type on arrival.
+
+    This bug class is invisible until a solver TRUSTS the field. A
+    ``BridgeRegistry`` put in a solver's init config arrived as its repr —
+    ``"<BridgeRegistry object at 0x…>"`` — which is TRUTHY, so a solver's
+    ``if registry is not None`` guard passed and the next attribute access
+    raised. Worse than sending nothing: ``None`` fails that guard cleanly.
+    """
+
+    def _roundtrip(self, config):
+        import json
+        from minotaur_subnet.harness.protocol import HarnessRequest
+        line = HarnessRequest(command="initialize",
+                              params={"config": config}).to_json()
+        return json.loads(line)["config"]
+
+    def test_a_registry_cannot_survive_the_hop(self):
+        """Pin the hazard itself, so nobody 'fixes' this by passing the object."""
+        from minotaur_subnet.bridge.registry import BridgeRegistry
+        got = self._roundtrip({"bridge_registry": BridgeRegistry()})["bridge_registry"]
+        assert isinstance(got, str) and got, "repr'd to a truthy string"
+        assert not hasattr(got, "find_bridge")
+
+    def test_the_descriptor_does_survive(self):
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            bridge_capability_descriptor,
+        )
+        d = bridge_capability_descriptor()
+        assert self._roundtrip({"bridge_capability": d})["bridge_capability"] == d
+
+    def test_every_value_keeps_its_type(self):
+        """The general guard: no value may change type crossing the wire."""
+        from minotaur_subnet.harness.runtime_solver import (
+            bridge_capability_descriptor,
+        )
+        cfg = {
+            "chain_ids": [1, 8453],
+            "rpc_urls": {"1": "http://x", "8453": "http://y"},
+            "timeout_per_plan_ms": 5000,
+            "bridge_capability": bridge_capability_descriptor(),
+        }
+        out = self._roundtrip(cfg)
+        assert out == cfg
+        for k, v in cfg.items():
+            assert type(out[k]) is type(v), f"{k} changed type on the wire"
+
+    def test_live_and_scored_paths_send_the_same_shape(self):
+        """One contract everywhere — not a registry field on one path and a
+        descriptor on another."""
+        import inspect
+        from minotaur_subnet.harness import orchestrator, runtime_solver
+        live = inspect.getsource(runtime_solver)
+        scored = inspect.getsource(orchestrator)
+        assert '"bridge_capability"' in live and '"bridge_capability"' in scored
+        # and the un-sendable field is gone from the live path entirely
+        assert '"bridge_registry"' not in live
