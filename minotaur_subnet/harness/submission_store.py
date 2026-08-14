@@ -2370,6 +2370,22 @@ class SubmissionStore:
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
                     sdk_version=d.get("sdk_version"),
+                    # Hydrate the deprecated-surface scan too. Omitting it here
+                    # silently reset the evidence to None on EVERY process
+                    # start: to_dict() emits it, upsert() carries it, set_
+                    # deprecated_surface() writes it — only this constructor
+                    # forgot it, so the DB kept the rows and the running
+                    # process could not see them. Live on 2026-08-13, minutes
+                    # after the fix that was supposed to make this measurable:
+                    # 124 scanned rows in the last 24h in submissions.db,
+                    # surface_scanned=0 on /v1/migration/status.
+                    #
+                    # This is the SAME defect class as the upsert merge bug
+                    # (see _upsert_one) — a field added on one path and missed
+                    # on another — and it survived that fix because upsert was
+                    # made field-agnostic while this constructor is an explicit
+                    # list. Any field added to Submission must be added HERE.
+                    deprecated_surface_hits=d.get("deprecated_surface_hits"),
                     is_copycat=bool(d.get("is_copycat", False)),
                     coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),
