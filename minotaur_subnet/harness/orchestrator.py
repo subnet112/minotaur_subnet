@@ -1384,9 +1384,26 @@ async def run_benchmark(
         )
 
     # Initialize — pass RPC URLs so Docker solvers can query pool states
+    from minotaur_subnet.simulator.cross_chain_bench import (
+        bridge_capability_descriptor,
+    )
+
     init_config: dict[str, Any] = {
         "chain_ids": config.chain_ids,
         "timeout_per_plan_ms": config.timeout_per_plan_ms,
+        # Which assets a bridge can carry ACROSS which chains, and at what fee —
+        # the scored path had no answer to that question at all, so a solver
+        # could only get cross-chain right by memorising four addresses.
+        #
+        # A plain dict, not a BridgeRegistry: the solver protocol is JSON
+        # (harness/protocol.py), and a registry object serialises to
+        # "<BridgeRegistry object at 0x…>" — a TRUTHY STRING that defeats a
+        # solver's `is not None` guard and then raises on attribute access.
+        #
+        # And deterministic, not live: the real registry prices routes over
+        # HTTP, which must never enter a scored path or two validators would
+        # disagree on the same plan. See bridge_capability_descriptor.
+        "bridge_capability": bridge_capability_descriptor(),
     }
     # Resolve live RPC for every chain we're about to benchmark. Without it the
     # solver silently falls back to an incomplete on-chain snapshot (missing
