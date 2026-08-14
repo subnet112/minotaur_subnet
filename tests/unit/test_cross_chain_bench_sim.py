@@ -482,7 +482,7 @@ class TestObserveOnly:
         out = asyncio.run(_measure_destination_delivery(
             ExplodingSimulator(), _plan({"route": "univ3"}), None, None, None,
         ))
-        assert out == (None, None)
+        assert out == (None, None, None)
 
     def test_observation_failure_is_swallowed(self):
         import asyncio
@@ -498,7 +498,7 @@ class TestObserveOnly:
         out = asyncio.run(_measure_destination_delivery(
             BrokenSimulator(), _plan(_multi_leg_plan_meta()), None, None, None,
         ))
-        assert out == (None, None)
+        assert out == (None, None, None)
 
     def test_simulator_without_the_method_is_skipped(self):
         import asyncio
@@ -512,7 +512,7 @@ class TestObserveOnly:
         out = asyncio.run(_measure_destination_delivery(
             SingleChainOnly(), _plan(_multi_leg_plan_meta()), None, None, None,
         ))
-        assert out == (None, None)
+        assert out == (None, None, None)
 
     def test_solver_shape_delivery_is_extracted(self):
         # Soak finding 2026-07-28: the extraction walked plan.metadata["legs"]
@@ -552,7 +552,7 @@ class TestObserveOnly:
             RecordingSimulator(), _plan(_cross_chain_plan_meta()),
             _State(output_token=WETH_ETH), None, None,
         ))
-        assert out == (str(delivered), "simulated")
+        assert out[:2] == (str(delivered), "simulated")
 
 
 USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -608,7 +608,7 @@ class TestDeliveryIsTokenFiltered:
             output_token=USDC_BASE,
         )
         # The stray WETH leg is change/dust, not delivery.
-        assert out == ("320000000", "simulated")
+        assert out[:2] == ("320000000", "simulated")
 
     def test_bridged_but_unswapped_delivers_nothing(self):
         """THE inversion this filter exists to stop.
@@ -619,11 +619,11 @@ class TestDeliveryIsTokenFiltered:
         regression. It delivered none of what was asked for; it scores zero.
         """
         from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
-        honest, _ = _measure(
+        honest, _, _ = _measure(
             [_transfer(USDC_BASE, _ANVIL_DEFAULT_ACCOUNT, 320_000_000)],
             output_token=USDC_BASE,
         )
-        dumper, _ = _measure(
+        dumper, _, _ = _measure(
             [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
             output_token=USDC_BASE,
         )
@@ -636,7 +636,7 @@ class TestDeliveryIsTokenFiltered:
             [_transfer(USDC_BASE.lower(), _ANVIL_DEFAULT_ACCOUNT, 5)],
             output_token=USDC_BASE.upper(),
         )
-        assert out == ("5", "simulated")
+        assert out[:2] == ("5", "simulated")
 
     def test_receiver_filter_still_applies(self):
         # Right token, wrong recipient — the pre-existing guard must survive.
@@ -644,7 +644,7 @@ class TestDeliveryIsTokenFiltered:
             [_transfer(USDC_BASE, "0x" + "99" * 20, 320_000_000)],
             output_token=USDC_BASE,
         )
-        assert out == ("0", "simulated")
+        assert out[:2] == ("0", "simulated")
 
     def test_no_requested_token_fails_closed(self):
         """Unmeasurable must mean uncredited, never unfiltered.
@@ -653,7 +653,7 @@ class TestDeliveryIsTokenFiltered:
         would hand the dumping plan its inflated number back through the gap.
         """
         from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
-        delivered, source = _measure(
+        delivered, source, _diag = _measure(
             [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
         )
         assert delivered is None
@@ -677,7 +677,7 @@ class TestDeliveryIsTokenFiltered:
             _dest_sim([_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)]),
             _plan(meta), _State(output_token=USDC_BASE), None, None,
         ))
-        assert out == ("0", "simulated")
+        assert out[:2] == ("0", "simulated")
 
 
 class TestCrossChainGatesAgree:
@@ -831,7 +831,7 @@ class TestDeliveryRecipients:
                    control={"_app_addresses": {8453: APP_BASE}}),
             None, None,
         ))
-        assert out == ("320000000", "simulated")
+        assert out[:2] == ("320000000", "simulated")
 
     def test_widening_never_lowers_a_measurement(self):
         """Superset property: every previously-credited transfer still counts."""
@@ -847,4 +847,135 @@ class TestDeliveryRecipients:
                    control={"_app_addresses": {8453: APP_BASE}}),
             None, None,
         ))
-        assert out == ("12", "simulated")
+        assert out[:2] == ("12", "simulated")
+
+
+class TestDeliveryDiagnosis:
+    """A zero delivery must say WHICH zero it is.
+
+    Three causes need three different fixes; a bare 0 told a miner nothing and
+    the distinction only ever reached a validator-side log.
+    """
+
+    def test_credited_delivery_has_no_diagnosis(self):
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        delivered, _, diag = _measure(
+            [_transfer(USDC_BASE, _ANVIL_DEFAULT_ACCOUNT, 5)],
+            output_token=USDC_BASE,
+        )
+        assert delivered == "5"
+        assert diag is None, "presence of a diagnosis IS the failure signal"
+
+    def test_wrong_recipient_is_named(self):
+        _, _, diag = _measure(
+            [_transfer(USDC_BASE, "0x" + "99" * 20, 320_000_000)],
+            output_token=USDC_BASE,
+        )
+        assert diag["code"] == "wrong_recipient"
+        assert diag["delivered_to_others"] == "320000000"
+
+    def test_wrong_token_is_named(self):
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        _, _, diag = _measure(
+            [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+            output_token=USDC_BASE,
+        )
+        assert diag["code"] == "wrong_token"
+        assert diag["other_tokens_delivered"] == str(10**18)
+
+    def test_nothing_delivered_is_named(self):
+        _, _, diag = _measure([], output_token=USDC_BASE)
+        assert diag["code"] == "nothing_delivered"
+
+    def test_wrong_recipient_outranks_wrong_token(self):
+        """The closer miss and the cheaper fix is the more useful thing to say."""
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        _, _, diag = _measure(
+            [_transfer(USDC_BASE, "0x" + "99" * 20, 1),
+             _transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+            output_token=USDC_BASE,
+        )
+        assert diag["code"] == "wrong_recipient"
+
+    def test_missing_output_token_is_named(self):
+        from minotaur_subnet.harness.orchestrator import _ANVIL_DEFAULT_ACCOUNT
+        delivered, _, diag = _measure(
+            [_transfer(WETH_BASE, _ANVIL_DEFAULT_ACCOUNT, 10**18)],
+        )
+        assert delivered is None
+        assert diag["code"] == "no_output_token"
+
+    def test_diagnosis_is_deterministic_across_validators(self):
+        """It rides a persisted row two validators compare byte-for-byte.
+
+        ``credited_recipients`` comes from a set, whose iteration order is not
+        stable — unsorted, two builds could emit different bytes for the same
+        observation and a wording difference would read as a data difference.
+        """
+        import json
+        from minotaur_subnet.harness.orchestrator import _delivery_diagnosis
+        a = _delivery_diagnosis("0xtok", {"0xb", "0xa", "0xc"}, 0, 7)
+        b = _delivery_diagnosis("0xtok", {"0xc", "0xa", "0xb"}, 0, 7)
+        assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+        assert a["credited_recipients"] == ["0xa", "0xb", "0xc"]
+
+    def test_code_vocabulary_is_closed(self):
+        from minotaur_subnet.api.routes.submissions.report import (
+            _DELIVERY_REASON_HINTS,
+        )
+        from minotaur_subnet.harness.orchestrator import _delivery_diagnosis
+        produced = {
+            _delivery_diagnosis("t", set(), 0, 1)["code"],
+            _delivery_diagnosis("t", set(), 1, 0)["code"],
+            _delivery_diagnosis("t", set(), 0, 0)["code"],
+            "no_output_token",
+        }
+        # Every code the platform can emit has miner-facing guidance.
+        assert produced <= set(_DELIVERY_REASON_HINTS), produced
+
+
+class TestCrossChainReportBlock:
+    """The miner-facing aggregate on /v1/submissions/{id}/status."""
+
+    def _block(self, rows):
+        from minotaur_subnet.api.routes.submissions.report import (
+            _cross_chain_delivery_block,
+        )
+        return _cross_chain_delivery_block({"per_intent": rows})
+
+    def test_single_chain_submissions_are_untouched(self):
+        # Every submission today. The report must stay byte-identical until a
+        # solver actually emits a cross-chain plan.
+        assert self._block([{"raw_output": "5"}, {"raw_output": "0"}]) is None
+        assert self._block([]) is None
+
+    def test_counts_and_hint(self):
+        b = self._block([
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_recipient"},
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_recipient"},
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_token"},
+            {"destination_delivered": "900"},
+            {"raw_output": "5"},
+        ])
+        assert b["orders"] == 4
+        assert b["credited"] == 1
+        assert b["reasons"] == {"wrong_recipient": 2, "wrong_token": 1}
+        assert "receiver" in b["hint"]
+
+    def test_hint_follows_the_most_common_cause(self):
+        b = self._block([
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_token"},
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_token"},
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "wrong_recipient"},
+        ])
+        assert "destination swap" in b["hint"]
+
+    def test_fully_credited_reports_no_hint(self):
+        b = self._block([{"destination_delivered": "900"}])
+        assert b == {"orders": 1, "credited": 1, "reasons": {}}
