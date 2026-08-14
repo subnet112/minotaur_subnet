@@ -2624,6 +2624,11 @@ class BenchmarkWorker:
                 "destination_amount_source": getattr(
                     r, "destination_amount_source", None,
                 ),
+                # Stable code explaining a ZERO delivery, surfaced to the miner
+                # on /v1/submissions/{id}/status. None when delivery counted.
+                "destination_delivery_reason": getattr(
+                    r, "destination_delivery_reason", None,
+                ),
             }
             # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
             # tag — ADDITIVE keys, present ONLY when the probe measured this
