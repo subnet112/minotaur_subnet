@@ -103,6 +103,58 @@ def map_bridged_token(token: str, src_chain_id: Any, dst_chain_id: Any) -> str:
     return token
 
 
+def bridge_capability_descriptor() -> dict[str, Any]:
+    """What the BENCHMARK can actually credit a bridge for — as plain JSON.
+
+    Solvers reach the benchmark over a JSON line protocol (harness/protocol.py
+    ``to_json``), so a ``BridgeRegistry`` OBJECT cannot be handed to them: it
+    serialises to ``"<BridgeRegistry object at 0x…>"``, a truthy STRING. That is
+    worse than omitting it — a solver's ``if registry is not None`` guard passes
+    and the next attribute access raises. This descriptor is the shape that can
+    actually cross that boundary.
+
+    DETERMINISTIC BY CONSTRUCTION, and that is the point. The live registry
+    prices routes by fetching bridge quotes over HTTP (bridge/across.py opens an
+    aiohttp session), which must never reach a scored path — two validators
+    quoting the same plan seconds apart would disagree and the adoption verdict
+    would diverge. This is built from CODE CONSTANTS only:
+    ``_CANONICAL_TOKEN_BY_CHAIN`` and ``BENCHMARK_BRIDGE_FEE_BPS``.
+
+    It also describes exactly what the benchmark will CREDIT, not merely what
+    some rail could carry. Those are different sets, and the gap was silent: an
+    unmapped token "passes through unchanged" in :func:`map_bridged_token`, so
+    no destination balance is seeded and the delivery measures zero however
+    correct the plan. A solver could only discover the creditable set by
+    memorising four addresses. Now it can ask.
+
+    The fee is the benchmark's own constant, so a solver planning against this
+    gets the number the scorer will use — strictly better information than a
+    live quote, which the benchmark ignores anyway.
+    """
+    routes: list[dict[str, Any]] = []
+    chains = sorted({c for by in _CANONICAL_TOKEN_BY_CHAIN.values() for c in by})
+    for src in chains:
+        for dst in chains:
+            if src == dst:
+                continue
+            tokens = [
+                {"symbol": sym, "token_in": by[src], "token_out": by[dst]}
+                for sym, by in sorted(_CANONICAL_TOKEN_BY_CHAIN.items())
+                if src in by and dst in by
+            ]
+            if tokens:
+                routes.append(
+                    {"src_chain_id": src, "dst_chain_id": dst, "tokens": tokens}
+                )
+    return {
+        "routes": routes,
+        "fee_bps": BENCHMARK_BRIDGE_FEE_BPS,
+        # Names the model so a solver can tell this apart from a live quote and
+        # know the number is exact rather than indicative.
+        "fee_model": "benchmark_constant",
+    }
+
+
 def declares_cross_chain(meta: Mapping[str, Any] | None) -> bool:
     """THE cross-chain declaration predicate. Every gate must call this one.
 
