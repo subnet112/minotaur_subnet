@@ -35,6 +35,18 @@ from minotaur_subnet.shared.types import AppIntentDefinition, ExecutionPlan, Int
 logger = logging.getLogger(__name__)
 
 
+def bridge_capability_descriptor() -> dict[str, Any]:
+    """Re-exported so the live path and the scored benchmark send one shape.
+
+    Defined in ``simulator/cross_chain_bench`` because the benchmark's
+    creditable set is the authority on what a bridge can actually carry.
+    """
+    from minotaur_subnet.simulator.cross_chain_bench import (
+        bridge_capability_descriptor as _d,
+    )
+    return _d()
+
+
 def forced_solver_image() -> str | None:
     """Operator break-glass override for the live solver image, or None.
 
@@ -146,7 +158,6 @@ class DockerRuntimeSolver:
         metadata: SolverMetadata,
         chain_ids: list[int] | None = None,
         rpc_urls: dict[int, str] | None = None,
-        bridge_registry: Any = None,
         live_proxy_cfg: Any = None,
         live_proxy_session_id: str | None = None,
         rpc_overrides: dict[int, str] | None = None,
@@ -180,7 +191,6 @@ class DockerRuntimeSolver:
         # after a crash can rebuild the inner session transparently.
         self._init_chain_ids = list(chain_ids or [])
         self._init_rpc_urls = dict(rpc_urls or {})
-        self._init_bridge_registry = bridge_registry
         # Respawn observability:
         #   _respawn_count: how many times the session has been rebuilt
         #     since this runtime was constructed. Surfaced in /health so
@@ -200,7 +210,6 @@ class DockerRuntimeSolver:
         image_ref: str,
         chain_ids: list[int],
         rpc_urls: dict[int, str],
-        bridge_registry: Any = None,
     ) -> "DockerRuntimeSolver":
         """Create and initialize a Docker-backed runtime solver.
 
@@ -324,7 +333,23 @@ class DockerRuntimeSolver:
         init_cfg: dict[str, Any] = {
             "chain_ids": chain_ids,
             "rpc_urls": rpc_urls,
-            "bridge_registry": bridge_registry,
+            # NOT the BridgeRegistry. This config crosses a JSON line protocol
+            # (harness/protocol.py), where an object is serialised by its repr:
+            # a solver received the STRING "<BridgeRegistry object at 0x…>",
+            # which is TRUTHY. That is worse than sending nothing — `None` fails
+            # a solver's `is not None` guard cleanly, a truthy string passes it
+            # and then raises on first attribute access. The live and quote
+            # paths were advertising a bridge capability they could not deliver.
+            #
+            # The descriptor is the JSON-safe shape, and it is the SAME one the
+            # scored benchmark sends (#1396), so a solver sees one contract
+            # everywhere instead of a registry-shaped field on one path and a
+            # descriptor on another. Deterministic by construction, which the
+            # scored path requires and costs the live path nothing — the real
+            # registry stays available in-process to the platform components
+            # that actually price routes (BridgeTracker, CrossChainCompiler,
+            # the quote builder).
+            "bridge_capability": bridge_capability_descriptor(),
         }
         await session.initialize(init_cfg)
 
@@ -344,7 +369,6 @@ class DockerRuntimeSolver:
             metadata=meta,
             chain_ids=chain_ids,
             rpc_urls=rpc_urls,
-            bridge_registry=bridge_registry,
             live_proxy_cfg=live_cfg,
             live_proxy_session_id=live_session_id,
             rpc_overrides=rpc_overrides,
@@ -390,10 +414,12 @@ class DockerRuntimeSolver:
                 os.environ["MINOTAUR_PRODUCTION"] = saved_production
             else:
                 os.environ.pop("MINOTAUR_PRODUCTION", None)
+        # Same shape as create()'s init_cfg — a respawn must not hand the
+        # solver a different contract than its first boot did.
         await session.initialize({
             "chain_ids": self._init_chain_ids,
             "rpc_urls": self._init_rpc_urls,
-            "bridge_registry": self._init_bridge_registry,
+            "bridge_capability": bridge_capability_descriptor(),
         })
         self._session = session
         self._respawn_count += 1

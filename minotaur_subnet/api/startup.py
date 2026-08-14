@@ -1897,7 +1897,6 @@ async def initialize(ctx: ServerContext) -> dict:
                     image_ref=_boot_image,
                     chain_ids=chain_ids,
                     rpc_urls=rpc_urls,
-                    bridge_registry=bridge_registry,
                 )
                 if _boot_forced:
                     logger.warning(
@@ -2584,7 +2583,6 @@ async def initialize(ctx: ServerContext) -> dict:
                         image_ref=image_ref,
                         chain_ids=chain_ids,
                         rpc_urls=rpc_urls,
-                        bridge_registry=bridge_registry,
                     ),
                     timeout=champion_swap_timeout,
                 )
