@@ -92,6 +92,45 @@ CONSTANT_METHODS = frozenset({"eth_chainId", "net_version"})
 # Block tags that name MOVING state — a request carrying one never caches.
 _MOVING_TAGS = frozenset({"latest", "pending", "earliest", "safe", "finalized"})
 
+# Methods the JSON-RPC spec defines as returning an OBJECT or null — "null"
+# meaning "no such thing", which is a routine answer, not a failure.
+#
+# A provider that answers one of these with a scalar has said something the
+# spec has no room for, and the damage is out of all proportion to the typo:
+# anvil deserializes these into ``Option<T>``, so ``null`` becomes "not found"
+# and a JSON *string* becomes a TYPE ERROR that fails the whole fork request —
+# `Fork Error: DeserError { invalid type: string "0x0", expected struct ... }`.
+# A routine "does this tx exist?" turns into a dead simulation.
+#
+# Observed live 2026-08-13: rpc-base.blockmachine.io returns the string "0x0"
+# instead of null for unknown tx hashes (eth_getTransactionReceipt 30/30,
+# eth_getTransactionByHash 28/30). Their ETH endpoint is correct on the same
+# gateway build, and Base's own mainnet.base.org plus two other independent
+# Base RPCs all return null — so this is that provider, not the chain.
+# It cost ~14h at 94.7% Base row failure.
+NULLABLE_OBJECT_METHODS = frozenset({
+    "eth_getBlockByHash",
+    "eth_getBlockByNumber",
+    "eth_getTransactionByHash",
+    "eth_getTransactionByBlockHashAndIndex",
+    "eth_getTransactionByBlockNumberAndIndex",
+    "eth_getTransactionReceipt",
+    "eth_getUncleByBlockHashAndIndex",
+    "eth_getUncleByBlockNumberAndIndex",
+})
+
+
+def conforms(method: Any, result: Any) -> bool:
+    """Is ``result`` a shape the spec allows for ``method``?
+
+    Only ever False for :data:`NULLABLE_OBJECT_METHODS` given a non-object,
+    non-null result. Every other method/result pair is accepted unexamined —
+    this is a narrow conformance guard, not a schema validator.
+    """
+    if method not in NULLABLE_OBJECT_METHODS:
+        return True
+    return result is None or isinstance(result, dict)
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -176,6 +215,9 @@ class ForkCache:
         self.hits = 0
         self.misses = 0
         self.uncacheable = 0
+        # Spec-violating results rewritten to null on the way to anvil. Should
+        # be 0 against a conformant provider; a rising count names a broken one.
+        self.nonconforming = 0
         self._client: ClientSession | None = None
         # Optional disk persistence: warm-load a snapshot on startup and re-write
         # it on a cadence, so a restart skips the cold re-fetch storm. Inert
@@ -224,6 +266,14 @@ class ForkCache:
     def _put(self, key: str, result: Any) -> None:
         if result is None:
             return  # null results are not cached (mirrors the pin cache)
+        # Never store a shape the spec forbids. ``_conform`` already rewrote
+        # these to null upstream of here, so this is defense in depth — but it
+        # is the layer that matters, because THIS cache persists to disk. That
+        # is how one provider's transient bug became a 14-hour outage that
+        # survived every restart: 2366/2366 cached base receipts held "0x0".
+        method = key.split(":", 2)[1] if key.count(":") >= 2 else None
+        if not conforms(method, result):
+            return
         try:
             size = len(json.dumps(result))
         except (TypeError, ValueError):
@@ -249,7 +299,22 @@ class ForkCache:
         items = list(payload.items())
         if len(items) > self.max_entries:
             items = items[-self.max_entries:]
-        self._cache = dict(items)
+        # Drop entries a conformant provider could never have produced. A
+        # snapshot written before this guard existed can carry poison, and
+        # warm-loading it would re-serve the outage from disk — the operator
+        # would have to purge the volume by hand to recover.
+        kept = [
+            (k, v) for k, v in items
+            if conforms(k.split(":", 2)[1] if k.count(":") >= 2 else None, v)
+        ]
+        dropped = len(items) - len(kept)
+        self._cache = dict(kept)
+        if dropped:
+            logger.warning(
+                "fork_cache dropped %d non-conforming entries while warm-loading "
+                "(a provider returned a shape the spec forbids and it was "
+                "persisted) — they will be re-fetched", dropped,
+            )
         logger.info("fork_cache warm-loaded %d entries from snapshot", len(self._cache))
 
     # -- request handling ----------------------------------------------------
@@ -287,7 +352,9 @@ class ForkCache:
             return web.json_response(
                 {"jsonrpc": "2.0", "id": req.get("id"), "result": result}
             )
-        resp = await self._forward(upstream, raw_body, request)
+        resp = self._conform(
+            await self._forward(upstream, raw_body, request), req.get("method"),
+        )
         self._harvest_single(key, resp)
         return resp
 
@@ -314,9 +381,66 @@ class ForkCache:
         if all_hit and answers:
             return web.json_response(answers)
 
-        resp = await self._forward(upstream, raw_body, request)
+        resp = self._conform(
+            await self._forward(upstream, raw_body, request),
+            {m.get("id"): m.get("method") for m in batch if isinstance(m, dict)},
+        )
         self._harvest_batch(batch, keys, resp)
         return resp
+
+    # -- conformance ---------------------------------------------------------
+
+    def _conform(
+        self, resp: web.StreamResponse, methods: dict[Any, Any] | str,
+    ) -> web.StreamResponse:
+        """Rewrite spec-violating scalar results to ``null`` before anvil sees them.
+
+        This DELIBERATELY breaks the byte-transparency ``_forward`` otherwise
+        keeps, for one narrow case the spec leaves no room for: a
+        :data:`NULLABLE_OBJECT_METHODS` result that is neither an object nor
+        null. Transparency exists so anvil sees what the provider really said;
+        it is not worth preserving when what the provider said is unspellable
+        and costs us the whole simulation (see NULLABLE_OBJECT_METHODS).
+
+        Narrow on purpose. We do NOT invent a receipt, mask an error object, or
+        touch any other method — the only rewrite is scalar → null, which maps
+        a malformed answer back onto the "no such thing" the provider was
+        trying to express. Everything else forwards untouched.
+
+        ``methods`` is the single request's method, or {id: method} for a batch.
+        """
+        data = self._response_json(resp)
+        if data is None:
+            return resp
+        fixed = 0
+
+        def _fix(member: Any) -> None:
+            nonlocal fixed
+            if not isinstance(member, dict) or "result" not in member:
+                return
+            method = (
+                methods if isinstance(methods, str)
+                else methods.get(member.get("id"))
+            )
+            if method is None or conforms(method, member["result"]):
+                return
+            logger.warning(
+                "fork_cache: %s returned a non-conforming result (%r) — "
+                "rewriting to null; the provider should send null for "
+                "'not found'", method, member["result"],
+            )
+            member["result"] = None
+            fixed += 1
+
+        if isinstance(data, dict):
+            _fix(data)
+        elif isinstance(data, list):
+            for member in data:
+                _fix(member)
+        if not fixed:
+            return resp
+        self.nonconforming += fixed
+        return web.json_response(data, status=resp.status)
 
     # -- fill-on-forward -----------------------------------------------------
 
@@ -404,6 +528,7 @@ class ForkCache:
             "hits": self.hits,
             "misses": self.misses,
             "uncacheable": self.uncacheable,
+            "nonconforming": self.nonconforming,
             "entries": len(self._cache),
             "disabled": self.disabled,
             "persist": self._snapshotter.enabled,
