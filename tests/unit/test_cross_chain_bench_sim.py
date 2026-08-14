@@ -979,3 +979,86 @@ class TestCrossChainReportBlock:
     def test_fully_credited_reports_no_hint(self):
         b = self._block([{"destination_delivered": "900"}])
         assert b == {"orders": 1, "credited": 1, "reasons": {}}
+
+
+class TestBridgeCapabilityDescriptor:
+    """The scored path had NO answer to 'what can a bridge carry?'.
+
+    A solver could only get cross-chain right by memorising the four canonical
+    addresses, which selects for hardcoded tables over general competence.
+    """
+
+    def _d(self):
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            bridge_capability_descriptor,
+        )
+        return bridge_capability_descriptor()
+
+    def test_survives_the_solver_wire(self):
+        """The whole reason this is a dict and not a BridgeRegistry.
+
+        Solvers are reached over a JSON line protocol. A registry object
+        serialises to "<BridgeRegistry object at 0x…>" — a TRUTHY string that
+        passes a solver's `is not None` guard and then raises on use, which is
+        strictly worse than sending nothing.
+        """
+        import json
+        from minotaur_subnet.harness.protocol import make_initialize_request
+
+        d = self._d()
+        assert json.loads(json.dumps(d)) == d, "descriptor must round-trip as JSON"
+        wire = make_initialize_request({"bridge_capability": d}).to_json()
+        assert "object at 0x" not in wire
+        assert json.loads(wire)["config"]["bridge_capability"] == d
+
+    def test_is_deterministic(self):
+        """It feeds a scored path, so two validators must derive it identically.
+
+        The live registry prices routes over HTTP; this must not.
+        """
+        import json
+        a, b = self._d(), self._d()
+        assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+    def test_describes_what_is_actually_creditable(self):
+        """Not what a rail *could* carry — what the benchmark will CREDIT.
+
+        An unmapped token passes through map_bridged_token unchanged, so no
+        destination balance is seeded and delivery measures zero. The descriptor
+        must not promise those.
+        """
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            _CANONICAL_TOKEN_BY_CHAIN, map_bridged_token,
+        )
+        d = self._d()
+        assert d["routes"], "must describe at least one route"
+        for route in d["routes"]:
+            src, dst = route["src_chain_id"], route["dst_chain_id"]
+            assert src != dst
+            for t in route["tokens"]:
+                # every advertised pair is one the seeding path can actually map
+                assert map_bridged_token(t["token_in"], src, dst).lower() == \
+                    t["token_out"].lower(), (t, src, dst)
+        advertised = {t["symbol"] for r in d["routes"] for t in r["tokens"]}
+        assert advertised == set(_CANONICAL_TOKEN_BY_CHAIN)
+
+    def test_fee_is_the_benchmark_constant_not_a_live_quote(self):
+        """A solver planning against this gets the number the scorer will use."""
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            BENCHMARK_BRIDGE_FEE_BPS,
+        )
+        d = self._d()
+        assert d["fee_bps"] == BENCHMARK_BRIDGE_FEE_BPS
+        assert d["fee_model"] == "benchmark_constant"
+
+    def test_reaches_the_scored_benchmark_init_config(self):
+        """The defect: benchmark_worker/orchestrator never told the solver anything.
+
+        Guards the wiring, not the value — the descriptor being correct is
+        useless if the scored path still omits it.
+        """
+        import inspect
+        from minotaur_subnet.harness import orchestrator
+        src = inspect.getsource(orchestrator)
+        assert "bridge_capability_descriptor()" in src
+        assert '"bridge_capability"' in src
