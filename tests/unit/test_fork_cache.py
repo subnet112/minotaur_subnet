@@ -227,7 +227,12 @@ async def test_fork_cache_retries_transient_429():
         if hits["n"] == 1:
             return web.Response(status=429, text='{"error":{"code":-32005}}',
                                 content_type="application/json")
-        return web.json_response({"jsonrpc": "2.0", "id": 1, "result": "0xfeed"})
+        # A block is an OBJECT. The stub used to answer "0xfeed" here, a shape
+        # no conformant provider returns — and the conformance shim now
+        # rewrites exactly that to null (see test_conforms_*).
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": 1, "result": {"number": "0xfeed"}}
+        )
 
     up = web.Application()
     up.router.add_post("/", flaky)
@@ -249,3 +254,134 @@ async def test_fork_cache_retries_transient_429():
             await client.close()
     finally:
         await server.close()
+
+
+# ── provider conformance shim ───────────────────────────────────────────────
+#
+# Live 2026-08-13: rpc-base.blockmachine.io answered unknown tx hashes with the
+# string "0x0" instead of null. anvil deserializes these into Option<T>, so a
+# JSON string is a TYPE error, not "not found" — the whole fork request died
+# ("Fork Error: DeserError"). 94.7% of Base benchmark rows failed for ~14h, and
+# the value was cached AND persisted to disk, so it outlived every restart.
+
+
+def test_conforms_only_judges_nullable_object_methods():
+    from minotaur_subnet.harness.rpc_budget_proxy.fork_cache import conforms
+
+    # the violation
+    assert conforms("eth_getTransactionReceipt", "0x0") is False
+    assert conforms("eth_getBlockByNumber", "0x0") is False
+    # the two shapes the spec allows
+    assert conforms("eth_getTransactionReceipt", None) is True
+    assert conforms("eth_getTransactionReceipt", {"status": "0x1"}) is True
+    # every other method is accepted unexamined — a scalar is CORRECT for these
+    assert conforms("eth_getStorageAt", "0x0") is True
+    assert conforms("eth_getBalance", "0x0") is True
+    assert conforms(None, "0x0") is True
+
+
+class _BadReceiptUpstream:
+    """Reproduces the provider: "0x0" for an unknown receipt, correct otherwise."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def handle(self, request: web.Request) -> web.Response:
+        body = json.loads(await request.read())
+        self.calls += 1
+        if isinstance(body, list):
+            return web.json_response([
+                {"jsonrpc": "2.0", "id": m.get("id"),
+                 "result": "0x0" if m.get("method") == "eth_getTransactionReceipt"
+                 else "0xstate"}
+                for m in body
+            ])
+        if body.get("method") == "eth_getTransactionReceipt":
+            return web.json_response({"jsonrpc": "2.0", "id": body.get("id"),
+                                      "result": "0x0"})
+        return web.json_response({"jsonrpc": "2.0", "id": body.get("id"),
+                                  "result": "0xstate"})
+
+
+@pytest_asyncio.fixture
+async def bad_provider():
+    stub = _BadReceiptUpstream()
+    up = web.Application()
+    up.router.add_post("/", stub.handle)
+    server = TestServer(up)
+    await server.start_server()
+    fc = ForkCache({"base": str(server.make_url("/"))})
+    client = TestClient(TestServer(fc.build_app()))
+    await client.start_server()
+    yield fc, client, stub
+    await client.close()
+    await server.close()
+
+
+@pytest.mark.asyncio
+async def test_scalar_receipt_is_rewritten_to_null(bad_provider):
+    """anvil must see 'not found', not a type error."""
+    fc, client, _ = bad_provider
+    r = await client.post("/base", json=_rpc("eth_getTransactionReceipt", ["0xdead"]))
+    assert (await r.json())["result"] is None
+    assert fc.nonconforming == 1
+
+
+@pytest.mark.asyncio
+async def test_scalar_receipt_is_never_cached(bad_provider):
+    """The half that turned a provider blip into a 14-hour outage.
+
+    This cache persists to disk, so a poisoned entry outlives restarts.
+    """
+    fc, client, _ = bad_provider
+    await client.post("/base", json=_rpc("eth_getTransactionReceipt", ["0xdead"]))
+    assert not [k for k in fc._cache if "eth_getTransactionReceipt" in k]
+
+
+@pytest.mark.asyncio
+async def test_legitimate_scalar_methods_are_untouched(bad_provider):
+    """Narrowness check: eth_getStorageAt returning '0x0' is CORRECT."""
+    fc, client, _ = bad_provider
+    r = await client.post("/base", json=_rpc("eth_getStorageAt", ["0xA", "0x1", "0x2ddd7c6"]))
+    assert (await r.json())["result"] == "0xstate"
+    assert fc.nonconforming == 0
+    assert [k for k in fc._cache if "eth_getStorageAt" in k], "must still cache"
+
+
+@pytest.mark.asyncio
+async def test_batch_members_are_rewritten_independently(bad_provider):
+    fc, client, _ = bad_provider
+    batch = [
+        _rpc("eth_getTransactionReceipt", ["0xdead"], 1),
+        _rpc("eth_getStorageAt", ["0xA", "0x1", "0x2ddd7c6"], 2),
+    ]
+    out = {m["id"]: m["result"] for m in await (await client.post("/base", json=batch)).json()}
+    assert out[1] is None          # rewritten
+    assert out[2] == "0xstate"     # untouched
+    assert fc.nonconforming == 1
+
+
+@pytest.mark.asyncio
+async def test_conformant_null_still_flows_through(cache_client):
+    """A provider that behaves must be byte-unaffected by any of this."""
+    fc, client, _ = cache_client
+    r = await client.post("/base", json=_rpc("eth_getStorageAt", ["0xA", "0x1", "0x2ddd7c6"]))
+    assert (await r.json())["result"] == "0xcafe"
+    assert fc.nonconforming == 0
+
+
+def test_warm_load_drops_poisoned_entries():
+    """A snapshot written before this guard must self-heal, not re-serve the outage.
+
+    Without this the operator has to purge the docker volume by hand.
+    """
+    fc = ForkCache({"base": "http://upstream.invalid"})
+    fc._restore({
+        'base:eth_getTransactionReceipt:["0xdead"]': "0x0",        # poison
+        'base:eth_getStorageAt:["0xA","0x1","0x2ddd7c6"]': "0x0",  # legitimate
+        'base:eth_getTransactionReceipt:["0xbeef"]': {"status": "0x1"},  # real receipt
+    })
+    keys = set(fc._cache)
+    assert 'base:eth_getTransactionReceipt:["0xdead"]' not in keys
+    assert 'base:eth_getStorageAt:["0xA","0x1","0x2ddd7c6"]' in keys
+    assert 'base:eth_getTransactionReceipt:["0xbeef"]' in keys
