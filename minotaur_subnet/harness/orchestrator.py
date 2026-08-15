@@ -1848,6 +1848,46 @@ async def _process_scenario(
                 else:
                     sim = _build_benchmark_simulation(plan, state)
                     used_mock = True
+                # DESTINATION MEASUREMENT — deliberately OUTSIDE the
+                # fail-closed guard below.
+                #
+                # It used to sit inside it, so the most common cross-chain
+                # outcome was also the one we recorded nothing for: a plan
+                # whose scoreIntent reverts fails closed, and 154 of the 172
+                # cross-chain rows benched in the first live day were exactly
+                # that. The row stored no delivered amount and no reason, so
+                # the miner-facing `cross_chain_delivery` block could never
+                # populate — the feature meant to explain a zero was silent for
+                # the failure that actually happens.
+                #
+                # A fail-closed scoreIntent says nothing about the destination
+                # legs: this is a SEPARATE simulate_cross_chain run over the
+                # plan's own legs, so it is exactly as meaningful there.
+                #
+                # SCORING IS UNCHANGED, structurally: `score_fn` is only called
+                # inside the guard, so a fail-closed row never reaches the app's
+                # scorer, and the values are attached to `sim` only on that
+                # path. This branch writes the ROW (diagnosis) and never the
+                # scorer's view. Still gated on `not used_mock` — a fabricated
+                # mock sim has no real fork to observe.
+                _delivery_diag = None
+                if not used_mock:
+                    (
+                        br.destination_delivered,
+                        br.destination_amount_source,
+                        _delivery_diag,
+                    ) = await _measure_destination_delivery(
+                        simulator, plan, state, token_balances, fork_block,
+                    )
+                    # Only the stable CODE is persisted. The full diagnosis
+                    # (recipients, amounts) would bloat every row for detail the
+                    # miner can get on demand from the dry run — and
+                    # submission-store bloat has frozen the event loop before
+                    # (#569).
+                    br.destination_delivery_reason = (
+                        (_delivery_diag or {}).get("code")
+                    )
+
                 if not fail_closed_miss:
                     br.mock_simulation = used_mock
                     # Capture the unfakeable on-chain scoreIntent BPS.
@@ -1864,32 +1904,14 @@ async def _process_scenario(
                         _gm if (not used_mock and sim.success and _gm > 0)
                         else None
                     )
-                    # PHASE 0 (observe-only): measure what the plan delivers
-                    # on the DESTINATION chain. Runs alongside the scored sim
-                    # above — which is untouched — so it cannot move a score.
-                    # No-op for every single-chain plan.
+                    # Hand the measurement (taken above) to the app's scorer:
+                    # the SAME values persisted on the row ride the sim into
+                    # context.simulation (engine/context.py), so the app JS can
+                    # price destination delivery itself. One computation feeds
+                    # both the stored artifact and the scorer — they can never
+                    # disagree. Scorer-visible ONLY here, never on the
+                    # fail-closed path.
                     if not used_mock:
-                        (
-                            br.destination_delivered,
-                            br.destination_amount_source,
-                            _delivery_diag,
-                        ) = await _measure_destination_delivery(
-                            simulator, plan, state, token_balances, fork_block,
-                        )
-                        # Only the stable CODE is persisted. The full diagnosis
-                        # (recipients, amounts) would bloat every row for detail
-                        # the miner can get on demand from the dry run — and
-                        # submission-store bloat has frozen the event loop
-                        # before (#569).
-                        br.destination_delivery_reason = (
-                            (_delivery_diag or {}).get("code")
-                        )
-                        # Hand the measurement to the app's scorer: the SAME
-                        # values persisted on the row ride the sim into
-                        # context.simulation (engine/context.py), so the app
-                        # JS can price destination delivery itself. One
-                        # computation feeds both the stored artifact and the
-                        # scorer — they can never disagree.
                         sim.destination_delivered = br.destination_delivered
                         sim.destination_amount_source = (
                             br.destination_amount_source
