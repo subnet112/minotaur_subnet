@@ -1121,3 +1121,51 @@ class TestSolverInitConfigSurvivesTheWire:
         assert '"bridge_capability"' in live and '"bridge_capability"' in scored
         # and the un-sendable field is gone from the live path entirely
         assert '"bridge_registry"' not in live
+class TestFailClosedRowsStillGetDiagnosed:
+    """A reverting plan is the MOST common cross-chain outcome, and the one a
+    miner most needs explained.
+
+    The measurement used to sit inside the ``if not fail_closed_miss:`` guard,
+    so a plan whose scoreIntent reverts recorded no delivered amount and no
+    reason. Live, 154 of the first 172 cross-chain rows were exactly that: the
+    `cross_chain_delivery` block shipped to explain a zero was silent for the
+    failure that actually happens.
+    """
+
+    def test_measurement_is_outside_the_fail_closed_guard(self):
+        """Structural: the call must not be nested under the guard."""
+        import inspect, re
+        from minotaur_subnet.harness import orchestrator
+
+        src = inspect.getsource(orchestrator._process_scenario)
+        guard = src.index("if not fail_closed_miss:")
+        call = src.index("await _measure_destination_delivery(")
+        assert call < guard, (
+            "_measure_destination_delivery moved back inside the fail-closed "
+            "guard — reverting plans would stop being diagnosed"
+        )
+
+    def test_scorer_only_sees_it_on_the_scored_path(self):
+        """The safety property. A fail-closed row never reaches score_fn, and
+        the values are attached to `sim` only inside the guard — so diagnosing
+        a reverting plan cannot become a way to earn credit for one."""
+        import inspect
+        from minotaur_subnet.harness import orchestrator
+
+        src = inspect.getsource(orchestrator._process_scenario)
+        guard = src.index("if not fail_closed_miss:")
+        assert src.index("sim.destination_delivered =") > guard
+        assert src.index("await score_fn(") > guard
+
+    def test_mock_sims_are_still_never_measured(self):
+        """A fabricated mock sim has no real fork to observe — the `used_mock`
+        gate must survive the move out of the fail-closed guard."""
+        import inspect
+        from minotaur_subnet.harness import orchestrator
+
+        src = inspect.getsource(orchestrator._process_scenario)
+        call = src.index("await _measure_destination_delivery(")
+        # the gate immediately preceding the call is `if not used_mock:`
+        between = src[src.index("_delivery_diag = None"):call]
+        assert "if not used_mock:" in between
+        assert "if not fail_closed_miss:" not in between
