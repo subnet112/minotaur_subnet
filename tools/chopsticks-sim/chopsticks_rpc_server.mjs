@@ -54,7 +54,16 @@ async function startChopsticks() {
   ]
   if (DB) args.push('--db', DB)
   console.log(`[ck] forking ${ENDPOINT} @ block ${block} on :${INNER_PORT}${DB ? ` (cache ${DB})` : ''}`)
-  const child = spawn('npx', args, { stdio: ['ignore', 'inherit', 'inherit'] })
+  // PORT must be overridden for the CHILD: chopsticks' CLI lets the PORT env var
+  // WIN over --port (cli.js: `if (environment.PORT) argv.port = Number(...)`), and
+  // this process sets PORT for its own listener — so an inherited PORT makes the
+  // fork steal our port, we never bind, and waitReady() times out on a chopsticks
+  // that is up but on the wrong port. Pass it explicitly rather than deleting it:
+  // the child then agrees with --port whichever precedence a future release picks.
+  const child = spawn('npx', args, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    env: { ...process.env, PORT: String(INNER_PORT) },
+  })
   child.on('exit', (c) => { console.error(`[ck] chopsticks exited ${c}`); process.exit(1) })
   return { child, block: Number(block) }
 }
@@ -88,7 +97,10 @@ if (ATTACH) {
   await waitReady()
   attachWs = `ws://127.0.0.1:${INNER_PORT}`
 }
-const ck = await ChopsticksAnvil.connect(attachWs)
+// The upstream is handed through so a FORWARD re-pin can resolve a block the
+// fork has never seen (chopsticks resolves a NUMBER only against its own chain,
+// which ends at the fork block — see ChopsticksAnvil.repin).
+const ck = await ChopsticksAnvil.connect(attachWs, { upstream: ENDPOINT })
 if (pinBlock === undefined) pinBlock = await ck.forkBlock()
 console.log(`[rpc] shim connected; fork @ ${await ck.forkBlock()}`)
 
