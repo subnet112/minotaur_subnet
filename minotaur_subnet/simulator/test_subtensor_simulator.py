@@ -203,3 +203,85 @@ async def test_subtensor_stake_raw_scorer_emits_delivered_alpha():
     assert res["metadata"]["raw_output"] == "219598620325"
     assert res["valid"] is True
     assert res["score"] == 1
+
+
+# ── sidecar process wiring (offline, source-inspected) ────────────────────────
+
+async def test_sidecar_gives_the_fork_its_own_port():
+    """The spawned chopsticks MUST get ``PORT=CK_INNER_PORT``, not ours.
+
+    chopsticks' CLI lets the ``PORT`` env var win over ``--port``
+    (``cli.js``: ``if (environment.PORT) argv.port = Number(environment.PORT)``),
+    and the container sets ``PORT=8545`` for the sidecar's OWN listener. Inherit
+    that and the fork binds 8545 first: the shim never binds, ``waitReady()``
+    polls the inner port for two minutes and dies, and the compose healthcheck
+    reports a container that is up but unreachable. Source-inspected because the
+    failure is in a Node child spawn, not in Python.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_rpc_server.mjs"
+    ).read_text()
+    spawn_call = src[src.index("const child = spawn("):]
+    spawn_call = spawn_call[:spawn_call.index("\n  return")]
+    assert "PORT: String(INNER_PORT)" in spawn_call, (
+        "the chopsticks child must be given the INNER port explicitly"
+    )
+
+
+async def test_sidecar_dependencies_are_exactly_pinned():
+    """Version RANGES are a consensus hazard here: this sidecar is the chain-964
+    simulator, so its executor decides scores, the lockfile is gitignored, and
+    two validators that built the image on different days would otherwise run
+    different runtime executors. (A range already bit us once — the 1.5.1 PORT
+    change above.)"""
+    pkg = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "tools" / "chopsticks-sim" / "package.json"
+        ).read_text()
+    )
+    for name, ver in pkg["dependencies"].items():
+        assert ver[0].isdigit(), f"{name} must be pinned exactly, got {ver!r}"
+
+
+async def test_repin_moves_forward_and_survives_a_runtime_upgrade():
+    """Rounds move FORWARD, and a long-lived sidecar will meet a runtime upgrade.
+
+    Both were broken until 2026-08-17, and both are on the per-round path:
+
+      * ``dev_setHead`` resolves a NUMBER against chopsticks' own chain, which
+        ends at the block it forked — so every re-pin to a newer block failed
+        with "Block not found", i.e. every round after the container started.
+      * crossing a runtime-version boundary left ``api.call.*`` decorated for the
+        OLD metadata (chopsticks' Manual block mode emits no new-heads
+        subscription for polkadot.js to learn from), so ethCall died with
+        "Cannot read properties of undefined".
+
+    The live half proves the forward jump; the boundary crossing needs a chain
+    whose spec version changed inside the node's history, so it is asserted on
+    the source of the fix instead.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_anvil.mjs"
+    ).read_text()
+    repin = src[src.index("async repin("):src.index("async reconnect(")]
+    assert "chain_getBlockHash" in repin, "forward re-pin must resolve the hash upstream"
+    assert "await this.reconnect()" in repin, "a spec-version change must re-decorate the api"
+
+    url = _sidecar_url()
+    if not url:
+        pytest.skip("SUBTENSOR_SIDECAR_URL not set/reachable")
+    sim = SubtensorSimulator(sidecar_url=url, chain_id=964)
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "sim_health", "params": []}).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        head = json.loads(r.read())["result"]["block"]
+
+    assert sim.pin_read_fork(964, head - 200) is True
+    assert sim.pin_read_fork(964, head) is True      # FORWARD — used to raise
+    # and the fork is still usable after the jump
+    sim.set_code(ROUTER, _HEX.read_text().strip())
+    sim.set_balance(ROUTER, 1_000_000_000)
+    assert sim._pinned[sim._urls[0]] == head
