@@ -102,15 +102,15 @@ def _request():
     )
 
 
-def _call(monkeypatch, plan_dict, simulator):
+def _call(monkeypatch, plan_dict, simulator, params=None):
     engine = _FakeEngine()
     monkeypatch.setattr(apps_module, "_store", _fake_store)
     monkeypatch.setattr(apps_module, "_simulator", simulator)
     monkeypatch.setattr(apps_module, "_js_engine", engine)
     body = apps_module.ScorePlanRequest(
         plan=plan_dict,
-        params={"input_token": WETH_BASE, "input_amount": str(10**17),
-                "output_token": WETH_ETH, "dest_chain_id": "1"},
+        params=params or {"input_token": WETH_BASE, "input_amount": str(10**17),
+                          "output_token": WETH_ETH, "dest_chain_id": "1"},
         chain_id=8453,
         intent_function="swap",
     )
@@ -133,10 +133,34 @@ def test_cross_chain_plan_gets_the_bench_measurement(monkeypatch):
 
 
 def test_single_chain_response_is_unchanged(monkeypatch):
+    """An ORDINARY order — one that never asked for another chain. ~97% of the
+    corpus, so the response here must stay byte-identical."""
     sim = _FakeSim()
     plan = {"intent_id": APP, "interactions": [_ix(8453)], "metadata": {}}
-    resp, engine = _call(monkeypatch, plan, sim)
+    resp, engine = _call(
+        monkeypatch, plan, sim,
+        params={"input_token": WETH_BASE, "input_amount": str(10**17),
+                "output_token": WETH_BASE},          # no dest_chain_id
+    )
     assert "cross_chain" not in resp
+    assert sim.cross_chain_calls == 0
+    assert engine.seen_sim.destination_delivered is None
+
+
+def test_single_chain_plan_for_a_cross_chain_order_is_diagnosed(monkeypatch):
+    """The case a miner is overwhelmingly likely to be in: 482 of 578 live
+    cross-chain rows are a plan that never declared cross-chain. Dry-running one
+    used to return the same bare single-chain response as any ordinary order —
+    the miner asks the platform why their score is zero and is told nothing."""
+    sim = _FakeSim()
+    plan = {"intent_id": APP, "interactions": [_ix(8453)], "metadata": {}}
+    resp, engine = _call(monkeypatch, plan, sim)      # params ask for chain 1
+    xc = resp["cross_chain"]
+    assert xc["diagnosis"]["code"] == "no_cross_chain_plan"
+    assert xc["diagnosis"]["requested_chain"] == "1"
+    # Diagnosis only: nothing was measured and the scorer's view is untouched,
+    # so explaining the zero cannot become a way to earn credit for one.
+    assert xc["destination_delivered"] is None
     assert sim.cross_chain_calls == 0
     assert engine.seen_sim.destination_delivered is None
 

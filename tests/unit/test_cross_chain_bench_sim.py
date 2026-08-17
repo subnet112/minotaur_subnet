@@ -1169,3 +1169,94 @@ class TestFailClosedRowsStillGetDiagnosed:
         between = src[src.index("_delivery_diag = None"):call]
         assert "if not used_mock:" in between
         assert "if not fail_closed_miss:" not in between
+
+
+class TestOrderAskedCrossChainButPlanDidNot:
+    """The 83% case, and the one that carried no signal at all until now.
+
+    Measured on the leader over 51 rounds and 43 miners: of 578 benched
+    cross-chain rows, 482 were a plan that never declared cross-chain (the
+    solver simply did not route the order) and 78 more had no plan; only 18
+    declared one. The 18 got a diagnosis. The 482 got
+    ``scoreIntent reverted: (empty revert)`` — what ANY broken plan produces —
+    so the most common way to score zero on cross-chain demand was also the one
+    that never mentioned cross-chain.
+    """
+
+    @staticmethod
+    def _measure_single_chain_plan(**params):
+        import asyncio
+        from minotaur_subnet.harness.orchestrator import (
+            _measure_destination_delivery,
+        )
+        return asyncio.run(_measure_destination_delivery(
+            _dest_sim([]), _plan({"route": "univ3"}),  # NOT a cross-chain plan
+            _State(**params), None, None,
+        ))
+
+    def test_single_chain_plan_for_a_cross_chain_order_is_named(self):
+        delivered, source, diag = self._measure_single_chain_plan(
+            output_token=USDC_BASE, dest_chain_id="8453",
+        )
+        assert diag["code"] == "no_cross_chain_plan"
+        assert diag["requested_chain"] == "8453"
+        # Nothing is measured — there is no journey to run — so this cannot
+        # move a score: both measurement fields stay exactly as they were.
+        assert delivered is None and source is None
+
+    def test_nothing_delivered_is_not_reused_for_it(self):
+        """``nothing_delivered`` would be a lie: it says the destination legs
+        moved nothing, and here there are no destination legs to blame. The two
+        need opposite fixes — build a leg vs fix the leg you built."""
+        _, _, diag = self._measure_single_chain_plan(
+            output_token=USDC_BASE, dest_chain_id="8453",
+        )
+        assert diag["code"] != "nothing_delivered"
+
+    def test_ordinary_single_chain_order_is_untouched(self):
+        """Byte-identical for every non-cross-chain order — which is ~97% of
+        the corpus, so a false positive here would be a fleet-wide row change."""
+        assert self._measure_single_chain_plan(output_token=USDC_BASE) == (
+            None, None, None,
+        )
+
+    def test_dest_chain_equal_to_source_is_not_cross_chain(self):
+        """An order that names its own chain as the destination is single-chain;
+        a presence test on dest_chain_id would diagnose the whole corpus."""
+        import asyncio
+        from minotaur_subnet.harness.orchestrator import (
+            _measure_destination_delivery,
+        )
+
+        class _StateOn8453(_State):
+            chain_id = 8453
+
+        out = asyncio.run(_measure_destination_delivery(
+            _dest_sim([]), _plan({"route": "univ3"}),
+            _StateOn8453(output_token=USDC_BASE, dest_chain_id="8453"),
+            None, None,
+        ))
+        assert out == (None, None, None)
+
+
+class TestIntentRequestsCrossChain:
+    """The USER's question, kept separate from the SOLVER's answer."""
+
+    def test_reads_the_declared_destination(self):
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            intent_requests_cross_chain,
+        )
+        assert intent_requests_cross_chain({"dest_chain_id": "8453"}, 1) is True
+        assert intent_requests_cross_chain({"dest_chain_id": 8453}, 1) is True
+        assert intent_requests_cross_chain({"dest_chain_id": "1"}, 1) is False
+        assert intent_requests_cross_chain({}, 1) is False
+        assert intent_requests_cross_chain(None, 1) is False
+
+    def test_junk_reads_as_single_chain(self):
+        """This only decides whether to EXPLAIN a zero, so guessing wrong must
+        cost nothing — every unparseable value falls back to silence."""
+        from minotaur_subnet.simulator.cross_chain_bench import (
+            intent_requests_cross_chain,
+        )
+        for junk in ("", "0", 0, None, "base", {}, []):
+            assert intent_requests_cross_chain({"dest_chain_id": junk}, 1) is False

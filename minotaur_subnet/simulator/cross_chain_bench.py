@@ -203,6 +203,40 @@ def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
     return declares_cross_chain(plan.metadata)
 
 
+def intent_requests_cross_chain(
+    params: Mapping[str, Any] | None,
+    source_chain_id: Any = None,
+) -> bool:
+    """Did the ORDER ask for delivery on another chain?
+
+    The mirror of :func:`declares_cross_chain`, and deliberately separate: one
+    reads the SOLVER's answer, this one reads the USER's question. Keeping them
+    apart is what lets a caller name the gap between them — a plan that is not
+    cross-chain answering an intent that is. Measured on the leader 2026-08-17,
+    that gap is 83% of all benched cross-chain rows (482 of 578), and it was
+    the one outcome with no diagnosis at all.
+
+    ``dest_chain_id`` is the user-declared destination (``orders.py`` derives it
+    from CAIP-10 token chains at intake). An order that names its own source
+    chain is NOT cross-chain — hence the comparison rather than a presence test.
+    Unparseable values read as single-chain: this only ever decides whether to
+    EXPLAIN a zero, so guessing wrong must cost nothing.
+    """
+    dest_raw = (params or {}).get("dest_chain_id")
+    if dest_raw in (None, "", 0, "0"):
+        return False
+    try:
+        dest = int(dest_raw)
+    except (TypeError, ValueError):
+        return False
+    if not dest:
+        return False
+    try:
+        return source_chain_id is None or int(source_chain_id) != dest
+    except (TypeError, ValueError):
+        return True
+
+
 def normalize_to_legs(plan: ExecutionPlan) -> ExecutionPlan | None:
     """Project a modern cross-chain plan onto the legacy ``legs`` convention.
 

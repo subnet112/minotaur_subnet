@@ -711,6 +711,15 @@ _DELIVERY_REASON_HINTS = {
         "The intent declared no `output_token`, so there was nothing to "
         "measure delivery against."
     ),
+    "no_cross_chain_plan": (
+        "The order asked for delivery on a DIFFERENT chain (`dest_chain_id`), "
+        "and your plan declared no cross-chain legs — so it was scored as an "
+        "ordinary single-chain plan and delivered nothing. Emit a plan "
+        "declaring `cross_chain_plan` with a destination leg that delivers the "
+        "intent's `output_token` on that chain. Dry-run it against "
+        "`POST /v1/apps/{app_id}/score`, which returns exactly what a round "
+        "would credit."
+    ),
 }
 
 
