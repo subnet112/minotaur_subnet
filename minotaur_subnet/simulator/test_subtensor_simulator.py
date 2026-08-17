@@ -243,3 +243,45 @@ async def test_sidecar_dependencies_are_exactly_pinned():
     )
     for name, ver in pkg["dependencies"].items():
         assert ver[0].isdigit(), f"{name} must be pinned exactly, got {ver!r}"
+
+
+async def test_repin_moves_forward_and_survives_a_runtime_upgrade():
+    """Rounds move FORWARD, and a long-lived sidecar will meet a runtime upgrade.
+
+    Both were broken until 2026-08-17, and both are on the per-round path:
+
+      * ``dev_setHead`` resolves a NUMBER against chopsticks' own chain, which
+        ends at the block it forked — so every re-pin to a newer block failed
+        with "Block not found", i.e. every round after the container started.
+      * crossing a runtime-version boundary left ``api.call.*`` decorated for the
+        OLD metadata (chopsticks' Manual block mode emits no new-heads
+        subscription for polkadot.js to learn from), so ethCall died with
+        "Cannot read properties of undefined".
+
+    The live half proves the forward jump; the boundary crossing needs a chain
+    whose spec version changed inside the node's history, so it is asserted on
+    the source of the fix instead.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_anvil.mjs"
+    ).read_text()
+    repin = src[src.index("async repin("):src.index("async reconnect(")]
+    assert "chain_getBlockHash" in repin, "forward re-pin must resolve the hash upstream"
+    assert "await this.reconnect()" in repin, "a spec-version change must re-decorate the api"
+
+    url = _sidecar_url()
+    if not url:
+        pytest.skip("SUBTENSOR_SIDECAR_URL not set/reachable")
+    sim = SubtensorSimulator(sidecar_url=url, chain_id=964)
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "sim_health", "params": []}).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        head = json.loads(r.read())["result"]["block"]
+
+    assert sim.pin_read_fork(964, head - 200) is True
+    assert sim.pin_read_fork(964, head) is True      # FORWARD — used to raise
+    # and the fork is still usable after the jump
+    sim.set_code(ROUTER, _HEX.read_text().strip())
+    sim.set_balance(ROUTER, 1_000_000_000)
+    assert sim._pinned[sim._urls[0]] == head

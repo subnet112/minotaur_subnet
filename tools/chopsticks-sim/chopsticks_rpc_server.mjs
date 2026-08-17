@@ -97,7 +97,10 @@ if (ATTACH) {
   await waitReady()
   attachWs = `ws://127.0.0.1:${INNER_PORT}`
 }
-const ck = await ChopsticksAnvil.connect(attachWs)
+// The upstream is handed through so a FORWARD re-pin can resolve a block the
+// fork has never seen (chopsticks resolves a NUMBER only against its own chain,
+// which ends at the fork block — see ChopsticksAnvil.repin).
+const ck = await ChopsticksAnvil.connect(attachWs, { upstream: ENDPOINT })
 if (pinBlock === undefined) pinBlock = await ck.forkBlock()
 console.log(`[rpc] shim connected; fork @ ${await ck.forkBlock()}`)
 
