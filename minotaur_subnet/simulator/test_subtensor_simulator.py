@@ -285,3 +285,35 @@ async def test_repin_moves_forward_and_survives_a_runtime_upgrade():
     sim.set_code(ROUTER, _HEX.read_text().strip())
     sim.set_balance(ROUTER, 1_000_000_000)
     assert sim._pinned[sim._urls[0]] == head
+
+
+async def test_sidecar_image_can_open_the_fork_cache():
+    """The container must work in the configuration PRODUCTION uses: with
+    ``CK_DB`` set (the compose service sets it).
+
+    Two ways this broke, both of which built a green image that died at runtime:
+
+      * chopsticks' ``--db`` opens a typeorm sqlite DataSource and typeorm loads
+        the driver lazily, so a missing ``sqlite3`` surfaces only once CK_DB is
+        set. chopsticks declares it as an optional peer and
+        ``npm install --omit=dev`` skips it.
+      * ``sqlite3``'s PREBUILT binding links against GLIBC_2.38, so on a bookworm
+        base (node:22-slim AND node:24-slim, both glibc 2.36) it installs fine
+        and then dies at ``require`` with ERR_DLOPEN_FAILED.
+
+    Source-inspected: actually building the image belongs in CI, not the unit
+    lane, but the two facts that must not silently regress are cheap to pin.
+    """
+    root = Path(__file__).resolve().parents[2] / "tools" / "chopsticks-sim"
+    pkg = json.loads((root / "package.json").read_text())
+    assert "sqlite3" in pkg["dependencies"], (
+        "the --db fork cache needs sqlite3 as a REAL dependency"
+    )
+    dockerfile = (root / "Dockerfile").read_text()
+    base = next(
+        line for line in dockerfile.splitlines() if line.startswith("FROM ")
+    )
+    assert "trixie" in base, (
+        f"base image must carry glibc >= 2.38 for sqlite3's prebuilt binding; "
+        f"got {base!r}"
+    )
