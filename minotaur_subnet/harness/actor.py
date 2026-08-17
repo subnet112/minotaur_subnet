@@ -27,12 +27,13 @@ actor is the connected component of a hotkey under TWO kinds of link:
 
   * OPERATOR MERGE (union, from evidence): identifiers proven to be one
     operator collapse into one actor even when they share neither a coldkey nor
-    a github owner. Two sources — a static, evidence-documented list in code
-    (plus ``SOLVER_ACTOR_MERGE_EXTRA``), and the structural CO-OCCURRENCE
-    ledger below. This closes the shape the 2026-07-28 audit found live: a ring
-    of 13 coldkeys, ONE hotkey each, each under its OWN throwaway github
-    account, so both links above see 13 singleton actors and every per-actor
-    cap is satisfied 13 times in parallel.
+    a github owner. Two sources — the operator-supplied ``SOLVER_ACTOR_MERGE_EXTRA``
+    groups, and the structural CO-OCCURRENCE ledger below. This closes the shape
+    the 2026-07-28 audit found live: a ring of 13 coldkeys, ONE hotkey each,
+    each under its OWN throwaway github account, so both links above see 13
+    singleton actors and every per-actor cap is satisfied 13 times in parallel.
+    No identifier is named in code: a merge is only ever asserted by live
+    evidence (the ledger) or by an explicit operator decision (the env var).
 
 The union is over a graph of {coldkey, github-owner, hotkey} tokens: for each
 submitted hotkey, union its coldkey token (or its own hotkey token if unmapped)
@@ -128,54 +129,18 @@ def owner_union_enabled() -> bool:
 
 # ── operator merges: identifiers proven to be ONE operator ───────────────────
 
-# Static, evidence-documented merges. Hardcoded like ``shared.signer_denylist``
-# so the protection cannot be lost by a missing env var; each entry states the
-# evidence that justified it. Entries are COLDKEYS (an operator can mint hotkeys
-# under a coldkey for free, so merging the coldkey covers the fleet); a hotkey
-# or github owner works too — every token form of an identifier is unioned.
-_STATIC_ACTOR_MERGES: tuple[frozenset[str], ...] = (
-    # 2026-07-28 — "fp-ring": originally 13 coldkeys, ONE hotkey each (uids
-    # 117/126/127/128/157/158/159/160/161/173/176/177/178), each under its own
-    # throwaway github account, all shipping structurally-identical solvers
-    # whose solver_name embeds the round id (aurora-swap-engine-fp29753820n1,
-    # halcyon-mino-solver-fp29753820n1, sable-dex-router-fp…). Evidence: the
-    # ring's members co-clustered on one structural fingerprint in 25 of 26
-    # measured rounds and registered in three batches (07-16 06:31, 07-16
-    # 11:43, 07-20 08:51); it re-rolls the fingerprint every round, defeating
-    # every equality key, and took 5 of 8 build units and up to 2 of 3 slate
-    # seats per round while ~28 other submissions shared the remainder.
-    #
-    # 2026-08-13 — NARROWED to the 9 members below: uids 117/126/127/128 were
-    # dropped from the merge, so each is once again its own actor with its own
-    # submission slot, build unit and seniority clock. The 07-28 evidence above
-    # is the record of the ORIGINAL 13-member shape; it is not a claim that the
-    # four dropped uids have been cleared.
-    frozenset({
-        "5GdfDv3EoWorapgFY7TPTed1v8ESeGSrnuu2TZ26jPSPSzuC",  # uid 160
-        "5HmKDgzKt6KRj3WfXD3vd2fWiKBjaxG4uYPuWrbdApZx5Dfq",  # uid 161
-        "5FF8NEw4nc6rh6pmFRBFoAfcLpgPRiUQFnt66PPD1FeVBc8X",  # uid 159
-        "5CGS8ZTeS3XgUo4BQfPH8NnJzUVuJnWdi3pbrSdidMAVfMzi",  # uid 158
-        "5FsCAcRLtjUEnNy2ux6M3FyDAfiCgsqWqPQFLKCQFY5ucLRG",  # uid 157
-        "5DCKr2ChZVzvzXRRbeBY5Hk9BohPAfpS2HbRdupYCaYRxA4R",  # uid 176
-        "5F6sPTG1csHsSEQNBYaRwjHD2zCJToRs9B4br7PkWLYPagQf",  # uid 177
-        "5DtLdZreG6ZNc4d4T6LLspjqgzpUfFQVfjXnp5UdLra5783a",  # uid 178
-        "5GBrU1Yy7MhpNbrveEY25PVcCJdFqC6c3NmUdFkH2gNsLX67",  # uid 173
-    }),
-)
+# NOTE (2026-08-17). There is deliberately NO hardcoded merge list here. The
+# in-code list (the 2026-07-28 "fp-ring", narrowed to 9 coldkeys on 08-13) was
+# removed: naming identifiers in code makes a one-time audit permanent, cannot
+# decay as behaviour changes, and needs a deploy to correct. Merges now come
+# only from live evidence (the co-occurrence ledger below, which decays on a
+# TTL) or an explicit operator decision (``SOLVER_ACTOR_MERGE_EXTRA``).
 
 # Per-pair structural co-occurrence evidence, next to the other sidecars.
 _STRUCT_LINK_SIDECAR = "actor_structural_links.json"
 # Cap the round-id history kept per pair: only the DISTINCT-round count matters
 # and the threshold is single digits, so a short window bounds the file.
 _STRUCT_LINK_MAX_ROUNDS = 32
-
-
-def static_merges_enabled() -> bool:
-    """Apply :data:`_STATIC_ACTOR_MERGES` (``SOLVER_ACTOR_STATIC_MERGE``,
-    default on; ``0`` is the kill-switch — the ring reverts to N actors)."""
-    return os.environ.get(
-        "SOLVER_ACTOR_STATIC_MERGE", "1",
-    ).strip().lower() not in ("0", "false", "no", "off")
 
 
 def extra_merge_groups() -> list[frozenset[str]]:
@@ -498,11 +463,9 @@ def structural_merge_groups() -> list[frozenset[str]]:
 
 
 def merge_groups() -> list[frozenset[str]]:
-    """Every operator merge to APPLY: static (unless kill-switched) + env extras
-    + structural co-occurrence (only in ``enforce``)."""
+    """Every operator merge to APPLY: env extras + structural co-occurrence
+    (the latter only in ``enforce``)."""
     groups: list[frozenset[str]] = []
-    if static_merges_enabled():
-        groups.extend(_STATIC_ACTOR_MERGES)
     groups.extend(extra_merge_groups())
     if structural_merge_mode() == "enforce":
         groups.extend(structural_merge_groups())

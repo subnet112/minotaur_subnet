@@ -1,5 +1,6 @@
 """Operator merges (harness/actor.py): identifiers proven to be ONE operator
-resolve to one actor — static list, env extras, and structural co-occurrence.
+resolve to one actor — env extras and structural co-occurrence. No identifier is
+named in code; every merge comes from live evidence or an operator's env var.
 
 THE SHAPE THIS CLOSES (live, 2026-07-28). A ring of 13 coldkeys with ONE hotkey
 each, each under its own throwaway github account, defeats both existing links:
@@ -39,8 +40,6 @@ OWNERS = {hk: [f"gh-{hk.lower()}"] for hk in COLDKEYS}
 @pytest.fixture(autouse=True)
 def _clean(tmp_path, monkeypatch):
     monkeypatch.setenv("SOLVER_ROTATION_LEDGER_PATH", str(tmp_path / "rotation.json"))
-    # Tests opt IN to the production static list where they mean to exercise it.
-    monkeypatch.setenv("SOLVER_ACTOR_STATIC_MERGE", "0")
     monkeypatch.delenv("SOLVER_ACTOR_MERGE_EXTRA", raising=False)
     monkeypatch.setenv("STRUCTURAL_ACTOR_MERGE_MODE", "observe")
     monkeypatch.delenv("STRUCTURAL_ACTOR_MERGE_MIN_ROUNDS", raising=False)
@@ -68,7 +67,7 @@ def test_ring_is_n_actors_without_a_merge():
     assert r("S") == "CK_S" and r("T") == "CK_T"
 
 
-# ── static list + env extras ─────────────────────────────────────────────────
+# ── env extras ───────────────────────────────────────────────────────────────
 
 def test_env_extra_group_collapses_the_ring(monkeypatch):
     monkeypatch.setenv("SOLVER_ACTOR_MERGE_EXTRA", "CK0,CK1,CK2,CK3")
@@ -95,25 +94,16 @@ def test_merge_may_name_a_hotkey_or_an_owner(monkeypatch):
     assert r("HK0") == r("HK1") == r("HK2")
 
 
-def test_static_list_is_on_by_default_and_kill_switchable(monkeypatch):
-    monkeypatch.delenv("SOLVER_ACTOR_STATIC_MERGE", raising=False)
-    ring = sorted(actor_mod._STATIC_ACTOR_MERGES[0])
-    assert len(ring) == 9                             # fp-ring, narrowed 08-13
-    assert all(len(ck) > 40 for ck in ring)           # full SS58, not truncated
-    groups = merge_groups()
-    assert any(set(ring) <= set(g) for g in groups)
-    monkeypatch.setenv("SOLVER_ACTOR_STATIC_MERGE", "0")
-    assert not any(set(ring) <= set(g) for g in merge_groups())
-
-
-def test_static_list_collapses_its_ring_end_to_end(monkeypatch):
-    monkeypatch.delenv("SOLVER_ACTOR_STATIC_MERGE", raising=False)
-    ring = sorted(actor_mod._STATIC_ACTOR_MERGES[0])
-    coldkeys = {f"hk-{i}": ck for i, ck in enumerate(ring)}
-    coldkeys["hk-solo"] = "CK_SOLO"
-    r = ActorResolver.from_maps(coldkeys, {}, source="test")
-    assert len({r(hk) for hk in coldkeys if hk != "hk-solo"}) == 1
-    assert r("hk-solo") == "CK_SOLO"
+def test_no_merges_are_hardcoded(monkeypatch):
+    """With no env extras and no recorded evidence, NOTHING is merged: the
+    module must not name any identifier of its own (the in-code fp-ring list was
+    removed 2026-08-17 — a merge is only ever asserted by live evidence or by an
+    explicit operator decision)."""
+    monkeypatch.delenv("SOLVER_ACTOR_MERGE_EXTRA", raising=False)
+    monkeypatch.setenv("STRUCTURAL_ACTOR_MERGE_MODE", "enforce")
+    assert merge_groups() == []
+    assert not hasattr(actor_mod, "_STATIC_ACTOR_MERGES")
+    assert len(_actors(_resolver())) == 4              # every miner its own actor
 
 
 # ── structural co-occurrence: record → arm → merge ───────────────────────────
