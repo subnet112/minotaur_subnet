@@ -203,3 +203,43 @@ async def test_subtensor_stake_raw_scorer_emits_delivered_alpha():
     assert res["metadata"]["raw_output"] == "219598620325"
     assert res["valid"] is True
     assert res["score"] == 1
+
+
+# ── sidecar process wiring (offline, source-inspected) ────────────────────────
+
+async def test_sidecar_gives_the_fork_its_own_port():
+    """The spawned chopsticks MUST get ``PORT=CK_INNER_PORT``, not ours.
+
+    chopsticks' CLI lets the ``PORT`` env var win over ``--port``
+    (``cli.js``: ``if (environment.PORT) argv.port = Number(environment.PORT)``),
+    and the container sets ``PORT=8545`` for the sidecar's OWN listener. Inherit
+    that and the fork binds 8545 first: the shim never binds, ``waitReady()``
+    polls the inner port for two minutes and dies, and the compose healthcheck
+    reports a container that is up but unreachable. Source-inspected because the
+    failure is in a Node child spawn, not in Python.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_rpc_server.mjs"
+    ).read_text()
+    spawn_call = src[src.index("const child = spawn("):]
+    spawn_call = spawn_call[:spawn_call.index("\n  return")]
+    assert "PORT: String(INNER_PORT)" in spawn_call, (
+        "the chopsticks child must be given the INNER port explicitly"
+    )
+
+
+async def test_sidecar_dependencies_are_exactly_pinned():
+    """Version RANGES are a consensus hazard here: this sidecar is the chain-964
+    simulator, so its executor decides scores, the lockfile is gitignored, and
+    two validators that built the image on different days would otherwise run
+    different runtime executors. (A range already bit us once — the 1.5.1 PORT
+    change above.)"""
+    pkg = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "tools" / "chopsticks-sim" / "package.json"
+        ).read_text()
+    )
+    for name, ver in pkg["dependencies"].items():
+        assert ver[0].isdigit(), f"{name} must be pinned exactly, got {ver!r}"
