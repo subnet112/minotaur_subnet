@@ -359,3 +359,37 @@ async def test_sidecar_keeps_its_upstream_alive_and_says_when_it_is_not():
     with urllib.request.urlopen(req, timeout=10) as r:
         res = json.loads(r.read())["result"]
     assert res["upstream"] is True and res["ok"] is True, res
+
+
+async def test_sidecar_gives_up_and_restarts_when_the_upstream_stays_dead():
+    """The keepalive alone is not enough — an 18h soak proved it.
+
+    Against blockmachine the upstream dropped 12 times and self-healed 11; the
+    12th stuck permanently, and the error changed character with it
+    (``disconnected ...: 100``, which the provider reconnects from, versus
+    ``WebSocket is not connected``, which it does not). A fork that cannot reach
+    its upstream serves nothing, so once it is clearly not coming back the
+    useful move is to die and let the restart policy re-fork — ~40s, and the
+    --db cache makes it cheap.
+
+    The probe also has to be BOUNDED: polkadot.js has its own 60s RPC timeout,
+    so against a half-open socket (severed link, no RST) an unbounded probe sits
+    for a full minute, which makes "N consecutive failures" mean an
+    unpredictable number of minutes and stalls the health flag meanwhile.
+    """
+    root = Path(__file__).resolve().parents[2] / "tools" / "chopsticks-sim"
+    shim = (root / "chopsticks_anvil.mjs").read_text()
+    probe = shim[shim.index("async probeUpstream("):]
+    probe = probe[:probe.index("\n  }")]
+    assert "Promise.race" in probe and "timeoutMs" in probe, (
+        "an unbounded probe hangs on a half-open socket instead of failing"
+    )
+
+    server = (root / "chopsticks_rpc_server.mjs").read_text()
+    assert "CK_UNHEALTHY_EXIT_AFTER" in server
+    assert "CK_PROBE_TIMEOUT_MS" in server
+    exit_block = server[server.index("if (EXIT_AFTER > 0"):]
+    exit_block = exit_block[:exit_block.index("\n    }")]
+    assert "process.exit(1)" in exit_block, (
+        "a permanently dead upstream must exit so the restart policy re-forks"
+    )

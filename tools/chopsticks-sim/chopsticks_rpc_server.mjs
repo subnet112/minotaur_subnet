@@ -124,19 +124,41 @@ console.log(`[rpc] shim connected; fork @ ${await ck.forkBlock()}`)
 //     healthcheck (which reads exactly this field) stops claiming the sidecar
 //     is serving. A fork that cannot reach its upstream is not healthy.
 const KEEPALIVE_MS = Number(process.env.CK_KEEPALIVE_MS ?? 30000)
+// Consecutive failed probes before we give up and exit for a restart. The
+// keepalive alone is NOT enough: measured over 18h against blockmachine the
+// upstream dropped 12 times and self-healed 11 — the 12th stuck permanently,
+// and the error changed character with it (`disconnected ...: 100`, which the
+// provider reconnects from, vs `WebSocket is not connected`, which it does
+// not). A fork that cannot reach its upstream serves nothing, so once it is
+// clearly not coming back the useful move is to die: the container restart
+// policy re-forks in ~40s and the --db cache makes that cheap. 0 disables.
+const EXIT_AFTER = Number(process.env.CK_UNHEALTHY_EXIT_AFTER ?? 5)
+// Bounds how long ONE probe may take, so the exit threshold means a
+// predictable wall-clock (see ChopsticksAnvil.probeUpstream).
+const PROBE_TIMEOUT_MS = Number(process.env.CK_PROBE_TIMEOUT_MS ?? 15000)
 let upstreamOk = true
 let upstreamError = null
+let consecutiveFailures = 0
 
 async function touchUpstream() {
   try {
-    await ck.probeUpstream()
-    if (!upstreamOk) console.log('[ck] upstream recovered')
+    await ck.probeUpstream(PROBE_TIMEOUT_MS)
+    if (!upstreamOk) console.log(`[ck] upstream recovered after ${consecutiveFailures} failed probe(s)`)
     upstreamOk = true
     upstreamError = null
+    consecutiveFailures = 0
   } catch (e) {
+    consecutiveFailures++
     if (upstreamOk) console.error(`[ck] upstream UNHEALTHY: ${String(e.message || e).slice(0, 160)}`)
     upstreamOk = false
     upstreamError = String(e.message || e).slice(0, 200)
+    if (EXIT_AFTER > 0 && consecutiveFailures >= EXIT_AFTER) {
+      console.error(
+        `[ck] upstream dead for ${consecutiveFailures} consecutive probes ` +
+        `(~${Math.round(consecutiveFailures * (KEEPALIVE_MS + PROBE_TIMEOUT_MS) / 1000)}s max) — exiting for a restart`,
+      )
+      process.exit(1)
+    }
   }
 }
 

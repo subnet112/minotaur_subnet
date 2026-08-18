@@ -128,9 +128,25 @@ export class ChopsticksAnvil {
   // it can never be in the fork's cache, so answering it forces the real
   // upstream fetch, which is exactly the call that fails when the socket is
   // dead. Returns null (no such key) on success; throws on a dead upstream.
-  async probeUpstream() {
+  // ``timeoutMs`` bounds DETECTION. polkadot.js has its own 60s RPC timeout, so
+  // without this a probe against a HALF-OPEN socket (severed link, no RST) sits
+  // for a full minute before throwing — which makes "N consecutive failures"
+  // mean an unpredictable number of MINUTES, and stalls the health flag
+  // meanwhile. Fail fast instead: this call only has to answer "is the upstream
+  // answering right now?".
+  async probeUpstream(timeoutMs = 15000) {
     const key = '0x' + randomBytes(32).toString('hex')
-    return await this.provider.send('state_getStorage', [key])
+    let timer
+    try {
+      return await Promise.race([
+        this.provider.send('state_getStorage', [key]),
+        new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error(`upstream probe timed out after ${timeoutMs}ms`)), timeoutMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   // Rebuild the api against the runtime currently in force (see repin note 2).
