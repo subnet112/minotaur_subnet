@@ -538,9 +538,11 @@ class SimulationResult:
     # None everywhere but the benchmark path, and for every single-leg plan.
     destination_delivered: str | None = None
     destination_amount_source: str | None = None
-    # WHY a cross-chain plan delivered nothing, as a stable code from the
+    # WHY a cross-chain ORDER delivered nothing, as a stable code from the
     # closed vocabulary in harness/orchestrator.py ``_delivery_diagnosis``
-    # (wrong_recipient | wrong_token | nothing_delivered | no_output_token).
+    # (wrong_recipient | wrong_token | nothing_delivered | no_output_token |
+    # no_cross_chain_plan — the last meaning the order asked for another chain
+    # and the plan declared no cross-chain legs, which is most of them).
     # None whenever delivery WAS credited, so its presence is the signal. This
     # is the miner-facing half of the measurement: the amount says what the
     # contest credited, this says what to change to earn more.
