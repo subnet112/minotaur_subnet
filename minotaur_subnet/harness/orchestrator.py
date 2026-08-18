@@ -2457,11 +2457,36 @@ async def _measure_destination_delivery(
     :stable fleet-wide BEFORE seeding, never after.
     """
     from minotaur_subnet.simulator.cross_chain_bench import (
+        intent_requests_cross_chain,
         is_cross_chain_plan,
         normalize_to_legs,
     )
 
     if not is_cross_chain_plan(plan):
+        # THE COMMON FAILURE, and until 2026-08-17 the silent one. Measured on
+        # the leader over 51 rounds: of 578 benched cross-chain rows, 482 (83%)
+        # were a plan that never declared cross-chain at all — the solver simply
+        # did not route the order — and 78 more had no plan. Only 18 declared
+        # one. Those 18 got a reason; the 482 got the bare
+        # "scoreIntent reverted: (empty revert)" that any broken plan produces,
+        # so the single most common way to score zero on cross-chain demand was
+        # also the one carrying no cross-chain signal.
+        #
+        # It is a distinct state and needs a distinct code: nothing_delivered
+        # means "your destination legs moved nothing", which would be a LIE here
+        # — there are no destination legs to blame. Nothing is measured (there
+        # is no journey to run), so this costs one dict lookup and cannot move a
+        # score: delivered stays None exactly as before.
+        params = (
+            state.raw_params_view()
+            if state is not None and hasattr(state, "raw_params_view")
+            else {}
+        )
+        if intent_requests_cross_chain(params, getattr(state, "chain_id", None)):
+            return None, None, {
+                "code": "no_cross_chain_plan",
+                "requested_chain": str(params.get("dest_chain_id")),
+            }
         return None, None, None
     if simulator is None or not hasattr(simulator, "simulate_cross_chain"):
         return None, None, None
@@ -2606,6 +2631,11 @@ def _delivery_diagnosis(
                             anyone. Usually an empty or reverting leg.
       ``no_output_token``   the intent declared no output token, so there was
                             nothing to measure against (set upstream).
+
+    Two codes are set by the CALLER rather than here, because they are decided
+    before there is any journey to measure — ``no_output_token`` above, and
+    ``no_cross_chain_plan`` (the order asked for delivery on another chain and
+    the plan is not cross-chain at all: 83% of live cross-chain rows).
 
     ``wrong_recipient`` outranks ``wrong_token`` when both are present: it is
     the closer miss and the cheaper fix, so it is the more useful thing to say.

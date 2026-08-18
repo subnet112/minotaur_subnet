@@ -1551,9 +1551,18 @@ async def score_plan(
             _measure_destination_delivery,
         )
         from minotaur_subnet.simulator.cross_chain_bench import (
+            intent_requests_cross_chain,
             is_cross_chain_plan,
         )
-        if is_cross_chain_plan(plan):
+        # Either side being cross-chain is worth answering. The plan being
+        # cross-chain gets the delivery measurement; the ORDER being cross-chain
+        # while the plan is NOT gets the ``no_cross_chain_plan`` diagnosis, and
+        # that is the case a miner is overwhelmingly likely to be in — it is 83%
+        # of live cross-chain rows, and dry-running it used to return the same
+        # bare single-chain response as any ordinary order.
+        if is_cross_chain_plan(plan) or intent_requests_cross_chain(
+            params, getattr(state, "chain_id", None),
+        ):
             _xc_declared = True
             (
                 simulation.destination_delivered,
@@ -1617,6 +1626,13 @@ async def score_plan(
                 #                       bridged and skipped the dest swap.
                 #   nothing_delivered - the destination legs moved nothing.
                 #   no_output_token   - the intent declared no output token.
+                #   no_cross_chain_plan - the ORDER asked for delivery on
+                #                       another chain (requested_chain) and
+                #                       this plan declared no cross-chain legs,
+                #                       so it was scored as an ordinary
+                #                       single-chain plan. Nothing was measured
+                #                       (destination_delivered is null) because
+                #                       there is no journey to run.
                 "diagnosis": _xc_diagnosis,
             }
         return _resp
