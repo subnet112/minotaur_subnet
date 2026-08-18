@@ -104,9 +104,57 @@ const ck = await ChopsticksAnvil.connect(attachWs, { upstream: ENDPOINT })
 if (pinBlock === undefined) pinBlock = await ck.forkBlock()
 console.log(`[rpc] shim connected; fork @ ${await ck.forkBlock()}`)
 
+// ── upstream liveness ────────────────────────────────────────────────────────
+//
+// A forked chain reads storage LAZILY: every miss goes upstream. So an upstream
+// websocket that has quietly died turns every simulation into
+// "WebSocket is not connected" while the fork still answers chain_getHeader from
+// local state — i.e. the process looks healthy and scores nothing.
+//
+// Measured 2026-08-17 on the leader: `rpc.blockmachine.io` closes an IDLE
+// substrate websocket within 90s (1 disconnect event, no recovery), while
+// `entrypoint-finney.opentensor.ai` survived the same idle untouched. The
+// benchmark's access pattern is exactly the dangerous one — pin once, then sit
+// idle between rounds — and polkadot.js's WsProvider does not queue a request
+// made while disconnected, it throws.
+//
+// Two defences, because either alone is insufficient:
+//   * KEEPALIVE — touch the upstream on an interval so it never idles out.
+//   * HONEST HEALTH — report ok:false once it has died, so the container
+//     healthcheck (which reads exactly this field) stops claiming the sidecar
+//     is serving. A fork that cannot reach its upstream is not healthy.
+const KEEPALIVE_MS = Number(process.env.CK_KEEPALIVE_MS ?? 30000)
+let upstreamOk = true
+let upstreamError = null
+
+async function touchUpstream() {
+  try {
+    await ck.probeUpstream()
+    if (!upstreamOk) console.log('[ck] upstream recovered')
+    upstreamOk = true
+    upstreamError = null
+  } catch (e) {
+    if (upstreamOk) console.error(`[ck] upstream UNHEALTHY: ${String(e.message || e).slice(0, 160)}`)
+    upstreamOk = false
+    upstreamError = String(e.message || e).slice(0, 200)
+  }
+}
+
+if (KEEPALIVE_MS > 0) {
+  await touchUpstream()
+  setInterval(touchUpstream, KEEPALIVE_MS).unref?.()
+  console.log(`[rpc] upstream keepalive every ${KEEPALIVE_MS}ms`)
+}
+
 const HANDLERS = {
   async sim_health() {
-    return { ok: true, block: await ck.forkBlock(), pinBlock }
+    return {
+      ok: upstreamOk,
+      block: await ck.forkBlock(),
+      pinBlock,
+      upstream: upstreamOk,
+      upstream_error: upstreamError,
+    }
   },
   async sim_forkBlock() { return await ck.forkBlock() },
   async sim_forkTimestamp() { return await ck.forkTimestamp() },

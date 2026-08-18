@@ -22,6 +22,8 @@
 //                                only traps if BLS is actually CALLED — dry-runs don't)
 //   --mock-signature-host       (impersonation for the future block-building path)
 
+import { randomBytes } from 'node:crypto'
+
 import { ApiPromise, WsProvider } from '@polkadot/api'
 import { blake2AsHex, keccakAsU8a } from '@polkadot/util-crypto'
 import { u8aConcat, hexToU8a, stringToU8a, u8aToHex } from '@polkadot/util'
@@ -116,6 +118,19 @@ export class ChopsticksAnvil {
     }
     if (await this._specVersion() !== before) await this.reconnect()
     return await this.forkBlock()
+  }
+
+  // Liveness probe AND keepalive for the FORK'S OWN upstream socket.
+  //
+  // It must travel through chopsticks, not through our own upstream provider:
+  // the socket that dies is the one chopsticks holds, and keeping a second
+  // connection warm proves nothing about it. A RANDOM storage key is the lever —
+  // it can never be in the fork's cache, so answering it forces the real
+  // upstream fetch, which is exactly the call that fails when the socket is
+  // dead. Returns null (no such key) on success; throws on a dead upstream.
+  async probeUpstream() {
+    const key = '0x' + randomBytes(32).toString('hex')
+    return await this.provider.send('state_getStorage', [key])
   }
 
   // Rebuild the api against the runtime currently in force (see repin note 2).
