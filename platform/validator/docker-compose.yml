@@ -377,6 +377,36 @@ services:
       start_period: 60s
     networks: [minotaur]
 
+  # Chain-964 sidecar for the SPLIT benchmark worker — its own fork, for the
+  # same reason the anvil-*-bench forks exist. The sidecar re-pins with
+  # dev_setHead around every simulation (SubtensorSimulator.pin_read_fork), so
+  # api and worker sharing ONE sidecar interleave re-pins and score each other's
+  # fork. `_assert_worker_forks_isolated` now refuses that configuration.
+  chopsticks-btevm-bench:
+    profiles: ["benchmark-worker"]
+    build:
+      context: ../..
+      dockerfile: tools/chopsticks-sim/Dockerfile
+    restart: unless-stopped
+    environment:
+      CK_ENDPOINT: "${BITTENSOR_SUBSTRATE_WS_URL:-wss://entrypoint-finney.opentensor.ai:443}"
+      CK_BLOCK: "${BITTENSOR_CHOPSTICKS_BLOCK:-}"
+      CK_DB: "/var/cache/chopsticks/fork.sqlite"
+      PORT: "8545"
+    tmpfs:
+      - /tmp:size=512m
+    volumes:
+      - chopsticks-bench-cache:/var/cache/chopsticks
+    ports:
+      - "127.0.0.1:18548:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:8545',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'sim_health',params:[]})}).then(r=>r.json()).then(j=>process.exit(j.result&&j.result.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 150s
+    networks: [minotaur]
+
   anvil-btevm-bench:
     profiles: [benchmark-worker]
     depends_on:
@@ -1007,6 +1037,13 @@ services:
       ETH_SIM_RPC_URL: http://anvil-eth-bench:8545
       BASE_SIM_RPC_URL: http://anvil-base-bench:8546
       BITTENSOR_EVM_SIM_RPC_URL: http://anvil-btevm-bench:8547
+      # Chain-964 sidecar — the worker's OWN, never the api's. Hardcoded to the
+      # -bench host exactly like the anvils above rather than inherited from
+      # ${BITTENSOR_CHOPSTICKS_SIM_RPC_URL}: sharing that one value would either
+      # point both processes at one fork (interleaved dev_setHead re-pins) or,
+      # worse, leave the worker on anvil while the api used chopsticks — two
+      # backends scoring the SAME chain, which diverges silently.
+      BITTENSOR_CHOPSTICKS_SIM_RPC_URL: "${BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL:-}"
 
       # ── live read RPCs + upstreams (SAME as the api — must fork-pin identically) ──
       BASE_RPC_URL: "${BASE_UPSTREAM_RPC_URL}"
@@ -1289,6 +1326,7 @@ volumes:
   # Chopsticks lazy-storage fork cache (sqlite) for the Bittensor substrate sim —
   # same purpose as fork-cache-data, warmed across chopsticks-btevm restarts.
   chopsticks-cache:
+  chopsticks-bench-cache:
 
 networks:
   # Main bridge — validator, api, anvils, docker-socket-proxy.

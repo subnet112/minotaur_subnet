@@ -393,3 +393,44 @@ async def test_sidecar_gives_up_and_restarts_when_the_upstream_stays_dead():
     assert "process.exit(1)" in exit_block, (
         "a permanently dead upstream must exit so the restart policy re-forks"
     )
+
+
+async def test_worker_may_not_share_the_apis_chain_964_sidecar():
+    """The split benchmark worker must fork on its OWN chain-964 sidecar.
+
+    The guard that enforces this for the anvils matched on hostname, and the
+    sidecar is not an anvil — so ``chopsticks-btevm`` sailed through a check
+    written for exactly this hazard. Sharing one sidecar is WORSE than sharing
+    an anvil: ``SubtensorSimulator.pin_read_fork`` re-pins with ``dev_setHead``
+    around every simulation, so two processes on one sidecar continuously move
+    each other's fork out from under the call being scored.
+    """
+    from minotaur_subnet.api.startup import _SHARED_API_FORK_HOSTS
+
+    assert "chopsticks-btevm" in _SHARED_API_FORK_HOSTS, (
+        "the worker pointing at the api's sidecar must fail closed"
+    )
+    for host in ("anvil-eth", "anvil-base", "anvil-btevm"):
+        assert host in _SHARED_API_FORK_HOSTS  # unchanged
+
+
+async def test_worker_has_its_own_sidecar_wired_in_compose():
+    """...and a dedicated one exists to point at.
+
+    Without a `-bench` sidecar the only configurations available are both
+    processes on one fork, or the worker silently left on anvil-btevm while the
+    api uses chopsticks — two DIFFERENT backends scoring the same chain, which
+    diverges without ever erroring.
+    """
+    compose = (
+        Path(__file__).resolve().parents[2]
+        / "platform" / "validator" / "docker-compose.yml"
+    ).read_text()
+    assert "chopsticks-btevm-bench:" in compose, "worker needs its own sidecar"
+    worker = compose[compose.index("  benchmark-worker:"):]
+    assert "BITTENSOR_CHOPSTICKS_SIM_RPC_URL" in worker, (
+        "the worker must set the 964 sim URL explicitly, like the anvils"
+    )
+    assert "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL" in worker, (
+        "and from its OWN var, never the api's shared one"
+    )
