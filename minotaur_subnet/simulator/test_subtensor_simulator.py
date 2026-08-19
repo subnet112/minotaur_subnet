@@ -346,9 +346,10 @@ async def test_sidecar_keeps_its_upstream_alive_and_says_when_it_is_not():
     assert "setInterval(touchUpstream" in server
     health = server[server.index("async sim_health()"):]
     health = health[:health.index("\n  },")]
-    assert "ok: upstreamOk" in health, (
+    assert "UNHEALTHY_AFTER" in health, (
         "health must FAIL when the upstream is dead — a fork that cannot reach "
-        "its upstream is not serving, and the container healthcheck reads this"
+        "its upstream is not serving, and the container healthcheck reads this. "
+        "(It is thresholded rather than instantaneous; see the hysteresis test.)"
     )
 
     url = _sidecar_url()
@@ -433,4 +434,41 @@ async def test_worker_has_its_own_sidecar_wired_in_compose():
     )
     assert "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL" in worker, (
         "and from its OWN var, never the api's shared one"
+    )
+
+
+async def test_health_reports_SUSTAINED_failure_not_a_single_blip():
+    """A one-probe blip must not condemn a sidecar that is serving.
+
+    Measured on the leader over 28h: blockmachine drops the socket roughly
+    hourly and the keepalive gets it back within a SINGLE probe — 28 UNHEALTHY
+    events, 27 recoveries, every one "recovered after 1 failed probe(s)". With
+    a 1-probe threshold the container healthcheck occasionally samples that
+    blip and latches unhealthy on a fork that is perfectly healthy. That is a
+    false alarm dressed up as honesty.
+
+    So ``ok`` tracks SUSTAINED failure while ``upstream`` keeps the
+    instantaneous read — and the health threshold must stay BELOW the exit
+    threshold, or the process would give up before ever reporting unhealthy.
+    """
+    server = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_rpc_server.mjs"
+    ).read_text()
+    assert "CK_UNHEALTHY_AFTER" in server
+    health = server[server.index("async sim_health()"):]
+    health = health[:health.index("\n  },")]
+    assert "ok: consecutiveFailures < UNHEALTHY_AFTER" in health, (
+        "health must reflect sustained failure, not the last probe"
+    )
+    assert "upstream: upstreamOk" in health, (
+        "the instantaneous read must stay observable"
+    )
+
+    def _default(name):
+        frag = server[server.index(f"process.env.{name} ??"):]
+        return int(frag[frag.index("??") + 2: frag.index(")")].strip())
+
+    assert _default("CK_UNHEALTHY_AFTER") < _default("CK_UNHEALTHY_EXIT_AFTER"), (
+        "health must degrade BEFORE the process exits, or it never reports it"
     )
