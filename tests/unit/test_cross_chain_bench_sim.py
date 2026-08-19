@@ -1260,3 +1260,99 @@ class TestIntentRequestsCrossChain:
         )
         for junk in ("", "0", 0, None, "base", {}, []):
             assert intent_requests_cross_chain({"dest_chain_id": junk}, 1) is False
+
+
+class TestScoredPathSeesTheSourceLeg:
+    """The scored sim must execute a cross-chain plan's SOURCE-side work.
+
+    A solver's ``cross_chain_plan`` keeps its interactions in LEGS and leaves
+    the top level empty. The destination measurement was taught this (it calls
+    ``normalize_to_legs`` first); the scored path was not — so it handed the
+    simulator a plan with ZERO interactions, scoreIntent reverted "(empty
+    revert)", and the row scored 0 however good the plan was.
+
+    Measured on the leader 2026-08-18: the one submission that demonstrably
+    delivered on the destination chain (499750000000000000 — exactly the
+    5bps-haircut amount) still scored 0.0 with ``interactions: []``. Replayed
+    on a throwaway fork: ``_mock_bridge_for_benchmark`` returned the plan
+    UNCHANGED with 0 interactions, while the same plan normalized carried 1
+    executable source-chain interaction (45836 gas).
+    """
+
+    @staticmethod
+    def _state(chain_id, **params):
+        """``_State`` funnels kwargs into params, so chain_id must be set as a
+        real ATTRIBUTE — the helper reads ``state.chain_id`` to decide which
+        legs execute here, and a params entry would silently exercise the
+        no-chain fallback instead."""
+        st = _State(**params)
+        st.chain_id = chain_id
+        return st
+
+    @staticmethod
+    def _legs_plan(source_chain=1, dest_chain=8453):
+        return _plan({"cross_chain_plan": {
+            "legs": [
+                {"chain_id": source_chain, "interactions": [asdict(_ix(source_chain))]},
+                {"chain_id": dest_chain, "interactions": [asdict(_ix(dest_chain))]},
+            ],
+            "bridge_requests": [{
+                "token": WETH_ETH, "amount": AMOUNT,
+                "src_chain_id": source_chain, "dst_chain_id": dest_chain,
+            }],
+        }})
+
+    def test_source_leg_is_recovered_when_the_top_level_is_empty(self):
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        plan = self._legs_plan()
+        assert plan.interactions == [], "precondition: the solver shape"
+        out = _mock_bridge_for_benchmark(plan, self._state(1, input_token=WETH_ETH))
+        assert len(out.interactions) >= 1, (
+            "the scored sim must run the source leg, not an empty plan"
+        )
+
+    def test_destination_legs_are_never_scored_here(self):
+        """They belong to another fork; crediting them would score work on the
+        wrong chain."""
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        out = _mock_bridge_for_benchmark(
+            self._legs_plan(), self._state(1, input_token=WETH_ETH),
+        )
+        for ix in out.interactions:
+            assert int(getattr(ix, "chain_id", 1) or 1) == 1, (
+                f"destination-chain interaction leaked into the scored sim: {ix}"
+            )
+
+    def test_a_plan_with_top_level_interactions_is_untouched(self):
+        """STRICTLY ADDITIVE: anything that scores today must keep byte-identical
+        inputs. Only the empty-top-level case — which scores 0 today — changes."""
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        plan = _plan(_cross_chain_plan_meta(), interactions=[_ix(1)])
+        before = list(plan.interactions)
+        out = _mock_bridge_for_benchmark(plan, self._state(1, input_token=WETH_ETH))
+        assert list(out.interactions) == before
+
+    def test_single_chain_plan_returns_the_same_object(self):
+        """~97% of rows. Not merely equal — the SAME object, as before."""
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        plan = _plan({"route": "univ3"}, interactions=[_ix(1)])
+        assert _mock_bridge_for_benchmark(plan, self._state(1)) is plan
+
+    def test_destination_only_plan_still_returns_the_same_object(self):
+        """Nothing recoverable on this chain ⇒ unchanged, hence score 0 exactly
+        as today — never a guess."""
+        from minotaur_subnet.harness.orchestrator import _mock_bridge_for_benchmark
+
+        plan = self._legs_plan()
+        # scored on the DESTINATION chain: no source-side work belongs here
+        out = _mock_bridge_for_benchmark(plan, self._state(999, input_token=WETH_ETH))
+        assert out is plan
+
+    def test_helper_returns_empty_for_a_non_multileg_plan(self):
+        from minotaur_subnet.harness.orchestrator import _source_leg_interactions
+
+        assert _source_leg_interactions(_plan({"route": "univ3"}), self._state(1)) == []
