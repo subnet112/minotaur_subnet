@@ -133,6 +133,16 @@ const KEEPALIVE_MS = Number(process.env.CK_KEEPALIVE_MS ?? 30000)
 // clearly not coming back the useful move is to die: the container restart
 // policy re-forks in ~40s and the --db cache makes that cheap. 0 disables.
 const EXIT_AFTER = Number(process.env.CK_UNHEALTHY_EXIT_AFTER ?? 5)
+// Consecutive failed probes before HEALTH goes false. Not 1, deliberately.
+// Measured on the leader over 28h: blockmachine drops the socket roughly hourly
+// and the keepalive gets it back within a SINGLE probe — 28 UNHEALTHY events,
+// 27 recoveries, every one of them "recovered after 1 failed probe(s)". With a
+// 1-probe threshold the container healthcheck occasionally samples that blip
+// and latches unhealthy on a sidecar that is serving perfectly, which is a
+// false alarm dressed up as honesty. Report sustained failure instead, and keep
+// the instantaneous read on `upstream` so a blip is still visible.
+// Must stay BELOW EXIT_AFTER so health degrades before the process gives up.
+const UNHEALTHY_AFTER = Number(process.env.CK_UNHEALTHY_AFTER ?? 2)
 // Bounds how long ONE probe may take, so the exit threshold means a
 // predictable wall-clock (see ChopsticksAnvil.probeUpstream).
 const PROBE_TIMEOUT_MS = Number(process.env.CK_PROBE_TIMEOUT_MS ?? 15000)
@@ -171,11 +181,15 @@ if (KEEPALIVE_MS > 0) {
 const HANDLERS = {
   async sim_health() {
     return {
-      ok: upstreamOk,
+      // SUSTAINED health — what the container healthcheck acts on.
+      ok: consecutiveFailures < UNHEALTHY_AFTER,
       block: await ck.forkBlock(),
       pinBlock,
+      // INSTANTANEOUS last-probe result, so a single blip stays observable
+      // without condemning the container.
       upstream: upstreamOk,
       upstream_error: upstreamError,
+      consecutive_failures: consecutiveFailures,
     }
   },
   async sim_forkBlock() { return await ck.forkBlock() },
