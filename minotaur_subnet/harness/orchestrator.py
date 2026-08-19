@@ -46,6 +46,7 @@ from minotaur_subnet.chains import registry
 from minotaur_subnet.shared.types import (
     AppIntentDefinition,
     ExecutionPlan,
+    Interaction,
     IntentState,
     ScoreResult,
     SimulationResult,
@@ -2351,6 +2352,51 @@ def _build_token_balances(state: IntentState | None) -> dict[str, int] | None:
     return None
 
 
+def _source_leg_interactions(
+    plan: ExecutionPlan, state: IntentState | None,
+) -> list[Interaction]:
+    """The SOURCE-side interactions of a legs-shaped cross-chain plan.
+
+    ``normalize_to_legs`` flattens ``metadata["cross_chain_plan"].legs`` into
+    one interaction list and records, per leg, its ``chain_id``, ``type``
+    (source / bridge / destination) and ``interaction_indices`` into that list.
+    We keep the legs that execute on the chain being scored and drop the
+    destination legs — those belong to another fork, and crediting them here
+    would score work on the wrong chain.
+
+    Selection is deliberately conservative: a leg is kept when its ``chain_id``
+    matches the scored chain, or — when the leg declares no chain — when it is
+    not a destination leg. Anything ambiguous is dropped, which returns this to
+    exactly today's behaviour (an empty list, hence score 0) rather than
+    guessing. Returns ``[]`` for any plan that is not multi-leg.
+    """
+    from minotaur_subnet.simulator.cross_chain_bench import normalize_to_legs
+
+    normalized = normalize_to_legs(plan)
+    if normalized is None:
+        return []
+    legs = (normalized.metadata or {}).get("legs") or []
+    flat = list(normalized.interactions)
+    scored_chain = getattr(state, "chain_id", None)
+
+    picked: list[Interaction] = []
+    for leg in legs:
+        leg_chain = leg.get("chain_id")
+        if leg_chain is not None and scored_chain is not None:
+            try:
+                keep = int(leg_chain) == int(scored_chain)
+            except (TypeError, ValueError):
+                keep = False
+        else:
+            keep = leg.get("type") != "destination"
+        if not keep:
+            continue
+        for idx in leg.get("interaction_indices") or []:
+            if 0 <= int(idx) < len(flat):
+                picked.append(flat[int(idx)])
+    return picked
+
+
 def _mock_bridge_for_benchmark(
     plan: ExecutionPlan, state: IntentState | None,
 ) -> ExecutionPlan:
@@ -2390,6 +2436,31 @@ def _mock_bridge_for_benchmark(
 
     from minotaur_subnet.shared.types import mock_bridge_interactions
 
+    # WHERE THE PLAN'S WORK ACTUALLY LIVES.
+    #
+    # A solver's ``cross_chain_plan`` carries its interactions inside LEGS and
+    # leaves the top level EMPTY. The destination measurement was taught this
+    # (it calls normalize_to_legs first); this scored path never was, so it
+    # handed the simulator a plan with zero interactions — scoreIntent then
+    # reverts "(empty revert)" and the row scores 0 NO MATTER HOW GOOD THE PLAN
+    # IS. Measured on the leader 2026-08-18: the one submission that
+    # demonstrably delivered on the destination chain (499750000000000000, the
+    # exact 5bps-haircut amount) still scored 0.0 with ``interactions: []``.
+    # Replayed on a throwaway fork: this function returned the plan UNCHANGED
+    # with 0 interactions, while the same plan normalized carried 1 executable
+    # source-chain interaction (45836 gas).
+    #
+    # Only the SOURCE side is taken. Destination legs belong to another fork —
+    # running them here would credit work on the wrong chain — and the bridge
+    # leg's deposit is exactly what the mocking below exists to make executable.
+    #
+    # STRICTLY ADDITIVE: this fires only when the top level is EMPTY, which is
+    # the case that scores 0 today. A plan that already carries top-level
+    # interactions keeps byte-identical inputs, so nothing that scores now moves.
+    interactions = plan.interactions
+    if not interactions:
+        interactions = _source_leg_interactions(plan, state)
+
     params = (
         state.raw_params_view()
         if state is not None and hasattr(state, "raw_params_view")
@@ -2400,18 +2471,22 @@ def _mock_bridge_for_benchmark(
     except (ValueError, TypeError):
         amount = 0
     mocked = mock_bridge_interactions(
-        plan.interactions,
+        interactions,
         token_address=params.get("input_token", "") or "",
         amount=amount,
     )
     if mocked == plan.interactions:
-        # Declared cross-chain but carries no bridge calldata on this chain
-        # (e.g. a destination-only leg) — nothing to rewrite.
+        # Nothing changed AND nothing was recovered from the legs: a
+        # destination-only leg, or a plan with no executable source side.
+        # Same object out, exactly as before.
         return plan
 
     logger.info(
-        "[benchmark] cross-chain plan: mocked %d bridge call(s) for simulation",
-        sum(1 for a, b in zip(mocked, plan.interactions) if a != b),
+        "[benchmark] cross-chain plan: scoring %d source-side interaction(s), "
+        "%d bridge call(s) mocked%s",
+        len(mocked),
+        sum(1 for a, b in zip(mocked, interactions) if a != b),
+        " (recovered from legs — top level was empty)" if not plan.interactions else "",
     )
     return ExecutionPlan(
         intent_id=plan.intent_id,
