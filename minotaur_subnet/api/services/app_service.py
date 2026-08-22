@@ -159,7 +159,30 @@ def create_app_intent(
         if isinstance(validation.js_manifest, dict):
             extracted_manifest = validation.js_manifest
     except Exception as exc:
-        logger.warning("Pre-flight validation skipped: %s", exc)
+        # FAIL CLOSED. This block used to log a warning and fall through, which
+        # meant an app whose code could not be validated was accepted anyway —
+        # with nothing but a WARNING line to show for it.
+        #
+        # The distinction the old code missed: `validation.valid == False` is a
+        # verdict, and it already returns an error above. Reaching HERE means no
+        # verdict was ever reached — the compiler was missing, the sandbox would
+        # not start, the toolchain was broken. "I could not check" is not
+        # "I checked and it is fine", and only one of those is safe to accept.
+        #
+        # This is the path hardened after the credential-exfil incident, where
+        # untrusted JS reached RELAYER_PRIVATE_KEY. A box with a degraded forge
+        # or node would silently accept unvalidated app code on exactly that
+        # path. Refusing is the conservative failure: an operator sees a clear
+        # error and fixes the toolchain, instead of a warning nobody reads.
+        logger.exception("Pre-flight validation could not run; refusing to create app")
+        return {
+            "error": "Validation could not run",
+            "validation_errors": [
+                "Pre-flight validation failed to execute, so the submitted code "
+                f"was never checked: {exc}",
+            ],
+            "validation_warnings": [],
+        }
 
     # ── resolve the deployer (owner allowed to edit) ───────────────────
     # Two paths:
