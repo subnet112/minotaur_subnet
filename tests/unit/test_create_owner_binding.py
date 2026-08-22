@@ -4,11 +4,13 @@ is proven by a key, not a claimed address."""
 from __future__ import annotations
 
 import time
+from unittest.mock import AsyncMock, patch
 
 from eth_account import Account
 
 from minotaur_subnet.api.services import app_auth, developer_auth
 from minotaur_subnet.api.services.app_service import create_app_intent
+from minotaur_subnet.shared.types import CodeValidationResult
 from minotaur_subnet.store.app_intent_store import AppIntentStore
 
 OWNER = Account.from_key("0x" + "11" * 32)
@@ -35,11 +37,32 @@ def _sign(wallet, js=JS, sol=SOL, deadline=None):
     ), deadline
 
 
+def _ok_validation():
+    """Stub out create's pre-flight code validation.
+
+    ``create_app_intent`` runs the real validator, which shells out to
+    ``node runner.js`` (needing the isolated-vm native addon in
+    engine/node_modules) and to ``forge`` (needing the contracts submodule
+    checked out). Neither is a prerequisite of the no-Docker/no-RPC unit lane,
+    and neither has anything to do with the OWNER BINDING under test here — an
+    unbuilt toolchain otherwise fails these tests with "Validation failed"
+    before the ownership code is ever reached. Same stub the sibling
+    create-path suite uses (tests/unit/test_api_services.py::_ok_validation).
+    """
+    return patch(
+        "minotaur_subnet.engine.validation.validate_app_intent",
+        new=AsyncMock(return_value=CodeValidationResult(
+            valid=True, errors=[], warnings=[], js_config={}, js_manifest=None,
+        )),
+    )
+
+
 def _create(store, **kw):
     base = dict(name="dex", description="", supported_chains=[8453],
                 js_code=JS, solidity_code=SOL)
     base.update(kw)
-    return create_app_intent(store, **base)
+    with _ok_validation():
+        return create_app_intent(store, **base)
 
 
 def test_owner_signature_sets_proven_deployer(tmp_path):

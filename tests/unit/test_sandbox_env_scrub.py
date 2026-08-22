@@ -24,6 +24,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# The end-to-end escape test shells out to `node runner.js`. Since #933 runner.js
+# runs the untrusted guest in a REAL V8 isolate, so it `require("isolated-vm")` —
+# a native addon that lives in engine/node_modules and is NOT vendored (it is
+# built by the Docker image / by CI's `npm ci`). A `which("node")` guard alone is
+# therefore stale: with node present but the addon missing, the child dies with
+# MODULE_NOT_FOUND before any JS runs and the test fails for a reason that has
+# nothing to do with the env allowlist. Guard on the addon too, exactly as the
+# sibling sandbox suites do (test_sandbox_isolate_escape, test_runner_js_ssrf_
+# blocklist, test_sandbox_dos_hardening).
+_ISOLATED_VM = _REPO_ROOT / "minotaur_subnet" / "engine" / "node_modules" / "isolated-vm"
+
 from minotaur_subnet.engine.sandbox import JsSandbox, _sandbox_child_env  # noqa: E402
 
 _FAKE_SECRET = "0xDEADBEEF_fake_relayer_key_MUST_NOT_LEAK"
@@ -77,7 +88,13 @@ def test_child_env_excludes_parent_only_sandbox_vars(monkeypatch):
     assert "JS_SANDBOX_ACQUIRE_TIMEOUT_SEC" not in env
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+@pytest.mark.skipif(
+    shutil.which("node") is None or not _ISOLATED_VM.exists(),
+    reason=(
+        "node or engine/node_modules/isolated-vm not present — run "
+        "`npm --prefix minotaur_subnet/engine install --omit=dev` first"
+    ),
+)
 @pytest.mark.asyncio
 async def test_sandbox_escape_cannot_read_secret_from_env(monkeypatch):
     """End-to-end: a secret in the PARENT env is invisible to escaping JS.
