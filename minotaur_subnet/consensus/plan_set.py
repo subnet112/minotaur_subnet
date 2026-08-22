@@ -113,7 +113,12 @@ def leg_plan_hash(plan: ExecutionPlan) -> bytes:
             int(ix.value),
             cd_bytes,
         ))
-    metadata = json.dumps(plan.metadata).encode() if plan.metadata else b""
+    if not plan.metadata:
+        metadata = b""
+    elif isinstance(plan.metadata, dict):
+        metadata = json.dumps(plan.metadata).encode()
+    else:
+        metadata = plan.metadata
     return hash_plan_eip712(calls, plan.deadline, plan.nonce, metadata)
 
 
