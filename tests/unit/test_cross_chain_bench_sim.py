@@ -1356,3 +1356,51 @@ class TestScoredPathSeesTheSourceLeg:
         from minotaur_subnet.harness.orchestrator import _source_leg_interactions
 
         assert _source_leg_interactions(_plan({"route": "univ3"}), self._state(1)) == []
+
+
+class TestTaoBridgeTokenMapping:
+    """wTAO on Ethereum -> native TAO on chain 964.
+
+    The two sides of this row are different KINDS of asset, which is why the row
+    has to exist at all: without it `map_bridged_token` passes the token through
+    and the destination fork is seeded with wTAO's Ethereum address, a contract
+    that does not exist on 964.
+    """
+
+    WTAO_ETH = "0x77E06c9eCCf2E797fd462A92B6D7642EF85b0A44"
+
+    def test_wtao_becomes_native_on_bittensor(self):
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
+        assert map_bridged_token(self.WTAO_ETH, 1, 964) == NATIVE_SENTINEL
+
+    def test_the_reverse_leg_becomes_the_erc20(self):
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
+        assert map_bridged_token(NATIVE_SENTINEL, 964, 1).lower() == self.WTAO_ETH.lower()
+
+    def test_it_is_case_insensitive_on_the_source_address(self):
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
+        assert map_bridged_token(self.WTAO_ETH.lower(), 1, 964) == NATIVE_SENTINEL
+
+    def test_existing_routes_are_untouched(self):
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        weth_eth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        assert map_bridged_token(weth_eth, 1, 8453) == "0x4200000000000000000000000000000000000006"
+
+    def test_an_unmapped_token_still_passes_through(self):
+        """Fail-closed: an unknown asset seeds nothing usable and the leg fails,
+        which is the no-credit outcome, never a mis-credit."""
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        unknown = "0x1234567890123456789012345678901234567890"
+        assert map_bridged_token(unknown, 1, 964) == unknown
+
+    def test_the_bridge_adapter_and_the_map_agree(self):
+        """The adapter's quote and the seeding map must name the same asset, or
+        the leg is seeded with something the plan does not spend."""
+        import asyncio
+        from minotaur_subnet.bridge.tensorplex import TensorplexAdapter
+        from minotaur_subnet.simulator.cross_chain_bench import map_bridged_token
+        q = asyncio.run(TensorplexAdapter().quote(self.WTAO_ETH, 7_000_000_000, 1, 964))
+        assert q.token_out.lower() == map_bridged_token(self.WTAO_ETH, 1, 964).lower()
