@@ -209,6 +209,91 @@ def _revert_trace_budget() -> int:
         return 10
 
 
+# Fraction of TOTAL_BENCHMARK_TIMEOUT after which transient-RPC retries stop
+# being issued. Retries cost wall clock against the SAME run budget as the
+# first attempts, so an unbounded retry policy would convert a fairness fix
+# into a worse failure: the tail of the corpus zero-filled by
+# "skipped: total run budget exceeded". Past this mark the run spends what is
+# left finishing first attempts, which every order still needs.
+_RPC_RETRY_DEADLINE_FRACTION = 0.75
+
+
+def _rpc_retry_max() -> int:
+    """EXTRA attempts a scenario gets after a TRANSIENT RPC/provider failure.
+
+    A provider rate-limit / timeout / 5xx makes the solver emit no plan for the
+    affected order (see ``_RPC_ERROR_SIGNATURES``). The relative adoption rule
+    then records that order as ``dropped`` — and a single drop is a HARD VETO
+    no amount of wins can offset — so the miner is rejected for the provider's
+    hiccup rather than its own capability. Re-running the scenario turns that
+    misattribution into a retry.
+
+    CONSENSUS-RELEVANT: a retried scenario can produce a plan where the first
+    attempt produced none, which changes per_intent raw_output and hence the
+    adoption verdict. Ships OFF (``0``) so it can soak inert, and MUST be
+    flipped fleet-uniformly (develop->main promotion + env on every validator)
+    exactly like PIN_SOLVER_READ_BLOCK — a split value means leader and
+    follower can score the same image differently. Capped at 5 so a
+    misconfigured value cannot spend the whole run budget on one order.
+    """
+    raw = os.environ.get("BENCHMARK_RPC_RETRY_MAX", "0").strip()
+    try:
+        return max(0, min(int(raw), 5))
+    except ValueError:
+        return 0
+
+
+def _rpc_retry_run_budget(n_intents: int) -> int:
+    """Run-wide ceiling on transient-RPC retries, shared by every runtime.
+
+    The per-scenario cap alone bounds ONE order; this bounds the RUN, so a
+    provider outage degrades to "scored like today" instead of burning the
+    whole budget re-running everything. Default scales with corpus size
+    (a quarter of it, floor 8) — comfortably above the ~10-15% transient
+    failure rate seen live, well below a full re-run.
+    """
+    raw = os.environ.get("BENCHMARK_RPC_RETRY_RUN_MAX", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return max(8, n_intents // 4)
+
+
+# Errors that are DETERMINISTIC outcomes of the plan itself, never provider
+# flake — retrying them re-derives the same verdict and only spends budget.
+# ``real_sim_reverted`` is the important one: a reverted scoreIntent is a real
+# result (the plan cannot execute) and its revert text can incidentally contain
+# a transient-looking substring.
+_RPC_RETRY_EXCLUDED_PREFIXES: tuple[str, ...] = (
+    "real_sim_reverted:",
+)
+
+
+def _is_retryable_rpc_failure(br: "BenchmarkResult") -> str | None:
+    """Return the transient signature when ``br`` is a provider-caused MISS.
+
+    All three must hold, so a retry can only ever rescue a row the miner did
+    not lose on merit:
+
+    1. the row DELIVERED NOTHING (no ``raw_output``) — a scored row is never
+       re-run, so retries cannot change a result the solver actually produced;
+    2. its error carries a transient RPC/provider signature; and
+    3. it is not a deterministic plan outcome (a real revert).
+    """
+    raw = br.raw_output
+    if raw is not None and str(raw) != "":
+        return None
+    err = br.error
+    if not err:
+        return None
+    for prefix in _RPC_RETRY_EXCLUDED_PREFIXES:
+        if err.startswith(prefix):
+            return None
+    return _classify_rpc_error(err)
+
+
 def _capture_revert_trace(
     simulator: Any, plan: Any, token_balances: dict[str, int] | None,
 ) -> dict[str, Any] | None:
@@ -289,6 +374,13 @@ class BenchmarkResult:
     # app is deployed on more than one chain (BENCHMARK_ALL_DEPLOYMENT_CHAINS);
     # the ``intent_id`` label alone (app_id:scenario) does not identify the chain.
     chain_id: int | None = None
+    # How many EXTRA attempts this scenario needed because a previous attempt
+    # failed with a TRANSIENT RPC/provider signature (see _RPC_ERROR_SIGNATURES).
+    # 0 on every row when the retry is disarmed, so disarmed runs stay
+    # byte-identical. OBSERVABILITY: it records that the harness absorbed a
+    # provider hiccup on the miner's behalf, never a quality signal about the
+    # solver.
+    rpc_retries: int = 0
 
 
 @dataclass
@@ -1623,12 +1715,25 @@ async def run_benchmark(
             _n, _samples = _report()
             _rpc_total += _n
             _rpc_samples.extend(_samples)
-        if _rpc_total:
+        # How much of that flake the retry actually absorbed this run. Rows
+        # that still carry a transient signature were NOT rescued (budget
+        # spent, or it failed every attempt) and are the residual fairness
+        # cost; `_rescued` is what the miner would otherwise have been
+        # hard-vetoed for.
+        _retried = sum(int(getattr(r, "rpc_retries", 0) or 0) for r in results)
+        _rescued = sum(
+            1 for r in results
+            if int(getattr(r, "rpc_retries", 0) or 0) > 0
+            and _is_retryable_rpc_failure(r) is None
+        )
+        if _rpc_total or _retried:
             logger.warning(
                 "[benchmark-rpc-health] %s: %d transient RPC/provider error(s) over "
                 "%d scenario(s) this run — these silently zero orders and get "
-                "misattributed to miner capability (fairness impact). samples: %s",
+                "misattributed to miner capability (fairness impact). "
+                "retries=%d rescued_orders=%d. samples: %s",
                 getattr(session, "_label", "solver"), _rpc_total, len(intents),
+                _retried, _rescued,
                 " | ".join(_rpc_samples[:4]),
             )
     except Exception as exc:  # noqa: BLE001 — audit logging must never break a run
@@ -1975,6 +2080,8 @@ async def _scenario_pool_worker(
     run_start: float,
     trace_budget: list[int],
     max_respawns: int,
+    rpc_retry_max: int = 0,
+    retry_budget: list[int] | None = None,
     read_proxy: Any | None,
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
@@ -1997,6 +2104,8 @@ async def _scenario_pool_worker(
     proxy_session_id = runtime.proxy_session_id
     respawns = 0
     solver_dead = False
+    if retry_budget is None:
+        retry_budget = [0]
     dead_reason = "skipped: solver unrecoverable"
 
     async def _respawn() -> bool:
@@ -2050,25 +2159,87 @@ async def _scenario_pool_worker(
             results[idx] = br
             continue
 
-        br, need_respawn = await _process_scenario(
-            intent, state, snapshot,
-            session=session,
-            simulator=simulator,
-            proxy_session_id=proxy_session_id,
-            read_proxy=read_proxy,
-            config=config,
-            score_fn=score_fn,
-            fork_block=fork_block,
-            fork_blocks=fork_blocks,
-            require_real_sim=require_real_sim,
-            trigger_ground_truth=trigger_ground_truth,
-            trace_budget=trace_budget,
-        )
+        async def _attempt():
+            return await _process_scenario(
+                intent, state, snapshot,
+                session=session,
+                simulator=simulator,
+                proxy_session_id=proxy_session_id,
+                read_proxy=read_proxy,
+                config=config,
+                score_fn=score_fn,
+                fork_block=fork_block,
+                fork_blocks=fork_blocks,
+                require_real_sim=require_real_sim,
+                trigger_ground_truth=trigger_ground_truth,
+                trace_budget=trace_budget,
+            )
+
+        br, need_respawn = await _attempt()
+
+        # TRANSIENT-RPC RETRY (disarmed unless BENCHMARK_RPC_RETRY_MAX > 0).
+        #
+        # When a provider rate-limits / times out / 5xx's, the solver emits no
+        # plan for the affected order. The relative rule records that as a
+        # `dropped` order, which is a HARD VETO on adoption — so a provider
+        # hiccup, not the miner's capability, decides the round. Re-running the
+        # scenario is the narrowest fix: it only ever re-runs a row that
+        # delivered NOTHING and failed with a transient signature, so it cannot
+        # change a result the solver actually produced.
+        #
+        # Bounded three ways — per scenario (`_rpc_retry_max`), per run
+        # (`retry_budget`, shared across runtimes), and by wall clock
+        # (`_RPC_RETRY_DEADLINE_FRACTION`) — because retries spend the SAME
+        # budget as first attempts; an unbounded policy would zero-fill the
+        # tail of the corpus and make miners worse off than doing nothing.
+        attempts = 0
+        while (
+            rpc_retry_max > 0
+            and attempts < rpc_retry_max
+            and retry_budget[0] > 0
+            and not solver_dead
+        ):
+            sig = _is_retryable_rpc_failure(br)
+            if sig is None:
+                break
+            if (
+                time.monotonic() - run_start
+            ) > TOTAL_BENCHMARK_TIMEOUT * _RPC_RETRY_DEADLINE_FRACTION:
+                logger.warning(
+                    "[benchmark-rpc-retry] %s: transient provider failure (%s) "
+                    "NOT retried — past %.0f%% of the run budget; the miner "
+                    "still eats this drop",
+                    br.intent_id, sig, _RPC_RETRY_DEADLINE_FRACTION * 100,
+                )
+                break
+            # A timeout/crash killed the process; it must be live to retry.
+            if need_respawn:
+                if not await _respawn():
+                    solver_dead = True
+                    break
+                need_respawn = False
+            attempts += 1
+            retry_budget[0] -= 1
+            logger.warning(
+                "[benchmark-rpc-retry] %s: retry %d/%d after transient "
+                "provider failure (%s): %s",
+                br.intent_id, attempts, rpc_retry_max, sig, br.error,
+            )
+            br, need_respawn = await _attempt()
+
+        # Carried on whichever attempt is FINAL, so the row says how many
+        # provider hiccups the harness absorbed for this order.
+        br.rpc_retries = attempts
+        if attempts and _is_retryable_rpc_failure(br) is None:
+            logger.info(
+                "[benchmark-rpc-retry] %s: recovered after %d retry(ies)",
+                br.intent_id, attempts,
+            )
         results[idx] = br
 
         # A timeout/crash left the process dead — respawn so the NEXT scenario
         # this worker pulls runs on a live solver. Only THIS scenario scored 0.
-        if need_respawn:
+        if need_respawn and not solver_dead:
             solver_dead = not await _respawn()
 
 
@@ -2105,6 +2276,10 @@ async def _run_scenarios(
     trace_budget = [_revert_trace_budget()]
     # Per-runtime respawn ceiling (matches the legacy single-session bound).
     max_respawns = max(4, len(intents))
+    # Transient-RPC retry allowance, SHARED across runtimes (a list so every
+    # worker decrements one counter) — bounds the RUN, not just one scenario.
+    rpc_retry_max = _rpc_retry_max()
+    retry_budget = [_rpc_retry_run_budget(len(intents)) if rpc_retry_max else 0]
 
     await asyncio.gather(*[
         _scenario_pool_worker(
@@ -2116,6 +2291,8 @@ async def _run_scenarios(
             run_start=run_start,
             trace_budget=trace_budget,
             max_respawns=max_respawns,
+            rpc_retry_max=rpc_retry_max,
+            retry_budget=retry_budget,
             read_proxy=read_proxy,
             config=config,
             score_fn=score_fn,

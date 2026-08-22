@@ -2639,6 +2639,14 @@ class BenchmarkWorker:
             if gm is not None:
                 row["gas_metered"] = gm
                 row["gas_basis"] = GAS_BASIS
+            # Transient-RPC retries the harness absorbed for this order.
+            # ADDITIVE + only when non-zero, so rows are byte-identical to the
+            # pre-retry shape wherever the retry is disarmed or never fired.
+            # Records that a provider hiccup was re-run on the miner's behalf;
+            # never a quality signal, and nothing reads it for any verdict.
+            rr = int(getattr(r, "rpc_retries", 0) or 0)
+            if rr > 0:
+                row["rpc_retries"] = rr
             per_intent.append(row)
         return {
             "total_intents": len(results),
