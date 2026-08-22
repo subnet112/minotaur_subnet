@@ -8,13 +8,14 @@ nulls + per-chain errors, never an exception.
 from __future__ import annotations
 
 import hashlib
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from minotaur_subnet.api.services.app_admin import get_app_admin_state
 from minotaur_subnet.shared.types import (
     AppIntentConfig,
     AppIntentDefinition,
     AppStatus,
+    CodeValidationResult,
     DeploymentResult,
 )
 from minotaur_subnet.store.app_intent_store import AppIntentStore
@@ -194,16 +195,28 @@ def test_create_app_persists_contract_version(tmp_path):
     from minotaur_subnet.api.services.app_service import create_app_intent
 
     store = AppIntentStore(store_path=tmp_path / "s.db")
-    out = create_app_intent(
-        store, name="dex", description="", supported_chains=[8453],
-        js_code=(
-            "const manifest = { intent_functions: [{ name: 'swap', params: [] }] };\n"
-            "function score() { return 1; }\n"
-            "module.exports = { score, manifest };\n"
-        ),
-        solidity_code="contract X {}",
-        contract_version="V2",
-    )
+    # Stub the pre-flight code validation: it shells out to `node runner.js`
+    # (isolated-vm native addon) and to `forge` (contracts submodule), neither
+    # of which the no-Docker/no-RPC unit lane provides, and neither of which is
+    # what this test is about (contract_version persistence). Without the stub
+    # an unbuilt toolchain returns "Validation failed" before the store write.
+    # Same stub as tests/unit/test_api_services.py::_ok_validation.
+    with patch(
+        "minotaur_subnet.engine.validation.validate_app_intent",
+        new=AsyncMock(return_value=CodeValidationResult(
+            valid=True, errors=[], warnings=[], js_config={}, js_manifest=None,
+        )),
+    ):
+        out = create_app_intent(
+            store, name="dex", description="", supported_chains=[8453],
+            js_code=(
+                "const manifest = { intent_functions: [{ name: 'swap', params: [] }] };\n"
+                "function score() { return 1; }\n"
+                "module.exports = { score, manifest };\n"
+            ),
+            solidity_code="contract X {}",
+            contract_version="V2",
+        )
     assert "error" not in out, out
     assert store.get_app(out["app_id"]).contract_version == "v2"
 
