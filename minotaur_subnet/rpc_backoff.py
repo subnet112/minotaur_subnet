@@ -84,7 +84,14 @@ RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 # estimateGas "gas required exceeds allowance"), so retrying it wastes attempts on
 # an error a retry can't fix. A genuinely-transient upstream failure surfaces as a
 # 429/5xx HTTP status or a timeout/reset (caught by is_retryable_status/exception).
-RETRYABLE_RPC_CODES = frozenset({-32005})
+# -32070 = the gateway/proxy telling us the UPSTREAM did not answer in time
+# ("Gateway request timeout"). It is the JSON-RPC analogue of HTTP 504, which is
+# already in RETRYABLE_HTTP_STATUS, and carries no information about the request
+# itself — a retry is exactly the right response. It was missing here, so the
+# backoff layer never retried it; it surfaced instead as a raw exception inside
+# the scoreIntent simulation, was swallowed by a catch-all, and was reported to
+# the miner as "the plan reverted". See simulator/anvil_simulator.
+RETRYABLE_RPC_CODES = frozenset({-32005, -32070})
 
 
 def is_retryable_status(status: int | None) -> bool:
