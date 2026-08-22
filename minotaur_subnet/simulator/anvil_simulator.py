@@ -41,6 +41,7 @@ from web3 import Web3
 
 from minotaur_subnet.rpc_backoff import body_has_retryable_rpc_error, retry_sync
 from minotaur_subnet.rpc_backoff import is_retryable_exception
+from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
 
 # Marker prefix on a SimulationResult.error meaning "the simulation could not be
 # RUN", as distinct from "the plan ran and reverted". These are opposite facts
@@ -654,9 +655,18 @@ class AnvilSimulator:
             if self.fund_executor:
                 self._fund(executor, 100 * 10**18)
 
-            # Deal ERC-20 token balances to executor (for quotes / dry-runs)
+            # Deal token balances to executor (for quotes / dry-runs).
+            #
+            # The native sentinel is not a contract, so it needs setBalance, not
+            # ERC-20 storage. This is load-bearing for bridges that deliver a
+            # native coin rather than a token — Tensorplex credits native TAO on
+            # chain 964 — where dealing it as an ERC-20 silently fails and the
+            # destination leg then reverts for want of msg.value.
             if token_balances:
                 for token_addr, amount in token_balances.items():
+                    if (token_addr or "").lower() == NATIVE_SENTINEL:
+                        self._fund(executor, int(amount))
+                        continue
                     ok = self._deal_erc20(token_addr, executor, amount)
                     if not ok:
                         logger.warning(
