@@ -52,6 +52,7 @@ from minotaur_subnet.shared.types import (
     SimulationResult,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
+from minotaur_subnet.simulator.anvil_simulator import TRANSIENT_SIM_ERROR_PREFIX
 from minotaur_subnet.harness.solver_read_proxy import (
     CHAIN_NAMES,
     budget_enforced,
@@ -142,6 +143,7 @@ _RPC_ERROR_SIGNATURES: tuple[str, ...] = (
     "socket hang up", "fetch failed", "network error",
     "bad gateway", "service unavailable", "gateway timeout",
     "alchemy", "provider error", "json-rpc error", "-32005", "-32603",
+    "-32070", "gateway request timeout",
 )
 
 
@@ -1915,19 +1917,37 @@ async def _process_scenario(
                         )
                         print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
                         if require_real_sim and not sim.success:
-                            # Fail-closed: a real simulation that REVERTED means
-                            # the plan could not execute. Score 0, exactly like a
-                            # genuine on-chain revert.
-                            logger.warning(
-                                "Simulation reverted for %s and "
-                                "require_real_sim is set; scoring 0: %s",
-                                intent.app_id, sim.error,
+                            # TRANSIENT PROVIDER FAULT vs REAL REVERT — opposite
+                            # facts about the miner, and they were being
+                            # collapsed. A `-32070 Gateway request timeout`
+                            # inside the scoreIntent sim used to arrive here
+                            # wearing the generic "scoreIntent simulation
+                            # reverted" error, so it was recorded as
+                            # `real_sim_reverted` (the plan's own failure) and
+                            # graded a DROPPED order — a hard adoption veto for
+                            # our outage, not the miner's plan. The simulator
+                            # now tags it; keep the two apart from here on.
+                            _transient = str(sim.error or "").startswith(
+                                TRANSIENT_SIM_ERROR_PREFIX,
                             )
-                            br.error = f"real_sim_reverted: {sim.error}"
-                            br.revert_reason = getattr(sim, "revert_reason", None)
+                            if _transient:
+                                logger.warning(
+                                    "Simulation UNAVAILABLE for %s (transient "
+                                    "provider fault, NOT a plan revert): %s",
+                                    intent.app_id, sim.error,
+                                )
+                                br.error = f"real_sim_unavailable: {sim.error}"
+                            else:
+                                logger.warning(
+                                    "Simulation reverted for %s and "
+                                    "require_real_sim is set; scoring 0: %s",
+                                    intent.app_id, sim.error,
+                                )
+                                br.error = f"real_sim_reverted: {sim.error}"
+                                br.revert_reason = getattr(sim, "revert_reason", None)
                             # Diagnostics only: capture a per-step trace. Bounded
                             # per run; never affects the score.
-                            if trace_budget[0] > 0:
+                            if trace_budget[0] > 0 and not _transient:
                                 tr = _capture_revert_trace(simulator, plan, token_balances)
                                 if tr is not None:
                                     br.revert_trace = tr
