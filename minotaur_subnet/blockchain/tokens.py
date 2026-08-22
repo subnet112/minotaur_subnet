@@ -141,6 +141,14 @@ TOKENS[31337] = dict(TOKENS[1])
 # Wrapped native token per chain (for platform fee collection)
 # ---------------------------------------------------------------------------
 
+# The address that means "this chain's native coin, not an ERC-20".
+#
+# Widely used convention (1inch, 0x, and others). It is NOT a contract: code
+# that seeds or transfers balances has to branch on it rather than treat it as
+# a token, or it will try to write ERC-20 storage at an address with no code.
+NATIVE_SENTINEL = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+
 WRAPPED_NATIVE_TOKEN: dict[int, str] = {
     1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",       # WETH (Ethereum)
     8453: "0x4200000000000000000000000000000000000006",      # WETH (Base)

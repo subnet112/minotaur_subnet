@@ -11,6 +11,7 @@
   - [Quickstart](miner/quickstart.md)
   - [Configuration](miner/configuration.md)
   - [Solver API](miner/solver-api.md)
+  - [Bittensor Alpha Intents](miner/bittensor-alpha-intents.md)
   - [Custom Solver](miner/custom-solver.md)
   - [Troubleshooting](miner/troubleshooting.md)
 

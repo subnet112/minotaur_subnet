@@ -57,6 +57,9 @@ _LEG_SOURCE = "source"
 _LEG_BRIDGE = "bridge"
 _LEG_DESTINATION = "destination"
 
+from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
+
+
 # Canonical per-chain addresses of bridgeable assets. A CODE CONSTANT — same
 # discipline as BENCHMARK_BRIDGE_FEE_BPS (anything that feeds scoring and can
 # differ between two nodes eventually will). Mirrors the adapters' static
@@ -79,6 +82,24 @@ _CANONICAL_TOKEN_BY_CHAIN: dict[str, dict[int, str]] = {
     "USDC": {
         1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
         8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    },
+    # TAO across the Tensorplex bridge. The two sides are NOT the same kind of
+    # thing, which is the whole reason this row has to exist:
+    #
+    #   chain 1   — wTAO, a 9-decimal ERC-20 (not 18; it matches rao 1:1)
+    #   chain 964 — NATIVE TAO. The bridge credits a substrate account, and on
+    #               Bittensor an H160's EVM balance IS its mapped account's
+    #               balance, so what lands is spendable as msg.value.
+    #
+    # Without this row `map_bridged_token` passes the token through unchanged
+    # and the destination fork is seeded with wTAO's ETHEREUM address — a
+    # contract that does not exist on 964 — so the destination leg has nothing
+    # to spend. Mapping it to the wrapped token on 964 instead would be worse
+    # than doing nothing: the plan would unwrap in simulation and then fail on
+    # mainnet, where the bridge delivers native and there is no WTAO to unwrap.
+    "TAO": {
+        1: "0x77E06c9eCCf2E797fd462A92B6D7642EF85b0A44",
+        964: NATIVE_SENTINEL,
     },
 }
 
