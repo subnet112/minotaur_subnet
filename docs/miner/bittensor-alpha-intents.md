@@ -57,6 +57,16 @@ plan.metadata      = abi.encode(bytes32 hotkey, uint16 uid)
 plan.calls         = []
 ```
 
+In Python, return **`bytes`** for `metadata` — not a dict. The App abi-decodes
+it, so the encoders forward raw bytes verbatim; a dict is JSON-encoded and will
+not decode:
+
+```python
+from eth_abi import encode as abi_encode
+
+plan.metadata = abi_encode(["bytes32", "uint16"], [hotkey_bytes32, uid])
+```
+
 ## Everything you need to decide, in one call
 
 ```solidity
