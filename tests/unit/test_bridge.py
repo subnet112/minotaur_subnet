@@ -113,7 +113,11 @@ class TestTensorplexAdapter:
         assert quote.estimated_output == 9_990_000
         assert quote.estimated_duration_s == 1800
 
-    def test_build_interactions_not_implemented(self, adapter):
+    def test_build_interactions_requires_a_destination(self, adapter):
+        """Was: asserted the Ethereum -> Bittensor direction raised
+        NotImplementedError. It is implemented now (see
+        TestTensorplexEthereumToBittensor); what still must not be accepted is a
+        burn with nowhere to credit, since the burn itself is irreversible."""
         quote = BridgeQuote(
             protocol="tensorplex",
             src_chain_id=1,
@@ -125,8 +129,8 @@ class TestTensorplexAdapter:
             fee=1,
             estimated_duration_s=1800,
         )
-        with pytest.raises(NotImplementedError):
-            adapter.build_bridge_interactions(quote, "0x")
+        with pytest.raises(ValueError, match="recipient is required"):
+            adapter.build_bridge_interactions(quote, "")
 
     def test_check_status_returns_pending_on_network_error(self, adapter):
         """check_status calls the Tensorplex API; network errors return PENDING."""
@@ -499,3 +503,82 @@ class TestCctpMintSelfRelay:
         assert oid in tracker._tracked              # still tracked (retry)
         assert tracker._tracked[oid].cctp_minted is False
         tracker._on_bridge_complete.assert_not_awaited()
+
+
+class TestTensorplexEthereumToBittensor:
+    """The Ethereum -> Bittensor direction, against the real mainnet ABI.
+
+    Every constant here was read off chain rather than from documentation: the
+    selector and argument shape come from decoding a live burn transaction
+    (0xbee4795c...), which is also how the previous stub's "approve + deposit to
+    a bridge contract" description was found to be wrong — there is no bridge
+    contract and no approval.
+    """
+
+    @pytest.fixture
+    def adapter(self):
+        return TensorplexAdapter()
+
+    @pytest.fixture
+    def quote(self):
+        from minotaur_subnet.bridge.base import BridgeQuote
+        from minotaur_subnet.bridge.tensorplex import _WTAO_ETH
+        return BridgeQuote(
+            protocol="tensorplex", src_chain_id=1, dst_chain_id=964,
+            token_in=_WTAO_ETH, token_out="0x" + "ee" * 20,
+            amount_in=7_000_000_000,  # 7 wTAO — NINE decimals, not eighteen
+            estimated_output=6_993_000_000, fee=7_000_000,
+            estimated_duration_s=1800, metadata={},
+        )
+
+    def test_selector_matches_the_mainnet_transaction(self):
+        from minotaur_subnet.bridge.tensorplex import _BRIDGE_BACK_SELECTOR
+        assert _BRIDGE_BACK_SELECTOR.hex() == "2a383090"
+
+    def test_it_burns_on_the_token_itself_with_no_approve(self, adapter, quote):
+        from minotaur_subnet.bridge.tensorplex import _WTAO_ETH
+        ix = adapter.build_bridge_interactions(quote, "0xc2bf4b789F89644E62D04dcBBF51a8cD60A9e692")
+        assert len(ix) == 1, "an approve would be dead weight: bridgeBack burns from msg.sender"
+        assert ix[0].target.lower() == _WTAO_ETH.lower()
+        assert ix[0].value == "0"
+        assert ix[0].chain_id == 1
+        assert ix[0].call_data.startswith("0x2a383090")
+
+    def test_an_h160_destination_is_mapped_to_its_substrate_account(self, adapter, quote):
+        from eth_abi import decode as abi_decode
+        from minotaur_subnet.bridge.tensorplex import evm_to_ss58
+        h160 = "0xc2bf4b789F89644E62D04dcBBF51a8cD60A9e692"
+        ix = adapter.build_bridge_interactions(quote, h160)
+        amount, dest = abi_decode(["uint256", "string"], bytes.fromhex(ix[0].call_data[10:]))
+        assert amount == 7_000_000_000
+        # The bridge releases to substrate; on Bittensor that account IS the
+        # H160's EVM balance, which is what lets the destination leg spend it.
+        assert dest == evm_to_ss58(h160)
+        assert not dest.startswith("0x")
+
+    def test_an_ss58_destination_passes_through(self, adapter, quote):
+        from eth_abi import decode as abi_decode
+        ss58 = "5CZtoc8iLLhxSnZYXHvwGC9dksb58pRaLe1aZGGGBPYegkV3"
+        ix = adapter.build_bridge_interactions(quote, ss58)
+        _, dest = abi_decode(["uint256", "string"], bytes.fromhex(ix[0].call_data[10:]))
+        assert dest == ss58
+
+    def test_it_refuses_a_non_ethereum_origin(self, adapter, quote):
+        quote.src_chain_id = 964
+        with pytest.raises(ValueError, match="originates on Ethereum"):
+            adapter.build_bridge_interactions(quote, "0x" + "11" * 20)
+
+    def test_a_bittensor_bound_quote_names_native_tao_not_an_eth_address(self, adapter):
+        import asyncio
+        from minotaur_subnet.bridge.tensorplex import _WTAO_ETH
+        q = asyncio.run(adapter.quote(_WTAO_ETH, 7_000_000_000, 1, 964))
+        # token_out seeds the DESTINATION fork. wTAO's Ethereum address does not
+        # exist on 964, so echoing token_in would leave the leg nothing to spend.
+        assert q.token_out.lower() == "0x" + "ee" * 20
+        assert q.token_out.lower() != _WTAO_ETH.lower()
+
+    def test_mock_config_targets_the_burn(self, adapter, quote):
+        cfg = adapter.mock_config(quote)
+        assert cfg["selectors"] == ["2a383090"]
+        assert cfg["mock_type"] == "erc20_transfer"
+        assert cfg["mock_amount"] == 7_000_000_000
