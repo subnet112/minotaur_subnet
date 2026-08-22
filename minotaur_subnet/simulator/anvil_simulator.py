@@ -40,6 +40,15 @@ import requests
 from web3 import Web3
 
 from minotaur_subnet.rpc_backoff import body_has_retryable_rpc_error, retry_sync
+from minotaur_subnet.rpc_backoff import is_retryable_exception
+
+# Marker prefix on a SimulationResult.error meaning "the simulation could not be
+# RUN", as distinct from "the plan ran and reverted". These are opposite facts
+# about a miner: a revert is the plan's own failure, an unavailable provider is
+# ours. Collapsing the two is what made a `-32070 Gateway request timeout`
+# reach the miner as `real_sim_reverted` — an order the relative rule then
+# graded `dropped`, which is a HARD adoption veto.
+TRANSIENT_SIM_ERROR_PREFIX = "provider_unavailable:"
 from minotaur_subnet.shared.types import (
     ExecutionPlan,
     SimulationResult,
@@ -299,6 +308,25 @@ def _sim_offload_enabled() -> bool:
         "1", "true", "yes", "on",
     }
 
+
+
+def _is_transient_rpc_payload(exc: BaseException) -> bool:
+    """True when a raw JSON-RPC error payload rides on the exception itself.
+
+    ``w3.provider.make_request`` hands back a plain ``{"error": {...}}`` dict, so
+    a failure raised off it carries the code/message as ``args`` text rather than
+    as a typed web3 exception — which ``is_retryable_exception`` cannot see.
+    Matches the retryable CODES plus the gateway-timeout wording.
+    """
+    text = " ".join(str(a) for a in (getattr(exc, "args", ()) or ())) or str(exc)
+    low = text.lower()
+    from minotaur_subnet.rpc_backoff import RETRYABLE_RPC_CODES
+    if any(str(code) in text for code in RETRYABLE_RPC_CODES):
+        return True
+    return any(
+        sig in low
+        for sig in ("gateway request timeout", "gateway timeout", "request timeout")
+    )
 
 class AnvilSimulator:
     """Simulates execution plans on a running Anvil fork.
@@ -1070,6 +1098,23 @@ class AnvilSimulator:
             print(f"[SIM] scoreIntent exception: {exc}", flush=True)
             traceback.print_exc()
             logger.warning("scoreIntent simulation failed: %s", exc)
+            # A TRANSIENT provider fault (gateway timeout, rate limit, reset)
+            # says nothing about the plan. Returning None here sent the caller
+            # down its fail-closed branch, which reports the generic
+            # "scoreIntent simulation reverted" — indistinguishable from a real
+            # revert, and graded as a DROPPED order (a hard adoption veto) for
+            # a failure the miner did not cause. Report it as what it is so the
+            # benchmark can retry it instead of scoring it 0.
+            if is_retryable_exception(exc) or _is_transient_rpc_payload(exc):
+                logger.warning(
+                    "scoreIntent: TRANSIENT provider fault (%s) — reporting as "
+                    "unavailable, NOT as a plan revert", exc,
+                )
+                return SimulationResult(
+                    success=False,
+                    gas_used=0,
+                    error=f"{TRANSIENT_SIM_ERROR_PREFIX} {exc}",
+                )
             return None
 
     def _measure_gas_via_meter(
