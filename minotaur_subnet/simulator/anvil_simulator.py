@@ -955,7 +955,12 @@ class AnvilSimulator:
             plan_metadata = b""
             if plan.metadata:
                 import json as _json
-                plan_metadata = _json.dumps(plan.metadata).encode()
+                if not plan.metadata:
+                    plan_metadata = b""
+                elif isinstance(plan.metadata, dict):
+                    plan_metadata = _json.dumps(plan.metadata).encode()
+                else:
+                    plan_metadata = plan.metadata
 
             encoded = abi_encode(
                 [
@@ -2150,7 +2155,12 @@ class AnvilSimulator:
             plan_metadata = b""
             if plan.metadata:
                 import json
-                plan_metadata = json.dumps(plan.metadata).encode()
+                if not plan.metadata:
+                    plan_metadata = b""
+                elif isinstance(plan.metadata, dict):
+                    plan_metadata = json.dumps(plan.metadata).encode()
+                else:
+                    plan_metadata = plan.metadata
 
             # ABI-encode the full calldata
             encoded = abi_encode(

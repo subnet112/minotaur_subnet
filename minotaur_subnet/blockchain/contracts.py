@@ -291,7 +291,12 @@ def _plan_to_solidity(plan: ExecutionPlan) -> tuple:
 
     # metadata -> bytes (encode as JSON bytes for simplicity)
     import json as _json
-    metadata_bytes = _json.dumps(plan.metadata).encode() if plan.metadata else b""
+    if not plan.metadata:
+        metadata_bytes = b""
+    elif isinstance(plan.metadata, dict):
+        metadata_bytes = _json.dumps(plan.metadata).encode()
+    else:
+        metadata_bytes = plan.metadata
 
     return (intent_id_bytes, interactions, plan.deadline, plan.nonce, metadata_bytes)
 

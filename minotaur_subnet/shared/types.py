@@ -252,7 +252,11 @@ class ExecutionPlan:
     interactions: list[Interaction]           # Ordered calls to execute
     deadline: int                            # Unix timestamp - plan expires after
     nonce: int                               # Replay protection
-    metadata: dict[str, Any] = field(default_factory=dict)  # App-specific data
+    # dict for the common case, or raw BYTES when an App's contract abi.decodes
+    # its metadata (AlphaYieldApp reads abi.decode(metadata, (bytes32, uint16))).
+    # Encoders must pass bytes through verbatim — JSON-wrapping them is what made
+    # every such plan score zero.
+    metadata: dict[str, Any] | bytes = field(default_factory=dict)
 
 
 @dataclass
