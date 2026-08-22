@@ -174,6 +174,32 @@ STAGE2_CORPUS_SAMPLES: int = 50
 # a per-validator value would split the pack hash. A CODE constant, never env.
 QUOTE_CORPUS_SAMPLES: int = STAGE2_CORPUS_SAMPLES
 
+# FRESH SLICE — how much of each chain's quote draw is reserved for the newest
+# demand, and how deep "newest" reaches.
+#
+# The problem it solves: the draw is uniform over a 14-day window, so newly
+# seeded demand is invisible. Ten fresh cases against a 2,558-deep chain-1
+# corpus appear in 18% of rounds — a miner iterating on that route gets a signal
+# about once every six rounds and cannot tell a barren round from a broken
+# solver.
+#
+# Why a RESERVED SLICE and not a recency WEIGHT over the whole draw:
+# ``POST /apps/{app_id}/quote`` is UNAUTHENTICATED (rate-limited per IP, nothing
+# more), so anyone can write to the demand corpus. Weighting the entire draw by
+# recency would let a miner spam quotes for the route their solver happens to
+# handle, minutes before a round, and effectively set their own exam. Uniformity
+# over a long window is precisely what makes public quoting safe today.
+#
+# A reserved slice keeps the benefit and BOUNDS the exposure: fresh demand is
+# present in ~2 rounds out of 3 instead of 1 in 6, and the worst a flooder can
+# take is these slots — the uniform remainder still carries the round.
+#
+# Both are CODE constants for the same reason as the cap above: they bound the
+# population the round draw sees, so a per-validator value would split the pack
+# hash.
+QUOTE_FRESH_SLOTS: int = 10
+QUOTE_FRESH_POOL: int = 100
+
 # Round-anchored quote retention window, in opened_epoch units (EPOCH_SECONDS=60s,
 # so 20160 ≈ 14 days). A quote is kept while its first-seen capturing opened_epoch
 # is >= current_opened_epoch − this. CONSENSUS-RELEVANT and fleet-uniform (it bounds
@@ -520,9 +546,76 @@ def sample_historical_quotes(
     for chain_id, quotes in sorted(by_chain.items()):
         quotes_sorted = sorted(quotes, key=lambda o: o.get("order_id", ""))
         k = min(n_per_chain, len(quotes_sorted))
-        sampled.extend(rng.sample(quotes_sorted, k))
+        sampled.extend(_draw_with_fresh_slice(quotes_sorted, k, rng))
 
     return [_strip_pii(q) for q in sampled]
+
+
+def _draw_with_fresh_slice(
+    quotes_sorted: list[dict[str, Any]],
+    k: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Draw ``k`` quotes, reserving ``QUOTE_FRESH_SLOTS`` for the newest demand.
+
+    Deterministic given ``rng`` and the candidate list: the recency ordering
+    breaks ties on ``order_id`` so the fresh/rest split is total, and both draws
+    run against lists in a fixed order. Every validator therefore derives the
+    identical subset without broadcasting it — the property the pack hash rests
+    on.
+
+    Degrades to the plain uniform draw when there is no recency information or
+    too few candidates to split, so a corpus of quotes predating
+    ``captured_opened_epoch`` behaves exactly as before.
+    """
+    if k <= 0 or not quotes_sorted:
+        return []
+
+    def _epoch(q: dict[str, Any]) -> int:
+        try:
+            return int(q.get("captured_opened_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # Nothing to prioritise: no capture epochs recorded at all.
+    if not any(_epoch(q) for q in quotes_sorted):
+        return rng.sample(quotes_sorted, k)
+
+    by_recency = sorted(
+        quotes_sorted, key=lambda q: (-_epoch(q), q.get("order_id", "")),
+    )
+    fresh_pool = by_recency[:QUOTE_FRESH_POOL]
+
+    # Reserve at most the slice, never more than the caller asked for, and never
+    # so much that the uniform remainder disappears on a small corpus.
+    reserved = min(QUOTE_FRESH_SLOTS, k, len(fresh_pool))
+    picked = rng.sample(
+        sorted(fresh_pool, key=lambda q: q.get("order_id", "")), reserved,
+    )
+
+    remaining = k - reserved
+    if remaining <= 0:
+        return picked
+
+    # The uniform remainder draws from OUTSIDE the fresh pool, so the newest
+    # quotes get exactly the reserved slots and no more.
+    #
+    # Without this the bound does not hold: a flooder's quotes sit in the
+    # remainder too and collect proportional share on top of the slice —
+    # measured at 19 of 50 slots for 500 spammed quotes, against 10 by the
+    # reserve alone. Excluding them keeps the exposure equal to the reserve
+    # exactly, and costs only that a fresh quote cannot also be drawn by luck
+    # from the uniform half.
+    rest = [q for q in quotes_sorted if q.get("order_id") not in {
+        f.get("order_id") for f in fresh_pool
+    }]
+    if len(rest) < remaining:
+        # Corpus too small to fill from outside the fresh pool — fall back to
+        # everything not already taken, so the draw still returns k.
+        taken = {q.get("order_id") for q in picked}
+        rest = [q for q in quotes_sorted if q.get("order_id") not in taken]
+    picked.extend(rng.sample(rest, min(remaining, len(rest))))
+    return picked
 
 
 def _filter_candidates(
