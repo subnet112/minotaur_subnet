@@ -150,6 +150,7 @@ class TestMigrationStatusEndpoint:
         import time
         from types import SimpleNamespace
         from minotaur_subnet.api.routes import monitoring as mon
+        from minotaur_subnet.api.routes.submissions import state as sub_state
 
         now = time.time()
         subs = {
@@ -163,7 +164,7 @@ class TestMigrationStatusEndpoint:
                                    deprecated_surface_hits=None),
         }
         fake = SimpleNamespace(_maybe_reload=lambda: None, _submissions=subs)
-        monkeypatch.setattr(mon, "_store", lambda: fake)
+        monkeypatch.setattr(sub_state, "get_store", lambda: fake)
         monkeypatch.setenv("SDK_VERSION_FLOOR", "1.1.0")
         monkeypatch.delenv("SDK_VERSION_FLOOR_ENFORCE", raising=False)
         mon._MIGRATION_CACHE["payload"] = None
@@ -176,9 +177,216 @@ class TestMigrationStatusEndpoint:
         day = p["last_24h"]
         assert day["submissions"] == 3          # 'old' excluded
         assert day["sdk_version_counts"] == {"1.1.0": 1, "1.0.0": 1, "pre-marker": 1}
-        assert day["below_floor"] == 2          # 1.0.0 + pre-marker
+        # 1.0.0 only. The pre-marker row REPORTED nothing, so it is unmeasured,
+        # not below floor — see TestUnmeasuredIsNotBelowFloor.
+        assert day["below_floor"] == 1
+        assert day["unmeasured"] == 1
         assert day["surface_scanned"] == 2 and day["surface_hits"] == 1
         assert p["retirement_target"] == "2026-09-01"
+        assert day["degraded"] is False
         # cache: second call returns the same object without rescanning
         assert mon.migration_status() is p
         mon._MIGRATION_CACHE["payload"] = None
+
+    def test_counts_the_real_submission_store(self, tmp_path, monkeypatch):
+        """Wiring, not shape — the fake above cannot catch a wrong-store read.
+
+        The endpoint read ``monitoring._store()``, which is the AppIntentStore
+        and has no ``_submissions``; the AttributeError landed in the endpoint's
+        bare ``except`` and every count was pinned at zero and served as a
+        measurement. Live on 2026-08-04: 0 submissions reported against 302
+        real ones. So drive a REAL SubmissionStore through the real accessor.
+        """
+        from minotaur_subnet.api.routes import monitoring as mon
+        from minotaur_subnet.api.routes.submissions import state as sub_state
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+
+        st = SubmissionStore(persist_path=tmp_path / "submissions.json")
+        sub = st.create(
+            repo_url="src://x", commit_hash="c1", epoch=1, hotkey="H",
+            round_id="r1", max_per_round=0, max_total_per_round=0,
+        )
+        st.set_sdk_version(sub.submission_id, "1.0.0")
+        st.set_deprecated_surface(sub.submission_id, ["s.py:1: x = snap.pool_states"])
+
+        monkeypatch.setattr(sub_state, "get_store", lambda: st)
+        monkeypatch.setenv("SDK_VERSION_FLOOR", "1.1.0")
+        mon._MIGRATION_CACHE["payload"] = None
+        mon._MIGRATION_CACHE["ts"] = 0.0
+
+        day = mon.migration_status()["last_24h"]
+        mon._MIGRATION_CACHE["payload"] = None
+
+        assert day["submissions"] == 1, "the endpoint is not reading the submission store"
+        assert day["sdk_version_counts"] == {"1.0.0": 1}
+        assert day["below_floor"] == 1
+        assert day["unmeasured"] == 0
+        assert day["surface_scanned"] == 1 and day["surface_hits"] == 1
+        assert day["degraded"] is False
+
+    def test_store_failure_reports_degraded_and_is_not_cached(self, monkeypatch):
+        """Zero-because-it-broke must not read as zero-because-nobody-submitted,
+        and must not be served for the next 5 minutes."""
+        from minotaur_subnet.api.routes import monitoring as mon
+        from minotaur_subnet.api.routes.submissions import state as sub_state
+
+        def _boom():
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(sub_state, "get_store", _boom)
+        mon._MIGRATION_CACHE["payload"] = None
+        mon._MIGRATION_CACHE["ts"] = 0.0
+
+        day = mon.migration_status()["last_24h"]
+        assert day["degraded"] is True
+        assert day["submissions"] == 0
+        assert mon._MIGRATION_CACHE["payload"] is None, (
+            "a degraded reading was cached — it would be served as the answer "
+            "for the full cache TTL"
+        )
+
+
+class TestUnmeasuredIsNotBelowFloor:
+    """A generation we never read is not a generation that is out of date.
+
+    ``below_floor(None, floor)`` is True by construction, which is correct at
+    the ENFORCEMENT gate (the value has been read; None means a genuinely
+    unmarked solver) and wrong in the dashboard window, which also contains
+    submissions rejected before screening stage 2 ever read one.
+    """
+
+    def _day(self, monkeypatch, subs):
+        import time
+        from types import SimpleNamespace
+        from minotaur_subnet.api.routes import monitoring as mon
+        from minotaur_subnet.api.routes.submissions import state as sub_state
+
+        now = time.time()
+        store = {
+            str(i): SimpleNamespace(
+                created_at=now - 100, sdk_version=v, deprecated_surface_hits=None,
+            )
+            for i, v in enumerate(subs)
+        }
+        fake = SimpleNamespace(_maybe_reload=lambda: None, _submissions=store)
+        monkeypatch.setattr(sub_state, "get_store", lambda: fake)
+        monkeypatch.setenv("SDK_VERSION_FLOOR", "1.1.0")
+        mon._MIGRATION_CACHE["payload"] = None
+        mon._MIGRATION_CACHE["ts"] = 0.0
+        day = mon.migration_status()["last_24h"]
+        mon._MIGRATION_CACHE["payload"] = None
+        return day
+
+    def test_never_read_counts_as_unmeasured(self, monkeypatch):
+        day = self._day(monkeypatch, [None, None, None])
+        assert day["unmeasured"] == 3
+        assert day["below_floor"] == 0, (
+            "submissions rejected before stage 2 never reported a generation — "
+            "counting them as below floor invents a migration backlog"
+        )
+
+    def test_reported_old_still_counts_as_below_floor(self, monkeypatch):
+        day = self._day(monkeypatch, ["1.0.0", "0.9.0"])
+        assert day["below_floor"] == 2
+        assert day["unmeasured"] == 0
+
+    def test_the_two_buckets_are_disjoint_and_total(self, monkeypatch):
+        day = self._day(monkeypatch, ["1.1.0", "1.0.0", None, "1.1.0"])
+        assert day["below_floor"] == 1
+        assert day["unmeasured"] == 1
+        assert day["submissions"] == 4
+        assert day["below_floor"] + day["unmeasured"] <= day["submissions"]
+
+    def test_the_live_shape_that_motivated_this(self, monkeypatch):
+        """2026-08-13: 221 in 24h, 55 unread — 54 of them dedup rejects whose
+        operators reported 1.1.0 on their other submissions. Real backlog: 0."""
+        day = self._day(monkeypatch, ["1.1.0"] * 166 + [None] * 55)
+        assert day["below_floor"] == 0
+        assert day["unmeasured"] == 55
+
+    def test_enforcement_gate_still_rejects_unmarked_solvers(self):
+        """The floor itself is UNCHANGED — only the dashboard bucket moved.
+
+        At the gate the value HAS been read, so a None is a real pre-marker
+        solver and must still be floored when enforcement is armed.
+        """
+        from minotaur_subnet.harness.deprecated_surface import below_floor
+        assert below_floor(None, "1.1.0") is True
+
+
+class TestSurfaceHitsSurviveHydration:
+    """The scan evidence must survive a process restart.
+
+    ``_load`` rebuilds every Submission from the DB with an EXPLICIT field
+    list. It omitted ``deprecated_surface_hits``, so the rows stayed in
+    submissions.db and the running process could not see any of them — the
+    evidence read zero however many scans had been recorded.
+
+    Same defect class as the upsert merge bug, and it SURVIVED that fix:
+    upsert was made field-agnostic, this constructor is a hand-maintained list.
+    """
+
+    def test_hits_survive_a_reload(self, tmp_path):
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+
+        path = tmp_path / "submissions.json"
+        st = SubmissionStore(persist_path=path)
+        sub = st.create(
+            repo_url="src://x", commit_hash="c1", epoch=1, hotkey="H",
+            round_id="r1", max_per_round=0, max_total_per_round=0,
+        )
+        sid = sub.submission_id
+        st.set_sdk_version(sid, "1.0.0")
+        st.set_deprecated_surface(sid, ["s.py:1: x = snap.pool_states"])
+
+        # A brand-new store over the same files == a process restart.
+        st2 = SubmissionStore(persist_path=path)
+        got = st2.get(sid)
+        assert got is not None
+        assert got.deprecated_surface_hits == ["s.py:1: x = snap.pool_states"], (
+            "the scan evidence was dropped on hydrate — /v1/migration/status "
+            "reports surface_scanned=0 no matter how many rows were scanned"
+        )
+        # sdk_version already survived; pin it so the pair cannot regress apart.
+        assert got.sdk_version == "1.0.0"
+
+    def test_scanned_empty_is_distinct_from_never_scanned(self, tmp_path):
+        """[] means 'scanned, clean'. None means 'never scanned'. The endpoint
+        counts scanned rows by `is not None`, so collapsing them would inflate
+        or erase the denominator."""
+        from minotaur_subnet.harness.submission_store import SubmissionStore
+
+        path = tmp_path / "submissions.json"
+        st = SubmissionStore(persist_path=path)
+        clean = st.create(repo_url="src://a", commit_hash="c1", epoch=1,
+                          hotkey="H", round_id="r1", max_per_round=0,
+                          max_total_per_round=0)
+        never = st.create(repo_url="src://b", commit_hash="c2", epoch=1,
+                          hotkey="H", round_id="r1", max_per_round=0,
+                          max_total_per_round=0)
+        st.set_deprecated_surface(clean.submission_id, [])
+
+        st2 = SubmissionStore(persist_path=path)
+        assert st2.get(clean.submission_id).deprecated_surface_hits == []
+        assert st2.get(never.submission_id).deprecated_surface_hits is None
+
+    def test_every_persisted_field_is_hydrated(self, tmp_path):
+        """The guard that would have caught this, and the next one.
+
+        ``_load`` is a hand-maintained constructor: a field added to Submission
+        and to to_dict() but not here is silently reset on every restart, with
+        no error and no log.
+        """
+        import dataclasses, inspect, re
+        from minotaur_subnet.harness.submission_store import Submission, SubmissionStore
+
+        fields = {f.name for f in dataclasses.fields(Submission)}
+        set_by_load = set(
+            re.findall(r"^\s+([a-z_]+)=", inspect.getsource(SubmissionStore._load), re.M)
+        )
+        # _repo_path is explicitly "transient, not persisted".
+        missing = fields - set_by_load - {"_repo_path"}
+        assert not missing, (
+            f"fields on Submission that _load never restores: {sorted(missing)} "
+            "— each is silently reset to its default on every process start"
+        )

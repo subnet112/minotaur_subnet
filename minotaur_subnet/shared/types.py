@@ -252,7 +252,11 @@ class ExecutionPlan:
     interactions: list[Interaction]           # Ordered calls to execute
     deadline: int                            # Unix timestamp - plan expires after
     nonce: int                               # Replay protection
-    metadata: dict[str, Any] = field(default_factory=dict)  # App-specific data
+    # dict for the common case, or raw BYTES when an App's contract abi.decodes
+    # its metadata (AlphaYieldApp reads abi.decode(metadata, (bytes32, uint16))).
+    # Encoders must pass bytes through verbatim — JSON-wrapping them is what made
+    # every such plan score zero.
+    metadata: dict[str, Any] | bytes = field(default_factory=dict)
 
 
 @dataclass
@@ -538,6 +542,15 @@ class SimulationResult:
     # None everywhere but the benchmark path, and for every single-leg plan.
     destination_delivered: str | None = None
     destination_amount_source: str | None = None
+    # WHY a cross-chain ORDER delivered nothing, as a stable code from the
+    # closed vocabulary in harness/orchestrator.py ``_delivery_diagnosis``
+    # (wrong_recipient | wrong_token | nothing_delivered | no_output_token |
+    # no_cross_chain_plan — the last meaning the order asked for another chain
+    # and the plan declared no cross-chain legs, which is most of them).
+    # None whenever delivery WAS credited, so its presence is the signal. This
+    # is the miner-facing half of the measurement: the amount says what the
+    # contest credited, this says what to change to earn more.
+    destination_delivery_reason: str | None = None
 
 
 # ── cross-chain plan helpers ─────────────────────────────────────────────────

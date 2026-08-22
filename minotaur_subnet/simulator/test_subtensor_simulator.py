@@ -203,3 +203,272 @@ async def test_subtensor_stake_raw_scorer_emits_delivered_alpha():
     assert res["metadata"]["raw_output"] == "219598620325"
     assert res["valid"] is True
     assert res["score"] == 1
+
+
+# ── sidecar process wiring (offline, source-inspected) ────────────────────────
+
+async def test_sidecar_gives_the_fork_its_own_port():
+    """The spawned chopsticks MUST get ``PORT=CK_INNER_PORT``, not ours.
+
+    chopsticks' CLI lets the ``PORT`` env var win over ``--port``
+    (``cli.js``: ``if (environment.PORT) argv.port = Number(environment.PORT)``),
+    and the container sets ``PORT=8545`` for the sidecar's OWN listener. Inherit
+    that and the fork binds 8545 first: the shim never binds, ``waitReady()``
+    polls the inner port for two minutes and dies, and the compose healthcheck
+    reports a container that is up but unreachable. Source-inspected because the
+    failure is in a Node child spawn, not in Python.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_rpc_server.mjs"
+    ).read_text()
+    spawn_call = src[src.index("const child = spawn("):]
+    spawn_call = spawn_call[:spawn_call.index("\n  return")]
+    assert "PORT: String(INNER_PORT)" in spawn_call, (
+        "the chopsticks child must be given the INNER port explicitly"
+    )
+
+
+async def test_sidecar_dependencies_are_exactly_pinned():
+    """Version RANGES are a consensus hazard here: this sidecar is the chain-964
+    simulator, so its executor decides scores, the lockfile is gitignored, and
+    two validators that built the image on different days would otherwise run
+    different runtime executors. (A range already bit us once — the 1.5.1 PORT
+    change above.)"""
+    pkg = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "tools" / "chopsticks-sim" / "package.json"
+        ).read_text()
+    )
+    for name, ver in pkg["dependencies"].items():
+        assert ver[0].isdigit(), f"{name} must be pinned exactly, got {ver!r}"
+
+
+async def test_repin_moves_forward_and_survives_a_runtime_upgrade():
+    """Rounds move FORWARD, and a long-lived sidecar will meet a runtime upgrade.
+
+    Both were broken until 2026-08-17, and both are on the per-round path:
+
+      * ``dev_setHead`` resolves a NUMBER against chopsticks' own chain, which
+        ends at the block it forked — so every re-pin to a newer block failed
+        with "Block not found", i.e. every round after the container started.
+      * crossing a runtime-version boundary left ``api.call.*`` decorated for the
+        OLD metadata (chopsticks' Manual block mode emits no new-heads
+        subscription for polkadot.js to learn from), so ethCall died with
+        "Cannot read properties of undefined".
+
+    The live half proves the forward jump; the boundary crossing needs a chain
+    whose spec version changed inside the node's history, so it is asserted on
+    the source of the fix instead.
+    """
+    src = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_anvil.mjs"
+    ).read_text()
+    repin = src[src.index("async repin("):src.index("async reconnect(")]
+    assert "chain_getBlockHash" in repin, "forward re-pin must resolve the hash upstream"
+    assert "await this.reconnect()" in repin, "a spec-version change must re-decorate the api"
+
+    url = _sidecar_url()
+    if not url:
+        pytest.skip("SUBTENSOR_SIDECAR_URL not set/reachable")
+    sim = SubtensorSimulator(sidecar_url=url, chain_id=964)
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "sim_health", "params": []}).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        head = json.loads(r.read())["result"]["block"]
+
+    assert sim.pin_read_fork(964, head - 200) is True
+    assert sim.pin_read_fork(964, head) is True      # FORWARD — used to raise
+    # and the fork is still usable after the jump
+    sim.set_code(ROUTER, _HEX.read_text().strip())
+    sim.set_balance(ROUTER, 1_000_000_000)
+    assert sim._pinned[sim._urls[0]] == head
+
+
+async def test_sidecar_image_can_open_the_fork_cache():
+    """The container must work in the configuration PRODUCTION uses: with
+    ``CK_DB`` set (the compose service sets it).
+
+    Two ways this broke, both of which built a green image that died at runtime:
+
+      * chopsticks' ``--db`` opens a typeorm sqlite DataSource and typeorm loads
+        the driver lazily, so a missing ``sqlite3`` surfaces only once CK_DB is
+        set. chopsticks declares it as an optional peer and
+        ``npm install --omit=dev`` skips it.
+      * ``sqlite3``'s PREBUILT binding links against GLIBC_2.38, so on a bookworm
+        base (node:22-slim AND node:24-slim, both glibc 2.36) it installs fine
+        and then dies at ``require`` with ERR_DLOPEN_FAILED.
+
+    Source-inspected: actually building the image belongs in CI, not the unit
+    lane, but the two facts that must not silently regress are cheap to pin.
+    """
+    root = Path(__file__).resolve().parents[2] / "tools" / "chopsticks-sim"
+    pkg = json.loads((root / "package.json").read_text())
+    assert "sqlite3" in pkg["dependencies"], (
+        "the --db fork cache needs sqlite3 as a REAL dependency"
+    )
+    dockerfile = (root / "Dockerfile").read_text()
+    base = next(
+        line for line in dockerfile.splitlines() if line.startswith("FROM ")
+    )
+    assert "trixie" in base, (
+        f"base image must carry glibc >= 2.38 for sqlite3's prebuilt binding; "
+        f"got {base!r}"
+    )
+
+
+async def test_sidecar_keeps_its_upstream_alive_and_says_when_it_is_not():
+    """A dead upstream is INVISIBLE without this, and fatal with it.
+
+    A forked chain reads storage lazily, so once the upstream websocket dies
+    every simulation fails with "WebSocket is not connected" while the fork
+    still answers ``chain_getHeader`` from local state — the process looks
+    healthy and scores nothing. Measured on the leader 2026-08-17:
+    rpc.blockmachine.io closes an IDLE substrate socket inside 90s;
+    entrypoint-finney survived the same idle. The benchmark's access pattern is
+    the dangerous one: pin once, then sit idle between rounds.
+
+    The probe must travel THROUGH chopsticks (a random storage key, which can
+    never be cached, forcing the real upstream fetch) — keeping a second
+    connection of our own warm would prove nothing about the socket that dies.
+    """
+    root = Path(__file__).resolve().parents[2] / "tools" / "chopsticks-sim"
+    shim = (root / "chopsticks_anvil.mjs").read_text()
+    probe = shim[shim.index("async probeUpstream("):]
+    probe = probe[:probe.index("\n  }")]
+    assert "randomBytes" in probe, "a cached key would not exercise the upstream"
+    assert "this.provider.send" in probe, "the probe must go through the FORK"
+
+    server = (root / "chopsticks_rpc_server.mjs").read_text()
+    assert "CK_KEEPALIVE_MS" in server, "the upstream must be kept warm"
+    assert "setInterval(touchUpstream" in server
+    health = server[server.index("async sim_health()"):]
+    health = health[:health.index("\n  },")]
+    assert "UNHEALTHY_AFTER" in health, (
+        "health must FAIL when the upstream is dead — a fork that cannot reach "
+        "its upstream is not serving, and the container healthcheck reads this. "
+        "(It is thresholded rather than instantaneous; see the hysteresis test.)"
+    )
+
+    url = _sidecar_url()
+    if not url:
+        pytest.skip("SUBTENSOR_SIDECAR_URL not set/reachable")
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "sim_health", "params": []}).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        res = json.loads(r.read())["result"]
+    assert res["upstream"] is True and res["ok"] is True, res
+
+
+async def test_sidecar_gives_up_and_restarts_when_the_upstream_stays_dead():
+    """The keepalive alone is not enough — an 18h soak proved it.
+
+    Against blockmachine the upstream dropped 12 times and self-healed 11; the
+    12th stuck permanently, and the error changed character with it
+    (``disconnected ...: 100``, which the provider reconnects from, versus
+    ``WebSocket is not connected``, which it does not). A fork that cannot reach
+    its upstream serves nothing, so once it is clearly not coming back the
+    useful move is to die and let the restart policy re-fork — ~40s, and the
+    --db cache makes it cheap.
+
+    The probe also has to be BOUNDED: polkadot.js has its own 60s RPC timeout,
+    so against a half-open socket (severed link, no RST) an unbounded probe sits
+    for a full minute, which makes "N consecutive failures" mean an
+    unpredictable number of minutes and stalls the health flag meanwhile.
+    """
+    root = Path(__file__).resolve().parents[2] / "tools" / "chopsticks-sim"
+    shim = (root / "chopsticks_anvil.mjs").read_text()
+    probe = shim[shim.index("async probeUpstream("):]
+    probe = probe[:probe.index("\n  }")]
+    assert "Promise.race" in probe and "timeoutMs" in probe, (
+        "an unbounded probe hangs on a half-open socket instead of failing"
+    )
+
+    server = (root / "chopsticks_rpc_server.mjs").read_text()
+    assert "CK_UNHEALTHY_EXIT_AFTER" in server
+    assert "CK_PROBE_TIMEOUT_MS" in server
+    exit_block = server[server.index("if (EXIT_AFTER > 0"):]
+    exit_block = exit_block[:exit_block.index("\n    }")]
+    assert "process.exit(1)" in exit_block, (
+        "a permanently dead upstream must exit so the restart policy re-forks"
+    )
+
+
+async def test_worker_may_not_share_the_apis_chain_964_sidecar():
+    """The split benchmark worker must fork on its OWN chain-964 sidecar.
+
+    The guard that enforces this for the anvils matched on hostname, and the
+    sidecar is not an anvil — so ``chopsticks-btevm`` sailed through a check
+    written for exactly this hazard. Sharing one sidecar is WORSE than sharing
+    an anvil: ``SubtensorSimulator.pin_read_fork`` re-pins with ``dev_setHead``
+    around every simulation, so two processes on one sidecar continuously move
+    each other's fork out from under the call being scored.
+    """
+    from minotaur_subnet.api.startup import _SHARED_API_FORK_HOSTS
+
+    assert "chopsticks-btevm" in _SHARED_API_FORK_HOSTS, (
+        "the worker pointing at the api's sidecar must fail closed"
+    )
+    for host in ("anvil-eth", "anvil-base", "anvil-btevm"):
+        assert host in _SHARED_API_FORK_HOSTS  # unchanged
+
+
+async def test_worker_has_its_own_sidecar_wired_in_compose():
+    """...and a dedicated one exists to point at.
+
+    Without a `-bench` sidecar the only configurations available are both
+    processes on one fork, or the worker silently left on anvil-btevm while the
+    api uses chopsticks — two DIFFERENT backends scoring the same chain, which
+    diverges without ever erroring.
+    """
+    compose = (
+        Path(__file__).resolve().parents[2]
+        / "platform" / "validator" / "docker-compose.yml"
+    ).read_text()
+    assert "chopsticks-btevm-bench:" in compose, "worker needs its own sidecar"
+    worker = compose[compose.index("  benchmark-worker:"):]
+    assert "BITTENSOR_CHOPSTICKS_SIM_RPC_URL" in worker, (
+        "the worker must set the 964 sim URL explicitly, like the anvils"
+    )
+    assert "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL" in worker, (
+        "and from its OWN var, never the api's shared one"
+    )
+
+
+async def test_health_reports_SUSTAINED_failure_not_a_single_blip():
+    """A one-probe blip must not condemn a sidecar that is serving.
+
+    Measured on the leader over 28h: blockmachine drops the socket roughly
+    hourly and the keepalive gets it back within a SINGLE probe — 28 UNHEALTHY
+    events, 27 recoveries, every one "recovered after 1 failed probe(s)". With
+    a 1-probe threshold the container healthcheck occasionally samples that
+    blip and latches unhealthy on a fork that is perfectly healthy. That is a
+    false alarm dressed up as honesty.
+
+    So ``ok`` tracks SUSTAINED failure while ``upstream`` keeps the
+    instantaneous read — and the health threshold must stay BELOW the exit
+    threshold, or the process would give up before ever reporting unhealthy.
+    """
+    server = (
+        Path(__file__).resolve().parents[2]
+        / "tools" / "chopsticks-sim" / "chopsticks_rpc_server.mjs"
+    ).read_text()
+    assert "CK_UNHEALTHY_AFTER" in server
+    health = server[server.index("async sim_health()"):]
+    health = health[:health.index("\n  },")]
+    assert "ok: consecutiveFailures < UNHEALTHY_AFTER" in health, (
+        "health must reflect sustained failure, not the last probe"
+    )
+    assert "upstream: upstreamOk" in health, (
+        "the instantaneous read must stay observable"
+    )
+
+    def _default(name):
+        frag = server[server.index(f"process.env.{name} ??"):]
+        return int(frag[frag.index("??") + 2: frag.index(")")].strip())
+
+    assert _default("CK_UNHEALTHY_AFTER") < _default("CK_UNHEALTHY_EXIT_AFTER"), (
+        "health must degrade BEFORE the process exits, or it never reports it"
+    )

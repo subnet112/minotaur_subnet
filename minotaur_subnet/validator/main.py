@@ -376,7 +376,6 @@ class AppIntentsValidator:
                         image_ref=_boot_image,
                         chain_ids=chain_ids or [31337],
                         rpc_urls=rpc_urls,
-                        bridge_registry=bridge_registry,
                     )
                 )
                 if _boot_forced:

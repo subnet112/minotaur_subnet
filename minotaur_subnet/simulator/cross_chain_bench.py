@@ -30,6 +30,7 @@ anything that feeds scoring and can differ between two nodes eventually will.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from minotaur_subnet.shared.types import (
@@ -56,6 +57,9 @@ _LEG_SOURCE = "source"
 _LEG_BRIDGE = "bridge"
 _LEG_DESTINATION = "destination"
 
+from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
+
+
 # Canonical per-chain addresses of bridgeable assets. A CODE CONSTANT — same
 # discipline as BENCHMARK_BRIDGE_FEE_BPS (anything that feeds scoring and can
 # differ between two nodes eventually will). Mirrors the adapters' static
@@ -78,6 +82,24 @@ _CANONICAL_TOKEN_BY_CHAIN: dict[str, dict[int, str]] = {
     "USDC": {
         1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
         8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    },
+    # TAO across the Tensorplex bridge. The two sides are NOT the same kind of
+    # thing, which is the whole reason this row has to exist:
+    #
+    #   chain 1   — wTAO, a 9-decimal ERC-20 (not 18; it matches rao 1:1)
+    #   chain 964 — NATIVE TAO. The bridge credits a substrate account, and on
+    #               Bittensor an H160's EVM balance IS its mapped account's
+    #               balance, so what lands is spendable as msg.value.
+    #
+    # Without this row `map_bridged_token` passes the token through unchanged
+    # and the destination fork is seeded with wTAO's ETHEREUM address — a
+    # contract that does not exist on 964 — so the destination leg has nothing
+    # to spend. Mapping it to the wrapped token on 964 instead would be worse
+    # than doing nothing: the plan would unwrap in simulation and then fail on
+    # mainnet, where the bridge delivers native and there is no WTAO to unwrap.
+    "TAO": {
+        1: "0x77E06c9eCCf2E797fd462A92B6D7642EF85b0A44",
+        964: NATIVE_SENTINEL,
     },
 }
 
@@ -102,19 +124,138 @@ def map_bridged_token(token: str, src_chain_id: Any, dst_chain_id: Any) -> str:
     return token
 
 
-def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
-    """Does this plan DECLARE cross-chain intent?
+def bridge_capability_descriptor() -> dict[str, Any]:
+    """What the BENCHMARK can actually credit a bridge for — as plain JSON.
 
-    Declaration, not calldata — the same gate the benchmark's bridge mocking
-    uses, so the two can never disagree about what is cross-chain.
+    Solvers reach the benchmark over a JSON line protocol (harness/protocol.py
+    ``to_json``), so a ``BridgeRegistry`` OBJECT cannot be handed to them: it
+    serialises to ``"<BridgeRegistry object at 0x…>"``, a truthy STRING. That is
+    worse than omitting it — a solver's ``if registry is not None`` guard passes
+    and the next attribute access raises. This descriptor is the shape that can
+    actually cross that boundary.
+
+    DETERMINISTIC BY CONSTRUCTION, and that is the point. The live registry
+    prices routes by fetching bridge quotes over HTTP (bridge/across.py opens an
+    aiohttp session), which must never reach a scored path — two validators
+    quoting the same plan seconds apart would disagree and the adoption verdict
+    would diverge. This is built from CODE CONSTANTS only:
+    ``_CANONICAL_TOKEN_BY_CHAIN`` and ``BENCHMARK_BRIDGE_FEE_BPS``.
+
+    It also describes exactly what the benchmark will CREDIT, not merely what
+    some rail could carry. Those are different sets, and the gap was silent: an
+    unmapped token "passes through unchanged" in :func:`map_bridged_token`, so
+    no destination balance is seeded and the delivery measures zero however
+    correct the plan. A solver could only discover the creditable set by
+    memorising four addresses. Now it can ask.
+
+    The fee is the benchmark's own constant, so a solver planning against this
+    gets the number the scorer will use — strictly better information than a
+    live quote, which the benchmark ignores anyway.
     """
-    meta = plan.metadata or {}
+    routes: list[dict[str, Any]] = []
+    chains = sorted({c for by in _CANONICAL_TOKEN_BY_CHAIN.values() for c in by})
+    for src in chains:
+        for dst in chains:
+            if src == dst:
+                continue
+            tokens = [
+                {"symbol": sym, "token_in": by[src], "token_out": by[dst]}
+                for sym, by in sorted(_CANONICAL_TOKEN_BY_CHAIN.items())
+                if src in by and dst in by
+            ]
+            if tokens:
+                routes.append(
+                    {"src_chain_id": src, "dst_chain_id": dst, "tokens": tokens}
+                )
+    return {
+        "routes": routes,
+        "fee_bps": BENCHMARK_BRIDGE_FEE_BPS,
+        # Names the model so a solver can tell this apart from a live quote and
+        # know the number is exact rather than indicative.
+        "fee_model": "benchmark_constant",
+    }
+
+
+def declares_cross_chain(meta: Mapping[str, Any] | None) -> bool:
+    """THE cross-chain declaration predicate. Every gate must call this one.
+
+    Four shapes mean "cross-chain", and which one a plan carries depends only
+    on how far through the pipeline it is — not on whether it is cross-chain:
+
+      ``cross_chain_plan``  the SOLVER's request (what miners emit)
+      ``multi_leg_plan``    the COMPILER's output (carries real bridge calldata)
+      ``cross_chain``       the post-compile marker (``order_processor`` sets it
+                            and pops ``cross_chain_plan``, so it is the only key
+                            a live order's stored plan is guaranteed to have)
+      ``legs``              the LEGACY convention ``normalize_to_legs`` projects
+                            onto, and the shape ``simulate_cross_chain`` walks
+
+    Accepting a subset is how gates silently disagree, and every disagreement
+    found so far failed in the same direction — a plan treated as cross-chain by
+    one gate and as single-chain by another, which reliably reads to a miner as
+    "cross-chain earns nothing". Concretely, before these were unified:
+
+      - the miner-facing quote gate accepted only ``cross_chain``, while the
+        ``build_cross_chain_quote`` behind it reads ``cross_chain_plan`` — so
+        the reference solver's own EVM shape fell through to the single-chain
+        sim, whose empty top-level interactions quote 0;
+      - the benchmark's bridge-mocking gate omitted ``legs``, so a legacy-shape
+        plan was destination-MEASURED but its bridge calldata was never mocked,
+        and therefore reverted in the scored sim.
+
+    Takes the metadata mapping, not the plan, because half the call sites
+    (stored order plans, quote-time plan metadata) only ever hold the dict.
+    """
+    meta = meta or {}
     return bool(
         meta.get("legs")
         or meta.get("multi_leg_plan")
         or meta.get("cross_chain_plan")
         or meta.get("cross_chain")
     )
+
+
+def is_cross_chain_plan(plan: ExecutionPlan) -> bool:
+    """Does this plan DECLARE cross-chain intent?
+
+    Declaration, not calldata. Thin wrapper over :func:`declares_cross_chain`
+    so plan-holding and metadata-holding call sites share one definition.
+    """
+    return declares_cross_chain(plan.metadata)
+
+
+def intent_requests_cross_chain(
+    params: Mapping[str, Any] | None,
+    source_chain_id: Any = None,
+) -> bool:
+    """Did the ORDER ask for delivery on another chain?
+
+    The mirror of :func:`declares_cross_chain`, and deliberately separate: one
+    reads the SOLVER's answer, this one reads the USER's question. Keeping them
+    apart is what lets a caller name the gap between them — a plan that is not
+    cross-chain answering an intent that is. Measured on the leader 2026-08-17,
+    that gap is 83% of all benched cross-chain rows (482 of 578), and it was
+    the one outcome with no diagnosis at all.
+
+    ``dest_chain_id`` is the user-declared destination (``orders.py`` derives it
+    from CAIP-10 token chains at intake). An order that names its own source
+    chain is NOT cross-chain — hence the comparison rather than a presence test.
+    Unparseable values read as single-chain: this only ever decides whether to
+    EXPLAIN a zero, so guessing wrong must cost nothing.
+    """
+    dest_raw = (params or {}).get("dest_chain_id")
+    if dest_raw in (None, "", 0, "0"):
+        return False
+    try:
+        dest = int(dest_raw)
+    except (TypeError, ValueError):
+        return False
+    if not dest:
+        return False
+    try:
+        return source_chain_id is None or int(source_chain_id) != dest
+    except (TypeError, ValueError):
+        return True
 
 
 def normalize_to_legs(plan: ExecutionPlan) -> ExecutionPlan | None:

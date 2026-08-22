@@ -84,7 +84,14 @@ RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 # estimateGas "gas required exceeds allowance"), so retrying it wastes attempts on
 # an error a retry can't fix. A genuinely-transient upstream failure surfaces as a
 # 429/5xx HTTP status or a timeout/reset (caught by is_retryable_status/exception).
-RETRYABLE_RPC_CODES = frozenset({-32005})
+# -32070 = the gateway/proxy telling us the UPSTREAM did not answer in time
+# ("Gateway request timeout"). It is the JSON-RPC analogue of HTTP 504, which is
+# already in RETRYABLE_HTTP_STATUS, and carries no information about the request
+# itself — a retry is exactly the right response. It was missing here, so the
+# backoff layer never retried it; it surfaced instead as a raw exception inside
+# the scoreIntent simulation, was swallowed by a catch-all, and was reported to
+# the miner as "the plan reverted". See simulator/anvil_simulator.
+RETRYABLE_RPC_CODES = frozenset({-32005, -32070})
 
 
 def is_retryable_status(status: int | None) -> bool:
@@ -98,11 +105,23 @@ def is_retryable_rpc_code(code: Any) -> bool:
         return False
 
 
+# Byte patterns for the same codes, DERIVED from RETRYABLE_RPC_CODES so the two
+# can never drift apart — that drift is exactly what let -32070 through: the code
+# set and this body check were maintained independently.
+_RETRYABLE_RPC_CODE_BYTES: tuple[bytes, ...] = tuple(
+    str(code).encode() for code in sorted(RETRYABLE_RPC_CODES)
+)
+
+
 def body_has_retryable_rpc_error(body: bytes | None) -> bool:
-    """Cheap check: does a raw JSON-RPC response body carry the TRANSIENT
-    ``-32005`` rate-limit error served as HTTP 200? Alchemy returns compute-unit
-    throttling this way as well as via HTTP 429. (Only ``-32005`` — not the
-    generic ``-32000`` — see RETRYABLE_RPC_CODES.)
+    """Cheap check: does a raw JSON-RPC response body carry a TRANSIENT error
+    served as HTTP 200? ``-32005`` is Alchemy compute-unit throttling; ``-32070``
+    is a gateway telling us the upstream did not answer in time. (Not the generic
+    ``-32000`` — see RETRYABLE_RPC_CODES.)
+
+    This runs in the proxies BETWEEN anvil and the upstream, so absorbing a
+    gateway timeout here is the cheapest place to do it: anvil never sees an
+    error and the benchmark never has to re-run the scenario.
 
     Byte-substring only (no JSON parse) and skips large bodies — error responses
     are tiny, so a big ``result`` body is never scanned. A false positive would
@@ -113,7 +132,7 @@ def body_has_retryable_rpc_error(body: bytes | None) -> bool:
         return False
     if b'"error"' not in body:
         return False
-    return b"-32005" in body
+    return any(code in body for code in _RETRYABLE_RPC_CODE_BYTES)
 
 
 def _status_of(exc: BaseException) -> int | None:

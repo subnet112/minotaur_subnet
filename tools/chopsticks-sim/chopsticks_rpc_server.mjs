@@ -54,7 +54,16 @@ async function startChopsticks() {
   ]
   if (DB) args.push('--db', DB)
   console.log(`[ck] forking ${ENDPOINT} @ block ${block} on :${INNER_PORT}${DB ? ` (cache ${DB})` : ''}`)
-  const child = spawn('npx', args, { stdio: ['ignore', 'inherit', 'inherit'] })
+  // PORT must be overridden for the CHILD: chopsticks' CLI lets the PORT env var
+  // WIN over --port (cli.js: `if (environment.PORT) argv.port = Number(...)`), and
+  // this process sets PORT for its own listener — so an inherited PORT makes the
+  // fork steal our port, we never bind, and waitReady() times out on a chopsticks
+  // that is up but on the wrong port. Pass it explicitly rather than deleting it:
+  // the child then agrees with --port whichever precedence a future release picks.
+  const child = spawn('npx', args, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    env: { ...process.env, PORT: String(INNER_PORT) },
+  })
   child.on('exit', (c) => { console.error(`[ck] chopsticks exited ${c}`); process.exit(1) })
   return { child, block: Number(block) }
 }
@@ -88,13 +97,100 @@ if (ATTACH) {
   await waitReady()
   attachWs = `ws://127.0.0.1:${INNER_PORT}`
 }
-const ck = await ChopsticksAnvil.connect(attachWs)
+// The upstream is handed through so a FORWARD re-pin can resolve a block the
+// fork has never seen (chopsticks resolves a NUMBER only against its own chain,
+// which ends at the fork block — see ChopsticksAnvil.repin).
+const ck = await ChopsticksAnvil.connect(attachWs, { upstream: ENDPOINT })
 if (pinBlock === undefined) pinBlock = await ck.forkBlock()
 console.log(`[rpc] shim connected; fork @ ${await ck.forkBlock()}`)
 
+// ── upstream liveness ────────────────────────────────────────────────────────
+//
+// A forked chain reads storage LAZILY: every miss goes upstream. So an upstream
+// websocket that has quietly died turns every simulation into
+// "WebSocket is not connected" while the fork still answers chain_getHeader from
+// local state — i.e. the process looks healthy and scores nothing.
+//
+// Measured 2026-08-17 on the leader: `rpc.blockmachine.io` closes an IDLE
+// substrate websocket within 90s (1 disconnect event, no recovery), while
+// `entrypoint-finney.opentensor.ai` survived the same idle untouched. The
+// benchmark's access pattern is exactly the dangerous one — pin once, then sit
+// idle between rounds — and polkadot.js's WsProvider does not queue a request
+// made while disconnected, it throws.
+//
+// Two defences, because either alone is insufficient:
+//   * KEEPALIVE — touch the upstream on an interval so it never idles out.
+//   * HONEST HEALTH — report ok:false once it has died, so the container
+//     healthcheck (which reads exactly this field) stops claiming the sidecar
+//     is serving. A fork that cannot reach its upstream is not healthy.
+const KEEPALIVE_MS = Number(process.env.CK_KEEPALIVE_MS ?? 30000)
+// Consecutive failed probes before we give up and exit for a restart. The
+// keepalive alone is NOT enough: measured over 18h against blockmachine the
+// upstream dropped 12 times and self-healed 11 — the 12th stuck permanently,
+// and the error changed character with it (`disconnected ...: 100`, which the
+// provider reconnects from, vs `WebSocket is not connected`, which it does
+// not). A fork that cannot reach its upstream serves nothing, so once it is
+// clearly not coming back the useful move is to die: the container restart
+// policy re-forks in ~40s and the --db cache makes that cheap. 0 disables.
+const EXIT_AFTER = Number(process.env.CK_UNHEALTHY_EXIT_AFTER ?? 5)
+// Consecutive failed probes before HEALTH goes false. Not 1, deliberately.
+// Measured on the leader over 28h: blockmachine drops the socket roughly hourly
+// and the keepalive gets it back within a SINGLE probe — 28 UNHEALTHY events,
+// 27 recoveries, every one of them "recovered after 1 failed probe(s)". With a
+// 1-probe threshold the container healthcheck occasionally samples that blip
+// and latches unhealthy on a sidecar that is serving perfectly, which is a
+// false alarm dressed up as honesty. Report sustained failure instead, and keep
+// the instantaneous read on `upstream` so a blip is still visible.
+// Must stay BELOW EXIT_AFTER so health degrades before the process gives up.
+const UNHEALTHY_AFTER = Number(process.env.CK_UNHEALTHY_AFTER ?? 2)
+// Bounds how long ONE probe may take, so the exit threshold means a
+// predictable wall-clock (see ChopsticksAnvil.probeUpstream).
+const PROBE_TIMEOUT_MS = Number(process.env.CK_PROBE_TIMEOUT_MS ?? 15000)
+let upstreamOk = true
+let upstreamError = null
+let consecutiveFailures = 0
+
+async function touchUpstream() {
+  try {
+    await ck.probeUpstream(PROBE_TIMEOUT_MS)
+    if (!upstreamOk) console.log(`[ck] upstream recovered after ${consecutiveFailures} failed probe(s)`)
+    upstreamOk = true
+    upstreamError = null
+    consecutiveFailures = 0
+  } catch (e) {
+    consecutiveFailures++
+    if (upstreamOk) console.error(`[ck] upstream UNHEALTHY: ${String(e.message || e).slice(0, 160)}`)
+    upstreamOk = false
+    upstreamError = String(e.message || e).slice(0, 200)
+    if (EXIT_AFTER > 0 && consecutiveFailures >= EXIT_AFTER) {
+      console.error(
+        `[ck] upstream dead for ${consecutiveFailures} consecutive probes ` +
+        `(~${Math.round(consecutiveFailures * (KEEPALIVE_MS + PROBE_TIMEOUT_MS) / 1000)}s max) — exiting for a restart`,
+      )
+      process.exit(1)
+    }
+  }
+}
+
+if (KEEPALIVE_MS > 0) {
+  await touchUpstream()
+  setInterval(touchUpstream, KEEPALIVE_MS).unref?.()
+  console.log(`[rpc] upstream keepalive every ${KEEPALIVE_MS}ms`)
+}
+
 const HANDLERS = {
   async sim_health() {
-    return { ok: true, block: await ck.forkBlock(), pinBlock }
+    return {
+      // SUSTAINED health — what the container healthcheck acts on.
+      ok: consecutiveFailures < UNHEALTHY_AFTER,
+      block: await ck.forkBlock(),
+      pinBlock,
+      // INSTANTANEOUS last-probe result, so a single blip stays observable
+      // without condemning the container.
+      upstream: upstreamOk,
+      upstream_error: upstreamError,
+      consecutive_failures: consecutiveFailures,
+    }
   },
   async sim_forkBlock() { return await ck.forkBlock() },
   async sim_forkTimestamp() { return await ck.forkTimestamp() },

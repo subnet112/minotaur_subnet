@@ -446,6 +446,85 @@ def test_concurrent_same_record_rmw_does_not_lose_a_field(tmp_path: Path):
     assert fresh.benchmark_rank == 7, "the worker's field was clobbered by the api"
 
 
+def test_peer_row_omitting_a_field_does_not_null_it(tmp_path: Path):
+    """A key ABSENT from a peer's blob means "my peer does not know this field",
+    NOT "set it to None".
+
+    _upsert_one rebuilds the WHOLE record from the incoming dict, so a peer that
+    serializes an older field set silently erases every field it lacks — the api
+    writes it, the peer's next write reverts it, and no error is raised anywhere.
+    Live shape (2026-08-04): deprecated_surface_hits survived on every
+    api-written row (waitlisted/rejected) and was None on 0/60 scored+adopted
+    rows — exactly the rows the benchmark worker flips — while the follower that
+    got them in the leader's close snapshot still held the value. The evidence
+    the migration ladder arms on was being destroyed for precisely the
+    submissions eligible to become champion.
+
+    An EXPLICIT null still clears (to_dict always emits every key it knows), so
+    this only protects against a field the writer never spoke to.
+    """
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    sub = _create(api, hotkey="5Gskew")
+    sid = sub.submission_id
+    api.set_deprecated_surface(sid, [])       # stage-1 scan: scanned, clean
+    worker.get(sid)                           # worker pulls the row
+
+    # The worker flips the row to SCORED with a blob that has no
+    # deprecated_surface_hits key at all — what a peer running an image from
+    # before the field existed serializes.
+    record = worker.get(sid).to_dict()
+    record.pop("deprecated_surface_hits")
+    record["status"] = SubmissionStatus.SCORED.value
+    worker._db.write_records([(sid, record)])
+
+    pulled = api.get(sid)
+    assert pulled.status == SubmissionStatus.SCORED, "the peer row was not pulled"
+    assert pulled.deprecated_surface_hits == [], (
+        "the peer's older field set nulled a value it never wrote — scan "
+        "evidence is lost for every submission the worker scores"
+    )
+
+
+def test_peer_row_with_an_explicit_null_still_clears_the_field(tmp_path: Path):
+    """The other half of the contract: present-and-None is a real write.
+
+    Without this, "preserve on absent" would degrade into "never clear", and a
+    field could not be reset across the process boundary at all.
+    """
+    api = _mk(tmp_path)
+    worker = _mk(tmp_path)
+
+    sub = _create(api, hotkey="5Gclear")
+    sid = sub.submission_id
+    api.set_deprecated_surface(sid, ["solver.py:1: snapshot.pool_states"])
+    worker.get(sid)
+
+    record = worker.get(sid).to_dict()
+    record["deprecated_surface_hits"] = None   # explicit: not scanned
+    worker._db.write_records([(sid, record)])
+
+    assert api.get(sid).deprecated_surface_hits is None, (
+        "an explicit null from a peer must still clear the field"
+    )
+
+
+def test_upsert_of_an_unknown_record_keeps_absent_fields_none(tmp_path: Path):
+    """No prior record → nothing to preserve; absent stays None (unchanged)."""
+    store = _mk(tmp_path)
+    store.upsert_submission(
+        {
+            "submission_id": "sub_fresh",
+            "hotkey": "5Gfresh",
+            "round_id": "round-e1-n1",
+            "epoch": 1,
+        }
+    )
+    assert store.get("sub_fresh").deprecated_surface_hits is None
+    assert store.get("sub_fresh").sdk_version is None
+
+
 # ── second-review regressions (the fixes to the fixes) ──────────────────────
 
 

@@ -575,7 +575,16 @@ def _build_quote_simulator():
 # worker (BENCHMARK_WORKER_ONLY) MUST fork on its OWN dedicated anvils (…-bench):
 # sharing a fork means both processes evm_snapshot / evm_revert + re-fork the same
 # anvil, silently corrupting each other's scoreIntent on BOTH sides.
-_SHARED_API_FORK_HOSTS = frozenset({"anvil-eth", "anvil-base", "anvil-btevm"})
+# The api's OWN shared simulation forks. The worker must never point at these.
+# ``chopsticks-btevm`` belongs here for the same reason the anvils do, and the
+# reason is easy to miss: the chain-964 sidecar re-pins with dev_setHead around
+# every simulation (SubtensorSimulator.pin_read_fork), so two processes sharing
+# one sidecar interleave re-pins and silently score each other's fork — the very
+# corruption the -bench forks exist to prevent. It is NOT an anvil, so the
+# hostname check that catches the other three would have waved it through.
+_SHARED_API_FORK_HOSTS = frozenset({
+    "anvil-eth", "anvil-base", "anvil-btevm", "chopsticks-btevm",
+})
 
 
 def _assert_worker_forks_isolated() -> None:
@@ -605,10 +614,12 @@ def _assert_worker_forks_isolated() -> None:
         raise RuntimeError(
             "BENCHMARK_WORKER_ONLY: the worker is pointed at the api's SHARED "
             "simulator fork(s): " + ", ".join(shared) + ". The worker must fork on "
-            "its OWN dedicated anvil-*-bench forks (set ETH_SIM_RPC_URL / "
-            "BASE_SIM_RPC_URL / BITTENSOR_EVM_SIM_RPC_URL to the -bench hosts) — "
-            "sharing a fork races snapshot/revert on both processes and corrupts "
-            "scoring. Override for single-fork dev only: "
+            "its OWN dedicated -bench forks (set ETH_SIM_RPC_URL / "
+            "BASE_SIM_RPC_URL / BITTENSOR_EVM_SIM_RPC_URL / "
+            "BITTENSOR_CHOPSTICKS_SIM_RPC_URL to the -bench hosts) — "
+            "sharing a fork races snapshot/revert (or dev_setHead re-pins, for "
+            "the chain-964 sidecar) on both processes and corrupts scoring. "
+            "Override for single-fork dev only: "
             "BENCHMARK_WORKER_ALLOW_SHARED_FORKS=1."
         )
 
@@ -1897,7 +1908,6 @@ async def initialize(ctx: ServerContext) -> dict:
                     image_ref=_boot_image,
                     chain_ids=chain_ids,
                     rpc_urls=rpc_urls,
-                    bridge_registry=bridge_registry,
                 )
                 if _boot_forced:
                     logger.warning(
@@ -2584,7 +2594,6 @@ async def initialize(ctx: ServerContext) -> dict:
                         image_ref=image_ref,
                         chain_ids=chain_ids,
                         rpc_urls=rpc_urls,
-                        bridge_registry=bridge_registry,
                     ),
                     timeout=champion_swap_timeout,
                 )

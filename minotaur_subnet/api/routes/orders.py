@@ -33,6 +33,7 @@ from minotaur_subnet.shared.feature_flags import (
     quote_capture_enabled,
     quote_corpus_enabled,
 )
+from minotaur_subnet.simulator import cross_chain_bench as _xc_bench
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1669,7 +1670,19 @@ async def get_quote(app_id: str, req: QuoteRequest, request: Request) -> dict:
                     for _k in ("route", "dex", "fee_tier", "pool", "data_source", "plan_type")
                     if _pmeta.get(_k) is not None
                 }
-                if _pmeta.get("cross_chain"):
+                if _xc_bench.declares_cross_chain(_pmeta):
+                    # Gate on the shared declaration predicate, NOT on
+                    # ``cross_chain`` alone. That key is set by the COMPILER
+                    # (order_processor, post-compile) — but the plan here comes
+                    # straight from ``solver.generate_plan``, so a solver's
+                    # cross-chain plan reaches this point carrying
+                    # ``cross_chain_plan``, which is precisely what
+                    # ``build_cross_chain_quote`` below reads. Gate and body
+                    # disagreed: the reference solver's EVM shape fell through
+                    # to the single-chain ``elif``, whose empty top-level
+                    # interactions quote 0 — so a miner who implemented
+                    # cross-chain exactly as documented saw it earn nothing.
+                    #
                     # Unified cross-chain quote: dry-compile the solver's
                     # CrossChainPlan through the platform compiler to get LIVE
                     # bridge quotes (fee/ETA/min output) + the revert plan per
@@ -2613,7 +2626,7 @@ def get_bridge_status(order_id: str) -> dict:
     plan = order.plan or {}
     meta = plan.get("metadata", {}) if isinstance(plan, dict) else {}
 
-    if not meta.get("cross_chain"):
+    if not _xc_bench.declares_cross_chain(meta):
         return {
             "order_id": order_id,
             "cross_chain": False,

@@ -38,6 +38,7 @@ import os
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -45,11 +46,13 @@ from minotaur_subnet.chains import registry
 from minotaur_subnet.shared.types import (
     AppIntentDefinition,
     ExecutionPlan,
+    Interaction,
     IntentState,
     ScoreResult,
     SimulationResult,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot, SolverMetadata
+from minotaur_subnet.simulator.anvil_simulator import TRANSIENT_SIM_ERROR_PREFIX
 from minotaur_subnet.harness.solver_read_proxy import (
     CHAIN_NAMES,
     budget_enforced,
@@ -140,6 +143,7 @@ _RPC_ERROR_SIGNATURES: tuple[str, ...] = (
     "socket hang up", "fetch failed", "network error",
     "bad gateway", "service unavailable", "gateway timeout",
     "alchemy", "provider error", "json-rpc error", "-32005", "-32603",
+    "-32070", "gateway request timeout",
 )
 
 
@@ -205,6 +209,91 @@ def _revert_trace_budget() -> int:
         return max(0, int(raw))
     except ValueError:
         return 10
+
+
+# Fraction of TOTAL_BENCHMARK_TIMEOUT after which transient-RPC retries stop
+# being issued. Retries cost wall clock against the SAME run budget as the
+# first attempts, so an unbounded retry policy would convert a fairness fix
+# into a worse failure: the tail of the corpus zero-filled by
+# "skipped: total run budget exceeded". Past this mark the run spends what is
+# left finishing first attempts, which every order still needs.
+_RPC_RETRY_DEADLINE_FRACTION = 0.75
+
+
+def _rpc_retry_max() -> int:
+    """EXTRA attempts a scenario gets after a TRANSIENT RPC/provider failure.
+
+    A provider rate-limit / timeout / 5xx makes the solver emit no plan for the
+    affected order (see ``_RPC_ERROR_SIGNATURES``). The relative adoption rule
+    then records that order as ``dropped`` — and a single drop is a HARD VETO
+    no amount of wins can offset — so the miner is rejected for the provider's
+    hiccup rather than its own capability. Re-running the scenario turns that
+    misattribution into a retry.
+
+    CONSENSUS-RELEVANT: a retried scenario can produce a plan where the first
+    attempt produced none, which changes per_intent raw_output and hence the
+    adoption verdict. Ships OFF (``0``) so it can soak inert, and MUST be
+    flipped fleet-uniformly (develop->main promotion + env on every validator)
+    exactly like PIN_SOLVER_READ_BLOCK — a split value means leader and
+    follower can score the same image differently. Capped at 5 so a
+    misconfigured value cannot spend the whole run budget on one order.
+    """
+    raw = os.environ.get("BENCHMARK_RPC_RETRY_MAX", "0").strip()
+    try:
+        return max(0, min(int(raw), 5))
+    except ValueError:
+        return 0
+
+
+def _rpc_retry_run_budget(n_intents: int) -> int:
+    """Run-wide ceiling on transient-RPC retries, shared by every runtime.
+
+    The per-scenario cap alone bounds ONE order; this bounds the RUN, so a
+    provider outage degrades to "scored like today" instead of burning the
+    whole budget re-running everything. Default scales with corpus size
+    (a quarter of it, floor 8) — comfortably above the ~10-15% transient
+    failure rate seen live, well below a full re-run.
+    """
+    raw = os.environ.get("BENCHMARK_RPC_RETRY_RUN_MAX", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return max(8, n_intents // 4)
+
+
+# Errors that are DETERMINISTIC outcomes of the plan itself, never provider
+# flake — retrying them re-derives the same verdict and only spends budget.
+# ``real_sim_reverted`` is the important one: a reverted scoreIntent is a real
+# result (the plan cannot execute) and its revert text can incidentally contain
+# a transient-looking substring.
+_RPC_RETRY_EXCLUDED_PREFIXES: tuple[str, ...] = (
+    "real_sim_reverted:",
+)
+
+
+def _is_retryable_rpc_failure(br: "BenchmarkResult") -> str | None:
+    """Return the transient signature when ``br`` is a provider-caused MISS.
+
+    All three must hold, so a retry can only ever rescue a row the miner did
+    not lose on merit:
+
+    1. the row DELIVERED NOTHING (no ``raw_output``) — a scored row is never
+       re-run, so retries cannot change a result the solver actually produced;
+    2. its error carries a transient RPC/provider signature; and
+    3. it is not a deterministic plan outcome (a real revert).
+    """
+    raw = br.raw_output
+    if raw is not None and str(raw) != "":
+        return None
+    err = br.error
+    if not err:
+        return None
+    for prefix in _RPC_RETRY_EXCLUDED_PREFIXES:
+        if err.startswith(prefix):
+            return None
+    return _classify_rpc_error(err)
 
 
 def _capture_revert_trace(
@@ -287,6 +376,13 @@ class BenchmarkResult:
     # app is deployed on more than one chain (BENCHMARK_ALL_DEPLOYMENT_CHAINS);
     # the ``intent_id`` label alone (app_id:scenario) does not identify the chain.
     chain_id: int | None = None
+    # How many EXTRA attempts this scenario needed because a previous attempt
+    # failed with a TRANSIENT RPC/provider signature (see _RPC_ERROR_SIGNATURES).
+    # 0 on every row when the retry is disarmed, so disarmed runs stay
+    # byte-identical. OBSERVABILITY: it records that the harness absorbed a
+    # provider hiccup on the miner's behalf, never a quality signal about the
+    # solver.
+    rpc_retries: int = 0
 
 
 @dataclass
@@ -1383,9 +1479,26 @@ async def run_benchmark(
         )
 
     # Initialize — pass RPC URLs so Docker solvers can query pool states
+    from minotaur_subnet.simulator.cross_chain_bench import (
+        bridge_capability_descriptor,
+    )
+
     init_config: dict[str, Any] = {
         "chain_ids": config.chain_ids,
         "timeout_per_plan_ms": config.timeout_per_plan_ms,
+        # Which assets a bridge can carry ACROSS which chains, and at what fee —
+        # the scored path had no answer to that question at all, so a solver
+        # could only get cross-chain right by memorising four addresses.
+        #
+        # A plain dict, not a BridgeRegistry: the solver protocol is JSON
+        # (harness/protocol.py), and a registry object serialises to
+        # "<BridgeRegistry object at 0x…>" — a TRUTHY STRING that defeats a
+        # solver's `is not None` guard and then raises on attribute access.
+        #
+        # And deterministic, not live: the real registry prices routes over
+        # HTTP, which must never enter a scored path or two validators would
+        # disagree on the same plan. See bridge_capability_descriptor.
+        "bridge_capability": bridge_capability_descriptor(),
     }
     # Resolve live RPC for every chain we're about to benchmark. Without it the
     # solver silently falls back to an incomplete on-chain snapshot (missing
@@ -1604,12 +1717,25 @@ async def run_benchmark(
             _n, _samples = _report()
             _rpc_total += _n
             _rpc_samples.extend(_samples)
-        if _rpc_total:
+        # How much of that flake the retry actually absorbed this run. Rows
+        # that still carry a transient signature were NOT rescued (budget
+        # spent, or it failed every attempt) and are the residual fairness
+        # cost; `_rescued` is what the miner would otherwise have been
+        # hard-vetoed for.
+        _retried = sum(int(getattr(r, "rpc_retries", 0) or 0) for r in results)
+        _rescued = sum(
+            1 for r in results
+            if int(getattr(r, "rpc_retries", 0) or 0) > 0
+            and _is_retryable_rpc_failure(r) is None
+        )
+        if _rpc_total or _retried:
             logger.warning(
                 "[benchmark-rpc-health] %s: %d transient RPC/provider error(s) over "
                 "%d scenario(s) this run — these silently zero orders and get "
-                "misattributed to miner capability (fairness impact). samples: %s",
+                "misattributed to miner capability (fairness impact). "
+                "retries=%d rescued_orders=%d. samples: %s",
                 getattr(session, "_label", "solver"), _rpc_total, len(intents),
+                _retried, _rescued,
                 " | ".join(_rpc_samples[:4]),
             )
     except Exception as exc:  # noqa: BLE001 — audit logging must never break a run
@@ -1791,19 +1917,37 @@ async def _process_scenario(
                         )
                         print(f"[BENCHMARK] Simulation: success={sim.success} transfers={len(sim.token_transfers)} gas={sim.gas_used} error={sim.error}", flush=True)
                         if require_real_sim and not sim.success:
-                            # Fail-closed: a real simulation that REVERTED means
-                            # the plan could not execute. Score 0, exactly like a
-                            # genuine on-chain revert.
-                            logger.warning(
-                                "Simulation reverted for %s and "
-                                "require_real_sim is set; scoring 0: %s",
-                                intent.app_id, sim.error,
+                            # TRANSIENT PROVIDER FAULT vs REAL REVERT — opposite
+                            # facts about the miner, and they were being
+                            # collapsed. A `-32070 Gateway request timeout`
+                            # inside the scoreIntent sim used to arrive here
+                            # wearing the generic "scoreIntent simulation
+                            # reverted" error, so it was recorded as
+                            # `real_sim_reverted` (the plan's own failure) and
+                            # graded a DROPPED order — a hard adoption veto for
+                            # our outage, not the miner's plan. The simulator
+                            # now tags it; keep the two apart from here on.
+                            _transient = str(sim.error or "").startswith(
+                                TRANSIENT_SIM_ERROR_PREFIX,
                             )
-                            br.error = f"real_sim_reverted: {sim.error}"
-                            br.revert_reason = getattr(sim, "revert_reason", None)
+                            if _transient:
+                                logger.warning(
+                                    "Simulation UNAVAILABLE for %s (transient "
+                                    "provider fault, NOT a plan revert): %s",
+                                    intent.app_id, sim.error,
+                                )
+                                br.error = f"real_sim_unavailable: {sim.error}"
+                            else:
+                                logger.warning(
+                                    "Simulation reverted for %s and "
+                                    "require_real_sim is set; scoring 0: %s",
+                                    intent.app_id, sim.error,
+                                )
+                                br.error = f"real_sim_reverted: {sim.error}"
+                                br.revert_reason = getattr(sim, "revert_reason", None)
                             # Diagnostics only: capture a per-step trace. Bounded
                             # per run; never affects the score.
-                            if trace_budget[0] > 0:
+                            if trace_budget[0] > 0 and not _transient:
                                 tr = _capture_revert_trace(simulator, plan, token_balances)
                                 if tr is not None:
                                     br.revert_trace = tr
@@ -1830,6 +1974,46 @@ async def _process_scenario(
                 else:
                     sim = _build_benchmark_simulation(plan, state)
                     used_mock = True
+                # DESTINATION MEASUREMENT — deliberately OUTSIDE the
+                # fail-closed guard below.
+                #
+                # It used to sit inside it, so the most common cross-chain
+                # outcome was also the one we recorded nothing for: a plan
+                # whose scoreIntent reverts fails closed, and 154 of the 172
+                # cross-chain rows benched in the first live day were exactly
+                # that. The row stored no delivered amount and no reason, so
+                # the miner-facing `cross_chain_delivery` block could never
+                # populate — the feature meant to explain a zero was silent for
+                # the failure that actually happens.
+                #
+                # A fail-closed scoreIntent says nothing about the destination
+                # legs: this is a SEPARATE simulate_cross_chain run over the
+                # plan's own legs, so it is exactly as meaningful there.
+                #
+                # SCORING IS UNCHANGED, structurally: `score_fn` is only called
+                # inside the guard, so a fail-closed row never reaches the app's
+                # scorer, and the values are attached to `sim` only on that
+                # path. This branch writes the ROW (diagnosis) and never the
+                # scorer's view. Still gated on `not used_mock` — a fabricated
+                # mock sim has no real fork to observe.
+                _delivery_diag = None
+                if not used_mock:
+                    (
+                        br.destination_delivered,
+                        br.destination_amount_source,
+                        _delivery_diag,
+                    ) = await _measure_destination_delivery(
+                        simulator, plan, state, token_balances, fork_block,
+                    )
+                    # Only the stable CODE is persisted. The full diagnosis
+                    # (recipients, amounts) would bloat every row for detail the
+                    # miner can get on demand from the dry run — and
+                    # submission-store bloat has frozen the event loop before
+                    # (#569).
+                    br.destination_delivery_reason = (
+                        (_delivery_diag or {}).get("code")
+                    )
+
                 if not fail_closed_miss:
                     br.mock_simulation = used_mock
                     # Capture the unfakeable on-chain scoreIntent BPS.
@@ -1846,23 +2030,14 @@ async def _process_scenario(
                         _gm if (not used_mock and sim.success and _gm > 0)
                         else None
                     )
-                    # PHASE 0 (observe-only): measure what the plan delivers
-                    # on the DESTINATION chain. Runs alongside the scored sim
-                    # above — which is untouched — so it cannot move a score.
-                    # No-op for every single-chain plan.
+                    # Hand the measurement (taken above) to the app's scorer:
+                    # the SAME values persisted on the row ride the sim into
+                    # context.simulation (engine/context.py), so the app JS can
+                    # price destination delivery itself. One computation feeds
+                    # both the stored artifact and the scorer — they can never
+                    # disagree. Scorer-visible ONLY here, never on the
+                    # fail-closed path.
                     if not used_mock:
-                        (
-                            br.destination_delivered,
-                            br.destination_amount_source,
-                        ) = await _measure_destination_delivery(
-                            simulator, plan, state, token_balances, fork_block,
-                        )
-                        # Hand the measurement to the app's scorer: the SAME
-                        # values persisted on the row ride the sim into
-                        # context.simulation (engine/context.py), so the app
-                        # JS can price destination delivery itself. One
-                        # computation feeds both the stored artifact and the
-                        # scorer — they can never disagree.
                         sim.destination_delivered = br.destination_delivered
                         sim.destination_amount_source = (
                             br.destination_amount_source
@@ -1925,6 +2100,8 @@ async def _scenario_pool_worker(
     run_start: float,
     trace_budget: list[int],
     max_respawns: int,
+    rpc_retry_max: int = 0,
+    retry_budget: list[int] | None = None,
     read_proxy: Any | None,
     config: "BenchmarkConfig",
     score_fn: ScoreFn | None,
@@ -1947,6 +2124,8 @@ async def _scenario_pool_worker(
     proxy_session_id = runtime.proxy_session_id
     respawns = 0
     solver_dead = False
+    if retry_budget is None:
+        retry_budget = [0]
     dead_reason = "skipped: solver unrecoverable"
 
     async def _respawn() -> bool:
@@ -2000,25 +2179,87 @@ async def _scenario_pool_worker(
             results[idx] = br
             continue
 
-        br, need_respawn = await _process_scenario(
-            intent, state, snapshot,
-            session=session,
-            simulator=simulator,
-            proxy_session_id=proxy_session_id,
-            read_proxy=read_proxy,
-            config=config,
-            score_fn=score_fn,
-            fork_block=fork_block,
-            fork_blocks=fork_blocks,
-            require_real_sim=require_real_sim,
-            trigger_ground_truth=trigger_ground_truth,
-            trace_budget=trace_budget,
-        )
+        async def _attempt():
+            return await _process_scenario(
+                intent, state, snapshot,
+                session=session,
+                simulator=simulator,
+                proxy_session_id=proxy_session_id,
+                read_proxy=read_proxy,
+                config=config,
+                score_fn=score_fn,
+                fork_block=fork_block,
+                fork_blocks=fork_blocks,
+                require_real_sim=require_real_sim,
+                trigger_ground_truth=trigger_ground_truth,
+                trace_budget=trace_budget,
+            )
+
+        br, need_respawn = await _attempt()
+
+        # TRANSIENT-RPC RETRY (disarmed unless BENCHMARK_RPC_RETRY_MAX > 0).
+        #
+        # When a provider rate-limits / times out / 5xx's, the solver emits no
+        # plan for the affected order. The relative rule records that as a
+        # `dropped` order, which is a HARD VETO on adoption — so a provider
+        # hiccup, not the miner's capability, decides the round. Re-running the
+        # scenario is the narrowest fix: it only ever re-runs a row that
+        # delivered NOTHING and failed with a transient signature, so it cannot
+        # change a result the solver actually produced.
+        #
+        # Bounded three ways — per scenario (`_rpc_retry_max`), per run
+        # (`retry_budget`, shared across runtimes), and by wall clock
+        # (`_RPC_RETRY_DEADLINE_FRACTION`) — because retries spend the SAME
+        # budget as first attempts; an unbounded policy would zero-fill the
+        # tail of the corpus and make miners worse off than doing nothing.
+        attempts = 0
+        while (
+            rpc_retry_max > 0
+            and attempts < rpc_retry_max
+            and retry_budget[0] > 0
+            and not solver_dead
+        ):
+            sig = _is_retryable_rpc_failure(br)
+            if sig is None:
+                break
+            if (
+                time.monotonic() - run_start
+            ) > TOTAL_BENCHMARK_TIMEOUT * _RPC_RETRY_DEADLINE_FRACTION:
+                logger.warning(
+                    "[benchmark-rpc-retry] %s: transient provider failure (%s) "
+                    "NOT retried — past %.0f%% of the run budget; the miner "
+                    "still eats this drop",
+                    br.intent_id, sig, _RPC_RETRY_DEADLINE_FRACTION * 100,
+                )
+                break
+            # A timeout/crash killed the process; it must be live to retry.
+            if need_respawn:
+                if not await _respawn():
+                    solver_dead = True
+                    break
+                need_respawn = False
+            attempts += 1
+            retry_budget[0] -= 1
+            logger.warning(
+                "[benchmark-rpc-retry] %s: retry %d/%d after transient "
+                "provider failure (%s): %s",
+                br.intent_id, attempts, rpc_retry_max, sig, br.error,
+            )
+            br, need_respawn = await _attempt()
+
+        # Carried on whichever attempt is FINAL, so the row says how many
+        # provider hiccups the harness absorbed for this order.
+        br.rpc_retries = attempts
+        if attempts and _is_retryable_rpc_failure(br) is None:
+            logger.info(
+                "[benchmark-rpc-retry] %s: recovered after %d retry(ies)",
+                br.intent_id, attempts,
+            )
         results[idx] = br
 
         # A timeout/crash left the process dead — respawn so the NEXT scenario
         # this worker pulls runs on a live solver. Only THIS scenario scored 0.
-        if need_respawn:
+        if need_respawn and not solver_dead:
             solver_dead = not await _respawn()
 
 
@@ -2055,6 +2296,10 @@ async def _run_scenarios(
     trace_budget = [_revert_trace_budget()]
     # Per-runtime respawn ceiling (matches the legacy single-session bound).
     max_respawns = max(4, len(intents))
+    # Transient-RPC retry allowance, SHARED across runtimes (a list so every
+    # worker decrements one counter) — bounds the RUN, not just one scenario.
+    rpc_retry_max = _rpc_retry_max()
+    retry_budget = [_rpc_retry_run_budget(len(intents)) if rpc_retry_max else 0]
 
     await asyncio.gather(*[
         _scenario_pool_worker(
@@ -2066,6 +2311,8 @@ async def _run_scenarios(
             run_start=run_start,
             trace_budget=trace_budget,
             max_respawns=max_respawns,
+            rpc_retry_max=rpc_retry_max,
+            retry_budget=retry_budget,
             read_proxy=read_proxy,
             config=config,
             score_fn=score_fn,
@@ -2302,6 +2549,51 @@ def _build_token_balances(state: IntentState | None) -> dict[str, int] | None:
     return None
 
 
+def _source_leg_interactions(
+    plan: ExecutionPlan, state: IntentState | None,
+) -> list[Interaction]:
+    """The SOURCE-side interactions of a legs-shaped cross-chain plan.
+
+    ``normalize_to_legs`` flattens ``metadata["cross_chain_plan"].legs`` into
+    one interaction list and records, per leg, its ``chain_id``, ``type``
+    (source / bridge / destination) and ``interaction_indices`` into that list.
+    We keep the legs that execute on the chain being scored and drop the
+    destination legs — those belong to another fork, and crediting them here
+    would score work on the wrong chain.
+
+    Selection is deliberately conservative: a leg is kept when its ``chain_id``
+    matches the scored chain, or — when the leg declares no chain — when it is
+    not a destination leg. Anything ambiguous is dropped, which returns this to
+    exactly today's behaviour (an empty list, hence score 0) rather than
+    guessing. Returns ``[]`` for any plan that is not multi-leg.
+    """
+    from minotaur_subnet.simulator.cross_chain_bench import normalize_to_legs
+
+    normalized = normalize_to_legs(plan)
+    if normalized is None:
+        return []
+    legs = (normalized.metadata or {}).get("legs") or []
+    flat = list(normalized.interactions)
+    scored_chain = getattr(state, "chain_id", None)
+
+    picked: list[Interaction] = []
+    for leg in legs:
+        leg_chain = leg.get("chain_id")
+        if leg_chain is not None and scored_chain is not None:
+            try:
+                keep = int(leg_chain) == int(scored_chain)
+            except (TypeError, ValueError):
+                keep = False
+        else:
+            keep = leg.get("type") != "destination"
+        if not keep:
+            continue
+        for idx in leg.get("interaction_indices") or []:
+            if 0 <= int(idx) < len(flat):
+                picked.append(flat[int(idx)])
+    return picked
+
+
 def _mock_bridge_for_benchmark(
     plan: ExecutionPlan, state: IntentState | None,
 ) -> ExecutionPlan:
@@ -2333,15 +2625,38 @@ def _mock_bridge_for_benchmark(
     one :stable promotion before any solver emits such a plan. It is inert
     until one does.
     """
+    from minotaur_subnet.simulator.cross_chain_bench import declares_cross_chain
+
     meta = plan.metadata or {}
-    if not (
-        meta.get("cross_chain")
-        or meta.get("multi_leg_plan")
-        or meta.get("cross_chain_plan")
-    ):
+    if not declares_cross_chain(meta):
         return plan
 
     from minotaur_subnet.shared.types import mock_bridge_interactions
+
+    # WHERE THE PLAN'S WORK ACTUALLY LIVES.
+    #
+    # A solver's ``cross_chain_plan`` carries its interactions inside LEGS and
+    # leaves the top level EMPTY. The destination measurement was taught this
+    # (it calls normalize_to_legs first); this scored path never was, so it
+    # handed the simulator a plan with zero interactions — scoreIntent then
+    # reverts "(empty revert)" and the row scores 0 NO MATTER HOW GOOD THE PLAN
+    # IS. Measured on the leader 2026-08-18: the one submission that
+    # demonstrably delivered on the destination chain (499750000000000000, the
+    # exact 5bps-haircut amount) still scored 0.0 with ``interactions: []``.
+    # Replayed on a throwaway fork: this function returned the plan UNCHANGED
+    # with 0 interactions, while the same plan normalized carried 1 executable
+    # source-chain interaction (45836 gas).
+    #
+    # Only the SOURCE side is taken. Destination legs belong to another fork —
+    # running them here would credit work on the wrong chain — and the bridge
+    # leg's deposit is exactly what the mocking below exists to make executable.
+    #
+    # STRICTLY ADDITIVE: this fires only when the top level is EMPTY, which is
+    # the case that scores 0 today. A plan that already carries top-level
+    # interactions keeps byte-identical inputs, so nothing that scores now moves.
+    interactions = plan.interactions
+    if not interactions:
+        interactions = _source_leg_interactions(plan, state)
 
     params = (
         state.raw_params_view()
@@ -2353,18 +2668,22 @@ def _mock_bridge_for_benchmark(
     except (ValueError, TypeError):
         amount = 0
     mocked = mock_bridge_interactions(
-        plan.interactions,
+        interactions,
         token_address=params.get("input_token", "") or "",
         amount=amount,
     )
     if mocked == plan.interactions:
-        # Declared cross-chain but carries no bridge calldata on this chain
-        # (e.g. a destination-only leg) — nothing to rewrite.
+        # Nothing changed AND nothing was recovered from the legs: a
+        # destination-only leg, or a plan with no executable source side.
+        # Same object out, exactly as before.
         return plan
 
     logger.info(
-        "[benchmark] cross-chain plan: mocked %d bridge call(s) for simulation",
-        sum(1 for a, b in zip(mocked, plan.interactions) if a != b),
+        "[benchmark] cross-chain plan: scoring %d source-side interaction(s), "
+        "%d bridge call(s) mocked%s",
+        len(mocked),
+        sum(1 for a, b in zip(mocked, interactions) if a != b),
+        " (recovered from legs — top level was empty)" if not plan.interactions else "",
     )
     return ExecutionPlan(
         intent_id=plan.intent_id,
@@ -2396,18 +2715,53 @@ async def _measure_destination_delivery(
     was observed to move — never a live bridge quote (differs between
     validators) and never the solver's declared output (self-reported).
 
-    Returns ``(delivered_wei_str | None, amount_source | None)``. Never
-    raises: an observation failing must not fail a benchmark row.
+    Returns ``(delivered_wei_str | None, amount_source | None, diagnosis |
+    None)``. ``diagnosis`` explains a ZERO — see :func:`_delivery_diagnosis`.
+    It is ``None`` whenever delivery was credited, so its presence IS the
+    "this delivered nothing, and here is why" signal. Never raises: an
+    observation failing must not fail a benchmark row.
+
+    FLEET UNIFORMITY: the credited quantity is an input to ``raw_output`` and
+    therefore to the adoption verdict, so a leader filtering by token while
+    followers still sum blind would have them disagree on the same plan. This
+    is inert only while nothing emits cross-chain — which is true today and
+    stops being true the moment cross-chain demand is re-seeded. Promote to
+    :stable fleet-wide BEFORE seeding, never after.
     """
     from minotaur_subnet.simulator.cross_chain_bench import (
+        intent_requests_cross_chain,
         is_cross_chain_plan,
         normalize_to_legs,
     )
 
     if not is_cross_chain_plan(plan):
-        return None, None
+        # THE COMMON FAILURE, and until 2026-08-17 the silent one. Measured on
+        # the leader over 51 rounds: of 578 benched cross-chain rows, 482 (83%)
+        # were a plan that never declared cross-chain at all — the solver simply
+        # did not route the order — and 78 more had no plan. Only 18 declared
+        # one. Those 18 got a reason; the 482 got the bare
+        # "scoreIntent reverted: (empty revert)" that any broken plan produces,
+        # so the single most common way to score zero on cross-chain demand was
+        # also the one carrying no cross-chain signal.
+        #
+        # It is a distinct state and needs a distinct code: nothing_delivered
+        # means "your destination legs moved nothing", which would be a LIE here
+        # — there are no destination legs to blame. Nothing is measured (there
+        # is no journey to run), so this costs one dict lookup and cannot move a
+        # score: delivered stays None exactly as before.
+        params = (
+            state.raw_params_view()
+            if state is not None and hasattr(state, "raw_params_view")
+            else {}
+        )
+        if intent_requests_cross_chain(params, getattr(state, "chain_id", None)):
+            return None, None, {
+                "code": "no_cross_chain_plan",
+                "requested_chain": str(params.get("dest_chain_id")),
+            }
+        return None, None, None
     if simulator is None or not hasattr(simulator, "simulate_cross_chain"):
-        return None, None
+        return None, None, None
 
     # Normalize HERE, not only inside the simulator: the delivered-amount
     # extraction below walks metadata["legs"], which only the LEGACY shape
@@ -2419,7 +2773,7 @@ async def _measure_destination_delivery(
     # declared but there is no multi-leg journey to measure.
     normalized = normalize_to_legs(plan)
     if normalized is None:
-        return None, None
+        return None, None, None
     plan = normalized
 
     try:
@@ -2432,7 +2786,7 @@ async def _measure_destination_delivery(
         )
     except Exception as exc:  # noqa: BLE001
         logger.info("[benchmark] destination-leg observation failed: %s", exc)
-        return None, None
+        return None, None, None
 
     estimate = getattr(result, "bridge_estimate", None) or {}
     amount_source = estimate.get("amount_source")
@@ -2443,28 +2797,205 @@ async def _measure_destination_delivery(
         leg["leg_id"] for leg in legs_meta if leg.get("type") == "destination"
     ]
     if not dest_ids:
-        return None, amount_source
+        return None, amount_source, None
 
     params = (
         state.raw_params_view()
         if state is not None and hasattr(state, "raw_params_view")
         else {}
     )
-    receiver = str(
-        params.get("receiver") or _ANVIL_DEFAULT_ACCOUNT
-    ).lower()
+    recipients = _delivery_recipients(state, plan)
 
-    delivered = 0
+    # WHICH token counts as delivery — the asset the INTENT asked for, taken
+    # from the request params, never from the plan's own metadata.
+    #
+    # Summing every transfer to the receiver regardless of token does not
+    # measure delivery, it measures arrival, and the two come apart exactly
+    # where it matters. A cross-chain intent is "spend WETH on chain A, deliver
+    # USDC on chain B"; a plan that bridges the WETH and simply forwards it,
+    # skipping the destination swap, lands a raw amount ~1e12 larger than the
+    # honest USDC answer purely because WETH has 18 decimals and USDC has 6.
+    # That number becomes ``metadata.raw_output``, which feeds the per-order
+    # relative comparison — so the plan that DIDN'T do the work wins the order
+    # outright and the plan that did is recorded as a regression. The incentive
+    # inverts. (The app's own single-chain scorer never had this hole: it
+    # already filters ``tokenAddr === tokenOut``, and so does the sibling
+    # cross-chain QUOTE path at cross_chain_quote.py — this scored path was the
+    # only one summing blind.)
+    #
+    # Params, not plan metadata, because the plan is solver-authored: filtering
+    # on a solver-declared ``token_out`` would restore the same vector in one
+    # move — declare the cheap token, dump the cheap token, get credited for it.
+    # ``output_token`` is already the DESTINATION-chain address (the CAIP-10
+    # intake derives dest_chain_id from it), so it needs no remapping.
+    expected_token = str(params.get("output_token") or "").lower()
+    if not expected_token:
+        # Fail closed, exactly like the no-destination-leg case above: an
+        # unmeasurable journey reports nothing and earns nothing. Crediting an
+        # unfiltered sum here would be the very mis-credit this guards against.
+        logger.info(
+            "[benchmark] destination delivery not measurable: intent declares "
+            "no output_token to credit against",
+        )
+        return None, amount_source, {"code": "no_output_token"}
+
+    # Four buckets, because a zero has more than one cause and they need
+    # OPPOSITE fixes. Collapsing them (as a bare sum does) is what made every
+    # cross-chain zero look identical and unactionable.
+    delivered = 0                 # right token, credited recipient
+    wrong_token_to_recipient = 0  # credited recipient, but not what was asked
+    right_token_elsewhere = 0     # what was asked, delivered somewhere we don't count
     for leg_id in dest_ids:
         for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
-            if str(t.get("to", "")).lower() != receiver:
-                continue
             try:
-                delivered += int(t.get("amount") or 0)
+                amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
                 continue
+            right_token = str(t.get("token", "")).lower() == expected_token
+            credited_to = str(t.get("to", "")).lower() in recipients
+            if right_token and credited_to:
+                delivered += amount
+            elif right_token:
+                right_token_elsewhere += amount
+            elif credited_to:
+                wrong_token_to_recipient += amount
 
-    return str(delivered), amount_source
+    diagnosis = None
+    if not delivered:
+        diagnosis = _delivery_diagnosis(
+            expected_token, recipients,
+            wrong_token_to_recipient, right_token_elsewhere,
+        )
+        logger.info(
+            "[benchmark] destination legs credited 0 of %s — %s",
+            expected_token, diagnosis["code"],
+        )
+
+    return str(delivered), amount_source, diagnosis
+
+
+def _delivery_diagnosis(
+    expected_token: str,
+    recipients: set[str],
+    wrong_token_to_recipient: int,
+    right_token_elsewhere: int,
+) -> dict[str, Any]:
+    """Why did a cross-chain plan deliver nothing? Answered in a stable code.
+
+    A zero delivery is the single most common cross-chain outcome and, until
+    now, the least actionable thing the platform could tell a miner: the row
+    said ``0`` whether they shipped the wrong asset, shipped to an address the
+    contest does not count, or never built a destination leg at all. Those need
+    three different fixes, and a miner had no way to tell which they had.
+
+    The code vocabulary is CLOSED and the values are content-addressed off the
+    measurement, never free text — this rides a persisted benchmark row that
+    leader and follower compare, so a wording difference between two validator
+    builds must never read as a data difference. Add codes, never reword them.
+
+      ``wrong_recipient``   the requested token WAS delivered, just not to an
+                            address that counts. Nearest miss there is: fix the
+                            destination leg's recipient.
+      ``wrong_token``       something reached a counted recipient, but not what
+                            the intent asked for — the signature of bridging
+                            and skipping the destination swap.
+      ``nothing_delivered`` the destination legs moved nothing at all to
+                            anyone. Usually an empty or reverting leg.
+      ``no_output_token``   the intent declared no output token, so there was
+                            nothing to measure against (set upstream).
+
+    Two codes are set by the CALLER rather than here, because they are decided
+    before there is any journey to measure — ``no_output_token`` above, and
+    ``no_cross_chain_plan`` (the order asked for delivery on another chain and
+    the plan is not cross-chain at all: 83% of live cross-chain rows).
+
+    ``wrong_recipient`` outranks ``wrong_token`` when both are present: it is
+    the closer miss and the cheaper fix, so it is the more useful thing to say.
+    """
+    if right_token_elsewhere:
+        code = "wrong_recipient"
+    elif wrong_token_to_recipient:
+        code = "wrong_token"
+    else:
+        code = "nothing_delivered"
+    return {
+        "code": code,
+        "requested_token": expected_token,
+        # Sorted so two validators emit byte-identical diagnoses for the same
+        # observation — this is a set, and set order is not stable.
+        "credited_recipients": sorted(recipients),
+        "delivered_to_others": str(right_token_elsewhere),
+        "other_tokens_delivered": str(wrong_token_to_recipient),
+    }
+
+
+def _delivery_recipients(
+    plan_state: IntentState | None, plan: ExecutionPlan,
+) -> set[str]:
+    """Addresses whose incoming transfers count as destination delivery.
+
+    Crediting ONLY ``params['receiver']`` is why the reference solver measured
+    zero on every case. A benchmark IntentState is built with ``owner=""``
+    (benchmark_worker.py), quote cases carry no ``receiver``, and the solver's
+    own default is ``receiver_default = state.contract_address or state.owner``
+    — so the solver addresses the destination leg at the APP CONTRACT while the
+    platform was watching only the anvil default account. Neither side is wrong
+    on its own; they were answering different questions.
+
+    The app contract is a legitimate delivery target, not a workaround: under
+    the V2 escrow model the destination funds are SUPPOSED to land in the app
+    (``escrowDeposit`` gates on ``balanceOf(address(this))``, and ``escrowRefund``
+    returns from there), which is exactly why the cross-chain compiler resolves
+    the dest recipient to the App on the DESTINATION chain and fails closed when
+    that chain has no order-ready deployment. The app's own single-chain scorer
+    has always counted both: ``toAddr === receiver || toAddr === appAddr``.
+
+    Deliberately the DESTINATION chain's app address, never the source chain's.
+    They differ, and a transfer to the source-chain address on the destination
+    fork reaches an account with no code there — stranded funds. Crediting that
+    would be a mis-credit, so an unresolvable destination address simply is not
+    added (the measurement then reports what it can see, and a plan delivering
+    only there reads 0 — correctly).
+
+    Strictly a SUPERSET of the previous single-address rule, so this can only
+    ever raise a measured delivery, never lower one.
+    """
+    params = (
+        plan_state.raw_params_view()
+        if plan_state is not None and hasattr(plan_state, "raw_params_view")
+        else {}
+    )
+    control = (
+        plan_state.control_view()
+        if plan_state is not None and hasattr(plan_state, "control_view")
+        else {}
+    )
+
+    out: set[str] = set()
+    receiver = str(params.get("receiver") or "").lower()
+    if receiver:
+        out.add(receiver)
+    else:
+        # Preserve the historical default so single-receiver cases are
+        # unchanged: the pre-funded Anvil account is who the benchmark's
+        # scoreIntent path submits as.
+        out.add(_ANVIL_DEFAULT_ACCOUNT.lower())
+
+    dst_chain = (plan.metadata or {}).get("dst_chain_id")
+    app_addresses = control.get("_app_addresses") or {}
+    if dst_chain is not None and isinstance(app_addresses, Mapping):
+        try:
+            key = int(dst_chain)
+        except (TypeError, ValueError):
+            key = None
+        if key is not None:
+            # Callers may key by int or str depending on where the map came
+            # from (app store vs a JSON round-trip).
+            dest_app = app_addresses.get(key) or app_addresses.get(str(key))
+            if dest_app:
+                out.add(str(dest_app).lower())
+
+    return out
 
 
 def _build_benchmark_simulation(

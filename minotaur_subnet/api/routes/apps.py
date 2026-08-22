@@ -1419,6 +1419,19 @@ async def score_plan(
         intent_function=body.intent_function,
         owner=params.get("owner", ""),
     )
+    # Per-chain app addresses, so the dry run credits destination delivery to
+    # the App on the DESTINATION chain exactly as a bench round does. Without
+    # it the two disagree and the dry run stops being a preview: a plan
+    # delivering into the far-side app escrow would read 0 here and non-zero
+    # in a round. Mirrors the benchmark worker's ``_app_addresses``.
+    try:
+        state.control["_app_addresses"] = {
+            int(cid): (dep.contract_address or "")
+            for cid, dep in s.get_deployments(app_id).items()
+            if dep is not None and dep.contract_address
+        }
+    except Exception:  # noqa: BLE001 - a dry run must not 500 over this
+        pass
 
     # Synthesize a stand-in IntentOrder so the simulator takes the same
     # scoreIntent path production uses. Without this, simulator.simulate()
@@ -1532,18 +1545,29 @@ async def score_plan(
     # tell "broken" from "unmeasured". Never on the mock path (nothing real to
     # observe), never raises (a failed observation reports null, not a 500).
     _xc_declared = False
+    _xc_diagnosis: dict[str, Any] | None = None
     if simulation_mode == "anvil":
         from minotaur_subnet.harness.orchestrator import (
             _measure_destination_delivery,
         )
         from minotaur_subnet.simulator.cross_chain_bench import (
+            intent_requests_cross_chain,
             is_cross_chain_plan,
         )
-        if is_cross_chain_plan(plan):
+        # Either side being cross-chain is worth answering. The plan being
+        # cross-chain gets the delivery measurement; the ORDER being cross-chain
+        # while the plan is NOT gets the ``no_cross_chain_plan`` diagnosis, and
+        # that is the case a miner is overwhelmingly likely to be in — it is 83%
+        # of live cross-chain rows, and dry-running it used to return the same
+        # bare single-chain response as any ordinary order.
+        if is_cross_chain_plan(plan) or intent_requests_cross_chain(
+            params, getattr(state, "chain_id", None),
+        ):
             _xc_declared = True
             (
                 simulation.destination_delivered,
                 simulation.destination_amount_source,
+                _xc_diagnosis,
             ) = await _measure_destination_delivery(
                 _simulator, plan, state, token_balances, body.fork_block,
             )
@@ -1587,6 +1611,29 @@ async def score_plan(
                 "destination_amount_source": (
                     simulation.destination_amount_source
                 ),
+                # WHY it delivered nothing. Absent when delivery counted, so
+                # its presence is the "here is what to change" signal. The
+                # dry run carries the FULL diagnosis (which recipients count,
+                # how much went elsewhere) rather than the bare code the
+                # benchmark row stores — this response is not persisted, so
+                # detail is free here and expensive there.
+                #   wrong_recipient   - right token, uncounted address. Deliver
+                #                       to `receiver`, or to the App on the
+                #                       DESTINATION chain (see
+                #                       credited_recipients).
+                #   wrong_token       - something reached a counted recipient
+                #                       but not the intent's output_token: you
+                #                       bridged and skipped the dest swap.
+                #   nothing_delivered - the destination legs moved nothing.
+                #   no_output_token   - the intent declared no output token.
+                #   no_cross_chain_plan - the ORDER asked for delivery on
+                #                       another chain (requested_chain) and
+                #                       this plan declared no cross-chain legs,
+                #                       so it was scored as an ordinary
+                #                       single-chain plan. Nothing was measured
+                #                       (destination_delivered is null) because
+                #                       there is no journey to run.
+                "diagnosis": _xc_diagnosis,
             }
         return _resp
     except Exception as exc:

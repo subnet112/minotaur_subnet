@@ -8,13 +8,14 @@ nulls + per-chain errors, never an exception.
 from __future__ import annotations
 
 import hashlib
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from minotaur_subnet.api.services.app_admin import get_app_admin_state
 from minotaur_subnet.shared.types import (
     AppIntentConfig,
     AppIntentDefinition,
     AppStatus,
+    CodeValidationResult,
     DeploymentResult,
 )
 from minotaur_subnet.store.app_intent_store import AppIntentStore
@@ -194,16 +195,28 @@ def test_create_app_persists_contract_version(tmp_path):
     from minotaur_subnet.api.services.app_service import create_app_intent
 
     store = AppIntentStore(store_path=tmp_path / "s.db")
-    out = create_app_intent(
-        store, name="dex", description="", supported_chains=[8453],
-        js_code=(
-            "const manifest = { intent_functions: [{ name: 'swap', params: [] }] };\n"
-            "function score() { return 1; }\n"
-            "module.exports = { score, manifest };\n"
-        ),
-        solidity_code="contract X {}",
-        contract_version="V2",
-    )
+    # Stub the pre-flight code validation: it shells out to `node runner.js`
+    # (isolated-vm native addon) and to `forge` (contracts submodule), neither
+    # of which the no-Docker/no-RPC unit lane provides, and neither of which is
+    # what this test is about (contract_version persistence). Without the stub
+    # an unbuilt toolchain returns "Validation failed" before the store write.
+    # Same stub as tests/unit/test_api_services.py::_ok_validation.
+    with patch(
+        "minotaur_subnet.engine.validation.validate_app_intent",
+        new=AsyncMock(return_value=CodeValidationResult(
+            valid=True, errors=[], warnings=[], js_config={}, js_manifest=None,
+        )),
+    ):
+        out = create_app_intent(
+            store, name="dex", description="", supported_chains=[8453],
+            js_code=(
+                "const manifest = { intent_functions: [{ name: 'swap', params: [] }] };\n"
+                "function score() { return 1; }\n"
+                "module.exports = { score, manifest };\n"
+            ),
+            solidity_code="contract X {}",
+            contract_version="V2",
+        )
     assert "error" not in out, out
     assert store.get_app(out["app_id"]).contract_version == "v2"
 
@@ -223,3 +236,59 @@ def test_create_app_rejects_bad_contract_version(tmp_path):
         contract_version="v3",
     )
     assert "contract_version" in out.get("error", "")
+
+
+class TestValidationFailsClosed:
+    """App creation must refuse code it could not validate.
+
+    `validation.valid == False` is a verdict and already returns an error. An
+    EXCEPTION means no verdict was ever reached — missing compiler, sandbox that
+    would not start, broken toolchain. "I could not check" is not "I checked and
+    it is fine", and this is the create path hardened after untrusted JS reached
+    RELAYER_PRIVATE_KEY.
+    """
+
+    def _store(self, tmp_path):
+        from minotaur_subnet.store.app_intent_store import AppIntentStore
+        return AppIntentStore(str(tmp_path / "apps.db"))
+
+    def _create(self, store):
+        from minotaur_subnet.api.services.app_service import create_app_intent
+        return create_app_intent(
+            store,
+            name="X",
+            description="",
+            supported_chains=[1],
+            js_code="var config={}; var manifest={}; function score(){return 0;}",
+            solidity_code="contract X is Y {}",
+        )
+
+    def test_a_validator_that_raises_refuses_the_app(self, tmp_path, monkeypatch):
+        import minotaur_subnet.engine.validation as validation
+
+        async def _boom(*a, **k):
+            raise RuntimeError("forge not installed")
+
+        monkeypatch.setattr(validation, "validate_app_intent", _boom)
+        store = self._store(tmp_path)
+        result = self._create(store)
+
+        assert result.get("error") == "Validation could not run", (
+            "an app whose code could not be validated was accepted"
+        )
+        assert "forge not installed" in " ".join(result.get("validation_errors", []))
+        assert not store.list_apps(), "a refused app must not be persisted"
+
+    def test_a_clean_validator_still_creates(self, tmp_path, monkeypatch):
+        """The guard must not turn a working validator into a refusal."""
+        import minotaur_subnet.engine.validation as validation
+        from unittest.mock import AsyncMock
+        from minotaur_subnet.shared.types import CodeValidationResult
+
+        monkeypatch.setattr(
+            validation, "validate_app_intent",
+            AsyncMock(return_value=CodeValidationResult(valid=True, errors=[], warnings=[])),
+        )
+        result = self._create(self._store(tmp_path))
+        assert "error" not in result, result
+        assert result.get("app_id")

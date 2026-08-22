@@ -856,12 +856,41 @@ class SubmissionStore:
         local lifecycle marker and is NOT part of the benchmark pack hash, so a
         record must never be dropped just because its status string is unknown.
         Raises ValueError only when ``submission_id`` is missing.
+
+        Field handling is MERGE-on-absent, replace-on-present: a key missing from
+        ``record`` keeps the value already held for that submission (or the
+        default, for a submission we have never seen), while a key present with
+        ``None`` clears it. See the ``_f`` helper below for why.
         """
         sid = (record.get("submission_id") or "").strip()
         if not sid:
             raise ValueError("upsert requires a submission_id")
-        round_id = record.get("round_id") or self._legacy_round_id(record.get("epoch", 0))
-        raw_status = record.get("status", SubmissionStatus.QUEUED.value)
+
+        # A key ABSENT from the incoming record means "the writer does not know
+        # this field", NOT "clear it". We rebuild the WHOLE record here, so
+        # without this fallback any peer serializing an older field set silently
+        # erases every field it lacks — no error, no log, and the next local
+        # write UPSERTs the erased blob back over the good DB row.
+        #
+        # Live shape (2026-08-04): the api recorded the stage-1
+        # deprecated_surface_hits scan, the benchmark worker flipped the row to
+        # SCORED from a blob without that key, and the evidence the migration
+        # ladder arms on was gone for 0/60 scored+adopted rows while every
+        # api-written row kept it. Field-agnostic on purpose: the next field
+        # added on one side of the process split must not repeat it.
+        #
+        # Present-and-None still clears — to_dict() always emits every key it
+        # knows, so an explicit null is a real write, and only a field the
+        # writer never spoke to is preserved.
+        prev = self._submissions.get(sid)
+
+        def _f(key: str, default: Any = None) -> Any:
+            if key in record:
+                return record[key]
+            return getattr(prev, key, default) if prev is not None else default
+
+        round_id = _f("round_id") or self._legacy_round_id(_f("epoch", 0))
+        raw_status = _f("status", SubmissionStatus.QUEUED.value)
         try:
             status = SubmissionStatus(raw_status)
         except ValueError:
@@ -869,41 +898,41 @@ class SubmissionStore:
             status = SubmissionStatus.QUEUED
         sub = Submission(
             submission_id=sid,
-            repo_url=record.get("repo_url", ""),
-            commit_hash=record.get("commit_hash", ""),
-            epoch=int(record.get("epoch", 0) or 0),
-            hotkey=record.get("hotkey", ""),
+            repo_url=_f("repo_url", ""),
+            commit_hash=_f("commit_hash", ""),
+            epoch=int(_f("epoch", 0) or 0),
+            hotkey=_f("hotkey", ""),
             round_id=round_id,
-            pr_number=record.get("pr_number"),
-            is_private=bool(record.get("is_private", False)),
-            private_repo_full=record.get("private_repo_full"),
-            github_owner=record.get("github_owner"),
+            pr_number=_f("pr_number"),
+            is_private=bool(_f("is_private", False)),
+            private_repo_full=_f("private_repo_full"),
+            github_owner=_f("github_owner"),
             status=status,
-            created_at=record.get("created_at", 0.0) or 0.0,
-            updated_at=record.get("updated_at", 0.0) or 0.0,
-            screening=record.get("screening") or {},
-            image_tag=record.get("image_tag"),
-            image_id=record.get("image_id"),
-            image_digest=record.get("image_digest"),
-            provenance=record.get("provenance"),
-            solver_path=record.get("solver_path"),
-            solver_name=record.get("solver_name"),
-            solver_version=record.get("solver_version"),
-            sdk_version=record.get("sdk_version"),
-            deprecated_surface_hits=record.get("deprecated_surface_hits"),
-            is_copycat=bool(record.get("is_copycat", False)),
-            coined_by_hotkey=record.get("coined_by_hotkey"),
-            max_region_nodes=record.get("max_region_nodes"),
-            content_fingerprint=record.get("content_fingerprint"),
-            structural_fingerprint=record.get("structural_fingerprint"),
-            unproductive_nodes=record.get("unproductive_nodes"),
-            unproductive_metric_version=record.get("unproductive_metric_version"),
-            unproductive_top_offenders=record.get("unproductive_top_offenders"),
-            benchmark_rank=record.get("benchmark_rank"),
-            benchmark_details=record.get("benchmark_details"),
-            rejection_reason=record.get("rejection_reason"),
-            outcome_code=record.get("outcome_code"),
-            waitlist=record.get("waitlist"),
+            created_at=_f("created_at", 0.0) or 0.0,
+            updated_at=_f("updated_at", 0.0) or 0.0,
+            screening=_f("screening") or {},
+            image_tag=_f("image_tag"),
+            image_id=_f("image_id"),
+            image_digest=_f("image_digest"),
+            provenance=_f("provenance"),
+            solver_path=_f("solver_path"),
+            solver_name=_f("solver_name"),
+            solver_version=_f("solver_version"),
+            sdk_version=_f("sdk_version"),
+            deprecated_surface_hits=_f("deprecated_surface_hits"),
+            is_copycat=bool(_f("is_copycat", False)),
+            coined_by_hotkey=_f("coined_by_hotkey"),
+            max_region_nodes=_f("max_region_nodes"),
+            content_fingerprint=_f("content_fingerprint"),
+            structural_fingerprint=_f("structural_fingerprint"),
+            unproductive_nodes=_f("unproductive_nodes"),
+            unproductive_metric_version=_f("unproductive_metric_version"),
+            unproductive_top_offenders=_f("unproductive_top_offenders"),
+            benchmark_rank=_f("benchmark_rank"),
+            benchmark_details=_f("benchmark_details"),
+            rejection_reason=_f("rejection_reason"),
+            outcome_code=_f("outcome_code"),
+            waitlist=_f("waitlist"),
         )
         # _submissions is the source of truth for list_by_round / the pack hash;
         # the indexes are best-effort lookups (last-wins is fine, they aren't
@@ -2341,6 +2370,22 @@ class SubmissionStore:
                     solver_name=d.get("solver_name"),
                     solver_version=d.get("solver_version"),
                     sdk_version=d.get("sdk_version"),
+                    # Hydrate the deprecated-surface scan too. Omitting it here
+                    # silently reset the evidence to None on EVERY process
+                    # start: to_dict() emits it, upsert() carries it, set_
+                    # deprecated_surface() writes it — only this constructor
+                    # forgot it, so the DB kept the rows and the running
+                    # process could not see them. Live on 2026-08-13, minutes
+                    # after the fix that was supposed to make this measurable:
+                    # 124 scanned rows in the last 24h in submissions.db,
+                    # surface_scanned=0 on /v1/migration/status.
+                    #
+                    # This is the SAME defect class as the upsert merge bug
+                    # (see _upsert_one) — a field added on one path and missed
+                    # on another — and it survived that fix because upsert was
+                    # made field-agnostic while this constructor is an explicit
+                    # list. Any field added to Submission must be added HERE.
+                    deprecated_surface_hits=d.get("deprecated_surface_hits"),
                     is_copycat=bool(d.get("is_copycat", False)),
                     coined_by_hotkey=d.get("coined_by_hotkey"),
                     max_region_nodes=d.get("max_region_nodes"),

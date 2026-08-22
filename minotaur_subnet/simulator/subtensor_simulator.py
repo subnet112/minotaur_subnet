@@ -376,7 +376,17 @@ class SubtensorSimulator:
                 cd = bytes.fromhex(cd[2:] if cd.startswith("0x") else cd) if cd else b""
             calls.append((to_checksum_address(ix.target), int(ix.value) if ix.value else 0, cd))
 
-        plan_metadata = json.dumps(plan.metadata).encode() if plan.metadata else b""
+        # A solver may emit metadata that is ALREADY encoded bytes — an App whose
+        # contract abi.decodes it needs the exact bytes, and JSON-wrapping them
+        # destroys the plan. relayer/encoder.py and consensus/signatures.py
+        # already guard this; the simulation and contract-call paths did not, so
+        # a bytes-metadata plan was SIGNED correctly and SCORED as garbage.
+        if not plan.metadata:
+            plan_metadata = b""
+        elif isinstance(plan.metadata, dict):
+            plan_metadata = json.dumps(plan.metadata).encode()
+        else:
+            plan_metadata = plan.metadata
 
         encoded = abi_encode(
             ["(bytes32,address,bytes4,bytes,address,uint256,uint256,uint256,bool,uint256,uint256)",

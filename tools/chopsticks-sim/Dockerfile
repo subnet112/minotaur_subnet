@@ -1,7 +1,14 @@
 # The "anvil binary" for Bittensor: a Chopsticks fork of subtensor + the
 # anvil-dialect JSON-RPC sidecar the Python SubtensorSimulator drives.
 # Build context = repo root:  docker build -f tools/chopsticks-sim/Dockerfile .
-FROM node:22-slim
+#
+# TRIXIE, not bookworm. `sqlite3` (required for chopsticks' --db fork cache, see
+# package.json) ships a PREBUILT native binding linked against GLIBC_2.38, and
+# node:22-slim is Debian bookworm at glibc 2.36 — the module installs cleanly and
+# then dies at `require` with ERR_DLOPEN_FAILED, so the image builds green and
+# fails only at runtime, only when CK_DB is set. node:24-slim is bookworm too;
+# trixie carries glibc 2.41. Verified: `node -e "require('sqlite3')"` loads here.
+FROM node:22-trixie-slim
 
 WORKDIR /app
 # deps first for layer caching (installs @acala-network/chopsticks + @polkadot/*)

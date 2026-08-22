@@ -22,6 +22,8 @@
 //                                only traps if BLS is actually CALLED — dry-runs don't)
 //   --mock-signature-host       (impersonation for the future block-building path)
 
+import { randomBytes } from 'node:crypto'
+
 import { ApiPromise, WsProvider } from '@polkadot/api'
 import { blake2AsHex, keccakAsU8a } from '@polkadot/util-crypto'
 import { u8aConcat, hexToU8a, stringToU8a, u8aToHex } from '@polkadot/util'
@@ -41,15 +43,33 @@ export function launchArgs({ endpoint, block, port = 8000 }) {
 }
 
 export class ChopsticksAnvil {
-  constructor(api) {
+  constructor(api, { ws, upstream } = {}) {
     this.api = api
     this.provider = api._rpcCore.provider
+    this.ws = ws                 // local chopsticks, for reconnecting after an upgrade
+    this.upstream = upstream     // real node, for resolving blocks the fork hasn't seen
+    this._upstreamProvider = null
   }
 
-  static async connect(ws = 'ws://127.0.0.1:8000') {
+  static async connect(ws = 'ws://127.0.0.1:8000', { upstream = '' } = {}) {
     const api = await ApiPromise.create({ provider: new WsProvider(ws), noInitWarn: true })
     await api.isReady
-    return new ChopsticksAnvil(api)
+    return new ChopsticksAnvil(api, { ws, upstream })
+  }
+
+  async _specVersion() {
+    const v = await this.provider.send('state_getRuntimeVersion', [])
+    return Number(v?.specVersion ?? -1)
+  }
+
+  // The upstream node, lazily. Only a FORWARD re-pin needs it (see repin).
+  async _upstreamSend(method, params) {
+    if (!this.upstream) throw new Error('no upstream endpoint configured (CK_ENDPOINT)')
+    if (!this._upstreamProvider) {
+      this._upstreamProvider = new WsProvider(this.upstream)
+      await this._upstreamProvider.isReady
+    }
+    return await this._upstreamProvider.send(method, params)
   }
 
   async forkBlock() {
@@ -68,9 +88,74 @@ export class ChopsticksAnvil {
   // archive node for a jump beyond its pruning window. Returns the new head.
   // Any pending cheatcode overrides (setBalance/setCode) are dropped by the
   // re-pin (fresh state), so re-pin FIRST, then seed, then dry-run.
+  //
+  // TWO things make this more than one dev_setHead call, both found by driving a
+  // real fork of Finney:
+  //
+  //  1. BY NUMBER ONLY GOES BACKWARD. Chopsticks resolves a NUMBER against its
+  //     own chain, which ends at the block it forked; anything newer is
+  //     "Block not found". Rounds move FORWARD, so re-pinning by number would
+  //     fail on every round after the container started. A HASH is resolved
+  //     against the UPSTREAM, so we fetch the hash there and set that instead.
+  //
+  //  2. A RE-PIN CAN CROSS A RUNTIME UPGRADE. The polkadot.js api decorates
+  //     `api.call.*` from the metadata it saw at connect time and learns about
+  //     upgrades from a new-heads subscription that chopsticks (Manual block
+  //     mode) never emits. Cross the boundary and `api.call.ethereumRuntimeRPCApi`
+  //     is undefined — every ethCall dies with "Cannot read properties of
+  //     undefined". Reconnecting re-decorates against the runtime now in force.
+  //     Live: Finney 8800000 is spec 443 and head is spec 447.
   async repin(blockNumber) {
-    await this.provider.send('dev_setHead', [Number(blockNumber)])
+    const target = Number(blockNumber)
+    const before = await this._specVersion()
+    try {
+      await this.provider.send('dev_setHead', [target])
+    } catch (err) {
+      if (!/not found/i.test(String(err?.message || err))) throw err
+      const hash = await this._upstreamSend('chain_getBlockHash', [target])
+      if (!hash) throw new Error(`upstream has no block ${target}`)
+      await this.provider.send('dev_setHead', [hash])
+    }
+    if (await this._specVersion() !== before) await this.reconnect()
     return await this.forkBlock()
+  }
+
+  // Liveness probe AND keepalive for the FORK'S OWN upstream socket.
+  //
+  // It must travel through chopsticks, not through our own upstream provider:
+  // the socket that dies is the one chopsticks holds, and keeping a second
+  // connection warm proves nothing about it. A RANDOM storage key is the lever —
+  // it can never be in the fork's cache, so answering it forces the real
+  // upstream fetch, which is exactly the call that fails when the socket is
+  // dead. Returns null (no such key) on success; throws on a dead upstream.
+  // ``timeoutMs`` bounds DETECTION. polkadot.js has its own 60s RPC timeout, so
+  // without this a probe against a HALF-OPEN socket (severed link, no RST) sits
+  // for a full minute before throwing — which makes "N consecutive failures"
+  // mean an unpredictable number of MINUTES, and stalls the health flag
+  // meanwhile. Fail fast instead: this call only has to answer "is the upstream
+  // answering right now?".
+  async probeUpstream(timeoutMs = 15000) {
+    const key = '0x' + randomBytes(32).toString('hex')
+    let timer
+    try {
+      return await Promise.race([
+        this.provider.send('state_getStorage', [key]),
+        new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error(`upstream probe timed out after ${timeoutMs}ms`)), timeoutMs)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  // Rebuild the api against the runtime currently in force (see repin note 2).
+  async reconnect() {
+    if (!this.ws) throw new Error('cannot reconnect: no local ws endpoint recorded')
+    try { await this.api.disconnect() } catch { /* already gone */ }
+    this.api = await ApiPromise.create({ provider: new WsProvider(this.ws), noInitWarn: true })
+    await this.api.isReady
+    this.provider = this.api._rpcCore.provider
   }
 
   // H160 -> the ss58 account that owns its balance/gas (HashedAddressMapping):

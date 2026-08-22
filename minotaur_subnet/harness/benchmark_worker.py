@@ -1714,9 +1714,33 @@ class BenchmarkWorker:
                 "_intent_function": order.get("intent_function", "swap"),
                 "_original_block_number": order.get("block_number"),
                 "_original_tx_hash": order.get("tx_hash"),
+                # Per-chain app addresses, so a cross-chain plan's destination
+                # delivery can be credited to the App on the DESTINATION chain
+                # (the V2 escrow recipient) and not only to `receiver`. The
+                # state itself is single-chain by construction —
+                # `contract_address` above is the ORDER's chain — so without
+                # this the measurement has no way to name the far-side app and
+                # every cross-chain delivery reads 0. See
+                # `_delivery_recipients` in harness/orchestrator.py.
+                "_app_addresses": self._app_addresses_for(app_id),
             },
         )
         return (app_def, state, snapshot)
+
+    def _app_addresses_for(self, app_id: str) -> dict[int, str]:
+        """``{chain_id: contract_address}`` for every deployment of ``app_id``.
+
+        Fleet-uniform: read from the app store, which app-sync replicates, so
+        two validators building the same scenario derive the same map.
+        """
+        try:
+            return {
+                int(cid): (dep.contract_address or "")
+                for cid, dep in self._app_store.get_deployments(app_id).items()
+                if dep is not None and dep.contract_address
+            }
+        except Exception:  # noqa: BLE001 - never fail a scenario over this
+            return {}
 
     def build_explicit_scenarios(
         self,
@@ -2600,6 +2624,11 @@ class BenchmarkWorker:
                 "destination_amount_source": getattr(
                     r, "destination_amount_source", None,
                 ),
+                # Stable code explaining a ZERO delivery, surfaced to the miner
+                # on /v1/submissions/{id}/status. None when delivery counted.
+                "destination_delivery_reason": getattr(
+                    r, "destination_delivery_reason", None,
+                ),
             }
             # PRE-REFUND metered gas (GasMeter probe) + its measurement-basis
             # tag — ADDITIVE keys, present ONLY when the probe measured this
@@ -2610,6 +2639,14 @@ class BenchmarkWorker:
             if gm is not None:
                 row["gas_metered"] = gm
                 row["gas_basis"] = GAS_BASIS
+            # Transient-RPC retries the harness absorbed for this order.
+            # ADDITIVE + only when non-zero, so rows are byte-identical to the
+            # pre-retry shape wherever the retry is disarmed or never fired.
+            # Records that a provider hiccup was re-run on the miner's behalf;
+            # never a quality signal, and nothing reads it for any verdict.
+            rr = int(getattr(r, "rpc_retries", 0) or 0)
+            if rr > 0:
+                row["rpc_retries"] = rr
             per_intent.append(row)
         return {
             "total_intents": len(results),
