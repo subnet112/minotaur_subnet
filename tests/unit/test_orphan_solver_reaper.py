@@ -185,3 +185,39 @@ def test_kill_still_removes_the_container_when_wait_hangs(monkeypatch):
     """The pre-existing TimeoutError path must keep working."""
     monkeypatch.setattr(orch, "_KILL_REAP_TIMEOUT", 0.01)
     assert "minotaur-bench-zzzz" in _kill_and_capture(_session(wait_hangs=True))
+
+
+# ── one label, one definition ─────────────────────────────────────────────────
+
+def test_role_label_key_has_a_single_definition():
+    """runtime_solver introduced `minotaur.role` and reaps live orphans with it;
+    the benchmark path stamps the SAME key with "bench" and reaps by it. Two
+    independent definitions of one docker label is how they drift apart — and a
+    drift here means either a live solver becomes reapable or bench orphans stop
+    being found."""
+    from minotaur_subnet.harness import runtime_solver as rs
+    assert rs.LIVE_SOLVER_LABEL_KEY is orch.SOLVER_ROLE_LABEL
+    assert rs.LIVE_SOLVER_LABEL_VALUE is orch.SOLVER_ROLE_LIVE
+
+
+def test_live_and_bench_values_are_distinct():
+    """The whole safety argument is that the reaper's filter cannot match a live
+    solver."""
+    assert orch.SOLVER_ROLE_LIVE != orch.SOLVER_ROLE_BENCH
+
+
+def test_deployed_live_label_is_unchanged():
+    """Containers already running carry `minotaur.role=live-solver`; changing the
+    value would orphan them from runtime_solver's own reaper."""
+    from minotaur_subnet.harness.runtime_solver import LIVE_SOLVER_LABEL
+    assert LIVE_SOLVER_LABEL == "minotaur.role=live-solver"
+
+
+def test_live_sessions_do_not_get_a_bench_label():
+    """start_docker must not stamp a role for live sessions — runtime_solver
+    supplies `live-solver` via `labels`, and docker takes the LAST --label for a
+    repeated key, so anything stamped here would be silently overridden."""
+    import inspect
+    src = inspect.getsource(orch.SolverOrchestrator.start_docker)
+    assert "if not live:" in src
+    assert f"{{SOLVER_ROLE_LABEL}}={{SOLVER_ROLE_BENCH}}" in src or "SOLVER_ROLE_BENCH" in src

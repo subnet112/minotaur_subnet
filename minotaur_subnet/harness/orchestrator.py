@@ -123,9 +123,17 @@ async def _docker_rm_f(name: str) -> None:
         pass
 
 
-# Docker label stamped on every solver container: "live" (long-lived runtime
-# solver behind /quote) or "bench" (one benchmark run). The reaper keys on it.
+# Docker label distinguishing a BENCH solver (one benchmark run, bounded by
+# TOTAL_BENCHMARK_TIMEOUT) from the LIVE runtime solver behind /quote, which is
+# long-lived and must never be reaped.
+#
+# harness.runtime_solver introduced this label and reaps its own live orphans
+# with it, but it IMPORTS from this module — so the constants live HERE, at the
+# bottom of the dependency edge, and runtime_solver re-exports them under its
+# original names. One definition, no cycle, and the two can never disagree.
 SOLVER_ROLE_LABEL = "minotaur.role"
+SOLVER_ROLE_LIVE = "live-solver"
+SOLVER_ROLE_BENCH = "bench"
 
 
 def _orphan_reap_age_seconds() -> float:
@@ -157,8 +165,19 @@ async def reap_orphaned_solver_containers(*, age_s: float | None = None) -> list
 
     Safety comes from the role label, not from ownership: only
     ``minotaur.role=bench`` is considered, so a live solver serving /quote is
-    never a candidate no matter how long it has been up. Best-effort and fully
-    swallowed — reaping is never allowed to break a benchmark run.
+    never a candidate no matter how long it has been up.
+
+    NOT scoped by ``minotaur.launcher`` the way runtime_solver's live-solver
+    reap is. That scoping exists because several API instances can share one
+    host docker.sock and would otherwise kill each other's IN-USE containers
+    mid-INITIALIZE — a live solver has no bounded lifetime, so role alone cannot
+    tell "in use" from "stranded". A bench container can: it cannot outlive
+    TOTAL_BENCHMARK_TIMEOUT, so anything past a multiple of that is stranded no
+    matter which instance started it. Age is the stronger guarantee here, and it
+    also reaps orphans left by an instance that is GONE — which launcher
+    scoping, keyed on the running instance's own id, structurally cannot.
+
+    Best-effort and fully swallowed — reaping is never allowed to break a run.
 
     Returns the names removed (for logging/tests).
     """
@@ -167,7 +186,8 @@ async def reap_orphaned_solver_containers(*, age_s: float | None = None) -> list
         return []
     try:
         ps = await asyncio.create_subprocess_exec(
-            "docker", "ps", "--filter", f"label={SOLVER_ROLE_LABEL}=bench",
+            "docker", "ps",
+            "--filter", f"label={SOLVER_ROLE_LABEL}={SOLVER_ROLE_BENCH}",
             "--format", "{{.Names}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
@@ -1109,11 +1129,18 @@ class SolverOrchestrator:
         # concurrent benchmark solvers never collide on the name.
         container_name = f"minotaur-bench-{uuid.uuid4().hex[:12]}"
         cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
-        # ROLE LABEL — what lets the reaper tell a long-lived LIVE solver (serves
-        # /quote for days, must never be reaped) from a BENCH solver (bounded by
-        # TOTAL_BENCHMARK_TIMEOUT, so an old one is provably an orphan). Applied
-        # unconditionally, before caller labels, so it cannot be overridden away.
-        cmd.extend(["--label", f"{SOLVER_ROLE_LABEL}={'live' if live else 'bench'}"])
+        # ROLE LABEL — what lets the reaper tell a BENCH solver (bounded by
+        # TOTAL_BENCHMARK_TIMEOUT, so an old one is provably an orphan) from the
+        # LIVE runtime solver, which serves /quote for days and must never be
+        # reaped.
+        #
+        # ONLY the bench value is stamped here. The live path supplies its own
+        # `minotaur.role=live-solver` through `labels` (runtime_solver owns that
+        # constant and reaps live orphans with it), and docker applies the LAST
+        # --label for a repeated key — so stamping a live value here would be
+        # dead weight that the caller silently overrides anyway.
+        if not live:
+            cmd.extend(["--label", f"{SOLVER_ROLE_LABEL}={SOLVER_ROLE_BENCH}"])
         if labels:
             for k, v in labels.items():
                 cmd.extend(["--label", f"{k}={v}"])
