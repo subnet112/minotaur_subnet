@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 
 import asyncio
 import os
+import shutil
 
 # Configure logging before anything else so all modules get handlers.
 # Without this, the root logger has no handlers and drops all INFO/WARNING logs.
@@ -258,6 +259,53 @@ app.add_middleware(
 )
 
 
+
+# ── storage headroom ──────────────────────────────────────────────────────────
+# Thresholds for the /health `disk` block. A validator whose disk fills does not
+# crash — it degrades in a way that a naive liveness probe cannot see, which is
+# exactly how the 2026-08-22 outage ran for hours: /health answered 200 (it
+# touches no store) while every store-backed endpoint 500'd, `docker exec` failed
+# with "no space left on device", and rounds stalled ~5h. Everything the api does
+# that matters — persisting the submission store, writing round state, docker
+# spawning solver containers — needs free bytes.
+DISK_WARN_FREE_PCT = float(os.environ.get("HEALTH_DISK_WARN_PCT", "10"))
+DISK_CRIT_FREE_PCT = float(os.environ.get("HEALTH_DISK_CRIT_PCT", "3"))
+# A percentage alone is a bad alarm on a very large disk (3% of 2TB is 60GB of
+# headroom; 3% of 20GB is 600MB), so an absolute floor runs alongside it and the
+# WORSE of the two verdicts wins.
+DISK_WARN_FREE_BYTES = int(os.environ.get("HEALTH_DISK_WARN_BYTES", str(20 * 1024**3)))
+DISK_CRIT_FREE_BYTES = int(os.environ.get("HEALTH_DISK_CRIT_BYTES", str(5 * 1024**3)))
+
+
+def _disk_health(path: str | None = None) -> dict:
+    """Free-space snapshot for the volume backing the store.
+
+    Reports rather than raises: a probe that cannot measure must not itself be
+    the reason /health fails. An unreadable path yields state "unknown", which
+    is NOT treated as degraded.
+    """
+    target = path or os.environ.get("MINOTAUR_STORE_DIR") or "/data"
+    try:
+        usage = shutil.disk_usage(target)
+    except Exception as exc:  # noqa: BLE001 — a probe must never break /health
+        return {"state": "unknown", "path": target, "error": str(exc)[:120]}
+    free_pct = 100.0 * usage.free / usage.total if usage.total else 0.0
+    if usage.free <= DISK_CRIT_FREE_BYTES or free_pct <= DISK_CRIT_FREE_PCT:
+        state = "critical"
+    elif usage.free <= DISK_WARN_FREE_BYTES or free_pct <= DISK_WARN_FREE_PCT:
+        state = "low"
+    else:
+        state = "ok"
+    return {
+        "state": state,
+        "path": target,
+        "free_bytes": usage.free,
+        "total_bytes": usage.total,
+        "free_pct": round(free_pct, 2),
+        "used_pct": round(100.0 - free_pct, 2),
+    }
+
+
 @app.get("/health")
 def health():
     worker_running = ctx.benchmark_worker is not None and ctx.benchmark_worker._running
@@ -299,8 +347,15 @@ def health():
     from minotaur_subnet.harness.runtime_solver import forced_solver_image
     _forced_image = forced_solver_image()
 
+    # Storage headroom. Deliberately does NOT make /health return non-200: the
+    # container healthcheck fails only on an exception, so a 5xx here would mark
+    # the api unhealthy and invite a restart loop — and restarting fixes nothing
+    # when the disk is full. Degrading `status` instead means a monitor keyed on
+    # `status == "ok"` fires while the process is left alone to be repaired.
+    disk = _disk_health()
     data = {
-        "status": "ok",
+        "status": "degraded" if disk.get("state") in ("low", "critical") else "ok",
+        "disk": disk,
         "service": "app-intents-api",
         "image_sha": image_sha,
         "benchmark_worker": "running" if worker_running else "disabled",
