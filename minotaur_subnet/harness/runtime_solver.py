@@ -24,6 +24,8 @@ from typing import Any
 from minotaur_subnet.chains import registry
 from minotaur_subnet.harness import solver_read_proxy as _srp
 from minotaur_subnet.harness.orchestrator import (
+    SOLVER_ROLE_LABEL,
+    SOLVER_ROLE_LIVE,
     SolverCrashedError,
     SolverOrchestrator,
     SolverSession,
@@ -77,8 +79,11 @@ def resolve_boot_solver_image() -> tuple[str | None, bool]:
 # Marker placed on every live-solver container. Lets us reap orphans from
 # prior API restarts (the --rm flag only runs on clean exit, so a SIGKILLed
 # API leaves its child container running).
-LIVE_SOLVER_LABEL_KEY = "minotaur.role"
-LIVE_SOLVER_LABEL_VALUE = "live-solver"
+# Re-exported from harness.orchestrator, which owns them: the benchmark path
+# stamps the SAME key with "bench" and reaps by it, so a second definition here
+# would be two sources of truth for one docker label. Names kept for callers.
+LIVE_SOLVER_LABEL_KEY = SOLVER_ROLE_LABEL
+LIVE_SOLVER_LABEL_VALUE = SOLVER_ROLE_LIVE
 LIVE_SOLVER_LABEL = f"{LIVE_SOLVER_LABEL_KEY}={LIVE_SOLVER_LABEL_VALUE}"
 
 # Per-launcher scope for the orphan reap. Multiple API instances (leader +
