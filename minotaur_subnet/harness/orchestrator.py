@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import base64
 import json
 import logging
@@ -120,6 +121,101 @@ async def _docker_rm_f(name: str) -> None:
         await asyncio.wait_for(rm.wait(), timeout=_KILL_REAP_TIMEOUT)
     except Exception:  # noqa: BLE001 — cleanup path, never propagate
         pass
+
+
+# Docker label stamped on every solver container: "live" (long-lived runtime
+# solver behind /quote) or "bench" (one benchmark run). The reaper keys on it.
+SOLVER_ROLE_LABEL = "minotaur.role"
+
+
+def _orphan_reap_age_seconds() -> float:
+    """Age past which a RUNNING bench container is provably an orphan.
+
+    Anchored to TOTAL_BENCHMARK_TIMEOUT rather than a bare constant: a benchmark
+    run cannot outlive its own budget, so a multiple of it cannot mistake an
+    in-flight run for an orphan — including a run belonging to a DIFFERENT
+    process (the api and the benchmark-worker both spawn solvers and cannot see
+    each other's sessions, which rules out any ownership-tracking scheme).
+    """
+    raw = os.environ.get("BENCHMARK_ORPHAN_REAP_AGE_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 3.0 * TOTAL_BENCHMARK_TIMEOUT
+
+
+async def reap_orphaned_solver_containers(*, age_s: float | None = None) -> list[str]:
+    """Remove RUNNING bench solver containers older than the orphan age.
+
+    A container outlives its ``docker run`` CLI, so any path that loses the CLI
+    without an explicit removal strands one forever. :meth:`SolverSession.kill`
+    now always removes its own, which closes the ordinary leak; this is the
+    backstop for the paths no session can clean up after — the owning PROCESS
+    dying (OOM, SIGKILL, container restart), where ``kill()`` never runs at all.
+
+    Safety comes from the role label, not from ownership: only
+    ``minotaur.role=bench`` is considered, so a live solver serving /quote is
+    never a candidate no matter how long it has been up. Best-effort and fully
+    swallowed — reaping is never allowed to break a benchmark run.
+
+    Returns the names removed (for logging/tests).
+    """
+    horizon = _orphan_reap_age_seconds() if age_s is None else age_s
+    if horizon <= 0:
+        return []
+    try:
+        ps = await asyncio.create_subprocess_exec(
+            "docker", "ps", "--filter", f"label={SOLVER_ROLE_LABEL}=bench",
+            "--format", "{{.Names}}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(ps.communicate(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001 — a sweep must never break the run
+        return []
+    names = [n for n in out.decode("utf-8", "replace").split() if n]
+    if not names:
+        return []
+
+    try:
+        insp = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "--format", "{{.Name}} {{.State.StartedAt}}", *names,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        iout, _ = await asyncio.wait_for(insp.communicate(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        return []
+
+    now = datetime.now(timezone.utc)
+    reaped: list[str] = []
+    for line in iout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, started = parts[0].lstrip("/"), parts[1]
+        try:
+            # Docker emits RFC-3339 with nanosecond precision, which
+            # fromisoformat rejects before 3.11 — truncate to microseconds.
+            ts = started.replace("Z", "+00:00")
+            if "." in ts:
+                head, _, tail = ts.partition(".")
+                frac, sign, off = tail.partition("+")
+                ts = f"{head}.{frac[:6]}{sign}{off}" if sign else f"{head}.{frac[:6]}"
+            age = (now - datetime.fromisoformat(ts)).total_seconds()
+        except Exception:  # noqa: BLE001 — an unparseable stamp is not an orphan
+            continue
+        if age <= horizon:
+            continue
+        logger.warning(
+            "[orphan-reap] removing bench solver %s — running %.1fh with no "
+            "in-flight run possible (budget %.0fs); its owner process is gone",
+            name, age / 3600.0, horizon,
+        )
+        await _docker_rm_f(name)
+        reaped.append(name)
+    return reaped
+
 
 # Trailing stderr lines kept per session for crash diagnostics (surfaced in the
 # SolverCrashedError when a solver dies / hangs). Bounded so a chatty solver
@@ -713,8 +809,19 @@ class SolverSession:
             # Bounded reap — never block the caller (and the runtime lock it
             # may hold) forever if child-reaping stalls. See _KILL_REAP_TIMEOUT.
             await asyncio.wait_for(self._proc.wait(), timeout=_KILL_REAP_TIMEOUT)
+            # THE CONTAINER OUTLIVES ITS CLI. SIGKILL of `docker run` detaches;
+            # it does NOT stop the container (same fact _docker_rm_f's docstring
+            # states). This removal used to live ONLY in the TimeoutError branch
+            # below, so the HAPPY path — CLI dies promptly, wait() returns — left
+            # the container running forever. Orphans then accumulated holding
+            # their full 4g memory + 2 CPU reservation and, before the log cap,
+            # wrote unbounded stdout: on 2026-08-23 four of them (up to 9 days
+            # old) were found on the leader, three writing ~19 GB/hour.
+            # Idempotent and bounded, so doing it on every path is free.
+            await _docker_rm_f(self._container_name)
         except ProcessLookupError:
-            pass
+            # The CLI was already gone, but its container may not be.
+            await _docker_rm_f(self._container_name)
         except asyncio.TimeoutError:
             # SIGKILL of the `docker run` CLI doesn't stop the attached
             # container, so proc.wait() hangs and the CLI (+ its threads) leaks
@@ -1002,6 +1109,11 @@ class SolverOrchestrator:
         # concurrent benchmark solvers never collide on the name.
         container_name = f"minotaur-bench-{uuid.uuid4().hex[:12]}"
         cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
+        # ROLE LABEL — what lets the reaper tell a long-lived LIVE solver (serves
+        # /quote for days, must never be reaped) from a BENCH solver (bounded by
+        # TOTAL_BENCHMARK_TIMEOUT, so an old one is provably an orphan). Applied
+        # unconditionally, before caller labels, so it cannot be overridden away.
+        cmd.extend(["--label", f"{SOLVER_ROLE_LABEL}={'live' if live else 'bench'}"])
         if labels:
             for k, v in labels.items():
                 cmd.extend(["--label", f"{k}={v}"])
@@ -1486,6 +1598,22 @@ async def run_benchmark(
         config = BenchmarkConfig()
     if trigger_ground_truth is None:
         trigger_ground_truth = {}
+
+    # Sweep bench solvers stranded by a process that died before it could clean
+    # up (OOM, SIGKILL, container restart) — the one leak an in-session kill()
+    # can never close. Run-start is the natural hook: it needs no scheduler, and
+    # a run is exactly when the host should be clear of stale solvers. Two cheap
+    # docker calls, fully swallowed, and it can only ever match `role=bench`
+    # containers older than the whole benchmark budget.
+    try:
+        _reaped = await reap_orphaned_solver_containers()
+        if _reaped:
+            logger.warning(
+                "[orphan-reap] removed %d stranded bench solver(s) before this "
+                "run: %s", len(_reaped), ", ".join(_reaped),
+            )
+    except Exception as exc:  # noqa: BLE001 — never let a sweep block a run
+        logger.debug("[orphan-reap] sweep failed: %r", exc)
 
     # Fail-closed: when a real simulation is required but none was injected,
     # refuse to run rather than score every scenario on the fabricated mock
