@@ -827,6 +827,25 @@ DOCKER_SECURITY_OPTS = [
     "--cpus=2.0",
     "--pids-limit=256",
     "--tmpfs=/tmp:size=512m",
+    # LOG CAP. Every other resource a solver can consume is bounded above —
+    # memory, swap, CPU, pids, tmpfs, and a read-only rootfs — but its stdout
+    # was not, and docker's default json-file driver has no size limit. A
+    # chatty (or deliberately spammy) solver therefore writes unbounded data to
+    # the VALIDATOR's disk, which no sandbox flag here could stop.
+    #
+    # This is not hypothetical: on 2026-08-22 three solver containers wrote
+    # 74.5GB + 60.1GB + 11.1GB of json logs in ~13h, filled the leader's 193GB
+    # root, and took the api down — /health still answered 200 while every
+    # store-backed endpoint 500'd and `docker exec` failed with "no space left
+    # on device". Rounds stalled for ~5h.
+    #
+    # The driver is pinned to json-file BECAUSE these opts are driver-specific:
+    # a host defaulting to journald would reject `max-size` outright and every
+    # benchmark run would fail to start. Pinning keeps the cap self-consistent
+    # regardless of the daemon's default. 32m × 2 files = 64MB per solver.
+    "--log-driver=json-file",
+    "--log-opt", "max-size=32m",
+    "--log-opt", "max-file=2",
     # Prevent Python from writing .pyc files to the read-only filesystem.
     # Without this, dynamic imports (e.g., strategy auto-discovery) fail
     # silently when __pycache__ can't be created.
