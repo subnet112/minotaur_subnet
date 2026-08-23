@@ -2841,6 +2841,64 @@ def _mock_bridge_for_benchmark(
     )
 
 
+def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> None:
+    """Raise ``RealSimulationUnavailable`` if a destination chain cannot be simulated.
+
+    Two distinct ways a chain is unscoreable, both of which previously produced
+    a silent ``nothing_delivered``:
+
+    * the backend is the WRONG KIND — a substrate chain (Bittensor 964) routed
+      to AnvilSimulator because the Chopsticks sidecar env was never set. Anvil
+      forks EVM state; the native staking precompile at 0x…0805 has no bytecode
+      to fork, so ``AlphaVault.purchaseWrapped`` can never mint.
+    * the backend is the right kind but NOT CONNECTED — the sidecar is down.
+
+    Only chains that actually carry a destination leg are checked, so a dead
+    sidecar for a chain this plan never touches does not defer the round.
+    """
+    legs = ((plan.metadata or {}).get("legs") or [])
+    dest_chains = {
+        leg.get("chain_id") for leg in legs if leg.get("type") == "destination"
+    }
+    dest_chains.discard(None)
+    if not dest_chains:
+        return
+
+    sims = getattr(simulator, "simulators", None)
+    if not isinstance(sims, dict):
+        return
+
+    for chain_id in sorted(dest_chains):
+        backend = sims.get(chain_id)
+        if backend is None:
+            continue
+
+        want_substrate = False
+        try:
+            from minotaur_subnet.chains import registry
+            spec = registry.spec(chain_id)
+            want_substrate = bool(spec and spec.sim_backend == "substrate_chopsticks")
+        except Exception:  # noqa: BLE001
+            want_substrate = False
+
+        if want_substrate and type(backend).__name__ != "SubtensorSimulator":
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} needs the substrate backend but resolved to "
+                f"{type(backend).__name__} — native precompiles cannot execute, so "
+                "destination legs could never deliver. Set "
+                "BITTENSOR_CHOPSTICKS_SIM_RPC_URL (api/validator) and "
+                "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL (benchmark-worker)."
+            )
+
+        probe = getattr(backend, "is_connected", None)
+        if callable(probe) and not probe():
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} destination backend ({type(backend).__name__}) is "
+                "not reachable — deferring rather than scoring rows that cannot "
+                "deliver. Check the chain's simulator sidecar."
+            )
+
+
 async def _measure_destination_delivery(
     simulator: Any,
     plan: ExecutionPlan,
@@ -2922,6 +2980,18 @@ async def _measure_destination_delivery(
     if normalized is None:
         return None, None, None
     plan = normalized
+
+    # A destination chain whose backend cannot run makes the row unscoreable BY
+    # CONSTRUCTION — no plan any miner can write would deliver. Recording it as
+    # nothing_delivered blames the solver for our outage, and that is not a
+    # theoretical concern: on 2026-08-23 both Chopsticks sidecars were dead
+    # (docker reported them Up; they were running=false with no IP) and the
+    # whole fleet logged nothing_delivered on every chain-964 leg for hours.
+    # Several miners spent rounds debugging correct plans.
+    #
+    # Defer LOUD instead, the same fail-closed move the rest of this module
+    # makes when a real simulation is unavailable.
+    _assert_destination_backends_usable(simulator, plan)
 
     try:
         result = await simulator.simulate_cross_chain(
