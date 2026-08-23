@@ -1418,11 +1418,27 @@ class SubmissionStore:
         ``(hotkey, submission_id, status_value)``.
 
         "Live" = still holds or contends for a queue seat: queued, any
-        screening stage, pending selection, benchmarking, scored, waitlisted.
+        screening stage, pending selection, benchmarking, scored.
         REJECTED is out (a lost duplicate frees the structure), and ADOPTED is
         out ON PURPOSE — the champion's own operator must be able to iterate
         on the champion's structure (measured 2026-07-29: a real -123-node
         improvement kept the incumbent's exact structural fingerprint).
+
+        WAITLISTED is out too, and MUST be: rotation is round-scoped
+        (``list_by_round``) and treats waitlisted as TERMINAL, so a waitlisted
+        row is bound to a round that has already closed — it neither holds nor
+        contends for a seat, and NOTHING ever transitions it out (the only
+        other writes are repo-token purge and age pruning). Counting it live
+        made two rules contradict: rotation tells the miner "resubmit next
+        round" while this dedup rejected that resubmit and told them to "wait
+        for <id> to resolve" — a state that never arrives, so a miner
+        waitlisted once could never resubmit that solver again (gimly/UID 118,
+        sub_627e35595788 -> sub_3f8022083752). The cross-ACTOR rule already
+        carves this path out by name (``_reject_cross_actor_copies``: "the
+        waitlist resubmit loop is the designed no-fault path"); this makes the
+        same-OPERATOR rule agree with it and with the rotation contract.
+        Same-round resubmit spam stays bounded by the per-actor round cap,
+        whose counts are over ALL statuses.
 
         Read-only scan, same access pattern as :meth:`fingerprint_usage`.
         """
@@ -1435,7 +1451,6 @@ class SubmissionStore:
             SubmissionStatus.PENDING_SELECTION.value,
             SubmissionStatus.BENCHMARKING.value,
             SubmissionStatus.SCORED.value,
-            SubmissionStatus.WAITLISTED.value,
         }
         out: list[tuple[str, str, str]] = []
         if not fingerprint:
