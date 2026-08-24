@@ -1417,12 +1417,31 @@ class SubmissionStore:
         """Every LIVE submission carrying this STRUCTURAL fingerprint, as
         ``(hotkey, submission_id, status_value)``.
 
-        "Live" = still holds or contends for a queue seat: queued, any
-        screening stage, pending selection, benchmarking, scored.
+        "Live" = still holds or contends for A QUEUE SEAT: queued, any
+        screening stage, pending selection, benchmarking. That is the whole
+        rule — "one queue seat per distinct structure per operator" — so a
+        status that holds no seat does not belong here however recent it is.
         REJECTED is out (a lost duplicate frees the structure), and ADOPTED is
         out ON PURPOSE — the champion's own operator must be able to iterate
         on the champion's structure (measured 2026-07-29: a real -123-node
         improvement kept the incumbent's exact structural fingerprint).
+
+        SCORED is out for the same reason, and this file already said so: the
+        retention sweep lists SCORED among the "terminal end-states safe to
+        prune" (``_RETENTION_PRUNABLE_VALUES``), while this set called it live. Both
+        could not be true. A SCORED submission has been benchmarked — it
+        consumed its seat and released it; what it still contends for is
+        ADOPTION, and ADOPTED is already excluded above with reasoning that
+        transfers verbatim. Nothing moves it out of SCORED either, so the
+        block only lifted when age/cap pruning happened to drop the row,
+        which is a storage bound standing in for a decision.
+
+        Measured on gimly/UID 118 over 8 consecutive rounds, submitting every
+        round: a clean 2-rejected / 1-benched cycle (e29792072 SCORED, then
+        e29792154 + e29792241 rejected as its duplicates; e29792368 SCORED,
+        then e29792452 + e29792544 rejected). Every successful bench cost the
+        miner the next two rounds. This is the same defect as the WAITLISTED
+        one below, found in the same audit and fixed only halfway.
 
         WAITLISTED is out too, and MUST be: rotation is round-scoped
         (``list_by_round``) and treats waitlisted as TERMINAL, so a waitlisted
@@ -1450,7 +1469,6 @@ class SubmissionStore:
             SubmissionStatus.SCREENING_STAGE_3.value,
             SubmissionStatus.PENDING_SELECTION.value,
             SubmissionStatus.BENCHMARKING.value,
-            SubmissionStatus.SCORED.value,
         }
         out: list[tuple[str, str, str]] = []
         if not fingerprint:

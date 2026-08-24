@@ -95,6 +95,7 @@ class TestStoreLiveScan:
             ("dead", "O", SubmissionStatus.REJECTED, "fpA"),
             ("champ", "O", SubmissionStatus.ADOPTED, "fpA"),
             ("other", "B", SubmissionStatus.WAITLISTED, "fpB"),
+            ("benched", "B", SubmissionStatus.SCORED, "fpC"),
         ]:
             sub = st.create(
                 repo_url="src://x", commit_hash="c-" + tag, epoch=1,
@@ -108,8 +109,9 @@ class TestStoreLiveScan:
     def test_live_statuses_in_terminal_and_adopted_out(self, store):
         rows = store.structural_fingerprint_live("fpA")
         hotkeys = sorted(hk for hk, _sid, _st in rows)
-        # REJECTED and ADOPTED (champion iteration!) are excluded.
-        assert hotkeys == ["A1", "O"]
+        # Only the QUEUED row holds a seat. REJECTED, ADOPTED (champion
+        # iteration!), WAITLISTED and SCORED are all excluded.
+        assert hotkeys == ["O"]
 
     def test_waitlisted_is_not_live(self, store):
         """A WAITLISTED row must not hold a structure.
@@ -124,6 +126,38 @@ class TestStoreLiveScan:
         assert "waitlisted" not in statuses
         # fpB's ONLY row is waitlisted -> the structure is fully freed.
         assert store.structural_fingerprint_live("fpB") == []
+
+    def test_scored_is_not_live(self, store):
+        """A SCORED row must not hold a structure either.
+
+        It has already been benchmarked: it consumed its queue seat and
+        released it, and what it still contends for is ADOPTION — which is
+        excluded above for exactly this reason. Nothing transitions a row out
+        of SCORED, so the block lifted only when age/cap pruning happened to
+        drop it; the same file already lists SCORED among the terminal
+        end-states safe to prune.
+
+        Measured on gimly/UID 118 over 8 rounds: a 2-rejected / 1-benched
+        cycle, every successful bench costing the miner the next two rounds.
+        """
+        statuses = {st for _hk, _sid, st in store.structural_fingerprint_live("fpA")}
+        assert "scored" not in statuses
+        # fpC's ONLY row is scored -> the structure is fully freed, so the
+        # miner can resubmit the solver they just had benched.
+        assert store.structural_fingerprint_live("fpC") == []
+
+    def test_only_seat_holding_statuses_are_live(self, store):
+        """The live set IS the seat-holding set — no status may drift in.
+
+        Guards the boundary directly: WAITLISTED and SCORED both used to sit
+        here and both were the same defect, found in the same audit and fixed
+        one at a time.
+        """
+        rows = store.structural_fingerprint_live("fpA")
+        assert {st for _hk, _sid, st in rows} <= {
+            "queued", "screening_stage_1", "screening_stage_2",
+            "screening_stage_3", "pending_selection", "benchmarking",
+        }
 
     def test_exclude_self(self, store):
         rows = store.structural_fingerprint_live("fpA")
