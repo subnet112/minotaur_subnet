@@ -47,6 +47,7 @@ from minotaur_subnet.harness.orchestrator import (
     SolverCrashedError,
     run_benchmark,
 )
+from minotaur_subnet.simulator.cross_chain_bench import intent_requests_cross_chain
 from minotaur_subnet.weight_policy import GENESIS_HOTKEY
 from minotaur_subnet.epoch.relative_scoring import (
     adoption_scored_chains,
@@ -243,6 +244,64 @@ class BenchmarkScorecard:
             total=data.get("total", 0),
             mock_simulation_count=data.get("mock_simulation_count", 0),
         )
+
+
+def benchmark_chain_ids(
+    intents: list[tuple[Any, Any, Any]] | Any,
+) -> list[int]:
+    """Every chain this slate needs a simulator for — SOURCE **and** DESTINATION.
+
+    ``IntentState.chain_id`` is the chain the order ORIGINATES on. For a
+    cross-chain order the delivery chain lives in the params
+    (``dest_chain_id``, derived from CAIP-10 token chains at intake), and it is
+    routinely a chain no order is native to — Bittensor EVM (964) is the whole
+    seeded wTAO -> wAlpha corpus.
+
+    Building the set from sources alone made those chains unscoreable BY
+    CONSTRUCTION, and silently: ``build_rpc_url_map`` never saw 964, so
+    ``MultiChainSimulator.simulators`` had no entry, so ``simulate_cross_chain``
+    took its ``sim is None`` branch and SKIPPED the leg — no interactions, no
+    Transfer logs, no token_transfers. The destination measurement then observed
+    nothing and reported ``nothing_delivered``, which is what a genuinely bad
+    plan looks like. Miners were handed their own correct plans back as
+    failures; gimly (UID 118) burned five rounds on one whose destination call
+    verifies against live mainnet state at every seeded amount.
+
+    Note this also arms the loud-failure contract ``build_rpc_url_map`` already
+    documents ("Callers MUST treat a missing chain as a loud failure, never a
+    silent degradation") — its ``missing_rpc`` check iterates ``chain_ids``, so
+    a destination chain absent from that list could never trip it either.
+
+    Unparseable or absent values are skipped rather than raising: this only ever
+    ADDS chains to provision, and a chain we cannot name is one we cannot
+    provision anyway.
+    """
+    chains: set[int] = set()
+    for row in intents or ():
+        try:
+            state = row[1]
+        except (TypeError, IndexError):
+            continue
+        src = getattr(state, "chain_id", None)
+        try:
+            if src is not None:
+                chains.add(int(src))
+        except (TypeError, ValueError):
+            pass
+        # Destination chains, read through the SAME predicate the delivery
+        # measurement uses, so "needs a simulator" and "is a cross-chain order"
+        # can never drift apart.
+        try:
+            params = (
+                state.raw_params_view()
+                if state is not None and hasattr(state, "raw_params_view")
+                else {}
+            )
+            if intent_requests_cross_chain(params, src):
+                chains.add(int(params.get("dest_chain_id")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return sorted(chains) or [1]
 
 
 def _allow_subprocess_benchmark() -> bool:
@@ -1223,7 +1282,7 @@ class BenchmarkWorker:
         try:
             results = await run_benchmark(
                 session, intents,
-                config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
+                config=BenchmarkConfig(chain_ids=benchmark_chain_ids(intents)),
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
@@ -1247,7 +1306,7 @@ class BenchmarkWorker:
         try:
             results = await run_benchmark(
                 session, intents,
-                config=BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1})),
+                config=BenchmarkConfig(chain_ids=benchmark_chain_ids(intents)),
                 score_fn=score_fn,
                 simulator=self._simulator,
                 fork_block=self._epoch_block_number,
@@ -2064,7 +2123,7 @@ class BenchmarkWorker:
                     logger.warning("[shadow-vote] historical load failed: %s", exc)
 
         _require_real_sim = require_real_sim_default()
-        cfg = BenchmarkConfig(chain_ids=list({s.chain_id for _, s, _ in intents} or {1}))
+        cfg = BenchmarkConfig(chain_ids=benchmark_chain_ids(intents))
 
         async def _bench(image: str) -> list[BenchmarkResult]:
             orch = SolverOrchestrator()
