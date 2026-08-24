@@ -2871,9 +2871,16 @@ def _mock_bridge_for_benchmark(
 def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> None:
     """Raise ``RealSimulationUnavailable`` if a destination chain cannot be simulated.
 
-    Two distinct ways a chain is unscoreable, both of which previously produced
+    Three distinct ways a chain is unscoreable, all of which previously produced
     a silent ``nothing_delivered``:
 
+    * the backend is ABSENT — the chain is one we claim to simulate (a WIRED
+      registry spec) but no simulator was built for it, so the destination leg
+      is never dispatched at all: ``MultiChainSimulator.simulate_cross_chain``
+      writes ``{"success": False, "error": "No simulator for chain N"}`` into
+      the leg result, that dict carries no ``token_transfers``, and every
+      delivery bucket lands on zero. Indistinguishable, from the row, from a
+      plan that delivered nothing.
     * the backend is the WRONG KIND — a substrate chain (Bittensor 964) routed
       to AnvilSimulator because the Chopsticks sidecar env was never set. Anvil
       forks EVM state; the native staking precompile at 0x…0805 has no bytecode
@@ -2882,6 +2889,14 @@ def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> 
 
     Only chains that actually carry a destination leg are checked, so a dead
     sidecar for a chain this plan never touches does not defer the round.
+
+    An UNWIRED or unregistered destination chain is deliberately NOT a defer.
+    The destination chain comes off a solver-authored plan, so deferring on any
+    chain we cannot simulate would let one submission declaring
+    ``dest_chain_id: 42161`` stall every round it lands in. We never claimed to
+    simulate those, so it is a fact about the plan, not an outage: it is
+    diagnosed per-row as ``destination_unsimulated`` instead, which costs that
+    row and nobody else's.
     """
     legs = ((plan.metadata or {}).get("legs") or [])
     dest_chains = {
@@ -2897,16 +2912,29 @@ def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> 
 
     for chain_id in sorted(dest_chains):
         backend = sims.get(chain_id)
-        if backend is None:
-            continue
 
-        want_substrate = False
+        spec = None
         try:
             from minotaur_subnet.chains import registry
             spec = registry.spec(chain_id)
-            want_substrate = bool(spec and spec.sim_backend == "substrate_chopsticks")
         except Exception:  # noqa: BLE001
-            want_substrate = False
+            spec = None
+
+        if backend is None:
+            if spec is None or not spec.wired:
+                # Not a chain we ever claimed to simulate — the plan's own
+                # declaration. Diagnosed on the row, never a round-wide defer.
+                continue
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} carries a destination leg and IS a wired "
+                f"chain, but no simulator was built for it — the leg would "
+                f"never be dispatched and the row would read nothing_delivered "
+                f"through no fault of the plan. Check this chain's sim RPC env "
+                f"({', '.join(spec.sim_rpc_envs) or 'sim_rpc_envs'}) on the "
+                f"benchmark worker."
+            )
+
+        want_substrate = bool(spec and spec.sim_backend == "substrate_chopsticks")
 
         if want_substrate and type(backend).__name__ != "SubtensorSimulator":
             raise RealSimulationUnavailable(
@@ -3089,8 +3117,33 @@ async def _measure_destination_delivery(
     delivered = 0                 # right token, credited recipient
     wrong_token_to_recipient = 0  # credited recipient, but not what was asked
     right_token_elsewhere = 0     # what was asked, delivered somewhere we don't count
+    # ...and WHY there were no transfers to bucket, which the three counters
+    # above cannot express. A leg that reverted and a leg that was never
+    # dispatched both yield an empty token_transfers list, and so does a leg
+    # that ran cleanly and simply moved nothing — three causes needing three
+    # different fixes, collapsed into one "nothing_delivered" until now.
+    #
+    # Read off the leg RESULT, never by matching the error text: this rides a
+    # persisted row that leader and follower compare, so a wording difference
+    # between two builds must never read as a data difference.
+    legs_reverted = 0
+    legs_unsimulated = 0
+    sims_map = getattr(simulator, "simulators", None)
     for leg_id in dest_ids:
-        for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
+        _res = leg_results.get(leg_id) or {}
+        if not _res.get("success", True):
+            _leg_chain = next(
+                (
+                    leg.get("chain_id") for leg in legs_meta
+                    if leg.get("leg_id") == leg_id
+                ),
+                None,
+            )
+            if isinstance(sims_map, dict) and _leg_chain not in sims_map:
+                legs_unsimulated += 1
+            else:
+                legs_reverted += 1
+        for t in _res.get("token_transfers", []):
             try:
                 amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
@@ -3109,6 +3162,7 @@ async def _measure_destination_delivery(
         diagnosis = _delivery_diagnosis(
             expected_token, recipients,
             wrong_token_to_recipient, right_token_elsewhere,
+            legs_reverted=legs_reverted, legs_unsimulated=legs_unsimulated,
         )
         logger.info(
             "[benchmark] destination legs credited 0 of %s — %s",
@@ -3123,6 +3177,9 @@ def _delivery_diagnosis(
     recipients: set[str],
     wrong_token_to_recipient: int,
     right_token_elsewhere: int,
+    *,
+    legs_reverted: int = 0,
+    legs_unsimulated: int = 0,
 ) -> dict[str, Any]:
     """Why did a cross-chain plan deliver nothing? Answered in a stable code.
 
@@ -3143,10 +3200,26 @@ def _delivery_diagnosis(
       ``wrong_token``       something reached a counted recipient, but not what
                             the intent asked for — the signature of bridging
                             and skipping the destination swap.
-      ``nothing_delivered`` the destination legs moved nothing at all to
-                            anyone. Usually an empty or reverting leg.
+      ``destination_unsimulated``
+                            the destination leg was never DISPATCHED — the
+                            plan named a chain this benchmark has no simulator
+                            for, so nothing ran and there was nothing to
+                            measure. Not a fact about the plan's quality.
+      ``destination_leg_reverted``
+                            the destination leg RAN and failed. The journey
+                            reached the far chain; the call there did not
+                            succeed.
+      ``nothing_delivered`` the destination legs ran, succeeded, and moved
+                            nothing to anyone. An empty leg.
       ``no_output_token``   the intent declared no output token, so there was
                             nothing to measure against (set upstream).
+
+    The last three used to be one code. A miner reading ``nothing_delivered``
+    could not tell whether their leg was empty, reverted, or never ran, and
+    those need three different fixes — one of them ours, not theirs. Splitting
+    them is the whole reason a fleet-wide chain-964 outage (2026-08-23, both
+    Chopsticks sidecars dead) read to every miner as their own bad plan, and
+    why it stayed arguable for days afterwards.
 
     Two codes are set by the CALLER rather than here, because they are decided
     before there is any journey to measure — ``no_output_token`` above, and
@@ -3155,16 +3228,24 @@ def _delivery_diagnosis(
 
     ``wrong_recipient`` outranks ``wrong_token`` when both are present: it is
     the closer miss and the cheaper fix, so it is the more useful thing to say.
+    A leg that never ran outranks everything — no advice about tokens or
+    recipients is honest when the call was never dispatched.
     """
-    if right_token_elsewhere:
+    if legs_unsimulated:
+        code = "destination_unsimulated"
+    elif right_token_elsewhere:
         code = "wrong_recipient"
     elif wrong_token_to_recipient:
         code = "wrong_token"
+    elif legs_reverted:
+        code = "destination_leg_reverted"
     else:
         code = "nothing_delivered"
     return {
         "code": code,
         "requested_token": expected_token,
+        "legs_reverted": str(legs_reverted),
+        "legs_unsimulated": str(legs_unsimulated),
         # Sorted so two validators emit byte-identical diagnoses for the same
         # observation — this is a set, and set order is not stable.
         "credited_recipients": sorted(recipients),
