@@ -980,6 +980,43 @@ class TestCrossChainReportBlock:
         b = self._block([{"destination_delivered": "900"}])
         assert b == {"orders": 1, "credited": 1, "reasons": {}}
 
+    def test_amount_source_is_surfaced(self):
+        """It was measured and persisted on every row, and shown to nobody.
+
+        A miner could see "credited 0" with no way to tell WHICH measurement
+        produced it, and the platform could not answer "is this the
+        deterministic bridge model?" without reading the store by hand.
+        """
+        b = self._block([
+            {"destination_delivered": "900",
+             "destination_amount_source": "deterministic_model"},
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "nothing_delivered",
+             "destination_amount_source": "deterministic_model"},
+        ])
+        assert b["amount_sources"] == {"deterministic_model": 2}
+
+    def test_amount_sources_are_sorted_for_a_stable_surface(self):
+        b = self._block([
+            {"destination_delivered": "1", "destination_amount_source": "z"},
+            {"destination_delivered": "1", "destination_amount_source": "a"},
+        ])
+        assert list(b["amount_sources"]) == ["a", "z"]
+
+    def test_a_row_with_no_source_adds_no_key(self):
+        """Byte-identical to before for every row that never measured one."""
+        b = self._block([{"destination_delivered": "900"}])
+        assert "amount_sources" not in b
+
+    def test_the_never_dispatched_hint_does_not_blame_the_miner(self):
+        """The old text said "usually an empty destination leg, or one that
+        reverted" — advice about a plan, for a row where nothing ran."""
+        b = self._block([
+            {"destination_delivered": "0",
+             "destination_delivery_reason": "destination_unsimulated"},
+        ])
+        assert "not a judgement on your plan" in b["hint"].lower()
+
 
 class TestBridgeCapabilityDescriptor:
     """The scored path had NO answer to 'what can a bridge carry?'.
