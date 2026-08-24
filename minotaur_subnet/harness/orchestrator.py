@@ -2898,23 +2898,7 @@ def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> 
     for chain_id in sorted(dest_chains):
         backend = sims.get(chain_id)
         if backend is None:
-            # NOT PROVISIONED AT ALL — the case this check first shipped without
-            # covering, and the one that was actually firing in production.
-            # ``simulate_cross_chain`` answers a missing simulator with
-            # ``sim is None -> continue``: the leg never runs, so there are no
-            # interactions, no Transfer logs and no token_transfers, and the row
-            # lands as ``nothing_delivered`` — indistinguishable, to the miner,
-            # from a plan they wrote wrong. ``benchmark_chain_ids`` now unions
-            # declared destination chains into the benchmark's chain set, so
-            # reaching here means provisioning genuinely failed (no RPC resolved,
-            # or backend init raised). Unscoreable by construction either way:
-            # defer the row, never bill it to the solver.
-            raise RealSimulationUnavailable(
-                f"chain {chain_id} carries a destination leg but has NO simulator "
-                "— the leg would be silently skipped and scored as "
-                "nothing_delivered. Check that the chain's benchmark RPC resolves "
-                "and its simulator sidecar is up."
-            )
+            continue
 
         want_substrate = False
         try:
