@@ -230,18 +230,7 @@ _SPECS: tuple[ChainSpec, ...] = (
         sim_rpc_envs=("BITTENSOR_CHOPSTICKS_SIM_RPC_URL", "BITTENSOR_EVM_RPC_URL"),
         upstream_rpc_env="BITTENSOR_EVM_UPSTREAM_RPC_URL",
         sim_backend="substrate_chopsticks",
-        # Chopsticks FIRST: 964's sim_backend is substrate, so the benchmark's
-        # simulator for this chain is the Chopsticks sidecar — not the anvil-btevm
-        # EVM fork on :8547. Resolving the anvil URL here handed
-        # ``SubtensorSimulator(sidecar_url=...)`` an anvil endpoint and it spoke
-        # the wrong dialect to it. Latent until destination chains began being
-        # provisioned at all (``benchmark_chain_ids``); it would have been the
-        # very next failure. The anvil entries stay as the degraded EVM-only
-        # fallback, matching ``_build_backend``'s activation gate: no Chopsticks
-        # env -> AnvilSimulator -> the destination-backend check defers the row.
         benchmark_rpc_envs=(
-            "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL",
-            "BITTENSOR_CHOPSTICKS_SIM_RPC_URL",
             "BENCHMARK_ANVIL_RPC_BTEVM",
             "BITTENSOR_EVM_SIM_RPC_URL",
             "BITTENSOR_EVM_RPC_URL",
