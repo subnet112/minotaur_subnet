@@ -41,7 +41,7 @@ class TestMode:
 
 class TestSameOperatorDuplicates:
     def test_same_hotkey_duplicate_is_flagged(self):
-        live = [("O", "sub_orig", "waitlisted")]
+        live = [("O", "sub_orig", "queued")]
         assert structural_duplicates_same_operator(
             live, hotkey="O", resolver=RESOLVER,
         ) == ["sub_orig"]
@@ -89,7 +89,8 @@ class TestStoreLiveScan:
 
         st = SubmissionStore(persist_path=tmp_path / "submissions.json")
         for tag, hk, status, fp in [
-            ("live1", "O", SubmissionStatus.WAITLISTED, "fpA"),
+            ("wait1", "O", SubmissionStatus.WAITLISTED, "fpA"),
+            ("live1", "O", SubmissionStatus.QUEUED, "fpA"),
             ("live2", "A1", SubmissionStatus.SCORED, "fpA"),
             ("dead", "O", SubmissionStatus.REJECTED, "fpA"),
             ("champ", "O", SubmissionStatus.ADOPTED, "fpA"),
@@ -109,6 +110,20 @@ class TestStoreLiveScan:
         hotkeys = sorted(hk for hk, _sid, _st in rows)
         # REJECTED and ADOPTED (champion iteration!) are excluded.
         assert hotkeys == ["A1", "O"]
+
+    def test_waitlisted_is_not_live(self, store):
+        """A WAITLISTED row must not hold a structure.
+
+        Rotation is round-scoped and treats waitlisted as TERMINAL, and
+        nothing ever transitions a row out of it — so counting it live made
+        "resubmit next round" (rotation) and "wait for <id> to resolve"
+        (dedup) contradict, permanently locking a once-waitlisted miner out
+        of resubmitting that solver.
+        """
+        statuses = {st for _hk, _sid, st in store.structural_fingerprint_live("fpA")}
+        assert "waitlisted" not in statuses
+        # fpB's ONLY row is waitlisted -> the structure is fully freed.
+        assert store.structural_fingerprint_live("fpB") == []
 
     def test_exclude_self(self, store):
         rows = store.structural_fingerprint_live("fpA")
