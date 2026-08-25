@@ -39,12 +39,13 @@ import os
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import MutableMapping, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from minotaur_subnet.chains import registry
 from minotaur_subnet.shared.types import (
+    plan_metadata_fields,
     AppIntentDefinition,
     ExecutionPlan,
     Interaction,
@@ -2028,11 +2029,25 @@ async def _process_scenario(
                         token_balances = _build_token_balances(state)
                         # Ensure the plan's metadata carries chain_id so the
                         # MultiChainSimulator routes to the correct Anvil fork.
+                        #
+                        # ONLY when metadata is a dict. An App that abi.decodes
+                        # its metadata takes raw bytes (#1617), and this block
+                        # used to fail TWICE on those: `"chain_id" not in
+                        # plan.metadata` is a SUBSTRING test on a str — it passes
+                        # for the wrong reason, and could just as easily skip for
+                        # the wrong reason — and the assignment then raises
+                        # `'str' object does not support item assignment`.
+                        #
+                        # Skipping it is safe: chain selection is already driven
+                        # by the AUTHORITATIVE `chain_id` kwarg passed below
+                        # (_get_simulator treats the metadata hint as a
+                        # cross-check only), so this is belt-and-braces for
+                        # legacy callers, never the routing source here.
                         if state and state.chain_id and plan:
                             if plan.metadata is None:
                                 plan.metadata = {}
-                            if "chain_id" not in plan.metadata:
-                                plan.metadata["chain_id"] = state.chain_id
+                            if isinstance(plan.metadata, MutableMapping):
+                                plan.metadata.setdefault("chain_id", state.chain_id)
                         # Build intent_order so the simulator uses the full
                         # scoreIntent contract path instead of the bare path.
                         # The pinned fork block's timestamp anchors the order
@@ -2898,7 +2913,7 @@ def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> 
     diagnosed per-row as ``destination_unsimulated`` instead, which costs that
     row and nobody else's.
     """
-    legs = ((plan.metadata or {}).get("legs") or [])
+    legs = (plan_metadata_fields(plan).get("legs") or [])
     dest_chains = {
         leg.get("chain_id") for leg in legs if leg.get("type") == "destination"
     }
@@ -3063,7 +3078,7 @@ async def _measure_destination_delivery(
     estimate = getattr(result, "bridge_estimate", None) or {}
     amount_source = estimate.get("amount_source")
 
-    legs_meta = (plan.metadata or {}).get("legs") or []
+    legs_meta = plan_metadata_fields(plan).get("legs") or []
     leg_results = getattr(result, "leg_results", None) or {}
     dest_ids = [
         leg["leg_id"] for leg in legs_meta if leg.get("type") == "destination"
@@ -3306,7 +3321,7 @@ def _delivery_recipients(
         # scoreIntent path submits as.
         out.add(_ANVIL_DEFAULT_ACCOUNT.lower())
 
-    dst_chain = (plan.metadata or {}).get("dst_chain_id")
+    dst_chain = plan_metadata_fields(plan).get("dst_chain_id")
     app_addresses = control.get("_app_addresses") or {}
     if dst_chain is not None and isinstance(app_addresses, Mapping):
         try:
