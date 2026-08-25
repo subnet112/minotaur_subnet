@@ -238,7 +238,13 @@ _SPECS: tuple[ChainSpec, ...] = (
         proxy_upstream_envs=("BITTENSOR_EVM_RPC_URL", "BITTENSOR_EVM_UPSTREAM_RPC_URL"),
         boot_rpc_envs=("BITTENSOR_EVM_RPC_URL",),
         is_anchor=False,
-        lookback_epochs=1,
+        # ~12s blocks, same profile as Ethereum: 12 confirmations put the
+        # confirmed tip ~144s behind head, so a 1-epoch (60s) anchor can NEVER be
+        # confirm-bracketed and find_pin_block defers EVERY epoch, forever. The
+        # fork then never re-pins and sits at whatever block its sidecar booted
+        # at — measured 2026-08-25 at 9,562 blocks / 32h stale. 3 epochs = 180s
+        # > 144s, the same margin and the same reason as chain 1 above.
+        lookback_epochs=3,
         fee_floor_wei=330_000_000_000_000,
         fallback_gas_price_wei=25_000_000_000,
     ),
