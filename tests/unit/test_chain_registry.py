@@ -128,7 +128,12 @@ def test_anchor_chains_is_base_only():
 def test_lookback_epochs_eth_is_three():
     assert registry.lookback_epochs(1) == 3
     assert registry.lookback_epochs(8453) == 1
-    assert registry.lookback_epochs(964) == 1
+    # 964 was 1 and that was the bug: ~12s blocks x 12 confirmations puts the
+    # confirmed tip ~144s behind head, which a 60s anchor can never bracket, so
+    # the chain deferred its fork pin EVERY epoch and its benchmark fork never
+    # re-pinned (measured 9,562 blocks / 32h stale on the leader 2026-08-25).
+    # Same block profile as chain 1 above, so the same 3 epochs.
+    assert registry.lookback_epochs(964) == 3
     assert registry.lookback_epochs(999) == 1  # unknown -> default
 
 

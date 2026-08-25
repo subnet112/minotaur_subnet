@@ -704,8 +704,23 @@ _DELIVERY_REASON_HINTS = {
         "destination swap. Only the asset the intent asked for is credited."
     ),
     "nothing_delivered": (
-        "The destination legs moved nothing to anyone. Usually an empty "
-        "destination leg, or one that reverted."
+        "The destination legs RAN, succeeded, and moved nothing to anyone — "
+        "an empty destination leg. (A leg that reverted, or one that was "
+        "never dispatched, now reports its own code instead of this one.)"
+    ),
+    "destination_leg_reverted": (
+        "Your destination leg RAN on the far chain and the call failed. The "
+        "journey and the routing are fine; the destination call itself is "
+        "not. Dry-run it against `POST /v1/apps/{app_id}/score`, which "
+        "executes the same legs and returns the same measurement."
+    ),
+    "destination_unsimulated": (
+        "The destination leg was NEVER DISPATCHED: the plan named a chain "
+        "this benchmark has no simulator for, so nothing ran and there was "
+        "nothing to measure. This is not a judgement on your plan. Check the "
+        "`dest_chain_id` you emitted against the chains the platform "
+        "simulates; if it is one of them, this is our outage and not yours — "
+        "please report it."
     ),
     "no_output_token": (
         "The intent declared no `output_token`, so there was nothing to "
@@ -739,6 +754,12 @@ def _cross_chain_delivery_block(details: Any) -> dict[str, Any] | None:
     considered = 0
     credited = 0
     reasons: dict[str, int] = {}
+    # WHERE the credited amount came from. Already measured and persisted per
+    # row, and never surfaced — so a miner could see "credited 0" without being
+    # able to tell which of the two measurements produced it, and the platform
+    # could not answer "is this the deterministic bridge model or something
+    # else?" without reading the store by hand.
+    sources: dict[str, int] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -747,6 +768,9 @@ def _cross_chain_delivery_block(details: Any) -> dict[str, Any] | None:
         if delivered is None and reason is None:
             continue  # single-chain row — the overwhelming majority
         considered += 1
+        src = row.get("destination_amount_source")
+        if src:
+            sources[str(src)] = sources.get(str(src), 0) + 1
         try:
             if int(delivered or 0) > 0:
                 credited += 1
@@ -765,6 +789,8 @@ def _cross_chain_delivery_block(details: Any) -> dict[str, Any] | None:
         # Sorted for a stable surface across validators and polls.
         "reasons": dict(sorted(reasons.items())),
     }
+    if sources:
+        block["amount_sources"] = dict(sorted(sources.items()))
     if reasons:
         # Lead with the most common cause; ties broken by code so the hint a
         # miner sees does not flip between two equally-frequent reasons.

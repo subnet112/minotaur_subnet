@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import base64
 import json
 import logging
@@ -120,6 +121,121 @@ async def _docker_rm_f(name: str) -> None:
         await asyncio.wait_for(rm.wait(), timeout=_KILL_REAP_TIMEOUT)
     except Exception:  # noqa: BLE001 — cleanup path, never propagate
         pass
+
+
+# Docker label distinguishing a BENCH solver (one benchmark run, bounded by
+# TOTAL_BENCHMARK_TIMEOUT) from the LIVE runtime solver behind /quote, which is
+# long-lived and must never be reaped.
+#
+# harness.runtime_solver introduced this label and reaps its own live orphans
+# with it, but it IMPORTS from this module — so the constants live HERE, at the
+# bottom of the dependency edge, and runtime_solver re-exports them under its
+# original names. One definition, no cycle, and the two can never disagree.
+SOLVER_ROLE_LABEL = "minotaur.role"
+SOLVER_ROLE_LIVE = "live-solver"
+SOLVER_ROLE_BENCH = "bench"
+
+
+def _orphan_reap_age_seconds() -> float:
+    """Age past which a RUNNING bench container is provably an orphan.
+
+    Anchored to TOTAL_BENCHMARK_TIMEOUT rather than a bare constant: a benchmark
+    run cannot outlive its own budget, so a multiple of it cannot mistake an
+    in-flight run for an orphan — including a run belonging to a DIFFERENT
+    process (the api and the benchmark-worker both spawn solvers and cannot see
+    each other's sessions, which rules out any ownership-tracking scheme).
+    """
+    raw = os.environ.get("BENCHMARK_ORPHAN_REAP_AGE_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 3.0 * TOTAL_BENCHMARK_TIMEOUT
+
+
+async def reap_orphaned_solver_containers(*, age_s: float | None = None) -> list[str]:
+    """Remove RUNNING bench solver containers older than the orphan age.
+
+    A container outlives its ``docker run`` CLI, so any path that loses the CLI
+    without an explicit removal strands one forever. :meth:`SolverSession.kill`
+    now always removes its own, which closes the ordinary leak; this is the
+    backstop for the paths no session can clean up after — the owning PROCESS
+    dying (OOM, SIGKILL, container restart), where ``kill()`` never runs at all.
+
+    Safety comes from the role label, not from ownership: only
+    ``minotaur.role=bench`` is considered, so a live solver serving /quote is
+    never a candidate no matter how long it has been up.
+
+    NOT scoped by ``minotaur.launcher`` the way runtime_solver's live-solver
+    reap is. That scoping exists because several API instances can share one
+    host docker.sock and would otherwise kill each other's IN-USE containers
+    mid-INITIALIZE — a live solver has no bounded lifetime, so role alone cannot
+    tell "in use" from "stranded". A bench container can: it cannot outlive
+    TOTAL_BENCHMARK_TIMEOUT, so anything past a multiple of that is stranded no
+    matter which instance started it. Age is the stronger guarantee here, and it
+    also reaps orphans left by an instance that is GONE — which launcher
+    scoping, keyed on the running instance's own id, structurally cannot.
+
+    Best-effort and fully swallowed — reaping is never allowed to break a run.
+
+    Returns the names removed (for logging/tests).
+    """
+    horizon = _orphan_reap_age_seconds() if age_s is None else age_s
+    if horizon <= 0:
+        return []
+    try:
+        ps = await asyncio.create_subprocess_exec(
+            "docker", "ps",
+            "--filter", f"label={SOLVER_ROLE_LABEL}={SOLVER_ROLE_BENCH}",
+            "--format", "{{.Names}}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(ps.communicate(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001 — a sweep must never break the run
+        return []
+    names = [n for n in out.decode("utf-8", "replace").split() if n]
+    if not names:
+        return []
+
+    try:
+        insp = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "--format", "{{.Name}} {{.State.StartedAt}}", *names,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        iout, _ = await asyncio.wait_for(insp.communicate(), timeout=_KILL_REAP_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        return []
+
+    now = datetime.now(timezone.utc)
+    reaped: list[str] = []
+    for line in iout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, started = parts[0].lstrip("/"), parts[1]
+        try:
+            # Docker emits RFC-3339 with nanosecond precision, which
+            # fromisoformat rejects before 3.11 — truncate to microseconds.
+            ts = started.replace("Z", "+00:00")
+            if "." in ts:
+                head, _, tail = ts.partition(".")
+                frac, sign, off = tail.partition("+")
+                ts = f"{head}.{frac[:6]}{sign}{off}" if sign else f"{head}.{frac[:6]}"
+            age = (now - datetime.fromisoformat(ts)).total_seconds()
+        except Exception:  # noqa: BLE001 — an unparseable stamp is not an orphan
+            continue
+        if age <= horizon:
+            continue
+        logger.warning(
+            "[orphan-reap] removing bench solver %s — running %.1fh with no "
+            "in-flight run possible (budget %.0fs); its owner process is gone",
+            name, age / 3600.0, horizon,
+        )
+        await _docker_rm_f(name)
+        reaped.append(name)
+    return reaped
+
 
 # Trailing stderr lines kept per session for crash diagnostics (surfaced in the
 # SolverCrashedError when a solver dies / hangs). Bounded so a chatty solver
@@ -713,8 +829,19 @@ class SolverSession:
             # Bounded reap — never block the caller (and the runtime lock it
             # may hold) forever if child-reaping stalls. See _KILL_REAP_TIMEOUT.
             await asyncio.wait_for(self._proc.wait(), timeout=_KILL_REAP_TIMEOUT)
+            # THE CONTAINER OUTLIVES ITS CLI. SIGKILL of `docker run` detaches;
+            # it does NOT stop the container (same fact _docker_rm_f's docstring
+            # states). This removal used to live ONLY in the TimeoutError branch
+            # below, so the HAPPY path — CLI dies promptly, wait() returns — left
+            # the container running forever. Orphans then accumulated holding
+            # their full 4g memory + 2 CPU reservation and, before the log cap,
+            # wrote unbounded stdout: on 2026-08-23 four of them (up to 9 days
+            # old) were found on the leader, three writing ~19 GB/hour.
+            # Idempotent and bounded, so doing it on every path is free.
+            await _docker_rm_f(self._container_name)
         except ProcessLookupError:
-            pass
+            # The CLI was already gone, but its container may not be.
+            await _docker_rm_f(self._container_name)
         except asyncio.TimeoutError:
             # SIGKILL of the `docker run` CLI doesn't stop the attached
             # container, so proc.wait() hangs and the CLI (+ its threads) leaks
@@ -827,6 +954,25 @@ DOCKER_SECURITY_OPTS = [
     "--cpus=2.0",
     "--pids-limit=256",
     "--tmpfs=/tmp:size=512m",
+    # LOG CAP. Every other resource a solver can consume is bounded above —
+    # memory, swap, CPU, pids, tmpfs, and a read-only rootfs — but its stdout
+    # was not, and docker's default json-file driver has no size limit. A
+    # chatty (or deliberately spammy) solver therefore writes unbounded data to
+    # the VALIDATOR's disk, which no sandbox flag here could stop.
+    #
+    # This is not hypothetical: on 2026-08-22 three solver containers wrote
+    # 74.5GB + 60.1GB + 11.1GB of json logs in ~13h, filled the leader's 193GB
+    # root, and took the api down — /health still answered 200 while every
+    # store-backed endpoint 500'd and `docker exec` failed with "no space left
+    # on device". Rounds stalled for ~5h.
+    #
+    # The driver is pinned to json-file BECAUSE these opts are driver-specific:
+    # a host defaulting to journald would reject `max-size` outright and every
+    # benchmark run would fail to start. Pinning keeps the cap self-consistent
+    # regardless of the daemon's default. 32m × 2 files = 64MB per solver.
+    "--log-driver=json-file",
+    "--log-opt", "max-size=32m",
+    "--log-opt", "max-file=2",
     # Prevent Python from writing .pyc files to the read-only filesystem.
     # Without this, dynamic imports (e.g., strategy auto-discovery) fail
     # silently when __pycache__ can't be created.
@@ -983,6 +1129,18 @@ class SolverOrchestrator:
         # concurrent benchmark solvers never collide on the name.
         container_name = f"minotaur-bench-{uuid.uuid4().hex[:12]}"
         cmd = ["docker", "run", "--rm", "-i", "--name", container_name]
+        # ROLE LABEL — what lets the reaper tell a BENCH solver (bounded by
+        # TOTAL_BENCHMARK_TIMEOUT, so an old one is provably an orphan) from the
+        # LIVE runtime solver, which serves /quote for days and must never be
+        # reaped.
+        #
+        # ONLY the bench value is stamped here. The live path supplies its own
+        # `minotaur.role=live-solver` through `labels` (runtime_solver owns that
+        # constant and reaps live orphans with it), and docker applies the LAST
+        # --label for a repeated key — so stamping a live value here would be
+        # dead weight that the caller silently overrides anyway.
+        if not live:
+            cmd.extend(["--label", f"{SOLVER_ROLE_LABEL}={SOLVER_ROLE_BENCH}"])
         if labels:
             for k, v in labels.items():
                 cmd.extend(["--label", f"{k}={v}"])
@@ -1467,6 +1625,22 @@ async def run_benchmark(
         config = BenchmarkConfig()
     if trigger_ground_truth is None:
         trigger_ground_truth = {}
+
+    # Sweep bench solvers stranded by a process that died before it could clean
+    # up (OOM, SIGKILL, container restart) — the one leak an in-session kill()
+    # can never close. Run-start is the natural hook: it needs no scheduler, and
+    # a run is exactly when the host should be clear of stale solvers. Two cheap
+    # docker calls, fully swallowed, and it can only ever match `role=bench`
+    # containers older than the whole benchmark budget.
+    try:
+        _reaped = await reap_orphaned_solver_containers()
+        if _reaped:
+            logger.warning(
+                "[orphan-reap] removed %d stranded bench solver(s) before this "
+                "run: %s", len(_reaped), ", ".join(_reaped),
+            )
+    except Exception as exc:  # noqa: BLE001 — never let a sweep block a run
+        logger.debug("[orphan-reap] sweep failed: %r", exc)
 
     # Fail-closed: when a real simulation is required but none was injected,
     # refuse to run rather than score every scenario on the fabricated mock
@@ -2694,6 +2868,92 @@ def _mock_bridge_for_benchmark(
     )
 
 
+def _assert_destination_backends_usable(simulator: Any, plan: ExecutionPlan) -> None:
+    """Raise ``RealSimulationUnavailable`` if a destination chain cannot be simulated.
+
+    Three distinct ways a chain is unscoreable, all of which previously produced
+    a silent ``nothing_delivered``:
+
+    * the backend is ABSENT — the chain is one we claim to simulate (a WIRED
+      registry spec) but no simulator was built for it, so the destination leg
+      is never dispatched at all: ``MultiChainSimulator.simulate_cross_chain``
+      writes ``{"success": False, "error": "No simulator for chain N"}`` into
+      the leg result, that dict carries no ``token_transfers``, and every
+      delivery bucket lands on zero. Indistinguishable, from the row, from a
+      plan that delivered nothing.
+    * the backend is the WRONG KIND — a substrate chain (Bittensor 964) routed
+      to AnvilSimulator because the Chopsticks sidecar env was never set. Anvil
+      forks EVM state; the native staking precompile at 0x…0805 has no bytecode
+      to fork, so ``AlphaVault.purchaseWrapped`` can never mint.
+    * the backend is the right kind but NOT CONNECTED — the sidecar is down.
+
+    Only chains that actually carry a destination leg are checked, so a dead
+    sidecar for a chain this plan never touches does not defer the round.
+
+    An UNWIRED or unregistered destination chain is deliberately NOT a defer.
+    The destination chain comes off a solver-authored plan, so deferring on any
+    chain we cannot simulate would let one submission declaring
+    ``dest_chain_id: 42161`` stall every round it lands in. We never claimed to
+    simulate those, so it is a fact about the plan, not an outage: it is
+    diagnosed per-row as ``destination_unsimulated`` instead, which costs that
+    row and nobody else's.
+    """
+    legs = ((plan.metadata or {}).get("legs") or [])
+    dest_chains = {
+        leg.get("chain_id") for leg in legs if leg.get("type") == "destination"
+    }
+    dest_chains.discard(None)
+    if not dest_chains:
+        return
+
+    sims = getattr(simulator, "simulators", None)
+    if not isinstance(sims, dict):
+        return
+
+    for chain_id in sorted(dest_chains):
+        backend = sims.get(chain_id)
+
+        spec = None
+        try:
+            from minotaur_subnet.chains import registry
+            spec = registry.spec(chain_id)
+        except Exception:  # noqa: BLE001
+            spec = None
+
+        if backend is None:
+            if spec is None or not spec.wired:
+                # Not a chain we ever claimed to simulate — the plan's own
+                # declaration. Diagnosed on the row, never a round-wide defer.
+                continue
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} carries a destination leg and IS a wired "
+                f"chain, but no simulator was built for it — the leg would "
+                f"never be dispatched and the row would read nothing_delivered "
+                f"through no fault of the plan. Check this chain's sim RPC env "
+                f"({', '.join(spec.sim_rpc_envs) or 'sim_rpc_envs'}) on the "
+                f"benchmark worker."
+            )
+
+        want_substrate = bool(spec and spec.sim_backend == "substrate_chopsticks")
+
+        if want_substrate and type(backend).__name__ != "SubtensorSimulator":
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} needs the substrate backend but resolved to "
+                f"{type(backend).__name__} — native precompiles cannot execute, so "
+                "destination legs could never deliver. Set "
+                "BITTENSOR_CHOPSTICKS_SIM_RPC_URL (api/validator) and "
+                "BITTENSOR_CHOPSTICKS_BENCH_SIM_RPC_URL (benchmark-worker)."
+            )
+
+        probe = getattr(backend, "is_connected", None)
+        if callable(probe) and not probe():
+            raise RealSimulationUnavailable(
+                f"chain {chain_id} destination backend ({type(backend).__name__}) is "
+                "not reachable — deferring rather than scoring rows that cannot "
+                "deliver. Check the chain's simulator sidecar."
+            )
+
+
 async def _measure_destination_delivery(
     simulator: Any,
     plan: ExecutionPlan,
@@ -2776,6 +3036,18 @@ async def _measure_destination_delivery(
         return None, None, None
     plan = normalized
 
+    # A destination chain whose backend cannot run makes the row unscoreable BY
+    # CONSTRUCTION — no plan any miner can write would deliver. Recording it as
+    # nothing_delivered blames the solver for our outage, and that is not a
+    # theoretical concern: on 2026-08-23 both Chopsticks sidecars were dead
+    # (docker reported them Up; they were running=false with no IP) and the
+    # whole fleet logged nothing_delivered on every chain-964 leg for hours.
+    # Several miners spent rounds debugging correct plans.
+    #
+    # Defer LOUD instead, the same fail-closed move the rest of this module
+    # makes when a real simulation is unavailable.
+    _assert_destination_backends_usable(simulator, plan)
+
     try:
         result = await simulator.simulate_cross_chain(
             plan,
@@ -2845,8 +3117,33 @@ async def _measure_destination_delivery(
     delivered = 0                 # right token, credited recipient
     wrong_token_to_recipient = 0  # credited recipient, but not what was asked
     right_token_elsewhere = 0     # what was asked, delivered somewhere we don't count
+    # ...and WHY there were no transfers to bucket, which the three counters
+    # above cannot express. A leg that reverted and a leg that was never
+    # dispatched both yield an empty token_transfers list, and so does a leg
+    # that ran cleanly and simply moved nothing — three causes needing three
+    # different fixes, collapsed into one "nothing_delivered" until now.
+    #
+    # Read off the leg RESULT, never by matching the error text: this rides a
+    # persisted row that leader and follower compare, so a wording difference
+    # between two builds must never read as a data difference.
+    legs_reverted = 0
+    legs_unsimulated = 0
+    sims_map = getattr(simulator, "simulators", None)
     for leg_id in dest_ids:
-        for t in (leg_results.get(leg_id) or {}).get("token_transfers", []):
+        _res = leg_results.get(leg_id) or {}
+        if not _res.get("success", True):
+            _leg_chain = next(
+                (
+                    leg.get("chain_id") for leg in legs_meta
+                    if leg.get("leg_id") == leg_id
+                ),
+                None,
+            )
+            if isinstance(sims_map, dict) and _leg_chain not in sims_map:
+                legs_unsimulated += 1
+            else:
+                legs_reverted += 1
+        for t in _res.get("token_transfers", []):
             try:
                 amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
@@ -2865,6 +3162,7 @@ async def _measure_destination_delivery(
         diagnosis = _delivery_diagnosis(
             expected_token, recipients,
             wrong_token_to_recipient, right_token_elsewhere,
+            legs_reverted=legs_reverted, legs_unsimulated=legs_unsimulated,
         )
         logger.info(
             "[benchmark] destination legs credited 0 of %s — %s",
@@ -2879,6 +3177,9 @@ def _delivery_diagnosis(
     recipients: set[str],
     wrong_token_to_recipient: int,
     right_token_elsewhere: int,
+    *,
+    legs_reverted: int = 0,
+    legs_unsimulated: int = 0,
 ) -> dict[str, Any]:
     """Why did a cross-chain plan deliver nothing? Answered in a stable code.
 
@@ -2899,10 +3200,26 @@ def _delivery_diagnosis(
       ``wrong_token``       something reached a counted recipient, but not what
                             the intent asked for — the signature of bridging
                             and skipping the destination swap.
-      ``nothing_delivered`` the destination legs moved nothing at all to
-                            anyone. Usually an empty or reverting leg.
+      ``destination_unsimulated``
+                            the destination leg was never DISPATCHED — the
+                            plan named a chain this benchmark has no simulator
+                            for, so nothing ran and there was nothing to
+                            measure. Not a fact about the plan's quality.
+      ``destination_leg_reverted``
+                            the destination leg RAN and failed. The journey
+                            reached the far chain; the call there did not
+                            succeed.
+      ``nothing_delivered`` the destination legs ran, succeeded, and moved
+                            nothing to anyone. An empty leg.
       ``no_output_token``   the intent declared no output token, so there was
                             nothing to measure against (set upstream).
+
+    The last three used to be one code. A miner reading ``nothing_delivered``
+    could not tell whether their leg was empty, reverted, or never ran, and
+    those need three different fixes — one of them ours, not theirs. Splitting
+    them is the whole reason a fleet-wide chain-964 outage (2026-08-23, both
+    Chopsticks sidecars dead) read to every miner as their own bad plan, and
+    why it stayed arguable for days afterwards.
 
     Two codes are set by the CALLER rather than here, because they are decided
     before there is any journey to measure — ``no_output_token`` above, and
@@ -2911,16 +3228,24 @@ def _delivery_diagnosis(
 
     ``wrong_recipient`` outranks ``wrong_token`` when both are present: it is
     the closer miss and the cheaper fix, so it is the more useful thing to say.
+    A leg that never ran outranks everything — no advice about tokens or
+    recipients is honest when the call was never dispatched.
     """
-    if right_token_elsewhere:
+    if legs_unsimulated:
+        code = "destination_unsimulated"
+    elif right_token_elsewhere:
         code = "wrong_recipient"
     elif wrong_token_to_recipient:
         code = "wrong_token"
+    elif legs_reverted:
+        code = "destination_leg_reverted"
     else:
         code = "nothing_delivered"
     return {
         "code": code,
         "requested_token": expected_token,
+        "legs_reverted": str(legs_reverted),
+        "legs_unsimulated": str(legs_unsimulated),
         # Sorted so two validators emit byte-identical diagnoses for the same
         # observation — this is a set, and set order is not stable.
         "credited_recipients": sorted(recipients),
