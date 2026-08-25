@@ -218,6 +218,14 @@ def _round_anchor_rpc_timeout() -> float:
         return 10.0
 
 
+# How far below the tip the fork-pin binary search may reach. The pin itself is
+# only an epoch or two back, so this is enormous headroom; it exists purely to
+# keep the search off blocks a pruned upstream cannot serve (see _lo below).
+# ~2 weeks at Ethereum/Bittensor block times, ~14 hours at Base's — all far
+# beyond any anchor, and far inside what the leader's nodes actually retain.
+_PIN_SEARCH_WINDOW_BLOCKS = 100_000
+
+
 def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
     """Canonical per-chain fork pins for the round's epoch anchor, or None.
 
@@ -276,13 +284,51 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
             )
         return w3_cache[chain_id]
 
+    # HEAD memo: derive_fork_pins asks for head once per chain, and the search
+    # floor below is derived from the SAME head. Reading it twice would be a
+    # wasted RPC round-trip on the leader's shared event loop, and (worse) two
+    # reads can straddle a block and disagree.
+    head_memo: dict[int, int] = {}
+
+    def _head(chain_id: int) -> int:
+        if chain_id not in head_memo:
+            head_memo[chain_id] = int(_w3(chain_id).eth.block_number)
+        return head_memo[chain_id]
+
+    def _lo(chain_id: int) -> int:
+        """Lowest block the pin search may touch.
+
+        WITHOUT this, ``lo`` defaults to 0 and ``find_pin_block`` opens by reading
+        the GENESIS block — and not every upstream serves it. The leader's chain-964
+        node is pruned (measured 2026-08-25: blocks 0, 1 and 1e6 return
+        ``BlockNotFound``; 5e6 and above are fine), so the read raised, the whole
+        derivation failed, and NO chain got pinned — not just 964:
+
+            fork-pins: derivation failed for epoch N: Block with id: '0x0' not found.
+
+        Ethereum and Base never hit it because their upstreams serve genesis.
+
+        DETERMINISM: this cannot move the pin. ``find_pin_block`` returns the
+        HIGHEST block in ``[lo, confirmed_tip]`` with ``ts <= anchor``, so every
+        ``lo`` below that block yields the identical answer — and the pin sits
+        within an epoch or two of the tip, many orders of magnitude above this
+        floor. Two validators whose heads differ by a few blocks get floors that
+        differ by a few blocks and still agree exactly. A floor that somehow rose
+        ABOVE the answer fails LOUD ("anchor precedes lo block"), never silently.
+
+        Relative to the tip rather than a per-chain constant, so it keeps working
+        as a node prunes forward instead of needing to be re-tuned each time.
+        """
+        return max(0, _head(chain_id) - _PIN_SEARCH_WINDOW_BLOCKS)
+
     try:
         return derive_fork_pins(
             anchor_ts,
             chains,
-            head_of=lambda c: int(_w3(c).eth.block_number),
+            head_of=_head,
             block_timestamp_of=lambda c, b: int(_w3(c).eth.get_block(b)["timestamp"]),
             confirmations=confirmations,
+            lo_of=_lo,
             # PER-CHAIN anchor: slow chains (e.g. Ethereum) anchor deeper so
             # find_pin_block confirm-brackets them at round open instead of
             # deferring forever (#632). Base is unchanged (default lookback).
