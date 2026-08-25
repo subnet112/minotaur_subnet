@@ -34,6 +34,7 @@ import urllib.request
 from typing import Any
 
 from minotaur_subnet.shared.types import (
+    plan_metadata_fields,
     ExecutionPlan,
     SimulationResult,
     TokenTransfer,
@@ -232,7 +233,10 @@ class SubtensorSimulator:
         # anvil's state-changing send — NO impersonation is needed. Falls back to
         # metadata.executor / the default when the target has no relayer() (e.g. the
         # measuring router).
-        executor = (plan.metadata.get("executor") if plan.metadata else None) or self.default_executor
+        # `if plan.metadata` is TRUTHY for the raw bytes an abi.decoding App
+        # takes (#1617), so this used to call .get on bytes and raise. This is
+        # the chain-964 scoring path — the one AlphaYieldApp actually runs on.
+        executor = (plan_metadata_fields(plan).get("executor")) or self.default_executor
         if contract_address:
             relayer = self._discover_relayer(contract_address, url)
             if relayer:

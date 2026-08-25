@@ -51,6 +51,7 @@ from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL
 # graded `dropped`, which is a HARD adoption veto.
 TRANSIENT_SIM_ERROR_PREFIX = "provider_unavailable:"
 from minotaur_subnet.shared.types import (
+    plan_metadata_fields,
     ExecutionPlan,
     SimulationResult,
     TokenTransfer,
@@ -609,7 +610,7 @@ class AnvilSimulator:
                 error=f"baseline revert failed: {exc}",
             )
 
-        executor = plan.metadata.get("executor", self.default_executor)
+        executor = plan_metadata_fields(plan).get("executor", self.default_executor)
         executor = Web3.to_checksum_address(executor)
 
         snap_id = self._snapshot()
@@ -2332,7 +2333,11 @@ class MultiChainSimulator:
         1. plan.metadata["chain_id"]  2. plan.interactions[0].chain_id
         3. self.default_chain_id
         """
-        plan_chain = plan.metadata.get("chain_id")
+        # Metadata is not always a dict — an App that abi.decodes it takes raw
+        # bytes (#1617), and `.get` on those raises `'str'/'bytes' object has no
+        # attribute 'get'`. Such a plan simply carries no chain hint, which the
+        # ladder below already handles.
+        plan_chain = plan_metadata_fields(plan).get("chain_id")
         if plan_chain is None and plan.interactions:
             # Every Interaction carries a chain_id even when metadata omits it.
             plan_chain = plan.interactions[0].chain_id
@@ -2424,7 +2429,7 @@ class MultiChainSimulator:
             resolved = (
                 _coerce_chain_id(chain_id)
                 if chain_id is not None
-                else plan.metadata.get("chain_id", self.default_chain_id)
+                else plan_metadata_fields(plan).get("chain_id", self.default_chain_id)
             )
             return SimulationResult(
                 success=False,
@@ -2474,12 +2479,12 @@ class MultiChainSimulator:
             observed_bridged_amount,
         )
 
-        if not plan.metadata.get("legs"):
+        if not plan_metadata_fields(plan).get("legs"):
             normalized = normalize_to_legs(plan)
             if normalized is None:
                 return await self.simulate(plan, **kwargs)
             plan = normalized
-        legs = plan.metadata.get("legs")
+        legs = plan_metadata_fields(plan).get("legs")
 
         leg_results: dict[int, Any] = {}
         bridge_estimate: dict[str, Any] | None = None
