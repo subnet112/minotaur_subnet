@@ -12,6 +12,7 @@ All agents MUST use these types for interoperability.
 
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -243,6 +244,28 @@ def mock_bridge_interactions_from_config(
         else:
             result.append(ix)
     return result
+
+
+
+def plan_metadata_fields(plan: Any) -> dict:
+    """``plan.metadata`` as a MAPPING, or an empty one when it is not.
+
+    Metadata is NOT always a dict. An App that ``abi.decode``s its metadata takes
+    raw ``bytes`` (pinned in #1617: "solvers return bytes for metadata an App
+    abi-decodes; a dict still becomes JSON"), so every ``metadata.get(...)`` and
+    ``metadata[...] = ...`` on the scoring path is wrong for those Apps.
+
+    Live consequence, chain 964 / AlphaYieldApp 2026-08-25: EVERY row scored 0
+    for EVERY miner, ~300 tracebacks in 20 minutes, each still burning a sandbox
+    solver run --
+
+        'str' object does not support item assignment
+        'str' object has no attribute 'get'
+
+    Read through this helper; never assume the shape.
+    """
+    md = getattr(plan, "metadata", None)
+    return md if isinstance(md, Mapping) else {}
 
 
 @dataclass
