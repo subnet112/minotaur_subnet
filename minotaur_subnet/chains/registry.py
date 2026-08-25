@@ -93,6 +93,14 @@ class ChainSpec:
     # Consensus-only extra: a public/local fallback when the archive is unset
     # (the local node IS the live chain on testnet/dev; 964's lite endpoint).
     consensus_public_fallback: str | None = None
+    # How far below the tip the round-anchor pin search may reach on THIS chain.
+    # NOT consensus-relevant and it CANNOT move a pin: find_pin_block returns the
+    # highest block in [lo, confirmed_tip] with ts <= anchor, so every window
+    # larger than the pin's own depth yields the identical block (measured on 964
+    # 2026-08-25: windows of 100/200/300 all returned pin head-17).
+    # It exists only to keep the binary search off blocks the UPSTREAM cannot
+    # serve, so it must be sized to the SHALLOWEST node any validator might use.
+    pin_search_window: int = 100_000
     # ROLE 2 — SIM FORK target: the scoring/order-processing anvil (the
     # api/validator sim_rpc_urls builder).
     sim_rpc_envs: tuple[str, ...] = ()
@@ -224,6 +232,12 @@ _SPECS: tuple[ChainSpec, ...] = (
             "BITTENSOR_EVM_FORK_RPC_URL",
         ),
         consensus_public_fallback="https://lite.chain.opentensor.ai",
+        # That lite endpoint retains only ~397 blocks (~1.3h, measured
+        # 2026-08-25) — it is what a validator with no 964 archive configured
+        # falls back to, and a 100k window makes the binary search open at
+        # head-50k and miss. The pin sits ~17 blocks back, so 300 is ~17x margin
+        # and still an order of magnitude inside what the endpoint keeps.
+        pin_search_window=300,
         # Sim target = the Chopsticks anvil-dialect sidecar (native precompiles
         # execute there); falls back to the legacy anvil-btevm eth RPC only if the
         # sidecar env is unset (EVM-native-only degraded mode).
@@ -338,6 +352,16 @@ def anchor_chains() -> tuple[int, ...]:
     the ``is_anchor`` CODE constants here — never env — and must be fleet-uniform.
     """
     return tuple(cid for cid, s in CHAINS.items() if s.is_anchor)
+
+
+def pin_search_window(chain_id: int, default: int = 100_000) -> int:
+    """How far below the tip this chain's fork-pin search may reach.
+
+    See :attr:`ChainSpec.pin_search_window` — sized to the shallowest upstream a
+    validator might use, and unable to move a pin.
+    """
+    s = spec(chain_id)
+    return s.pin_search_window if s is not None else default
 
 
 def lookback_epochs(chain_id: int, default: int = 1) -> int:
