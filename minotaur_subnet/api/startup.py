@@ -231,11 +231,14 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
 
     Anchor timestamp = ``anchor_epoch * epoch_seconds`` (deterministic, no chain
     read). Reads each chain's LIVE upstream RPC (never the sim fork) via
-    ``_chain_rpc_env`` — the same source chain_corpus uses. All determinism lives
-    in the pure ``consensus.round_anchor``; this is only the live adapter. Returns
-    None (defer / live-head) on any unavailability — never a guess.
+    ``_chain_rpc_env``, then the chain's explicit ``consensus_public_fallback``
+    so a chain can still be pinned by a validator whose operator has not
+    configured its archive. All determinism lives in the pure
+    ``consensus.round_anchor``; this is only the live adapter. Returns None
+    (defer / live-head) on any unavailability — never a guess.
     """
     from minotaur_subnet.epoch.clock import SolverRoundEpochClock
+    from minotaur_subnet.chains import registry
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
     from minotaur_subnet.consensus.round_anchor import (
         ROUND_ANCHOR_CONFIRMATIONS,
@@ -265,10 +268,31 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
 
     def _w3(chain_id: int):
         if chain_id not in w3_cache:
+            # Archive ladder first (unchanged), then the chain's EXPLICIT
+            # public fallback.
+            #
+            # Measured 2026-08-25: with a chain-964 app live, the leader pinned
+            # {1, 964, 8453} while BOTH followers deferred with no pins at all —
+            # they have no 964 archive configured, so this raised and
+            # derive_fork_pins (which fails if ANY chain fails) took the whole
+            # anchor down. 964 already carried a public fallback in the registry;
+            # this path never consulted it.
+            #
+            # DELIBERATELY NOT `registry.consensus_rpc`, which looks like the
+            # right ladder and is not: its last rung is the LOCAL NODE for every
+            # chain except 1. A validator with no Base archive would then pin
+            # Base against its own anvil — a confident pin off the WRONG CHAIN,
+            # which is far worse than the defer it replaces. Only an explicit
+            # per-chain `consensus_public_fallback` is safe here, because that
+            # value IS that chain.
             rpc = _chain_rpc_env(chain_id)
             if not rpc:
+                rpc = (getattr(registry.spec(chain_id), "consensus_public_fallback", None)
+                       or "")
+            if not rpc:
                 raise ForkPinUnavailable(
-                    f"no live RPC for chain {chain_id} (set *_UPSTREAM_RPC_URL)"
+                    f"no live RPC for chain {chain_id} (set *_UPSTREAM_RPC_URL, "
+                    f"or give the chain a consensus_public_fallback)"
                 )
             # Bounded per-request timeout: this runs synchronously, and on the
             # leader the same event loop also drives the order-execution
@@ -319,7 +343,12 @@ def _derive_round_fork_pins(anchor_epoch: int) -> dict[int, int] | None:
         Relative to the tip rather than a per-chain constant, so it keeps working
         as a node prunes forward instead of needing to be re-tuned each time.
         """
-        return max(0, _head(chain_id) - _PIN_SEARCH_WINDOW_BLOCKS)
+        # PER-CHAIN: sized to the SHALLOWEST upstream a validator might use for
+        # this chain, which is its public fallback when one is configured. 964's
+        # lite endpoint retains ~397 blocks, so the global default would open the
+        # binary search at head-50k and miss every time.
+        return max(0, _head(chain_id) - registry.pin_search_window(
+            chain_id, _PIN_SEARCH_WINDOW_BLOCKS))
 
     try:
         return derive_fork_pins(
@@ -790,13 +819,21 @@ def _fetch_pin_block_hashes(pins: dict[int, int]) -> dict[str, str]:
     /health).
     """
     from minotaur_subnet.blockchain.web3_retry import build_retrying_web3
+    from minotaur_subnet.chains import registry
     from minotaur_subnet.consensus.app_registry_cache import _chain_rpc_env
 
     timeout_s = _round_anchor_rpc_timeout()
     out: dict[str, str] = {}
     for chain_id, block in sorted(pins.items()):
         try:
-            rpc = _chain_rpc_env(int(chain_id))
+            # SAME ladder as the derivation above, which this docstring promises
+            # (archive, then the chain's explicit public fallback — never the
+            # local node, see the note there). On the archive-only ladder a
+            # validator without that chain configured hits `if not rpc: continue`
+            # and silently OMITS the hash, losing exactly the cross-fleet
+            # divergence signal this probe exists to provide.
+            rpc = _chain_rpc_env(int(chain_id)) or (
+                getattr(registry.spec(int(chain_id)), "consensus_public_fallback", None) or "")
             if not rpc:
                 continue
             w3 = build_retrying_web3(
