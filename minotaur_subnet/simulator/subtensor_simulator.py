@@ -119,9 +119,33 @@ class SubtensorSimulator:
 
     def eth_call(self, to: str, data: str, from_addr: str | None = None,
                  value: int = 0, gas: str | None = None, url: str | None = None) -> dict:
+        """Dry-run a call on the fork. ``value`` is WEI (964's native TAO is
+        18-decimal), and it is sent as a STRING — never as a JSON number.
+
+        The sidecar is JavaScript. A bare JSON number is parsed as a double and
+        handed to polkadot.js, whose ``U256`` codec refuses anything above
+        ``Number.MAX_SAFE_INTEGER`` (9,007,199,254,740,991 ≈ 0.009 TAO):
+
+            createType(PrimitiveTypesU256):: Number needs to be an integer
+            <= Number.MAX_SAFE_INTEGER
+
+        So EVERY value-bearing call carrying a realistic TAO amount failed at
+        the RPC layer — 0.01 TAO and up, which is every cross-chain delivery
+        anyone would benchmark. Measured against the live bench sidecar: as an
+        int 6.993e18 raises the error above; as a decimal or hex string the
+        same call succeeds. ``set_balance`` already stringifies (which is why
+        FUNDING always worked while SPENDING never did) — this makes the two
+        agree.
+
+        Note the failures this does NOT explain, so they are not chased again:
+        a value between 1 and 499 rao returns ``outOfFund``. That is subtensor's
+        500-rao EXISTENTIAL DEPOSIT (measured: 200 rao fails, 500 rao passes),
+        a property of the chain, not of the seeding — the executor is funded
+        100,000 TAO by ``_DEFAULT_FUND_RAO`` and raising that changes nothing.
+        """
         return self._rpc("ck_ethCall", [{
             "from": from_addr or self.default_executor,
-            "to": to, "data": data, "value": value, "gas": gas,
+            "to": to, "data": data, "value": str(int(value or 0)), "gas": gas,
         }], url=url)
 
     # ── the AnvilSimulator-compatible surface ─────────────────────────────────
