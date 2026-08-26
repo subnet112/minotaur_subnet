@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping
+
 import os
 import time
 from collections import deque
@@ -1374,7 +1376,18 @@ async def score_plan(
         interactions=parse_interactions(interactions_raw),
         deadline=plan_dict.get("deadline", 0),
         nonce=plan_dict.get("nonce", 0),
-        metadata=dict(plan_dict.get("metadata", {})),
+        # NOT dict(...): metadata is not always a mapping. An App that
+        # abi.decodes its metadata takes raw bytes, sent over JSON as a hex
+        # STRING (#1617), and `dict("0x02071f…")` raises
+        #   ValueError: dictionary update sequence element #0 has length 1; 2 is required
+        # — an unhandled 500 with no logged traceback, which is what made the
+        # chain-964 dry-run impossible to run at all (2026-08-25). Copy a
+        # mapping (callers mutate it below); pass anything else through as-is.
+        metadata=(
+            dict(plan_dict["metadata"])
+            if isinstance(plan_dict.get("metadata"), Mapping)
+            else plan_dict.get("metadata", {}) or {}
+        ),
     )
 
     params = body.params
@@ -1410,7 +1423,11 @@ async def score_plan(
     # and the scoreIntent call runs against the wrong fork — the DexAggregator
     # contract isn't deployed there, relayer() returns empty, and the
     # simulator fails with "Unknown format '0x'".
-    plan.metadata.setdefault("chain_id", chain_id)
+    # Only when it IS a mapping — see the metadata note above. chain_id is
+    # passed to the simulator explicitly below and is authoritative there, so
+    # skipping this for bytes metadata changes no routing.
+    if isinstance(plan.metadata, MutableMapping):
+        plan.metadata.setdefault("chain_id", chain_id)
 
     state = build_intent_state(
         contract_address=contract_address,

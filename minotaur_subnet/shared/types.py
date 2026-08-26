@@ -599,7 +599,7 @@ def partition_plan_by_leg(plan: ExecutionPlan) -> dict[int, list[Interaction]]:
     Returns a dict mapping leg_id to the list of Interactions for that leg.
     If the plan has no legs metadata, returns ``{0: plan.interactions}``.
     """
-    legs = plan.metadata.get("legs")
+    legs = plan_metadata_fields(plan).get("legs")
     if not legs:
         return {0: list(plan.interactions)}
 
@@ -617,7 +617,7 @@ def extract_leg_plan(plan: ExecutionPlan, leg_id: int) -> ExecutionPlan:
     The returned plan copies the original's metadata with the specific
     leg's chain_id set in ``metadata["chain_id"]``.
     """
-    legs = plan.metadata.get("legs", [])
+    legs = plan_metadata_fields(plan).get("legs", [])
     leg_meta = next((l for l in legs if l["leg_id"] == leg_id), None)
 
     if leg_meta is None:
@@ -626,8 +626,8 @@ def extract_leg_plan(plan: ExecutionPlan, leg_id: int) -> ExecutionPlan:
     indices = leg_meta.get("interaction_indices", [])
     interactions = [plan.interactions[i] for i in indices if i < len(plan.interactions)]
 
-    meta = dict(plan.metadata)
-    meta["chain_id"] = leg_meta.get("chain_id", plan.metadata.get("chain_id"))
+    meta = dict(plan_metadata_fields(plan))
+    meta["chain_id"] = leg_meta.get("chain_id", plan_metadata_fields(plan).get("chain_id"))
 
     return ExecutionPlan(
         intent_id=plan.intent_id,

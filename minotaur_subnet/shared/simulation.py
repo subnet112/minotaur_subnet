@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from minotaur_subnet.shared.types import (
+    plan_metadata_fields,
     ExecutionPlan,
     SimulationResult,
     TokenTransfer,
@@ -91,7 +92,7 @@ def compute_mock_score(plan: ExecutionPlan, params: dict[str, Any]) -> float:
     score = 0.6  # Base score
     if len(plan.interactions) >= 2:
         score += 0.1  # Multi-step plans get a bonus
-    if plan.metadata.get("fallback"):
+    if plan_metadata_fields(plan).get("fallback"):
         score = 0.3  # Fallback plans score low
     if params.get("input_token") and params.get("output_token"):
         score += 0.05  # Valid token pair bonus

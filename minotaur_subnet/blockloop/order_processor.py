@@ -7,6 +7,8 @@ relayer submission -> order persistence.
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+
 import asyncio
 import logging
 import os
@@ -14,6 +16,7 @@ import time
 from typing import Any
 
 from minotaur_subnet.shared.types import (
+    plan_metadata_fields,
     AppIntentDefinition,
     ExecutionPlan,
     IntentState,
@@ -304,6 +307,31 @@ class OrderProcessor:
         # fee covers measured gas and lies within the on-chain clamp — runs
         # after simulation below via fee_policy.certify_fee (the relayer cannot
         # refuse a quorum-approved order, so the gate must be upstream).
+        # PRECONDITION for the whole execution rail below, which WRITES
+        # platform fields into plan.metadata — platform_fee_wei here, and
+        # escrow_params / plan_set / multi_leg_plan in the cross-chain compile.
+        #
+        # Metadata is not always a mapping: an App that abi.decodes it takes raw
+        # bytes (#1617). Those writes cannot land there, and SILENTLY SKIPPING
+        # them is the wrong answer — the fee "travels in the consensus proposal"
+        # (below) and the escrow params gate the relayer, so dropping them would
+        # turn a money path into a quiet mis-execution.
+        #
+        # Reject once, here, before any partial mutation. This changes nothing
+        # that works today: such a plan currently dies a few lines down on an
+        # unhandled TypeError, having already mutated whatever came before it.
+        # An App whose metadata is its payload needs a platform-field channel
+        # that is not plan.metadata; until that exists it cannot use this rail.
+        if not isinstance(plan.metadata, MutableMapping):
+            logger.error(
+                "order %s: plan.metadata is %s, not a mapping — the execution "
+                "rail must write platform fields (platform_fee_wei, "
+                "escrow_params, plan_set) into it. Refusing rather than "
+                "executing with them dropped.",
+                getattr(order, "order_id", "?"), type(plan.metadata).__name__,
+            )
+            return False
+
         fee_in_params = int(order.params.get("platform_fee_wei", 0))
         if fee_in_params > 0:
             plan.metadata["platform_fee_wei"] = fee_in_params
@@ -341,7 +369,7 @@ class OrderProcessor:
         # Cross-chain plan compilation: solver provides CrossChainPlan,
         # platform compiles it into MultiLegPlan with bridge calldata + escrow.
         # See _resolve_app_addresses for the fail-closed destination policy.
-        cross_chain_plan_dict = plan.metadata.get("cross_chain_plan")
+        cross_chain_plan_dict = plan_metadata_fields(plan).get("cross_chain_plan")
         if cross_chain_plan_dict and self.cross_chain_compiler is not None:
             try:
                 from minotaur_subnet.shared.types import CrossChainPlan
@@ -407,7 +435,7 @@ class OrderProcessor:
                 return False
 
         # Multi-leg intents: skip normal simulation, use per-leg orchestrator
-        multi_leg_dict = plan.metadata.get("multi_leg_plan")
+        multi_leg_dict = plan_metadata_fields(plan).get("multi_leg_plan")
         if multi_leg_dict:
             from minotaur_subnet.shared.types import MultiLegPlan
             multi_leg = MultiLegPlan.from_dict(multi_leg_dict)
@@ -425,7 +453,7 @@ class OrderProcessor:
                 )
                 if (
                     cross_chain_require_plan_set_signature()
-                    and plan.metadata.get("plan_set")
+                    and plan_metadata_fields(plan).get("plan_set")
                     and not order.params.get("plan_set_signature")
                 ):
                     self.orderbook.update_order(
@@ -452,7 +480,7 @@ class OrderProcessor:
         if contract_address:
             # Resolve 4-byte intent selector: prefer explicit hex, else
             # look it up from the plan metadata or the order's intent_function
-            _raw_sel = order.params.get("intent_selector") or plan.metadata.get("intent_selector") or ""
+            _raw_sel = order.params.get("intent_selector") or plan_metadata_fields(plan).get("intent_selector") or ""
             if not _raw_sel or not all(c in '0123456789abcdefABCDEF' for c in _raw_sel.replace("0x", "")):
                 # Derive the selector from the APP'S OWN manifest — the same
                 # generic, manifest-driven path the submit-order endpoint uses.
@@ -493,7 +521,7 @@ class OrderProcessor:
                 "_input_amount": order.params.get("input_amount", "0"),
             }
 
-        is_cross_chain = plan.metadata.get("cross_chain", False)
+        is_cross_chain = plan_metadata_fields(plan).get("cross_chain", False)
 
         # Defense-in-depth: the API already rejects cross-chain orders when
         # CROSS_CHAIN_ENABLED=0, but a solver could still return a plan
