@@ -92,6 +92,30 @@ def _simulation_to_dict(sim: SimulationResult) -> dict[str, Any]:
     if getattr(sim, "destination_amount_source", None) is not None:
         result["destination_amount_source"] = str(sim.destination_amount_source)
         result["destinationAmountSource"] = result["destination_amount_source"]
+    # The App's OWN verdict, as returned by its on-chain scoreIntent (BPS,
+    # 0..10000). The counterpart to token_transfers: one channel for "what
+    # moved", one for "what the App ruled".
+    #
+    # Absent until now, which made a whole App shape unscoreable. The DEX
+    # aggregator measures an OUTCOME — its plan executes real calls, tokens
+    # move, and the scorer reads token_transfers — so it never needed this and
+    # nobody noticed it was missing. An App whose plan is DATA rather than code
+    # has no such observable: AlphaYieldApp (chain 964) executes no solver calls
+    # at all, so token_transfers and state_changes are both legitimately empty
+    # and its scoreIntent return is the ONLY signal that exists. Its scorer read
+    # `sim.score`, got undefined, and fell back to a flat 0.15 floor while the
+    # contract was returning a correctly graded verdict (measured 2026-08-26:
+    # 10000 / 1427 / 588 / 21 / 0 across the five allowlisted candidates,
+    # matching survey() exactly).
+    #
+    # Additive and inert for existing scorers: the DEX references neither
+    # `on_chain_score` nor `score`, so its output is bit-identical.
+    if getattr(sim, "on_chain_score", None) is not None:
+        result["on_chain_score"] = int(sim.on_chain_score)
+        result["onChainScore"] = result["on_chain_score"]
+        # `score` is the name an App scorer reaches for first (and what
+        # AlphaYieldApp's `pick(sim, "score")` already looks for).
+        result["score"] = result["on_chain_score"]
     if sim.error is not None:
         result["error"] = sim.error
     if sim.token_transfers:
