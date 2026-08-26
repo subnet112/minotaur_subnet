@@ -439,6 +439,38 @@ class LinkSS58Request(BaseModel):
                                 "'MinotaurLinkSS58:{app_id}:{deployer_lower}:{nonce}' (hex).")
 
 
+def _decode_plan_metadata(md: Any) -> Any:
+    """Plan metadata as the SOLVER wire would deliver it.
+
+    Three shapes, and the endpoint has to reproduce all three faithfully or a
+    dry-run does not answer the question it exists to answer:
+
+      * a Mapping  -> COPIED (callers mutate it: chain_id is set below)
+      * "0x…"      -> BYTES. An App that ``abi.decode``s its metadata takes raw
+                      bytes (#1617); over JSON those can only travel as a hex
+                      string, and leaving it a str fails one step later inside
+                      the ABI encoder with
+                        Value '0x02071f…' of type <class 'str'> cannot be
+                        encoded by ByteStringEncoder
+                      so scoreIntent calldata never builds and on_chain_score
+                      stays null — the exact symptom on chain 964, 2026-08-26.
+      * anything else -> through untouched (never ``dict(...)``, which raises on
+                      a str: "dictionary update sequence element #0 has length
+                      1; 2 is required").
+
+    An odd-length or non-hex "0x…" is left as-is rather than guessed at: a
+    malformed value should fail loudly downstream, not be silently reshaped.
+    """
+    if isinstance(md, Mapping):
+        return dict(md)
+    if isinstance(md, str) and md.startswith("0x"):
+        try:
+            return bytes.fromhex(md[2:])
+        except ValueError:
+            return md
+    return md if md is not None else {}
+
+
 class ScorePlanRequest(BaseModel):
     plan: dict[str, Any] = Field(..., description="Execution plan to score")
     params: dict[str, Any] = Field(..., description="Order params → state.raw_params")
@@ -1383,11 +1415,7 @@ async def score_plan(
         # — an unhandled 500 with no logged traceback, which is what made the
         # chain-964 dry-run impossible to run at all (2026-08-25). Copy a
         # mapping (callers mutate it below); pass anything else through as-is.
-        metadata=(
-            dict(plan_dict["metadata"])
-            if isinstance(plan_dict.get("metadata"), Mapping)
-            else plan_dict.get("metadata", {}) or {}
-        ),
+        metadata=_decode_plan_metadata(plan_dict.get("metadata")),
     )
 
     params = body.params
