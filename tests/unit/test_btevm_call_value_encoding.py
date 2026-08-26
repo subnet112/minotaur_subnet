@@ -32,7 +32,10 @@ class _Recorder(SubtensorSimulator):
         super().__init__(sidecar_url="http://sidecar:8545")
         self.sent = None
 
-    def _rpc(self, method, params=None, url=None):
+    def _rpc(self, method, params=None, url=None, timeout=None):
+        # `timeout` mirrors the real signature: the scoreIntent read passes a
+        # long per-call budget (a cold Chopsticks fork costs ~60-90s before it
+        # does any work), so the stub must accept it or every call here raises.
         self.sent = (method, params)
         return {}
 

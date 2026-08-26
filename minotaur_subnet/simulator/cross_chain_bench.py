@@ -205,7 +205,20 @@ def declares_cross_chain(meta: Mapping[str, Any] | None) -> bool:
 
     Takes the metadata mapping, not the plan, because half the call sites
     (stored order plans, quote-time plan metadata) only ever hold the dict.
+
+    The annotation says ``Mapping | None`` and, until 2026-08-26, nothing
+    enforced it. Callers pass ``plan.metadata`` straight in, and that is NOT
+    always a mapping: an App which ``abi.decode``s its metadata takes raw bytes
+    (#1617), so ``meta.get`` raised ``'str' object has no attribute 'get'`` and
+    took the whole /score request down as an unlogged 500. A non-mapping cannot
+    declare anything, so the honest answer here is False, not a crash.
+
+    Guarded HERE rather than at the call sites on purpose: this is the single
+    declaration predicate every gate is required to funnel through, so it is the
+    one place a shape guard cannot be forgotten by the next caller.
     """
+    if not isinstance(meta, Mapping):
+        return False
     meta = meta or {}
     return bool(
         meta.get("legs")
@@ -337,6 +350,11 @@ def _forward_legs(meta: dict[str, Any]) -> list[dict[str, Any]]:
     still abstract) — if both are present the compiled one is what would
     actually execute.
     """
+    # Shape guard, same reason as declares_cross_chain: metadata is not always
+    # a mapping. Unreachable today (callers gate on that predicate first), which
+    # is exactly why it is cheap to keep honest.
+    if not isinstance(meta, Mapping):
+        return []
     mlp = meta.get("multi_leg_plan")
     if isinstance(mlp, dict) and mlp.get("forward_legs"):
         out = []

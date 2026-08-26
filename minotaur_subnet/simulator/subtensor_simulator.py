@@ -47,6 +47,9 @@ _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df52
 _DEFAULT_EXECUTOR = "0x000000000000000000000000000000000000c0de"
 # Generous native funding for the executor's mapped account (rao; 1 TAO = 1e9 rao).
 _DEFAULT_FUND_RAO = 100_000 * 1_000_000_000
+# Budget for the App scoreIntent read (see the call site). A cold fork's first
+# mutating call costs ~60-90s of upstream state fetch before it does any work.
+_SCORE_INTENT_TIMEOUT_S = 300.0
 
 
 class SubtensorSimulator:
@@ -95,11 +98,11 @@ class SubtensorSimulator:
         return url
 
     # ── sidecar JSON-RPC ──────────────────────────────────────────────────────
-    def _rpc(self, method: str, params: list | None = None, url: str | None = None) -> Any:
+    def _rpc(self, method: str, params: list | None = None, url: str | None = None, timeout: float | None = None) -> Any:
         target = (url or self.sidecar_url)
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
         req = urllib.request.Request(target, data=body, headers={"content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.rpc_timeout) as resp:
+        with urllib.request.urlopen(req, timeout=(timeout or self.rpc_timeout)) as resp:
             msg = json.loads(resp.read())
         if msg.get("error"):
             raise RuntimeError(f"{method}: {msg['error'].get('message')}")
@@ -119,7 +122,8 @@ class SubtensorSimulator:
         return self._rpc("sim_mappedAccount", [h160], url=url)
 
     def eth_call(self, to: str, data: str, from_addr: str | None = None,
-                 value: int = 0, gas: str | None = None, url: str | None = None) -> dict:
+                 value: int = 0, gas: str | None = None, url: str | None = None,
+                 timeout: float | None = None) -> dict:
         """Dry-run a call on the fork. ``value`` is WEI (964's native TAO is
         18-decimal), and it is sent as a STRING — never as a JSON number.
 
@@ -147,7 +151,7 @@ class SubtensorSimulator:
         return self._rpc("ck_ethCall", [{
             "from": from_addr or self.default_executor,
             "to": to, "data": data, "value": str(int(value or 0)), "gas": gas,
-        }], url=url)
+        }], url=url, timeout=timeout)
 
     # ── the AnvilSimulator-compatible surface ─────────────────────────────────
     def is_connected(self) -> bool:
@@ -216,7 +220,18 @@ class SubtensorSimulator:
         whole flow in one App/router call (the measuring-router pattern). Single
         App-call plans (staking/vault/DEX-via-app) are the target and work today.
         """
-        if not plan.interactions:
+        # An empty interaction list is not necessarily an empty PLAN. For an App
+        # whose plan is DATA rather than code — AlphaYieldApp on 964 reads an
+        # abi-encoded recommendation out of plan.metadata and does the work
+        # itself, ignoring plan.calls entirely — `interactions: []` is the
+        # CORRECT shape, and everything that scores it lives in the App's own
+        # scoreIntent, read further down.
+        #
+        # Bailing here made that whole class unscoreable: the chain-964 dry-run
+        # returned `simulation_failed: empty plan` for a perfectly formed plan
+        # (2026-08-26). Only bail when there is genuinely nothing to do — no
+        # calls AND no scoreIntent path to fall back on.
+        if not plan.interactions and not (contract_address and intent_order):
             return SimulationResult(success=False, error="empty plan")
 
         # Pick ONE sidecar for this whole simulate() (round-robin across the pool)
@@ -325,7 +340,17 @@ class SubtensorSimulator:
                 logger.warning("scoreIntent calldata build failed: %s", exc)
         if contract_address and sic:
             try:
-                r = self.eth_call(to=contract_address, data=sic, from_addr=executor, url=url)
+                # LONG budget on purpose. This is a whole App scoreIntent on a
+                # possibly COLD Chopsticks fork — AlphaYieldApp alone reads the
+                # metagraph for every allowlisted candidate — and the first call
+                # after a re-pin pulls all that state from upstream. The 60s
+                # default kills it and surfaces as "scoreIntent read failed:
+                # timed out", i.e. on_chain_score None for a plan that is fine
+                # (chain 964, 2026-08-26). Only THIS read is widened; the
+                # per-interaction calls keep the default so a genuinely hung
+                # sidecar still fails fast.
+                r = self.eth_call(to=contract_address, data=sic, from_addr=executor,
+                                  url=url, timeout=_SCORE_INTENT_TIMEOUT_S)
                 if r.get("success"):
                     from eth_abi import decode as abi_decode
                     ret = r.get("returnData") or "0x"
