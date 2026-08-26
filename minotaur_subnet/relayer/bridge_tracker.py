@@ -18,7 +18,7 @@ from typing import Any
 
 from minotaur_subnet.bridge.base import BridgeStatus, BridgeStatusEnum
 from minotaur_subnet.orderbook.orderbook import OrderStatus
-from minotaur_subnet.shared.types import ExecutionPlan, extract_leg_plan
+from minotaur_subnet.shared.types import plan_metadata_fields, ExecutionPlan, extract_leg_plan
 
 logger = logging.getLogger(__name__)
 
@@ -397,7 +397,7 @@ class BridgeTracker:
                     logger.warning("Dest leg simulation error: %s", exc)
 
             # Escrow: deposit bridged tokens and get validator release
-            escrow_params_list = tracked.plan.metadata.get("escrow_params", [])
+            escrow_params_list = plan_metadata_fields(tracked.plan).get("escrow_params", [])
             escrow_for_leg = next(
                 (ep for ep in escrow_params_list if ep.get("leg_index") == leg.leg_index),
                 None,
@@ -499,7 +499,7 @@ class BridgeTracker:
             from minotaur_subnet.consensus.plan_set import thread_plan_set_params
             thread_plan_set_params(
                 submit_params,
-                tracked.plan.metadata.get("plan_set"),
+                plan_metadata_fields(tracked.plan).get("plan_set"),
                 order.params.get("plan_set_signature", ""),
                 leg.leg_index,
             )
@@ -534,7 +534,7 @@ class BridgeTracker:
         contract_address: str | None,
     ) -> None:
         """Legacy path for substrate-origin bridges without multi-leg plans."""
-        legs = tracked.plan.metadata.get("legs", [])
+        legs = plan_metadata_fields(tracked.plan).get("legs", [])
         dest_leg = next(
             (l for l in legs if l.get("type") == "destination"), None,
         )
@@ -547,7 +547,7 @@ class BridgeTracker:
         dest_plan.metadata["cross_chain_leg_index"] = dest_leg["leg_id"]
 
         try:
-            if tracked.plan.metadata.get("substrate_origin"):
+            if plan_metadata_fields(tracked.plan).get("substrate_origin"):
                 print(f"[BRIDGE] Seeding bridged tokens for {tracked.order_id}", flush=True)
                 await self._seed_bridged_tokens(tracked, order, contract_address)
 
@@ -594,7 +594,7 @@ class BridgeTracker:
         user's address on Ethereum so the DexAggregator can pull it.
         """
         try:
-            legs = tracked.plan.metadata.get("legs", [])
+            legs = plan_metadata_fields(tracked.plan).get("legs", [])
             bridge_leg = next((l for l in legs if l.get("type") == "bridge"), None)
             if not bridge_leg:
                 return
@@ -736,7 +736,7 @@ class BridgeTracker:
                 meta.get("contract_address", ""),
                 {"plan_set": meta.get("plan_set"),
                  "escrow_params": meta.get("escrow_params")},
-                tracked.plan.metadata.get("bridge_leg_index", -1),
+                plan_metadata_fields(tracked.plan).get("bridge_leg_index", -1),
                 f"{error} (origin-chain refund to your wallet)",
                 options=["refresh"],
                 expiry_status=OrderStatus.BRIDGE_FAILED,

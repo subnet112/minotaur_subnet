@@ -32,7 +32,7 @@ from minotaur_subnet.harness.orchestrator import (
     _build_token_balances,
 )
 from minotaur_subnet.sdk.intent_solver import MarketSnapshot
-from minotaur_subnet.shared.types import AppIntentConfig, AppIntentDefinition, IntentState
+from minotaur_subnet.shared.types import plan_metadata_fields, AppIntentConfig, AppIntentDefinition, IntentState
 
 from . import make_engine
 from .model import LabConfig, Scenario, StageRecord
@@ -154,7 +154,7 @@ class ForkBackend:
         # ── Stage 1: Solve (real solver, routes against the fork) ──
         t0 = time.monotonic()
         plan = await self.session.generate_plan(intent, state, snapshot)
-        route = (plan.metadata or {}).get("route", "?") if plan else "none"
+        route = plan_metadata_fields(plan).get("route", "?") if plan else "none"
         solve_rec = StageRecord(
             stage="solve", scenario=scenario.name, ok=plan is not None,
             summary=f"route={route} interactions={len(plan.interactions) if plan else 0}",
@@ -166,7 +166,10 @@ class ForkBackend:
         # ── Stage 2: Simulate (real scoreIntent on the fork) ──
         t1 = time.monotonic()
         if plan and plan.metadata is not None:
-            plan.metadata.setdefault("chain_id", scenario.chain_id)
+            # Only when it is a mapping — an abi.decoding App's metadata is
+            # raw bytes (#1617) and carries no platform fields.
+            if isinstance(plan.metadata, MutableMapping):
+                plan.metadata.setdefault("chain_id", scenario.chain_id)
         token_balances = _build_token_balances(state)
         intent_order = _build_benchmark_intent_order(state, plan) if plan else None
         sim = await self.simulator.simulate(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from minotaur_subnet.shared.types import ExecutionPlan
+from minotaur_subnet.shared.types import plan_metadata_fields, ExecutionPlan
 from minotaur_subnet.orderbook.orderbook import Order, OrderStatus
 from minotaur_subnet.blockloop.persistence import OrderPersistence
 
@@ -62,7 +62,7 @@ class CrossChainOrchestrator:
         3. Register with BridgeTracker -> order enters BRIDGING
         4. BridgeTracker polls bridge, submits EVM dest leg on completion
         """
-        legs = plan.metadata.get("legs", [])
+        legs = plan_metadata_fields(plan).get("legs", [])
 
         # Separate substrate vs EVM legs
         substrate_legs = [l for l in legs if l.get("runtime") == "substrate"]
