@@ -307,33 +307,34 @@ class OrderProcessor:
         # fee covers measured gas and lies within the on-chain clamp — runs
         # after simulation below via fee_policy.certify_fee (the relayer cannot
         # refuse a quorum-approved order, so the gate must be upstream).
-        # PRECONDITION for the whole execution rail below, which WRITES
-        # platform fields into plan.metadata — platform_fee_wei here, and
-        # escrow_params / plan_set / multi_leg_plan in the cross-chain compile.
+        # The rail writes platform fields INTO plan.metadata, and metadata is
+        # not always a mapping — an App that abi.decodes it takes raw bytes
+        # (#1617). Guard each write AT the write, not with a blanket up-front
+        # rejection.
         #
-        # Metadata is not always a mapping: an App that abi.decodes it takes raw
-        # bytes (#1617). Those writes cannot land there, and SILENTLY SKIPPING
-        # them is the wrong answer — the fee "travels in the consensus proposal"
-        # (below) and the escrow params gate the relayer, so dropping them would
-        # turn a money path into a quiet mis-execution.
+        # #1693 used a blanket precondition here and that was WRONG: every
+        # write below is already conditional, and for a non-cross-chain,
+        # zero-platform-fee App none of them fire at all. The blanket check
+        # refused a plan that would have executed perfectly — which for
+        # AlphaYieldApp (chain 964) meant its PERPETUAL ORDER could never fill,
+        # and a vault that never rebalances is the whole App doing nothing.
         #
-        # Reject once, here, before any partial mutation. This changes nothing
-        # that works today: such a plan currently dies a few lines down on an
-        # unhandled TypeError, having already mutated whatever came before it.
-        # An App whose metadata is its payload needs a platform-field channel
-        # that is not plan.metadata; until that exists it cannot use this rail.
-        if not isinstance(plan.metadata, MutableMapping):
-            logger.error(
-                "order %s: plan.metadata is %s, not a mapping — the execution "
-                "rail must write platform fields (platform_fee_wei, "
-                "escrow_params, plan_set) into it. Refusing rather than "
-                "executing with them dropped.",
-                getattr(order, "order_id", "?"), type(plan.metadata).__name__,
-            )
-            return False
-
+        # Refuse only when a platform field ACTUALLY needs to be written and
+        # cannot be. Dropping a fee that "travels in the consensus proposal"
+        # would be a quiet mis-execution; refusing a plan that needs no such
+        # field is just a self-inflicted outage.
         fee_in_params = int(order.params.get("platform_fee_wei", 0))
         if fee_in_params > 0:
+            if not isinstance(plan.metadata, MutableMapping):
+                logger.error(
+                    "order %s: a platform fee of %d must travel in the "
+                    "consensus proposal, but plan.metadata is %s, not a "
+                    "mapping, so it cannot carry it. Refusing rather than "
+                    "executing with the fee dropped.",
+                    getattr(order, "order_id", "?"), fee_in_params,
+                    type(plan.metadata).__name__,
+                )
+                return False
             plan.metadata["platform_fee_wei"] = fee_in_params
 
         if (
