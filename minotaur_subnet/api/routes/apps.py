@@ -228,6 +228,50 @@ def set_simulator(simulator: Any) -> None:
     _simulator = simulator
 
 
+def simulator_backends_health() -> dict[str, Any]:
+    """Which chains this node can actually SIMULATE, and with what backend.
+
+    Not the same question as which chains it can PIN. Fork pins come off an
+    archive RPC; simulation needs a live backend — and for chain 964 that is a
+    Chopsticks sidecar behind a compose profile that is inert by default.
+
+    That gap is load-bearing rather than cosmetic. 964 is a WIRED chain, so
+    ``_assert_destination_backends_usable`` DEFERS THE WHOLE ROUND on a node
+    with no backend for it, while a node running the profile scores normally.
+    Nothing in /health distinguished the two, so the only way to discover the
+    split was a round already stalling on it. ``expected_backend`` comes from
+    the registry, so a node reports not just what it has but what it SHOULD
+    have.
+    """
+    from minotaur_subnet.chains import registry
+
+    out: dict[str, Any] = {}
+    sims = getattr(_simulator, "simulators", None)
+    for chain_id in registry.all_chain_ids():
+        spec = registry.spec(chain_id)
+        if spec is None or not spec.wired:
+            continue  # dormant chains are not expected to simulate
+        backend = (sims or {}).get(chain_id)
+        entry: dict[str, Any] = {
+            "expected_backend": spec.sim_backend,
+            "backend": type(backend).__name__ if backend is not None else None,
+            "present": backend is not None,
+        }
+        if backend is not None and hasattr(backend, "is_connected"):
+            try:
+                entry["connected"] = bool(backend.is_connected())
+            except Exception:  # noqa: BLE001
+                entry["connected"] = False
+        # The condition the round-defer branch actually tests.
+        entry["would_defer_destination_leg"] = (
+            backend is None
+            or (spec.sim_backend == "substrate_chopsticks"
+                and type(backend).__name__ != "SubtensorSimulator")
+        )
+        out[str(chain_id)] = entry
+    return out
+
+
 def set_metagraph_sync(metagraph_sync: Any) -> None:
     """Wire the MetagraphSync instance so the signed-miner gate can check
     membership on SN112. Called by startup.py once the periodic sync has

@@ -369,6 +369,12 @@ def health():
         "forced_solver_image": _forced_image,  # operator break-glass override, or null
         "provenance_policy": dict(ctx.provenance_policy_health),
         "runtime_security_policy": dict(ctx.runtime_security_policy_health),
+        # Which chains this node can SIMULATE (distinct from which it can PIN —
+        # pins come off an archive RPC, simulation needs a live backend). A
+        # wired chain with no backend DEFERS THE WHOLE ROUND on any plan
+        # carrying a destination leg there, so a fleet split here is an
+        # availability fact, not a detail. See apps.simulator_backends_health.
+        "simulators": apps.simulator_backends_health(),
     }
     if ctx.epoch_manager is not None:
         data["solver_epoch"] = max(ctx.epoch_manager.current_epoch, _current_solver_round_epoch())
