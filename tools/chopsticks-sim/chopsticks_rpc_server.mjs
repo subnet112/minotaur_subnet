@@ -202,6 +202,51 @@ const HANDLERS = {
   async ck_ethCall([{ from, to, data, value, gas }]) {
     return await ck.ethCall(to, data, { from, value: value ?? 0, gas: gas ?? undefined })
   },
+
+  // ── standard EVM dialect ────────────────────────────────────────────────
+  // This file calls itself an "anvil-dialect JSON-RPC" but answered only
+  // ck_ethCall, so every EVM-shaped client got `unknown method eth_call`.
+  // The scoring sandbox (engine/runner.js) is exactly such a client: it sends
+  // `eth_call` with params [{to, data}, blockTag] and reads `result` as the
+  // return data, so chain 964 was unreachable from scoring JS no matter which
+  // URL it was pointed at. ck_ethCall stays — subtensor_simulator speaks it
+  // and wants the full {success, exitReason, usedGas, logs} record.
+  async eth_call([tx = {}, blockTag = 'latest']) {
+    const { from, to, data, value, gas } = tx || {}
+
+    // The fork is PINNED. Answering a request for some other block with
+    // pin-block state would be a silent lie of exactly the kind this repo
+    // keeps getting burned by (chain 1 served Base state; 8453 served an
+    // unpinned head). Serve the pin, or say why not.
+    if (blockTag != null && blockTag !== 'latest' && blockTag !== 'pending') {
+      const have = Number(pinBlock ?? await ck.forkBlock())
+      const want = typeof blockTag === 'string' && blockTag.startsWith('0x')
+        ? parseInt(blockTag, 16)
+        : Number(blockTag)
+      if (!Number.isFinite(want) || want !== have) {
+        throw new Error(
+          `eth_call: fork is pinned at block ${have}, cannot serve blockTag ${blockTag}`)
+      }
+    }
+
+    // value as a DECIMAL STRING, never a JS number: the sidecar hands it to
+    // polkadot.js, whose U256 codec rejects anything above
+    // Number.MAX_SAFE_INTEGER (~0.009 TAO). Same trap as #1663.
+    const r = await ck.ethCall(to, data, {
+      from,
+      value: value == null ? 0 : BigInt(value).toString(),
+      gas: gas ?? undefined,
+    })
+    if (!r.success) {
+      throw new Error(`execution reverted: ${JSON.stringify(r.exitReason)}`)
+    }
+    return r.returnData ?? '0x'
+  },
+
+  // Standard spelling of sim_forkBlock, hex-encoded per the JSON-RPC spec.
+  async eth_blockNumber() {
+    return '0x' + Number(pinBlock ?? await ck.forkBlock()).toString(16)
+  },
 }
 
 const server = http.createServer((req, res) => {
