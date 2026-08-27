@@ -21,9 +21,14 @@ later reads WITHIN the same call (so a measuring App/router can return delivered
 alpha as return data), and EVM logs come back for DEX-style apps — covering both
 scoring paths with no block-building.
 
-FIRST-CUT SCOPE: runs the plan's interactions and reports success + gas +
-token_transfers (from logs). Per-round re-pinning and the App scoreIntent decode
-are follow-ups (see the methods below).
+"WITHIN the same call" is the whole design constraint, and it used to be a
+scoring DIVERGENCE: the backend ran a plan's interactions as N separate
+dry-runs, so nothing composed and chain 964 scored by different rules than
+chains 1 and 8453 — a leg that wrapped native and then moved the wrapper
+measured zero here and worked there. ``PlanRunner`` (tools/chopsticks-sim/,
+installed at the executor via anvil_setCode) packs the whole plan into ONE
+call, restoring parity, and samples watched addresses' native balances across
+the span so a native delivery is measurable at all.
 """
 
 from __future__ import annotations
@@ -45,6 +50,104 @@ logger = logging.getLogger(__name__)
 # keccak256("Transfer(address,address,uint256)")
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 _DEFAULT_EXECUTOR = "0x000000000000000000000000000000000000c0de"
+# What a native (non-ERC-20) delivery is recorded as. Matches
+# blockchain.tokens.NATIVE_SENTINEL; kept literal so this module stays
+# import-light (stdlib + shared.types only).
+_NATIVE_SENTINEL = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+# ── plan composition (chain-964 parity with anvil) ──────────────────────────
+# Chopsticks cannot build blocks (pallet_drand's per-block hook needs a
+# BLS12-381 host fn its executor lacks), so every ck_ethCall is an INDEPENDENT
+# dry-run against the pinned fork. Running a plan's interactions as N separate
+# calls therefore gave NO composition: interaction 2 could not see interaction
+# 1's effects. A destination leg that wrapped native and then moved the wrapper
+# measured nothing, because as far as the transfer was concerned the wrap had
+# never happened — while the SAME plan on anvil (chains 1/8453) composed fine.
+# Chain 964 was silently scored by different rules.
+#
+# PlanRunner restores parity the only way this fork allows: one call, every
+# interaction inside it, state composing as it goes — the same measuring-router
+# trick StakeMeter already uses for staking. Installed via anvil_setCode AT THE
+# EXECUTOR ADDRESS so sub-calls carry msg.sender == executor exactly as on
+# anvil (the idiom the anvil gas meter uses at the relayer address).
+#
+# Source: tools/chopsticks-sim/PlanRunner.sol (solc 0.8.33, 2293 bytes runtime).
+_PLAN_RUNNER_SELECTOR = "92595a16"  # runPlan((address,uint256,bytes)[],address[])
+_PLAN_RUNNER_RUNTIME_HEX = (
+    "0x608060405260043610610021575f3560e01c806392595a161461002457610022"
+    "565b5b005b61003e60048036038101906100399190610444565b610056565b60"
+    "405161004d939291906106ad565b60405180910390f35b606080606084849050"
+    "67ffffffffffffffff811115610078576100776106f7565b5b60405190808252"
+    "80602002602001820160405280156100a6578160200160208202803683378082"
+    "0191505090505b5092505f5b8585905081101561011f578585828181106100c9"
+    "576100c8610724565b5b90506020020160208101906100de91906107ab565b73"
+    "ffffffffffffffffffffffffffffffffffffffff163184828151811061010857"
+    "610107610724565b5b6020026020010181815250508060010190506100ab565b"
+    "508686905067ffffffffffffffff81111561013d5761013c6106f7565b5b6040"
+    "5190808252806020026020018201604052801561017057816020015b60608152"
+    "6020019060019003908161015b5790505b5090505f5b878790508110156102b6"
+    "575f5f89898481811061019557610194610724565b5b90506020028101906101"
+    "a791906107e2565b5f0160208101906101b891906107ab565b73ffffffffffff"
+    "ffffffffffffffffffffffffffff168a8a858181106101e1576101e061072456"
+    "5b5b90506020028101906101f391906107e2565b602001358b8b868181106102"
+    "0a57610209610724565b5b905060200281019061021c91906107e2565b806040"
+    "019061022b9190610809565b6040516102399291906108a7565b5f6040518083"
+    "038185875af1925050503d805f8114610273576040519150601f19603f3d0116"
+    "82016040523d82523d5f602084013e610278565b606091505b50915091508161"
+    "028a57805160208201fd5b8084848151811061029e5761029d610724565b5b60"
+    "200260200101819052505050806001019050610175565b508484905067ffffff"
+    "ffffffffff8111156102d4576102d36106f7565b5b6040519080825280602002"
+    "6020018201604052801561030257816020016020820280368337808201915050"
+    "90505b5091505f5b8585905081101561037b5785858281811061032557610324"
+    "610724565b5b905060200201602081019061033a91906107ab565b73ffffffff"
+    "ffffffffffffffffffffffffffffffff16318382815181106103645761036361"
+    "0724565b5b602002602001018181525050806001019050610307565b50945094"
+    "5094915050565b5f5ffd5b5f5ffd5b5f5ffd5b5f5ffd5b5f5ffd5b5f5f83601f"
+    "8401126103af576103ae61038e565b5b8235905067ffffffffffffffff811115"
+    "6103cc576103cb610392565b5b6020830191508360208202830111156103e857"
+    "6103e7610396565b5b9250929050565b5f5f83601f8401126104045761040361"
+    "038e565b5b8235905067ffffffffffffffff8111156104215761042061039256"
+    "5b5b60208301915083602082028301111561043d5761043c610396565b5b9250"
+    "929050565b5f5f5f5f6040858703121561045c5761045b610386565b5b5f8501"
+    "3567ffffffffffffffff8111156104795761047861038a565b5b610485878288"
+    "0161039a565b9450945050602085013567ffffffffffffffff8111156104a857"
+    "6104a761038a565b5b6104b4878288016103ef565b9250925050929591945092"
+    "50565b5f81519050919050565b5f82825260208201905092915050565b5f8190"
+    "50602082019050919050565b5f819050919050565b6104fd816104eb565b8252"
+    "5050565b5f61050e83836104f4565b60208301905092915050565b5f60208201"
+    "9050919050565b5f610530826104c2565b61053a81856104cc565b9350610545"
+    "836104dc565b805f5b8381101561057557815161055c8882610503565b975061"
+    "05678361051a565b925050600181019050610548565b50859350505050929150"
+    "50565b5f81519050919050565b5f82825260208201905092915050565b5f8190"
+    "50602082019050919050565b5f81519050919050565b5f828252602082019050"
+    "92915050565b8281835e5f83830152505050565b5f601f19601f830116905091"
+    "9050565b5f6105ed826105ab565b6105f781856105b5565b9350610607818560"
+    "2086016105c5565b610610816105d3565b840191505092915050565b5f610626"
+    "83836105e3565b905092915050565b5f602082019050919050565b5f61064482"
+    "610582565b61064e818561058c565b9350836020820285016106608561059c56"
+    "5b805f5b8581101561069b578484038952815161067c858261061b565b945061"
+    "06878361062e565b925060208a01995050600181019050610663565b50829750"
+    "879550505050505092915050565b5f6060820190508181035f8301526106c581"
+    "86610526565b905081810360208301526106d98185610526565b905081810360"
+    "408301526106ed818461063a565b9050949350505050565b7f4e487b71000000"
+    "000000000000000000000000000000000000000000000000005f526041600452"
+    "60245ffd5b7f4e487b7100000000000000000000000000000000000000000000"
+    "0000000000005f52603260045260245ffd5b5f73ffffffffffffffffffffffff"
+    "ffffffffffffffff82169050919050565b5f61077a82610751565b9050919050"
+    "565b61078a81610770565b8114610794575f5ffd5b50565b5f813590506107a5"
+    "81610781565b92915050565b5f602082840312156107c0576107bf610386565b"
+    "5b5f6107cd84828501610797565b91505092915050565b5f5ffd5b5f5ffd5b5f"
+    "5ffd5b5f823560016060038336030381126107fd576107fc6107d6565b5b8083"
+    "0191505092915050565b5f5f8335600160200384360303811261082557610824"
+    "6107d6565b5b80840192508235915067ffffffffffffffff8211156108475761"
+    "08466107da565b5b602083019250600182023603831315610863576108626107"
+    "de565b5b509250929050565b5f81905092915050565b828183375f8383015250"
+    "5050565b5f61088e838561086b565b935061089b838584610875565b82840190"
+    "509392505050565b5f6108b3828486610883565b9150819050939250505056fe"
+    "a26469706673582212202732ce216a5529de350f1d85d6c3faccc2842ef8b554"
+    "70516c2c1af6b99bd14964736f6c63430008210033"
+)
+
+
 # Generous native funding for the executor's mapped account (rao; 1 TAO = 1e9 rao).
 _DEFAULT_FUND_RAO = 100_000 * 1_000_000_000
 # Budget for the App scoreIntent read (see the call site). A cold fork's first
@@ -209,16 +312,25 @@ class SubtensorSimulator:
         token_balances: dict[str, int] | None = None,
         fork_block: int | None = None,
         meter_gas: bool = False,
+        delivery_recipients: list[str] | None = None,
     ) -> SimulationResult:
         """Execute ``plan`` against the pinned Chopsticks fork as a dry-run and
         report the delivered-output surface. Signature matches
         ``AnvilSimulator.simulate`` so MultiChainSimulator routes here unchanged.
 
-        NOTE: each interaction is an isolated dry-run (no persisted state between
-        them — block-building is BLS-blocked on subtensor's runtime), so plans
-        whose steps depend on a prior step's *persisted* state should encode the
-        whole flow in one App/router call (the measuring-router pattern). Single
-        App-call plans (staking/vault/DEX-via-app) are the target and work today.
+        Interactions COMPOSE: they are executed together inside one
+        ``PlanRunner`` call, so a step sees the previous step's effects exactly
+        as it would on an anvil chain. This is not free composition — block
+        building is BLS-blocked on subtensor's runtime, so each ``ck_ethCall``
+        is still an isolated dry-run — it is the whole plan packed into a
+        single one of them. Plans that depend on state persisting BETWEEN
+        top-level calls (across separate simulate() invocations) still cannot
+        work here.
+
+        ``delivery_recipients`` names addresses whose NATIVE balance is sampled
+        across the span. A bridge that credits native (Tensorplex on 964) emits
+        no ERC-20 Transfer log, so without this a correct delivery is
+        indistinguishable from no delivery at all.
         """
         # An empty interaction list is not necessarily an empty PLAN. For an App
         # whose plan is DATA rather than code — AlphaYieldApp on 964 reads an
@@ -268,26 +380,19 @@ class SubtensorSimulator:
         transfers: list[TokenTransfer] = []
         total_gas = 0
         last_return = None
-        for i, ix in enumerate(plan.interactions):
-            if ix.chain_id and ix.chain_id != self.chain_id:
-                continue
-            try:
-                r = self.eth_call(
-                    to=ix.target, data=ix.call_data,
-                    from_addr=executor, value=int(ix.value or "0"), url=url,
-                )
-            except Exception as exc:  # noqa: BLE001
-                return SimulationResult(success=False, error=f"interaction {i} rpc: {exc}")
-            if not r.get("success"):
+        if plan.interactions:
+            composed = self._run_plan_composed(
+                plan, executor, url, delivery_recipients=delivery_recipients,
+            )
+            if composed.get("error"):
                 return SimulationResult(
                     success=False,
-                    error=f"interaction {i} reverted",
-                    revert_reason=json.dumps(r.get("exitReason")),
-                    gas_used=total_gas,
+                    error=composed["error"],
+                    revert_reason=composed.get("revert_reason"),
                 )
-            total_gas += int(r.get("usedGas") or 0, 16) if isinstance(r.get("usedGas"), str) else int(r.get("usedGas") or 0)
-            last_return = r.get("returnData")
-            transfers.extend(self._parse_transfers(r.get("logs") or []))
+            transfers.extend(composed["transfers"])
+            total_gas = composed["gas_used"]
+            last_return = composed["last_return"]
 
         result = SimulationResult(
             success=True,
@@ -458,6 +563,121 @@ class SubtensorSimulator:
         if len(h) < 64:
             return None
         return int(h[-64:], 16)
+
+    def _run_plan_composed(
+        self,
+        plan: ExecutionPlan,
+        executor: str,
+        url: str,
+        delivery_recipients: list[str] | None = None,
+    ) -> dict:
+        """Execute every interaction inside ONE dry-run, so state composes.
+
+        Returns ``{transfers, gas_used, last_return}`` or ``{error, ...}``.
+
+        Two things this buys that the previous per-interaction loop could not:
+
+        * **Composition.** Each ``ck_ethCall`` is independent, so N calls meant
+          N isolated dry-runs against the same pre-state. Inside PlanRunner the
+          calls run in sequence within one EVM execution, exactly as they do on
+          an anvil chain.
+        * **Native delivery.** Native movement emits no ERC-20 Transfer log, so
+          a bridge that credits native (Tensorplex on 964) was invisible to
+          log-based accounting and scored ``nothing_delivered`` however
+          correctly it had delivered. PlanRunner samples the watched addresses'
+          balances either side of the span, and a rise becomes a synthetic
+          transfer carrying the native sentinel as its token.
+        """
+        from eth_abi import decode as abi_decode, encode as abi_encode
+
+        calls = [
+            (
+                self._addr(ix.target),
+                int(ix.value or 0),
+                bytes.fromhex(str(ix.call_data or "0x").removeprefix("0x")),
+            )
+            for ix in plan.interactions
+            if not (ix.chain_id and ix.chain_id != self.chain_id)
+        ]
+        if not calls:
+            return {"transfers": [], "gas_used": 0, "last_return": None}
+
+        # The executor is always watched: it is where a bridge-seeded native
+        # balance lands, so a leg that never forwards it is distinguishable
+        # from one that did.
+        watch: list[str] = [self._addr(executor)]
+        for r in delivery_recipients or []:
+            a = self._addr(r)
+            if a and a not in watch:
+                watch.append(a)
+
+        # Install the runner AT the executor so sub-calls carry
+        # msg.sender == executor. Must come after any re-pin: a re-pin drops
+        # pending cheatcode overrides (see chopsticks_anvil.repin).
+        try:
+            self.set_code(executor, _PLAN_RUNNER_RUNTIME_HEX, url=url)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"plan runner install failed: {exc}"}
+
+        data = "0x" + _PLAN_RUNNER_SELECTOR + abi_encode(
+            ["(address,uint256,bytes)[]", "address[]"], [calls, watch],
+        ).hex()
+
+        total_value = sum(c[1] for c in calls)
+        try:
+            r = self.eth_call(
+                to=executor, data=data, from_addr=executor,
+                value=total_value, url=url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"composed plan rpc: {exc}"}
+
+        if not r.get("success"):
+            # PlanRunner bubbles a failed interaction's revert unchanged, so
+            # this is the underlying revert, not a wrapper error.
+            return {
+                "error": "plan reverted",
+                "revert_reason": json.dumps(r.get("exitReason")),
+            }
+
+        used = r.get("usedGas") or 0
+        gas_used = int(used, 16) if isinstance(used, str) else int(used)
+
+        transfers = self._parse_transfers(r.get("logs") or [])
+
+        last_return = None
+        ret_hex = str(r.get("returnData") or "")
+        if ret_hex:
+            try:
+                before, after, rets = abi_decode(
+                    ["uint256[]", "uint256[]", "bytes[]"],
+                    bytes.fromhex(ret_hex.removeprefix("0x")),
+                )
+                # Only a RISE counts. The executor's balance normally falls (it
+                # is funding the calls), and a fall is not a delivery.
+                for addr, b, a in zip(watch, before, after):
+                    if a > b:
+                        transfers.append(TokenTransfer(
+                            token=_NATIVE_SENTINEL,
+                            from_addr="",
+                            to_addr=addr,
+                            amount=int(a - b),
+                        ))
+                if rets:
+                    last_return = "0x" + bytes(rets[-1]).hex()
+            except Exception as exc:  # noqa: BLE001
+                # A decode failure must not fail the whole leg: the calls DID
+                # run and their logs are already counted. Report what is known.
+                logger.warning("PlanRunner return decode failed: %s", exc)
+                last_return = ret_hex
+
+        return {"transfers": transfers, "gas_used": gas_used, "last_return": last_return}
+
+    @staticmethod
+    def _addr(a: Any) -> str:
+        """Lowercase 0x-prefixed address, or "" when unusable."""
+        t = str(a or "").strip().lower()
+        return t if t.startswith("0x") and len(t) == 42 else ""
 
     @staticmethod
     def _parse_transfers(logs: list[dict]) -> list[TokenTransfer]:
