@@ -427,13 +427,31 @@ def _resolve_token_params(params: dict, chain_id: int) -> dict:
         if not val:
             continue
 
-        # Native sentinel → wrapped native token for the chain
+        # Native sentinel → wrapped native token for THAT TOKEN'S chain.
+        #
+        # Using the order's own chain_id for both sides silently broke every
+        # cross-chain order whose OUTPUT is native: "deliver native TAO on 964"
+        # resolved to chain 1's WETH (the source chain's wrapped native — a
+        # different asset entirely), and, because it also recorded the source
+        # chain in token_chains, input_chain == output_chain, so the
+        # cross-chain branch below never fired and the order was routed as
+        # single-chain. Two wrong answers from one missing distinction.
+        #
+        # The sentinel carries no chain of its own, so an explicit
+        # dest_chain_id is the only signal for the output side; absent one the
+        # order's chain is still the right reading (a single-chain order).
         if val.lower() == _NATIVE_SENTINEL:
-            wnt = WRAPPED_NATIVE_TOKEN.get(chain_id)
+            native_chain = chain_id
+            if key == "output_token":
+                try:
+                    native_chain = int(params.get("dest_chain_id") or 0) or chain_id
+                except (TypeError, ValueError):
+                    native_chain = chain_id
+            wnt = WRAPPED_NATIVE_TOKEN.get(native_chain)
             if wnt:
                 result[key] = wnt
                 result[f"_{key}_is_native"] = True  # tag for downstream
-            token_chains[key] = chain_id
+            token_chains[key] = native_chain
         # CAIP-10 format: eip155:chain_id:0xaddress
         elif val.startswith("eip155:"):
             try:
