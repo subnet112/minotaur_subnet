@@ -3063,6 +3063,12 @@ async def _measure_destination_delivery(
     # makes when a real simulation is unavailable.
     _assert_destination_backends_usable(simulator, plan)
 
+    # The addresses whose NATIVE balance the destination leg samples. Native
+    # movement emits no ERC-20 Transfer event, so a bridge that credits native
+    # — Tensorplex delivering TAO on 964 — was invisible to the delivery
+    # buckets below and scored `nothing_delivered` however correctly it had
+    # delivered. Same recipient set the ERC-20 accounting already credits, so
+    # the two agree by construction.
     try:
         result = await simulator.simulate_cross_chain(
             plan,
@@ -3070,6 +3076,7 @@ async def _measure_destination_delivery(
             contract_address=state.contract_address if state else None,
             token_balances=token_balances,
             fork_block=fork_block,
+            delivery_recipients=sorted(_delivery_recipients(state, plan)),
         )
     except Exception as exc:  # noqa: BLE001
         logger.info("[benchmark] destination-leg observation failed: %s", exc)
@@ -3144,6 +3151,38 @@ async def _measure_destination_delivery(
     legs_reverted = 0
     legs_unsimulated = 0
     sims_map = getattr(simulator, "simulators", None)
+
+    # Native counts as the chain's WRAPPED native, and vice versa. They are the
+    # same value, redeemable 1:1, and which one arrives is a property of the
+    # RAIL, not of the solver's effort: Tensorplex credits native TAO on 964,
+    # while `output_token` can only ever name an address, so an order asking
+    # for TAO resolves to WTAO and the honest native delivery matched nothing.
+    #
+    # Safe because both sides are platform-derived: `expected_token` comes from
+    # the request params (never plan metadata — a solver-declared token_out
+    # would restore the declare-cheap-dump-cheap vector), and the native
+    # sentinel can only be produced by the simulator observing a real balance
+    # rise on that chain's own fork.
+    from minotaur_subnet.blockchain.tokens import NATIVE_SENTINEL, WRAPPED_NATIVE_TOKEN
+
+    _dest_chains = {
+        leg.get("chain_id") for leg in legs_meta
+        if leg.get("leg_id") in set(dest_ids)
+    }
+    _native_equivalents = {NATIVE_SENTINEL}
+    for _c in _dest_chains:
+        try:
+            _w = WRAPPED_NATIVE_TOKEN.get(int(_c))
+        except (TypeError, ValueError):
+            continue
+        if _w:
+            _native_equivalents.add(_w.lower())
+
+    def _is_expected(token: str) -> bool:
+        t = (token or "").lower()
+        if t == expected_token:
+            return True
+        return t in _native_equivalents and expected_token in _native_equivalents
     for leg_id in dest_ids:
         _res = leg_results.get(leg_id) or {}
         if not _res.get("success", True):
@@ -3163,7 +3202,7 @@ async def _measure_destination_delivery(
                 amount = int(t.get("amount") or 0)
             except (ValueError, TypeError):
                 continue
-            right_token = str(t.get("token", "")).lower() == expected_token
+            right_token = _is_expected(str(t.get("token", "")))
             credited_to = str(t.get("to", "")).lower() in recipients
             if right_token and credited_to:
                 delivered += amount
