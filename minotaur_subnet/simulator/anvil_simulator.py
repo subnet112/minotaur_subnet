@@ -537,6 +537,7 @@ class AnvilSimulator:
         pin_only: bool = False,
         deposit_contract_seeds: dict[str, int] | None = None,
         fee_seeds: dict[str, int] | None = None,
+        delivery_recipients: list[str] | None = None,
     ) -> SimulationResult:
         """Execute a plan against the Anvil fork and return results.
 
@@ -613,6 +614,41 @@ class AnvilSimulator:
         executor = plan_metadata_fields(plan).get("executor", self.default_executor)
         executor = Web3.to_checksum_address(executor)
 
+        # Native balances of the delivery recipients, sampled across the whole
+        # simulation. A native transfer emits NO ERC-20 Transfer event, so a
+        # bridge that credits native (Tensorplex delivering TAO) is invisible
+        # to _parse_transfer_events and a correct delivery is indistinguishable
+        # from no delivery at all. Only a RISE counts — the executor's balance
+        # normally falls paying for the calls, and a fall is not a delivery.
+        _watch: list[str] = []
+        for _r in delivery_recipients or []:
+            try:
+                _a = Web3.to_checksum_address(str(_r))
+            except (ValueError, TypeError):
+                continue
+            if _a not in _watch:
+                _watch.append(_a)
+        _native_before = {a: self.w3.eth.get_balance(a) for a in _watch}
+
+        def _with_native_delivery(res: SimulationResult) -> SimulationResult:
+            """Append synthetic native transfers for recipients whose balance rose."""
+            if not _watch or res is None or not res.success:
+                return res
+            extra = []
+            for a in _watch:
+                try:
+                    delta = self.w3.eth.get_balance(a) - _native_before.get(a, 0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if delta > 0:
+                    extra.append(TokenTransfer(
+                        token=NATIVE_SENTINEL, from_addr="", to_addr=a,
+                        amount=int(delta),
+                    ))
+            if extra:
+                res.token_transfers = list(res.token_transfers or []) + extra
+            return res
+
         snap_id = self._snapshot()
         try:
             # ── Primary path: scoreIntent via contract ────────────────────
@@ -634,7 +670,7 @@ class AnvilSimulator:
                 )
                 if result is not None:
                     print(f"[SIM] scoreIntent result: success={result.success} gas={result.gas_used} transfers={len(result.token_transfers or [])} on_chain_score={result.on_chain_score}", flush=True)
-                    return result
+                    return _with_native_delivery(result)
                 # Fail closed. The manual-interaction fallback runs plan calls
                 # directly from a funded executor, bypassing the contract's
                 # proxy deploy / platform fee / invariant checks, which
@@ -716,12 +752,12 @@ class AnvilSimulator:
                 "delta": str(eth_delta),
             })
 
-            return SimulationResult(
+            return _with_native_delivery(SimulationResult(
                 success=True,
                 gas_used=total_gas,
                 token_transfers=all_transfers,
                 state_changes=state_changes,
-            )
+            ))
 
         except Exception as exc:
             logger.error("Simulation error: %s", exc, exc_info=True)
@@ -2591,6 +2627,12 @@ class MultiChainSimulator:
             # Bridge legs are not simulated on-chain, so the dest
             # fork has no bridged tokens — deal them to the executor.
             leg_kwargs = dict(kwargs)
+            # Delivery recipients are only meaningful on a DESTINATION leg —
+            # that is where the intent's output is supposed to land. Sampling
+            # them on a source leg would count the executor's own funding as a
+            # delivery.
+            if leg.get("type") != "destination":
+                leg_kwargs.pop("delivery_recipients", None)
             if leg.get("type") == "destination" and bridge_estimate:
                 token_out = bridge_estimate.get("token_out", "")
                 est_output = bridge_estimate.get("estimated_output", 0)
