@@ -21,6 +21,8 @@ import shutil
 from dataclasses import asdict
 from typing import Any
 
+from minotaur_subnet.chains import registry
+
 try:
     import resource  # POSIX-only; used to disable core dumps in the Node child
 except ImportError:  # pragma: no cover - non-POSIX (e.g. Windows dev box)
@@ -125,18 +127,61 @@ _SANDBOX_ENV_PASSTHROUGH = frozenset(
 _SANDBOX_ENV_RPC_RE = re.compile(r"^RPC_URL_\d+$")  # per-chain override, e.g. RPC_URL_8453
 
 
+def _registry_rpc_env() -> dict[str, str]:
+    """``RPC_URL_<chain_id>`` for every registered chain, from the SIM ladder.
+
+    ``runner.js`` builds its RPC map from two legacy names — ``ANVIL_RPC_URL``
+    (assigned to chains 1 and 31337) and ``BASE_RPC_URL`` (8453) — plus
+    ``RPC_URL_<chain_id>`` overrides applied afterwards. Both legacy names are
+    WRONG on prod, for the two reasons this module's registry docstring already
+    warns about:
+
+    * ``ANVIL_RPC_URL`` is the *Base* anvil there, so scoring JS asking for
+      chain 1 was handed Base state — the same split-brain that produced the
+      ``DexAggregatorV2 relayer() UNRESOLVED`` bugs.
+    * ``BASE_RPC_URL`` is the *live* archive, not the round-pinned fork, so
+      chain 8453 reads an unpinned head — non-deterministic across validators,
+      which is exactly what fork pinning exists to prevent.
+
+    Deriving every chain from the registry's SIM role fixes both and wires new
+    chains automatically. That last part is the point: chain 964 was invisible
+    to the sandbox purely because nothing assigned it a URL, and leaving that to
+    a per-operator env var would have left ``ethCall`` broken on every validator
+    we do not run ourselves.
+
+    An explicitly-set ``RPC_URL_<chain_id>`` still wins — the override hatch is
+    preserved, this only supplies a correct default.
+    """
+    out: dict[str, str] = {}
+    for chain_id in registry.all_chain_ids():
+        key = f"RPC_URL_{chain_id}"
+        if os.environ.get(key, "").strip():
+            continue  # explicit operator override wins
+        url = registry.sim_rpc(chain_id)
+        if url:
+            out[key] = url
+    return out
+
+
 def _sandbox_child_env() -> dict[str, str]:
     """The MINIMAL, secret-free environment for the Node sandbox subprocess.
 
     Returns only the RPC endpoint URLs and the HTTP domain allowlist that
     ``runner.js`` reads from ``process.env`` — never any credential. This is a
     full replacement env (not additive), so the child inherits NOTHING else.
+
+    The registry-derived per-chain URLs are layered UNDER the passthrough so an
+    explicit ``RPC_URL_<chain_id>`` in the parent env still takes precedence.
     """
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k in _SANDBOX_ENV_PASSTHROUGH or _SANDBOX_ENV_RPC_RE.match(k)
-    }
+    env = _registry_rpc_env()
+    env.update(
+        {
+            k: v
+            for k, v in os.environ.items()
+            if k in _SANDBOX_ENV_PASSTHROUGH or _SANDBOX_ENV_RPC_RE.match(k)
+        }
+    )
+    return env
 
 
 async def _get_sandbox_semaphore() -> asyncio.Semaphore:
